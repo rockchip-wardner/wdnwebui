@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>通用智能监视平台</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-title">通用智能监视平台</span>
+        <span class="brand-version" id="brand-version"></span>
+      </div>
+      <nav class="nav">
+        <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统监控</a>
+        <a href="#video-detection" data-page="video-detection" class="nav-item">视频检测</a>
+        <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
+        <a href="#power"           data-page="power"           class="nav-item">电源控制</a>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <section id="page-system-monitor"  class="page" data-page="system-monitor">
+        <header class="page-header">
+          <h2>系统监控</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="system-monitor-time"></span>
+            <button class="refresh-btn" data-refresh>刷新</button>
+          </div>
+        </header>
+
+        <div class="metric-grid">
+          <div class="metric-card" id="card-cpu">
+            <div class="metric-head">
+              <span class="metric-label">CPU 占用</span>
+              <span class="metric-value" id="cpu-percent">--</span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="cpu-bar"></div></div>
+            <div class="metric-sub" id="cpu-meta"></div>
+            <div class="core-grid" id="cpu-cores"></div>
+          </div>
+
+          <div class="metric-card" id="card-mem">
+            <div class="metric-head">
+              <span class="metric-label">内存占用</span>
+              <span class="metric-value" id="mem-percent">--</span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="mem-bar"></div></div>
+            <div class="metric-sub" id="mem-meta"></div>
+          </div>
+        </div>
+
+        <section class="npu-section">
+          <header class="section-header">
+            <h3>RKNN NPU 资源</h3>
+            <span class="badge" id="npu-badge">--</span>
+          </header>
+          <div id="npu-message" class="npu-message hidden"></div>
+          <div class="table-wrap">
+            <table class="data-table" id="npu-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>芯片</th>
+                  <th>Bus-Id</th>
+                  <th>状态</th>
+                  <th>健康</th>
+                  <th>温度 (°C)</th>
+                  <th>功率 (mW)</th>
+                  <th>NPU %</th>
+                  <th>显存 (MB)</th>
+                </tr>
+              </thead>
+              <tbody id="npu-tbody">
+                <tr><td colspan="9" class="empty-row">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <details class="raw-output">
+            <summary>完整 JSON</summary>
+            <pre id="npu-raw"></pre>
+          </details>
+        </section>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-system-monitor"></pre>
+        </details>
+      </section>
+
+      <section id="page-video-detection" class="page hidden" data-page="video-detection">
+        <header class="page-header">
+          <h2>视频检测</h2>
+          <button class="refresh-btn" data-refresh>刷新</button>
+        </header>
+        <div class="placeholder-note">占位页面 — 待接入 rkv / rkai 视频检测</div>
+        <pre class="payload" id="data-video-detection"></pre>
+      </section>
+
+      <section id="page-system-logs"     class="page hidden" data-page="system-logs">
+        <header class="page-header">
+          <h2>系统日志</h2>
+          <button class="refresh-btn" data-refresh>刷新</button>
+        </header>
+        <div class="placeholder-note">占位页面 — 待接入日志流</div>
+        <pre class="payload" id="data-system-logs"></pre>
+      </section>
+
+      <section id="page-power"           class="page hidden" data-page="power">
+        <header class="page-header">
+          <h2>电源控制</h2>
+          <button class="refresh-btn" data-refresh>刷新</button>
+        </header>
+        <div class="placeholder-note">占位页面 — 待接入电源控制命令</div>
+        <pre class="payload" id="data-power"></pre>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/js/app.js" defer></script>
+</body>
+</html>
