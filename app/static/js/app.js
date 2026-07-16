@@ -751,6 +751,244 @@ function initVideoDetection() {
 }
 
 /* ------------------------------------------------------------------ *
+ *  system logs page (journalctl-backed)                              *
+ * ------------------------------------------------------------------ */
+const Logs = {
+  ws: null,
+  wsRetry: 0,
+  wsTimer: null,
+  init() { return initLogs(); },
+  refresh() { return refreshLogs(); },
+};
+
+function setLogsStatus(text, isError) {
+  const el = document.getElementById("system-logs-status");
+  if (!el) return;
+  el.textContent = text || "";
+  el.style.color = isError ? "#b91c1c" : "";
+}
+
+function fmtLogTs(ts_ms) {
+  if (!ts_ms) return "--:--:--";
+  const d = new Date(ts_ms);
+  if (isNaN(d.getTime())) return "--";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function appendLogEntry(entry) {
+  const list = document.getElementById("logs-list");
+  if (!list) return;
+  // Drop the empty placeholder if it's still there.
+  const empty = list.querySelector(".logs-empty");
+  if (empty) empty.remove();
+  const li = document.createElement("li");
+  li.className = "log-entry prio-" + (entry.priority_name || "info");
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.textContent = fmtLogTs(entry.ts_ms);
+  const prio = document.createElement("span");
+  prio.className = "prio";
+  prio.textContent = entry.priority_name || "?";
+  prio.title = "priority " + (entry.priority || "?");
+  const unit = document.createElement("span");
+  unit.className = "unit";
+  unit.textContent = (entry.unit || "?") + (entry.pid ? "[" + entry.pid + "]" : "");
+  const msg = document.createElement("span");
+  msg.className = "msg";
+  msg.textContent = entry.message || "";
+  li.appendChild(ts);
+  li.appendChild(prio);
+  li.appendChild(unit);
+  li.appendChild(msg);
+  list.appendChild(li);
+
+  // Auto-scroll only if user is parked at (or near) the bottom.
+  const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 60;
+  if (nearBottom) {
+    list.scrollTop = list.scrollHeight;
+  }
+}
+
+function setLogsCounter(n) {
+  const el = document.getElementById("logs-counter");
+  if (el) el.textContent = n + " 条";
+}
+
+function setLogsEmpty(text, isError) {
+  const list = document.getElementById("logs-list");
+  if (!list) return;
+  list.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "logs-empty" + (isError ? " error" : "");
+  div.textContent = text;
+  list.appendChild(div);
+}
+
+async function populateUnits() {
+  const sel = document.getElementById("logs-unit");
+  if (!sel) return;
+  try {
+    const r = await fetch(API_PREFIX + "/system-logs/units");
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data.available) {
+      setLogsStatus("journalctl 不可用", true);
+      return;
+    }
+    // Keep the first "全部" option, drop the rest, then append fresh ones.
+    while (sel.options.length > 1) sel.remove(1);
+    (data.units || []).forEach((u) => {
+      const opt = document.createElement("option");
+      opt.value = u.unit;
+      opt.textContent = `${u.unit} (${u.state})`;
+      opt.title = u.description || "";
+      sel.appendChild(opt);
+    });
+  } catch (_) { /* ignore */ }
+}
+
+async function refreshLogs() {
+  const unitEl = document.getElementById("logs-unit");
+  const prioEl = document.getElementById("logs-priority");
+  const linesEl = document.getElementById("logs-lines");
+  const params = new URLSearchParams();
+  if (unitEl && unitEl.value) params.set("unit", unitEl.value);
+  if (prioEl && prioEl.value) params.set("priority", prioEl.value);
+  if (linesEl && linesEl.value) params.set("lines", linesEl.value);
+  setLogsStatus("加载中…");
+  setLogsEmpty("加载中…");
+  try {
+    const r = await fetch(API_PREFIX + "/system-logs?" + params.toString());
+    const body = await r.json();
+    if (!r.ok) {
+      setLogsEmpty("加载失败: " + (body.detail || r.status), true);
+      setLogsStatus("加载失败", true);
+      return;
+    }
+    const list = document.getElementById("logs-list");
+    if (list) list.innerHTML = "";
+    (body.entries || []).forEach(appendLogEntry);
+    setLogsCounter(body.entries ? body.entries.length : 0);
+    setLogsStatus(body.truncated ? `已显示 ${body.entries.length} 行 (可能更多)` : `已显示 ${body.entries.length} 行`);
+    document.getElementById("data-system-logs").textContent =
+      JSON.stringify(body, null, 2);
+  } catch (e) {
+    setLogsEmpty("请求失败: " + e.message, true);
+    setLogsStatus("请求失败", true);
+  }
+}
+
+function logsWsUrl() {
+  const unitEl = document.getElementById("logs-unit");
+  const prioEl = document.getElementById("logs-priority");
+  const params = new URLSearchParams();
+  if (unitEl && unitEl.value) params.set("unit", unitEl.value);
+  if (prioEl && prioEl.value) params.set("priority", prioEl.value);
+  const qs = params.toString();
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}${API_PREFIX}/system-logs/ws${qs ? "?" + qs : ""}`;
+}
+
+function startLogsFollow() {
+  if (Logs.ws) return;  // already following
+  setLogsStatus("连接追踪…");
+  const ws = new WebSocket(logsWsUrl());
+  Logs.ws = ws;
+  ws.onopen = () => {
+    Logs.wsRetry = 0;
+    setLogsStatus("追踪中…");
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "ready") {
+      setLogsStatus(`追踪中 (journalctl pid=${msg.pid})`);
+    } else if (msg.type === "line" && msg.entry) {
+      appendLogEntry(msg.entry);
+      const list = document.getElementById("logs-list");
+      const n = list ? list.querySelectorAll(".log-entry").length : 0;
+      setLogsCounter(n);
+    } else if (msg.type === "info" || msg.type === "error") {
+      setLogsStatus(msg.detail || msg.type, msg.type === "error");
+    } else if (msg.type === "ping") {
+      /* keepalive */
+    }
+  };
+  ws.onclose = () => {
+    Logs.ws = null;
+    if (document.getElementById("logs-follow")?.checked) {
+      const wait = Math.min(5000, 500 * Math.pow(2, Logs.wsRetry++));
+      Logs.wsTimer = setTimeout(startLogsFollow, wait);
+    } else {
+      setLogsStatus("");
+    }
+  };
+  ws.onerror = () => {
+    try { ws.close(); } catch (_) {}
+  };
+}
+
+function stopLogsFollow() {
+  Logs.wsRetry = 0;
+  if (Logs.wsTimer) {
+    clearTimeout(Logs.wsTimer);
+    Logs.wsTimer = null;
+  }
+  if (Logs.ws) {
+    try { Logs.ws.close(); } catch (_) {}
+    Logs.ws = null;
+  }
+}
+
+function initLogs() {
+  if (window.__logsInit) return;
+  window.__logsInit = true;
+
+  const refreshBtn = document.getElementById("system-logs-refresh");
+  const followEl   = document.getElementById("logs-follow");
+  const clearBtn   = document.getElementById("logs-clear");
+  const unitEl     = document.getElementById("logs-unit");
+  const prioEl     = document.getElementById("logs-priority");
+
+  if (refreshBtn) refreshBtn.addEventListener("click", () => {
+    Logs.refresh().then(() => {
+      if (followEl && followEl.checked) {
+        stopLogsFollow();
+        startLogsFollow();
+      }
+    });
+  });
+  if (followEl) followEl.addEventListener("change", () => {
+    if (followEl.checked) {
+      Logs.refresh().then(startLogsFollow);
+    } else {
+      stopLogsFollow();
+      setLogsStatus("");
+    }
+  });
+  if (clearBtn) clearBtn.addEventListener("click", () => {
+    const list = document.getElementById("logs-list");
+    if (list) list.innerHTML = "";
+    setLogsCounter(0);
+    document.getElementById("data-system-logs").textContent = "";
+  });
+  // When filters change, re-fetch and (if following) restart the WS.
+  if (unitEl)   unitEl.addEventListener("change",   onLogsFilterChanged);
+  if (prioEl)   prioEl.addEventListener("change",   onLogsFilterChanged);
+  document.getElementById("logs-lines")?.addEventListener("change", onLogsFilterChanged);
+
+  populateUnits();
+}
+
+function onLogsFilterChanged() {
+  stopLogsFollow();
+  Logs.refresh().then(() => {
+    if (document.getElementById("logs-follow")?.checked) startLogsFollow();
+  });
+}
+
+/* ------------------------------------------------------------------ *
  *  page loader / router                                              *
  * ------------------------------------------------------------------ */
 
@@ -773,6 +1011,12 @@ async function loadPageData(name) {
     // initial state sync — drives button enable/disable so the user
     // can tell which control is currently valid
     await vdStatus();
+    return;
+  }
+
+  if (name === "system-logs") {
+    Logs.init();
+    await Logs.refresh();
     return;
   }
 

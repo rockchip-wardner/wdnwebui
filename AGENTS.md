@@ -155,6 +155,31 @@ The `#page-video-detection` section is wired to:
 so `app.include_router(...)` in `main.py` actually sees them — without it
 the package object is empty and the routes are silently missing.
 
+## System logs page
+
+The `#page-system-logs` section is wired to `app/api/system_logs.py`,
+which shells out to `journalctl` and pipes JSON-lines back:
+
+- `GET /api/system-logs/units` — service list (running / failed /
+  exited / activating) + priority whitelist. Populates the unit
+  dropdown so the UI never hardcodes a name.
+- `GET /api/system-logs?unit=&priority=&lines=` — last N entries.
+  `unit` is matched against a strict regex (`[A-Za-z0-9_.@:-]{1,128}`),
+  `priority` is whitelisted, `lines` is clamped to 2000 — none of these
+  reach a shell.
+- `WS /api/system-logs/ws?unit=&priority=` — `journalctl -n 100 -f`
+  driven by `asyncio.create_subprocess_exec`. Lines stream as
+  `{"type":"line","entry":{...}}`; auto-terminates after 30 minutes
+  per connection; pings every 15 s so idle proxies don't reap.
+
+Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
+  priority + lines + follow-tail checkbox + clear), `<ol>` list of color-coded
+  log rows on a dark stage, auto-scroll only when the user is parked at
+  the bottom (so scrolling up to inspect an older line doesn't get yanked).
+  Journalctl outputs `MESSAGE` as a list-of-bytes for some services
+  (rknn3, etc.); `_normalize()` decodes with `errors="replace"` so the
+  page never 500s on a binary blob.
+
 ## Gotchas
 
 - **No lint / typecheck / test / CI config exists yet.** Do not invent

@@ -185,10 +185,54 @@
       <section id="page-system-logs"     class="page hidden" data-page="system-logs">
         <header class="page-header">
           <h2>系统日志</h2>
-          <button class="refresh-btn" data-refresh>刷新</button>
+          <div class="header-meta">
+            <span class="collected-at" id="system-logs-status">--</span>
+            <button class="refresh-btn" id="system-logs-refresh">刷新</button>
+          </div>
         </header>
-        <div class="placeholder-note">占位页面 — 待接入日志流</div>
-        <pre class="payload" id="data-system-logs"></pre>
+
+        <div class="logs-toolbar">
+          <label class="logs-field">
+            <span>服务单元</span>
+            <select id="logs-unit" class="logs-select">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label class="logs-field">
+            <span>最低等级</span>
+            <select id="logs-priority" class="logs-select">
+              <option value="">全部</option>
+              <option value="emerg">emerg</option>
+              <option value="alert">alert</option>
+              <option value="crit">crit</option>
+              <option value="err">err</option>
+              <option value="warning">warning</option>
+              <option value="notice">notice</option>
+              <option value="info">info</option>
+              <option value="debug">debug</option>
+            </select>
+          </label>
+          <label class="logs-field">
+            <span>行数</span>
+            <input type="number" id="logs-lines" class="logs-input" min="1" max="2000" step="50" value="200" />
+          </label>
+          <label class="logs-toggle">
+            <input type="checkbox" id="logs-follow" />
+            <span>追踪新日志 (-f)</span>
+          </label>
+          <span class="vd-spacer"></span>
+          <span class="logs-counter" id="logs-counter">0 条</span>
+          <button class="vd-btn" id="logs-clear">清屏</button>
+        </div>
+
+        <div class="logs-stage">
+          <ol class="logs-list" id="logs-list"></ol>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-system-logs"></pre>
+        </details>
       </section>
 
       <section id="page-power"           class="page hidden" data-page="power">

@@ -637,3 +637,122 @@ html, body {
   from { opacity: 0; transform: translateY(-4px); }
   to   { opacity: 1; transform: translateY(0); }
 }
+
+/* ---------- system logs page ---------- */
+.logs-toolbar {
+  display: flex;
+  gap: 0.8rem;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin: 0.5rem 0 0.6rem;
+  padding: 0.5rem 0.8rem;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.logs-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.logs-field > span { font-family: var(--mono); }
+.logs-select,
+.logs-input {
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  background: #fff;
+  min-width: 8rem;
+}
+.logs-input { min-width: 4.5rem; text-align: right; }
+.logs-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: #4b5563;
+  font-family: var(--mono);
+  cursor: pointer;
+  user-select: none;
+}
+.logs-toggle input { width: 1rem; height: 1rem; }
+.logs-counter {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.logs-stage {
+  background: #0f172a;
+  border-radius: 6px;
+  border: 1px solid #1e293b;
+  height: 540px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.logs-list {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  list-style: none;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.logs-list::-webkit-scrollbar { width: 8px; }
+.logs-list::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+
+.logs-empty {
+  padding: 2rem;
+  text-align: center;
+  color: #64748b;
+  font-style: italic;
+}
+.logs-empty.error { color: #fca5a5; }
+
+.log-entry {
+  display: grid;
+  grid-template-columns: 168px 60px 200px 1fr;
+  gap: 0.4rem;
+  padding: 0.05rem 0;
+  color: #e2e8f0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-left: 2px solid transparent;
+  padding-left: 0.4rem;
+}
+.log-entry:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+.log-entry .ts { color: #94a3b8; }
+.log-entry .prio {
+  font-weight: 600;
+  text-align: center;
+  border-radius: 3px;
+  padding: 0 0.3rem;
+}
+.log-entry .unit { color: #93c5fd; }
+.log-entry .msg { color: #e2e8f0; }
+
+/* Priority color tiers — match the syslog severity naming. */
+.log-entry.prio-emerg   .prio { background: #7f1d1d; color: #fee2e2; }
+.log-entry.prio-alert   .prio { background: #991b1b; color: #fee2e2; }
+.log-entry.prio-crit    .prio { background: #b91c1c; color: #fee2e2; }
+.log-entry.prio-err     .prio { background: #ef4444; color: #fff1f2; }
+.log-entry.prio-warning .prio { background: #f59e0b; color: #451a03; }
+.log-entry.prio-notice  .prio { background: #2563eb; color: #eff6ff; }
+.log-entry.prio-info    .prio { background: #475569; color: #f1f5f9; }
+.log-entry.prio-debug   .prio { background: #1e293b; color: #64748b; }
+
+/* Whole-row tints for the loudest severities — easier to spot at a glance. */
+.log-entry.prio-emerg,
+.log-entry.prio-alert,
+.log-entry.prio-crit,
+.log-entry.prio-err { border-left-color: #ef4444; }
+.log-entry.prio-warning { border-left-color: #f59e0b; }
