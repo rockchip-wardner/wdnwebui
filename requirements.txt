@@ -4,3 +4,9 @@ pydantic>=2.6.0
 psutil>=5.9.0
 opencv-python-headless>=4.8.0
 python-multipart>=0.0.9
+rknn3-toolkit-lite>=1.0.0
+gguf>=0.10.0
+# rkv / rkai are internal SDKs (behind SSH on git@10.10.10.10) and are
+# installed separately — see README §4.
+# gguf is imported by rkai.gguf_tokenizer to load the *.tokenizer.gguf
+# files that ship with RKNN models; rkai's own pyproject doesn't pin it.
