@@ -95,9 +95,57 @@
           <h2>视频检测</h2>
           <button class="refresh-btn" data-refresh>刷新</button>
         </header>
-        <div class="placeholder-note">占位页面 — 待接入 rkv / rkai 视频检测</div>
-        <pre class="payload" id="data-video-detection"></pre>
+
+        <div class="vd-toolbar">
+          <input type="text" id="vd-source" class="vd-input"
+                 placeholder="rtsp://…  /  rtmp://…  /  /mnt/share/cam.mp4  /  http(s)://…/*.m3u8" />
+          <button id="vd-browse" class="vd-btn">浏览设备…</button>
+          <button id="vd-open" class="vd-btn vd-btn-primary">打开</button>
+          <button id="vd-close" class="vd-btn">关闭</button>
+        </div>
+        <div class="vd-hint" id="vd-hint">
+          支持本地路径 (设备可见的绝对路径)、RTSP、RTMP、HLS。
+        </div>
+
+        <div class="vd-stage">
+          <canvas id="vd-canvas" width="960" height="540"></canvas>
+          <div class="vd-overlay" id="vd-overlay"></div>
+        </div>
+
+        <div class="vd-controls">
+          <button id="vd-play"  class="vd-btn">▶ 播放</button>
+          <button id="vd-pause" class="vd-btn">⏸ 暂停</button>
+          <button id="vd-stop"  class="vd-btn">⏹ 停止</button>
+          <span class="vd-spacer"></span>
+          <span class="vd-meta" id="vd-meta">--</span>
+        </div>
+
+        <div class="vd-progress">
+          <div class="vd-progress-bar" id="vd-progress"></div>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-detection"></pre>
+        </details>
       </section>
+
+      <div id="vd-modal" class="vd-modal hidden" role="dialog" aria-modal="true">
+        <div class="vd-modal-card">
+          <div class="vd-modal-head">
+            <span class="vd-modal-title">设备端文件</span>
+            <button class="vd-btn vd-modal-close" id="vd-modal-close" aria-label="关闭">×</button>
+          </div>
+          <div class="vd-modal-crumbs" id="vd-crumbs"></div>
+          <div class="vd-modal-list" id="vd-list"></div>
+          <div class="vd-modal-foot">
+            <span class="vd-hint" id="vd-modal-hint"></span>
+            <span class="vd-spacer"></span>
+            <button class="vd-btn" id="vd-modal-pick-dir">选择当前目录</button>
+            <button class="vd-btn vd-btn-primary" id="vd-modal-pick-file" disabled>选择此文件</button>
+          </div>
+        </div>
+      </div>
 
       <section id="page-system-logs"     class="page hidden" data-page="system-logs">
         <header class="page-header">

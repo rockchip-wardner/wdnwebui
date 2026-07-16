@@ -57,15 +57,69 @@ SDKs aren't published.
 pyrkaiweb/
 ├── run.py                # entry point — uvicorn.run("app.main:app", ...)
 ├── app/
-│   ├── __init__.py       # __version__ = "0.1.0"
-│   └── main.py           # create_app() factory + module-level `app`
-├── requirements.txt      # web deps only; SDKs come from private git
-├── .gitignore            # excludes .venv/, __pycache__/, .env, etc.
+│   ├── __init__.py       # __version__ = "0.2.0"
+│   ├── main.py           # create_app() factory + module-level `app`
+│   ├── api/
+│   │   ├── __init__.py   # imports submodules so include_router sees them
+│   │   ├── power.py
+│   │   ├── system_logs.py
+│   │   ├── system_monitor.py
+│   │   └── video_detection.py   # REST + WebSocket frame stream
+│   ├── services/
+│   │   ├── video_session.py     # VideoCapture + decode thread + JPEG queue
+│   │   └── uploads/             # local-file upload staging (gitignored)
+│   └── static/
+│       ├── index.html           # single-page UI
+│       ├── css/style.css
+│       └── js/app.js            # WebSocket + Canvas renderer
+├── requirements.txt      # web deps + opencv-python-headless + python-multipart
+├── .gitignore            # excludes .venv/, __pycache__/, .env, uploads/, etc.
 └── .venv/                # editable installs of rkv, rkai live under .venv/src/
 ```
 
 `app/__init__.py` owns the single version string; bump it there when the
 service version changes.
+
+## Video detection page
+
+The `#page-video-detection` section is wired to:
+
+- **Backend** (`app/api/video_detection.py`):
+  - `POST /api/video-detection/upload` — multipart file upload; saves to
+    `app/services/uploads/<uuid><ext>` and returns `{upload_id, path, …}`.
+  - `POST /api/video-detection/open` `{source: str}` — opens via
+    `rkv.VideoCapture`, starts decode thread, returns snapshot.
+  - `POST /api/video-detection/control` `{action: "play"|"pause"|"stop"}`.
+  - `POST /api/video-detection/close`.
+  - `GET  /api/video-detection` — current snapshot.
+  - `GET  /api/video-detection/fs?path=…` — server-side directory
+    listing (used by the in-page file picker modal). Constrained to
+    `VD_FS_ROOT` (env var, default `/`) and skips `/proc`, `/sys`,
+    `/dev`, `/run`, `/snap`, `/usr/share/{doc,locale,man}`, etc.
+  - `WS   /api/video-detection/ws` — server-pushes binary JPEG frames;
+    interleaves JSON status frames at <=1 Hz; emits `{"type":"eof"}`
+    once when a file source reaches end.
+- **Service** (`app/services/video_session.py`):
+  - One `VideoSession` singleton, one `rkv.VideoCapture`, one decode
+    `Thread`. Latest-frame-only queue (`maxsize=1`) — drops oldest on
+    overflow to keep latency low.
+  - Lazy `from rkv import VideoCapture` at module top (still behind the
+    `try/except` from `rkv/__init__.py`); never imports `rkv.video`
+    explicitly.
+- **Frontend** (`app/static/js/app.js` + `#page-video-detection` markup):
+  - Address input + "浏览设备…" button (opens server-side file picker
+    modal) + "打开" / "关闭" buttons. The picker modal drives
+    `/api/video-detection/fs` and writes the **device's** absolute path
+    back into the address input — paths come from the server's
+    filesystem, not the user's laptop.
+  - `<canvas>` rendered from binary WS frames; auto-reconnecting WS with
+    exponential backoff.
+  - Play / Pause / Stop, status line, animated progress bar for live
+    streams.
+
+`app/api/__init__.py` must import each submodule (`from . import power, …`)
+so `app.include_router(...)` in `main.py` actually sees them — without it
+the package object is empty and the routes are silently missing.
 
 ## Gotchas
 
@@ -83,6 +137,19 @@ service version changes.
   bare `import rkv`. Don't suppress the fallback.
 - **Imports should stay lazy** for `rkv.video` / `rkai.*` so a non-target
   dev box can still boot the web shell.
+- **`VideoSession.open()` event ordering matters.** Always `_teardown()`
+  before clearing `_stop_event` / setting `_play_event` — teardown flips
+  both into the "stopped" state, so doing it the other way leaves the new
+  decode thread seeing `_stop_event.is_set() == True` and exiting on
+  iteration 1 (silent: state stays "playing", `frame_pos` stays 0, no
+  frames ever appear on the WS).
+- **RTSP/RTMP/HLS work via the same `/open` endpoint** — `VideoCapture`
+  routes anything containing `://` through PyAV. The frontend just shows
+  the URL in the address bar; no client-side protocol branching needed.
+- **Seek/scrub is intentionally not implemented yet.** `VideoCapture`
+  doesn't expose a `set(1, frame_pos)` API; plumbing one in means
+  touching `self._container` internals. The progress bar is currently
+  read-only and animates only for live sources.
 
 ## When you change things, also update
 
