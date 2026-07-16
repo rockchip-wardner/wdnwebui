@@ -40,6 +40,7 @@ PRIORITIES = {
 }
 UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,128}$")
 MAX_LINES = 2000
+MAX_MSG_CHARS = 4 * 1024  # truncate huge entries so the WS/REST payload stays bounded
 MAX_FOLLOW_SECONDS = 30 * 60  # 30 min cap per WS connection
 
 # systemd-numeric → name. systemd priority 0=emerg ... 7=debug.
@@ -75,6 +76,9 @@ def _normalize(j: dict) -> dict:
         msg = msg.decode("utf-8", errors="replace")
     elif not isinstance(msg, str):
         msg = str(msg)
+    msg = msg or ""
+    if len(msg) > MAX_MSG_CHARS:
+        msg = msg[:MAX_MSG_CHARS] + f"… [+{len(msg) - MAX_MSG_CHARS} chars]"
     return {
         "cursor": j.get("__CURSOR"),
         "ts_ms": ts_ms,
@@ -91,7 +95,7 @@ def _normalize(j: dict) -> dict:
             or "?"
         ),
         "pid": j.get("_PID") or j.get("SYSLOG_PID"),
-        "message": (msg or "").rstrip(),
+        "message": msg.rstrip(),
     }
 
 
@@ -158,8 +162,13 @@ async def list_logs(
     if priority is not None and priority not in PRIORITIES:
         raise HTTPException(status_code=400, detail=f"priority must be one of {sorted(PRIORITIES)}")
     cmd = [
+        # NOTE: don't pass ``--no-tail`` here. The flag is documented as
+        # "show all lines, even in follow mode" but in practice it also
+        # makes ``-n`` get ignored — we get the entire journal back
+        # instead of the last N lines. Confirmed empirically on
+        # systemd 252.
         JOURNALCTL, "--no-pager", "-n", str(lines),
-        "--output=json", "--no-tail",
+        "--output=json",
     ]
     if unit:
         cmd += ["-u", unit]

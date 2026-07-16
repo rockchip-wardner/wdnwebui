@@ -803,6 +803,12 @@ function appendLogEntry(entry) {
   li.appendChild(msg);
   list.appendChild(li);
 
+  // Cap the DOM at ~1500 rows so the page stays light under heavy
+  // follow traffic. Trim from the front (oldest entries).
+  while (list.childElementCount > 1500) {
+    list.removeChild(list.firstElementChild);
+  }
+
   // Auto-scroll only if user is parked at (or near) the bottom.
   const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 60;
   if (nearBottom) {
