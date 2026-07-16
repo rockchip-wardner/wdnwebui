@@ -18,6 +18,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 
+from app.services.detector import get_detector
 from app.services.video_session import get_session
 
 
@@ -221,14 +222,69 @@ async def close_source() -> dict:
     return get_session().close()
 
 
+# --------------------------------------------------------------------- #
+# rkai VLM detection                                                     #
+# --------------------------------------------------------------------- #
+@router.get("/video-detection/prompt")
+async def get_prompt() -> dict:
+    return get_detector().snapshot()
+
+
+@router.post("/video-detection/prompt")
+async def set_prompt(payload: dict) -> dict:
+    """Start (or update) VLM detection.
+
+    Body: ``{prompt: str, every_n: int}`` — both required, default
+    cadence ~1s @ 30fps if not given.
+    """
+    payload = payload or {}
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt 不能为空")
+    try:
+        every_n = int(payload.get("every_n", 30))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="every_n 必须为整数")
+    if every_n < 1:
+        raise HTTPException(status_code=400, detail="every_n 必须 >= 1")
+    try:
+        return get_detector().start(prompt, every_n=every_n)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.post("/video-detection/prompt/stop")
+async def stop_prompt() -> dict:
+    return get_detector().stop()
+
+
+@router.get("/video-detection/events")
+async def list_events() -> dict:
+    det = get_detector()
+    return {
+        "snapshot": det.snapshot(),
+        "events": det.events(),
+        "latest": det.latest(),
+    }
+
+
+@router.post("/video-detection/events/clear")
+async def clear_events() -> dict:
+    get_detector().clear()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------- #
 @router.websocket("/video-detection/ws")
 async def stream_ws(ws: WebSocket) -> None:
-    """Push decoded JPEG frames to the browser.
+    """Push decoded JPEG frames + VLM events to the browser.
 
     Protocol (server -> client):
-      - JSON text: {"type":"status", ...snapshot...}
+      - JSON text: {"type":"status", ...session snapshot...}
       - Binary:    raw JPEG bytes for one frame
       - JSON text: {"type":"eof"} when a file source reaches end
+      - JSON text: {"type":"event", ...detector event...} when a VLM
+                   inference completes
 
     The connection is one-way (server pushes). Pause / play / stop go
     through the REST ``/control`` endpoint so the decode thread reacts
@@ -236,11 +292,20 @@ async def stream_ws(ws: WebSocket) -> None:
     """
     await ws.accept()
     session = get_session()
+    detector = get_detector()
     loop = asyncio.get_event_loop()
     last_status = 0.0
+    last_event_id = 0
     eof_sent = False
     try:
         while True:
+            # Push any new detector events first — they have lower
+            # latency tolerance than frames and the user is staring at
+            # the page waiting for them.
+            for ev in detector.events_since(last_event_id):
+                last_event_id = ev["id"]
+                await ws.send_json({"type": "event", **ev})
+
             kind, data = await loop.run_in_executor(
                 None, lambda: session.fetch_frame(timeout=0.05)
             )
@@ -254,14 +319,15 @@ async def stream_ws(ws: WebSocket) -> None:
                     snap["type"] = "eof"
                     await ws.send_json(snap)
                     eof_sent = True
-                # leave WS open — client may reopen via /open
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
                 continue
-            # no frame available: throttle status to <= 1 Hz
             now = loop.time()
             if now - last_status >= 1.0:
                 snap = session.snapshot()
                 snap["type"] = "status"
+                # also include detector snapshot so the UI can show
+                # prompt state without extra round-trips
+                snap["detector"] = detector.snapshot()
                 await ws.send_json(snap)
                 last_status = now
             await asyncio.sleep(0.02)

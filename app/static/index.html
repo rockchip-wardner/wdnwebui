@@ -110,12 +110,16 @@
         <div class="vd-stage">
           <canvas id="vd-canvas" width="960" height="540"></canvas>
           <div class="vd-overlay" id="vd-overlay"></div>
+          <div class="vd-event-badge hidden" id="vd-event-badge">
+            <span class="vd-event-badge-text" id="vd-event-badge-text"></span>
+          </div>
         </div>
 
         <div class="vd-controls">
           <button id="vd-play"  class="vd-btn">▶ 播放</button>
           <button id="vd-pause" class="vd-btn">⏸ 暂停</button>
           <button id="vd-stop"  class="vd-btn">⏹ 停止</button>
+          <button id="vd-replay" class="vd-btn" disabled title="从开头重新播放">↻ 重播</button>
           <span class="vd-spacer"></span>
           <span class="vd-meta" id="vd-meta">--</span>
         </div>
@@ -123,6 +127,37 @@
         <div class="vd-progress">
           <div class="vd-progress-bar" id="vd-progress"></div>
         </div>
+
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>检测提示词</h3>
+            <span class="vd-hint" id="vd-detector-status">未启动</span>
+          </header>
+          <textarea id="vd-prompt" class="vd-prompt" rows="2"
+                    placeholder="例如：检测画面中是否有人进入，或描述图中发生的事件"></textarea>
+          <div class="vd-detector-row">
+            <label class="vd-detector-label">
+              每隔
+              <input type="number" id="vd-every-n" min="1" max="600" step="1" value="30" />
+              帧检测一次
+            </label>
+            <span class="vd-spacer"></span>
+            <button id="vd-detector-start" class="vd-btn vd-btn-primary">启动检测</button>
+            <button id="vd-detector-stop"  class="vd-btn" disabled>停止检测</button>
+          </div>
+        </section>
+
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>检测事件历史</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="vd-events-count">0 条</span>
+            <button id="vd-events-clear" class="vd-btn">清空</button>
+          </header>
+          <ol class="vd-event-list" id="vd-event-list">
+            <li class="vd-event-empty">尚未检测到事件，启动检测后结果显示在这里。</li>
+          </ol>
+        </section>
 
         <details class="raw-output">
           <summary>完整 JSON</summary>

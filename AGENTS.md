@@ -64,14 +64,15 @@ pyrkaiweb/
 │   │   ├── power.py
 │   │   ├── system_logs.py
 │   │   ├── system_monitor.py
-│   │   └── video_detection.py   # REST + WebSocket frame stream
+│   │   └── video_detection.py   # REST + WebSocket frame stream + detector
 │   ├── services/
 │   │   ├── video_session.py     # VideoCapture + decode thread + JPEG queue
+│   │   ├── detector.py          # rkai VLM wrapper + worker thread
 │   │   └── uploads/             # local-file upload staging (gitignored)
 │   └── static/
 │       ├── index.html           # single-page UI
 │       ├── css/style.css
-│       └── js/app.js            # WebSocket + Canvas renderer
+│       └── js/app.js            # WebSocket + Canvas + event UI
 ├── requirements.txt      # web deps + opencv-python-headless + python-multipart
 ├── .gitignore            # excludes .venv/, __pycache__/, .env, uploads/, etc.
 └── .venv/                # editable installs of rkv, rkai live under .venv/src/
@@ -96,16 +97,45 @@ The `#page-video-detection` section is wired to:
     listing (used by the in-page file picker modal). Constrained to
     `VD_FS_ROOT` (env var, default `/`) and skips `/proc`, `/sys`,
     `/dev`, `/run`, `/snap`, `/usr/share/{doc,locale,man}`, etc.
+  - `POST /api/video-detection/prompt` `{prompt, every_n}` — start VLM
+    detection with the user's prompt; `every_n` controls how often
+    (in frames) the worker feeds a frame to the model.
+  - `POST /api/video-detection/prompt/stop` — stop detection (worker
+    thread exits, session stays loaded for next start).
+  - `GET  /api/video-detection/events` — snapshot + history list + latest.
+  - `POST /api/video-detection/events/clear` — clear history.
   - `WS   /api/video-detection/ws` — server-pushes binary JPEG frames;
-    interleaves JSON status frames at <=1 Hz; emits `{"type":"eof"}`
-    once when a file source reaches end.
+    interleaves JSON `{"type":"status", detector:{…}}` frames at <=1 Hz;
+    emits `{"type":"eof"}` once when a file source reaches end;
+    emits `{"type":"event", id, frame_pos, ts, prompt, text}` for each
+    VLM detection result.
 - **Service** (`app/services/video_session.py`):
   - One `VideoSession` singleton, one `rkv.VideoCapture`, one decode
     `Thread`. Latest-frame-only queue (`maxsize=1`) — drops oldest on
     overflow to keep latency low.
+  - Frame sinks: registered callbacks are called on each decoded BGR
+    frame (used by the detector). Sinks must not raise.
   - Lazy `from rkv import VideoCapture` at module top (still behind the
     `try/except` from `rkv/__init__.py`); never imports `rkv.video`
     explicitly.
+- **Service** (`app/services/detector.py`):
+  - `RkaiDetector` singleton. Wraps `rkai.LLMSession` with
+    `SystemLanguageModel.qwen3_vl_4b()` (configurable via
+    `RKAI_MODELS_DIR`).
+  - **rkai is imported lazily** at `start()` time — not at module load.
+    Loading the RKNN native libs eagerly at app startup caused a
+    segfault on this dev box (RKNN3 init races with rkv's mpp
+    bring-up). Don't move the import back to module top.
+  - One daemon worker thread consumes a `queue.Queue(maxsize=1)`
+    (latest-only); the decode-loop sink drops whatever's pending and
+    replaces it with the freshest frame so the detector always sees
+    the most recent state.
+  - Each inference calls `session.reset()` (clears history + KV cache)
+    and `session.respond(msg, attachment=Attachment(frame))` — free-text
+    response, no schema. ~1s after model warm-up.
+  - History is an in-memory deque (max 200). Events carry `id`, `frame_pos`,
+    `ts`, `prompt`, `text`.
+  - On app shutdown, `close()` releases the RKNN session handle.
 - **Frontend** (`app/static/js/app.js` + `#page-video-detection` markup):
   - Address input + "浏览设备…" button (opens server-side file picker
     modal) + "打开" / "关闭" buttons. The picker modal drives
@@ -114,8 +144,12 @@ The `#page-video-detection` section is wired to:
     filesystem, not the user's laptop.
   - `<canvas>` rendered from binary WS frames; auto-reconnecting WS with
     exponential backoff.
-  - Play / Pause / Stop, status line, animated progress bar for live
-    streams.
+  - Play / Pause / Stop / Replay, status line, animated progress bar for
+    live streams.
+  - Below the video: prompt textarea + "每隔 N 帧检测一次" input + 启动/停止
+    buttons + status text + 历史事件列表. Each new event also pops
+    a `vd-event-badge` overlay on top of the canvas (auto-dismiss
+    after 6s).
 
 `app/api/__init__.py` must import each submodule (`from . import power, …`)
 so `app.include_router(...)` in `main.py` actually sees them — without it
@@ -137,6 +171,11 @@ the package object is empty and the routes are silently missing.
   bare `import rkv`. Don't suppress the fallback.
 - **Imports should stay lazy** for `rkv.video` / `rkai.*` so a non-target
   dev box can still boot the web shell.
+- **`RkaiDetector._load_rkai()` must stay lazy**. The module-top import of
+  `rkai.Attachment / LLMSession / SystemLanguageModel` will pull in
+  RKNN3 native libs at app startup, racing with rkv's mpp init and
+  segfaulting on this dev box. Keep the import behind `_load_rkai()`,
+  which is called from `start()` / `_ensure_session()`.
 - **`VideoSession.open()` event ordering matters.** Always `_teardown()`
   before clearing `_stop_event` / setting `_play_event` — teardown flips
   both into the "stopped" state, so doing it the other way leaves the new

@@ -57,6 +57,11 @@ class VideoSession:
         self._fps = 0.0
         self._frame_pos = 0
         self._last_frame_ts = 0.0
+        # Per-frame sinks (e.g. the rkai detector). Notified on each
+        # decoded BGR frame; called from the decode thread so sinks must
+        # be cheap or marshal work elsewhere themselves.
+        self._frame_sinks: list = []
+        self._sinks_lock = threading.Lock()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -134,12 +139,42 @@ class VideoSession:
         return self.snapshot()
 
     def play(self) -> dict:
+        """Resume decode from any state.
+
+        - PAUSED + live thread → set play_event, mark PLAYING.
+        - PAUSED + dead thread (EOF race) / EOF / ERROR / IDLE →
+          re-open the last known source so the user recovers with one
+          click instead of having to retype the path.
+        - PLAYING → no-op success (idempotent).
+        """
         with self._lock:
-            if self._state in (self.STATE_PAUSED,):
+            cur_state = self._state
+            cur_source = self._source
+            cur_error = self._error
+            thread_alive = (
+                self._thread is not None and self._thread.is_alive()
+            )
+
+        if cur_state == self.STATE_PLAYING and thread_alive:
+            return {"ok": True, "state": cur_state}
+
+        if cur_state == self.STATE_PAUSED and thread_alive:
+            with self._lock:
                 self._play_event.set()
                 self._state = self.STATE_PLAYING
-                return {"ok": True, "state": self._state}
-            return {"ok": False, "state": self._state, "reason": "no active session"}
+            return {"ok": True, "state": self.STATE_PLAYING}
+
+        # Anything else — EOF, dead thread, ERROR, IDLE — re-open.
+        if not cur_source:
+            return {
+                "ok": False,
+                "state": cur_state,
+                "reason": cur_error or "no source",
+            }
+        try:
+            return self.open(cur_source)
+        except Exception as e:
+            return {"ok": False, "state": self._state, "reason": str(e)}
 
     def pause(self) -> dict:
         with self._lock:
@@ -154,6 +189,30 @@ class VideoSession:
         with self._lock:
             return {"ok": True, "state": self._state}
 
+    # ------------------------------------------------------------------ #
+    # Frame sinks — see ``_decode_loop`` for the call site.
+    # ------------------------------------------------------------------ #
+    def add_frame_sink(self, sink) -> None:
+        """Register ``sink(frame_bgr, frame_pos)`` to fire on each decoded
+        frame. Sinks persist across ``open()`` calls so the detector can
+        keep registering once at startup and forget about it.
+        """
+        with self._sinks_lock:
+            if sink not in self._frame_sinks:
+                self._frame_sinks.append(sink)
+
+    def remove_frame_sink(self, sink) -> None:
+        with self._sinks_lock:
+            try:
+                self._frame_sinks.remove(sink)
+            except ValueError:
+                pass
+
+    def _current_sinks(self) -> list:
+        # Cheap copy under lock so the decode loop can call without holding it.
+        with self._sinks_lock:
+            return list(self._frame_sinks)
+
     def fetch_frame(self, timeout: float = 0.1):
         """Pull the next event for the WS loop."""
         try:
@@ -166,6 +225,18 @@ class VideoSession:
 
     def _fail(self, msg: str) -> None:
         with self._lock:
+            # A dying decode thread (one whose cap was already released
+            # by _teardown) may still surface an exception in read()
+            # before it exits. If we let that flip the snapshot to
+            # ERROR after the user's already moved on — or worse, after
+            # we've already reopened a fresh session — the UI would
+            # display a stale "MppDecoder is closed" forever. Drop the
+            # call silently when we're already idle / already in error.
+            if self._state in (
+                self.STATE_IDLE,
+                self.STATE_ERROR,
+            ):
+                return
             self._state = self.STATE_ERROR
             self._error = msg
 
@@ -200,10 +271,15 @@ class VideoSession:
             cap = self._cap
         if cap is None:
             return
-        while not self._stop_event.is_set():
+        while True:
+            # Block here whenever _play_event is clear (paused).
+            # Returns immediately when play() lifts the event, so resume
+            # latency is bounded only by cap.read() / queue dispatch.
+            # Timeout just lets us recheck _stop_event during long pauses.
+            self._play_event.wait(timeout=0.5)
+            if self._stop_event.is_set():
+                return
             if not self._play_event.is_set():
-                if self._stop_event.wait(timeout=0.1):
-                    return
                 continue
             try:
                 ret, frame = cap.read()
@@ -212,7 +288,14 @@ class VideoSession:
                 return
             if not ret or frame is None:
                 with self._lock:
-                    if self._state == self.STATE_PLAYING:
+                    # EOF regardless of whether we were paused — file
+                    # finished during the previous frame's read. Without
+                    # this, state would stay stuck at PAUSED with a dead
+                    # thread, and play() couldn't recover.
+                    if self._state in (
+                        self.STATE_PLAYING,
+                        self.STATE_PAUSED,
+                    ):
                         self._state = self.STATE_EOF
                 try:
                     self._frame_queue.put_nowait(self._EOF)
@@ -230,6 +313,15 @@ class VideoSession:
             with self._lock:
                 self._frame_pos = cap.frame_pos
                 self._last_frame_ts = time.time()
+                cur_frame_pos = cap.frame_pos
+            # Per-frame sinks get the raw BGR. Sinks must not raise —
+            # a misbehaving one shouldn't take down the decode loop.
+            sinks = self._current_sinks()
+            for sink in sinks:
+                try:
+                    sink(frame, cur_frame_pos)
+                except Exception:
+                    pass
             # Drop oldest on overflow — favor low latency over completeness.
             try:
                 self._frame_queue.put_nowait(jpg)

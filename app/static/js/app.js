@@ -135,6 +135,12 @@ const VD = {
   init() { return initVideoDetection(); },
 };
 
+const VDDetector = {
+  events: [],
+  badgeTimer: null,
+  refresh() { return refreshVdDetector(); },
+};
+
 function setVdOverlay(text, isError) {
   const el = document.getElementById("vd-overlay");
   if (!el) return;
@@ -196,12 +202,19 @@ function connectVdWs() {
       let snap;
       try { snap = JSON.parse(ev.data); } catch (_) { return; }
       if (snap.type === "eof") {
-        setVdOverlay("文件已结束 (EOF)，重新打开即可恢复", true);
+        setVdOverlay("文件已结束 (EOF)，点 播放 可恢复", true);
       } else if (snap.type === "error") {
         setVdOverlay("WS 错误: " + (snap.detail || ""), true);
+      } else if (snap.type === "event") {
+        addVdEvent(snap);
+        showVdEventBadge(snap);
+        return;
+      } else if (snap.type === "status" && snap.detector) {
+        updateVdDetectorStatus(snap.detector);
       }
       setVdMeta(snap);
       setVdProgress(snap);
+      refreshVdButtons(snap.state);
       document.getElementById("data-video-detection").textContent =
         JSON.stringify(snap, null, 2);
       return;
@@ -245,6 +258,37 @@ async function vdAction(action) {
   });
   if (!r.ok) throw new Error("HTTP " + r.status);
   return r.json();
+}
+
+async function vdStatus() {
+  const r = await fetch(API_PREFIX + "/video-detection", { cache: "no-store" });
+  if (!r.ok) return null;
+  const snap = await r.json();
+  setVdMeta(snap);
+  setVdProgress(snap);
+  refreshVdButtons(snap.state);
+  document.getElementById("data-video-detection").textContent =
+    JSON.stringify(snap, null, 2);
+  return snap;
+}
+
+function refreshVdButtons(state) {
+  const playBtn = document.getElementById("vd-play");
+  const pauseBtn = document.getElementById("vd-pause");
+  const stopBtn = document.getElementById("vd-stop");
+  if (!playBtn || !pauseBtn || !stopBtn) return;
+  const active = state === "playing" || state === "paused" || state === "eof";
+  stopBtn.disabled = !active;
+  if (state === "playing") {
+    playBtn.disabled = true;
+    pauseBtn.disabled = false;
+  } else if (state === "paused") {
+    playBtn.disabled = false;
+    pauseBtn.disabled = true;
+  } else {
+    playBtn.disabled = !active;
+    pauseBtn.disabled = !active;
+  }
 }
 
 async function vdClose() {
@@ -413,6 +457,163 @@ const VdFsModal = {
   },
 };
 
+/* ------------------------------------------------------------------ *
+ *  VLM detection (rkai) — prompt + event history + overlay            *
+ * ------------------------------------------------------------------ */
+function fmtEventTime(ts) {
+  if (!ts) return "--";
+  try {
+    const d = new Date(ts * 1000);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  } catch (_) { return "--"; }
+}
+
+function addVdEvent(ev) {
+  VDDetector.events.unshift(ev);
+  if (VDDetector.events.length > 200) VDDetector.events.length = 200;
+  renderVdEventList();
+}
+
+function renderVdEventList() {
+  const list = document.getElementById("vd-event-list");
+  const count = document.getElementById("vd-events-count");
+  if (!list || !count) return;
+  count.textContent = VDDetector.events.length + " 条";
+  if (VDDetector.events.length === 0) {
+    list.innerHTML =
+      '<li class="vd-event-empty">尚未检测到事件，启动检测后结果显示在这里。</li>';
+    return;
+  }
+  list.innerHTML = "";
+  VDDetector.events.forEach((ev, idx) => {
+    const li = document.createElement("li");
+    li.className = "vd-event" + (idx === 0 ? " latest" : "");
+    const meta = document.createElement("div");
+    meta.className = "vd-event-meta";
+    const tsSpan = document.createElement("span");
+    tsSpan.textContent = fmtEventTime(ev.ts);
+    const fpSpan = document.createElement("span");
+    fpSpan.textContent = "帧 " + (ev.frame_pos ?? "?");
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = "#" + ev.id;
+    meta.appendChild(tsSpan);
+    meta.appendChild(fpSpan);
+    meta.appendChild(tag);
+    const text = document.createElement("div");
+    text.className = "vd-event-text";
+    text.textContent = ev.text || "(空)";
+    li.appendChild(meta);
+    li.appendChild(text);
+    list.appendChild(li);
+  });
+}
+
+let vdBadgeHideTimer = null;
+function showVdEventBadge(ev) {
+  const badge = document.getElementById("vd-event-badge");
+  const text = document.getElementById("vd-event-badge-text");
+  if (!badge || !text) return;
+  text.textContent = ev.text || "(空)";
+  badge.classList.remove("hidden");
+  // restart animation by toggling a class
+  badge.style.animation = "none";
+  // eslint-disable-next-line no-unused-expressions
+  badge.offsetHeight;
+  badge.style.animation = "";
+  if (vdBadgeHideTimer) clearTimeout(vdBadgeHideTimer);
+  vdBadgeHideTimer = setTimeout(() => {
+    badge.classList.add("hidden");
+  }, 6000);
+}
+
+function updateVdDetectorStatus(snap) {
+  const statusEl = document.getElementById("vd-detector-status");
+  const startBtn = document.getElementById("vd-detector-start");
+  const stopBtn  = document.getElementById("vd-detector-stop");
+  if (!snap || !statusEl) return;
+  if (!snap.available) {
+    statusEl.textContent = "不可用: " + (snap.init_error || "rkai 未安装");
+  } else if (snap.init_error) {
+    statusEl.textContent = "模型加载失败: " + snap.init_error;
+  } else if (snap.enabled && snap.session_ready) {
+    statusEl.textContent =
+      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size}`;
+  } else if (snap.enabled) {
+    statusEl.textContent =
+      `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
+  } else if (snap.session_ready) {
+    statusEl.textContent = `已加载 (${snap.model})`;
+  } else {
+    statusEl.textContent = "已安装但未启动";
+  }
+  if (startBtn) startBtn.disabled = !snap.available || !!snap.enabled;
+  if (stopBtn)  stopBtn.disabled  = !snap.enabled;
+}
+
+async function refreshVdDetector() {
+  try {
+    const r = await fetch(API_PREFIX + "/video-detection/events");
+    if (!r.ok) return null;
+    const data = await r.json();
+    updateVdDetectorStatus(data.snapshot || {});
+    // hydrate history if we just opened the page
+    if (VDDetector.events.length === 0 && Array.isArray(data.events)) {
+      // events are stored newest-first in detector; copy as-is so the
+      // display matches what the server already accumulated
+      VDDetector.events = data.events.slice();
+      renderVdEventList();
+    }
+    return data;
+  } catch (_) { return null; }
+}
+
+async function vdDetectorStart() {
+  const promptEl  = document.getElementById("vd-prompt");
+  const everyEl   = document.getElementById("vd-every-n");
+  const prompt = (promptEl?.value || "").trim();
+  const every_n = parseInt(everyEl?.value || "30", 10);
+  if (!prompt) {
+    setVdOverlay("请先填写检测提示词", true);
+    return;
+  }
+  try {
+    const r = await fetch(API_PREFIX + "/video-detection/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, every_n }),
+    });
+    if (!r.ok) {
+      const detail = await r.text().catch(() => "");
+      setVdOverlay("启动检测失败: " + detail, true);
+      return;
+    }
+    const snap = await r.json();
+    updateVdDetectorStatus(snap);
+    setVdOverlay("", false);
+  } catch (e) {
+    setVdOverlay("启动检测失败: " + e.message, true);
+  }
+}
+
+async function vdDetectorStop() {
+  try {
+    const r = await fetch(API_PREFIX + "/video-detection/prompt/stop", { method: "POST" });
+    if (r.ok) updateVdDetectorStatus(await r.json());
+  } catch (e) {
+    setVdOverlay("停止检测失败: " + e.message, true);
+  }
+}
+
+async function vdEventsClear() {
+  try {
+    await fetch(API_PREFIX + "/video-detection/events/clear", { method: "POST" });
+    VDDetector.events = [];
+    renderVdEventList();
+  } catch (_) {}
+}
+
 function initVideoDetection() {
   if (window.__vdInit) return;
   window.__vdInit = true;
@@ -424,6 +625,13 @@ function initVideoDetection() {
   const playBtn = document.getElementById("vd-play");
   const pauseBtn = document.getElementById("vd-pause");
   const stopBtn = document.getElementById("vd-stop");
+  const replayBtn = document.getElementById("vd-replay");
+
+  function refreshReplayBtn() {
+    replayBtn.disabled = !(sourceEl.value || "").trim();
+  }
+  sourceEl.addEventListener("input", refreshReplayBtn);
+  refreshReplayBtn();
 
   sourceEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter") openBtn.click();
@@ -471,14 +679,73 @@ function initVideoDetection() {
   });
 
   playBtn.addEventListener("click", async () => {
-    try { await vdAction("play"); } catch (e) { setVdOverlay("播放失败: " + e.message, true); }
+    try {
+      const r = await vdAction("play");
+      await vdStatus();  // immediate UI feedback so the click feels responsive
+      if (r && r.ok === false) {
+        setVdOverlay("播放失败: " + (r.reason || r.state), true);
+      } else {
+        setVdOverlay("", false);
+      }
+    } catch (e) {
+      setVdOverlay("播放失败: " + e.message, true);
+    }
   });
   pauseBtn.addEventListener("click", async () => {
-    try { await vdAction("pause"); } catch (e) { setVdOverlay("暂停失败: " + e.message, true); }
+    try {
+      const r = await vdAction("pause");
+      await vdStatus();
+      if (r && r.ok === false) {
+        setVdOverlay("暂停失败: " + (r.reason || r.state), true);
+      } else {
+        setVdOverlay("", false);
+      }
+    } catch (e) {
+      setVdOverlay("暂停失败: " + e.message, true);
+    }
   });
   stopBtn.addEventListener("click", async () => {
-    try { await vdAction("stop"); } catch (e) { setVdOverlay("停止失败: " + e.message, true); }
+    try {
+      const r = await vdAction("stop");
+      await vdStatus();
+      if (r && r.ok === false) {
+        setVdOverlay("停止失败: " + (r.reason || r.state), true);
+      } else {
+        setVdOverlay("已停止", false);
+      }
+    } catch (e) {
+      setVdOverlay("停止失败: " + e.message, true);
+    }
   });
+  replayBtn.addEventListener("click", async () => {
+    const src = (sourceEl.value || "").trim();
+    if (!src) {
+      setVdOverlay("请先输入视频源", true);
+      return;
+    }
+    replayBtn.disabled = true;
+    setVdOverlay("正在重播 " + src + " …", false);
+    try {
+      const snap = await vdOpen({ source: src });
+      setVdMeta(snap);
+      setVdProgress(snap);
+    } catch (e) {
+      setVdOverlay("重播失败: " + e.message, true);
+    } finally {
+      refreshReplayBtn();
+    }
+  });
+
+  // --- detection control buttons ---
+  const detStartBtn = document.getElementById("vd-detector-start");
+  const detStopBtn  = document.getElementById("vd-detector-stop");
+  const evClearBtn  = document.getElementById("vd-events-clear");
+  if (detStartBtn) detStartBtn.addEventListener("click", vdDetectorStart);
+  if (detStopBtn)  detStopBtn.addEventListener("click",  vdDetectorStop);
+  if (evClearBtn)  evClearBtn.addEventListener("click",  vdEventsClear);
+
+  // Initial state hydration (when navigating back to the page)
+  refreshVdDetector();
 
   if (!VD.ws && !VD.wsTimer) connectVdWs();
 }
@@ -503,16 +770,9 @@ async function loadPageData(name) {
 
   if (name === "video-detection") {
     VD.init();
-    // refresh JSON panel once
-    const target = document.getElementById("data-video-detection");
-    target.textContent = "加载中…";
-    try {
-      const r = await fetch(API_PREFIX + "/video-detection");
-      if (r.ok) target.textContent = JSON.stringify(await r.json(), null, 2);
-      else target.textContent = "(等待视频源)";
-    } catch (err) {
-      target.textContent = "请求失败: " + err.message;
-    }
+    // initial state sync — drives button enable/disable so the user
+    // can tell which control is currently valid
+    await vdStatus();
     return;
   }
 
