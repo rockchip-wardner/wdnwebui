@@ -35,6 +35,9 @@ html, body {
   padding: 1.25rem 0;
   display: flex;
   flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
 }
 
 .brand {
@@ -70,6 +73,38 @@ html, body {
   flex: 1;
   padding: 2rem 2.5rem;
   overflow-y: auto;
+}
+
+/* ---------- privilege warning (shown when service is not root) ---------- */
+.root-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.85rem 1.1rem;
+  margin-bottom: 1.5rem;
+  background: linear-gradient(180deg, #fef3c7, #fde68a);
+  border: 1px solid #f59e0b;
+  border-left: 5px solid #b45309;
+  border-radius: 6px;
+  color: #78350f;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  box-shadow: 0 2px 8px rgba(180, 83, 9, 0.08);
+}
+.root-warning-icon {
+  font-size: 1.4rem;
+  line-height: 1;
+  flex: 0 0 auto;
+  color: #b45309;
+}
+.root-warning-text { flex: 1 1 auto; }
+.root-warning code {
+  background: rgba(120, 53, 15, 0.12);
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 0.85em;
+  color: #78350f;
 }
 
 .page-header {
@@ -756,3 +791,135 @@ html, body {
 .log-entry.prio-crit,
 .log-entry.prio-err { border-left-color: #ef4444; }
 .log-entry.prio-warning { border-left-color: #f59e0b; }
+
+/* ---------- sidebar-bottom power button + popover ---------- */
+
+.sidebar-foot {
+  position: relative;            /* anchor for .power-popover */
+  margin-top: auto;              /* push to the bottom of the flex column */
+  padding: 0.75rem 1rem;
+  border-top: 1px solid #374151;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.power-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: #374151;
+  color: #d1d5db;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.power-btn:hover { background: #4b5563; color: #fff; }
+.power-btn:focus { outline: none; border-color: var(--accent); }
+.power-btn[aria-expanded="true"] { background: #4b5563; color: #fff; border-color: var(--accent); }
+.power-btn-icon { font-family: var(--mono); }
+
+.power-btn-label {
+  color: var(--sidebar-fg);
+  font-size: 0.85rem;
+  user-select: none;
+}
+
+.power-popover {
+  position: absolute;
+  left: 0;
+  right: 0;                      /* fill the sidebar's inner width */
+  bottom: calc(100% + 8px);      /* expand upward from the power button */
+  background: #fff;
+  color: #111827;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 60;                   /* above page content (vd-modal is 50) */
+  overflow: hidden;
+  animation: power-popover-in 0.14s ease-out;
+}
+.power-popover.hidden { display: none; }
+@keyframes power-popover-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.power-popover-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.7rem;
+  background: linear-gradient(180deg, #f9fafb, #f3f4f6);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+.power-popover-title { font-weight: 600; }
+.power-popover-close {
+  background: transparent;
+  border: none;
+  font-size: 1.05rem;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+}
+.power-popover-close:hover { color: #111827; background: #e5e7eb; }
+
+.power-popover-body {
+  display: flex;
+  flex-direction: column;
+  padding: 0.3rem;
+  gap: 2px;
+}
+.power-popover-action {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.65rem;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.88rem;
+  color: #111827;
+  text-align: left;
+  font-family: inherit;
+}
+.power-popover-action:hover { background: #eff6ff; }
+.power-popover-action:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: transparent;
+}
+.power-popover-action[data-action="shutdown"]:hover { background: #fee2e2; }
+.power-popover-action[data-action="shutdown"] .power-popover-icon { color: #dc2626; }
+.power-popover-action[data-action="reboot"] .power-popover-icon { color: var(--accent); }
+.power-popover-icon {
+  width: 1.1rem;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 0.95rem;
+  flex: 0 0 auto;
+}
+.power-popover-label { flex: 1 1 auto; }
+
+.power-popover-foot {
+  padding: 0.45rem 0.7rem;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  background: #f9fafb;
+  min-height: 1.6em;
+  word-break: break-word;
+}
+.power-popover-foot.warn { color: #b45309; }
+.power-popover-foot.danger { color: #b91c1c; font-weight: 600; }
+.power-popover-foot.ok { color: #047857; }

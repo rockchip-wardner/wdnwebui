@@ -17,11 +17,44 @@
         <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统监控</a>
         <a href="#video-detection" data-page="video-detection" class="nav-item">视频检测</a>
         <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
-        <a href="#power"           data-page="power"           class="nav-item">电源控制</a>
       </nav>
+
+      <div class="sidebar-foot">
+        <button class="power-btn" id="power-btn" type="button"
+                title="电源操作" aria-label="电源操作" aria-haspopup="dialog">
+          <span class="power-btn-icon" aria-hidden="true">⏻</span>
+        </button>
+
+        <div id="power-popover" class="power-popover hidden" role="dialog" aria-label="电源操作">
+          <div class="power-popover-head">
+            <span class="power-popover-title">电源操作</span>
+            <button class="power-popover-close" id="power-popover-close" type="button"
+                    aria-label="关闭">×</button>
+          </div>
+          <div class="power-popover-body">
+            <button class="power-popover-action" data-action="shutdown" type="button">
+              <span class="power-popover-icon" aria-hidden="true">⏻</span>
+              <span class="power-popover-label">关机</span>
+            </button>
+            <button class="power-popover-action" data-action="reboot" type="button">
+              <span class="power-popover-icon" aria-hidden="true">↻</span>
+              <span class="power-popover-label">重启</span>
+            </button>
+          </div>
+          <div class="power-popover-foot" id="power-popover-status">点击操作前请确认</div>
+        </div>
+      </div>
     </aside>
 
     <main class="content">
+      <div id="root-warning" class="root-warning hidden" role="alert">
+        <span class="root-warning-icon" aria-hidden="true">⚠</span>
+        <span class="root-warning-text">
+          当前服务未以 <strong>root</strong> 身份运行，电源控制（关机 / 重启）功能将受限或不可用。请使用
+          <code>sudo python run.py</code> 启动服务后再使用本平台。
+        </span>
+      </div>
+
       <section id="page-system-monitor"  class="page" data-page="system-monitor">
         <header class="page-header">
           <h2>系统监控</h2>
@@ -235,15 +268,7 @@
         </details>
       </section>
 
-      <section id="page-power"           class="page hidden" data-page="power">
-        <header class="page-header">
-          <h2>电源控制</h2>
-          <button class="refresh-btn" data-refresh>刷新</button>
-        </header>
-        <div class="placeholder-note">占位页面 — 待接入电源控制命令</div>
-        <pre class="payload" id="data-power"></pre>
-      </section>
-    </main>
+      </main>
   </div>
 
   <script src="/static/js/app.js" defer></script>

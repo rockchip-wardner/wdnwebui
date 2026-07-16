@@ -1065,5 +1065,142 @@ document.querySelectorAll("[data-refresh]").forEach(btn => {
 
 window.addEventListener("hashchange", () => showPage(currentPage()));
 
+/* ------------------------------------------------------------------ *
+ *  power menu: small icon button at the bottom-left of the sidebar.   *
+ *  Click opens a popover with two destructive actions (shutdown,    *
+ *  reboot). Each action requires a JS confirm() and then POSTs to    *
+ *  /api/power. The backend runs the host binary and either returns   *
+ *  success or surfaces the OS error message.                        *
+ * ------------------------------------------------------------------ */
+
+const PowerMenu = {
+  btn: null,
+  popover: null,
+  status: null,
+  busy: false,
+
+  ACTION_LABELS: {
+    shutdown:   { verb: "关机", pending: "正在关机…", confirm: "确定要立即关机吗？届时将无法访问该服务。" },
+    reboot:     { verb: "重启", pending: "正在重启…", confirm: "确定要立即重启吗？届时连接会短暂中断。" },
+  },
+
+  init() {
+    this.btn = document.getElementById("power-btn");
+    this.popover = document.getElementById("power-popover");
+    this.status = document.getElementById("power-popover-status");
+    if (!this.btn || !this.popover) return;
+
+    this.btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggle();
+    });
+
+    document.getElementById("power-popover-close")
+      .addEventListener("click", () => this.close());
+
+    this.popover.querySelectorAll(".power-popover-action").forEach((b) => {
+      b.addEventListener("click", () => {
+        const action = b.dataset.action;
+        if (action) this.runAction(action);
+      });
+    });
+
+    document.addEventListener("mousedown", (e) => {
+      if (this.popover.classList.contains("hidden")) return;
+      if (this.popover.contains(e.target) || this.btn.contains(e.target)) return;
+      this.close();
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !this.popover.classList.contains("hidden")) {
+        this.close();
+      }
+    });
+  },
+
+  isOpen() { return !this.popover.classList.contains("hidden"); },
+
+  open() {
+    this.popover.classList.remove("hidden");
+    this.btn.setAttribute("aria-expanded", "true");
+    this.setStatus("点击操作前请确认", "");
+  },
+
+  close() {
+    this.popover.classList.add("hidden");
+    this.btn.setAttribute("aria-expanded", "false");
+  },
+
+  toggle() {
+    if (this.isOpen()) this.close(); else this.open();
+  },
+
+  setStatus(text, level) {
+    if (!this.status) return;
+    this.status.textContent = text || "";
+    this.status.classList.remove("warn", "danger", "ok");
+    if (level) this.status.classList.add(level);
+  },
+
+  setButtonsDisabled(disabled) {
+    this.popover.querySelectorAll(".power-popover-action").forEach((b) => {
+      b.disabled = disabled;
+    });
+  },
+
+  async runAction(action) {
+    if (this.busy) return;
+    const meta = this.ACTION_LABELS[action];
+    if (!meta) return;
+    if (!window.confirm(meta.confirm)) return;
+
+    this.busy = true;
+    this.setButtonsDisabled(true);
+    this.setStatus(meta.pending, "warn");
+
+    try {
+      const r = await fetch(API_PREFIX + "/power", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const text = await r.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = { detail: text }; }
+      if (!r.ok) {
+        const msg = body.detail || body.message || ("HTTP " + r.status);
+        this.setStatus(`${meta.verb} 失败: ${msg}`, "danger");
+        return;
+      }
+      this.setStatus(body.message || `${meta.verb} 已执行`, "ok");
+      setTimeout(() => this.close(), 1500);
+    } catch (err) {
+      this.setStatus(`${meta.verb} 请求失败: ${err.message}`, "danger");
+    } finally {
+      this.busy = false;
+      this.setButtonsDisabled(false);
+    }
+  },
+};
+
+PowerMenu.init();
+
+/* Surface a top-of-page warning when the service isn't running as root
+ * — power actions (shutdown / reboot) need root and will fail silently
+ * or noisily otherwise. */
+async function showRootWarning() {
+  const el = document.getElementById("root-warning");
+  if (!el) return;
+  try {
+    const r = await fetch(API_PREFIX + "/power");
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data && data.is_root === false) {
+      el.classList.remove("hidden");
+    }
+  } catch (_) { /* network down at boot — skip silently */ }
+}
+showRootWarning();
+
 fetchVersion();
 showPage(currentPage());
