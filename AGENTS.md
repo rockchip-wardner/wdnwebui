@@ -200,9 +200,17 @@ holds it in memory. The file is seeded with a `base` section at
 - **Base config page** — second sidebar entry (`#base-config`),
   driven by the `Base` module in `app/static/js/app.js`. GETs the
   `base` section on entry, PUTs on submit; "放弃修改" re-fetches.
-  Services downstream (e.g. the detector's model loader) should
-  call `get_config().get_section("base")["model_path"]` lazily, not
-  at import time, so a saved change takes effect without a restart.
+  Services downstream (e.g. the detector's model loader) read
+  `get_config().get_section("base")["model_path"]` lazily, not at
+  import time, so a saved change takes effect on the next request.
+- **`RKAI_MODELS_DIR` propagation** — `app/main.py` reads
+  `base.model_path` at `create_app()` time and writes it into
+  `os.environ["RKAI_MODELS_DIR"]` before any `LLMSession` is built.
+  rkai's `_models_root()` reads that env var on first call, so the
+  SDK picks up the configured root automatically. Changing the
+  field via the UI after the app has booted only takes effect on
+  the next uvicorn reload (i.e. after a restart in production) —
+  an already-loaded `LLMSession` was bound to the old path.
 - **Frontend modules** — `ConfigMenu` (popover), `Base` (form page);
   `PowerMenu` was untouched and is mutually exclusive with
   `ConfigMenu` via the `_wrapOpenToCloseOther` helper.
