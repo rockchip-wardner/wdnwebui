@@ -15,6 +15,7 @@
       </div>
       <nav class="nav">
         <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统监控</a>
+        <a href="#base-config"     data-page="base-config"     class="nav-item">基础配置</a>
         <a href="#video-detection" data-page="video-detection" class="nav-item">视频检测</a>
         <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
       </nav>
@@ -23,6 +24,10 @@
         <button class="power-btn" id="power-btn" type="button"
                 title="电源操作" aria-label="电源操作" aria-haspopup="dialog">
           <span class="power-btn-icon" aria-hidden="true">⏻</span>
+        </button>
+        <button class="config-btn" id="config-btn" type="button"
+                title="配置管理" aria-label="配置管理" aria-haspopup="dialog">
+          <span class="config-btn-icon" aria-hidden="true">⚙</span>
         </button>
 
         <div id="power-popover" class="power-popover hidden" role="dialog" aria-label="电源操作">
@@ -42,6 +47,30 @@
             </button>
           </div>
           <div class="power-popover-foot" id="power-popover-status">点击操作前请确认</div>
+        </div>
+
+        <div id="config-popover" class="config-popover hidden" role="dialog" aria-label="配置管理">
+          <div class="config-popover-head">
+            <span class="config-popover-title">配置管理</span>
+            <button class="config-popover-close" id="config-popover-close" type="button"
+                    aria-label="关闭">×</button>
+          </div>
+          <div class="config-popover-body">
+            <button class="config-popover-action" data-config-action="export" type="button">
+              <span class="config-popover-icon" aria-hidden="true">⤓</span>
+              <span class="config-popover-label">导出配置</span>
+            </button>
+            <button class="config-popover-action" data-config-action="import" type="button">
+              <span class="config-popover-icon" aria-hidden="true">⤒</span>
+              <span class="config-popover-label">导入配置</span>
+            </button>
+          </div>
+          <div class="config-popover-foot" id="config-popover-foot">
+            <span class="config-popover-path" id="config-popover-path">--</span>
+            <span class="config-popover-status" id="config-popover-status"></span>
+          </div>
+          <input id="config-file-input" type="file" accept="application/json,.json"
+                 class="hidden" />
         </div>
       </div>
     </aside>
@@ -120,6 +149,48 @@
         <details class="raw-output">
           <summary>完整 JSON</summary>
           <pre class="payload" id="data-system-monitor"></pre>
+        </details>
+      </section>
+
+      <section id="page-base-config" class="page hidden" data-page="base-config">
+        <header class="page-header">
+          <h2>基础配置</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="base-config-path">--</span>
+            <button class="refresh-btn" id="base-config-refresh">刷新</button>
+          </div>
+        </header>
+
+        <form class="bc-form" id="base-config-form" autocomplete="off">
+          <section class="bc-section">
+            <header class="bc-section-head">
+              <h3>模型</h3>
+              <span class="bc-hint">RKNN 模型权重的存放目录</span>
+            </header>
+            <div class="bc-field">
+              <label class="bc-label" for="bc-model-path">模型存放路径</label>
+              <input type="text" id="bc-model-path" name="model_path"
+                     class="bc-input"
+                     placeholder="/userdata/models/"
+                     spellcheck="false" />
+              <div class="bc-meta">
+                <span class="bc-status" id="bc-model-path-status">--</span>
+                <span class="bc-hint">必须是设备上的绝对路径 (以 / 开头)</span>
+              </div>
+            </div>
+          </section>
+
+          <div class="bc-actions">
+            <span class="vd-spacer"></span>
+            <button type="button" class="vd-btn" id="bc-reload">放弃修改</button>
+            <button type="submit" class="vd-btn vd-btn-primary" id="bc-save">保存配置</button>
+          </div>
+          <div class="bc-foot" id="bc-foot"></div>
+        </form>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-base-config"></pre>
         </details>
       </section>
 

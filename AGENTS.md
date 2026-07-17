@@ -155,6 +155,58 @@ The `#page-video-detection` section is wired to:
 so `app.include_router(...)` in `main.py` actually sees them — without it
 the package object is empty and the routes are silently missing.
 
+## Configuration
+
+The service reads a single JSON-object `config.json` from disk and
+holds it in memory. The file is seeded with a `base` section at
+`{}` + future sections stacked alongside it.
+
+- **Where it lives** — resolved from `PYRKAIWEB_CONFIG` env var when
+  `run.py` starts (set by `--config /path/to/config.json`); if unset,
+  defaults to `<repo>/config.json`. Always absolute.
+- **Read-write** — `app/services/config.py` `ConfigStore` is a lazy
+  singleton (`get_config()`) with an in-memory dict guarded by an
+  `RLock`. Missing files / non-object payloads all collapse to `{}`.
+- **Atomic writes** — `replace()` / `set_section()` write a sibling
+  temp file and `os.replace()`-s into place so a crash mid-write
+  can't corrupt the file.
+- **Whole-file endpoints** (`app/api/config.py`):
+  - `GET  /api/config`        — `{path, data}` (current snapshot).
+  - `GET  /api/config/export` — `FileResponse` of the on-disk file
+    (downloads as `config.json`). If the file doesn't exist yet,
+    the endpoint writes `{}` first so the download always succeeds.
+  - `POST /api/config/import` — `multipart/form-data` upload (field
+    name `file`). Validates UTF-8, JSON parse, top-level object —
+    rejects empty bodies, lists, scalars with HTTP 400.
+- **Section endpoints** — `GET /api/config/{section}` reads a
+  top-level key (e.g. `base`) and fills in missing fields with
+  Pydantic defaults; `PUT /api/config/{section}` replaces just that
+  key without disturbing siblings. Other sections (e.g. a future
+  `power`) stay intact across `base` edits.
+- **`base` section** (Pydantic model `BaseConfig` in
+  `app/api/config.py`) currently has one field:
+  - `model_path` — absolute directory where RKNN model weights live
+    (default `/userdata/models/`). Validated as non-empty +
+    starts-with-`/`; the GET/PUT responses also include a
+    `model_path_exists` boolean for the UI to surface a soft warning
+    (the save doesn't create the directory).
+- **UI** — gear button (`#config-btn`) sits next to the power button
+  at the bottom-left of the sidebar. Opens a popover with 导出配置 /
+  导入配置 (export / import) and the live config file path at the
+  bottom. Import fires a hidden `<input type="file">`; export
+  fetches the file as a blob and triggers a download. Popover and
+  power popover are mutually exclusive (opening one closes the other
+  — they share the same anchor and would otherwise stack).
+- **Base config page** — second sidebar entry (`#base-config`),
+  driven by the `Base` module in `app/static/js/app.js`. GETs the
+  `base` section on entry, PUTs on submit; "放弃修改" re-fetches.
+  Services downstream (e.g. the detector's model loader) should
+  call `get_config().get_section("base")["model_path"]` lazily, not
+  at import time, so a saved change takes effect without a restart.
+- **Frontend modules** — `ConfigMenu` (popover), `Base` (form page);
+  `PowerMenu` was untouched and is mutually exclusive with
+  `ConfigMenu` via the `_wrapOpenToCloseOther` helper.
+
 ## System logs page
 
 The `#page-system-logs` section is wired to `app/api/system_logs.py`,

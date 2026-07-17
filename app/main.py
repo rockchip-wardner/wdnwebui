@@ -9,7 +9,8 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app import __version__
-from app.api import power, system_logs, system_monitor, video_detection
+from app.api import config, power, system_logs, system_monitor, video_detection
+from app.services.config import get_config
 from app.services.detector import get_detector
 from app.services.video_session import get_session
 
@@ -40,10 +41,16 @@ def create_app() -> FastAPI:
 
     app.add_middleware(NoCacheStaticMiddleware)
 
+    # Resolve the on-disk config.json path early so it shows up in the
+    # /health endpoint and the UI's config popover can render its
+    # absolute path. Missing files are tolerated — they read as {}.
+    get_config()
+
     app.include_router(system_monitor.router, prefix="/api")
     app.include_router(video_detection.router, prefix="/api")
     app.include_router(system_logs.router, prefix="/api")
     app.include_router(power.router, prefix="/api")
+    app.include_router(config.router, prefix="/api")
 
     # Wire the detector as a frame sink on the video session so each
     # decoded BGR frame is offered to it (it picks the Nth one).

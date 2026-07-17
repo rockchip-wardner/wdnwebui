@@ -995,6 +995,162 @@ function onLogsFilterChanged() {
 }
 
 /* ------------------------------------------------------------------ *
+ *  base config page (基础配置) — currently just one field: the RKNN   *
+ *  model_path. Read on click via GET /api/config/base; saved with    *
+ *  PUT /api/config/base which validates the absolute-path shape and  *
+ *  atomically swaps the "base" section in config.json without        *
+ *  touching other sections.                                         *
+ * ------------------------------------------------------------------ */
+const Base = {
+  initialized: false,
+  dirty: false,
+
+  init() {
+    if (this.initialized) return;
+    this.initialized = true;
+
+    const form = document.getElementById("base-config-form");
+    const refreshBtn = document.getElementById("base-config-refresh");
+    const reloadBtn = document.getElementById("bc-reload");
+
+    if (refreshBtn) refreshBtn.addEventListener("click", () => this.load());
+    if (reloadBtn) reloadBtn.addEventListener("click", () => this.load());
+
+    // Track edits so "放弃修改" actually drops them.
+    form.addEventListener("input", () => {
+      this.dirty = true;
+      this.updateFieldStatus();
+    });
+
+    if (form) {
+      form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        this.save();
+      });
+    }
+  },
+
+  async load() {
+    try {
+      const r = await fetch(API_PREFIX + "/config/base");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      this.render(data);
+    } catch (e) {
+      this.setFoot("加载失败: " + e.message, "danger");
+    }
+  },
+
+  render(data) {
+    this.dirty = false;
+    const section = (data && data.section) || {};
+    const modelPathInput = document.getElementById("bc-model-path");
+    if (modelPathInput) modelPathInput.value = section.model_path || "";
+    this.refreshPathLabel();
+    document.getElementById("data-base-config").textContent =
+      JSON.stringify({ section, model_path_exists: data.model_path_exists }, null, 2);
+    this.updateFieldStatus(data.model_path_exists);
+    this.setFoot("", "");
+  },
+
+  updateFieldStatus(existsOverride) {
+    const v = (document.getElementById("bc-model-path")?.value || "").trim();
+    const el = document.getElementById("bc-model-path-status");
+    if (!el) return;
+    el.classList.remove("ok", "warn", "danger");
+    if (!v) {
+      el.textContent = "请填写";
+      el.classList.add("warn");
+      return;
+    }
+    if (!v.startsWith("/")) {
+      el.textContent = "✗ 必须是绝对路径";
+      el.classList.add("danger");
+      return;
+    }
+    const exists = (typeof existsOverride === "boolean")
+      ? existsOverride
+      : false;  // unknown without a server check; refresh for an accurate read
+    if (exists) {
+      el.textContent = "✓ 目录存在";
+      el.classList.add("ok");
+    } else {
+      el.textContent = "保存后再确认目录是否存在";
+      el.classList.add("warn");
+    }
+  },
+
+  async save() {
+    const modelPath = (document.getElementById("bc-model-path")?.value || "").trim();
+    if (!modelPath) {
+      this.setFoot("模型存放路径不能为空", "danger");
+      this.updateFieldStatus();
+      return;
+    }
+    if (!modelPath.startsWith("/")) {
+      this.setFoot("模型存放路径必须是绝对路径 (以 / 开头)", "danger");
+      this.updateFieldStatus();
+      return;
+    }
+
+    const saveBtn = document.getElementById("bc-save");
+    const reloadBtn = document.getElementById("bc-reload");
+    saveBtn.disabled = true;
+    if (reloadBtn) reloadBtn.disabled = true;
+    this.setFoot("正在保存…", "warn");
+
+    try {
+      const r = await fetch(API_PREFIX + "/config/base", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_path: modelPath }),
+      });
+      const text = await r.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = { detail: text }; }
+      if (!r.ok) {
+        const msg = body.detail || ("HTTP " + r.status);
+        this.setFoot("保存失败: " + msg, "danger");
+        return;
+      }
+      this.refreshPathLabel();
+      document.getElementById("data-base-config").textContent =
+        JSON.stringify(body, null, 2);
+      this.updateFieldStatus(body.model_path_exists);
+      this.dirty = false;
+      const existsNote = body.model_path_exists
+        ? "（目录存在）"
+        : "（⚠ 目录当前不存在，请手动创建或调整）";
+      this.setFoot("已保存 " + existsNote, "ok");
+    } catch (e) {
+      this.setFoot("保存失败: " + e.message, "danger");
+    } finally {
+      saveBtn.disabled = false;
+      if (reloadBtn) reloadBtn.disabled = false;
+    }
+  },
+
+  refreshPathLabel() {
+    // Pull the on-disk path from /api/config and render it in the page
+    // header. Fire-and-forget; the field is purely informational.
+    const el = document.getElementById("base-config-path");
+    if (!el) return;
+    fetch(API_PREFIX + "/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d && d.path) el.textContent = "存储于 " + d.path; })
+      .catch(() => { /* leave prior value in place */ });
+  },
+
+  setFoot(text, level) {
+    const el = document.getElementById("bc-foot");
+    if (!el) return;
+    el.textContent = text || "";
+    el.classList.remove("warn", "danger", "ok");
+    if (level) el.classList.add(level);
+  },
+};
+
+/* ------------------------------------------------------------------ *
  *  page loader / router                                              *
  * ------------------------------------------------------------------ */
 
@@ -1023,6 +1179,12 @@ async function loadPageData(name) {
   if (name === "system-logs") {
     Logs.init();
     await Logs.refresh();
+    return;
+  }
+
+  if (name === "base-config") {
+    Base.init();
+    await Base.load();
     return;
   }
 
@@ -1184,6 +1346,202 @@ const PowerMenu = {
 };
 
 PowerMenu.init();
+
+/* ------------------------------------------------------------------ *
+ *  config menu: gear icon next to the power button. Opens a popover   *
+ *  with two actions — export (download the current config.json) and   *
+ *  import (upload a new config.json to overwrite). The hidden file    *
+ *  input is clicked programmatically when the user picks "导入配置".  *
+ * ------------------------------------------------------------------ */
+
+const ConfigMenu = {
+  btn: null,
+  popover: null,
+  closeBtn: null,
+  pathEl: null,
+  statusEl: null,
+  fileInput: null,
+  busy: false,
+  configPath: "--",
+
+  init() {
+    this.btn = document.getElementById("config-btn");
+    this.popover = document.getElementById("config-popover");
+    this.closeBtn = document.getElementById("config-popover-close");
+    this.pathEl = document.getElementById("config-popover-path");
+    this.statusEl = document.getElementById("config-popover-status");
+    this.fileInput = document.getElementById("config-file-input");
+    if (!this.btn || !this.popover) return;
+
+    this.btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggle();
+    });
+
+    if (this.closeBtn) {
+      this.closeBtn.addEventListener("click", () => this.close());
+    }
+
+    this.popover.querySelectorAll(".config-popover-action").forEach((b) => {
+      b.addEventListener("click", () => {
+        const action = b.dataset.configAction;
+        if (action) this.runAction(action);
+      });
+    });
+
+    if (this.fileInput) {
+      this.fileInput.addEventListener("change", (e) => {
+        const file = e.target.files && e.target.files[0];
+        // Always reset so the user can re-pick the same file.
+        e.target.value = "";
+        if (file) this.importFile(file);
+      });
+    }
+
+    document.addEventListener("mousedown", (e) => {
+      if (this.popover.classList.contains("hidden")) return;
+      if (this.popover.contains(e.target) || this.btn.contains(e.target)) return;
+      this.close();
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !this.popover.classList.contains("hidden")) {
+        this.close();
+      }
+    });
+
+    this.refreshPath();
+  },
+
+  isOpen() { return !this.popover.classList.contains("hidden"); },
+
+  open() {
+    this.refreshPath();
+    this.popover.classList.remove("hidden");
+    this.btn.setAttribute("aria-expanded", "true");
+  },
+
+  close() {
+    this.popover.classList.add("hidden");
+    this.btn.setAttribute("aria-expanded", "false");
+  },
+
+  toggle() {
+    if (this.isOpen()) this.close(); else this.open();
+  },
+
+  setStatus(text, level) {
+    if (!this.statusEl) return;
+    this.statusEl.textContent = text || "";
+    this.statusEl.classList.remove("warn", "danger", "ok");
+    if (level) this.statusEl.classList.add(level);
+  },
+
+  setActionsDisabled(disabled) {
+    this.popover.querySelectorAll(".config-popover-action").forEach((b) => {
+      b.disabled = disabled;
+    });
+  },
+
+  async refreshPath() {
+    if (!this.pathEl) return;
+    try {
+      const r = await fetch(API_PREFIX + "/config");
+      if (!r.ok) {
+        this.pathEl.textContent = "(无法读取配置路径)";
+        return;
+      }
+      const data = await r.json();
+      this.configPath = (data && data.path) || "--";
+      this.pathEl.textContent = this.configPath;
+      this.pathEl.title = this.configPath;
+    } catch (_) {
+      this.pathEl.textContent = "(无法读取配置路径)";
+    }
+  },
+
+  async runAction(action) {
+    if (this.busy) return;
+    if (action === "export") {
+      this.exportNow();
+    } else if (action === "import") {
+      if (this.fileInput) this.fileInput.click();
+    }
+  },
+
+  async exportNow() {
+    this.busy = true;
+    this.setActionsDisabled(true);
+    this.setStatus("正在导出…", "warn");
+    try {
+      const r = await fetch(API_PREFIX + "/config/export");
+      if (!r.ok) {
+        const detail = await r.text().catch(() => "");
+        this.setStatus(`导出失败: ${detail || r.status}`, "danger");
+        return;
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "config.json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      this.setStatus("已导出 config.json", "ok");
+    } catch (err) {
+      this.setStatus(`导出失败: ${err.message}`, "danger");
+    } finally {
+      this.busy = false;
+      this.setActionsDisabled(false);
+    }
+  },
+
+  async importFile(file) {
+    this.busy = true;
+    this.setActionsDisabled(true);
+    this.setStatus(`正在导入 ${file.name}…`, "warn");
+    try {
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      const r = await fetch(API_PREFIX + "/config/import", {
+        method: "POST",
+        body: fd,
+      });
+      const text = await r.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = { detail: text }; }
+      if (!r.ok) {
+        const msg = body.detail || body.message || ("HTTP " + r.status);
+        this.setStatus(`导入失败: ${msg}`, "danger");
+        return;
+      }
+      this.setStatus("已导入并覆盖当前配置", "ok");
+      this.refreshPath();
+    } catch (err) {
+      this.setStatus(`导入失败: ${err.message}`, "danger");
+    } finally {
+      this.busy = false;
+      this.setActionsDisabled(false);
+    }
+  },
+};
+
+ConfigMenu.init();
+
+/* The two popovers share the same sidebar-foot anchor and would stack
+ * on top of each other if both were visible. Wrap each .open() so it
+ * closes the other before showing itself. */
+function _wrapOpenToCloseOther(menu, other) {
+  const orig = menu.open.bind(menu);
+  menu.open = function () {
+    if (other && typeof other.close === "function") other.close();
+    orig();
+  };
+}
+_wrapOpenToCloseOther(PowerMenu, ConfigMenu);
+_wrapOpenToCloseOther(ConfigMenu, PowerMenu);
 
 /* Surface a top-of-page warning when the service isn't running as root
  * — power actions (shutdown / reboot) need root and will fail silently
