@@ -10,9 +10,10 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app import __version__
-from app.api import config, power, system_logs, system_monitor, video_detection
+from app.api import config, power, system_logs, system_monitor, tts, video_detection
 from app.services.config import get_config
 from app.services.detector import get_detector
+from app.services.tts_session import get_session as get_tts_session
 from app.services.video_session import get_session
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -64,6 +65,7 @@ def create_app() -> FastAPI:
     app.include_router(system_logs.router, prefix="/api")
     app.include_router(power.router, prefix="/api")
     app.include_router(config.router, prefix="/api")
+    app.include_router(tts.router, prefix="/api")
 
     # Wire the detector as a frame sink on the video session so each
     # decoded BGR frame is offered to it (it picks the Nth one).
@@ -88,6 +90,11 @@ def create_app() -> FastAPI:
         # Free the RKNN session handle if one was ever built.
         try:
             get_detector().close()
+        except Exception:
+            pass
+        # Free the Qwen3-TTS RKNN sessions if any were built.
+        try:
+            get_tts_session().close()
         except Exception:
             pass
 
