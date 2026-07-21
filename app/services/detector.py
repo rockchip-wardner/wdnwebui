@@ -1,15 +1,21 @@
-"""``rkai``-backed video detector.
+"""``rkai``-backed video detector (v2 API).
 
-Owns one ``LLMSession`` + a worker thread. Frames arrive from
-``VideoSession`` via a frame-sink callback; every Nth frame is fed to the
-session with the user-supplied prompt. Completed inferences are kept in an
-in-memory ring buffer and pushed to a list of registered broadcasters.
+Frames arrive from ``VideoSession`` via a frame-sink callback; every
+Nth frame is fed to a single ``LLMSession`` with the user prompt.
+Completed inferences live in an in-memory ring buffer and are pushed
+to the registered broadcasters.
 
-``rkai`` is heavy (RKNN model load is several seconds) and the inference is
-single-shot — one worker, one session, queue maxsize=1 (latest-only). On
-boxes without the model files ``start()`` records an error in
-``snapshot()["init_error"]`` and the worker exits cleanly without blocking
-the request handler.
+The service drives the v2 ``LLMSession.respond`` API with a list-
+shaped ``attachment`` (so the session can also carry text/audio
+later) and an ``LMOutput``-derived ``generating`` schema; for VLM
+``.attachment`` is just an empty list, but the slot exists so the
+same schema could be reused with a TTS-style backend without
+code changes here.
+
+``rkai`` is heavy (RKNN model load is several seconds) and inference
+is single-shot — one worker, one session, queue maxsize=1 (latest-only).
+On boxes without the model files ``start()`` records an error in
+``snapshot()["init_error"]`` and the worker exits cleanly.
 """
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -32,22 +39,139 @@ _RKAI_CACHE: dict = {}
 
 
 def _load_rkai():
-    """Lazily import rkai; return a tuple of (ok, Attachment, LLMSession,
-    SystemLanguageModel, error_str). Safe to call repeatedly — only the
-    first call hits Python's import machinery."""
+    """Lazily import rkai; cache the result so only the first call hits
+    the import machinery. Returns ``(ok, Attachment, LLMSession,
+    SystemLanguageModel, LMOutput, error_str)``."""
     if "_Attachment" in _RKAI_CACHE:
-        return _RKAI_CACHE["_ok"], _RKAI_CACHE["_Attachment"], _RKAI_CACHE["_LLMSession"], _RKAI_CACHE["_SystemLanguageModel"], _RKAI_CACHE["_error"]
+        return (
+            _RKAI_CACHE["_ok"],
+            _RKAI_CACHE["_Attachment"],
+            _RKAI_CACHE["_LLMSession"],
+            _RKAI_CACHE["_SystemLanguageModel"],
+            _RKAI_CACHE["_LMOutput"],
+            _RKAI_CACHE["_Generable"],
+            _RKAI_CACHE["_Field"],
+            _RKAI_CACHE["_error"],
+        )
     try:
-        from rkai import Attachment, LLMSession, SystemLanguageModel
-        _RKAI_CACHE.update(_ok=True, _Attachment=Attachment, _LLMSession=LLMSession, _SystemLanguageModel=SystemLanguageModel, _error="")
-        return True, Attachment, LLMSession, SystemLanguageModel, ""
+        from rkai import (
+            Attachment,
+            Field,
+            Generable,
+            LMOutput,
+            LLMSession,
+            SystemLanguageModel,
+        )
+        _RKAI_CACHE.update(
+            _ok=True,
+            _Attachment=Attachment,
+            _LLMSession=LLMSession,
+            _SystemLanguageModel=SystemLanguageModel,
+            _LMOutput=LMOutput,
+            _Generable=Generable,
+            _Field=Field,
+            _error="",
+        )
+        return True, Attachment, LLMSession, SystemLanguageModel, LMOutput, Generable, Field, ""
     except Exception as e:
-        _RKAI_CACHE.update(_ok=False, _Attachment=None, _LLMSession=None, _SystemLanguageModel=None, _error=str(e))
-        return False, None, None, None, str(e)
+        _RKAI_CACHE.update(
+            _ok=False,
+            _Attachment=None,
+            _LLMSession=None,
+            _SystemLanguageModel=None,
+            _LMOutput=None,
+            _Generable=None,
+            _Field=None,
+            _error=str(e),
+        )
+        return False, None, None, None, None, None, None, str(e)
 
 
+# --------------------------------------------------------------------------- #
+# Structured output schema — inherits LMOutput so the SDK can populate
+# ``attachment`` automatically when a future backend produces binary
+# outputs. Currently empty for VLM (text-only path).
+# --------------------------------------------------------------------------- #
+def _build_vlm_doc_class():
+    """Build the ``VLMDoc`` schema lazily, once rkai is importable.
+
+    The class is created with ``@Generable`` + ``LMOutput`` as the base so
+    the SDK can attach the parsed fields into an instance that also
+    carries the standard ``attachment`` slot.
+    """
+    # ``from typing import Optional`` *inside* this function so the name
+    # shows up in the function's locals — ``pydantic`` resolves forward
+    # refs by ``typing.get_type_hints``, which searches the enclosing
+    # frame's namespace. Without this, the ``Optional[str]`` annotation
+    # for ``level`` cannot be evaluated and instantiation fails.
+    from typing import Optional
+
+    _, _, _, _, LMOutput, Generable, Field, _ = _load_rkai()
+
+    @Generable
+    class VLMDoc(LMOutput):
+        """Structured VLM output for pyrkaiweb's video-detection panel."""
+        text: str = Field(description="The model's free-form description of the frame.")
+        level: Optional[str] = Field(
+            default=None,
+            description="Optional severity tag (e.g. 'normal' / 'warning' / 'danger').",
+        )
+
+    return VLMDoc
+
+
+# Cached after first build.
+_VLM_DOC_CLS = None
+
+
+def _get_vlm_doc_cls():
+    global _VLM_DOC_CLS
+    if _VLM_DOC_CLS is None:
+        _VLM_DOC_CLS = _build_vlm_doc_class()
+    return _VLM_DOC_CLS
+
+
+@dataclass
+class DetectorEvent:
+    """Public-facing event payload pushed to WS subscribers.
+
+    The shape is what the frontend already expects (id / frame_pos / ts
+    / prompt / text); the LMOutput instance is also attached so future
+    consumers can pull ``attachment`` or other structured fields.
+    """
+    id: int
+    frame_pos: int
+    ts: float
+    prompt: str
+    text: str
+    level: Optional[str] = None
+    attachment_count: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "id":               self.id,
+            "frame_pos":        self.frame_pos,
+            "ts":               self.ts,
+            "prompt":           self.prompt,
+            "text":             self.text,
+            "level":            self.level,
+            "attachment_count": self.attachment_count,
+        }
+
+
+# --------------------------------------------------------------------------- #
 class RkaiDetector:
-    """Single VLM session shared by the video-detection page."""
+    """Single VLM session shared by the video-detection page.
+
+    Uses the v2 SDK surface:
+
+        result = await session.respond(
+            msg=prompt,
+            attachment=[Attachment(frame)],     # list
+            generating=VLMDoc,                  # @Generable subclassing LMOutput
+        )
+        # result.text, result.level, result.attachment
+    """
 
     HISTORY_MAX = 200
     ITEM_QUEUE_MAX = 1  # latest-only — older frames are dropped
@@ -63,7 +187,7 @@ class RkaiDetector:
         self._init_error = ""
         self._events: deque = deque(maxlen=self.HISTORY_MAX)
         self._events_lock = threading.Lock()
-        self._latest = None
+        self._latest: Optional[dict] = None
         self._next_event_id = 1
         self._item_q: "queue.Queue" = queue.Queue(maxsize=self.ITEM_QUEUE_MAX)
         self._worker: Optional[threading.Thread] = None
@@ -80,17 +204,15 @@ class RkaiDetector:
     def snapshot(self) -> dict:
         with self._lock:
             return {
-                "available": self.available,
-                "init_error": self._init_error,
-                "enabled": self._enabled,
-                "prompt": self._prompt,
-                "every_n": self._every_n,
-                "model": self._model_name,
-                "session_ready": self._session is not None,
-                "worker_alive": (
-                    self._worker is not None and self._worker.is_alive()
-                ),
-                "queue_size": self._item_q.qsize(),
+                "available":      self.available,
+                "init_error":     self._init_error,
+                "enabled":        self._enabled,
+                "prompt":         self._prompt,
+                "every_n":        self._every_n,
+                "model":          self._model_name,
+                "session_ready":  self._session is not None,
+                "worker_alive":   self._worker is not None and self._worker.is_alive(),
+                "queue_size":     self._item_q.qsize(),
             }
 
     # ------------------------------------------------------------------ #
@@ -99,6 +221,9 @@ class RkaiDetector:
             raise RuntimeError(f"rkai 不可用: {self._init_error}")
         if not (prompt or "").strip():
             raise ValueError("prompt 不能为空")
+        # Build the structured-output class now (lazy) so that any
+        # import failure surfaces here instead of inside the worker.
+        _get_vlm_doc_cls()
         with self._lock:
             self._enabled = True
             self._prompt = prompt
@@ -117,7 +242,6 @@ class RkaiDetector:
     def stop(self) -> dict:
         with self._lock:
             self._enabled = False
-        # Wake the worker in case it's blocking on item_q.get().
         try:
             self._item_q.put_nowait(None)
         except queue.Full:
@@ -138,13 +262,6 @@ class RkaiDetector:
 
     # ------------------------------------------------------------------ #
     def submit_frame(self, frame_bgr: "np.ndarray", frame_pos: int) -> None:
-        """Called from the decode-loop thread.
-
-        Walks the frame counter, drops the frame if it doesn't match the
-        cadence, and otherwise hands it to the worker. The queue is size 1
-        so a backlog never builds up — if the worker is still busy on the
-        previous frame, this one replaces it.
-        """
         with self._lock:
             if not (self._enabled and self._prompt):
                 return
@@ -152,8 +269,6 @@ class RkaiDetector:
             if self._frame_count % self._every_n != 0:
                 return
             prompt = self._prompt
-        # Drop any backlog, then enqueue. The queue is size 1 and we
-        # just emptied it, so put_nowait always succeeds.
         try:
             while True:
                 self._item_q.get_nowait()
@@ -161,13 +276,13 @@ class RkaiDetector:
             pass
         try:
             self._item_q.put_nowait((frame_bgr, frame_pos, prompt))
-        except queue.Full:  # pragma: no cover - shouldn't happen
+        except queue.Full:
             pass
 
     # ------------------------------------------------------------------ #
     def events(self) -> list:
         with self._events_lock:
-            return list(self._events)
+            return [ev.to_dict() if hasattr(ev, "to_dict") else dict(ev) for ev in self._events]
 
     def latest(self) -> Optional[dict]:
         with self._events_lock:
@@ -179,9 +294,13 @@ class RkaiDetector:
             self._latest = None
 
     def events_since(self, since_id: int) -> list:
-        """Snapshot the events with id > ``since_id`` (for WS incremental push)."""
         with self._events_lock:
-            return [dict(ev) for ev in self._events if ev["id"] > since_id]
+            out = []
+            for ev in self._events:
+                d = ev.to_dict() if hasattr(ev, "to_dict") else dict(ev)
+                if d["id"] > since_id:
+                    out.append(d)
+            return out
 
     def register_broadcaster(self, fn: Callable[[dict], None]) -> None:
         with self._broadcaster_lock:
@@ -207,10 +326,10 @@ class RkaiDetector:
     def _ensure_session(self) -> None:
         if self._session is not None:
             return
-        ok, _Attachment, LLMSession, SystemLanguageModel, err = _load_rkai()
+        ok, Attachment, LLMSession, SystemLanguageModel, *_ = _load_rkai()
         if not ok:
             with self._lock:
-                self._init_error = f"rkai 不可用: {err}"
+                self._init_error = "rkai 不可用"
             raise RuntimeError(self._init_error)
         try:
             model = SystemLanguageModel.qwen3_vl_4b()
@@ -228,28 +347,46 @@ class RkaiDetector:
             self._session = sess
             self._init_error = ""
 
-    def _infer_sync(self, frame_bgr: "np.ndarray", prompt: str) -> str:
-        """One synchronous inference call. Wraps ``respond`` (a coroutine)
-        with ``asyncio.run`` because the SDK was originally designed for
-        ad-hoc scripts and the underlying C ``session_run`` is itself
-        blocking — the asyncio layer is just bookkeeping.
-        """
+    def _infer_sync(self, frame_bgr: "np.ndarray", prompt: str) -> DetectorEvent:
+        """One synchronous inference call against the v2 SDK surface."""
         try:
             self._ensure_session()
             assert self._session is not None
-            _, Attachment, *_ = _load_rkai()
+            ok, Attachment, *_ = _load_rkai()
+            VLMDoc = _get_vlm_doc_cls()
+
             self._session.reset()
             coro = self._session.respond(
                 msg=prompt,
-                attachment=Attachment(frame_bgr),
+                attachment=[Attachment(frame_bgr)],     # v2: list of Attachments
+                generating=VLMDoc,                      # v2: LMOutput subclass
             )
-            return str(asyncio.run(coro))
+            result = asyncio.run(coro)
+            # `result` is a ``VLMDoc`` (LMOutput subclass). Backend
+            # currently produces no audio outputs, so ``attachment`` is [].
+            att_count = len(getattr(result, "attachment", []) or [])
+            return DetectorEvent(
+                id=-1,                   # filled in by worker_loop
+                frame_pos=-1,            # ditto
+                ts=time.time(),
+                prompt=prompt,
+                text=str(getattr(result, "text", "") or ""),
+                level=getattr(result, "level", None),
+                attachment_count=att_count,
+            )
         except Exception as e:  # pragma: no cover - depends on model
-            return f"(推理失败: {e})"
+            return DetectorEvent(
+                id=-1,
+                frame_pos=-1,
+                ts=time.time(),
+                prompt=prompt,
+                text=f"(推理失败: {e})",
+                level=None,
+                attachment_count=0,
+            )
 
     # ------------------------------------------------------------------ #
     def _worker_loop(self) -> None:
-        """Daemon worker. One loop, one session, sequential inferences."""
         while not self._stop_event.is_set():
             try:
                 item = self._item_q.get(timeout=1.0)
@@ -258,19 +395,14 @@ class RkaiDetector:
             if item is None:
                 return
             frame_bgr, frame_pos, prompt = item
-            text = self._infer_sync(frame_bgr, prompt)
+            ev = self._infer_sync(frame_bgr, prompt)
             with self._events_lock:
-                event = {
-                    "id": self._next_event_id,
-                    "frame_pos": frame_pos,
-                    "ts": time.time(),
-                    "prompt": prompt,
-                    "text": text,
-                }
+                ev.id = self._next_event_id
+                ev.frame_pos = frame_pos
                 self._next_event_id += 1
-                self._events.append(event)
-                self._latest = event
-            self._broadcast(event)
+                self._events.append(ev)
+                self._latest = ev.to_dict()
+            self._broadcast(ev.to_dict())
 
 
 _detector: Optional[RkaiDetector] = None
