@@ -275,6 +275,65 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   touching `self._container` internals. The progress bar is currently
   read-only and animates only for live sources.
 
+## TTS (语音生成) page
+
+The `#page-tts` section drives Qwen3-TTS through the SDK's
+``TTSBackend`` (defined under
+``.venv/src/rkai/src/rkai/backends/tts.py`, which wraps the
+upstream ``Qwen3TTSDemo`` from
+``rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py``).
+The model layout, .1828.rknn naming, and AudioPlayer streaming
+path are all documented in ``.venv/src/rkai/src/rkai/models/README.md``
+and ``.venv/src/rkai/src/rkai/backends/tts.py``.
+
+* **Service** (`app/services/tts_session.py`):
+  - ``TtsSession`` singleton, lazy-imports rkai at first use so a
+    non-RK dev box still boots (just reports ``state="unavailable"``).
+  - State machine mirrors ``VideoSession``/``RkaiDetector``:
+    ``idle → start() → loading → running → done/error/stopped``.
+    The state transitions are broadcast over ``/api/tts/ws``.
+  - One daemon worker thread per request. The worker forwards
+    ``stop_event`` to the SDK so a stop issued during prefill or
+    decode unwinds the RKNN sessions cleanly; ``stop()`` flips the
+    state immediately so the UI is responsive while the worker
+    thread is still draining.
+  - Output history is an in-memory deque (max 50). Each entry:
+    ``{ts, text, language, speaker, output, size, audio_sec, frames}``.
+* **Endpoints** (`app/api/tts.py`):
+  - ``POST /api/tts/start`` ``{text, language, speaker, ref_speaker,
+    volume, instruct, no_play, non_streaming_mode, output}`` — kicks
+    off a synthesis. Refuses with 503 if a run is in flight.
+  - ``POST /api/tts/stop`` — flips state to ``stopped`` immediately
+    and propagates ``stop_event`` to the SDK.
+  - ``GET  /api/tts`` — current snapshot (state / available / frames
+    / audio_sec / elapsed / output / error / request / history_count).
+  - ``GET  /api/tts/history`` — list of recent output WAVs.
+  - ``WS   /api/tts/ws`` — pushes the snapshot on every state /
+    frames / error change. Auto-reconnect with exponential backoff
+    is handled on the client side (``app/static/js/app.js``
+    ``TTS.ensureWs``).
+* **Frontend** (``app/static/index.html`` + ``#page-tts`` markup):
+  - Sidebar entry ``语音生成`` sits between ``视频检测`` and
+    ``系统日志`` (mutually exclusive with other pages — the sidebar
+    just toggles the ``.hidden`` class on each ``.page``).
+  - Textarea + speaker/language selectors + volume slider (default
+    30%, range 0–100, step 5; the label mirrors the slider value
+    live via the ``input`` event).
+  - Start / Stop buttons, status line, history list below. Cmd/Ctrl
+    + Enter inside the textarea fires 开始生成.
+
+**Volume semantics** — the slider value is passed straight through to
+the SDK as the linear amplitude scale (``chunk *= volume`` on the
+decoded float32 PCM). A slider of 0.5 is 0.5 amplitude, no
+perceptual curve. The web default is 0.1 so the played PCM starts
+at ~10% on hardware whose mixers default to 100% — crank the slider
+to taste.
+
+**Output WAV format** — 24 kHz, mono, 32-bit IEEE float (format tag
+3, matching the C++ demo). Python's stdlib ``wave`` can't read
+format-3; for inspection, use ``soundfile.read(...)`` or parse the
+RIFF header by hand.
+
 ## When you change things, also update
 
 | You changed…                          | Then update…                                              |
