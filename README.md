@@ -136,6 +136,11 @@ edits show up on hard-refresh without restart.
 | GET    | `/api/video-detection/events`       | Detection event history                   |
 | WS     | `/api/video-detection/ws`           | JPEG frame stream + status + events       |
 | GET    | `/api/video-detection/fs?path=`     | Server-side directory listing             |
+| POST   | `/api/tts/start`                   | Kick off a TTS synthesis (`{text, ref_speaker, language, volume, ...}`) |
+| POST   | `/api/tts/stop`                    | Stop the current TTS run                   |
+| GET    | `/api/tts`                         | TTS state, frames, audio_sec, elapsed      |
+| GET    | `/api/tts/history`                 | Recent output WAVs                         |
+| WS     | `/api/tts/ws`                      | Snapshot pushed on every state change      |
 | GET    | `/api/power`                        | Uptime + `is_root`                        |
 | POST   | `/api/power` `{action:"shutdown"\|"reboot"}` | Run host shutdown / reboot       |
 

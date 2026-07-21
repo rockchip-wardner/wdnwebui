@@ -17,6 +17,7 @@
         <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统监控</a>
         <a href="#base-config"     data-page="base-config"     class="nav-item">基础配置</a>
         <a href="#video-detection" data-page="video-detection" class="nav-item">视频检测</a>
+        <a href="#tts"             data-page="tts"             class="nav-item">语音生成</a>
         <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
       </nav>
 
@@ -285,6 +286,72 @@
           </div>
         </div>
       </div>
+
+      <section id="page-tts" class="page hidden" data-page="tts">
+        <header class="page-header">
+          <h2>语音生成</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="tts-status-line">--</span>
+            <button class="refresh-btn" id="tts-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div id="tts-unavailable" class="tts-banner tts-banner-error hidden">
+          <span class="tts-banner-icon" aria-hidden="true">⚠</span>
+          <span class="tts-banner-text">
+            语音生成不可用：<span id="tts-unavailable-reason">--</span>
+          </span>
+        </div>
+
+        <div class="tts-stage">
+          <textarea id="tts-text" class="tts-text" rows="4"
+                    placeholder="请输入要合成的文本，例如：你好，这是一个语音合成测试。"></textarea>
+
+          <div class="tts-controls">
+            <label class="tts-field">
+              <span class="tts-label">声音</span>
+              <select id="tts-ref-speaker" class="tts-select">
+                <option value="girl_base">girl_base（默认）</option>
+              </select>
+            </label>
+            <label class="tts-field">
+              <span class="tts-label">语种</span>
+              <select id="tts-language" class="tts-select">
+                <option value="auto">auto</option>
+                <option value="chinese">chinese</option>
+                <option value="english">english</option>
+                <option value="japanese">japanese</option>
+                <option value="korean">korean</option>
+              </select>
+            </label>
+            <label class="tts-field tts-volume">
+              <span class="tts-label">音量 <span id="tts-volume-value">10%</span></span>
+              <input type="range" id="tts-volume" min="0" max="100" step="5" value="10" />
+            </label>
+            <span class="vd-spacer"></span>
+            <button id="tts-start" class="vd-btn vd-btn-primary">开始生成</button>
+            <button id="tts-stop"  class="vd-btn" disabled>停止</button>
+          </div>
+
+          <div class="tts-meta" id="tts-meta">未开始</div>
+        </div>
+
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>生成记录</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="tts-history-count">0 条</span>
+          </header>
+          <ol class="vd-event-list" id="tts-history-list">
+            <li class="vd-event-empty">尚无生成记录，启动合成后结果显示在这里。</li>
+          </ol>
+        </section>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-tts"></pre>
+        </details>
+      </section>
 
       <section id="page-system-logs"     class="page hidden" data-page="system-logs">
         <header class="page-header">

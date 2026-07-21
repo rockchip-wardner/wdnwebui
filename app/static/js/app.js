@@ -1188,6 +1188,16 @@ async function loadPageData(name) {
     return;
   }
 
+  if (name === "tts") {
+    TTS.init();
+    await TTS.refresh();
+    // Open the WS proactively so the page stays live even before the
+    // first click on "开始生成". The server only pushes on state change,
+    // so this is cheap.
+    TTS.ensureWs();
+    return;
+  }
+
   const target = document.getElementById("data-" + name);
   if (!target) return;
   target.textContent = "加载中…";
@@ -1529,6 +1539,272 @@ const ConfigMenu = {
 };
 
 ConfigMenu.init();
+
+/* ---------------------------------------------------------------- *
+ * TTS (语音生成) page                                              *
+ * ---------------------------------------------------------------- */
+const TTS = {
+  initialized: false,
+  ws: null,
+  backoff: 1.0,
+  lastSnap: null,
+
+  init() {
+    if (this.initialized) return;
+    this.initialized = true;
+
+    const textEl = document.getElementById("tts-text");
+    const refEl = document.getElementById("tts-ref-speaker");
+    const langEl = document.getElementById("tts-language");
+    const volEl = document.getElementById("tts-volume");
+    const volValEl = document.getElementById("tts-volume-value");
+    const startBtn = document.getElementById("tts-start");
+    const stopBtn = document.getElementById("tts-stop");
+    const refreshBtn = document.getElementById("tts-refresh");
+
+    if (volEl && volValEl) {
+      volEl.addEventListener("input", () => {
+        volValEl.textContent = volEl.value + "%";
+      });
+    }
+
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", () => this.refresh());
+    }
+
+    if (startBtn) {
+      startBtn.addEventListener("click", () => this.start());
+    }
+    if (stopBtn) {
+      stopBtn.addEventListener("click", () => this.stop());
+    }
+    if (textEl) {
+      // Cmd/Ctrl+Enter is a common shortcut for "fire".
+      textEl.addEventListener("keydown", (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+          e.preventDefault();
+          this.start();
+        }
+      });
+    }
+  },
+
+  async refresh() {
+    try {
+      const r = await fetch(API_PREFIX + "/tts");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const snap = await r.json();
+      this.lastSnap = snap;
+      this.render(snap);
+      this.refreshHistory();
+    } catch (err) {
+      this.setStatus("加载失败: " + err.message, true);
+    }
+  },
+
+  async refreshHistory() {
+    try {
+      const r = await fetch(API_PREFIX + "/tts/history");
+      if (!r.ok) return;
+      const data = await r.json();
+      this.renderHistory(data.items || []);
+    } catch (_) {
+      // history is best-effort
+    }
+  },
+
+  render(snap) {
+    const banner = document.getElementById("tts-unavailable");
+    const reasonEl = document.getElementById("tts-unavailable-reason");
+    const startBtn = document.getElementById("tts-start");
+    const stopBtn = document.getElementById("tts-stop");
+    const metaEl = document.getElementById("tts-meta");
+    const lineEl = document.getElementById("tts-status-line");
+    const dataEl = document.getElementById("data-tts");
+
+    if (dataEl) dataEl.textContent = JSON.stringify(snap, null, 2);
+
+    const isBusy = snap.busy === true || snap.running === true || snap.state === "loading" || snap.state === "running";
+    const isRunning = snap.running === true;
+
+    if (banner && reasonEl) {
+      if (snap.available === false) {
+        banner.classList.remove("hidden");
+        reasonEl.textContent = snap.init_error || "upstream 模块缺失";
+      } else {
+        banner.classList.add("hidden");
+      }
+    }
+
+    if (startBtn) {
+      startBtn.disabled = isBusy || snap.available === false;
+    }
+    if (stopBtn) {
+      stopBtn.disabled = !isBusy;
+    }
+
+    if (lineEl) {
+      lineEl.textContent = `状态: ${snap.state}` + (snap.error ? ` · ${snap.error}` : "");
+    }
+
+    if (metaEl) {
+      metaEl.textContent = this.formatMeta(snap);
+    }
+  },
+
+  formatMeta(snap) {
+    if (!snap.available) return "语音生成不可用，请检查上游 Qwen3-TTS 模型路径 / rknn3 驱动";
+    if (snap.state === "idle")  return `模型: ${snap.model_dir}`;
+    if (snap.state === "loading") return "正在加载模型…";
+    if (snap.state === "running") {
+      const f = snap.frames || 0;
+      const sec = (snap.audio_sec || 0).toFixed(2);
+      const wall = (snap.elapsed || 0).toFixed(2);
+      return `推理中 · 已生成 ${f} 帧 / ${sec}s · 用时 ${wall}s`;
+    }
+    if (snap.state === "done") {
+      return `已完成 · ${snap.frames} 帧 / ${(snap.audio_sec || 0).toFixed(2)}s · 用时 ${(snap.elapsed || 0).toFixed(2)}s`;
+    }
+    if (snap.state === "stopped") {
+      return `已停止 · 输出: ${snap.output || "--"}`;
+    }
+    if (snap.state === "error") return `错误: ${snap.error}`;
+    return `状态: ${snap.state}`;
+  },
+
+  async start() {
+    const textEl = document.getElementById("tts-text");
+    const refEl = document.getElementById("tts-ref-speaker");
+    const langEl = document.getElementById("tts-language");
+    const volEl = document.getElementById("tts-volume");
+
+    const text = (textEl ? textEl.value : "").trim();
+    if (!text) {
+      this.setStatus("请输入要合成的文本", true);
+      return;
+    }
+    const volume = volEl ? Number(volEl.value) / 100 : 0.1;
+
+    const payload = {
+      text,
+      ref_speaker: refEl ? refEl.value : "girl_base",
+      language: langEl ? langEl.value : "auto",
+      volume,
+    };
+
+    this.setStatus("提交中…", false);
+    try {
+      const r = await fetch(API_PREFIX + "/tts/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        this.setStatus("提交失败: " + (body.detail || r.statusText), true);
+        return;
+      }
+      this.lastSnap = body;
+      this.render(body);
+      this.ensureWs();
+    } catch (err) {
+      this.setStatus("提交失败: " + err.message, true);
+    }
+  },
+
+  async stop() {
+    try {
+      const r = await fetch(API_PREFIX + "/tts/stop", { method: "POST" });
+      const body = await r.json().catch(() => ({}));
+      this.lastSnap = body;
+      this.render(body);
+    } catch (err) {
+      this.setStatus("停止失败: " + err.message, true);
+    }
+  },
+
+  setStatus(text, isError) {
+    const lineEl = document.getElementById("tts-status-line");
+    if (lineEl) {
+      lineEl.textContent = text;
+      lineEl.style.color = isError ? "#dc2626" : "";
+    }
+  },
+
+  renderHistory(items) {
+    const listEl = document.getElementById("tts-history-list");
+    const countEl = document.getElementById("tts-history-count");
+    if (!listEl) return;
+    listEl.innerHTML = "";
+    if (!items.length) {
+      const li = document.createElement("li");
+      li.className = "vd-event-empty";
+      li.textContent = "尚无生成记录，启动合成后结果显示在这里。";
+      listEl.appendChild(li);
+    } else {
+      items.slice().reverse().forEach((it) => {
+        const li = document.createElement("li");
+        li.className = "vd-event";
+        const when = new Date((it.ts || 0) * 1000);
+        const whenStr = when.toLocaleString();
+        li.innerHTML = `
+          <div class="vd-event-meta">
+            <span class="tag">${whenStr}</span>
+            <span class="tag">${it.speaker || "--"}</span>
+            <span class="tag">${(it.audio_sec || 0).toFixed(2)}s</span>
+            <span class="tag">${it.frames || 0} 帧</span>
+            <span class="vd-event-path">${it.output || ""}</span>
+          </div>
+          <div class="vd-event-text"></div>
+        `;
+        li.querySelector(".vd-event-text").textContent = it.text || "";
+        listEl.appendChild(li);
+      });
+    }
+    if (countEl) countEl.textContent = items.length + " 条";
+  },
+
+  /* ------------------------------------------------------------------ *
+   * WebSocket status stream — auto-reconnect with backoff.
+   * ------------------------------------------------------------------ */
+  ensureWs() {
+    if (this.ws && this.ws.readyState <= WebSocket.OPEN) return;
+    try {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${location.host}${API_PREFIX}/tts/ws`;
+      this.ws = new WebSocket(url);
+    } catch (err) {
+      this.setStatus("WS 创建失败: " + err.message, true);
+      return;
+    }
+    this.ws.onmessage = (ev) => {
+      let snap;
+      try { snap = JSON.parse(ev.data); } catch (_) { return; }
+      if (!snap) return;
+      this.lastSnap = snap;
+      this.render(snap);
+      if (snap.state === "done" || snap.state === "stopped" || snap.state === "error") {
+        this.refreshHistory();
+      }
+    };
+    this.ws.onclose = () => {
+      this.ws = null;
+      // Reconnect only while a run is in flight; otherwise wait until the
+      // user clicks "start" again to open a fresh connection.
+      if (this.lastSnap && (this.lastSnap.busy || this.lastSnap.running)) {
+        const delay = Math.min(this.backoff, 8.0) * 1000;
+        this.backoff = Math.min(this.backoff * 1.6, 8.0);
+        setTimeout(() => this.ensureWs(), delay);
+      }
+    };
+    this.ws.onerror = () => {
+      try { this.ws && this.ws.close(); } catch (_) {}
+    };
+    this.backoff = 1.0;
+  },
+};
+
+TTS.init();
 
 /* The two popovers share the same sidebar-foot anchor and would stack
  * on top of each other if both were visible. Wrap each .open() so it
