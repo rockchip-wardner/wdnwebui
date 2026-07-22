@@ -166,7 +166,7 @@ class RkaiDetector:
     Uses the v2 SDK surface:
 
         result = await session.respond(
-            msg=prompt,
+            prompt=prompt,
             attachment=[Attachment(frame)],     # list
             generating=VLMDoc,                  # @Generable subclassing LMOutput
         )
@@ -357,7 +357,7 @@ class RkaiDetector:
 
             self._session.reset()
             coro = self._session.respond(
-                msg=prompt,
+                prompt=prompt,
                 attachment=[Attachment(frame_bgr)],     # v2: list of Attachments
                 generating=VLMDoc,                      # v2: LMOutput subclass
             )

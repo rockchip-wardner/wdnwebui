@@ -131,7 +131,7 @@ The `#page-video-detection` section is wired to:
     replaces it with the freshest frame so the detector always sees
     the most recent state.
   - Each inference calls `session.reset()` (clears history + KV cache)
-    and `session.respond(msg, attachment=Attachment(frame))` — free-text
+    and `session.respond(prompt=prompt, attachment=[Attachment(frame)])` — free-text
     response, no schema. ~1s after model warm-up.
   - History is an in-memory deque (max 200). Events carry `id`, `frame_pos`,
     `ts`, `prompt`, `text`.
