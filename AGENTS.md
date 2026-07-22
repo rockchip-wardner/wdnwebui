@@ -279,12 +279,16 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
 
 The `#page-tts` section drives Qwen3-TTS through the SDK's
 ``TTSBackend`` (defined under
-``.venv/src/rkai/src/rkai/backends/tts.py`, which wraps the
-upstream ``Qwen3TTSDemo`` from
-``rknn3-toolkit-lite/examples/Qwen3-TTS/qwen3_tts_demo.py``).
-The model layout, .1828.rknn naming, and AudioPlayer streaming
-path are all documented in ``.venv/src/rkai/src/rkai/models/README.md``
-and ``.venv/src/rkai/src/rkai/backends/tts.py``.
+``.venv/src/rkai/src/rkai/backends/tts.py`). The full RKNN3 driver
+(four ``.1828.rknn`` models, embed tables, prefill construction,
+talker/code_predictor/speech_decoder pipeline, ``AudioPlayer``
+streaming) is inlined into the same file as ``Qwen3TTSDemo`` —
+vendored in-tree so the SDK is self-contained and no longer has to
+find ``qwen3_tts_demo.py`` anywhere on the host filesystem. The
+model layout, .1828.rknn naming, and AudioPlayer streaming path
+are all documented in
+``.venv/src/rkai/src/rkai/models/README.md`` and
+``.venv/src/rkai/src/rkai/backends/tts.py``.
 
 * **Service** (`app/services/tts_session.py`):
   - ``TtsSession`` singleton, lazy-imports rkai at first use so a
@@ -321,6 +325,20 @@ and ``.venv/src/rkai/src/rkai/backends/tts.py``.
     live via the ``input`` event).
   - Start / Stop buttons, status line, history list below. Cmd/Ctrl
     + Enter inside the textarea fires 开始生成.
+
+* **VoiceClone speaker embeddings are bundled, not filesystem-loaded.**
+  The upstream C++ demo's ``qwen3tts_speaker_embed.h`` is a static
+  ``std::unordered_map<std::string, std::vector<float>>`` holding the
+  reference vectors for ``girl_base`` / ``ahu`` (each 2048-dim fp32).
+  That file ships only with the rknn3 dev tree and is never installed
+  on a clean board. To keep the SDK self-contained, both vectors are
+  encoded inline as zlib-compressed fp16 blobs in
+  ``_BUNDLED_SPEAKER_EMBEDDINGS_B64`` (``.venv/src/rkai/src/rkai/backends/tts.py:209``)
+  and decoded by ``_get_bundled_speaker_embeddings()`` on first use.
+  ``Qwen3TTSDriver._load_speaker_embeddings()`` (line 635) returns the
+  bundled dict directly — there is no runtime walk-up filesystem
+  search anymore, so ``ref_speaker="girl_base"`` / ``"ahu"`` always
+  resolves correctly regardless of the host's rknn3 layout.
 
 **Volume semantics** — the slider value is passed straight through to
 the SDK as the linear amplitude scale (``chunk *= volume`` on the

@@ -1561,25 +1561,30 @@ const TTS = {
     const startBtn = document.getElementById("tts-start");
     const stopBtn = document.getElementById("tts-stop");
     const refreshBtn = document.getElementById("tts-refresh");
+    const audioEl = document.getElementById("tts-audio");
 
     if (volEl && volValEl) {
       volEl.addEventListener("input", () => {
         volValEl.textContent = volEl.value + "%";
       });
     }
+    if (audioEl) {
+      audioEl.volume = 1.0;
+      audioEl.addEventListener("error", () =>
+        this.setStatus("浏览器播放失败 (autoplay 可能被拦截)", true));
+    }
+    const enableBtn = document.getElementById("tts-audio-enable");
+    if (enableBtn) {
+      enableBtn.addEventListener("click", () => this.enableBrowserAudio());
+    }
+    document.querySelectorAll('input[name="tts-play-to"]').forEach((el) => {
+      el.addEventListener("change", () => this._showAudioRowIfNeeded());
+    });
 
-    if (refreshBtn) {
-      refreshBtn.addEventListener("click", () => this.refresh());
-    }
-
-    if (startBtn) {
-      startBtn.addEventListener("click", () => this.start());
-    }
-    if (stopBtn) {
-      stopBtn.addEventListener("click", () => this.stop());
-    }
+    if (refreshBtn) refreshBtn.addEventListener("click", () => this.refresh());
+    if (startBtn)   startBtn.addEventListener("click", () => this.start());
+    if (stopBtn)    stopBtn.addEventListener("click", () => this.stop());
     if (textEl) {
-      // Cmd/Ctrl+Enter is a common shortcut for "fire".
       textEl.addEventListener("keydown", (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
           e.preventDefault();
@@ -1650,6 +1655,27 @@ const TTS = {
     if (metaEl) {
       metaEl.textContent = this.formatMeta(snap);
     }
+
+    // After the run finishes, expose the saved WAV via the <audio>
+    // element so the user can re-play the synthesis without
+    // re-running the model. Live chunks already played through the
+    // AudioContext; this is the post-run scrubber.
+    if (snap.output_url && (snap.state === "done" || snap.state === "stopped")) {
+      this._feedBrowserAudio(snap.output_url);
+    }
+  },
+
+  _feedBrowserAudio(url) {
+    const audioEl = this._audioEl();
+    if (!audioEl) return;
+    if (!this._wantsBrowser()) {
+      audioEl.classList.add("hidden");
+      return;
+    }
+    // Cache-bust so a fresh run doesn't replay the previous bytes.
+    const bust = (url.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now();
+    audioEl.src = url + bust;
+    audioEl.classList.remove("hidden");
   },
 
   formatMeta(snap) {
@@ -1677,22 +1703,58 @@ const TTS = {
     const refEl = document.getElementById("tts-ref-speaker");
     const langEl = document.getElementById("tts-language");
     const volEl = document.getElementById("tts-volume");
+    const audioEl = this._audioEl();
 
     const text = (textEl ? textEl.value : "").trim();
     if (!text) {
       this.setStatus("请输入要合成的文本", true);
       return;
     }
-    const volume = volEl ? Number(volEl.value) / 100 : 0.1;
+    const playTo = this._selectedPlayTo();
+
+    if (audioEl) {
+      audioEl.pause();
+      audioEl.removeAttribute("src");
+      audioEl.load();
+      audioEl.classList.add("hidden");
+    }
+
+    // ``start()`` may be entered more than once per run (double-click,
+    // Ctrl+Enter, onopen re-subscription). Don't reset audio state
+    // here — only ``_onAudioStreamEnd`` resets it when the run
+    // truly finishes.
+    this.audioScheduledUntil = 0;
+    this.audioPushedSec = 0;
+    this._showAudioRowIfNeeded();
+
+    this.setStatus(
+      playTo === "browser" ? "提交中…（将边生成边播浏览器）" :
+      playTo === "both"    ? "提交中…（设备 + 浏览器同时边播）" :
+                             "提交中…（仅设备播放）",
+      false,
+    );
+
+    // Eagerly resume the AudioContext under this user gesture. Chrome
+    // may have suspended the audio thread while the user was typing,
+    // and waking it up at audio_start time costs 1-3 s of cold-start
+    // tax. Doing it here, synchronously, runs under the gesture.
+    if (this._wantsBrowser()) {
+      const ctx = this._ensureAudioCtx();
+      if (ctx) {
+        try {
+          if (ctx.state !== "running") await ctx.resume();
+        } catch (_) {}
+        if (ctx.state === "running") this.audioReady = true;
+      }
+    }
 
     const payload = {
       text,
       ref_speaker: refEl ? refEl.value : "girl_base",
       language: langEl ? langEl.value : "auto",
-      volume,
+      volume: volEl ? Number(volEl.value) / 100 : 0.1,
+      play_to: playTo,
     };
-
-    this.setStatus("提交中…", false);
     try {
       const r = await fetch(API_PREFIX + "/tts/start", {
         method: "POST",
@@ -1707,6 +1769,7 @@ const TTS = {
       this.lastSnap = body;
       this.render(body);
       this.ensureWs();
+      // onopen will (re-)send subscribe_audio once the WS is OPEN.
     } catch (err) {
       this.setStatus("提交失败: " + err.message, true);
     }
@@ -1777,20 +1840,42 @@ const TTS = {
       this.setStatus("WS 创建失败: " + err.message, true);
       return;
     }
+    this.ws.binaryType = "arraybuffer";
     this.ws.onmessage = (ev) => {
-      let snap;
-      try { snap = JSON.parse(ev.data); } catch (_) { return; }
-      if (!snap) return;
-      this.lastSnap = snap;
-      this.render(snap);
-      if (snap.state === "done" || snap.state === "stopped" || snap.state === "error") {
-        this.refreshHistory();
+      this.audioFramesTotal = (this.audioFramesTotal || 0) + 1;
+      // Some browsers deliver text frames as Blob instead of string
+      // (default for binaryType="blob"). Read it as text first.
+      const data0 = ev.data;
+      if (data0 instanceof Blob) {
+        data0.text().then((t) => this._handleTextMessage(t, ev));
+        return;
       }
+      if (data0 instanceof ArrayBuffer) {
+        this._handleBinaryChunk(data0);
+        return;
+      }
+      // Assume string.
+      this._handleTextMessage(data0, ev);
+    };
+    this.ws.onopen = () => {
+      // Per-connection subscription: the server resets ``sub_id`` at
+      // end-of-run, so re-subscribing on every WS open is cheap and
+      // survives WS bounces mid-run.
+      if (this._wantsBrowser() && this.audioReady) {
+        this._subscribeAudio();
+      } else if (this.pendingAudioSubscribe) {
+        this._subscribeAudio();
+      }
+      this._armPing();
     };
     this.ws.onclose = () => {
       this.ws = null;
-      // Reconnect only while a run is in flight; otherwise wait until the
-      // user clicks "start" again to open a fresh connection.
+      if (this.audioPingTimer) {
+        clearInterval(this.audioPingTimer);
+        this.audioPingTimer = null;
+      }
+      // Reconnect only while a run is in flight; otherwise wait until
+      // the user clicks "start" again to open a fresh connection.
       if (this.lastSnap && (this.lastSnap.busy || this.lastSnap.running)) {
         const delay = Math.min(this.backoff, 8.0) * 1000;
         this.backoff = Math.min(this.backoff * 1.6, 8.0);
@@ -1801,6 +1886,235 @@ const TTS = {
       try { this.ws && this.ws.close(); } catch (_) {}
     };
     this.backoff = 1.0;
+  },
+
+  /* ------------------------------------------------------------------ *
+   * Browser-side audio playback (WebAudio, streaming chunks)
+   * ------------------------------------------------------------------ */
+  audioCtx: null,
+  audioReady: false,         // AudioContext created + resumed
+  audioActive: false,        // current stream is feeding the context
+  audioSampleRate: 24000,
+  audioChannels: 1,
+  audioScheduledUntil: 0,    // monotonic ctx time for back-to-back chunks
+  audioPushedSec: 0,
+  /* True when subscribe_audio was sent but the WS wasn't OPEN yet;
+   * ``onopen`` re-issues subscribe when the WS finishes opening. */
+  pendingAudioSubscribe: false,
+  audioPingTimer: null,
+
+  async _handleTextMessage(text) {
+    let snap;
+    try { snap = JSON.parse(text); } catch (_) { return; }
+    if (!snap) return;
+    if (snap.type === "audio_start") {
+      this._onAudioStreamStart(snap.sample_rate, snap.channels);
+      return;
+    }
+    if (snap.type === "audio_end") {
+      this._onAudioStreamEnd();
+      return;
+    }
+    this.lastSnap = snap;
+    this.render(snap);
+    if (snap.state === "done" || snap.state === "stopped" || snap.state === "error") {
+      this.refreshHistory();
+    }
+  },
+
+  _ensureAudioCtx() {
+    if (this.audioCtx) return this.audioCtx;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return null;
+    this.audioCtx = new Ctor();
+    // Keep the audio thread spinning. Chrome parks it when no source
+    // is active, and a 1-3s cold-start tax hits the first real chunk
+    // after a long idle. A 0-gain oscillator runs until ctx.close()
+    // and is effectively free in WebAudio.
+    try {
+      const osc = this.audioCtx.createOscillator();
+      const gain = this.audioCtx.createGain();
+      gain.gain.value = 0;
+      osc.connect(gain).connect(this.audioCtx.destination);
+      osc.start();
+    } catch (_) {}
+    return this.audioCtx;
+  },
+
+  async enableBrowserAudio() {
+    // Called from a button click → user gesture. Resume the
+    // AudioContext (Chrome blocks it otherwise) so subsequent
+    // audio_start frames can play immediately.
+    const ctx = this._ensureAudioCtx();
+    if (!ctx) {
+      this._setAudioChip("当前浏览器不支持 WebAudio", "error");
+      return;
+    }
+    try {
+      if (ctx.state === "suspended") await ctx.resume();
+    } catch (err) {
+      this._setAudioChip("AudioContext 启动失败: " + err.message, "error");
+      return;
+    }
+    if (ctx.state !== "running") {
+      this._setAudioChip(`AudioContext 状态异常: ${ctx.state}`, "error");
+      return;
+    }
+    this.audioReady = true;
+    this._setAudioChip(`已启用（${ctx.sampleRate} Hz）`, "idle");
+    this._showAudioRowIfNeeded();
+    this._subscribeAudio();
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.pendingAudioSubscribe = true;
+      this._setAudioChip("已启用 · 等 WS 开启后自动订阅", "idle");
+    }
+  },
+
+  _subscribeAudio() {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      this.pendingAudioSubscribe = true;
+      return false;
+    }
+    try {
+      ws.send(JSON.stringify({ type: "subscribe_audio" }));
+      this.pendingAudioSubscribe = false;
+      if (!this.audioActive) {
+        this._setAudioChip("订阅已发送", "idle");
+      }
+      return true;
+    } catch (err) {
+      this._setAudioChip("订阅失败: " + err.message, "error");
+      return false;
+    }
+  },
+
+  _unsubscribeAudio() {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try { ws.send(JSON.stringify({ type: "unsubscribe_audio" })); }
+    catch (_) {}
+  },
+
+  /* WS-level keep-alive ping; some proxies and NATs reap idle WS
+   * connections after ~30-60 s of silence. */
+  _armPing() {
+    if (this.audioPingTimer) clearInterval(this.audioPingTimer);
+    this.audioPingTimer = setInterval(() => {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      try { ws.send(JSON.stringify({ type: "ping" })); } catch (_) {}
+    }, 15000);
+  },
+
+  async _onAudioStreamStart(sampleRate, channels) {
+    const ctx = this._ensureAudioCtx();
+    if (!ctx || !this.audioReady) {
+      this._setAudioChip("AudioContext 未就绪", "error");
+      return;
+    }
+    // Defensive resume: state can flip back to "suspended" after long
+    // idle. If still not running, skip and surface the error.
+    if (ctx.state !== "running") {
+      try { await ctx.resume(); } catch (_) {}
+      if (ctx.state !== "running") {
+        this._setAudioChip("AudioContext 已挂起", "error");
+        return;
+      }
+    }
+    this.audioSampleRate = sampleRate || 24000;
+    this.audioChannels = channels || 1;
+    this.audioActive = true;
+    // No pre-roll: the keep-alive oscillator + eager resume() in
+    // start() already paid the AudioContext cold-start tax.
+    this.audioScheduledUntil = ctx.currentTime;
+    this.audioPushedSec = 0;
+    this._setAudioChip("浏览器音频流开始", "live");
+  },
+
+  _onAudioStreamEnd() {
+    if (!this.audioActive) {
+      this._setAudioChip("服务端 audio_end · 未播放", "idle");
+      return;
+    }
+    const sec = this.audioPushedSec;
+    this.audioActive = false;
+    this.audioScheduledUntil = 0;
+    this.audioPushedSec = 0;
+    this._setAudioChip(`浏览器音频流结束 · 已播 ${sec.toFixed(2)}s`, "idle");
+  },
+
+  _handleBinaryChunk(arrayBuf) {
+    if (!this.audioReady) {
+      this._setAudioChip("已收 chunk · 请先点 ▶ 启用浏览器音频", "error");
+      return;
+    }
+    if (!this.audioActive) return;
+
+    // 12-byte header (sr:u32, ch:u32, n:u32 little-endian) + float32 LE samples.
+    const view = new DataView(arrayBuf);
+    if (arrayBuf.byteLength < 12) return;
+    const sr = view.getUint32(0, true);
+    const ch = view.getUint32(4, true);
+    const n  = view.getUint32(8, true);
+    const sampleCount = sr === this.audioSampleRate
+      ? n
+      : Math.floor(n * (this.audioSampleRate / (sr || this.audioSampleRate)));
+    if (sampleCount <= 0) return;
+    const expectedBytes = sampleCount * ch * 4;
+    if (arrayBuf.byteLength < 12 + expectedBytes) return;
+
+    const ctx = this.audioCtx;
+    if (!ctx) return;
+
+    const f32 = new Float32Array(arrayBuf.slice(12, 12 + expectedBytes));
+    const buffer = ctx.createBuffer(ch, sampleCount, this.audioSampleRate);
+    // qwen3 is always mono; the ch>0 branch is here for future use.
+    for (let c = 0; c < ch; c++) {
+      const data = buffer.getChannelData(c);
+      if (ch === 1) data.set(f32);
+      else for (let i = 0; i < sampleCount; i++) data[i] = f32[i * ch + c];
+    }
+
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    // Back-to-back when the model keeps up; play immediately when
+    // the model lags (no 20ms lookahead).
+    const now = ctx.currentTime;
+    const startAt = this.audioScheduledUntil > now
+                    ? this.audioScheduledUntil : now;
+    src.start(startAt);
+    this.audioScheduledUntil = startAt + buffer.duration;
+    this.audioPushedSec += buffer.duration;
+    this._setAudioChip(`播放 ${this.audioPushedSec.toFixed(2)}s`, "live");
+  },
+
+  _setAudioChip(text, state) {
+    const chip = document.getElementById("tts-audio-chip");
+    if (!chip) return;
+    chip.textContent = text;
+    if (state) chip.dataset.state = state;
+  },
+
+  _showAudioRowIfNeeded() {
+    const row = document.getElementById("tts-audio-row");
+    if (!row) return;
+    row.classList.toggle("hidden", !this._wantsBrowser());
+  },
+
+  _audioEl() {
+    return document.getElementById("tts-audio");
+  },
+
+  _selectedPlayTo() {
+    const sel = document.querySelector('input[name="tts-play-to"]:checked');
+    return sel ? sel.value : "device";
+  },
+
+  _wantsBrowser() {
+    const v = this._selectedPlayTo();
+    return v === "browser" || v === "both";
   },
 };
 

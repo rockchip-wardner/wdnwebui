@@ -312,6 +312,7 @@
               <span class="tts-label">声音</span>
               <select id="tts-ref-speaker" class="tts-select">
                 <option value="girl_base">girl_base（默认）</option>
+                <option value="ahu">ahu</option>
               </select>
             </label>
             <label class="tts-field">
@@ -328,12 +329,36 @@
               <span class="tts-label">音量 <span id="tts-volume-value">10%</span></span>
               <input type="range" id="tts-volume" min="0" max="100" step="5" value="10" />
             </label>
+            <label class="tts-field">
+              <span class="tts-label">播放到</span>
+              <div class="tts-playto" role="radiogroup" aria-label="播放目标">
+                <label class="tts-playto-opt">
+                  <input type="radio" name="tts-play-to" value="device" checked />
+                  <span>设备</span>
+                </label>
+                <label class="tts-playto-opt">
+                  <input type="radio" name="tts-play-to" value="browser" />
+                  <span>浏览器</span>
+                </label>
+                <label class="tts-playto-opt">
+                  <input type="radio" name="tts-play-to" value="both" />
+                  <span>两者</span>
+                </label>
+              </div>
+            </label>
             <span class="vd-spacer"></span>
             <button id="tts-start" class="vd-btn vd-btn-primary">开始生成</button>
             <button id="tts-stop"  class="vd-btn" disabled>停止</button>
           </div>
 
           <div class="tts-meta" id="tts-meta">未开始</div>
+          <div class="tts-audio-row hidden" id="tts-audio-row">
+            <button id="tts-audio-enable" class="vd-btn" type="button">
+              ▶ 启用浏览器音频（一次性授权）
+            </button>
+            <span class="tts-audio-chip" id="tts-audio-chip">浏览器音频未启用</span>
+            <audio id="tts-audio" class="hidden" preload="auto" controls></audio>
+          </div>
         </div>
 
         <section class="vd-section">
@@ -409,6 +434,6 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js" defer></script>
+  <script src="/static/js/app.js?v=13" defer></script>
 </body>
 </html>
