@@ -627,7 +627,9 @@ html, body {
   color: var(--muted);
   margin-bottom: 0.2rem;
   display: flex;
+  align-items: center;
   gap: 0.6rem;
+  flex-wrap: wrap;
 }
 .vd-event-meta .tag {
   background: #e0e7ff;
@@ -635,11 +637,50 @@ html, body {
   padding: 0 0.4rem;
   border-radius: 3px;
 }
+/* Shrink + ellipsis so long paths don't push action buttons off-screen. */
+.vd-event-path {
+  min-width: 0;
+  flex: 1 1 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Right-align push shared by play + download buttons. */
+.vd-event-action {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
 .vd-event-text {
   color: #111827;
   white-space: pre-wrap;
   word-break: break-word;
 }
+.vd-btn-mini {
+  padding: 0.2rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: #111827;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1.4;
+  transition: background-color 0.12s ease;
+}
+.vd-btn-mini:hover { background: #f3f4f6; }
+.vd-btn-mini:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.tts-history-player {
+  height: 28px;
+  max-width: 320px;
+  vertical-align: middle;
+  flex: 0 1 320px;
+}
+.tts-history-player.hidden { display: none; }
 .vd-event-empty {
   padding: 1rem;
   text-align: center;

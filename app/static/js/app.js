@@ -1573,10 +1573,6 @@ const TTS = {
       audioEl.addEventListener("error", () =>
         this.setStatus("浏览器播放失败 (autoplay 可能被拦截)", true));
     }
-    const enableBtn = document.getElementById("tts-audio-enable");
-    if (enableBtn) {
-      enableBtn.addEventListener("click", () => this.enableBrowserAudio());
-    }
     document.querySelectorAll('input[name="tts-play-to"]').forEach((el) => {
       el.addEventListener("change", () => this._showAudioRowIfNeeded());
     });
@@ -1769,7 +1765,12 @@ const TTS = {
       this.lastSnap = body;
       this.render(body);
       this.ensureWs();
-      // onopen will (re-)send subscribe_audio once the WS is OPEN.
+      // onopen doesn't fire when the WS is already OPEN (server keeps
+      // it alive between runs) — resubscribe explicitly so the server
+      // recreates the audio pump for this run.
+      if (this._wantsBrowser() && this.audioReady) {
+        this._subscribeAudio();
+      }
     } catch (err) {
       this.setStatus("提交失败: " + err.message, true);
     }
@@ -1808,19 +1809,97 @@ const TTS = {
       items.slice().reverse().forEach((it) => {
         const li = document.createElement("li");
         li.className = "vd-event";
+
         const when = new Date((it.ts || 0) * 1000);
         const whenStr = when.toLocaleString();
-        li.innerHTML = `
-          <div class="vd-event-meta">
-            <span class="tag">${whenStr}</span>
-            <span class="tag">${it.speaker || "--"}</span>
-            <span class="tag">${(it.audio_sec || 0).toFixed(2)}s</span>
-            <span class="tag">${it.frames || 0} 帧</span>
-            <span class="vd-event-path">${it.output || ""}</span>
-          </div>
-          <div class="vd-event-text"></div>
-        `;
-        li.querySelector(".vd-event-text").textContent = it.text || "";
+        const url = it.output_url || "";
+        const filename = (it.output || "").split("/").filter(Boolean).pop()
+          || "tts.wav";
+
+        // textContent throughout so path / speaker never go through
+        // innerHTML (XSS). Action buttons sit at the right edge of this
+        // row via .vd-event-action { margin-left: auto } in CSS.
+        const meta = document.createElement("div");
+        meta.className = "vd-event-meta";
+        [
+          whenStr,
+          it.speaker || "--",
+          (it.audio_sec || 0).toFixed(2) + "s",
+          (it.frames || 0) + " 帧",
+        ].forEach((txt) => {
+          const sp = document.createElement("span");
+          sp.className = "tag";
+          sp.textContent = txt;
+          meta.appendChild(sp);
+        });
+        const path = document.createElement("span");
+        path.className = "vd-event-path";
+        path.textContent = it.output || "";
+        path.title = it.output || "";
+        meta.appendChild(path);
+
+        if (url) {
+          const playBtn = document.createElement("button");
+          playBtn.type = "button";
+          playBtn.className = "vd-btn vd-btn-mini vd-event-action";
+          playBtn.textContent = "▶ 试听";
+          meta.appendChild(playBtn);
+
+          const player = document.createElement("audio");
+          player.className = "tts-history-player hidden";
+          player.controls = true;
+          player.preload = "none";
+          player.src = url;
+          meta.appendChild(player);
+
+          const dlBtn = document.createElement("a");
+          dlBtn.className = "vd-btn vd-btn-mini vd-event-action";
+          dlBtn.href = url;
+          dlBtn.download = filename;
+          dlBtn.textContent = "⬇ 下载";
+          dlBtn.title = "下载 " + filename;
+          meta.appendChild(dlBtn);
+
+          playBtn.addEventListener("click", async () => {
+            const wasHidden = player.classList.contains("hidden");
+            document.querySelectorAll(
+              ".tts-history-player:not(.hidden)"
+            ).forEach((other) => {
+              if (other !== player) {
+                try { other.pause(); } catch (_) {}
+              }
+            });
+            const shared = this._audioEl();
+            if (shared && !shared.classList.contains("hidden")) {
+              try { shared.pause(); } catch (_) {}
+            }
+            if (wasHidden) {
+              player.classList.remove("hidden");
+              playBtn.textContent = "■ 停止";
+              try {
+                await player.play();
+              } catch (e) {
+                this.setStatus("试听失败: " + e.message, true);
+              }
+            } else {
+              try { player.pause(); } catch (_) {}
+              player.classList.add("hidden");
+              playBtn.textContent = "▶ 试听";
+            }
+          });
+          player.addEventListener("ended", () => {
+            playBtn.textContent = "▶ 试听";
+            player.classList.add("hidden");
+          });
+        }
+
+        const text = document.createElement("div");
+        text.className = "vd-event-text";
+        text.textContent = it.text || "";
+
+        li.appendChild(meta);
+        li.appendChild(text);
+
         listEl.appendChild(li);
       });
     }
@@ -1915,6 +1994,9 @@ const TTS = {
       this._onAudioStreamEnd();
       return;
     }
+    // Drop WS-heartbeat acks; otherwise the server's pong overwrites
+    // the snapshot in #data-tts every 15 s.
+    if (snap.type === "pong") return;
     this.lastSnap = snap;
     this.render(snap);
     if (snap.state === "done" || snap.state === "stopped" || snap.state === "error") {
@@ -1939,35 +2021,6 @@ const TTS = {
       osc.start();
     } catch (_) {}
     return this.audioCtx;
-  },
-
-  async enableBrowserAudio() {
-    // Called from a button click → user gesture. Resume the
-    // AudioContext (Chrome blocks it otherwise) so subsequent
-    // audio_start frames can play immediately.
-    const ctx = this._ensureAudioCtx();
-    if (!ctx) {
-      this._setAudioChip("当前浏览器不支持 WebAudio", "error");
-      return;
-    }
-    try {
-      if (ctx.state === "suspended") await ctx.resume();
-    } catch (err) {
-      this._setAudioChip("AudioContext 启动失败: " + err.message, "error");
-      return;
-    }
-    if (ctx.state !== "running") {
-      this._setAudioChip(`AudioContext 状态异常: ${ctx.state}`, "error");
-      return;
-    }
-    this.audioReady = true;
-    this._setAudioChip(`已启用（${ctx.sampleRate} Hz）`, "idle");
-    this._showAudioRowIfNeeded();
-    this._subscribeAudio();
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.pendingAudioSubscribe = true;
-      this._setAudioChip("已启用 · 等 WS 开启后自动订阅", "idle");
-    }
   },
 
   _subscribeAudio() {

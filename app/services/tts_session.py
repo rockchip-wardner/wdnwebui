@@ -17,6 +17,7 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -436,11 +437,12 @@ class TtsSession:
         The endpoint lives at ``/api/tts/output`` (see ``app/api/tts.py``)
         and is parameterised by the on-disk file path so the same snapshot
         shape (an absolute ``output`` + a relative ``output_url``) survives
-        web reloads and history lookups. ``name=`` is included for
-        human-readable download filenames."""
+        web reloads and history lookups. Path is URL-encoded (``/`` left
+        intact) so future upload dirs with spaces in their name keep working."""
         if path is None:
             return ""
-        return "/api/tts/output?path=" + str(path)
+        return "/api/tts/output?path=" + urllib.parse.quote(
+            str(path), safe="/")
 
     def register_broadcaster(self, fn: Callable[[dict], None]) -> None:
         with self._broadcast_lock:
