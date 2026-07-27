@@ -35,5 +35,6 @@ update_pkg() {
 
 update_pkg rkv  "git+ssh://git@10.10.10.10/pythonsdk/pyrkv.git#egg=rkv"
 update_pkg rkai "git+ssh://git@10.10.10.10/pythonsdk/pyrkai.git#egg=rkai"
+update_pkg wdiot "git+ssh://git@10.10.10.10/pythonsdk/wdiot.git#egg=wdiot"
 
 echo "更新完成。"

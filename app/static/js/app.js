@@ -6,7 +6,7 @@ async function fetchVersion() {
     const r = await fetch("/health");
     if (!r.ok) return;
     const el = document.getElementById("brand-version");
-    if (el) el.textContent = "v" + (window.__APP_VERSION__ || "0.1.0");
+    if (el) el.textContent = "v" + (window.__APP_VERSION__ || "0.2.0");
   } catch (_) { /* ignore */ }
 }
 
@@ -1044,6 +1044,8 @@ const Base = {
   render(data) {
     this.dirty = false;
     const section = (data && data.section) || {};
+    const deviceNameInput = document.getElementById("bc-device-name");
+    if (deviceNameInput) deviceNameInput.value = section.device_name || "";
     const modelPathInput = document.getElementById("bc-model-path");
     if (modelPathInput) modelPathInput.value = section.model_path || "";
     this.refreshPathLabel();
@@ -1081,7 +1083,12 @@ const Base = {
   },
 
   async save() {
+    const deviceName = (document.getElementById("bc-device-name")?.value || "").trim();
     const modelPath = (document.getElementById("bc-model-path")?.value || "").trim();
+    if (!deviceName) {
+      this.setFoot("设备名不能为空", "danger");
+      return;
+    }
     if (!modelPath) {
       this.setFoot("模型存放路径不能为空", "danger");
       this.updateFieldStatus();
@@ -1103,7 +1110,7 @@ const Base = {
       const r = await fetch(API_PREFIX + "/config/base", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_path: modelPath }),
+        body: JSON.stringify({ device_name: deviceName, model_path: modelPath }),
       });
       const text = await r.text();
       let body;

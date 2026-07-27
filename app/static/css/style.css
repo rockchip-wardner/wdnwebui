@@ -48,7 +48,9 @@ html, body {
   flex-direction: column;
   gap: 0.25rem;
 }
-.brand-title { font-size: 1.05rem; font-weight: 600; color: #fff; }
+.brand-title { font-size: 1.45rem; font-weight: 600; color: #fff; }
+.brand-meta { display: flex; align-items: baseline; gap: 0.5rem; }
+.brand-subtitle { font-size: 0.78rem; color: #cbd5e1; font-style: italic; letter-spacing: 0.04em; }
 .brand-version { font-size: 0.75rem; color: #9ca3af; font-family: var(--mono); }
 
 .nav { display: flex; flex-direction: column; }

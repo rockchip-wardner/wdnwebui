@@ -18,6 +18,8 @@ The runtime path is whatever ``PYRKAIWEB_CONFIG`` resolved to (see
 from __future__ import annotations
 
 import json
+import secrets
+import string
 from pathlib import Path
 from typing import Any
 
@@ -31,11 +33,29 @@ from app.services.config import get_config
 router = APIRouter(tags=["config"])
 
 
+_DEVICE_NAME_ALPHABET = string.ascii_letters + string.digits
+_DEVICE_NAME_LENGTH = 8
+
+
+def _random_device_name() -> str:
+    """8-char alphanumeric identifier (mixed case + digits)."""
+    return "".join(
+        secrets.choice(_DEVICE_NAME_ALPHABET)
+        for _ in range(_DEVICE_NAME_LENGTH)
+    )
+
+
 # --- base section schema --------------------------------------------------
 #
 # Add new fields here when more基础配置 entries show up. The PUT endpoint
 # validates with this model, so unknown fields from the client are
 # silently dropped (Pydantic's default `extra="ignore"`).
+#
+# `device_name` is a human-readable identifier for this device. The
+# default is generated once (random 8-char alphanumeric) the first time
+# the `base` section is read without one, then persisted to
+# ``config.json`` so the value stays stable across reads and reboots.
+# Users can overwrite it via PUT /api/config/base.
 #
 # `model_path` is the on-device directory where downstream SDKs (e.g.
 # rkai's RKNN model cache) look for weights. Services that consume it
@@ -43,17 +63,31 @@ router = APIRouter(tags=["config"])
 # after each successful PUT so a save takes effect without a restart.
 
 _BASE_DEFAULTS: dict[str, Any] = {
+    "device_name": "",  # filled lazily by _generate_missing_defaults()
     "model_path": "/userdata/models/",
 }
 
 
 class BaseConfig(BaseModel):
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "ignore", "validate_default": True}
+
+    device_name: str = Field(
+        default="",
+        description="设备名（默认首次读取时随机生成）",
+    )
 
     model_path: str = Field(
         default=_BASE_DEFAULTS["model_path"],
         description="模型存放路径（设备上的绝对路径）",
     )
+
+    @field_validator("device_name")
+    @classmethod
+    def _device_name_nonempty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("device_name 不能为空")
+        return v
 
     @field_validator("model_path")
     @classmethod
@@ -64,6 +98,22 @@ class BaseConfig(BaseModel):
         if not v.startswith("/"):
             raise ValueError("model_path 必须是绝对路径 (以 / 开头)")
         return v
+
+
+def _generate_missing_defaults(stored: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``stored`` with any missing defaultable fields
+    filled in. Persists the result so subsequent reads see the same
+    value (e.g. the randomly-generated device_name stays stable)."""
+    merged = dict(stored)
+    changed = False
+    if not str(merged.get("device_name") or "").strip():
+        merged["device_name"] = _random_device_name()
+        changed = True
+    if changed:
+        # Keep any other (unknown) keys the user has stored so we don't
+        # silently drop them on first-touch upgrade.
+        get_config().set_section("base", merged)
+    return merged
 
 
 @router.get("/config")
@@ -133,11 +183,21 @@ async def get_base_config() -> dict:
     stored = store.get_section("base", {})
     # Filter down to known fields (drop unknowns from prior versions).
     filtered = {k: v for k, v in stored.items() if k in _BASE_DEFAULTS}
+    # Lazily materialize defaults (random device_name) and persist so the
+    # value stays stable across reads / reboots.
+    filtered = _generate_missing_defaults(filtered)
     try:
         bc = BaseConfig(**filtered)
     except Exception:
         # Stored data is broken beyond defaults — fall back cleanly.
         bc = BaseConfig()
+        # Still try to backfill the random device_name into the broken
+        # section so the page has something to render.
+        if not (bc.device_name or "").strip():
+            bc = BaseConfig(
+                device_name=_random_device_name(),
+                model_path=bc.model_path,
+            )
     section = bc.model_dump()
     # Soft existence check so the UI can warn without making it fatal.
     model_path = section.get("model_path") or ""

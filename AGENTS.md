@@ -184,7 +184,13 @@ holds it in memory. The file is seeded with a `base` section at
   key without disturbing siblings. Other sections (e.g. a future
   `power`) stay intact across `base` edits.
 - **`base` section** (Pydantic model `BaseConfig` in
-  `app/api/config.py`) currently has one field:
+  `app/api/config.py`) currently has two fields:
+  - `device_name` — human-readable device identifier. The default is
+    generated lazily on the first `GET /api/config/base` after a
+    missing/empty value (random 8-char alphanumeric, mixed case + digits,
+    via `secrets.choice`) and persisted to `config.json` so the value
+    stays stable across reads and reboots. Validated as non-empty
+    (whitespace stripped).
   - `model_path` — absolute directory where RKNN model weights live
     (default `/userdata/models/`). Validated as non-empty +
     starts-with-`/`; the GET/PUT responses also include a
