@@ -1547,6 +1547,180 @@ const ConfigMenu = {
 
 ConfigMenu.init();
 
+/* ------------------------------------------------------------------ *
+ *  coprocessor menu: third sidebar-foot button. Opens a popover with   *
+ *  one action — "重启所有协处理器" — which POSTs to /api/coprocessor/ *
+ *  restart and runs the same steps as /userdata/samples/reset_182x.sh *
+ *  on the host (four NPU hardware resets + rknn3_startup restart).    *
+ * ------------------------------------------------------------------ */
+
+const CoprocessorMenu = {
+  btn: null,
+  popover: null,
+  status: null,
+  busy: false,
+  ws: null,
+
+  ACTION_LABELS: {
+    restart: {
+      verb:   "重启协处理器",
+      pending: "正在重启所有协处理器…",
+      confirm: "确定要立即重启所有协处理器吗？期间 NPU 推理将不可用。",
+    },
+  },
+
+  init() {
+    this.btn = document.getElementById("coprocessor-btn");
+    this.popover = document.getElementById("coprocessor-popover");
+    this.status = document.getElementById("coprocessor-popover-foot");
+    if (!this.btn || !this.popover) return;
+
+    this.btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggle();
+    });
+
+    document.getElementById("coprocessor-popover-close")
+      .addEventListener("click", () => this.close());
+
+    this.popover.querySelectorAll(".coprocessor-popover-action").forEach((b) => {
+      b.addEventListener("click", () => {
+        const action = b.dataset.coprocessorAction;
+        if (action) this.runAction(action);
+      });
+    });
+
+    document.addEventListener("mousedown", (e) => {
+      if (this.popover.classList.contains("hidden")) return;
+      if (this.popover.contains(e.target) || this.btn.contains(e.target)) return;
+      this.close();
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !this.popover.classList.contains("hidden")) {
+        this.close();
+      }
+    });
+  },
+
+  isOpen() { return !this.popover.classList.contains("hidden"); },
+
+  open() {
+    this.popover.classList.remove("hidden");
+    this.btn.setAttribute("aria-expanded", "true");
+    if (!this.busy) this.setStatus("点击操作前请确认", "");
+  },
+
+  close() {
+    this.popover.classList.add("hidden");
+    this.btn.setAttribute("aria-expanded", "false");
+  },
+
+  toggle() {
+    if (this.isOpen()) this.close(); else this.open();
+  },
+
+  setStatus(text, level) {
+    if (!this.status) return;
+    this.status.textContent = text || "";
+    this.status.classList.remove("warn", "danger", "ok");
+    if (level) this.status.classList.add(level);
+  },
+
+  appendStatus(line) {
+    if (!this.status) return;
+    const cur = this.status.textContent || "";
+    this.status.textContent = cur ? (cur + "\n" + line) : line;
+    // Keep the latest line visible while the user is watching.
+    this.status.scrollTop = this.status.scrollHeight;
+  },
+
+  setActionsDisabled(disabled) {
+    this.popover.querySelectorAll(".coprocessor-popover-action").forEach((b) => {
+      b.disabled = disabled;
+    });
+  },
+
+  async runAction(action) {
+    if (this.busy) return;
+    const meta = this.ACTION_LABELS[action];
+    if (!meta) return;
+    if (!window.confirm(meta.confirm)) return;
+
+    this.busy = true;
+    this.setActionsDisabled(true);
+    this.setStatus(meta.pending, "warn");
+
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${window.location.host}${API_PREFIX}/coprocessor/ws`;
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch (err) {
+      this.setStatus(`${meta.verb} 请求失败: ${err.message}`, "danger");
+      this.busy = false;
+      this.setActionsDisabled(false);
+      return;
+    }
+    this.ws = ws;
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "step_start") {
+        this.setStatus(msg.message || `步骤 ${msg.index}/${msg.total}`, "warn");
+      } else if (msg.type === "step_end") {
+        const tag = `[${msg.index}/${msg.total}] ${(msg.command || []).join(" ")}`;
+        const out = (msg.stdout || "").trim();
+        const err = (msg.stderr || "").trim();
+        this.appendStatus(
+          `${tag} 退出码=${msg.exit} (${msg.duration_ms}ms)` +
+          (out ? `\n  stdout: ${out}` : "") +
+          (err ? `\n  stderr: ${err}` : "")
+        );
+        if (msg.exit !== 0) {
+          this.status.classList.remove("warn", "ok");
+          this.status.classList.add("danger");
+        }
+      } else if (msg.type === "done") {
+        if (msg.ok) {
+          this.setStatus(
+            (this.status.textContent || "") +
+            `\n✓ ${meta.verb} 已完成`,
+            "ok"
+          );
+        } else {
+          this.setStatus(
+            (this.status.textContent || "") +
+            `\n✗ ${meta.verb} 在第 ${msg.failed_step} 步失败`,
+            "danger"
+          );
+        }
+      } else if (msg.type === "error") {
+        this.setStatus(
+          (this.status.textContent || "") +
+          `\n✗ ${meta.verb} 服务端错误: ${msg.detail || ""}`,
+          "danger"
+        );
+      }
+    };
+
+    ws.onerror = () => {
+      this.appendStatus(`✗ ${meta.verb} 连接出错`);
+      this.status.classList.remove("warn", "ok");
+      this.status.classList.add("danger");
+    };
+
+    ws.onclose = () => {
+      this.ws = null;
+      this.busy = false;
+      this.setActionsDisabled(false);
+    };
+  },
+};
+
+CoprocessorMenu.init();
+
 /* ---------------------------------------------------------------- *
  * TTS (语音生成) page                                              *
  * ---------------------------------------------------------------- */
@@ -2180,9 +2354,10 @@ const TTS = {
 
 TTS.init();
 
-/* The two popovers share the same sidebar-foot anchor and would stack
- * on top of each other if both were visible. Wrap each .open() so it
- * closes the other before showing itself. */
+/* The popovers share the same sidebar-foot anchor and would stack on
+ * top of each other if more than one were visible. For each pair, wrap
+ * the left-hand menu's .open() so it closes the right-hand one before
+ * showing itself. */
 function _wrapOpenToCloseOther(menu, other) {
   const orig = menu.open.bind(menu);
   menu.open = function () {
@@ -2190,8 +2365,12 @@ function _wrapOpenToCloseOther(menu, other) {
     orig();
   };
 }
-_wrapOpenToCloseOther(PowerMenu, ConfigMenu);
-_wrapOpenToCloseOther(ConfigMenu, PowerMenu);
+const _menus = [PowerMenu, ConfigMenu, CoprocessorMenu];
+for (const a of _menus) {
+  for (const b of _menus) {
+    if (a !== b) _wrapOpenToCloseOther(a, b);
+  }
+}
 
 /* Surface a top-of-page warning when the service isn't running as root
  * — power actions (shutdown / reboot) need root and will fail silently

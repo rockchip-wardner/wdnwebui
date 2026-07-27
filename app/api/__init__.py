@@ -5,6 +5,22 @@ Each module exposes an `APIRouter` named `router` that gets mounted under
 what makes ``app.include_router(...)`` in ``main.py`` see them — without
 it, only the bare package object is imported and nothing registers.
 """
-from . import config, power, system_logs, system_monitor, tts, video_detection
+from . import (
+    config,
+    coprocessor,
+    power,
+    system_logs,
+    system_monitor,
+    tts,
+    video_detection,
+)
 
-__all__ = ["config", "power", "system_logs", "system_monitor", "tts", "video_detection"]
+__all__ = [
+    "config",
+    "coprocessor",
+    "power",
+    "system_logs",
+    "system_monitor",
+    "tts",
+    "video_detection",
+]

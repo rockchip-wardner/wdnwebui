@@ -33,6 +33,10 @@
                 title="配置管理" aria-label="配置管理" aria-haspopup="dialog">
           <span class="config-btn-icon" aria-hidden="true">⚙</span>
         </button>
+        <button class="coprocessor-btn" id="coprocessor-btn" type="button"
+                title="协处理器管理" aria-label="协处理器管理" aria-haspopup="dialog">
+          <span class="coprocessor-btn-icon" aria-hidden="true">⚒</span>
+        </button>
 
         <div id="power-popover" class="power-popover hidden" role="dialog" aria-label="电源操作">
           <div class="power-popover-head">
@@ -75,6 +79,21 @@
           </div>
           <input id="config-file-input" type="file" accept="application/json,.json"
                  class="hidden" />
+        </div>
+
+        <div id="coprocessor-popover" class="coprocessor-popover hidden" role="dialog" aria-label="协处理器管理">
+          <div class="coprocessor-popover-head">
+            <span class="coprocessor-popover-title">协处理器管理</span>
+            <button class="coprocessor-popover-close" id="coprocessor-popover-close" type="button"
+                    aria-label="关闭">×</button>
+          </div>
+          <div class="coprocessor-popover-body">
+            <button class="coprocessor-popover-action" data-coprocessor-action="restart" type="button">
+              <span class="coprocessor-popover-icon" aria-hidden="true">↻</span>
+              <span class="coprocessor-popover-label">重启所有协处理器</span>
+            </button>
+          </div>
+          <div class="coprocessor-popover-foot" id="coprocessor-popover-foot">点击操作前请确认</div>
         </div>
       </div>
     </aside>

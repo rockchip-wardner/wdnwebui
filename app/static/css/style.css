@@ -1175,6 +1175,124 @@ html, body {
 .config-popover-status.danger { color: #b91c1c; font-weight: 600; }
 .config-popover-status.ok { color: #047857; }
 
+/* ---------- coprocessor menu (third sidebar-foot button) ---------- */
+
+.coprocessor-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: #374151;
+  color: #d1d5db;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.coprocessor-btn:hover { background: #4b5563; color: #fff; }
+.coprocessor-btn:focus { outline: none; border-color: var(--accent); }
+.coprocessor-btn[aria-expanded="true"] {
+  background: #4b5563;
+  color: #fff;
+  border-color: var(--accent);
+}
+.coprocessor-btn-icon { font-family: var(--mono); }
+
+.coprocessor-popover {
+  position: absolute;
+  left: 0;
+  right: 0;                      /* fill the sidebar's inner width */
+  bottom: calc(100% + 8px);      /* expand upward, same as power popover */
+  background: #fff;
+  color: #111827;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 60;                   /* above page content (vd-modal is 50) */
+  overflow: hidden;
+  animation: power-popover-in 0.14s ease-out;
+}
+.coprocessor-popover.hidden { display: none; }
+
+.coprocessor-popover-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.7rem;
+  background: linear-gradient(180deg, #f9fafb, #f3f4f6);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+.coprocessor-popover-title { font-weight: 600; }
+.coprocessor-popover-close {
+  background: transparent;
+  border: none;
+  font-size: 1.05rem;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+}
+.coprocessor-popover-close:hover { color: #111827; background: #e5e7eb; }
+
+.coprocessor-popover-body {
+  display: flex;
+  flex-direction: column;
+  padding: 0.3rem;
+  gap: 2px;
+}
+.coprocessor-popover-action {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.65rem;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.88rem;
+  color: #111827;
+  text-align: left;
+  font-family: inherit;
+}
+.coprocessor-popover-action:hover { background: #eff6ff; }
+.coprocessor-popover-action:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: transparent;
+}
+.coprocessor-popover-action[data-coprocessor-action="restart"]:hover { background: #fef3c7; }
+.coprocessor-popover-action[data-coprocessor-action="restart"] .coprocessor-popover-icon { color: #b45309; }
+.coprocessor-popover-icon {
+  width: 1.1rem;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 0.95rem;
+  flex: 0 0 auto;
+}
+.coprocessor-popover-label { flex: 1 1 auto; }
+
+.coprocessor-popover-foot {
+  padding: 0.45rem 0.7rem;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  background: #f9fafb;
+  min-height: 1.6em;
+  max-height: 18rem;
+  overflow-y: auto;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.coprocessor-popover-foot.warn { color: #b45309; }
+.coprocessor-popover-foot.danger { color: #b91c1c; font-weight: 600; }
+.coprocessor-popover-foot.ok { color: #047857; }
+
 /* ---------- TTS (语音生成) page ---------- */
 .tts-banner {
   display: flex;
