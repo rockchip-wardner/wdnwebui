@@ -61,10 +61,15 @@ def _random_device_name() -> str:
 # rkai's RKNN model cache) look for weights. Services that consume it
 # should re-read it from `get_config().get_section("base")["model_path"]`
 # after each successful PUT so a save takes effect without a restart.
+#
+# `resource_dir` is the on-device directory that downstream UIs (e.g. the
+# video-detection file picker) use as the root for server-side browsing.
+# Same lazy re-read contract as `model_path`.
 
 _BASE_DEFAULTS: dict[str, Any] = {
     "device_name": "",  # filled lazily by _generate_missing_defaults()
     "model_path": "/userdata/models/",
+    "resource_dir": "/userdata",
 }
 
 
@@ -79,6 +84,11 @@ class BaseConfig(BaseModel):
     model_path: str = Field(
         default=_BASE_DEFAULTS["model_path"],
         description="模型存放路径（设备上的绝对路径）",
+    )
+
+    resource_dir: str = Field(
+        default=_BASE_DEFAULTS["resource_dir"],
+        description="资源存放目录（设备上的绝对路径，视频检测浏览等场景使用）",
     )
 
     @field_validator("device_name")
@@ -99,6 +109,16 @@ class BaseConfig(BaseModel):
             raise ValueError("model_path 必须是绝对路径 (以 / 开头)")
         return v
 
+    @field_validator("resource_dir")
+    @classmethod
+    def _abs_resource_dir(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("resource_dir 不能为空")
+        if not v.startswith("/"):
+            raise ValueError("resource_dir 必须是绝对路径 (以 / 开头)")
+        return v
+
 
 def _generate_missing_defaults(stored: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``stored`` with any missing defaultable fields
@@ -109,6 +129,16 @@ def _generate_missing_defaults(stored: dict[str, Any]) -> dict[str, Any]:
     if not str(merged.get("device_name") or "").strip():
         merged["device_name"] = _random_device_name()
         changed = True
+    # Persist the other defaults too so config.json is a complete record
+    # of what's actually in effect (otherwise a fresh install would only
+    # see `device_name` written, with the rest living only as Pydantic
+    # defaults invisible on disk).
+    for key, default in _BASE_DEFAULTS.items():
+        if key == "device_name":
+            continue  # handled above with the random fill
+        if key not in merged or not str(merged.get(key) or "").strip():
+            merged[key] = default
+            changed = True
     if changed:
         # Keep any other (unknown) keys the user has stored so we don't
         # silently drop them on first-touch upgrade.
@@ -201,8 +231,12 @@ async def get_base_config() -> dict:
     section = bc.model_dump()
     # Soft existence check so the UI can warn without making it fatal.
     model_path = section.get("model_path") or ""
-    exists = bool(model_path) and Path(model_path).exists()
-    return {"section": section, "model_path_exists": exists}
+    resource_dir = section.get("resource_dir") or ""
+    return {
+        "section": section,
+        "model_path_exists": bool(model_path) and Path(model_path).exists(),
+        "resource_dir_exists": bool(resource_dir) and Path(resource_dir).exists(),
+    }
 
 
 @router.put("/config/base")
@@ -212,10 +246,11 @@ async def put_base_config(payload: BaseConfig) -> dict:
     section = payload.model_dump()
     snap = get_config().set_section("base", section)
     model_path = section.get("model_path") or ""
-    exists = bool(model_path) and Path(model_path).exists()
+    resource_dir = section.get("resource_dir") or ""
     return {
         "ok": True,
         "section": section,
-        "model_path_exists": exists,
+        "model_path_exists": bool(model_path) and Path(model_path).exists(),
+        "resource_dir_exists": bool(resource_dir) and Path(resource_dir).exists(),
         "data": snap,
     }

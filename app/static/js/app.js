@@ -1048,10 +1048,17 @@ const Base = {
     if (deviceNameInput) deviceNameInput.value = section.device_name || "";
     const modelPathInput = document.getElementById("bc-model-path");
     if (modelPathInput) modelPathInput.value = section.model_path || "";
+    const resourceDirInput = document.getElementById("bc-resource-dir");
+    if (resourceDirInput) resourceDirInput.value = section.resource_dir || "";
     this.refreshPathLabel();
     document.getElementById("data-base-config").textContent =
-      JSON.stringify({ section, model_path_exists: data.model_path_exists }, null, 2);
+      JSON.stringify({
+        section,
+        model_path_exists: data.model_path_exists,
+        resource_dir_exists: data.resource_dir_exists,
+      }, null, 2);
     this.updateFieldStatus(data.model_path_exists);
+    this.updateResourceDirStatus(data.resource_dir_exists);
     this.setFoot("", "");
   },
 
@@ -1082,21 +1089,59 @@ const Base = {
     }
   },
 
+  updateResourceDirStatus(existsOverride) {
+    const v = (document.getElementById("bc-resource-dir")?.value || "").trim();
+    const el = document.getElementById("bc-resource-dir-status");
+    if (!el) return;
+    el.classList.remove("ok", "warn", "danger");
+    if (!v) {
+      el.textContent = "请填写";
+      el.classList.add("warn");
+      return;
+    }
+    if (!v.startsWith("/")) {
+      el.textContent = "✗ 必须是绝对路径";
+      el.classList.add("danger");
+      return;
+    }
+    const exists = (typeof existsOverride === "boolean")
+      ? existsOverride
+      : false;
+    if (exists) {
+      el.textContent = "✓ 目录存在";
+      el.classList.add("ok");
+    } else {
+      el.textContent = "保存后再确认目录是否存在";
+      el.classList.add("warn");
+    }
+  },
+
   async save() {
     const deviceName = (document.getElementById("bc-device-name")?.value || "").trim();
     const modelPath = (document.getElementById("bc-model-path")?.value || "").trim();
+    const resourceDir = (document.getElementById("bc-resource-dir")?.value || "").trim();
     if (!deviceName) {
       this.setFoot("设备名不能为空", "danger");
       return;
     }
     if (!modelPath) {
-      this.setFoot("模型存放路径不能为空", "danger");
+      this.setFoot("模型目录不能为空", "danger");
       this.updateFieldStatus();
       return;
     }
     if (!modelPath.startsWith("/")) {
-      this.setFoot("模型存放路径必须是绝对路径 (以 / 开头)", "danger");
+      this.setFoot("模型目录必须是绝对路径 (以 / 开头)", "danger");
       this.updateFieldStatus();
+      return;
+    }
+    if (!resourceDir) {
+      this.setFoot("资源存放目录不能为空", "danger");
+      this.updateResourceDirStatus();
+      return;
+    }
+    if (!resourceDir.startsWith("/")) {
+      this.setFoot("资源存放目录必须是绝对路径 (以 / 开头)", "danger");
+      this.updateResourceDirStatus();
       return;
     }
 
@@ -1110,7 +1155,11 @@ const Base = {
       const r = await fetch(API_PREFIX + "/config/base", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_name: deviceName, model_path: modelPath }),
+        body: JSON.stringify({
+          device_name: deviceName,
+          model_path: modelPath,
+          resource_dir: resourceDir,
+        }),
       });
       const text = await r.text();
       let body;
@@ -1124,11 +1173,12 @@ const Base = {
       document.getElementById("data-base-config").textContent =
         JSON.stringify(body, null, 2);
       this.updateFieldStatus(body.model_path_exists);
+      this.updateResourceDirStatus(body.resource_dir_exists);
       this.dirty = false;
-      const existsNote = body.model_path_exists
-        ? "（目录存在）"
-        : "（⚠ 目录当前不存在，请手动创建或调整）";
-      this.setFoot("已保存 " + existsNote, "ok");
+      const parts = [];
+      parts.push(body.model_path_exists ? "模型目录存在" : "⚠ 模型目录不存在");
+      parts.push(body.resource_dir_exists ? "资源存放目录存在" : "⚠ 资源存放目录不存在");
+      this.setFoot("已保存（" + parts.join(" · ") + "）", "ok");
     } catch (e) {
       this.setFoot("保存失败: " + e.message, "danger");
     } finally {

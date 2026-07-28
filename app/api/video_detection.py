@@ -20,6 +20,7 @@ from fastapi import (
 
 from app.services.detector import get_detector
 from app.services.video_session import get_session
+from app.services.config import get_config
 
 
 router = APIRouter(tags=["video-detection"])
@@ -27,9 +28,27 @@ router = APIRouter(tags=["video-detection"])
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "services" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Default root for the server-side file browser. Override at startup with
-# VD_FS_ROOT if you want to constrain what the web UI can see (e.g. /mnt).
-_DEFAULT_FS_ROOT = os.environ.get("VD_FS_ROOT", "/")
+
+def _get_fs_root() -> str:
+    """Resolve the root directory the server-side file browser is
+    allowed to descend into. Priority:
+
+    1. ``VD_FS_ROOT`` env var (operator override; takes precedence over
+       anything stored in config so a host-side lockdown still wins).
+    2. ``base.resource_dir`` from ``config.json`` — the on-device
+       directory the user picked in the 基础配置 page (default
+       ``/userdata``). Read live on every call so a save takes effect
+       on the next click of 浏览设备.
+    3. Hard fallback ``/userdata`` if config is missing the field.
+    """
+    env_root = os.environ.get("VD_FS_ROOT")
+    if env_root:
+        return env_root
+    base = get_config().get_section("base", {}) or {}
+    rd = base.get("resource_dir")
+    if isinstance(rd, str) and rd.strip():
+        return rd.strip()
+    return "/userdata"
 # Pseudo-filesystems (and other large / sensitive trees) we never want to
 # descend into from the modal. Matched by prefix so /proc/1, /proc/foo,
 # etc. are all skipped.
@@ -61,11 +80,13 @@ async def get_video_detection() -> dict:
 async def browse_fs(path: str = "") -> dict:
     """List one directory on the server's filesystem.
 
-    The path is resolved and must stay under ``VD_FS_ROOT`` so the web
+    The path is resolved and must stay under the configured FS root
+    (``base.resource_dir``, with ``VD_FS_ROOT`` overriding) so the web
     UI cannot wander outside what's intended. Pseudo-filesystems and
     well-known system trees are filtered.
     """
-    raw = path.strip() or _DEFAULT_FS_ROOT
+    fs_root = _get_fs_root()
+    raw = path.strip() or fs_root
     try:
         target = Path(raw).resolve(strict=False)
     except (OSError, RuntimeError) as e:
@@ -75,7 +96,7 @@ async def browse_fs(path: str = "") -> dict:
             status_code=403,
             detail=f"路径 {target} 在黑名单中",
         )
-    root = Path(_DEFAULT_FS_ROOT).resolve(strict=False)
+    root = Path(fs_root).resolve(strict=False)
     if not _is_within(target, root):
         raise HTTPException(
             status_code=400,

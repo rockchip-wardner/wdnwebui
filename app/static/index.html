@@ -206,18 +206,29 @@
 
           <section class="bc-section">
             <header class="bc-section-head">
-              <h3>模型</h3>
-              <span class="bc-hint">RKNN 模型权重的存放目录</span>
+              <h3>路径配置</h3>
+              <span class="bc-hint">设备上的各类目录</span>
             </header>
             <div class="bc-field">
-              <label class="bc-label" for="bc-model-path">模型存放路径</label>
+              <label class="bc-label" for="bc-model-path">模型目录</label>
               <input type="text" id="bc-model-path" name="model_path"
                      class="bc-input"
                      placeholder="/userdata/models/"
                      spellcheck="false" />
               <div class="bc-meta">
                 <span class="bc-status" id="bc-model-path-status">--</span>
-                <span class="bc-hint">必须是设备上的绝对路径 (以 / 开头)</span>
+                <span class="bc-hint">RKNN 模型权重存放的绝对路径 (以 / 开头)</span>
+              </div>
+            </div>
+            <div class="bc-field">
+              <label class="bc-label" for="bc-resource-dir">资源存放目录</label>
+              <input type="text" id="bc-resource-dir" name="resource_dir"
+                     class="bc-input"
+                     placeholder="/userdata"
+                     spellcheck="false" />
+              <div class="bc-meta">
+                <span class="bc-status" id="bc-resource-dir-status">--</span>
+                <span class="bc-hint">视频检测等页面"浏览设备"将以该目录为根 (绝对路径，以 / 开头)</span>
               </div>
             </div>
           </section>
@@ -472,6 +483,6 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js?v=13" defer></script>
+  <script src="/static/js/app.js?v=14" defer></script>
 </body>
 </html>
