@@ -1,6 +1,7 @@
 {
   "base": {
     "model_path": "/userdata/models/",
-    "device_name": "TGx2u9ud"
+    "device_name": "TGx2u9ud",
+    "resource_dir": "/userdata"
   }
 }
