@@ -18,11 +18,17 @@
       </div>
       <nav class="nav">
         <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统监控</a>
-        <a href="#base-config"     data-page="base-config"     class="nav-item">基础配置</a>
+        <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
         <a href="#surveillance"    data-page="surveillance"    class="nav-item">视频监控</a>
-        <a href="#video-detection" data-page="video-detection" class="nav-item">视频检测</a>
-        <a href="#tts"             data-page="tts"             class="nav-item">语音生成</a>
-        <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
+        <a href="#audio-monitor"   data-page="audio-monitor"   class="nav-item">音频监控</a>
+        <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
+        <a href="#im-bridge"       data-page="im-bridge"       class="nav-item">应用对接</a>
+        <div class="nav-group" data-group="debug">
+          <span class="nav-group-title">调测</span>
+          <a href="#video-detection" data-page="video-detection" class="nav-item">视频检测</a>
+          <a href="#tts"             data-page="tts"             class="nav-item">语音生成</a>
+          <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
+        </div>
       </nav>
 
       <div class="sidebar-foot">
@@ -178,7 +184,7 @@
 
       <section id="page-base-config" class="page hidden" data-page="base-config">
         <header class="page-header">
-          <h2>基础配置</h2>
+          <h2>系统配置</h2>
           <div class="header-meta">
             <span class="collected-at" id="base-config-path">--</span>
             <button class="refresh-btn" id="base-config-refresh">刷新</button>
@@ -312,6 +318,45 @@
           <summary>完整 JSON</summary>
           <pre class="payload" id="data-surveillance"></pre>
         </details>
+      </section>
+
+      <section id="page-audio-monitor" class="page hidden" data-page="audio-monitor">
+        <header class="page-header">
+          <h2>音频监控</h2>
+        </header>
+        <div class="page-placeholder">
+          <div class="page-placeholder-icon" aria-hidden="true">♪</div>
+          <div class="page-placeholder-title">尚未实现</div>
+          <div class="page-placeholder-text">
+            该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
+          </div>
+        </div>
+      </section>
+
+      <section id="page-discovery" class="page hidden" data-page="discovery">
+        <header class="page-header">
+          <h2>注册发现</h2>
+        </header>
+        <div class="page-placeholder">
+          <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
+          <div class="page-placeholder-title">尚未实现</div>
+          <div class="page-placeholder-text">
+            该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
+          </div>
+        </div>
+      </section>
+
+      <section id="page-im-bridge" class="page hidden" data-page="im-bridge">
+        <header class="page-header">
+          <h2>应用对接</h2>
+        </header>
+        <div class="page-placeholder">
+          <div class="page-placeholder-icon" aria-hidden="true">✉</div>
+          <div class="page-placeholder-title">尚未实现</div>
+          <div class="page-placeholder-text">
+            该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
+          </div>
+        </div>
       </section>
 
       <section id="page-video-detection" class="page hidden" data-page="video-detection">
