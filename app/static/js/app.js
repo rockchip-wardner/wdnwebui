@@ -1673,14 +1673,19 @@ const CoprocessorMenu = {
         const tag = `[${msg.index}/${msg.total}] ${(msg.command || []).join(" ")}`;
         const out = (msg.stdout || "").trim();
         const err = (msg.stderr || "").trim();
+        const accepted = msg.accepted !== false;
         this.appendStatus(
           `${tag} 退出码=${msg.exit} (${msg.duration_ms}ms)` +
           (out ? `\n  stdout: ${out}` : "") +
           (err ? `\n  stderr: ${err}` : "")
         );
-        if (msg.exit !== 0) {
-          this.status.classList.remove("warn", "ok");
+        this.status.classList.remove("warn", "ok", "danger");
+        if (!accepted) {
           this.status.classList.add("danger");
+        } else if (msg.exit !== 0) {
+          this.status.classList.add("warn");
+        } else {
+          this.status.classList.add("ok");
         }
       } else if (msg.type === "done") {
         if (msg.ok) {

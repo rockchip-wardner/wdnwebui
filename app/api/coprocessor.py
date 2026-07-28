@@ -17,10 +17,18 @@ bounded by ``_STEP_TIMEOUT_S``; on expiry the process tree is killed
 and a timeout message is reported so the WS closes even when a step is
 wedged.
 
+``rknn-smi reset -t hw -d 0`` frequently exits with code 255 when the
+target NPU is already in the expected post-reset state — that's a
+benign "nothing to reset" reply, not a failure. Each entry in
+``_STEPS`` carries an ``acceptable_exits`` set so such non-zero but
+expected exit codes don't abort the rest of the sequence. The WS
+``step_end`` frame includes an ``accepted`` flag the UI uses to colour
+the line (danger vs. warn).
+
 WS frame types:
 - ``step_start`` — ``{index, total, command, message}``
 - ``step_end``   — ``{index, total, command, exit, stdout, stderr,
-                     duration_ms}``
+                     duration_ms, accepted}``
 - ``done``       — ``{ok, failed_step}``
 - ``error``      — ``{detail}`` (only on unexpected exceptions)
 """
@@ -36,12 +44,14 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 router = APIRouter(tags=["coprocessor"])
 
 
-_STEPS: list[list[str]] = [
-    ["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"],
-    ["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"],
-    ["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"],
-    ["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"],
-    ["sudo", "rknn3_startup", "restart"],
+_RKNNSMI_RESET_OK = {0, 255}
+
+_STEPS: list[tuple[list[str], set[int]]] = [
+    (["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"], _RKNNSMI_RESET_OK),
+    (["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"], _RKNNSMI_RESET_OK),
+    (["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"], _RKNNSMI_RESET_OK),
+    (["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"], _RKNNSMI_RESET_OK),
+    (["sudo", "rknn3_startup", "restart"], {0}),
 ]
 
 _STEP_TIMEOUT_S = 60.0
@@ -92,7 +102,7 @@ async def coprocessor_ws(ws: WebSocket) -> None:
     failed_step: int | None = None
     try:
         ok = True
-        for i, cmd in enumerate(_STEPS, 1):
+        for i, (cmd, acceptable) in enumerate(_STEPS, 1):
             label = " ".join(cmd)
             await ws.send_json({
                 "type": "step_start",
@@ -104,6 +114,7 @@ async def coprocessor_ws(ws: WebSocket) -> None:
             t0 = time.monotonic()
             rc, out, err = await _run_step(cmd, _STEP_TIMEOUT_S)
             elapsed_ms = int((time.monotonic() - t0) * 1000)
+            accepted = rc in acceptable
             await ws.send_json({
                 "type": "step_end",
                 "index": i,
@@ -113,8 +124,9 @@ async def coprocessor_ws(ws: WebSocket) -> None:
                 "stdout": out,
                 "stderr": err,
                 "duration_ms": elapsed_ms,
+                "accepted": accepted,
             })
-            if rc != 0:
+            if not accepted:
                 ok = False
                 failed_step = i
                 break
