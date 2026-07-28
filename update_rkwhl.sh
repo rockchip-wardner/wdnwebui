@@ -14,7 +14,8 @@ update_pkg() {
     local dir="$VENV_SRC/$pkg"
 
     if [ ! -d "$dir" ]; then
-        echo "[$pkg] 未找到 $dir，跳过"
+        echo "==> [$pkg] 未找到 $dir，执行 pip install -e 安装"
+        ( cd "$SCRIPT_DIR" && $PIP_TARGET install -e "$repo_url" )
         return 0
     fi
 
