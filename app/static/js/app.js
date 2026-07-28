@@ -6,7 +6,7 @@ async function fetchVersion() {
     const r = await fetch("/health");
     if (!r.ok) return;
     const el = document.getElementById("brand-version");
-    if (el) el.textContent = "v" + (window.__APP_VERSION__ || "0.2.0");
+    if (el) el.textContent = "v" + (window.__APP_VERSION__ || "0.3.0");
   } catch (_) { /* ignore */ }
 }
 
@@ -660,9 +660,6 @@ function initVideoDetection() {
   // upload — the path selected here is the path on the device the
   // server is running on).
   browseBtn.addEventListener("click", () => VdFsModal.open(""));
-  document.getElementById("vd-modal-close").addEventListener("click", () => VdFsModal.close());
-  document.getElementById("vd-modal-pick-dir").addEventListener("click", () => VdFsModal.pickCurrentDir());
-  document.getElementById("vd-modal-pick-file").addEventListener("click", () => VdFsModal.pickSelectedFile());
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       const m = document.getElementById("vd-modal");
@@ -1013,8 +1010,14 @@ const Base = {
     const refreshBtn = document.getElementById("base-config-refresh");
     const reloadBtn = document.getElementById("bc-reload");
 
-    if (refreshBtn) refreshBtn.addEventListener("click", () => this.load());
-    if (reloadBtn) reloadBtn.addEventListener("click", () => this.load());
+    if (refreshBtn) refreshBtn.addEventListener("click", () => {
+      this.load();
+      this.loadSurveillance();
+    });
+    if (reloadBtn) reloadBtn.addEventListener("click", () => {
+      this.load();
+      this.loadSurveillance();
+    });
 
     // Track edits so "放弃修改" actually drops them.
     form.addEventListener("input", () => {
@@ -1028,6 +1031,8 @@ const Base = {
         this.save();
       });
     }
+
+    this.initSurveillance();
   },
 
   async load() {
@@ -1205,6 +1210,261 @@ const Base = {
     el.classList.remove("warn", "danger", "ok");
     if (level) el.classList.add(level);
   },
+
+  // ------------------------------------------------------------------ //
+  // 视频监控 (16-channel config table)                                  //
+  // ------------------------------------------------------------------ //
+  // Shares the same config.json with the 视频监控 page; round-trips
+  // through GET/PUT /api/surveillance/config so any edit here shows
+  // up there and vice versa on the next refresh.
+  survConfigs: [],
+
+  initSurveillance() {
+    if (this.survInitialized) return;
+    this.survInitialized = true;
+
+    const tbody = document.getElementById("bc-surv-tbody");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    for (let i = 1; i <= 16; i++) {
+      const tr = document.createElement("tr");
+      tr.dataset.channelId = String(i);
+
+      const tdId = document.createElement("td");
+      tdId.className = "bc-surv-col-id";
+      tdId.textContent = String(i);
+      tr.appendChild(tdId);
+
+      // Name input
+      const tdName = document.createElement("td");
+      tdName.className = "bc-surv-col-name";
+      const nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.className = "bc-surv-input";
+      nameInput.id = `bc-surv-name-${i}`;
+      nameInput.placeholder = `通道 ${i}`;
+      nameInput.spellcheck = false;
+      tdName.appendChild(nameInput);
+      tr.appendChild(tdName);
+
+      // Source input + browse button
+      const tdSource = document.createElement("td");
+      tdSource.className = "bc-surv-col-source";
+      const srcRow = document.createElement("div");
+      srcRow.className = "bc-surv-source-row";
+      const srcInput = document.createElement("input");
+      srcInput.type = "text";
+      srcInput.className = "bc-surv-input";
+      srcInput.id = `bc-surv-source-${i}`;
+      srcInput.placeholder = "网络流或本地文件/文件夹";
+      srcInput.spellcheck = false;
+      const browseBtn = document.createElement("button");
+      browseBtn.type = "button";
+      browseBtn.className = "vd-btn";
+      browseBtn.textContent = "浏览…";
+      browseBtn.addEventListener("click", () => {
+        // Tell the file-picker modal which input to write the
+        // selected path back into. The VdFsModal.pickSelectedFile
+        // override (installed at module load) reads this target.
+        VdFsModal._sourceTarget = srcInput;
+        VdFsModal.open("");
+      });
+      srcRow.appendChild(srcInput);
+      srcRow.appendChild(browseBtn);
+      tdSource.appendChild(srcRow);
+      tr.appendChild(tdSource);
+
+      // Prompt input
+      const tdPrompt = document.createElement("td");
+      tdPrompt.className = "bc-surv-col-prompt";
+      const promptInput = document.createElement("input");
+      promptInput.type = "text";
+      promptInput.className = "bc-surv-input";
+      promptInput.id = `bc-surv-prompt-${i}`;
+      promptInput.placeholder = "VLM 检测提示词";
+      promptInput.spellcheck = false;
+      tdPrompt.appendChild(promptInput);
+      tr.appendChild(tdPrompt);
+
+      // Detection size as a fixed dropdown (384 / 768) — see
+      // ``app.api.surveillance`` for the validated choices. We
+      // store the value in a single ``detect_size`` field per
+      // row and reuse it for both ``detect_w`` and ``detect_h``
+      // when we PUT it back.
+      const tdSize = document.createElement("td");
+      tdSize.className = "bc-surv-col-size";
+      const sizeSelect = document.createElement("select");
+      sizeSelect.className = "bc-surv-input";
+      sizeSelect.id = `bc-surv-size-${i}`;
+      [["384", "384x384（默认）"], ["768", "768x768"]].forEach(([v, label]) => {
+        const opt = document.createElement("option");
+        opt.value = v;
+        opt.textContent = label;
+        sizeSelect.appendChild(opt);
+      });
+      tdSize.appendChild(sizeSelect);
+      tr.appendChild(tdSize);
+
+      // Playback toggle
+      const tdPlay = document.createElement("td");
+      tdPlay.className = "bc-surv-col-toggle";
+      tdPlay.appendChild(this._makeSurvToggle(`bc-surv-play-${i}`, "播放"));
+      tr.appendChild(tdPlay);
+
+      // Detection toggle
+      const tdDet = document.createElement("td");
+      tdDet.className = "bc-surv-col-toggle";
+      tdDet.appendChild(this._makeSurvToggle(`bc-surv-det-${i}`, "检测"));
+      tr.appendChild(tdDet);
+
+      tbody.appendChild(tr);
+    }
+
+    const reloadBtn = document.getElementById("bc-surv-reload");
+    if (reloadBtn) reloadBtn.addEventListener("click", () => this.loadSurveillance());
+
+    const saveBtn = document.getElementById("bc-surv-save");
+    if (saveBtn) saveBtn.addEventListener("click", () => this.saveSurveillance());
+
+    const allOn = document.getElementById("bc-surv-all-on");
+    if (allOn) allOn.addEventListener("click", () => {
+      for (let i = 1; i <= 16; i++) {
+        const el = document.getElementById(`bc-surv-play-${i}`);
+        if (el) el.checked = true;
+      }
+    });
+    const allOff = document.getElementById("bc-surv-all-off");
+    if (allOff) allOff.addEventListener("click", () => {
+      for (let i = 1; i <= 16; i++) {
+        const el = document.getElementById(`bc-surv-play-${i}`);
+        if (el) el.checked = false;
+      }
+    });
+  },
+
+  _makeSurvToggle(id, label) {
+    const lbl = document.createElement("label");
+    lbl.className = "bc-surv-toggle";
+    lbl.title = label;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.id = id;
+    const track = document.createElement("span");
+    track.className = "bc-surv-toggle-track";
+    const thumb = document.createElement("span");
+    thumb.className = "bc-surv-toggle-thumb";
+    track.appendChild(thumb);
+    lbl.appendChild(input);
+    lbl.appendChild(track);
+    return lbl;
+  },
+
+  async loadSurveillance() {
+    try {
+      const r = await fetch(API_PREFIX + "/surveillance/config");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      this.survConfigs = data.channels || [];
+      this.renderSurveillance();
+      this.setSurvFoot("", "");
+    } catch (e) {
+      this.setSurvFoot("加载失败: " + e.message, "danger");
+    }
+  },
+
+  renderSurveillance() {
+    const cfgs = this.survConfigs;
+    for (let i = 0; i < 16; i++) {
+      const cfg = cfgs[i] || {};
+      const idx = i + 1;
+      const setVal = (id, v) => {
+        const el = document.getElementById(id);
+        if (el) el.value = v == null ? "" : v;
+      };
+      const setChecked = (id, v) => {
+        const el = document.getElementById(id);
+        if (el) el.checked = !!v;
+      };
+      // Legacy configs may only have ``enabled`` (the pre-split
+      // toggle); treat that as playback_enabled.
+      setVal(`bc-surv-name-${idx}`, cfg.name || "");
+      setVal(`bc-surv-source-${idx}`, cfg.source || "");
+      setVal(`bc-surv-prompt-${idx}`, cfg.prompt || "");
+      // detect_w / detect_h are kept equal by the backend; only the
+      // size dropdown is rendered, so just clamp to the supported
+      // set before assigning.
+      const sz = (cfg.detect_w === 768 || cfg.detect_h === 768) ? "768" : "384";
+      setVal(`bc-surv-size-${idx}`, sz);
+      setChecked(`bc-surv-play-${idx}`, cfg.playback_enabled || cfg.enabled);
+      setChecked(`bc-surv-det-${idx}`, cfg.detection_enabled);
+    }
+    const configured = cfgs.filter((c) => c && c.source).length;
+    const summary = document.getElementById("bc-surv-summary");
+    if (summary) {
+      summary.textContent = `${configured}/16 路已配置视频源`;
+    }
+  },
+
+  async saveSurveillance() {
+    const channels = [];
+    for (let i = 1; i <= 16; i++) {
+      const get = (id) => {
+        const el = document.getElementById(id);
+        return el ? el.value : "";
+      };
+      const getChecked = (id) => {
+        const el = document.getElementById(id);
+        return el ? !!el.checked : false;
+      };
+      // Detection size: single dropdown, same value in both
+      // detect_w and detect_h (the backend enforces square + the
+      // choice set {384, 768}).
+      const rawSize = get(`bc-surv-size-${i}`);
+      const size = (rawSize === "768") ? 768 : 384;
+      channels.push({
+        name: (get(`bc-surv-name-${i}`) || "").trim(),
+        source: (get(`bc-surv-source-${i}`) || "").trim(),
+        prompt: get(`bc-surv-prompt-${i}`) || "",
+        playback_enabled: getChecked(`bc-surv-play-${i}`),
+        detection_enabled: getChecked(`bc-surv-det-${i}`),
+        detect_w: size,
+        detect_h: size,
+      });
+    }
+    const saveBtn = document.getElementById("bc-surv-save");
+    const reloadBtn = document.getElementById("bc-surv-reload");
+    if (saveBtn) saveBtn.disabled = true;
+    if (reloadBtn) reloadBtn.disabled = true;
+    this.setSurvFoot("正在保存 16 路配置…", "warn");
+    try {
+      const r = await fetch(API_PREFIX + "/surveillance/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channels }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        this.setSurvFoot("保存失败: " + (body.detail || r.status), "danger");
+        return;
+      }
+      this.survConfigs = body.channels || channels;
+      this.renderSurveillance();
+      this.setSurvFoot("已保存 16 路配置", "ok");
+    } catch (e) {
+      this.setSurvFoot("保存失败: " + e.message, "danger");
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
+      if (reloadBtn) reloadBtn.disabled = false;
+    }
+  },
+
+  setSurvFoot(text, level) {
+    const el = document.getElementById("bc-surv-foot");
+    if (!el) return;
+    el.textContent = text || "";
+    el.classList.remove("warn", "danger", "ok");
+    if (level) el.classList.add(level);
+  },
 };
 
 /* ------------------------------------------------------------------ *
@@ -1242,16 +1502,23 @@ async function loadPageData(name) {
   if (name === "base-config") {
     Base.init();
     await Base.load();
+    await Base.loadSurveillance();
     return;
   }
 
   if (name === "tts") {
-    TTS.init();
+TTS.init();
     await TTS.refresh();
     // Open the WS proactively so the page stays live even before the
     // first click on "开始生成". The server only pushes on state change,
     // so this is cheap.
     TTS.ensureWs();
+    return;
+  }
+
+  if (name === "surveillance") {
+    Surveillance.init();
+    await Surveillance.refresh();
     return;
   }
 
@@ -2445,4 +2712,806 @@ async function showRootWarning() {
 showRootWarning();
 
 fetchVersion();
+
+/* ---------------------------------------------------------------- *
+ * 视频监控 (Surveillance) page                                       *
+ * ---------------------------------------------------------------- *
+ * 16 channels in a 4x4 grid. Each cell renders a server-pushed    *
+ * JPEG thumbnail (canvas). Click a cell to open the enlarge modal *
+ * which shows:                                                     *
+ *   • WebCodecs-decoded H.264 video (same wire format the rkv     *
+ *     VideoWriter pushes via rkv+ws:// — server forwards verbatim) *
+ *   • Per-channel config form (name / source / prompt / size /    *
+ *     enabled toggle)                                               *
+ *   • Live VLM event history                                       *
+ *                                                                *
+ * Wire format shared with rkv.encoder._WebSocketSink:             *
+ *   <type_byte:u8><pts_us:u64 LE><payload>                        *
+ *     0x00 PKT_TYPE_DELTA, 0x01 KEY, 0x02 HEADER (avcC), 0xFF EOS *
+ * ---------------------------------------------------------------- */
+const Surveillance = {
+  initialized: false,
+  configs: [],          // [{id,name,source,prompt,enabled,detect_w,detect_h}]
+  snapshots: [],        // [{id,state,error,frame_pos,fps,...}]
+  cellStates: [],       // per-cell thumbnail canvas + WebSocket
+  modalChannelId: null,
+  modalDirty: false,
+  modalWebCodecs: { decoder: null, ws: null, fallbackWs: null, fallbackImg: null },
+
+  init() {
+    if (this.initialized) return;
+    this.initialized = true;
+
+    const refreshBtn = document.getElementById("surveillance-refresh");
+    if (refreshBtn) refreshBtn.addEventListener("click", () => this.refresh());
+
+    const resetBtn = document.getElementById("surveillance-reset");
+    if (resetBtn) resetBtn.addEventListener("click", () => this.resetAll());
+
+    const closeBtn = document.getElementById("surv-modal-close");
+    if (closeBtn) closeBtn.addEventListener("click", () => this.closeModal());
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        const m = document.getElementById("surv-modal");
+        if (m && !m.classList.contains("hidden")) this.closeModal();
+      }
+    });
+    const modal = document.getElementById("surv-modal");
+    if (modal) modal.addEventListener("click", (e) => {
+      if (e.target.id === "surv-modal") this.closeModal();
+    });
+
+    const form = document.getElementById("surv-modal-form");
+    if (form) form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      this.saveModal();
+    });
+
+    const reloadBtn = document.getElementById("surv-reload");
+    if (reloadBtn) reloadBtn.addEventListener("click", () => this.reloadModal());
+
+    const browseBtn = document.getElementById("surv-browse");
+    if (browseBtn) browseBtn.addEventListener("click", () => {
+      VdFsModal.open("");
+    });
+
+    const playbackEl = document.getElementById("surv-playback");
+    if (playbackEl) playbackEl.addEventListener("change", () => {
+      this.modalDirty = true;
+      this.updateModalToggleLabel();
+    });
+    const detectionEl = document.getElementById("surv-detection");
+    if (detectionEl) detectionEl.addEventListener("change", () => {
+      this.modalDirty = true;
+      this.updateModalToggleLabel();
+    });
+    ["surv-name", "surv-source", "surv-prompt", "surv-detect-size"]
+      .forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener("input", () => { this.modalDirty = true; });
+      });
+
+    const evClearBtn = document.getElementById("surv-events-clear");
+    if (evClearBtn) evClearBtn.addEventListener("click", () => this.clearEvents());
+
+    this.buildGrid();
+  },
+
+  buildGrid() {
+    const grid = document.getElementById("surveillance-grid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    this.cellStates = [];
+    for (let i = 1; i <= 16; i++) {
+      const cell = document.createElement("div");
+      cell.className = "surv-cell";
+      cell.dataset.channelId = String(i);
+
+      const canvas = document.createElement("canvas");
+      canvas.className = "surv-cell-canvas";
+      canvas.width = 240;
+      canvas.height = 135;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#0f172a";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "13px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText("等待画面…", canvas.width / 2, canvas.height / 2);
+      cell.appendChild(canvas);
+
+      const overlay = document.createElement("div");
+      overlay.className = "surv-cell-overlay";
+      const name = document.createElement("span");
+      name.className = "surv-cell-name";
+      name.textContent = `通道 ${i}`;
+      overlay.appendChild(name);
+
+      const status = document.createElement("span");
+      status.className = "surv-cell-status";
+      status.textContent = "未启用";
+      overlay.appendChild(status);
+
+      cell.appendChild(overlay);
+      cell.addEventListener("click", () => this.openModal(i));
+
+      grid.appendChild(cell);
+      this.cellStates.push({
+        cell, canvas, ctx, nameEl: name, statusEl: status,
+        ws: null, retry: 0, retryTimer: null,
+      });
+    }
+  },
+
+  async refresh() {
+    try {
+      const r = await fetch(API_PREFIX + "/surveillance");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      this.configs = data.configs || [];
+      this.snapshots = data.channels || [];
+      this.renderCells();
+      this.renderStatus();
+      this.updateRawJson(data);
+    } catch (e) {
+      this.setStatus("加载失败: " + e.message, true);
+    }
+  },
+
+  renderStatus() {
+    const enabled = this.snapshots.filter((s) => s && s.state === "running").length;
+    const total = this.snapshots.length;
+    this.setStatus(`共 ${total} 路 · 运行中 ${enabled} 路`, false);
+  },
+
+  setStatus(text, isError) {
+    const el = document.getElementById("surveillance-status");
+    if (!el) return;
+    el.textContent = text || "";
+    el.style.color = isError ? "#dc2626" : "";
+  },
+
+  updateRawJson(data) {
+    const el = document.getElementById("data-surveillance");
+    if (el) el.textContent = JSON.stringify(data, null, 2);
+  },
+
+  renderCells() {
+    for (let i = 0; i < this.cellStates.length; i++) {
+      const cs = this.cellStates[i];
+      const cfg = this.configs[i];
+      const snap = this.snapshots[i];
+      if (cfg) {
+        cs.nameEl.textContent = cfg.name || `通道 ${i + 1}`;
+      }
+      const playbackOn = !!(cfg && (cfg.playback_enabled || cfg.enabled));
+      const detectionOn = !!(cfg && cfg.detection_enabled);
+      let stateLabel = "未启用";
+      let cssClass = (snap ? snap.state : "idle");
+      if (snap) {
+        if (snap.state === "running") {
+          stateLabel = detectionOn ? "播放+检测" : "仅播放";
+        } else if (snap.state === "opening") {
+          stateLabel = "打开中…";
+        } else if (snap.state === "eof") {
+          stateLabel = "已结束";
+        } else if (snap.state === "error") {
+          stateLabel = "错误";
+        } else if (snap.state === "paused") {
+          stateLabel = "已暂停";
+        } else if (snap.state === "idle") {
+          if (!cfg || !cfg.source) stateLabel = "未配置";
+          else if (playbackOn) stateLabel = "启动中";
+          else stateLabel = detectionOn ? "检测(无画面)" : "未启用";
+        }
+        // Append the currently-playing file name for folder / loop
+        // sources so the user can see which clip is on.
+        if (snap.state === "running" && snap.current_file) {
+          stateLabel += " · " + snap.current_file;
+        }
+        if (snap.error) stateLabel = "错误: " + (snap.error || "").slice(0, 12);
+      }
+      cs.statusEl.textContent = stateLabel;
+      cs.statusEl.className = "surv-cell-status state-" + cssClass;
+
+      // Ensure the thumbnail WS is connected whenever the channel is
+      // running or has a configured source; the server only pushes
+      // when a frame arrives, so idle WS connections are essentially
+      // free.
+      const shouldThumb = snap && (
+        snap.state === "running" || snap.state === "opening"
+      );
+      if (shouldThumb && !cs.ws) this.connectThumb(i);
+      if (!shouldThumb && cs.ws) this.disconnectThumb(i);
+    }
+  },
+
+  connectThumb(idx) {
+    const cs = this.cellStates[idx];
+    if (!cs) return;
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}${API_PREFIX}/surveillance/${idx + 1}/thumb`;
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    cs.ws = ws;
+    ws.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const blob = new Blob([ev.data], { type: "image/jpeg" });
+      const img = new Image();
+      img.onload = () => {
+        cs.ctx.drawImage(img, 0, 0, cs.canvas.width, cs.canvas.height);
+        URL.revokeObjectURL(img.src);
+      };
+      img.src = URL.createObjectURL(blob);
+    };
+    ws.onclose = () => {
+      cs.ws = null;
+      // Slow reconnect — server pushes only when a frame arrives, so
+      // a closed connection doesn't necessarily mean anything is wrong.
+      const wait = Math.min(5000, 500 * Math.pow(2, cs.retry++));
+      cs.retryTimer = setTimeout(() => {
+        cs.retryTimer = null;
+        this.connectThumb(idx);
+      }, wait);
+    };
+    ws.onerror = () => {
+      try { ws.close(); } catch (_) {}
+    };
+  },
+
+  disconnectThumb(idx) {
+    const cs = this.cellStates[idx];
+    if (!cs) return;
+    if (cs.retryTimer) {
+      clearTimeout(cs.retryTimer);
+      cs.retryTimer = null;
+    }
+    cs.retry = 0;
+    if (cs.ws) {
+      try { cs.ws.close(); } catch (_) {}
+      cs.ws = null;
+    }
+  },
+
+  async resetAll() {
+    if (!window.confirm("确定要恢复所有 16 路通道为默认配置吗？")) return;
+    try {
+      const r = await fetch(API_PREFIX + "/surveillance/reset", { method: "POST" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      this.configs = data.channels || [];
+      await this.refresh();
+    } catch (e) {
+      window.alert("重置失败: " + e.message);
+    }
+  },
+
+  // ------------------------------------------------------------------ //
+  // Enlarge modal                                                       //
+  // ------------------------------------------------------------------ //
+  openModal(channelId) {
+    this.modalChannelId = channelId;
+    const modal = document.getElementById("surv-modal");
+    if (!modal) return;
+    modal.classList.remove("hidden");
+    this.reloadModal();
+    this.startModalStream(channelId);
+    this.refreshModalEvents();
+  },
+
+  closeModal() {
+    const modal = document.getElementById("surv-modal");
+    if (!modal) return;
+    if (this.modalDirty) {
+      if (!window.confirm("有未保存的修改，确定要关闭吗？")) return;
+    }
+    modal.classList.add("hidden");
+    this.modalChannelId = null;
+    this.stopModalStream();
+    this.modalDirty = false;
+  },
+
+  reloadModal() {
+    const id = this.modalChannelId;
+    if (id == null) return;
+    const cfg = this.configs[id - 1];
+    if (!cfg) return;
+    document.getElementById("surv-name").value = cfg.name || "";
+    document.getElementById("surv-source").value = cfg.source || "";
+    document.getElementById("surv-prompt").value = cfg.prompt || "";
+    // detect_w / detect_h are kept equal by the backend; the
+    // modal renders a single ``detect_size`` dropdown.
+    const size = (cfg.detect_w === 768 || cfg.detect_h === 768) ? "768" : "384";
+    document.getElementById("surv-detect-size").value = size;
+    // Legacy configs only have ``enabled``; treat that as
+    // playback_enabled for backwards compat.
+    const playback = !!(cfg.playback_enabled || cfg.enabled);
+    document.getElementById("surv-playback").checked = playback;
+    document.getElementById("surv-detection").checked = !!cfg.detection_enabled;
+    document.getElementById("surv-modal-title").textContent = cfg.name || `通道 ${id}`;
+    const subParts = [`#${id}`];
+    if (cfg.source) subParts.push(cfg.source);
+    document.getElementById("surv-modal-sub").textContent = subParts.join(" · ");
+    this.updateModalToggleLabel();
+    this.renderModalMeta();
+    this.modalDirty = false;
+    this.setFoot("", "");
+  },
+
+  updateModalToggleLabel() {
+    const playbackEl = document.getElementById("surv-playback");
+    const detectionEl = document.getElementById("surv-detection");
+    const playbackLabel = document.getElementById("surv-playback-label");
+    const detectionLabel = document.getElementById("surv-detection-label");
+    if (playbackEl && playbackLabel) {
+      playbackLabel.textContent = playbackEl.checked ? "播放中" : "播放关闭";
+    }
+    if (detectionEl && detectionLabel) {
+      detectionLabel.textContent = detectionEl.checked ? "检测中" : "检测关闭";
+    }
+  },
+
+  renderModalMeta() {
+    const id = this.modalChannelId;
+    if (id == null) return;
+    const snap = this.snapshots[id - 1];
+    const cfg = this.configs[id - 1];
+    const el = document.getElementById("surv-modal-meta");
+    if (!el) return;
+    if (!snap) { el.textContent = "--"; return; }
+    const parts = [];
+    parts.push(`状态 ${snap.state || "--"}`);
+    if (snap.current_file) parts.push(`▶ ${snap.current_file}`);
+    if (snap.fps) parts.push(`${snap.fps} fps`);
+    if (snap.frame_pos) parts.push(`帧 ${snap.frame_pos}`);
+    const playback = !!(cfg && (cfg.playback_enabled || cfg.enabled));
+    const detection = !!(cfg && cfg.detection_enabled);
+    parts.push(`播放 ${playback ? "开" : "关"}`);
+    parts.push(`检测 ${detection ? "开" : "关"}`);
+    if (snap.session_error) parts.push("VLM 错误: " + snap.session_error);
+    el.textContent = parts.join(" · ");
+  },
+
+  setFoot(text, level) {
+    const el = document.getElementById("surv-foot");
+    if (!el) return;
+    el.textContent = text || "";
+    el.classList.remove("warn", "danger", "ok");
+    if (level) el.classList.add(level);
+  },
+
+  async saveModal() {
+    const id = this.modalChannelId;
+    if (id == null) return;
+    // Single dropdown → mirrored into both detect_w and detect_h
+    // so the backend's "always square" invariant is preserved.
+    const rawSize = document.getElementById("surv-detect-size").value;
+    const size = (rawSize === "768") ? 768 : 384;
+    const payload = {
+      name: (document.getElementById("surv-name").value || "").trim(),
+      source: (document.getElementById("surv-source").value || "").trim(),
+      prompt: document.getElementById("surv-prompt").value || "",
+      playback_enabled: !!document.getElementById("surv-playback").checked,
+      detection_enabled: !!document.getElementById("surv-detection").checked,
+      detect_w: size,
+      detect_h: size,
+    };
+    this.setFoot("正在保存…", "warn");
+    try {
+      const r = await fetch(API_PREFIX + `/surveillance/config/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        this.setFoot("保存失败: " + (body.detail || r.status), "danger");
+        return;
+      }
+      this.modalDirty = false;
+      this.configs[id - 1] = { ...this.configs[id - 1], ...body.channel };
+      this.reloadModal();
+      this.renderCells();
+      this.setFoot("已保存", "ok");
+      this.refresh();
+    } catch (e) {
+      this.setFoot("保存失败: " + e.message, "danger");
+    }
+  },
+
+  async refreshModalEvents() {
+    const id = this.modalChannelId;
+    if (id == null) return;
+    try {
+      const r = await fetch(API_PREFIX + `/surveillance/${id}/events`);
+      if (!r.ok) return;
+      const data = await r.json();
+      this.renderEventList(data.events || []);
+      this.renderModalMeta();
+    } catch (_) {}
+  },
+
+  renderEventList(events) {
+    const list = document.getElementById("surv-event-list");
+    const count = document.getElementById("surv-events-count");
+    if (!list || !count) return;
+    count.textContent = (events.length || 0) + " 条";
+    list.innerHTML = "";
+    if (!events.length) {
+      const li = document.createElement("li");
+      li.className = "vd-event-empty";
+      li.textContent = "尚未检测到事件，启动通道后结果显示在这里。";
+      list.appendChild(li);
+      return;
+    }
+    events.forEach((ev) => {
+      const li = document.createElement("li");
+      li.className = "vd-event";
+      const meta = document.createElement("div");
+      meta.className = "vd-event-meta";
+      const ts = document.createElement("span");
+      ts.textContent = fmtEventTime(ev.ts);
+      const fp = document.createElement("span");
+      fp.textContent = "帧 " + (ev.frame_pos ?? "?");
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = "#" + ev.id;
+      meta.appendChild(ts);
+      meta.appendChild(fp);
+      meta.appendChild(tag);
+      const text = document.createElement("div");
+      text.className = "vd-event-text";
+      text.textContent = ev.text || "(空)";
+      li.appendChild(meta);
+      li.appendChild(text);
+      list.appendChild(li);
+    });
+  },
+
+  async clearEvents() {
+    const id = this.modalChannelId;
+    if (id == null) return;
+    try {
+      await fetch(API_PREFIX + `/surveillance/${id}/events/clear`, { method: "POST" });
+      this.renderEventList([]);
+    } catch (_) {}
+  },
+
+  // ------------------------------------------------------------------ //
+  // H.264 playback (WebCodecs)                                          //
+  // ------------------------------------------------------------------ //
+  startModalStream(channelId) {
+    this.stopModalStream();
+    const overlay = document.getElementById("surv-modal-overlay");
+    const canvas = document.getElementById("surv-modal-canvas");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // If the browser doesn't expose WebCodecs, fall back to the
+    // per-channel thumbnail WS (JPEG @ ~5 fps). Worse frame rate
+    // but works on every browser.
+    if (!hasWebCodecs()) {
+      this._setModalOverlay(overlay,
+        "此浏览器不支持 WebCodecs VideoDecoder；改用 240×135 JPEG 缩略图 fallback", false);
+      this.startModalFallbackStream(channelId);
+      return;
+    }
+
+    // Reflect channel state in the overlay so the user knows why the
+    // picture might be empty (channel not enabled, no source, errored).
+    const cfg = this.configs[channelId - 1];
+    const snap = this.snapshots[channelId - 1];
+    const playbackOn = !!(cfg && (cfg.playback_enabled || cfg.enabled));
+    if (!cfg || !cfg.source) {
+      this._setModalOverlay(overlay, "请先在「视频源」中填写路径并保存", false);
+    } else if (!playbackOn) {
+      this._setModalOverlay(overlay, "通道已配置但未启用播放（打开右上角「播放中」开关后保存）", false);
+    } else if (snap && snap.error) {
+      this._setModalOverlay(overlay, "通道错误: " + snap.error, true);
+    } else if (snap && snap.state !== "running") {
+      this._setModalOverlay(overlay, "正在启动解码…", false);
+    } else {
+      this._setModalOverlay(overlay, "正在连接视频流…", false);
+    }
+
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}${API_PREFIX}/surveillance/${channelId}/stream`;
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    this.modalWebCodecs.ws = ws;
+
+    let decoder = null;
+    let avccBytes = null;
+
+    const ensureDecoder = () => {
+      if (decoder) return decoder;
+      if (!avccBytes) return null;
+      try {
+        const codec = avccCodecString(avccBytes);
+        decoder = new VideoDecoder({
+          output: (frame) => {
+            const c = document.getElementById("surv-modal-canvas");
+            if (c) {
+              // Resize the canvas to the coded frame size on first
+              // frame. ``codedWidth/codedHeight`` come from WebCodecs'
+              // own parse of the SPS, which is reliable (the manual
+              // SPS parse we used to do was buggy).
+              if (frame.codedWidth && frame.codedHeight) {
+                if (c.width !== frame.codedWidth) c.width = frame.codedWidth;
+                if (c.height !== frame.codedHeight) c.height = frame.codedHeight;
+              }
+              const cx = c.getContext("2d");
+              cx.drawImage(frame, 0, 0, c.width, c.height);
+              this._setModalOverlay(overlay, "", false);
+            }
+            frame.close();
+          },
+          error: (e) => {
+            console.warn("[surveillance] decoder error", e && e.message);
+            this._setModalOverlay(overlay,
+              "解码器错误: " + ((e && e.message) || e), true);
+          },
+        });
+        // Pass ``codedWidth / codedHeight`` only if we know them;
+        // otherwise WebCodecs figures them out from the bitstream
+        // (and from the avcC ``description`` for H.264).
+        const config = {
+          codec,
+          description: avccBytes,
+          optimizeForLatency: true,
+        };
+        decoder.configure(config);
+        this._setModalOverlay(overlay, "", false);
+      } catch (e) {
+        console.warn("[surveillance] decoder configure failed", e);
+        this._setModalOverlay(overlay,
+          "解码器配置失败: " + (e && e.message || e), true);
+      }
+      return decoder;
+    };
+
+    ws.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const buf = new DataView(ev.data);
+      if (buf.byteLength < 9) return;
+      const typeByte = buf.getUint8(0);
+      // pts is u64 LE microseconds; convert via BigInt to preserve
+      // precision over the full 64-bit range, then to Number for
+      // WebCodecs' ``EncodedVideoChunk.timestamp`` (which is double).
+      let ptsUs = 0;
+      try { ptsUs = Number(buf.getBigUint64(1, true)); } catch (_) {}
+      const payload = new Uint8Array(ev.data, 9);
+
+      if (typeByte === 0xFF) return;  // EOS — encoder tore down
+      if (typeByte === 0x02) {
+        // avcC configuration record — feed to the decoder.
+        avccBytes = payload.buffer.slice(
+          payload.byteOffset, payload.byteOffset + payload.byteLength
+        );
+        ensureDecoder();
+        return;
+      }
+      const dec = ensureDecoder();
+      if (!dec) return;
+      const isKey = typeByte === 0x01;
+      try {
+        dec.decode(new EncodedVideoChunk({
+          type: isKey ? "key" : "delta",
+          timestamp: ptsUs,
+          data: payload,
+        }));
+      } catch (e) {
+        // DecoderError before any frames came through usually means
+        // the avcC was bad. Surface it instead of silently swallowing.
+        console.warn("[surveillance] decode failed", e);
+      }
+    };
+    ws.onopen = () => {
+      this._setModalOverlay(overlay, "等待画面…", false);
+    };
+    ws.onerror = () => {
+      this._setModalOverlay(overlay, "视频流连接失败", true);
+    };
+    ws.onclose = () => {
+      if (this.modalWebCodecs.ws === ws) {
+        this.modalWebCodecs.ws = null;
+      }
+    };
+  },
+
+  _setModalOverlay(el, text, isError) {
+    if (!el) return;
+    el.textContent = text || "";
+    el.classList.toggle("error", !!isError);
+    if (text) {
+      el.style.display = "";
+    } else {
+      el.style.display = "none";
+    }
+  },
+
+  stopModalStream() {
+    const mc = this.modalWebCodecs;
+    if (mc.ws) {
+      try { mc.ws.close(); } catch (_) {}
+      mc.ws = null;
+    }
+    if (mc.decoder) {
+      try { mc.decoder.close(); } catch (_) {}
+      mc.decoder = null;
+    }
+    if (mc.fallbackWs) {
+      try { mc.fallbackWs.close(); } catch (_) {}
+      mc.fallbackWs = null;
+    }
+    if (mc.fallbackImg) {
+      try { mc.fallbackImg.src = ""; } catch (_) {}
+      mc.fallbackImg = null;
+    }
+    const overlay = document.getElementById("surv-modal-overlay");
+    if (overlay) {
+      overlay.textContent = "";
+      overlay.classList.remove("error");
+    }
+  },
+
+  // ------------------------------------------------------------------ //
+  // MJPEG fallback                                                       //
+  // ------------------------------------------------------------------ //
+  // When the browser lacks WebCodecs (``window.VideoDecoder`` is
+  // undefined or throws on construction — common on older Chromium
+  // builds and on Linux ships that disable WebCodecs by default), we
+  // fall back to the server's per-channel thumbnail WS. The server
+  // already produces a 240×135 JPEG at ~5 fps per channel from the
+  // decoded BGR frame; subscribe to it and draw each JPEG to canvas.
+  // Not as smooth as H.264, but works on every browser.
+  startModalFallbackStream(channelId) {
+    const canvas = document.getElementById("surv-modal-canvas");
+    const overlay = document.getElementById("surv-modal-overlay");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}${API_PREFIX}/surveillance/${channelId}/thumb`;
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    this.modalWebCodecs.fallbackWs = ws;
+
+    // Re-use a single off-screen <img> so GC isn't triggered for
+    // every JPEG. We swap the .src on each frame.
+    const img = new Image();
+    this.modalWebCodecs.fallbackImg = img;
+    img.onload = () => {
+      // Match canvas to the thumbnail size on first frame, then
+      // let drawImage do the upscale to the displayed canvas.
+      if (canvas.width !== img.naturalWidth) canvas.width = img.naturalWidth;
+      if (canvas.height !== img.naturalHeight) canvas.height = img.naturalHeight;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      this._setModalOverlay(overlay, "", false);
+    };
+    img.onerror = () => {
+      this._setModalOverlay(overlay, "缩略图解码失败", true);
+    };
+
+    ws.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const blob = new Blob([ev.data], { type: "image/jpeg" });
+      const prev = img.src;
+      img.src = URL.createObjectURL(blob);
+      if (prev) URL.revokeObjectURL(prev);
+    };
+    ws.onopen = () => {
+      this._setModalOverlay(overlay, "等待画面…", false);
+    };
+    ws.onerror = () => {
+      this._setModalOverlay(overlay, "缩略图流连接失败", true);
+    };
+    ws.onclose = () => {
+      if (this.modalWebCodecs.fallbackWs === ws) {
+        this.modalWebCodecs.fallbackWs = null;
+      }
+    };
+  },
+};
+
+// WebCodecs feature detection — check both the constructor and the
+// EncodedVideoChunk factory so we don't accidentally accept a build
+// that exposes one without the other.
+function hasWebCodecs() {
+  try {
+    return typeof window.VideoDecoder === "function"
+      && typeof window.EncodedVideoChunk === "function"
+      && typeof window.DecodedVideoChunk === "function";
+  } catch (_) {
+    return false;
+  }
+}
+
+// WebCodecs codec-string parser for an avcC record.
+// avc1.PPCCLL — PP=profile_idc hex, CC=constraint_set_flags hex, LL=level_idc hex.
+function avccCodecString(avcc) {
+  if (!avcc || avcc.byteLength < 4) return "avc1.42E01E";
+  const v = new DataView(avcc.buffer, avcc.byteOffset, avcc.byteLength);
+  const profile = v.getUint8(1).toString(16).padStart(2, "0").toUpperCase();
+  const constraint = v.getUint8(2).toString(16).padStart(2, "0").toUpperCase();
+  const level = v.getUint8(3).toString(16).padStart(2, "0").toUpperCase();
+  return `avc1.${profile}${constraint}${level}`;
+}
+
+// The video-detection file picker modal knows about /api/video-detection/fs.
+// When the user picks a file from the 视频监控 modal, we want the same
+// destination. Wire VdFsModal to write into #surv-source when the
+// surveillance modal is open. Also covers the base-config 视频监控
+// table — there, each row's "浏览…" button sets
+// ``VdFsModal._sourceTarget`` to its source input before opening the
+// modal; the override below writes the picked path into that input.
+VdFsModal._sourceTarget = null;
+const _vdOrigPickFile = VdFsModal.pickSelectedFile.bind(VdFsModal);
+VdFsModal.pickSelectedFile = function () {
+  if (!this.selected) return;
+  // 1. Explicit target (e.g. base-config row's source input)
+  if (VdFsModal._sourceTarget) {
+    VdFsModal._sourceTarget.value = this.selected.path;
+    VdFsModal._sourceTarget = null;
+    this.close();
+    return;
+  }
+  // 2. Surveillance enlarge modal
+  const survModal = document.getElementById("surv-modal");
+  const survSource = document.getElementById("surv-source");
+  if (survModal && !survModal.classList.contains("hidden") && survSource) {
+    survSource.value = this.selected.path;
+    if (typeof Surveillance !== "undefined") {
+      Surveillance.modalDirty = true;
+    }
+    this.close();
+    return;
+  }
+  // 3. Default: video-detection page
+  _vdOrigPickFile();
+};
+const _vdOrigPickDir = VdFsModal.pickCurrentDir.bind(VdFsModal);
+VdFsModal.pickCurrentDir = function () {
+  const btn = document.getElementById("vd-modal-pick-dir");
+  const p = btn.dataset.path;
+  if (!p) return;
+  // 1. Explicit target (base-config row)
+  if (VdFsModal._sourceTarget) {
+    VdFsModal._sourceTarget.value = p;
+    VdFsModal._sourceTarget = null;
+    this.close();
+    return;
+  }
+  // 2. Surveillance enlarge modal
+  const survModal = document.getElementById("surv-modal");
+  const survSource = document.getElementById("surv-source");
+  if (survModal && !survModal.classList.contains("hidden") && survSource) {
+    survSource.value = p;
+    if (typeof Surveillance !== "undefined") {
+      Surveillance.modalDirty = true;
+    }
+    this.close();
+    return;
+  }
+  // 3. Default: video-detection page
+  _vdOrigPickDir();
+};
+
+// Wire the file-picker modal's own buttons (close / pick dir / pick file)
+// at module load so they work no matter which page triggered the modal —
+// previously they were registered inside ``initVideoDetection``, which
+// only ran when the user visited the 视频检测 page; users who opened
+// the picker from 视频监控 directly hit dead buttons.
+{
+  const closeBtn = document.getElementById("vd-modal-close");
+  const pickDirBtn = document.getElementById("vd-modal-pick-dir");
+  const pickFileBtn = document.getElementById("vd-modal-pick-file");
+  if (closeBtn) closeBtn.addEventListener("click", () => VdFsModal.close());
+  if (pickDirBtn) pickDirBtn.addEventListener("click", () => VdFsModal.pickCurrentDir());
+  if (pickFileBtn) pickFileBtn.addEventListener("click", () => VdFsModal.pickSelectedFile());
+}
 showPage(currentPage());

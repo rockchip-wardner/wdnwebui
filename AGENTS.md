@@ -21,6 +21,12 @@ creation); everything below is verified against the current tree.
   SDK-side gotchas (they're external code, not in this repo, but the
   constraints propagate here).
 
+## 设计原则
+
+1. 必须通过rkai的LLMSession调用rknn，不得直接调用
+2. 必须通过rkv调用mpp和rga，做编解码和图片缩放、格式转换等操作，不得直接调用或者通过其他库进行软编解和格式转换、resize等操作。
+3. 必须通过wdiot做发现和注册服务。
+
 ## TL;DR commands
 
 ```bash
@@ -57,15 +63,17 @@ SDKs aren't published.
 pyrkaiweb/
 ├── run.py                # entry point — uvicorn.run("app.main:app", ...)
 ├── app/
-│   ├── __init__.py       # __version__ = "0.2.0"
+│   ├── __init__.py       # __version__ = "0.3.0"
 │   ├── main.py           # create_app() factory + module-level `app`
 │   ├── api/
 │   │   ├── __init__.py   # imports submodules so include_router sees them
 │   │   ├── power.py
+│   │   ├── surveillance.py     # 16-channel REST + WS endpoints
 │   │   ├── system_logs.py
 │   │   ├── system_monitor.py
 │   │   └── video_detection.py   # REST + WebSocket frame stream + detector
 │   ├── services/
+│   │   ├── surveillance.py      # 16 channels sharing ONE LLMSession via a worker thread
 │   │   ├── video_session.py     # VideoCapture + decode thread + JPEG queue
 │   │   ├── detector.py          # rkai VLM wrapper + worker thread
 │   │   └── uploads/             # local-file upload staging (gitignored)
@@ -155,6 +163,161 @@ The `#page-video-detection` section is wired to:
 so `app.include_router(...)` in `main.py` actually sees them — without it
 the package object is empty and the routes are silently missing.
 
+## Surveillance page (视频监控)
+
+The `#page-surveillance` section (sits **above** 视频检测 in the sidebar)
+shows 16 monitoring cells in a 4x4 grid. Each cell runs its own
+decoder / encoder pipeline — one daemon thread per channel, one
+`rkv.VideoCapture` per thread, one `rkv.VideoWriter` per thread
+(zero-copy — the encoder consumes the decoder's DMA-BUF via
+`rkv+ws://`). The VLM interpreter is **shared across all 16 channels**:
+the ``SurveillanceManager`` owns ONE ``rkai.LLMSession`` (the qwen3-vl-4b
+RKNN contexts total ~3.5 GB resident; spinning up 16 would need
+~56 GB of unified memory, which a single RK3588 board can't supply).
+A single ``_InferenceWorker`` thread serialises all VLM calls into the
+shared session — see "Resource budget" below.
+
+* **Service** (`app/services/surveillance.py`):
+  - ``SurveillanceManager`` singleton (lazy), owns 16 ``Channel``
+    instances plus the shared ``_InferenceWorker``.
+  - Each ``Channel`` carries its own config (name / source / prompt /
+    detect_w / detect_h / playback_enabled / detection_enabled), runtime
+    state, decode thread, H.264 packet ring buffer, and JPEG
+    thumbnail ring buffer. The detection size is fixed to one of
+    two presets — ``DETECT_SIZE_CHOICES = (384, 768)`` — chosen to
+    match the qwen3-vl-4b model's native input (384) and a
+    higher-fidelity option (768). Anything else in stored configs
+    snaps back to 384 during ``_merge_default``. The
+    ``ChannelConfigModel`` Pydantic schema rejects out-of-set
+    values with HTTP 422 and ``detect_w != detect_h`` with HTTP
+    422, so the API won't accept non-square or out-of-set sizes.
+  - Decode loop (per-channel thread):
+    ```text
+    rkv.VideoCapture.read0(detect_w, detect_h, fmt="RGB")
+        |
+        v
+    _submit_vlm(...)                  # non-blocking: enqueue on the
+        |                              # shared ``LLMSession`` queue
+        v
+    SurveillanceManager._InferenceWorker (single daemon thread, persistent asyncio loop)
+        |   session.reset()  +  await session.respond(prompt, attachment=[Attachment(frame)])
+        |   (always goes through rkai — never direct rknn3lite / rknntoolkit)
+        v
+    Future resolves; channel._on_inference_done records the event async
+        |
+        v
+    rkv.VideoWriter("rkv+ws://127.0.0.1:8000/api/surveillance/<id>/ingest", codec="h264")
+        |   (zero-copy: writer.write(frame0) hands the decoder's
+        |    DMA-BUF to MPP's encoder)
+        v
+    /api/surveillance/<id>/ingest  (server-side WS, rkv encoder connects as client)
+        |   fan-out to per-subscriber queue
+        v
+    /api/surveillance/<id}/stream  (browser-facing WS, raw H.264 wire format)
+        |   WebCodecs (Chrome 94+ / Edge 94+ / Safari 17+ / Firefox 130+)
+        v
+    <canvas> in the enlarge modal
+    ```
+  - Thumbnail path runs in parallel: the decode thread downscales the
+    decoded BGR frame to 240x135 via OpenCV, JPEG-encodes at quality
+    70, and pushes the bytes to all registered
+    ``/api/surveillance/<id>/thumb`` WS subscribers at ~5 fps.
+  - rkai is imported lazily (``_load_rkai()``) inside the inference
+    worker — the same module-level cache as
+    :mod:`app.services.detector` so the rkai import only happens once
+    across the whole process. rkv is imported lazily for the same
+    reason (non-Rockchip dev boxes still boot).
+  - Packets use the rkv wire format
+    ``<type_byte:u8><pts_us:u64 LE><payload>`` with
+    ``0x00 DELTA | 0x01 KEY | 0x02 HEADER (avcC) | 0xFF EOS`` (matches
+    ``rkv.encoder._WebSocketSink`` and ``app/static/js/app.js``'s
+    ``avccCodecString()``).
+  - Each ``Channel`` exposes a thread-safe subscriber queue +
+    ``threading.Event`` pair for the H.264 stream and another for the
+    thumbnail. Subscribers are added/dropped from the asyncio side via
+    ``register_stream_subscriber()`` / ``unregister_stream_subscriber()``;
+    the asyncio handler drains via ``loop.run_in_executor``.
+* **Config persistence** — every per-channel edit (PATCH
+  ``/api/surveillance/config/{id}``) calls
+  ``SurveillanceManager.update_config()`` which writes the full
+  16-channel array back to ``config.json`` under
+  ``surveillance.channels[]``. Reset (POST
+  ``/api/surveillance/reset``) restores the 16 default entries.
+  Missing fields are back-filled with defaults so older configs keep
+  working.
+* **API** (`app/api/surveillance.py`):
+  - ``GET    /api/surveillance``              — per-channel runtime snapshot + config.
+  - ``GET    /api/surveillance/config``       — full 16-channel config.
+  - ``PUT    /api/surveillance/config``       — replace the whole list (validated by Pydantic).
+  - ``PATCH  /api/surveillance/config/{id}``  — partial update of one channel.
+  - ``POST   /api/surveillance/reset``        — restore defaults.
+  - ``GET    /api/surveillance/{id}/events``  — VLM event history + snapshot.
+  - ``POST   /api/surveillance/{id}/events/clear`` — clear history.
+  - ``WS     /api/surveillance/{id}/ingest``  — server-side ingest; the rkv
+    encoder connects here as a client (hand-rolled RFC 6455 handshake,
+    uvicorn accepts it as a vanilla client WS upgrade).
+  - ``WS     /api/surveillance/{id}/stream``  — server pushes the H.264 wire
+    format to the browser; the WebCodecs ``VideoDecoder`` (in
+    ``app/static/js/app.js``) consumes the same payload directly.
+  - ``WS     /api/surveillance/{id}/thumb``   — server pushes JPEG thumbnails
+    at ~5 fps.
+* **Frontend** (`app/static/js/app.js` ``Surveillance`` module +
+  ``#page-surveillance`` markup):
+  - 4x4 grid of ``<canvas>`` cells; each subscribes to
+    ``/api/surveillance/<id>/thumb`` while the channel is running.
+  - Click any cell → opens the enlarge modal
+    (``#surv-modal``) showing:
+    * a ``<canvas>`` fed by WebCodecs (``VideoDecoder``) using the H.264
+      wire format from ``/api/surveillance/<id>/stream``;
+    * a per-channel config form (name / source / prompt / detect size
+      / enable toggle) with dirty-state tracking and an
+      "放弃修改" button that re-fetches the saved config;
+    * a live VLM event history list (incremental updates on every
+      ``/events`` poll).
+  - The "浏览…" button reuses the video-detection file picker modal
+    (``VdFsModal``) — it writes the picked path into the surveillance
+    source field when the surveillance modal is open, otherwise back
+    into the video-detection source field as before.
+  - The "恢复默认" toolbar button POSTs
+    ``/api/surveillance/reset`` after a ``confirm()``.
+  - WebCodecs is the **preferred** path for the enlarged view, but if
+    the browser lacks ``window.VideoDecoder`` (older Chromium, or
+    builds with WebCodecs disabled by flag), the modal falls back
+    to the per-channel thumbnail WS (``/api/surveillance/{id}/thumb``)
+    — JPEG @ ~5 fps painted to ``<canvas>``. Smoother motion needs a
+    browser with WebCodecs; the grid cells continue to work either
+    way.
+  - Browser detection checks ``VideoDecoder`` + ``EncodedVideoChunk``
+    + ``DecodedVideoChunk`` so we don't accept a build that exposes
+    one without the others.
+
+* **Two independent toggles per channel** — the per-channel config
+  exposes ``playback_enabled`` (decodes + encodes the stream, opens
+  ``VideoCapture`` and the ``VideoWriter`` to ``rkv+ws://...``)
+  and ``detection_enabled`` (gates the per-frame submission to the
+  shared VLM worker). Playback can run without detection, so you
+  can monitor 16 streams without ever touching the NPU. Toggling
+  detection alone doesn't restart the decode thread — it's only
+  consulted inside the loop.
+* **Resource budget** — the manager owns ONE shared ``rkai.LLMSession``
+  (~3.5 GB resident: 2.32 GB LLM weights + 0.74 GB embed table +
+  0.23 GB vision weights + a few hundred MB KV cache, all on RK3588's
+  8 GB unified LPDDR5 — no dedicated VRAM, the NPU DMA reads from the
+  same system RAM). All 16 channels share that one interpreter via
+  the serialised ``_InferenceWorker`` queue, so the total resident
+  footprint stays at ~3.5 GB regardless of how many channels are
+  enabled. The trade-off is throughput: with N channels each wanting
+  one inference every ``every_n`` frames at 25 fps and ~1 s per
+  inference (typical qwen3-vl-4b warm call), the queue depth grows
+  as ``N * 1 s * fps / every_n`` — at ``every_n=30`` that's
+  ``N * 0.83``, so 16 channels queue ~13 frames deep on average. The
+  events timestamp reflects when the inference actually completed,
+  not when the frame was captured. If you need faster end-to-end
+  latency, sharding channels across multiple ``pyrkaiweb`` instances
+  (each with its own LLMSession) is the answer; the shared-session
+  design here makes that a horizontal scaling decision rather than a
+  per-channel one.
+
 ## Configuration
 
 The service reads a single JSON-object `config.json` from disk and
@@ -208,7 +371,24 @@ holds it in memory. The file is seeded with a `base` section at
   `base` section on entry, PUTs on submit; "放弃修改" re-fetches.
   Services downstream (e.g. the detector's model loader) read
   `get_config().get_section("base")["model_path"]` lazily, not at
-  import time, so a saved change takes effect on the next request.
+- **视频监控 section on the base-config page** — same page also
+  carries a sticky-header table of all 16 channels under
+  `bc-section-surveillance` (`#bc-surv-tbody`). Each row exposes
+  名称 / 视频源 (with "浏览…" reusing the existing server-side
+  picker) / 检测提示词 / 检测尺寸 (384 / 768 单选下拉) / 播放 /
+  检测 toggles.
+  Save button does `PUT /api/surveillance/config` with the full
+  16-channel array; the same `config.json` powers the dedicated
+  视频监控 sidebar page, so edits round-trip through the shared
+  store. The browse button sets `VdFsModal._sourceTarget` to the
+  row's source input before opening the modal; the
+  `VdFsModal.pickSelectedFile` / `pickCurrentDir` override at module
+  load checks this target before falling back to the surveillance-
+  modal / video-detection paths. The `Base.init()` call wires both
+  the device-name form and the surveillance table; navigating to
+  `基础配置` calls `Base.load()` (GET `/api/config/base`) **and**
+  `Base.loadSurveillance()` (GET `/api/surveillance/config`); each
+  section has its own save button that hits its own endpoint.
 - **`RKAI_MODELS_DIR` propagation** — `app/main.py` reads
   `base.model_path` at `create_app()` time and writes it into
   `os.environ["RKAI_MODELS_DIR"]` before any `LLMSession` is built.
@@ -276,6 +456,19 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
 - **RTSP/RTMP/HLS work via the same `/open` endpoint** — `VideoCapture`
   routes anything containing `://` through PyAV. The frontend just shows
   the URL in the address bar; no client-side protocol branching needed.
+- **Surveillance sources loop automatically.** When a channel's source
+  is a regular file the decode loop wraps around to the start when
+  EOF is hit; when it's a directory the loop enumerates video files
+  (``.mp4 .mkv .avi .mov .webm .flv .ts .m4v .3gp .wmv .mpg .mpeg
+  .rmvb .h264 .h265 .hevc .m2ts .mts``, dotfiles skipped) sorted
+  alphabetically and plays them in sequence, looping back to the
+  first file when the last one ends. The folder is re-scanned on
+  every wrap so newly-dropped files join the loop without a restart.
+  Live streams (``rtsp://``, ``rtmp://``, ``/dev/video*``) are
+  detected as ``"live"`` and never looped — they shouldn't hit EOF
+  anyway. The currently-playing file is exposed in the snapshot as
+  ``current_file`` and surfaces in the cell status + modal meta
+  strip so users can see which clip is on during a folder loop.
 - **Seek/scrub is intentionally not implemented yet.** `VideoCapture`
   doesn't expose a `set(1, frame_pos)` API; plumbing one in means
   touching `self._container` internals. The progress bar is currently

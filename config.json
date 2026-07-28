@@ -1,7 +1,171 @@
 {
   "base": {
-    "model_path": "/userdata/models/",
     "device_name": "TGx2u9ud",
+    "model_path": "/userdata/models/",
     "resource_dir": "/userdata"
+  },
+  "surveillance": {
+    "channels": [
+      {
+        "id": 1,
+        "name": "通道 1",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 2,
+        "name": "通道 2",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 3,
+        "name": "通道 3",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 4,
+        "name": "通道 4",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 5,
+        "name": "通道 5",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 6,
+        "name": "通道 6",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 7,
+        "name": "通道 7",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 8,
+        "name": "通道 8",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 9,
+        "name": "通道 9",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 10,
+        "name": "通道 10",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 11,
+        "name": "通道 11",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 12,
+        "name": "通道 12",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 13,
+        "name": "通道 13",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 14,
+        "name": "通道 14",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 15,
+        "name": "通道 15",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      },
+      {
+        "id": 16,
+        "name": "通道 16",
+        "source": "",
+        "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
+        "playback_enabled": false,
+        "detection_enabled": false,
+        "detect_w": 384,
+        "detect_h": 384
+      }
+    ]
   }
 }
