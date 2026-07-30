@@ -385,56 +385,87 @@
           <button class="refresh-btn" data-refresh>刷新</button>
         </header>
 
-        <div class="vd-toolbar">
-          <input type="text" id="vd-source" class="vd-input"
-                 placeholder="网络流或本地文件/文件夹" />
-          <button id="vd-browse" class="vd-btn">浏览设备…</button>
-          <button id="vd-open" class="vd-btn vd-btn-primary">打开</button>
-          <button id="vd-close" class="vd-btn">关闭</button>
-        </div>
-        <div class="vd-hint" id="vd-hint">
-          视频源
-        </div>
+        <div class="vd-layout">
+          <div class="vd-stage-col">
+            <div class="vd-stage">
+              <canvas id="vd-canvas" width="960" height="540"></canvas>
+              <div class="vd-overlay" id="vd-overlay"></div>
+              <div class="vd-event-badge hidden" id="vd-event-badge">
+                <span class="vd-event-badge-text" id="vd-event-badge-text"></span>
+              </div>
+            </div>
 
-        <div class="vd-stage">
-          <canvas id="vd-canvas" width="960" height="540"></canvas>
-          <div class="vd-overlay" id="vd-overlay"></div>
-          <div class="vd-event-badge hidden" id="vd-event-badge">
-            <span class="vd-event-badge-text" id="vd-event-badge-text"></span>
+            <div class="vd-controls">
+              <button id="vd-play"  class="vd-btn">▶ 播放</button>
+              <button id="vd-pause" class="vd-btn">⏸ 暂停</button>
+              <button id="vd-stop"  class="vd-btn">⏹ 停止</button>
+              <button id="vd-replay" class="vd-btn" disabled title="从开头重新播放">↻ 重播</button>
+              <span class="vd-spacer"></span>
+              <span class="vd-meta" id="vd-meta">--</span>
+            </div>
+
+            <div class="vd-progress">
+              <div class="vd-progress-bar" id="vd-progress"></div>
+            </div>
           </div>
-        </div>
 
-        <div class="vd-controls">
-          <button id="vd-play"  class="vd-btn">▶ 播放</button>
-          <button id="vd-pause" class="vd-btn">⏸ 暂停</button>
-          <button id="vd-stop"  class="vd-btn">⏹ 停止</button>
-          <button id="vd-replay" class="vd-btn" disabled title="从开头重新播放">↻ 重播</button>
-          <span class="vd-spacer"></span>
-          <span class="vd-meta" id="vd-meta">--</span>
-        </div>
+          <aside class="vd-side">
+            <form class="surv-form" id="vd-form" autocomplete="off" onsubmit="return false;">
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>视频源</h3>
+                </header>
+                <div class="surv-field">
+                  <div class="surv-input-row">
+                    <input type="text" id="vd-source" class="surv-input"
+                           placeholder="网络流或本地文件/文件夹" spellcheck="false" />
+                    <button type="button" class="vd-btn" id="vd-browse">浏览…</button>
+                  </div>
+                  <div class="vd-actions-row">
+                    <button type="button" class="vd-btn vd-btn-primary" id="vd-open">打开</button>
+                    <button type="button" class="vd-btn" id="vd-close">关闭</button>
+                  </div>
+                </div>
+              </section>
 
-        <div class="vd-progress">
-          <div class="vd-progress-bar" id="vd-progress"></div>
-        </div>
+              <section class="surv-form-section vd-grow">
+                <header class="surv-form-head">
+                  <h3>检测提示词</h3>
+                  <span class="surv-hint" id="vd-detector-status">未启动</span>
+                </header>
+                <div class="surv-field">
+                  <textarea id="vd-prompt" class="surv-input surv-textarea"
+                            placeholder="例如：检测画面中是否有人进入，或描述图中发生的事件"></textarea>
+                  <div class="vd-detector-row">
+                    <label class="vd-detector-label">
+                      隔
+                      <input type="number" id="vd-every-n" min="1" max="600" step="1" value="30" />
+                      帧
+                    </label>
+                    <button type="button" class="vd-btn vd-btn-primary" id="vd-detector-start">启动检测</button>
+                    <button type="button" class="vd-btn" id="vd-detector-stop" disabled>停止检测</button>
+                  </div>
+                </div>
+              </section>
 
-        <section class="vd-section">
-          <header class="vd-section-head">
-            <h3>检测提示词</h3>
-            <span class="vd-hint" id="vd-detector-status">未启动</span>
-          </header>
-          <textarea id="vd-prompt" class="vd-prompt" rows="2"
-                    placeholder="例如：检测画面中是否有人进入，或描述图中发生的事件"></textarea>
-          <div class="vd-detector-row">
-            <label class="vd-detector-label">
-              每隔
-              <input type="number" id="vd-every-n" min="1" max="600" step="1" value="30" />
-              帧检测一次
-            </label>
-            <span class="vd-spacer"></span>
-            <button id="vd-detector-start" class="vd-btn vd-btn-primary">启动检测</button>
-            <button id="vd-detector-stop"  class="vd-btn" disabled>停止检测</button>
-          </div>
-        </section>
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>检测尺寸</h3>
+                  <span class="surv-hint">VLM 推理帧大小（UI 占位）</span>
+                </header>
+                <div class="surv-field">
+                  <label class="surv-input-split">
+                    <span>尺寸</span>
+                    <select id="vd-detect-size" class="surv-input">
+                      <option value="384" selected>384×384（默认）</option>
+                      <option value="768">768×768</option>
+                    </select>
+                  </label>
+                </div>
+              </section>
+            </form>
+          </aside>
+        </div>
 
         <section class="vd-section">
           <header class="vd-section-head">
@@ -731,6 +762,6 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js?v=25" defer></script>
+  <script src="/static/js/app.js?v=26" defer></script>
 </body>
 </html>

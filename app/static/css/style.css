@@ -616,6 +616,66 @@ html, body {
   100% { background-position: -200% 0; }
 }
 
+.vd-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 0.85rem;
+  align-items: stretch;
+  margin-bottom: 0.85rem;
+}
+.vd-stage-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+.vd-side {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.85rem 0.95rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+.vd-actions-row {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+#page-video-detection .vd-detector-row {
+  margin-top: 0;
+}
+#page-video-detection .vd-side > .surv-form {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+#page-video-detection .vd-grow {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+#page-video-detection .vd-grow .surv-field {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+#page-video-detection .vd-grow .surv-textarea {
+  flex: 1 1 auto;
+  min-height: 4rem;
+  resize: none;
+}
+
+@media (max-width: 1100px) {
+  .vd-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ---------- server-side file picker modal ---------- */
 .vd-modal {
   position: fixed;
