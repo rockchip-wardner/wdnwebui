@@ -70,7 +70,7 @@ pyrkaiweb/
 │   │   ├── power.py
 │   │   ├── surveillance.py     # 16-channel REST + WS endpoints
 │   │   ├── system_logs.py
-│   │   ├── system_monitor.py
+│   │   ├── system_monitor.py   # CPU/mem/NPU + sysfs thermal zones → 系统信息 page
 │   │   └── video_detection.py   # REST + WebSocket frame stream + detector
 │   ├── services/
 │   │   ├── surveillance.py      # 16 channels sharing ONE LLMSession via a worker thread

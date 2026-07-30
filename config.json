@@ -9,10 +9,10 @@
       {
         "id": 1,
         "name": "通道 1",
-        "source": "",
+        "source": "/userdata/3339824657b2c8e9a861cf0e2ac53f68_raw.mp4",
         "prompt": "请用一句话描述当前画面中发生的事件，并标注是否有异常",
-        "playback_enabled": false,
-        "detection_enabled": false,
+        "playback_enabled": true,
+        "detection_enabled": true,
         "detect_w": 384,
         "detect_h": 384
       },

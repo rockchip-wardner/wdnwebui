@@ -1,8 +1,9 @@
 """System monitor endpoint.
 
-Returns CPU/memory usage (via psutil) and per-device NPU telemetry parsed
-from ``rknn-smi info``. Service must run as root (or with sudo) so the
-NPU driver's sysfs/BAR interface is readable.
+Returns CPU/memory usage (via psutil), per-thermal-zone temperature read
+from sysfs, and per-device NPU telemetry parsed from ``rknn-smi info``.
+Service must run as root (or with sudo) so the NPU driver's sysfs/BAR
+interface and ``/sys/class/thermal/`` are readable.
 """
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ import os
 import re
 import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 
 import psutil
 from fastapi import APIRouter
@@ -20,6 +22,21 @@ router = APIRouter(tags=["system-monitor"])
 _RKNNSMI_BIN = "rknn-smi"
 _RKNNSMI_TIMEOUT_S = 5
 _BLOCK_SEP = re.compile(r"^\+[-=]+\+\s*$", re.MULTILINE)
+_THERMAL_ROOT = Path("/sys/class/thermal")
+_THERMAL_NAME_OVERRIDES = {
+    "soc-thermal":      "SoC",
+    "bigcore0-thermal": "大核 0",
+    "bigcore1-thermal": "大核 1",
+    "littlecore-thermal": "小核",
+    "center-thermal":   "中心",
+    "gpu-thermal":      "GPU",
+    "npu-thermal":      "NPU",
+    "cpu-thermal":      "CPU",
+    "cpu0-thermal":     "CPU 0",
+    "cpu1-thermal":     "CPU 1",
+    "x86_pkg_temp":     "x86 整包",
+}
+_SKIP_THERMAL_TYPES = {"acpitz", "acpi"}
 
 
 async def _run_rknn_smi_info() -> tuple[str, str, int]:
@@ -197,6 +214,66 @@ async def _collect_npu() -> dict:
     }
 
 
+def _read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (FileNotFoundError, PermissionError, ValueError, OSError):
+        return None
+
+
+def _collect_thermal() -> dict:
+    if not _THERMAL_ROOT.is_dir():
+        return {
+            "available": False,
+            "reason": f"{_THERMAL_ROOT} not found",
+            "sensors": [],
+        }
+    sensors: list[dict] = []
+    try:
+        zone_dirs = sorted(
+            (p for p in _THERMAL_ROOT.iterdir() if p.name.startswith("thermal_zone")),
+            key=lambda p: int(p.name[len("thermal_zone"):]) if p.name[len("thermal_zone"):].isdigit() else p.name,
+        )
+    except OSError as exc:
+        return {
+            "available": False,
+            "reason": f"enumerate {_THERMAL_ROOT}: {exc.strerror or exc}",
+            "sensors": [],
+        }
+    for zone in zone_dirs:
+        try:
+            index = int(zone.name[len("thermal_zone"):])
+        except ValueError:
+            continue
+        type_path = zone / "type"
+        temp_path = zone / "temp"
+        if not temp_path.is_file():
+            continue
+        raw_temp = _read_int(temp_path)
+        if raw_temp is None:
+            continue
+        stype = type_path.read_text().strip() if type_path.is_file() else ""
+        if stype in _SKIP_THERMAL_TYPES:
+            continue
+        sensors.append({
+            "index": index,
+            "name": stype or zone.name,
+            "label": _THERMAL_NAME_OVERRIDES.get(stype, stype or zone.name),
+            "temp_c": round(raw_temp / 1000.0, 1),
+        })
+    if not sensors:
+        return {
+            "available": False,
+            "reason": "no thermal_zone sensors readable",
+            "sensors": [],
+        }
+    return {
+        "available": True,
+        "source": str(_THERMAL_ROOT),
+        "sensors": sensors,
+    }
+
+
 def _sample_cpu_mem() -> dict:
     cpu = psutil.cpu_percent(interval=0.1)
     per_core = psutil.cpu_percent(interval=None, percpu=True)
@@ -229,6 +306,7 @@ def _sample_cpu_mem() -> dict:
 @router.get("/system-monitor")
 async def get_system_monitor() -> dict:
     base = await asyncio.to_thread(_sample_cpu_mem)
+    base["thermal"] = await asyncio.to_thread(_collect_thermal)
     base["npu"] = await _collect_npu()
     base["placeholder"] = False
     base["section"] = "system-monitor"

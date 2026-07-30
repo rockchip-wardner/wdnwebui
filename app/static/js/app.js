@@ -79,6 +79,91 @@ function renderSystemMonitor(data) {
   const tbody = document.getElementById("npu-tbody");
   const rawEl = document.getElementById("npu-raw");
 
+  const thermal = data.thermal || {};
+  const tBadge = document.getElementById("thermal-badge");
+  const tMsgEl = document.getElementById("thermal-message");
+  const tGrid = document.getElementById("thermal-grid");
+  tBadge.classList.remove("ok", "warn", "err");
+  const sensors = thermal.sensors || [];
+  if (thermal.available && sensors.length) {
+    tBadge.textContent = sensors.length + " 路温控 · 在线";
+    tBadge.classList.add("ok");
+    tMsgEl.classList.add("hidden");
+  } else {
+    tBadge.textContent = "offline";
+    tBadge.classList.add("err");
+    tMsgEl.classList.remove("hidden");
+    tMsgEl.textContent = (thermal.source || "sysfs") + ": " + (thermal.reason || "no thermal sensors");
+  }
+  tGrid.innerHTML = "";
+  if (!sensors.length) {
+    const empty = document.createElement("div");
+    empty.className = "thermal-empty";
+    empty.textContent = "未检测到温控传感器";
+    tGrid.appendChild(empty);
+  } else {
+    const SCALE_MIN = -40;
+    const SCALE_MAX = 85;
+    const SPAN = SCALE_MAX - SCALE_MIN;
+    sensors.forEach(s => {
+      const tempC = s.temp_c == null ? null : Number(s.temp_c);
+      const card = document.createElement("div");
+      let level = "ok";
+      if (tempC != null) {
+        if (tempC < 0) level = "cold";
+        else if (tempC >= 85) level = "crit";
+        else if (tempC >= 80) level = "hot";
+        else if (tempC >= 70) level = "warn";
+      }
+      card.className = "thermal-card " + level;
+
+      const head = document.createElement("div");
+      head.className = "thermal-card-head";
+      const label = document.createElement("span");
+      label.className = "thermal-label";
+      label.textContent = s.label || s.name || "--";
+      label.title = s.label || s.name || "";
+      const loc = document.createElement("span");
+      loc.className = "thermal-loc";
+      loc.textContent = s.name || "";
+      loc.title = s.name || "";
+      head.appendChild(label);
+      head.appendChild(loc);
+      card.appendChild(head);
+
+      const val = document.createElement("div");
+      val.className = "thermal-value";
+      if (tempC == null) {
+        val.textContent = "--";
+      } else {
+        const num = document.createElement("span");
+        num.textContent = tempC.toFixed(1);
+        val.appendChild(num);
+        const unit = document.createElement("span");
+        unit.className = "thermal-value-unit";
+        unit.textContent = " °C";
+        val.appendChild(unit);
+      }
+      card.appendChild(val);
+
+      const bar = document.createElement("div");
+      bar.className = "thermal-bar";
+      const fill = document.createElement("div");
+      fill.className = "thermal-bar-fill " + (level === "ok" ? "" : level);
+      if (tempC != null) {
+        const pct = Math.min(100, Math.max(0, (tempC - SCALE_MIN) / SPAN * 100));
+        fill.style.width = pct + "%";
+      }
+      bar.appendChild(fill);
+      const track = document.createElement("div");
+      track.className = "thermal-bar-track";
+      bar.appendChild(track);
+      card.appendChild(bar);
+
+      tGrid.appendChild(card);
+    });
+  }
+
   badge.classList.remove("ok", "warn", "err");
   if (npu.available && (npu.devices || []).length > 0) {
     badge.textContent = npu.devices.length + " device(s) · online";
@@ -2736,7 +2821,7 @@ const Surveillance = {
   cellStates: [],       // per-cell thumbnail canvas + WebSocket
   modalChannelId: null,
   modalDirty: false,
-  modalWebCodecs: { decoder: null, ws: null, fallbackWs: null, fallbackImg: null },
+  modalStream: null,        // { ws, img } for the enlarge-modal MJPEG WS
 
   init() {
     if (this.initialized) return;
@@ -2809,8 +2894,14 @@ const Surveillance = {
 
       const canvas = document.createElement("canvas");
       canvas.className = "surv-cell-canvas";
-      canvas.width = 240;
-      canvas.height = 135;
+      // The thumb WS now pushes detection-resolution JPEG frames
+      // (384×384 by default, or 768×768 if the channel is configured
+      // for the higher-fidelity preset). We start with a 1×1 backing
+      // store and resize to the JPEG's natural size on the first
+      // frame that arrives — avoids a stretched render before the
+      // channel has produced a frame yet.
+      canvas.width = 1;
+      canvas.height = 1;
       const ctx = canvas.getContext("2d");
       ctx.fillStyle = "#0f172a";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -2939,6 +3030,15 @@ const Surveillance = {
       const blob = new Blob([ev.data], { type: "image/jpeg" });
       const img = new Image();
       img.onload = () => {
+        // Resize the canvas backing store to the JPEG's natural
+        // dimensions on first frame so the cell aspect ratio tracks
+        // the detection size (square). Subsequent frames keep the
+        // same backing store — ``drawImage`` will then scale the
+        // JPEG to whatever the CSS-driven display size is.
+        if (img.naturalWidth && img.naturalHeight) {
+          if (cs.canvas.width !== img.naturalWidth) cs.canvas.width = img.naturalWidth;
+          if (cs.canvas.height !== img.naturalHeight) cs.canvas.height = img.naturalHeight;
+        }
         cs.ctx.drawImage(img, 0, 0, cs.canvas.width, cs.canvas.height);
         URL.revokeObjectURL(img.src);
       };
@@ -3178,8 +3278,16 @@ const Surveillance = {
   },
 
   // ------------------------------------------------------------------ //
-  // H.264 playback (WebCodecs)                                          //
+  // Enlarge-modal MJPEG playback                                        //
   // ------------------------------------------------------------------ //
+  // The server pushes one native-resolution JPEG per WS message at the
+  // source's full fps. The browser is just a dumb consumer: we wrap
+  // each ``ArrayBuffer`` in a ``Blob`` and point an off-screen
+  // ``<img>`` at the resulting object URL; on each ``onload`` we
+  // ``drawImage`` the freshly-decoded picture into the modal canvas.
+  // No WebCodecs, no decoder on the client — works on every browser,
+  // including Edge over http:// non-secure contexts where
+  // ``window.VideoDecoder`` is undefined.
   startModalStream(channelId) {
     this.stopModalStream();
     const overlay = document.getElementById("surv-modal-overlay");
@@ -3189,18 +3297,8 @@ const Surveillance = {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // If the browser doesn't expose WebCodecs, fall back to the
-    // per-channel thumbnail WS (JPEG @ ~5 fps). Worse frame rate
-    // but works on every browser.
-    if (!hasWebCodecs()) {
-      this._setModalOverlay(overlay,
-        "此浏览器不支持 WebCodecs VideoDecoder；改用 240×135 JPEG 缩略图 fallback", false);
-      this.startModalFallbackStream(channelId);
-      return;
-    }
-
     // Reflect channel state in the overlay so the user knows why the
-    // picture might be empty (channel not enabled, no source, errored).
+    // picture might be empty.
     const cfg = this.configs[channelId - 1];
     const snap = this.snapshots[channelId - 1];
     const playbackOn = !!(cfg && (cfg.playback_enabled || cfg.enabled));
@@ -3220,93 +3318,35 @@ const Surveillance = {
     const url = `${proto}//${location.host}${API_PREFIX}/surveillance/${channelId}/stream`;
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
-    this.modalWebCodecs.ws = ws;
+    this.modalStream = { ws, img: null };
 
-    let decoder = null;
-    let avccBytes = null;
-
-    const ensureDecoder = () => {
-      if (decoder) return decoder;
-      if (!avccBytes) return null;
-      try {
-        const codec = avccCodecString(avccBytes);
-        decoder = new VideoDecoder({
-          output: (frame) => {
-            const c = document.getElementById("surv-modal-canvas");
-            if (c) {
-              // Resize the canvas to the coded frame size on first
-              // frame. ``codedWidth/codedHeight`` come from WebCodecs'
-              // own parse of the SPS, which is reliable (the manual
-              // SPS parse we used to do was buggy).
-              if (frame.codedWidth && frame.codedHeight) {
-                if (c.width !== frame.codedWidth) c.width = frame.codedWidth;
-                if (c.height !== frame.codedHeight) c.height = frame.codedHeight;
-              }
-              const cx = c.getContext("2d");
-              cx.drawImage(frame, 0, 0, c.width, c.height);
-              this._setModalOverlay(overlay, "", false);
-            }
-            frame.close();
-          },
-          error: (e) => {
-            console.warn("[surveillance] decoder error", e && e.message);
-            this._setModalOverlay(overlay,
-              "解码器错误: " + ((e && e.message) || e), true);
-          },
-        });
-        // Pass ``codedWidth / codedHeight`` only if we know them;
-        // otherwise WebCodecs figures them out from the bitstream
-        // (and from the avcC ``description`` for H.264).
-        const config = {
-          codec,
-          description: avccBytes,
-          optimizeForLatency: true,
-        };
-        decoder.configure(config);
-        this._setModalOverlay(overlay, "", false);
-      } catch (e) {
-        console.warn("[surveillance] decoder configure failed", e);
-        this._setModalOverlay(overlay,
-          "解码器配置失败: " + (e && e.message || e), true);
+    // Re-use a single off-screen <img> so GC isn't triggered for
+    // every JPEG. We swap the .src on each frame.
+    const img = new Image();
+    this.modalStream.img = img;
+    img.onload = () => {
+      // Resize the canvas to the native source size on first
+      // frame. Subsequent frames skip the canvas resize — ``drawImage``
+      // clips to the destination canvas dimensions.
+      if (img.naturalWidth && img.naturalHeight) {
+        if (canvas.width !== img.naturalWidth) canvas.width = img.naturalWidth;
+        if (canvas.height !== img.naturalHeight) canvas.height = img.naturalHeight;
       }
-      return decoder;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      this._setModalOverlay(overlay, "", false);
+      // Revoke the blob URL we created in onmessage — by the time
+      // ``onload`` fires the browser has already decoded the frame
+      // so the URL is no longer needed.
+      try { URL.revokeObjectURL(img.src); } catch (_) {}
+    };
+    img.onerror = () => {
+      this._setModalOverlay(overlay, "视频帧解码失败", true);
     };
 
     ws.onmessage = (ev) => {
       if (!(ev.data instanceof ArrayBuffer)) return;
-      const buf = new DataView(ev.data);
-      if (buf.byteLength < 9) return;
-      const typeByte = buf.getUint8(0);
-      // pts is u64 LE microseconds; convert via BigInt to preserve
-      // precision over the full 64-bit range, then to Number for
-      // WebCodecs' ``EncodedVideoChunk.timestamp`` (which is double).
-      let ptsUs = 0;
-      try { ptsUs = Number(buf.getBigUint64(1, true)); } catch (_) {}
-      const payload = new Uint8Array(ev.data, 9);
-
-      if (typeByte === 0xFF) return;  // EOS — encoder tore down
-      if (typeByte === 0x02) {
-        // avcC configuration record — feed to the decoder.
-        avccBytes = payload.buffer.slice(
-          payload.byteOffset, payload.byteOffset + payload.byteLength
-        );
-        ensureDecoder();
-        return;
-      }
-      const dec = ensureDecoder();
-      if (!dec) return;
-      const isKey = typeByte === 0x01;
-      try {
-        dec.decode(new EncodedVideoChunk({
-          type: isKey ? "key" : "delta",
-          timestamp: ptsUs,
-          data: payload,
-        }));
-      } catch (e) {
-        // DecoderError before any frames came through usually means
-        // the avcC was bad. Surface it instead of silently swallowing.
-        console.warn("[surveillance] decode failed", e);
-      }
+      const blob = new Blob([ev.data], { type: "image/jpeg" });
+      img.src = URL.createObjectURL(blob);
     };
     ws.onopen = () => {
       this._setModalOverlay(overlay, "等待画面…", false);
@@ -3315,8 +3355,8 @@ const Surveillance = {
       this._setModalOverlay(overlay, "视频流连接失败", true);
     };
     ws.onclose = () => {
-      if (this.modalWebCodecs.ws === ws) {
-        this.modalWebCodecs.ws = null;
+      if (this.modalStream && this.modalStream.ws === ws) {
+        this.modalStream = null;
       }
     };
   },
@@ -3333,22 +3373,15 @@ const Surveillance = {
   },
 
   stopModalStream() {
-    const mc = this.modalWebCodecs;
-    if (mc.ws) {
-      try { mc.ws.close(); } catch (_) {}
-      mc.ws = null;
-    }
-    if (mc.decoder) {
-      try { mc.decoder.close(); } catch (_) {}
-      mc.decoder = null;
-    }
-    if (mc.fallbackWs) {
-      try { mc.fallbackWs.close(); } catch (_) {}
-      mc.fallbackWs = null;
-    }
-    if (mc.fallbackImg) {
-      try { mc.fallbackImg.src = ""; } catch (_) {}
-      mc.fallbackImg = null;
+    const ms = this.modalStream;
+    if (ms) {
+      if (ms.ws) {
+        try { ms.ws.close(); } catch (_) {}
+      }
+      if (ms.img) {
+        try { ms.img.src = ""; } catch (_) {}
+      }
+      this.modalStream = null;
     }
     const overlay = document.getElementById("surv-modal-overlay");
     if (overlay) {
@@ -3356,91 +3389,9 @@ const Surveillance = {
       overlay.classList.remove("error");
     }
   },
-
-  // ------------------------------------------------------------------ //
-  // MJPEG fallback                                                       //
-  // ------------------------------------------------------------------ //
-  // When the browser lacks WebCodecs (``window.VideoDecoder`` is
-  // undefined or throws on construction — common on older Chromium
-  // builds and on Linux ships that disable WebCodecs by default), we
-  // fall back to the server's per-channel thumbnail WS. The server
-  // already produces a 240×135 JPEG at ~5 fps per channel from the
-  // decoded BGR frame; subscribe to it and draw each JPEG to canvas.
-  // Not as smooth as H.264, but works on every browser.
-  startModalFallbackStream(channelId) {
-    const canvas = document.getElementById("surv-modal-canvas");
-    const overlay = document.getElementById("surv-modal-overlay");
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}${API_PREFIX}/surveillance/${channelId}/thumb`;
-    const ws = new WebSocket(url);
-    ws.binaryType = "arraybuffer";
-    this.modalWebCodecs.fallbackWs = ws;
-
-    // Re-use a single off-screen <img> so GC isn't triggered for
-    // every JPEG. We swap the .src on each frame.
-    const img = new Image();
-    this.modalWebCodecs.fallbackImg = img;
-    img.onload = () => {
-      // Match canvas to the thumbnail size on first frame, then
-      // let drawImage do the upscale to the displayed canvas.
-      if (canvas.width !== img.naturalWidth) canvas.width = img.naturalWidth;
-      if (canvas.height !== img.naturalHeight) canvas.height = img.naturalHeight;
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      this._setModalOverlay(overlay, "", false);
-    };
-    img.onerror = () => {
-      this._setModalOverlay(overlay, "缩略图解码失败", true);
-    };
-
-    ws.onmessage = (ev) => {
-      if (!(ev.data instanceof ArrayBuffer)) return;
-      const blob = new Blob([ev.data], { type: "image/jpeg" });
-      const prev = img.src;
-      img.src = URL.createObjectURL(blob);
-      if (prev) URL.revokeObjectURL(prev);
-    };
-    ws.onopen = () => {
-      this._setModalOverlay(overlay, "等待画面…", false);
-    };
-    ws.onerror = () => {
-      this._setModalOverlay(overlay, "缩略图流连接失败", true);
-    };
-    ws.onclose = () => {
-      if (this.modalWebCodecs.fallbackWs === ws) {
-        this.modalWebCodecs.fallbackWs = null;
-      }
-    };
-  },
 };
 
-// WebCodecs feature detection — check both the constructor and the
-// EncodedVideoChunk factory so we don't accidentally accept a build
-// that exposes one without the other.
-function hasWebCodecs() {
-  try {
-    return typeof window.VideoDecoder === "function"
-      && typeof window.EncodedVideoChunk === "function"
-      && typeof window.DecodedVideoChunk === "function";
-  } catch (_) {
-    return false;
-  }
-}
 
-// WebCodecs codec-string parser for an avcC record.
-// avc1.PPCCLL — PP=profile_idc hex, CC=constraint_set_flags hex, LL=level_idc hex.
-function avccCodecString(avcc) {
-  if (!avcc || avcc.byteLength < 4) return "avc1.42E01E";
-  const v = new DataView(avcc.buffer, avcc.byteOffset, avcc.byteLength);
-  const profile = v.getUint8(1).toString(16).padStart(2, "0").toUpperCase();
-  const constraint = v.getUint8(2).toString(16).padStart(2, "0").toUpperCase();
-  const level = v.getUint8(3).toString(16).padStart(2, "0").toUpperCase();
-  return `avc1.${profile}${constraint}${level}`;
-}
 
 // The video-detection file picker modal knows about /api/video-detection/fs.
 // When the user picks a file from the 视频监控 modal, we want the same

@@ -13,35 +13,36 @@ REST endpoints (config + status):
 
 WebSocket endpoints (per-channel):
 
-  WS /api/surveillance/{id}/ingest          server-side ingest of H.264 NALs
-                                            from the rkv.VideoWriter's
-                                            rkv+ws:// client (forwarded
-                                            by the channel's decode thread).
-  WS /api/surveillance/{id}/stream          sends H.264 wire format to
-                                            the browser. Browser uses
-                                            WebCodecs (chrome 94+) or
-                                            MSE+mp4-muxer to render.
-  WS /api/surveillance/{id}/thumb           pushes JPEG thumbnails at
-                                            ~5 fps for the grid cell preview.
+  WS /api/surveillance/{id}/stream          pushes raw native-resolution
+                                            JPEG frames (one per WS
+                                            message) at the source's
+                                            full fps for the enlarge
+                                            modal. Each frame is a
+                                            standalone JPEG — no header,
+                                            no framing. Browser consumes
+                                            by handing each ``ArrayBuffer``
+                                            to ``<img>`` via a Blob URL.
+  WS /api/surveillance/{id}/thumb           pushes raw detection-resolution
+                                            JPEG frames at ~5 fps for the
+                                            grid cell preview. Same
+                                            format as ``/stream``.
 
-Wire format end-to-end (matches ``rkv.encoder._WebSocketSink``):
+Both ``/stream`` and ``/thumb`` are pure MJPEG WS feeds — no H.264,
+no WebCodecs, no PTS, no decoder on the client side. The JPEG frames
+are produced by ``rkv.MppEncoder`` (MPP hardware JPEG path) on the
+decode thread and fan out to per-subscriber queues with drop-oldest
+on overflow.
 
-    <type_byte:u8><pts_us:u64 LE><payload>
-
-  type_byte:
-    0x00  PKT_TYPE_DELTA   (length-prefixed H.264 access unit)
-    0x01  PKT_TYPE_KEY     (key-frame access unit)
-    0x02  PKT_TYPE_HEADER  (avcC configuration record)
-    0xFF  PKT_TYPE_EOS     (encoder tore down)
-
-The browser-side MSE helper expects the avcC record up front, then a
-stream of length-prefixed NAL access units. WebCodecs-based decoding
-takes the same payload directly.
+Browser-side consumption is the same as a regular ``<img src="...">``:
+each WS message is a complete JPEG (``SOI`` … ``EOI``), wrapped in a
+``Blob`` and pointed at ``img.src`` as a fresh object URL on every
+message. No timing logic — the browser paints at whatever rate frames
+arrive, which matches the source's real frame rate because the server
+paces the decode→encode loop to ``1/fps``.
 """
 from __future__ import annotations
-
 import asyncio
-import struct
+
 from typing import List, Optional
 
 from fastapi import (
@@ -248,68 +249,18 @@ async def clear_events(channel_id: int) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# WebSocket: ingest (rkv+ws:// client → server)                              #
-# --------------------------------------------------------------------------- #
-@router.websocket("/surveillance/{channel_id}/ingest")
-async def ingest_ws(ws: WebSocket, channel_id: int) -> None:
-    """Server-side ingest endpoint for the rkv.VideoWriter's
-    rkv+ws:// client. The encoder connects here, sends H.264 wire format
-    packets, and we route them to the channel's fan-out queue.
-
-    The encoder uses a stdlib socket + hand-rolled RFC 6455 handshake;
-    uvicorn's WS server accepts this (it's a vanilla client WS upgrade).
-    """
-    if not (1 <= channel_id <= CHANNEL_COUNT):
-        await ws.close(code=4404)
-        return
-    await ws.accept()
-    ch = get_manager().get_channel(channel_id - 1)
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg.get("type") == "websocket.disconnect":
-                break
-            data = msg.get("bytes")
-            if data is None:
-                # The rkv encoder only sends binary frames; text frames
-                # are a protocol violation. Drop silently.
-                continue
-            # Wire format: <type_byte:u8><pts_us:u64 LE><payload>
-            if len(data) < 9:
-                continue
-            (type_byte, pts_us) = struct.unpack("<BQ", data[:9])
-            payload = data[9:]
-            ch.push_packet(type_byte, pts_us, payload)
-            if type_byte == 0xFF:  # EOS marker
-                # Encoder is telling us the stream is over. Break out
-                # so the socket closes cleanly.
-                break
-    except WebSocketDisconnect:
-        return
-    except Exception:
-        # Defensive: any unexpected exception should not break the
-        # server. The decode thread will keep retrying on the next
-        # frame; the encoder's _WebSocketSink.send_packet reconnects
-        # on send failure too.
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
-
-# --------------------------------------------------------------------------- #
 # WebSocket: stream (server → browser)                                       #
 # --------------------------------------------------------------------------- #
+# Native-resolution MJPEG: each WS message is a complete standalone JPEG
+# (SOI…EOI bytes — no header, no framing). The browser consumes it by
+# wrapping the ``ArrayBuffer`` in a ``Blob`` and pointing ``<img>.src``
+# at the resulting object URL; swapping ``.src`` triggers the browser
+# to redraw on the next paint. No WebCodecs, no MSE, no decoder on the
+# client side — works on every browser, including ones that consider
+# non-localhost http origins insecure context.
 @router.websocket("/surveillance/{channel_id}/stream")
 async def stream_ws(ws: WebSocket, channel_id: int) -> None:
-    """Forward H.264 wire-format packets to the browser.
-
-    The browser consumes this either via WebCodecs (recommended) or by
-    running the same payload through a small JS fMP4 muxer before
-    appending to a MSE SourceBuffer. The packet format mirrors the
-    rkv encoder's on-wire layout so the browser can treat both paths
-    identically.
-    """
+    """Forward native-resolution MJPEG frames to the browser."""
     if not (1 <= channel_id <= CHANNEL_COUNT):
         await ws.close(code=4404)
         return
@@ -319,9 +270,6 @@ async def stream_ws(ws: WebSocket, channel_id: int) -> None:
     loop = asyncio.get_event_loop()
     try:
         while True:
-            # Wait for the next packet. Bound the wait so a quiet
-            # channel still flushes its close in a timely manner when
-            # the client disconnects.
             try:
                 await loop.run_in_executor(None, evt.wait, 1.0)
             except Exception:
@@ -329,17 +277,13 @@ async def stream_ws(ws: WebSocket, channel_id: int) -> None:
             if not evt.is_set():
                 continue
             evt.clear()
-            # Drain everything currently in the queue.
             while True:
                 try:
-                    pkt = q.get_nowait()
+                    jpg = q.get_nowait()
                 except Exception:
                     break
-                type_byte, pts_us, payload = pkt
                 try:
-                    await ws.send_bytes(
-                        struct.pack("<BQ", type_byte, pts_us) + payload
-                    )
+                    await ws.send_bytes(jpg)
                 except Exception:
                     return
     except WebSocketDisconnect:
@@ -353,9 +297,11 @@ async def stream_ws(ws: WebSocket, channel_id: int) -> None:
 # --------------------------------------------------------------------------- #
 # WebSocket: thumbnail (server → browser)                                    #
 # --------------------------------------------------------------------------- #
+# Same wire format as ``/stream`` — standalone JPEGs, one per WS
+# message. Detection-resolution (~5 fps) for the grid cell preview.
 @router.websocket("/surveillance/{channel_id}/thumb")
 async def thumb_ws(ws: WebSocket, channel_id: int) -> None:
-    """Push JPEG thumbnails at ~5 fps for the grid cell preview."""
+    """Push detection-resolution JPEG thumbnails at ~5 fps."""
     if not (1 <= channel_id <= CHANNEL_COUNT):
         await ws.close(code=4404)
         return

@@ -10,14 +10,14 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-title">守望者平台</span>
+        <span class="brand-title">守望者系统</span>
         <div class="brand-meta">
           <span class="brand-subtitle">Wardner</span>
           <span class="brand-version" id="brand-version">v0.3.0</span>
         </div>
       </div>
       <nav class="nav">
-        <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统监控</a>
+        <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
         <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
         <a href="#surveillance"    data-page="surveillance"    class="nav-item">视频监控</a>
         <a href="#audio-monitor"   data-page="audio-monitor"   class="nav-item">音频监控</a>
@@ -110,13 +110,13 @@
         <span class="root-warning-icon" aria-hidden="true">⚠</span>
         <span class="root-warning-text">
           当前服务未以 <strong>root</strong> 身份运行，电源控制（关机 / 重启）功能将受限或不可用。请使用
-          <code>sudo python run.py</code> 启动服务后再使用本平台。
+          <code>sudo python run.py</code> 启动服务后再使用本系统。
         </span>
       </div>
 
       <section id="page-system-monitor"  class="page" data-page="system-monitor">
         <header class="page-header">
-          <h2>系统监控</h2>
+          <h2>系统信息</h2>
           <div class="header-meta">
             <span class="collected-at" id="system-monitor-time"></span>
             <button class="refresh-btn" data-refresh>刷新</button>
@@ -143,6 +143,26 @@
             <div class="metric-sub" id="mem-meta"></div>
           </div>
         </div>
+
+        <section class="thermal-section">
+          <header class="section-header">
+            <h3>温控温度</h3>
+            <span class="badge" id="thermal-badge">--</span>
+            <span class="thermal-scale" aria-hidden="true">
+              <span class="thermal-scale-tick" style="left:0%">−40°</span>
+              <span class="thermal-scale-tick" style="left:36.4%">0°</span>
+              <span class="thermal-scale-tick" style="left:100%">85°</span>
+            </span>
+          </header>
+          <div class="thermal-range-info">
+            <span>工规范围 −40°C ~ 85°C</span>
+            <span>&lt; 0°C 低温告警 · 70°C 黄 · 80°C 橙 · ≥ 85°C 红</span>
+          </div>
+          <div id="thermal-message" class="npu-message hidden"></div>
+          <div class="thermal-grid" id="thermal-grid">
+            <div class="thermal-empty">加载中…</div>
+          </div>
+        </section>
 
         <section class="npu-section">
           <header class="section-header">
@@ -711,6 +731,6 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js?v=21" defer></script>
+  <script src="/static/js/app.js?v=25" defer></script>
 </body>
 </html>

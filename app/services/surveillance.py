@@ -3,9 +3,24 @@
 The ``SurveillanceManager`` owns 16 :class:`Channel` instances, each of
 which runs its own decoder / encoder pipeline:
 
-  rkv.VideoCapture.read0(detect_w, detect_h, fmt="RGB")
+  rkv.VideoCapture.read0(fmt="NV12")                  # native NV12 DMA-BUF
        |
-       v
+       +--> rkv.rga.resize_bgr(frame0, native_w, native_h)   # stream MJPEG path
+       |        |
+       |        v
+       |    MppEncoder(MJPEG, fixqp, native)  -- every ~5 frames
+       |        |                                 (MPP queue leak workaround)
+       |        v
+       |    /stream WS  ->  native-res JPEG -> browser <canvas>
+       |
+       +--> rkv.rga.resize_bgr(frame0, detect_w, detect_h)   # thumbnail MJPEG path
+                |
+                v
+            MppEncoder(MJPEG, fixqp, detect)    -- every ~5 frames
+                |
+                v
+            /thumb WS   ->  detection-res JPEG -> browser <canvas> (grid + modal)
+
   SurveillanceManager.submit_inference(...)   # enqueue, non-blocking
        |
        v
@@ -13,18 +28,6 @@ which runs its own decoder / encoder pipeline:
        |   session.reset()  +  await session.respond(prompt, attachment=[...])
        v
   concurrent.futures.Future resolves; channel records event async
-       |
-       v
-  rkv.VideoWriter("rkv+ws://127.0.0.1:8000/api/surveillance/<id>/ingest", codec="h264")
-       |   (zero-copy: writer.write(frame0) hands the decoder's DMA-BUF to MPP)
-       v
-  server's /ingest WebSocket  ->  per-channel H.264 packet buffer
-                                   |
-                                   v
-                             /stream WebSocket -> browser (WebCodecs / MSE)
-                                   |
-                                   v
-                             /thumb WebSocket -> browser (<canvas> per cell)
 
 Why a shared session
 ====================
@@ -83,24 +86,37 @@ DETECT_SIZE_CHOICES = (384, 768)
 DEFAULT_DETECT_W = 384
 DEFAULT_DETECT_H = 384
 
-# Thumbnail size + rate for the grid cells.
+# Detection size — only two valid values. The qwen3-vl-4b model
+# internally resizes to 384; 768 is the higher-fidelity preset.
+# Detection is forced square; ``detect_w == detect_h`` is enforced
+# wherever the value flows through. Per-channel override via
+# ``detect_w/h``.
+DETECT_SIZE_CHOICES = (384, 768)
+DEFAULT_DETECT_W = 384
+DEFAULT_DETECT_H = 384
+
+# Thumbnail size + rate for the grid cells. With the move to MJPEG
+# (see below) the thumbnail is a detection-resolution JPEG sent at
+# ~5fps; THUMB_W/H constants are kept for backward compat but no
+# longer drive the resize (we resize to detect_w/detect_h instead).
 THUMB_W = 240
 THUMB_H = 135
 THUMB_INTERVAL_S = 0.2  # ~5 fps
 
-# H.264 encoder settings.
+# MJPEG encoder settings (replaces the old H.264 path).
 ENCODE_FPS = 25
-ENCODE_BITRATE = 1_000_000
-ENCODE_GOP = 30
+STREAM_JPEG_QUALITY = 80    # 1..99; native-resolution frames
+THUMB_JPEG_QUALITY = 70     # 1..99; detection-resolution frames (smaller)
+# Workaround interval for the MPP MJPEG HAL input-queue leak (see
+# ``.venv/src/rkv/src/rkv/encoder.py`` ``_MPP_MJPEG_RECYCLE_EVERY``
+# comment). After ~6 encode() calls the queue fills up; closing and
+# recreating the encoder clears it. We recycle every 5 frames as a
+# safety margin (1 frame headroom under the observed deadlock).
+_MPP_MJPEG_RECYCLE_EVERY = 5
 
 # VLM cadence: one inference every N frames. Bounded so a slow channel
 # doesn't burn the NPU; user-tunable via the channel config.
 DEFAULT_EVERY_N = 30
-
-# Packet buffer: enough to absorb a brief network hiccup; older packets
-# get dropped on overflow (live monitoring — favor low latency).
-PACKET_BUFFER_MAX = 100
-SUBSCRIBER_QUEUE_MAX = 50
 
 # Inference worker queue: drop oldest on overflow. The decode threads
 # fire-and-forget; a backed-up queue just means older frames get
@@ -166,14 +182,32 @@ def _load_rkai():
 
 
 def _load_rkv():
-    """Lazy rkv import — :class:`rkv.VideoCapture` / ``VideoWriter``
-    are heavy native libs; the rkv package already gates them behind a
-    try/except so a non-Rockchip dev box still boots."""
+    """Lazy rkv import — :class:`rkv.VideoCapture` and the MPP
+    encoder/decoder handles are heavy native libs; the rkv package
+    already gates them behind a try/except so a non-Rockchip dev box
+    still boots. Returns the symbols the surveillance path needs:
+
+    * ``VideoCapture`` — per-channel decode
+    * ``MppEncoder`` — MJPEG hardware encoder (one instance per
+      encode path; recycled every ``_MPP_MJPEG_RECYCLE_EVERY``
+      frames to dodge the queue leak)
+    * ``MppCodingType.MJPEG`` — fixedqp MJPEG coding
+    * ``MppFrameFormat.BGR888`` — input format the encoder consumes
+      (we resize NV12 → BGR via RGA)
+    """
     try:
-        from rkv import VideoCapture, VideoWriter
-        return True, VideoCapture, VideoWriter, ""
+        from rkv import VideoCapture
+        from rkv.mpp import MppEncoder, MppCodingType, MppFrameFormat
+        return (
+            True,
+            VideoCapture,
+            MppEncoder,
+            int(MppCodingType.MJPEG),
+            int(MppFrameFormat.BGR888),
+            "",
+        )
     except Exception as e:
-        return False, None, None, str(e)
+        return False, None, None, None, None, str(e)
 
 
 # --------------------------------------------------------------------------- #
@@ -359,14 +393,17 @@ class Channel:
         self._events: deque = deque(maxlen=100)
         self._next_event_id: int = 1
 
-        # ----- H.264 packet fan-out -----
-        self._packet_lock = threading.Lock()
-        self._packet_avcc: Optional[bytes] = None
-        self._packet_buffer: deque = deque(maxlen=PACKET_BUFFER_MAX)
-        self._subs_lock = threading.Lock()
-        self._subs: List[Tuple[queue.Queue, threading.Event]] = []
+        # ----- native MJPEG stream fan-out (raw JPEG bytes) -----
+        # Subscribers are server-side WS clients (the browser). Each
+        # WS holds its own queue + event so a slow subscriber doesn't
+        # back-pressure the decode thread — the queue's
+        # put_nowait-with-drop-oldest behaviour favours latency.
+        self._stream_lock = threading.Lock()
+        self._stream_jpeg: Optional[bytes] = None
+        self._stream_subs_lock = threading.Lock()
+        self._stream_subs: List[Tuple[queue.Queue, threading.Event]] = []
 
-        # ----- thumbnail fan-out -----
+        # ----- detection-resolution MJPEG thumb fan-out -----
         self._thumb_lock = threading.Lock()
         self._thumb_jpeg: Optional[bytes] = None
         self._thumb_last_ts: float = 0.0
@@ -490,7 +527,12 @@ class Channel:
                 "session_ready": self._manager.session_ready(),
                 "session_error": self._session_error,
                 "events_count": len(self._events),
-                "avcc_ready": self.get_avcc() is not None,
+                # Latest bytes available for new subscribers; surfaces
+                # in the UI as a "frame available" hint so the cell
+                # can render immediately rather than waiting up to
+                # one frame interval.
+                "thumb_ready": self.get_thumb() is not None,
+                "stream_ready": self.get_stream() is not None,
             }
 
     def events_since(self, since_id: int = 0) -> List[dict]:
@@ -573,16 +615,43 @@ class Channel:
     # Decode loop                                                         #
     # ------------------------------------------------------------------ #
     def _decode_loop(self, source: str, detect_w: int, detect_h: int) -> None:
-        ok, VideoCapture, VideoWriter, err = _load_rkv()
+        ok, VideoCapture, MppEncoder, MJPEG_FMT, BGR_FMT, err = _load_rkv()
         if not ok:
             self._set_error(f"rkv 未加载: {err}")
             return
 
+        # ``resize_bgr`` does NV12→BGR + resize in a single RGA pass.
+        # Imported lazily so a non-Rockchip dev box that never calls
+        # the encode path still boots.
         try:
-            import cv2 as _cv2
-            self._cv2 = _cv2
+            from rkv import rga as _rkv_rga
+            resize_bgr = _rkv_rga.resize_bgr
         except Exception:
-            self._cv2 = None
+            resize_bgr = None  # type: ignore[assignment]
+
+        # Encoder lifecycle state. We keep one MppEncoder instance per
+        # MJPEG output (stream at native res, thumb at detect res) and
+        # recycle it every ``_MPP_MJPEG_RECYCLE_EVERY`` frames to dodge
+        # the MPP input-queue leak (see ``_MPP_MJPEG_RECYCLE_EVERY``
+        # comment at the top of the file). Both encoders follow the
+        # same lifecycle as ``cap`` — created on file open, destroyed
+        # on file close (or on stop).
+        self._stream_enc = None
+        self._stream_enc_count = 0
+        self._thumb_enc = None
+        self._thumb_enc_count = 0
+
+        def _open_enc(width: int, height: int, q: int):
+            return MppEncoder(
+                MJPEG_FMT,
+                width=width,
+                height=height,
+                fps=ENCODE_FPS,
+                gop=1,                # MJPEG: every frame is independent
+                input_format=BGR_FMT,
+                rc_mode="fixqp",      # MJPEG is fixed-quality per frame
+                q_factor=q,
+            )
 
         kind = _classify_source(source)
         # ``playlist`` is None for live / missing / single-file sources
@@ -600,11 +669,6 @@ class Channel:
         playlist_idx = 0
         # Force a re-scan of the folder at every wrap so newly-dropped
         # files get picked up without restarting the channel.
-        kind_changed = False
-
-        ingest_url = (
-            f"rkv+ws://127.0.0.1:8000/api/surveillance/{self.id}/ingest"
-        )
 
         while not self._stop_event.is_set():
             # Pick the current source — playlist or single source.
@@ -634,26 +698,40 @@ class Channel:
                 self._set_error("VideoCapture.isOpened() = False")
                 return
 
-            # Open VideoWriter (one per file — its ``release`` sends an
-            # EOS marker that tells the ingest endpoint to drop the
-            # connection, which is exactly what we want before
-            # reopening for the next file).
             fps = max(1, int(getattr(cap, "fps", 0.0) or 0.0) or ENCODE_FPS)
-            try:
-                writer = VideoWriter(
-                    ingest_url,
-                    fps=fps,
-                    frame_size=(detect_w, detect_h),
-                    codec="h264",
-                    bitrate=ENCODE_BITRATE,
-                    gop=ENCODE_GOP,
-                )
-            except Exception as e:
-                self._set_error(f"VideoWriter 初始化失败: {e}")
+            native_w = int(getattr(cap, "width", 0) or 0)
+            native_h = int(getattr(cap, "height", 0) or 0)
+            if native_w <= 0 or native_h <= 0:
                 try:
                     cap.release()
                 except Exception:
                     pass
+                if playlist is not None and len(playlist) > 1:
+                    playlist_idx = (playlist_idx + 1) % len(playlist)
+                    continue
+                self._set_error(f"无法获取源尺寸: {current_source}")
+                return
+
+            # Open both MJPEG encoders (native + detection). If either
+            # fails we drop this file from the playlist and move on.
+            try:
+                self._stream_enc = _open_enc(
+                    native_w, native_h, STREAM_JPEG_QUALITY,
+                )
+                self._thumb_enc = _open_enc(
+                    detect_w, detect_h, THUMB_JPEG_QUALITY,
+                )
+                self._stream_enc_count = 0
+                self._thumb_enc_count = 0
+            except Exception as e:
+                self._set_error(f"MppEncoder 初始化失败: {e}")
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                if playlist is not None and len(playlist) > 1:
+                    playlist_idx = (playlist_idx + 1) % len(playlist)
+                    continue
                 return
 
             with self._lock:
@@ -663,9 +741,11 @@ class Channel:
 
             # ---- inner decode loop for this one file ----
             hit_eof = False
+            next_frame_at = time.monotonic()
+            target_interval = 1.0 / float(fps)
             while not self._stop_event.is_set():
                 try:
-                    ret, frame0 = cap.read0(detect_w, detect_h, fmt="RGB")
+                    ret, frame0 = cap.read0(fmt="NV12")
                 except Exception as e:
                     self._set_error(f"read0 异常: {e}")
                     break
@@ -697,22 +777,105 @@ class Channel:
                 if (detection_on and prompt
                         and every_n > 0
                         and self._frame_pos % every_n == 0):
-                    self._submit_vlm(frame0, prompt)
+                    self._submit_vlm(frame0, prompt, detect_w, detect_h)
 
-                # H.264 encode via rkv.VideoWriter (zero-copy with frame0)
-                try:
-                    writer.write(frame0)
-                except Exception:
-                    pass
+                # Native-res MJPEG stream (full source fps). Recycle
+                # the encoder before it deadlocks on the MPP queue
+                # leak. On close / re-open failure we null the slot
+                # so subsequent encode attempts skip silently
+                # instead of pounding on a closed handle.
+                if (
+                    self._stream_enc is not None
+                    and self._stream_enc_count >= _MPP_MJPEG_RECYCLE_EVERY
+                ):
+                    try:
+                        self._stream_enc.close()
+                    except Exception:
+                        pass
+                    self._stream_enc = None
+                if self._stream_enc is None and resize_bgr is not None:
+                    try:
+                        self._stream_enc = _open_enc(
+                            native_w, native_h, STREAM_JPEG_QUALITY,
+                        )
+                        self._stream_enc_count = 0
+                    except Exception:
+                        pass  # leave None; next frame will retry
+                if resize_bgr is not None and self._stream_enc is not None:
+                    try:
+                        native_bgr = resize_bgr(frame0, native_w, native_h)
+                        pkt = self._stream_enc.encode(native_bgr)
+                        if pkt and pkt.data:
+                            self._stream_enc_count += 1
+                            self._push_stream(pkt.data)
+                    except Exception:
+                        pass
 
-                # Server-side thumbnail JPEG (~5 fps).
-                self._maybe_update_thumb(frame0)
+                # Detection-res MJPEG thumb (~5 fps, gated by
+                # ``_thumb_last_ts``). Same recycle logic as the
+                # stream encoder — thumb frame count is much lower
+                # per second but the queue leak still applies.
+                now_mono = time.monotonic()
+                with self._thumb_lock:
+                    thumb_due = (now_mono - self._thumb_last_ts) >= THUMB_INTERVAL_S
+                if thumb_due and self._thumb_enc is not None:
+                    if self._thumb_enc_count >= _MPP_MJPEG_RECYCLE_EVERY:
+                        try:
+                            self._thumb_enc.close()
+                        except Exception:
+                            pass
+                        self._thumb_enc = None
+                if (
+                    thumb_due
+                    and self._thumb_enc is None
+                    and resize_bgr is not None
+                ):
+                    try:
+                        self._thumb_enc = _open_enc(
+                            detect_w, detect_h, THUMB_JPEG_QUALITY,
+                        )
+                        self._thumb_enc_count = 0
+                    except Exception:
+                        pass
+                if thumb_due and self._thumb_enc is not None and resize_bgr is not None:
+                    try:
+                        detect_bgr = resize_bgr(frame0, detect_w, detect_h)
+                        pkt = self._thumb_enc.encode(detect_bgr)
+                        if pkt and pkt.data:
+                            self._thumb_enc_count += 1
+                            with self._thumb_lock:
+                                self._thumb_jpeg = pkt.data
+                                self._thumb_last_ts = now_mono
+                            self._push_thumb(pkt.data)
+                    except Exception:
+                        pass
+
+                # Server-side pacing. ``read0`` returns frames as
+                # fast as the decoder can produce them; without this
+                # we'd blast frames through the WS at hundreds of
+                # fps for a local file. Live streams (RTSP/RTMP/
+                # V4L2) block on the upstream so this sleep reduces
+                # to ~0 naturally.
+                now_mono = time.monotonic()
+                delay = next_frame_at - now_mono
+                if delay > 0:
+                    time.sleep(delay)
+                next_frame_at += target_interval
+                if next_frame_at < now_mono:
+                    # Loop iteration overran (encode stall, GC,
+                    # etc.). Resync rather than play catch-up by
+                    # bursting.
+                    next_frame_at = now_mono + target_interval
 
             # ---- cleanup this file ----
-            try:
-                writer.release()
-            except Exception:
-                pass
+            for enc_attr in ("_stream_enc", "_thumb_enc"):
+                enc = getattr(self, enc_attr, None)
+                if enc is not None:
+                    try:
+                        enc.close()
+                    except Exception:
+                        pass
+                    setattr(self, enc_attr, None)
             try:
                 cap.release()
             except Exception:
@@ -765,33 +928,36 @@ class Channel:
             self._current_source_label = ""
 
     # ------------------------------------------------------------------ #
-    # Thumbnail                                                           #
+    # JPEG fan-out (native stream + detection thumb)                     #
     # ------------------------------------------------------------------ #
-    def _maybe_update_thumb(self, frame0) -> None:
-        if self._cv2 is None:
-            return
-        now = time.time()
-        with self._thumb_lock:
-            if now - self._thumb_last_ts < THUMB_INTERVAL_S:
-                return
-            self._thumb_last_ts = now
-        try:
-            bgr = frame0.numpy(fmt="BGR")
-        except Exception:
-            return
-        try:
-            thumb = self._cv2.resize(bgr, (THUMB_W, THUMB_H))
-            ok, buf = self._cv2.imencode(
-                ".jpg", thumb,
-                [int(self._cv2.IMWRITE_JPEG_QUALITY), 70],
-            )
-            if not ok:
-                return
-            jpg = bytes(buf)
-        except Exception:
-            return
-        with self._thumb_lock:
-            self._thumb_jpeg = jpg
+    # Both the enlarge-modal WS and the per-cell thumbnail WS deliver
+    # raw JPEG bytes (no header / framing) — the browser just hands
+    # them to ``<img>`` via a Blob URL. The decode thread pushes each
+    # encoded JPEG into every subscriber queue with a non-blocking
+    # ``put_nowait``; full queues drop the oldest frame so a stalled
+    # subscriber doesn't back-pressure the encode pipeline.
+
+    def _push_stream(self, jpg: bytes) -> None:
+        with self._stream_lock:
+            self._stream_jpeg = jpg
+        with self._stream_subs_lock:
+            subs = list(self._stream_subs)
+        for q, evt in subs:
+            try:
+                q.put_nowait(jpg)
+                evt.set()
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(jpg)
+                    evt.set()
+                except queue.Full:
+                    pass
+
+    def _push_thumb(self, jpg: bytes) -> None:
         with self._thumb_subs_lock:
             subs = list(self._thumb_subs)
         for q, evt in subs:
@@ -799,7 +965,6 @@ class Channel:
                 q.put_nowait(jpg)
                 evt.set()
             except queue.Full:
-                # Drop oldest to favor latency.
                 try:
                     q.get_nowait()
                 except queue.Empty:
@@ -813,6 +978,10 @@ class Channel:
     def get_thumb(self) -> Optional[bytes]:
         with self._thumb_lock:
             return self._thumb_jpeg
+
+    def get_stream(self) -> Optional[bytes]:
+        with self._stream_lock:
+            return self._stream_jpeg
 
     def register_thumb_subscriber(self) -> Tuple[queue.Queue, threading.Event]:
         q = queue.Queue(maxsize=2)
@@ -839,10 +1008,31 @@ class Channel:
                 (qq, e) for (qq, e) in self._thumb_subs if qq is not q
             ]
 
+    def register_stream_subscriber(self) -> Tuple[queue.Queue, threading.Event]:
+        q = queue.Queue(maxsize=2)
+        evt = threading.Event()
+        with self._stream_subs_lock:
+            self._stream_subs.append((q, evt))
+        with self._stream_lock:
+            cur = self._stream_jpeg
+        if cur is not None:
+            try:
+                q.put_nowait(cur)
+                evt.set()
+            except queue.Full:
+                pass
+        return q, evt
+
+    def unregister_stream_subscriber(self, q: queue.Queue) -> None:
+        with self._stream_subs_lock:
+            self._stream_subs = [
+                (qq, e) for (qq, e) in self._stream_subs if qq is not q
+            ]
+
     # ------------------------------------------------------------------ #
     # VLM inference (routed through the manager's shared session)       #
     # ------------------------------------------------------------------ #
-    def _submit_vlm(self, frame0, prompt: str) -> None:
+    def _submit_vlm(self, frame0, prompt: str, detect_w: int, detect_h: int) -> None:
         """Fire-and-forget VLM inference. The channel's decode thread
         never blocks — the manager's worker thread consumes the
         request, calls ``session.respond()`` on the shared
@@ -850,16 +1040,20 @@ class Channel:
         We attach a done-callback that records the result in
         ``self._events`` so the UI sees it next time it polls.
 
+        ``frame0`` is the decoder's native NV12 DMA-BUF — we resize
+        + colour-convert to BGR at ``(detect_w, detect_h)`` in a
+        single RGA pass via ``rkv.rga.resize_bgr`` (no NV12→RGB→BGR
+        CPU round-trip). The encode paths keep ``frame0`` untouched
+        so the encoder sees the same DMA-BUF the decoder handed us.
+
         Returns immediately so the decode loop can keep pumping frames
-        to ``rkv.VideoWriter`` regardless of how long the inference
-        queue happens to be.
+        regardless of how long the inference queue happens to be.
         """
         try:
-            rgb = frame0.numpy(fmt="RGB")
+            from rkv import rga as _rkv_rga
+            bgr = _rkv_rga.resize_bgr(frame0, detect_w, detect_h)
         except Exception:
             return
-        # rkai.Attachment wants BGR (the existing detector uses BGR too).
-        bgr = rgb[..., ::-1].copy()
         future = self._manager.submit_inference(
             self.id, bgr, prompt, frame_pos=self._frame_pos,
         )
@@ -895,73 +1089,8 @@ class Channel:
             self._events.append(ev)
 
     # ------------------------------------------------------------------ #
-    # H.264 packet fan-out                                                #
+    # End of Channel                                                      #
     # ------------------------------------------------------------------ #
-    def push_packet(self, type_byte: int, pts_us: int, payload: bytes) -> None:
-        """Called by the /ingest WS handler for every packet received
-        from the rkv encoder. Writes to the central ring buffer (for
-        late subscribers) and fans out to every active subscriber queue."""
-        if type_byte == 0x02:
-            with self._packet_lock:
-                self._packet_avcc = payload
-        pkt = (type_byte, pts_us, payload)
-        with self._packet_lock:
-            self._packet_buffer.append(pkt)
-        with self._subs_lock:
-            subs = list(self._subs)
-        for q, evt in subs:
-            try:
-                q.put_nowait(pkt)
-                evt.set()
-            except queue.Full:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    q.put_nowait(pkt)
-                    evt.set()
-                except queue.Full:
-                    pass
-
-    def get_avcc(self) -> Optional[bytes]:
-        with self._packet_lock:
-            return self._packet_avcc
-
-    def register_stream_subscriber(
-        self,
-    ) -> Tuple[queue.Queue, threading.Event]:
-        q = queue.Queue(maxsize=SUBSCRIBER_QUEUE_MAX)
-        evt = threading.Event()
-        with self._subs_lock:
-            self._subs.append((q, evt))
-        # Replay avcC header (if known) so the decoder can configure.
-        with self._packet_lock:
-            avcc = self._packet_avcc
-            buffer = list(self._packet_buffer)
-        if avcc is not None:
-            try:
-                q.put_nowait((0x02, 0, avcc))
-            except queue.Full:
-                pass
-        # Replay the most recent N packets so the new viewer sees a
-        # usable state instead of an empty buffer.
-        for pkt in buffer[-30:]:
-            if pkt[0] == 0x02:
-                continue  # already pushed above
-            try:
-                q.put_nowait(pkt)
-            except queue.Full:
-                break
-        if avcc is not None or buffer:
-            evt.set()
-        return q, evt
-
-    def unregister_stream_subscriber(self, q: queue.Queue) -> None:
-        with self._subs_lock:
-            self._subs = [
-                (qq, e) for (qq, e) in self._subs if qq is not q
-            ]
 
 
 # --------------------------------------------------------------------------- #
