@@ -84,11 +84,12 @@ def create_app() -> FastAPI:
     app.include_router(compute.router, prefix="/api")
     app.include_router(tools.router, prefix="/api")
 
-    # 异步启动算力实例（不阻塞 UI 启动）。后台 daemon thread 串行
-    # 从 config.json["compute"]["instances"] 加载；UI 在算力配置页
-    # 通过 /api/compute 轮询状态，每条 instance 显示 queued/loading
-    # 倒计时。
-    get_registry().apply_boot_config_async()
+    # 暂时关闭：boot 时**不**自动加载 config.json["compute"]["instances"]
+    # 里的实例 —— 用户必须从算力配置页手动启用。Worker 线程在第一次
+    # POST /api/compute/instances 时由 ``start_one`` 走 ``_wake_worker``
+    # → ``_ensure_worker`` 按需起 daemon thread。
+    # 重新打开 boot 自动加载：
+    #   get_registry().apply_boot_config_async()
 
     # Wire the detector as a frame sink on the video session so each
     # decoded BGR frame is offered to it (it picks the Nth one).

@@ -494,11 +494,17 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   touching `self._container` internals. The progress bar is currently
   read-only and animates only for live sources.
 - **`ComputeRegistry` 启动顺序**：`app.main.create_app()` 必须先
-  `include_router(compute.router)`，**再**调
+  `include_router(compute.router)`，**再**（可选）调
   `get_registry().apply_boot_config_async()`，**再**注册 detector 的
-  frame sink。`apply_boot_config_async()` 起 daemon thread 后立即返回；
-  UI 在算力配置页通过 `GET /api/compute` 看到 queued / loading / running
-  状态机。Detector 等消费方在第一次 inference 时才调
+  frame sink。
+  
+  **当前 boot 不自动加载**：`apply_boot_config_async()` 在 `app/main.py`
+  里被注释掉。ComputeRegistry worker 线程在第一次 `POST /api/compute/instances`
+  时由 `start_one` → `_wake_worker` → `_ensure_worker` 按需起 daemon thread。
+  config.json["compute"]["instances"] 里的条目仍会被
+  `POST /api/compute/instances` / `start_one` 写到 `inst.model`，
+  重启后配置保留，但**不会**自动启动 —— 用户必须从算力配置页手动启用。
+  Detector 等消费方在第一次 inference 时才调
   `get_registry().get_session("video_query")`—— registry 还是空就会抛
   "功能未启用"，这是预期行为（不是 bug）。
 - **`apply_boot_config_async` 的后台线程只在 reload 模式下被杀掉**：
