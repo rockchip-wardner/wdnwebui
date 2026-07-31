@@ -384,8 +384,8 @@ class Channel:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        # ----- rkai session is owned by the manager; this channel
-        # only records session-level state for snapshot() -----
+        # ----- rkai session is owned by the manager (ComputeRegistry); this
+        # channel only records session-level state for snapshot() -----
         self._session_error: str = ""
 
         # ----- VLM event history (in-memory, max 100 per channel) -----
@@ -525,7 +525,7 @@ class Channel:
                 "thread_alive":
                     self._thread is not None and self._thread.is_alive(),
                 "session_ready": self._manager.session_ready(),
-                "session_error": self._session_error,
+                "session_error": self._manager.session_error(),
                 "events_count": len(self._events),
                 # Latest bytes available for new subscribers; surfaces
                 # in the UI as a "frame available" hint so the cell
@@ -1120,8 +1120,7 @@ class _InferenceWorker:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._session: Any = None
-        self._session_error: str = ""
+        # LLMSession 由 ComputeRegistry 持有 —— 不再自己持 _session。
         self._session_lock = threading.Lock()
         # Queue is asyncio.Queue so the worker can ``await`` on it from
         # inside its loop; producers put items in via
@@ -1187,15 +1186,9 @@ class _InferenceWorker:
                 pass
         # Give cancelled tasks a chance to settle.
         await asyncio.sleep(0)
-        # Close the session + drain the queue.
-        with self._session_lock:
-            sess = self._session
-            self._session = None
-        if sess is not None:
-            try:
-                sess.close()
-            except Exception:
-                pass
+        # Drain the queue. LLMSession is owned by ComputeRegistry, so
+        # we don't close it here — registry.close_all() handles that on
+        # app shutdown.
         if self._queue is not None:
             while True:
                 try:
@@ -1209,11 +1202,22 @@ class _InferenceWorker:
         self._loop.stop()
 
     def session_ready(self) -> bool:
-        with self._session_lock:
-            return self._session is not None
+        """是否已就绪 video_query capability（由 ComputeRegistry 提供）。"""
+        try:
+            from app.services.compute_registry import get_registry
+            get_registry().get_session("video_query")
+            return True
+        except RuntimeError:
+            return False
 
     def session_error(self) -> str:
-        return self._session_error
+        """video_query capability 不可用时的错误信息（UI 提示）。"""
+        try:
+            from app.services.compute_registry import get_registry
+            get_registry().get_session("video_query")
+            return ""
+        except RuntimeError as e:
+            return str(e)
 
     # ------------------------------------------------------------------ #
     # Producer API (called from any thread)                               #
@@ -1298,30 +1302,6 @@ class _InferenceWorker:
             self._loop = None
             self._queue = None
 
-    def _ensure_session(self) -> Any:
-        """Build the LLMSession once on the worker thread. Subsequent
-        calls reuse the same handle."""
-        with self._session_lock:
-            if self._session is not None:
-                return self._session
-            ok, Attachment, LLMSession, SystemLanguageModel, err = _load_rkai()
-            if not ok:
-                self._session_error = f"rkai 不可用: {err}"
-                return None
-            try:
-                model = SystemLanguageModel.qwen3_vl_4b()
-            except Exception as e:
-                self._session_error = f"模型配置失败: {e}"
-                return None
-            try:
-                sess = LLMSession(model=model)
-            except Exception as e:
-                self._session_error = f"LLMSession 初始化失败: {e}"
-                return None
-            self._session = sess
-            self._session_error = ""
-            return sess
-
     async def _consume(self) -> None:
         """The coroutine that drains the queue forever. Lives on the
         worker's persistent asyncio loop."""
@@ -1338,14 +1318,23 @@ class _InferenceWorker:
             except asyncio.TimeoutError:
                 text, error = "", f"推理超时 ({INFERENCE_TIMEOUT_S}s)"
             except Exception as e:
+                # VLM capability 不可用时（"功能未启用"）算正常业务流：
+                # 把异常落到 error 字段，future 正常 set_result，channel
+                # event 流照样走一行 error，**不**让 worker 协程挂掉。
                 text, error = "", f"推理异常: {e}"
             if not req.future.done():
                 req.future.set_result((text, error))
 
     async def _infer_one(self, req: "_Request") -> Tuple[str, Optional[str]]:
-        sess = self._ensure_session()
-        if sess is None:
-            return "", f"rkai 不可用: {self._session_error}"
+        # LLMSession 由 ComputeRegistry 统一管理（"算力配置"页面启用）。
+        # 找不到 video_query capability → "功能未启用: video_query" —— 跟
+        # detector / tts_session 一致；surveillance 的 16 路解码 / 缩略图
+        # / WS 推送完全不动，只是 VLM 这一步报"功能未启用"。
+        from app.services.compute_registry import get_registry
+        try:
+            sess = get_registry().get_session("video_query")
+        except RuntimeError as e:
+            return "", str(e)
         # ``session.reset()`` clears the C-level KV cache so the next
         # inference starts from a clean state. We call it between every
         # request — yes, it loses the rolling context, but each
@@ -1359,7 +1348,7 @@ class _InferenceWorker:
         try:
             ok, Attachment, *_ = _load_rkai()
             if not ok:
-                return "", f"rkai 不可用: {self._session_error}"
+                return "", "rkai 不可用"
             result = await sess.respond(
                 prompt=req.prompt,
                 attachment=[Attachment(req.frame_bgr)],

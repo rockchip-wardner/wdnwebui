@@ -6,6 +6,7 @@ what makes ``app.include_router(...)`` in ``main.py`` see them — without
 it, only the bare package object is imported and nothing registers.
 """
 from . import (
+    compute,
     config,
     coprocessor,
     power,
@@ -17,6 +18,7 @@ from . import (
 )
 
 __all__ = [
+    "compute",
     "config",
     "coprocessor",
     "power",

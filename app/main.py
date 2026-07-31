@@ -11,6 +11,7 @@ from starlette.responses import Response
 
 from app import __version__
 from app.api import (
+    compute,
     config,
     coprocessor,
     power,
@@ -20,6 +21,7 @@ from app.api import (
     tts,
     video_detection,
 )
+from app.services.compute_registry import get_registry
 from app.services.config import get_config
 from app.services.detector import get_detector
 from app.services.surveillance import get_manager as get_surveillance_manager
@@ -78,6 +80,13 @@ def create_app() -> FastAPI:
     app.include_router(coprocessor.router, prefix="/api")
     app.include_router(tts.router, prefix="/api")
     app.include_router(surveillance.router, prefix="/api")
+    app.include_router(compute.router, prefix="/api")
+
+    # 异步启动算力实例（不阻塞 UI 启动）。后台 daemon thread 串行
+    # 从 config.json["compute"]["instances"] 加载；UI 在算力配置页
+    # 通过 /api/compute 轮询状态，每条 instance 显示 queued/loading
+    # 倒计时。
+    get_registry().apply_boot_config_async()
 
     # Wire the detector as a frame sink on the video session so each
     # decoded BGR frame is offered to it (it picks the Nth one).
@@ -99,6 +108,13 @@ def create_app() -> FastAPI:
 
     @app.on_event("shutdown")
     async def _on_shutdown():
+        # Stop all compute instances (close their LLMSession handles
+        # and join the worker thread). Done first so other shutdown
+        # steps that touch the SDK see a clean state.
+        try:
+            get_registry().close_all()
+        except Exception:
+            pass
         # Free the RKNN session handle if one was ever built.
         try:
             get_detector().close()

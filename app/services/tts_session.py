@@ -334,8 +334,11 @@ class TtsSession:
         self._worker: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-        # Active SDK session (lazy — created on first start())
-        self._llm_session = None
+        # Active SDK session is owned by ComputeRegistry (算力配置) — see
+        # ``app/services/compute_registry.py``. TtsSession no longer
+        # builds an LLMSession itself; ``_infer_one`` looks it up via
+        # ``get_registry().get_session("audio_output")`` and surfaces
+        # "功能未启用: audio_output" if no instance is running.
 
         # Latest snapshot data surfaced to the WS
         self._frames = 0
@@ -624,12 +627,17 @@ class TtsSession:
             self._state = self.STATE_STOPPED
             self._error = ""
         self._stop_event.set()
-        sess = self._llm_session
+        # Tell the underlying LLM session to stop. ``rknn3lite``
+        # forwards ``session_stop()`` to the C runtime which aborts
+        # the in-flight inference cleanly. The session is owned by
+        # ComputeRegistry (算力配置), so we look it up by capability.
+        try:
+            from app.services.compute_registry import get_registry
+            sess = get_registry().get_session("audio_output")
+        except RuntimeError:
+            sess = None
         if sess is not None:
             try:
-                # Tell the underlying LLM session to stop. ``rknn3lite``
-                # forwards ``session_stop()`` to the C runtime which
-                # aborts the in-flight inference cleanly.
                 inner = getattr(sess, "rknn_llm", None) or getattr(sess, "_backend", None)
                 target = getattr(inner, "rknn_llm", inner)
                 stop_fn = getattr(target, "session_stop", None)
@@ -645,38 +653,7 @@ class TtsSession:
         if worker is not None:
             worker.join(timeout=5)
         self._worker = None
-        if self._llm_session is not None:
-            try:
-                self._llm_session.close()
-            except Exception:                     # noqa: BLE001
-                pass
-            self._llm_session = None
-
-    # ------------------------------------------------------------------ #
-    def _ensure_session(self) -> None:
-        if self._llm_session is not None:
-            return
-        ok, _, LLMSession, SystemLanguageModel, _, _, _, err = _load_rkai()
-        if not ok:
-            with self._lock:
-                self._init_error = err
-            raise RuntimeError(self._init_error)
-        try:
-            spec = SystemLanguageModel.qwen3_tts()
-            spec.tts_model_dir = str(self._model_dir)
-        except Exception as e:
-            with self._lock:
-                self._init_error = f"无法构建 qwen3_tts spec: {e}"
-            raise
-        try:
-            sess = LLMSession(model=spec)
-        except Exception as e:
-            with self._lock:
-                self._init_error = f"LLMSession 初始化失败: {e}"
-            raise
-        with self._lock:
-            self._llm_session = sess
-            self._init_error = ""
+        # LLMSession 由 ComputeRegistry 持有并负责释放 —— 这里只停本服务的 worker。
 
     def _infer_one(self, req: TTSRequest):
         """Single synchronous TTS inference: ``synthesize, return WAV bytes``.
@@ -693,11 +670,17 @@ class TtsSession:
         keep device playback on (``no_play=False``); browser-only skips
         it so the SDK doesn't touch the host sound card at all
         (``no_play=True``).
+
+        LLMSession 由 ComputeRegistry 统一管理（"算力配置"页面启用）。
+        找不到 audio_output capability → RuntimeError("功能未启用: audio_output")。
         """
         try:
-            self._ensure_session()
-            sess = self._llm_session
-            assert sess is not None
+            from app.services.compute_registry import get_registry
+            sess = get_registry().get_session("audio_output")
+        except RuntimeError as e:
+            self._init_error = str(e)
+            raise
+        try:
             ok, Attachment, *_ = _load_rkai()
             TTSResult = _get_tts_result_cls()
 

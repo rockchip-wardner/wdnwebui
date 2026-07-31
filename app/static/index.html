@@ -17,9 +17,10 @@
         </div>
       </div>
       <nav class="nav">
-        <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
-        <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
-        <a href="#surveillance"    data-page="surveillance"    class="nav-item">视频监控</a>
+<a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
+      <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
+      <a href="#compute-config"  data-page="compute-config"  class="nav-item">算力配置</a>
+      <a href="#surveillance"    data-page="surveillance"    class="nav-item">视频监控</a>
         <a href="#audio-monitor"   data-page="audio-monitor"   class="nav-item">音频监控</a>
         <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
         <a href="#im-bridge"       data-page="im-bridge"       class="nav-item">应用对接</a>
@@ -309,6 +310,21 @@
         </details>
       </section>
 
+      <section id="page-compute-config" class="page hidden" data-page="compute-config">
+        <header class="page-header">
+          <h2>算力配置</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="cc-collected-at">--</span>
+            <button class="refresh-btn" id="cc-refresh">刷新</button>
+            <button class="vd-btn" id="cc-stop-all">全部停止</button>
+          </div>
+        </header>
+
+        <div class="cc-tabs" id="cc-tabs"></div>
+        <div class="cc-panels" id="cc-panels"></div>
+        <div class="cc-foot" id="cc-foot"></div>
+      </section>
+
       <section id="page-surveillance" class="page hidden" data-page="surveillance">
         <header class="page-header">
           <h2>视频监控</h2>
@@ -356,12 +372,19 @@
       <section id="page-discovery" class="page hidden" data-page="discovery">
         <header class="page-header">
           <h2>注册发现</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="discovery-collected-at">--</span>
+            <button class="refresh-btn" id="discovery-refresh">刷新</button>
+          </div>
         </header>
-        <div class="page-placeholder">
-          <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
-          <div class="page-placeholder-title">尚未实现</div>
-          <div class="page-placeholder-text">
-            该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
+        <div class="discovery-summary" id="discovery-summary"></div>
+        <div class="discovery-list" id="discovery-list">
+          <div class="page-placeholder">
+            <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
+            <div class="page-placeholder-title">等待算力实例</div>
+            <div class="page-placeholder-text">
+              启用 算力配置 中的实例后，这里会列出对应的能力。
+            </div>
           </div>
         </div>
       </section>

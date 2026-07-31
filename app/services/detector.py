@@ -183,7 +183,7 @@ class RkaiDetector:
         self._every_n = 30
         self._frame_count = 0
         self._model_name = "qwen3-vl-4b"
-        self._session = None
+        # LLMSession 不再由 detector 持有，统一在 ComputeRegistry 里管理。
         self._init_error = ""
         self._events: deque = deque(maxlen=self.HISTORY_MAX)
         self._events_lock = threading.Lock()
@@ -202,15 +202,23 @@ class RkaiDetector:
         return ok
 
     def snapshot(self) -> dict:
+        from app.services.compute_registry import get_registry
+        try:
+            sess = get_registry().get_session("video_query")
+            session_ready = sess is not None
+            session_error = ""
+        except RuntimeError as e:
+            session_ready = False
+            session_error = str(e)
         with self._lock:
             return {
                 "available":      self.available,
-                "init_error":     self._init_error,
+                "init_error":     session_error or self._init_error,
                 "enabled":        self._enabled,
                 "prompt":         self._prompt,
                 "every_n":        self._every_n,
                 "model":          self._model_name,
-                "session_ready":  self._session is not None,
+                "session_ready":  session_ready,
                 "worker_alive":   self._worker is not None and self._worker.is_alive(),
                 "queue_size":     self._item_q.qsize(),
             }
@@ -218,9 +226,16 @@ class RkaiDetector:
     # ------------------------------------------------------------------ #
     def start(self, prompt: str, every_n: int = 30) -> dict:
         if not self.available:
-            raise RuntimeError(f"rkai 不可用: {self._init_error}")
+            raise RuntimeError("rkai 不可用")
         if not (prompt or "").strip():
             raise ValueError("prompt 不能为空")
+        # 业务级校验：算力是否就绪。这一步失败 → 立刻 raise，前端能
+        # 区分"功能未启用"和"运行时错误"。
+        from app.services.compute_registry import get_registry
+        try:
+            get_registry().get_session("video_query")
+        except RuntimeError as e:
+            raise RuntimeError(str(e))
         # Build the structured-output class now (lazy) so that any
         # import failure surfaces here instead of inside the worker.
         _get_vlm_doc_cls()
@@ -249,16 +264,10 @@ class RkaiDetector:
         return self.snapshot()
 
     def close(self) -> None:
-        """Fully tear down (worker + session) — used on app shutdown."""
+        """Stop the worker — the LLMSession is owned by ComputeRegistry,
+        not us, so we don't close it here. Registry.close_all() handles
+        that on app shutdown."""
         self.stop()
-        with self._lock:
-            sess = self._session
-            self._session = None
-        if sess is not None:
-            try:
-                sess.close()
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------ #
     def submit_frame(self, frame_bgr: "np.ndarray", frame_pos: int) -> None:
@@ -323,40 +332,31 @@ class RkaiDetector:
                 pass
 
     # ------------------------------------------------------------------ #
-    def _ensure_session(self) -> None:
-        if self._session is not None:
-            return
-        ok, Attachment, LLMSession, SystemLanguageModel, *_ = _load_rkai()
-        if not ok:
-            with self._lock:
-                self._init_error = "rkai 不可用"
-            raise RuntimeError(self._init_error)
-        try:
-            model = SystemLanguageModel.qwen3_vl_4b()
-        except Exception as e:
-            with self._lock:
-                self._init_error = f"无法加载模型配置: {e}"
-            raise
-        try:
-            sess = LLMSession(model=model)
-        except Exception as e:
-            with self._lock:
-                self._init_error = f"LLMSession 初始化失败: {e}"
-            raise
-        with self._lock:
-            self._session = sess
-            self._init_error = ""
-
     def _infer_sync(self, frame_bgr: "np.ndarray", prompt: str) -> DetectorEvent:
-        """One synchronous inference call against the v2 SDK surface."""
+        """One synchronous inference call against the v2 SDK surface.
+
+        LLMSession 由 ComputeRegistry 统一管理（"算力配置"页面启用）。
+        找不到 video_query capability → 报错 "功能未启用"。
+        """
         try:
-            self._ensure_session()
-            assert self._session is not None
+            from app.services.compute_registry import get_registry
+            sess = get_registry().get_session("video_query")
+        except RuntimeError as e:
+            return DetectorEvent(
+                id=-1,
+                frame_pos=-1,
+                ts=time.time(),
+                prompt=prompt,
+                text=f"({e})",
+                level="disabled",
+                attachment_count=0,
+            )
+        try:
             ok, Attachment, *_ = _load_rkai()
             VLMDoc = _get_vlm_doc_cls()
 
-            self._session.reset()
-            coro = self._session.respond(
+            sess.reset()
+            coro = sess.respond(
                 prompt=prompt,
                 attachment=[Attachment(frame_bgr)],     # v2: list of Attachments
                 generating=VLMDoc,                      # v2: LMOutput subclass

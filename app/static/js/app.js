@@ -1607,6 +1607,18 @@ TTS.init();
     return;
   }
 
+  if (name === "compute-config") {
+    ComputeConfigPage.init();
+    await ComputeConfigPage.load();
+    ComputeConfigPage.startTicking();
+    return;
+  }
+
+  if (name === "discovery") {
+    await Discovery.load();
+    return;
+  }
+
   const target = document.getElementById("data-" + name);
   if (!target) return;
   target.textContent = "加载中…";
@@ -1622,6 +1634,12 @@ TTS.init();
 
 function showPage(name) {
   if (!document.getElementById("page-" + name)) name = DEFAULT_PAGE;
+  // Track previous page so we can stop page-local resources (e.g.
+  // ComputeConfigPage's 1Hz countdown tick) when navigating away.
+  const prev = currentPage();
+  if (prev === "compute-config" && name !== "compute-config") {
+    ComputeConfigPage.stopTicking();
+  }
   document.querySelectorAll(".page").forEach(p => {
     p.classList.toggle("hidden", p.dataset.page !== name);
   });
@@ -3465,4 +3483,391 @@ VdFsModal.pickCurrentDir = function () {
   if (pickDirBtn) pickDirBtn.addEventListener("click", () => VdFsModal.pickCurrentDir());
   if (pickFileBtn) pickFileBtn.addEventListener("click", () => VdFsModal.pickSelectedFile());
 }
+
+/* ---------------------------------------------------------------- *
+ * 算力配置 (Compute Config) page                                   *
+ * ---------------------------------------------------------------- */
+const ComputeConfigPage = {
+  initialized: false,
+  _tickHandle: null,
+  _snapshot: null,
+  _activeTab: "rk3588",   // 默认显示 3588 占位 tab
+
+  init() {
+    if (this.initialized) return;
+    this.initialized = true;
+    document.getElementById("cc-refresh")?.addEventListener("click", () => this.load());
+    document.getElementById("cc-stop-all")?.addEventListener("click", () => this.stopAll());
+  },
+
+  async load() {
+    if (this._loading) return;
+    this._loading = true;
+    try {
+      const r = await fetch(API_PREFIX + "/compute", {
+        cache: "no-store",
+        headers: {"Cache-Control": "no-cache"},
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      this._snapshot = await r.json();
+      this.render();
+    } catch (e) {
+      this.setFoot("加载失败: " + e.message, "danger");
+    } finally {
+      this._loading = false;
+    }
+  },
+
+  startTicking() {
+    if (this._tickHandle) return;
+    this._tickHandle = setInterval(() => this.tick(), 1000);
+  },
+
+  stopTicking() {
+    if (this._tickHandle) {
+      clearInterval(this._tickHandle);
+      this._tickHandle = null;
+    }
+  },
+
+  tick() {
+    // 1Hz 拉新数据 —— 只有这样才能让 queued/loading → running/error 的
+    // 状态变化自动反映到 UI（local render 只重画倒计时秒数，不会感知
+    // status 字段变化）。
+    if (!this._snapshot) return;
+    this.load();
+  },
+
+  async toggle(npu, model, enabled) {
+    const url = API_PREFIX + "/compute/instances";
+    const method = enabled ? "POST" : "DELETE";
+    try {
+      const r = await fetch(url, {
+        method,
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({npu_index: npu, model}),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        alert(`${enabled ? "启用" : "停用"}失败: ${text}`);
+      }
+    } catch (e) {
+      alert("请求失败: " + e.message);
+    }
+    await this.load();
+  },
+
+  async stopAll() {
+    if (!confirm("确定要停止所有算力实例吗？")) return;
+    try {
+      const r = await fetch(API_PREFIX + "/compute/stop-all", {method: "POST"});
+      if (!r.ok) {
+        const text = await r.text();
+        alert("全部停止失败: " + text);
+      }
+    } catch (e) {
+      alert("请求失败: " + e.message);
+    }
+    await this.load();
+  },
+
+  // -------------------------------------------------------------- render
+  render() {
+    this._renderTabs();
+    this._renderPanels();
+    this._renderSummary();
+    this._renderModelStates(this._snapshot);
+  },
+
+  _renderTabs() {
+    const cards = this._snapshot?.cards || [];
+    const failed = this._snapshot?.cards_failed || "";
+    const tabsRoot = document.getElementById("cc-tabs");
+    if (!tabsRoot) return;
+    tabsRoot.innerHTML = "";
+
+    // 3588 tab —— 占位
+    this._makeTab("rk3588", "RK3588", tabsRoot);
+
+    // 182x tabs —— 几卡就几个
+    for (const card of cards) {
+      const idx = card.npu_index;
+      this._makeTab(`rk182x-${idx}`, `RK182x #${idx}`, tabsRoot);
+    }
+
+    if (failed) {
+      this.setFoot("枚举 NPU 卡失败: " + failed, "danger");
+    }
+  },
+
+  _makeTab(tabKey, label, root) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cc-tab" + (this._activeTab === tabKey ? " active" : "");
+    btn.textContent = label;
+    btn.dataset.tab = tabKey;
+    btn.addEventListener("click", () => {
+      this._activeTab = tabKey;
+      this._renderTabs();
+      this._renderPanels();
+    });
+    root.appendChild(btn);
+  },
+
+  _renderPanels() {
+    const panelsRoot = document.getElementById("cc-panels");
+    if (!panelsRoot) return;
+    panelsRoot.innerHTML = "";
+
+    // 3588 panel —— 占位
+    const rk3588 = document.createElement("div");
+    rk3588.className = "cc-panel" + (this._activeTab === "rk3588" ? "" : " hidden");
+    rk3588.dataset.tab = "rk3588";
+    rk3588.innerHTML = `<div class="cc-placeholder">占位 — 未来将列出主控上能运行的模型列表</div>`;
+    panelsRoot.appendChild(rk3588);
+
+    // 182x panels —— 每张卡独立
+    const cards = this._snapshot?.cards || [];
+    for (const card of cards) {
+      const tabKey = `rk182x-${card.npu_index}`;
+      const panel = document.createElement("div");
+      panel.className = "cc-panel" + (this._activeTab === tabKey ? "" : " hidden");
+      panel.dataset.tab = tabKey;
+      panel.innerHTML = `
+        <div class="cc-card-head">
+          <span class="cc-card-mem" data-mem-for="${card.npu_index}">已用 0 MB</span>
+        </div>
+        <ul class="cc-models" id="cc-models-${card.npu_index}"></ul>
+      `;
+      panelsRoot.appendChild(panel);
+      this._renderModels(card.npu_index);
+    }
+  },
+
+  _renderModels(npuIndex) {
+    const ul = document.getElementById(`cc-models-${npuIndex}`);
+    if (!ul) return;
+    ul.innerHTML = "";
+    const supported = this._snapshot?.supported_models || [];
+    const instances = this._snapshot?.instances || [];
+    for (const m of supported) {
+      const inst = instances.find(i => i.npu_index === npuIndex && i.model === m.id);
+      const li = document.createElement("li");
+      li.className = "cc-model";
+      li.dataset.npu = npuIndex;
+      li.dataset.model = m.id;
+      const enabled = !!inst && inst.status !== "stopped";
+      const existsFlag = m.exists !== false;
+      // 整行状态类：is-running 蓝边 / has-error 红边 —— 视觉上让"toggle ON 但实际 error"
+      // 这种坑爹情况一眼能看出来。
+      if (inst) {
+        if (inst.status === "running") li.classList.add("is-running");
+        if (inst.status === "error")   li.classList.add("has-error");
+        if (inst.status === "queued" || inst.status === "loading") li.classList.add("is-pending");
+      }
+      li.innerHTML = `
+        <label class="cc-toggle">
+          <input type="checkbox" data-role="toggle" ${enabled ? "checked" : ""} ${existsFlag ? "" : "disabled"} />
+          <span class="cc-toggle-track"></span>
+        </label>
+        <div class="cc-model-meta">
+          <strong>${m.label}</strong>
+          <span class="cc-model-cap">${(m.capability_types || []).join(" · ")}</span>
+          <span class="cc-model-mem">~${m.memory_estimate_mb} MB</span>
+        </div>
+        <div class="cc-model-state" data-state="${inst ? inst.status : "disabled"}">
+          <span class="cc-state-text">${this._statusLabel(inst)}</span>
+        </div>
+      `;
+      // error 时把错误信息单独拎一行显眼显示（默认在 state 里只是 inline 文字）
+      if (inst && inst.status === "error" && inst.error) {
+        const errBox = document.createElement("pre");
+        errBox.className = "cc-model-error";
+        errBox.textContent = inst.error;
+        li.appendChild(errBox);
+      }
+      if (!existsFlag) {
+        const missing = document.createElement("div");
+        missing.className = "cc-model-missing";
+        missing.textContent = "模型目录不存在";
+        li.appendChild(missing);
+      }
+      const checkbox = li.querySelector("input[type=checkbox]");
+      checkbox.addEventListener("change", () => this.toggle(npuIndex, m.id, checkbox.checked));
+      ul.appendChild(li);
+    }
+  },
+
+  _renderModelStates(snapshot) {
+    if (!snapshot) return;
+    const perCard = snapshot.per_card_memory_mb || {};
+    for (const [npuIndex, mb] of Object.entries(perCard)) {
+      const el = document.querySelector(`[data-mem-for="${npuIndex}"]`);
+      if (el) el.textContent = `已用 ${mb} MB`;
+    }
+    const ulMap = document.querySelectorAll(".cc-model");
+    ulMap.forEach(li => {
+      const npu = parseInt(li.dataset.npu, 10);
+      const model = li.dataset.model;
+      const inst = (snapshot.instances || []).find(i => i.npu_index === npu && i.model === model);
+      const stateDiv = li.querySelector(".cc-model-state");
+      if (!stateDiv) return;
+      const newState = inst ? inst.status : "disabled";
+      stateDiv.dataset.state = newState;
+      const text = stateDiv.querySelector(".cc-state-text");
+      if (text) text.textContent = this._statusLabel(inst);
+      // 整行状态类同步（status 变化时给整行换边框颜色）
+      li.classList.toggle("is-running", newState === "running");
+      li.classList.toggle("has-error", newState === "error");
+      li.classList.toggle("is-pending", newState === "queued" || newState === "loading");
+      // error 信息：增/删 <pre> 节点
+      let errBox = li.querySelector(".cc-model-error");
+      if (inst && inst.status === "error" && inst.error) {
+        if (!errBox) {
+          errBox = document.createElement("pre");
+          errBox.className = "cc-model-error";
+          li.appendChild(errBox);
+        }
+        errBox.textContent = inst.error;
+      } else if (errBox) {
+        errBox.remove();
+      }
+    });
+  },
+
+  _statusLabel(inst) {
+    if (!inst || inst.status === "stopped") return "禁用";
+    if (inst.status === "queued") {
+      const waitSec = this._countdownSec(inst, "queued");
+      return `排队中，预计 ${waitSec}s`;
+    }
+    if (inst.status === "loading") {
+      const left = this._countdownSec(inst, "loading");
+      return `初始化中... ${left}s`;
+    }
+    if (inst.status === "running") return "运行中";
+    if (inst.status === "error") return "启动失败";
+    return inst.status;
+  },
+
+  _estimateFor(inst) {
+    const perModel = this._snapshot?.estimated_init_seconds_per_model || {};
+    return perModel[inst?.model] ?? this._snapshot?.default_estimated_init_seconds ?? 10;
+  },
+
+  _countdownSec(inst, kind) {
+    const est = this._estimateFor(inst);
+    if (kind === "queued") {
+      // worker 是单线程串行，同 npu 内严格按 queued_at 顺序。
+      // 跨 npu 理论上能并行，但当前 worker 一次只跑一条，所以也算"队列"里。
+      // 用 queued_at 升序算"前面还有几条"。
+      const inQueue = (this._snapshot?.instances || [])
+        .filter(i => i.status === "queued" || i.status === "loading")
+        .sort((a, b) => (a.queued_at || 0) - (b.queued_at || 0));
+      const idx = inQueue.findIndex(i => i.npu_index === inst.npu_index && i.model === inst.model);
+      const ahead = idx < 0 ? 0 : idx;
+      return Math.max(0, ahead) * est;
+    }
+    if (kind === "loading") {
+      const elapsed = Math.max(0, Date.now() / 1000 - (inst.started_at || 0));
+      return Math.max(0, Math.round(est - elapsed));
+    }
+    return 0;
+  },
+
+  _renderSummary() {
+    const snap = this._snapshot || {};
+    const cards = snap.cards || [];
+    const sup = snap.supported_models || [];
+    const running = snap.running_count || 0;
+    const queued  = snap.queued_count  || 0;
+    const loading = snap.loading_count || 0;
+    const error   = snap.error_count   || 0;
+    const totalMb = snap.total_memory_mb || 0;
+    const parts = [
+      `${cards.length} 张算力卡`,
+      `${sup.length} 个候选模型`,
+      `${running} 运行中`,
+      error   ? `${error} 失败`  : null,
+      loading ? `${loading} 加载中` : null,
+      queued  ? `${queued} 排队中`  : null,
+      `已用 ${totalMb} MB`,
+    ].filter(Boolean);
+    const summary = parts.join(" · ");
+    const at = document.getElementById("cc-collected-at");
+    if (at) at.textContent = summary;
+    const last = snap.last_updated;
+    if (last) {
+      const ago = Math.max(0, Math.round(Date.now() / 1000 - last));
+      this.setFoot(`数据 ${ago} 秒前刷新`, ago > 5 ? "warn" : "");
+    }
+  },
+
+  setFoot(msg, kind) {
+    const el = document.getElementById("cc-foot");
+    if (!el) return;
+    el.className = "cc-foot " + (kind || "");
+    el.textContent = msg || "";
+  },
+};
+
+/* ---------------------------------------------------------------- *
+ * 注册发现 (Discovery) page — 读 registry，不调 wdiot              *
+ * ---------------------------------------------------------------- */
+const Discovery = {
+  async load() {
+    try {
+      const r = await fetch(API_PREFIX + "/compute/capabilities");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      this.render(data);
+    } catch (e) {
+      const list = document.getElementById("discovery-list");
+      if (list) list.innerHTML = `<div class="page-placeholder danger">加载失败: ${e.message}</div>`;
+    }
+  },
+
+  render(data) {
+    const at = document.getElementById("discovery-collected-at");
+    const list = document.getElementById("discovery-list");
+    const summary = document.getElementById("discovery-summary");
+    if (!list) return;
+    const caps = (data && data.capabilities) || [];
+    if (at) at.textContent = `${caps.length} 个 capability`;
+    if (summary) {
+      summary.textContent = caps.length === 0
+        ? "当前没有活跃的 capability —— 到 算力配置 启用模型后这里会显示。"
+        : "当前本机暴露的 capability 列表（用于注册发现）。";
+    }
+    if (caps.length === 0) {
+      list.innerHTML = `
+        <div class="page-placeholder">
+          <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
+          <div class="page-placeholder-title">等待算力实例</div>
+          <div class="page-placeholder-text">
+            启用 算力配置 中的实例后，这里会列出对应的能力。
+          </div>
+        </div>`;
+      return;
+    }
+    list.innerHTML = "";
+    for (const c of caps) {
+      const card = document.createElement("article");
+      card.className = "discovery-card";
+      card.innerHTML = `
+        <header class="discovery-card-head">
+          <span class="discovery-cap-type">${c.type}</span>
+          <code class="discovery-cap-name">${c.name}</code>
+        </header>
+        <div class="discovery-card-meta">
+          <span>来自 <strong>${c.model}</strong></span>
+          <span>NPU #${c.npu_index}</span>
+          <span>~${c.memory_estimate_mb} MB</span>
+        </div>
+      `;
+      list.appendChild(card);
+    }
+  },
+};
+
 showPage(currentPage());

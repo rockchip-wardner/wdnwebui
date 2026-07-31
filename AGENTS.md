@@ -26,6 +26,14 @@ creation); everything below is verified against the current tree.
 1. 必须通过rkai的LLMSession调用rknn，不得直接调用
 2. 必须通过rkv调用mpp和rga，做编解码和图片缩放、格式转换等操作，不得直接调用或者通过其他库进行软编解和格式转换、resize等操作。
 3. 必须通过wdiot做发现和注册服务。
+4. **LLMSession 必须从 `ComputeRegistry` 取，禁止各业务模块自建**。视频检测
+   / 语音生成 / 视频监控等服务只能通过
+   `get_registry().get_session("<capability>")` 拿到 session；
+   找不到对应 capability 就抛 `RuntimeError("功能未启用: <capability>")`，
+   由调用方决定如何向上层报告（视频监控选择静默 error 返回，不阻塞 16 路
+   解码；视频检测 / 语音生成选择 raise，由 HTTP 层 502 透传给前端）。
+   实例集合在 算力配置 页配置，存到 `config.json["compute"]["instances"]`，
+   `run.py` 启动时后台线程串行加载，不阻塞 UI。
 
 ## TL;DR commands
 
@@ -400,6 +408,18 @@ holds it in memory. The file is seeded with a `base` section at
 - **Frontend modules** — `ConfigMenu` (popover), `Base` (form page);
   `PowerMenu` was untouched and is mutually exclusive with
   `ConfigMenu` via the `_wrapOpenToCloseOther` helper.
+- **算力配置 (`ComputeConfigPage`) + 算力注册中心 (`ComputeRegistry`)**
+  —— 用户在算力配置页启用/禁用实例；每条实例绑定到一张 NPU 卡（由
+  `RKNN3Lite().get_devices_id()` 枚举）+ 一个 model preset。同一 NPU 上
+  多个不同 model 允许（按内存预算自我约束），但同 NPU 重复同 model 拒绝
+  （pydantic 校验 + 注册中心运行时校验双层防护）。内存估算硬编码：
+  Qwen3-VL-4B ≈ 3500 MB / Qwen3-TTS ≈ 1900 MB / Qwen3-ASR ≈ 2500 MB。
+  启动 **不阻塞 UI**：`apply_boot_config_async()` 起一个 daemon thread
+  串行加载；UI 通过 `GET /api/compute` 每秒轮询状态，queued / loading
+  实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL = 8s`）。
+  Capability 概念作为内部 key 使用（`get_session("video_query")` /
+  `"audio_output"`），**这一轮不做** wdiot 真实注册发现；discovery
+  页面只读 registry 内存状态。
 
 ## System logs page
 
@@ -473,6 +493,20 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   doesn't expose a `set(1, frame_pos)` API; plumbing one in means
   touching `self._container` internals. The progress bar is currently
   read-only and animates only for live sources.
+- **`ComputeRegistry` 启动顺序**：`app.main.create_app()` 必须先
+  `include_router(compute.router)`，**再**调
+  `get_registry().apply_boot_config_async()`，**再**注册 detector 的
+  frame sink。`apply_boot_config_async()` 起 daemon thread 后立即返回；
+  UI 在算力配置页通过 `GET /api/compute` 看到 queued / loading / running
+  状态机。Detector 等消费方在第一次 inference 时才调
+  `get_registry().get_session("video_query")`—— registry 还是空就会抛
+  "功能未启用"，这是预期行为（不是 bug）。
+- **`apply_boot_config_async` 的后台线程只在 reload 模式下被杀掉**：
+  uvicorn `reload=True` 重启父进程时 daemon thread 跟着挂掉；
+  production（`reload=False`）下要靠 `create_app` 的
+  `on_event("shutdown")` 调 `get_registry().close_all()`，会 join
+  worker thread（最长 2s）。正在 loading 的模型被中断后会留在
+  `status='error'`，下次启动时由 `apply_boot_config_async` 重新尝试。
 
 ## TTS (语音生成) page
 
@@ -559,3 +593,5 @@ RIFF header by hand.
 | Default bind host / port              | `run.py` `main()`                                        |
 | Public SDK dependency                 | Re-run the two `pip install -e` lines above              |
 | Anything that needs a new endpoint    | Add a route inside `create_app()` in `app/main.py`        |
+| Added/removed a model preset          | `MODEL_PRESETS` in `app/services/compute_registry.py` + `register` the new capability in the same table; update `app/static/index.html` and `app/static/js/app.js` only if the UI needs new model cards |
+| `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
