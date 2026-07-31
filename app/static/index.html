@@ -25,11 +25,12 @@
         <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
         <a href="#im-bridge"       data-page="im-bridge"       class="nav-item">应用对接</a>
         <div class="nav-group" data-group="debug">
-          <span class="nav-group-title">调测</span>
-          <a href="#video-detection" data-page="video-detection" class="nav-item">视频检测</a>
-          <a href="#tts"             data-page="tts"             class="nav-item">语音生成</a>
-          <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
+          <span class="nav-group-title">能力调测</span>
+          <a href="#video-detection"      data-page="video-detection"      class="nav-item">音视频检测</a>
+          <a href="#video-content-search" data-page="video-content-search" class="nav-item">视频内容检索</a>
+          <a href="#tts"                  data-page="tts"                  class="nav-item">语音生成</a>
         </div>
+        <a href="#system-logs" data-page="system-logs" class="nav-item">系统日志</a>
       </nav>
 
       <div class="sidebar-foot">
@@ -404,7 +405,7 @@
 
       <section id="page-video-detection" class="page hidden" data-page="video-detection">
         <header class="page-header">
-          <h2>视频检测</h2>
+          <h2>音视频检测</h2>
           <button class="refresh-btn" data-refresh>刷新</button>
         </header>
 
@@ -640,6 +641,19 @@
           </div>
         </div>
       </div>
+
+      <section id="page-video-content-search" class="page hidden" data-page="video-content-search">
+        <header class="page-header">
+          <h2>视频内容检索</h2>
+        </header>
+        <div class="page-placeholder">
+          <div class="page-placeholder-icon" aria-hidden="true">⌕</div>
+          <div class="page-placeholder-title">尚未实现</div>
+          <div class="page-placeholder-text">
+            该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
+          </div>
+        </div>
+      </section>
 
       <section id="page-tts" class="page hidden" data-page="tts">
         <header class="page-header">
