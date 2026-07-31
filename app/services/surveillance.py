@@ -1431,15 +1431,14 @@ class SurveillanceManager:
                 stored_list[idx] if idx < len(stored_list) else {},
                 idx,
             )
-            ch.apply_config(
-                name=merged["name"],
-                source=merged["source"],
-                prompt=merged["prompt"],
-                playback_enabled=merged.get("playback_enabled", False),
-                detection_enabled=merged.get("detection_enabled", False),
-                detect_w=merged["detect_w"],
-                detect_h=merged["detect_h"],
-            )
+            with ch._config_lock:
+                ch._name = merged["name"]
+                ch._source = merged["source"]
+                ch._prompt = merged["prompt"]
+                ch._playback_enabled = merged.get("playback_enabled", False)
+                ch._detection_enabled = merged.get("detection_enabled", False)
+                ch._detect_w = merged["detect_w"]
+                ch._detect_h = merged["detect_h"]
 
     def _read_channels_list(self) -> List[dict]:
         section = self._store.get_section("surveillance", {}) or {}
