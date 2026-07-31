@@ -6,7 +6,7 @@ async function fetchVersion() {
     const r = await fetch("/health");
     if (!r.ok) return;
     const el = document.getElementById("brand-version");
-    if (el) el.textContent = "v" + (window.__APP_VERSION__ || "0.3.0");
+    if (el) el.textContent = "v" + (window.__APP_VERSION__ || "0.4.0");
   } catch (_) { /* ignore */ }
 }
 
@@ -217,6 +217,8 @@ const VD = {
   wsTimer: null,
   blobUrl: null,
   inflight: 0,
+  tools: [],
+  enabledTools: [],
   init() { return initVideoDetection(); },
 };
 
@@ -271,6 +273,35 @@ async function drawVdFrame(jpgBytes) {
   ctx.drawImage(img, 0, 0);
 }
 
+/* Draw a red bbox overlay (5s fade) when a tool_call event arrives
+ * with bbox. The SVG viewBox is fixed at 1000x1000 to match the
+ * @Callable tools' normalised 0–1000 coordinate space. Coordinates
+ * are passed through verbatim — we never scale to canvas pixels.
+ */
+function pushVdBbox(bbox, toolKey) {
+  const svg = document.getElementById("vd-bbox-svg");
+  if (!svg || !Array.isArray(bbox) || bbox.length !== 4) return;
+  const [x1, y1, x2, y2] = bbox.map((v) => Number(v));
+  if (![x1, y1, x2, y2].every((v) => Number.isFinite(v))) return;
+  const ns = "http://www.w3.org/2000/svg";
+  const rect = document.createElementNS(ns, "rect");
+  const x = Math.max(0, Math.min(1000, Math.min(x1, x2)));
+  const y = Math.max(0, Math.min(1000, Math.min(y1, y2)));
+  const w = Math.max(0, Math.abs(x2 - x1));
+  const h = Math.max(0, Math.abs(y2 - y1));
+  rect.setAttribute("x", x);
+  rect.setAttribute("y", y);
+  rect.setAttribute("width", w);
+  rect.setAttribute("height", h);
+  rect.setAttribute("rx", 8);
+  rect.setAttribute("class", "vd-bbox-rect");
+  if (toolKey) rect.setAttribute("data-tool", toolKey);
+  svg.appendChild(rect);
+  setTimeout(() => {
+    try { rect.remove(); } catch (_) { /* already gone */ }
+  }, 5200);
+}
+
 function connectVdWs() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${proto}//${location.host}${API_PREFIX}/video-detection/ws`;
@@ -293,6 +324,9 @@ function connectVdWs() {
       } else if (snap.type === "event") {
         addVdEvent(snap);
         showVdEventBadge(snap);
+        if (Array.isArray(snap.bbox) && (snap.tool_call === "annotate_roi" || snap.tool_call === "crop_region")) {
+          pushVdBbox(snap.bbox, snap.tool_call);
+        }
         return;
       } else if (snap.type === "status" && snap.detector) {
         updateVdDetectorStatus(snap.detector);
@@ -623,8 +657,10 @@ function updateVdDetectorStatus(snap) {
   } else if (snap.init_error) {
     statusEl.textContent = "模型加载失败: " + snap.init_error;
   } else if (snap.enabled && snap.session_ready) {
+    const toolsCount = (snap.enabled_tools || []).length;
+    const toolsHint = toolsCount ? ` · ${toolsCount} 个工具` : "";
     statusEl.textContent =
-      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size}`;
+      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size}${toolsHint}`;
   } else if (snap.enabled) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
@@ -663,11 +699,12 @@ async function vdDetectorStart() {
     setVdOverlay("请先填写检测提示词", true);
     return;
   }
+  const enabled_tools = vdCollectEnabledTools();
   try {
     const r = await fetch(API_PREFIX + "/video-detection/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, every_n }),
+      body: JSON.stringify({ prompt, every_n, enabled_tools }),
     });
     if (!r.ok) {
       const detail = await r.text().catch(() => "");
@@ -680,6 +717,109 @@ async function vdDetectorStart() {
   } catch (e) {
     setVdOverlay("启动检测失败: " + e.message, true);
   }
+}
+
+function vdCollectEnabledTools() {
+  const root = document.getElementById("vd-tools-list");
+  if (!root) return [];
+  const out = [];
+  root.querySelectorAll("input[type=checkbox][data-tool-key]").forEach((el) => {
+    if (el.checked && !el.disabled) out.push(el.dataset.toolKey);
+  });
+  return out;
+}
+
+async function vdLoadTools() {
+  const root = document.getElementById("vd-tools-list");
+  const summary = document.getElementById("vd-tools-summary");
+  if (!root) return;
+  let data = { tools: [] };
+  try {
+    const r = await fetch(API_PREFIX + "/video-detection/tools");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    data = await r.json();
+  } catch (e) {
+    root.innerHTML = `<div class="vd-tools-empty">加载失败: ${e.message}</div>`;
+    if (summary) summary.textContent = "加载失败";
+    return;
+  }
+  VD.tools = data.tools || [];
+  renderVdTools();
+}
+
+function renderVdTools() {
+  const root = document.getElementById("vd-tools-list");
+  const summary = document.getElementById("vd-tools-summary");
+  if (!root) return;
+  const tools = VD.tools || [];
+  if (!tools.length) {
+    root.innerHTML = `<div class="vd-tools-empty">当前无工具</div>`;
+    if (summary) summary.textContent = "0 个工具";
+    return;
+  }
+  root.innerHTML = "";
+  tools.forEach((t) => {
+    const card = document.createElement("label");
+    card.className = "vd-tool-card" + (t.available ? "" : " is-disabled");
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.dataset.toolKey = t.key;
+    check.disabled = !t.available;
+    if (VD.enabledTools.includes(t.key)) check.checked = true;
+    check.addEventListener("change", () => {
+      if (check.checked) {
+        if (!VD.enabledTools.includes(t.key)) VD.enabledTools.push(t.key);
+      } else {
+        VD.enabledTools = VD.enabledTools.filter((k) => k !== t.key);
+      }
+      updateVdToolsSummary();
+    });
+    const body = document.createElement("div");
+    body.className = "vd-tool-card-body";
+    const title = document.createElement("div");
+    title.className = "vd-tool-card-title";
+    const name = document.createElement("span");
+    name.className = "vd-tool-card-name";
+    name.textContent = t.name;
+    const key = document.createElement("span");
+    key.className = "vd-tool-card-key";
+    key.textContent = t.key;
+    title.appendChild(name);
+    title.appendChild(key);
+    const desc = document.createElement("div");
+    desc.className = "vd-tool-card-desc";
+    desc.textContent = t.description;
+    body.appendChild(title);
+    body.appendChild(desc);
+    if (t.requires_capability) {
+      const dep = document.createElement("div");
+      dep.className = "vd-tool-card-dep " + (t.available ? "is-ok" : "is-bad");
+      dep.textContent = t.available
+        ? `依赖 ${t.requires_capability} · ✓ 可用`
+        : `依赖 ${t.requires_capability} · ⚠ ${t.reason || "未启用"}`;
+      body.appendChild(dep);
+    }
+    card.appendChild(check);
+    card.appendChild(body);
+    card.addEventListener("click", (ev) => {
+      if (ev.target.tagName === "INPUT") return;
+      if (check.disabled) return;
+      check.checked = !check.checked;
+      check.dispatchEvent(new Event("change"));
+    });
+    root.appendChild(card);
+  });
+  updateVdToolsSummary();
+}
+
+function updateVdToolsSummary() {
+  const summary = document.getElementById("vd-tools-summary");
+  if (!summary) return;
+  const enabled = vdCollectEnabledTools();
+  const total = (VD.tools || []).length;
+  summary.textContent = enabled.length
+    ? `已启用 ${enabled.length} / ${total}`
+    : `未启用（${total} 个可选）`;
 }
 
 async function vdDetectorStop() {
@@ -828,6 +968,7 @@ function initVideoDetection() {
 
   // Initial state hydration (when navigating back to the page)
   refreshVdDetector();
+  vdLoadTools();
 
   if (!VD.ws && !VD.wsTimer) connectVdWs();
 }
@@ -1614,6 +1755,13 @@ TTS.init();
     return;
   }
 
+  if (name === "tools") {
+    Tools.init();
+    await Tools.load();
+    Tools.startTicking();
+    return;
+  }
+
   if (name === "discovery") {
     await Discovery.load();
     return;
@@ -1639,6 +1787,9 @@ function showPage(name) {
   const prev = currentPage();
   if (prev === "compute-config" && name !== "compute-config") {
     ComputeConfigPage.stopTicking();
+  }
+  if (prev === "tools" && name !== "tools") {
+    Tools.stopTicking();
   }
   document.querySelectorAll(".page").forEach(p => {
     p.classList.toggle("hidden", p.dataset.page !== name);
@@ -3867,6 +4018,110 @@ const Discovery = {
       `;
       list.appendChild(card);
     }
+  },
+};
+
+/* ------------------------------------------------------------------ *
+ *  工具列表 (Tools) page — sidebar entry between 算力配置 and 视频监控.  *
+ *  Renders the registry's tool cards + per-tool capability status;     *
+ *  polls /api/tools every 2s so enabling/disabling compute instances   *
+ *  on the 算力配置 page reflects here without a manual refresh.        *
+ * ------------------------------------------------------------------ */
+const Tools = {
+  initialized: false,
+  _tickHandle: null,
+  _loading: false,
+  _lastData: null,
+
+  init() {
+    if (this.initialized) return;
+    this.initialized = true;
+    document.getElementById("tools-refresh")?.addEventListener("click", () => this.load());
+  },
+
+  async load() {
+    if (this._loading) return;
+    this._loading = true;
+    try {
+      const r = await fetch(API_PREFIX + "/tools", { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      this._lastData = data;
+      this.render(data);
+    } catch (e) {
+      const list = document.getElementById("tools-list");
+      if (list) {
+        list.innerHTML = `<div class="tools-empty danger">加载失败: ${e.message}</div>`;
+      }
+    } finally {
+      this._loading = false;
+    }
+  },
+
+  startTicking() {
+    if (this._tickHandle) return;
+    this._tickHandle = setInterval(() => this.load(), 2000);
+  },
+
+  stopTicking() {
+    if (this._tickHandle) {
+      clearInterval(this._tickHandle);
+      this._tickHandle = null;
+    }
+  },
+
+  render(data) {
+    const list = document.getElementById("tools-list");
+    const collectedAt = document.getElementById("tools-collected-at");
+    const payload = document.getElementById("data-tools");
+    if (!list) return;
+    const tools = (data && data.tools) || [];
+    list.innerHTML = "";
+    if (!tools.length) {
+      list.innerHTML = `<div class="tools-empty">当前没有可用工具</div>`;
+    }
+    for (const t of tools) {
+      const card = document.createElement("article");
+      card.className = "tool-card";
+      const head = document.createElement("div");
+      head.className = "tool-card-head";
+      const name = document.createElement("span");
+      name.className = "tool-card-name";
+      name.textContent = t.name;
+      const key = document.createElement("span");
+      key.className = "tool-card-key";
+      key.textContent = t.key;
+      head.appendChild(name);
+      head.appendChild(key);
+      const desc = document.createElement("div");
+      desc.className = "tool-card-desc";
+      desc.textContent = t.description;
+      const state = document.createElement("div");
+      state.className = "tool-card-state";
+      if (t.requires_capability) {
+        if (t.available) {
+          state.classList.add("is-ok");
+          state.textContent = `✓ 可用 · 依赖 ${t.requires_capability}`;
+        } else {
+          state.classList.add("is-bad");
+          state.textContent = `⚠ 未启用 · ${t.reason || "依赖未启用"}`;
+        }
+      } else {
+        state.classList.add("is-neutral");
+        state.textContent = "无外部依赖";
+      }
+      card.appendChild(head);
+      card.appendChild(desc);
+      card.appendChild(state);
+      list.appendChild(card);
+    }
+    if (collectedAt) {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      collectedAt.textContent =
+        `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    }
+    if (payload) payload.textContent = JSON.stringify(data, null, 2);
   },
 };
 

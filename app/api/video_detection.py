@@ -255,8 +255,9 @@ async def get_prompt() -> dict:
 async def set_prompt(payload: dict) -> dict:
     """Start (or update) VLM detection.
 
-    Body: ``{prompt: str, every_n: int}`` — both required, default
-    cadence ~1s @ 30fps if not given.
+    Body: ``{prompt: str, every_n: int, enabled_tools: list[str]}``
+    — ``prompt`` 必填；``enabled_tools`` 可选，默认 ``[]``，每一项
+    必须是 ``/api/video-detection/tools`` 返回的合法 ``key``。
     """
     payload = payload or {}
     prompt = (payload.get("prompt") or "").strip()
@@ -268,10 +269,51 @@ async def set_prompt(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail="every_n 必须为整数")
     if every_n < 1:
         raise HTTPException(status_code=400, detail="every_n 必须 >= 1")
+    enabled_tools = payload.get("enabled_tools") or []
+    if not isinstance(enabled_tools, list):
+        raise HTTPException(status_code=400, detail="enabled_tools 必须是列表")
     try:
-        return get_detector().start(prompt, every_n=every_n)
+        return get_detector().start(prompt, every_n=every_n, enabled_tools=enabled_tools)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.get("/video-detection/tools")
+async def list_tools() -> dict:
+    """返回当前 detector 可启用的工具列表 + 能力可用性。
+
+    每条记录包含 ``key`` / ``name`` / ``description`` /
+    ``requires_capability`` / ``available`` / ``reason`` / ``fields``。
+    """
+    from app.services.compute_registry import get_registry
+    from app.services.tools import get_tool_registry
+
+    reg = get_tool_registry()
+    out = []
+    for spec in reg.list_specs():
+        available = True
+        reason = ""
+        if spec.requires_capability:
+            try:
+                get_registry().get_session(spec.requires_capability)
+            except RuntimeError as e:
+                available = False
+                reason = str(e)
+        out.append({
+            "key":                 spec.key,
+            "name":                spec.name,
+            "description":         spec.description,
+            "requires_capability": spec.requires_capability,
+            "available":           available,
+            "reason":              reason,
+            "fields":              [
+                {"name": fname, "description": fdesc}
+                for fname, fdesc in spec.fields
+            ],
+        })
+    return {"tools": out}
 
 
 @router.post("/video-detection/prompt/stop")

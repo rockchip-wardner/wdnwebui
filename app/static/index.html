@@ -13,13 +13,14 @@
         <span class="brand-title">守望者系统</span>
         <div class="brand-meta">
           <span class="brand-subtitle">Wardner</span>
-          <span class="brand-version" id="brand-version">v0.3.0</span>
+          <span class="brand-version" id="brand-version">v0.4.0</span>
         </div>
       </div>
       <nav class="nav">
-<a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
+      <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
       <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
       <a href="#compute-config"  data-page="compute-config"  class="nav-item">算力配置</a>
+      <a href="#tools"           data-page="tools"           class="nav-item">工具列表</a>
       <a href="#surveillance"    data-page="surveillance"    class="nav-item">视频监控</a>
         <a href="#audio-monitor"   data-page="audio-monitor"   class="nav-item">音频监控</a>
         <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
@@ -326,6 +327,29 @@
         <div class="cc-foot" id="cc-foot"></div>
       </section>
 
+      <section id="page-tools" class="page hidden" data-page="tools">
+        <header class="page-header">
+          <h2>工具列表</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="tools-collected-at">--</span>
+            <button class="refresh-btn" id="tools-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div class="tools-hint">
+          当前内置工具集合，可在音视频检测页面右侧勾选使用。工具运行依赖的算力（VLM / TTS 等）必须在“算力配置”页启用；未启用时该工具会显示为灰色不可用。
+        </div>
+
+        <div class="tools-list" id="tools-list">
+          <div class="tools-empty">加载中…</div>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-tools"></pre>
+        </details>
+      </section>
+
       <section id="page-surveillance" class="page hidden" data-page="surveillance">
         <header class="page-header">
           <h2>视频监控</h2>
@@ -413,6 +437,9 @@
           <div class="vd-stage-col">
             <div class="vd-stage">
               <canvas id="vd-canvas" width="960" height="540"></canvas>
+              <svg id="vd-bbox-svg" class="vd-bbox-svg"
+                   viewBox="0 0 1000 1000" preserveAspectRatio="none"
+                   xmlns="http://www.w3.org/2000/svg"></svg>
               <div class="vd-overlay" id="vd-overlay"></div>
               <div class="vd-event-badge hidden" id="vd-event-badge">
                 <span class="vd-event-badge-text" id="vd-event-badge-text"></span>
@@ -485,6 +512,18 @@
                       <option value="768">768×768</option>
                     </select>
                   </label>
+                </div>
+              </section>
+
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>工具</h3>
+                  <span class="surv-hint" id="vd-tools-summary">未启用</span>
+                </header>
+                <div class="surv-field">
+                  <div id="vd-tools-list" class="vd-tools-list">
+                    <div class="vd-tools-empty">加载中…</div>
+                  </div>
                 </div>
               </section>
             </form>
@@ -799,6 +838,6 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js?v=26" defer></script>
+  <script src="/static/js/app.js?v=27" defer></script>
 </body>
 </html>

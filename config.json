@@ -173,10 +173,6 @@
       {
         "npu_index": 0,
         "model": "qwen3-tts"
-      },
-      {
-        "npu_index": 0,
-        "model": "qwen3-vl-4b"
       }
     ]
   }

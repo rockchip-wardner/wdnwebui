@@ -2391,3 +2391,167 @@ html, body {
   font-size: 12px;
   color: var(--text-2);
 }
+
+/* ---------- tools (音视频检测 + 工具列表) ---------- */
+.vd-bbox-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+}
+.vd-bbox-rect {
+  fill: rgba(239, 68, 68, 0.10);
+  stroke: #ef4444;
+  stroke-width: 6;
+  vector-effect: non-scaling-stroke;
+  animation: vd-bbox-fade 5s ease-out forwards;
+}
+@keyframes vd-bbox-fade {
+  0%   { opacity: 0; }
+  10%  { opacity: 1; }
+  85%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.vd-tools-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.vd-tools-empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0.4rem 0.2rem;
+}
+.vd-tool-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #f9fafb;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.vd-tool-card.is-disabled {
+  background: #f3f4f6;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.vd-tool-card.is-selected {
+  border-color: var(--accent);
+  background: #eff6ff;
+}
+.vd-tool-card input[type="checkbox"] {
+  margin-top: 0.18rem;
+  cursor: inherit;
+}
+.vd-tool-card-body {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+  min-width: 0;
+}
+.vd-tool-card-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.vd-tool-card-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+.vd-tool-card-key {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.vd-tool-card-desc {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.vd-tool-card-dep {
+  font-size: 11px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.vd-tool-card-dep.is-ok {
+  color: #15803d;
+}
+.vd-tool-card-dep.is-bad {
+  color: var(--danger);
+}
+
+.tools-hint {
+  background: #fff7ed;
+  border: 1px solid #fdba74;
+  color: #9a3412;
+  padding: 0.6rem 0.8rem;
+  border-radius: 4px;
+  margin-bottom: 0.85rem;
+  font-size: 13px;
+}
+.tools-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 0.6rem;
+}
+.tools-empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 0.6rem 0.4rem;
+}
+.tool-card {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.7rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-height: 110px;
+}
+.tool-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.tool-card-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+.tool-card-key {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.tool-card-desc {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.45;
+  flex: 1 1 auto;
+}
+.tool-card-state {
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.tool-card-state.is-ok {
+  color: #15803d;
+}
+.tool-card-state.is-bad {
+  color: var(--danger);
+}
+.tool-card-state.is-neutral {
+  color: var(--muted);
+}

@@ -439,9 +439,36 @@ class ComputeRegistry:
         return None
 
     def _run_one(self, inst: ModelInstance) -> None:
-        """真正调 rkai.LLMSession()。失败 → status='error'。"""
+        """真正调 rkai.LLMSession()。失败 → status='error'。
+
+        关键约束：**LLMSession(...)** 内部会触发 rknn3 native lib 的
+        ``MODEL_SETUP``。在非 RK 开发板 / 算力配置错的板子上，该
+        调用可能会直接走 ``std::terminate()``，把整 uvicorn 进程
+        拖死 —— 之前亲眼见过 ``terminate called without an active
+        exception`` 之后整个 web 服务整个挂掉、网页卡死。
+        所以这里把构造放到 **子进程** 里跑：subprocess 挂了不影响
+        父进程，父进程把实例标 ``status='error'``，算力配置页可
+        以看到错误原因 + 重试（disable → enable）。
+        """
         npu_index = inst.npu_index
         model_id = inst.model_id
+
+        ok, err, probe = _init_session_subprocess(npu_index, model_id)
+        if not ok:
+            with self._lock:
+                inst.status = "error"
+                inst.error = err
+                inst.finished_at = time.time()
+            LOG.warning(
+                "compute init subprocess failed (%d, %s): %s",
+                npu_index, model_id, err,
+            )
+            return
+
+        # 子进程构造成功 —— 父进程也构造一份（consumers 要拿
+        # ``llm_session`` 句柄用）。这一步是**双倍代价**，但只
+        # 在 init 成功路径上出现，且确保 web 不会因为 native abort
+        # 而挂。失败依旧标 error。
         try:
             preset = MODEL_PRESETS[model_id]
             spec = preset["preset_factory"]()
@@ -450,10 +477,14 @@ class ComputeRegistry:
         except Exception as e:
             with self._lock:
                 inst.status = "error"
-                inst.error = f"{type(e).__name__}: {e}"
+                inst.error = f"subprocess 探针 ok，但父进程 init 失败: {e}"
                 inst.finished_at = time.time()
-            LOG.warning("compute start failed (%d, %s): %s", npu_index, model_id, e)
+            LOG.warning(
+                "compute parent init failed (%d, %s) after subprocess ok: %s",
+                npu_index, model_id, e,
+            )
             return
+
         with self._lock:
             inst.llm_session = sess
             inst.status = "running"
@@ -463,6 +494,9 @@ class ComputeRegistry:
         # 注意：这是后台 thread 调，_persist 会调 config.set_section，
         # 已经 thread-safe（ConfigStore 内部有 RLock）。
         self._persist()
+        LOG.info(
+            "compute instance running (%d, %s, probe=%.1fs)", npu_index, model_id, probe,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -478,3 +512,126 @@ def get_registry() -> ComputeRegistry:
         if _registry is None:
             _registry = ComputeRegistry()
         return _registry
+
+
+# --------------------------------------------------------------------------- #
+# 子进程隔离的 LLMSession 构造探针
+# --------------------------------------------------------------------------- #
+_INIT_SENTINEL = b"__PYRKAIWEB_INIT_DONE__"
+
+
+def _init_session_subprocess(
+    npu_index: int, model_id: str, *, timeout: float = 180.0,
+) -> Tuple[bool, str, float]:
+    """在子进程里尝试构造一次 LLMSession。
+
+    **目的**：rkai 的 ``LLMSession(...)`` 在 rknn3 加载失败 / 模型文件
+    缺失等情况下会触发 ``std::terminate()``（而不是抛 Python 异常），
+    整 uvicorn 跟着挂。把构造放到子进程里：
+
+    * 子进程 exit 0 → 子进程构造成功，父进程也照着构造一份（consumers
+      要拿句柄），构造时再失败同样标 error。
+    * 子进程 exit 非 0 / SIGABRT → 父进程捕获，把 stderr/stdout
+      截一段写到 ``inst.error``，实例标 ``error``，网页不挂。
+
+    Returns:
+        (ok, error_str, probe_seconds)
+        ok=True 时 error_str 为空；ok=False 时 error_str 含原因。
+    """
+    import subprocess
+    import sys
+    import json as _json
+
+    env = os.environ.copy()
+    # rkai 用 RKAI_MODELS_DIR 找模型；保留主进程里已经写过的值。
+    repo_root = str(Path(__file__).resolve().parents[2])
+    env.setdefault("PYTHONPATH", repo_root)
+    if "PYTHONPATH" in env and repo_root not in env["PYTHONPATH"].split(":"):
+        env["PYTHONPATH"] = repo_root + ":" + env["PYTHONPATH"]
+
+    # 子进程脚本：import rkai, 构建 LLMSession, 把结果写到 stdout。
+    # **故意**把 rkai 构造包在 try/except BaseException 里 —— 既捕
+    # Python 异常，也避免 C++ 异常 unwind 把 Python 解释器拖死（虽然
+    # std::terminate 我们抓不住，但至少 import 错误 / TypeError 等
+    # 能被截到）。脚本**完全**用 ``.format()`` 风格字符串拼接，
+    # 避开 ``%`` 模板 —— 下面整段作为 ``python -c`` 的代码不能
+    # 含 ``%`` 字符。
+    model_id_js = model_id.replace("'", "\\'")
+    script = (
+        "import sys, json, os\n"
+        "sys.path.insert(0, " + repr(repo_root) + ")\n"
+        "def _emit(ok, error=''):\n"
+        "    sys.stdout.buffer.write(\n"
+        "        b'__PYRKAIWEB_INIT_DONE__' +\n"
+        "        json.dumps({'ok': bool(ok), 'error': str(error)}).encode('utf-8') +\n"
+        "        b'\\n')\n"
+        "    sys.stdout.flush()\n"
+        "try:\n"
+        "    from rkai import LLMSession, SystemLanguageModel\n"
+        "except BaseException as _e:\n"
+        "    _emit(False, 'import rkai failed: ' + repr(_e))\n"
+        "    sys.exit(0)\n"
+        "try:\n"
+        "    model_id = '" + model_id_js + "'\n"
+        "    npu_index = " + str(int(npu_index)) + "\n"
+        "    if model_id == 'qwen3-vl-4b':\n"
+        "        spec = SystemLanguageModel.qwen3_vl_4b()\n"
+        "    elif model_id == 'qwen3-tts':\n"
+        "        spec = SystemLanguageModel.qwen3_tts()\n"
+        "    elif model_id == 'qwen3-asr':\n"
+        "        spec = SystemLanguageModel.qwen3_asr()\n"
+        "    else:\n"
+        "        raise ValueError('unknown model: ' + model_id)\n"
+        "    _ = LLMSession(model=spec, npu=npu_index)\n"
+        "    _emit(True)\n"
+        "except BaseException as _e:\n"
+        "    _emit(False, 'LLMSession() raised: ' + type(_e).__name__ + ': ' + str(_e))\n"
+        "finally:\n"
+        "    sys.exit(0)\n"
+    )
+
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"init 超时 (>={timeout}s)", time.time() - t0
+
+    elapsed = time.time() - t0
+    # 找 sentinel + JSON 行
+    out = proc.stdout or b""
+    idx = out.find(_INIT_SENTINEL)
+    if idx >= 0:
+        tail = out[idx + len(_INIT_SENTINEL):]
+        line = tail.split(b"\n", 1)[0].strip()
+        try:
+            payload = _json.loads(line.decode("utf-8", errors="replace"))
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            ok = bool(payload.get("ok"))
+            err = str(payload.get("error") or "")
+            if not ok and not err:
+                err = "subprocess returned error but empty message"
+            return ok, err, elapsed
+        return False, f"subprocess stdout 无法解析: {line!r}", elapsed
+
+    # 没有 sentinel：subprocess 崩了 / 输出没到。常见是 rknn3
+    # `std::terminate()` —— exit code 是 -6 (SIGABRT) 或 -11 (SIGSEGV)。
+    rc = proc.returncode
+    tail_err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+    tail_out = out.decode("utf-8", errors="replace").strip()
+    snippet = tail_err.splitlines()[-3:] if tail_err else []
+    snippet = "\n".join(snippet) or (tail_out[-300:] if tail_out else "(无输出)")
+    if rc < 0:
+        sig = -rc
+        try:
+            sig_name = {6: "SIGABRT", 11: "SIGSEGV", 9: "SIGKILL"}.get(sig, f"signal {sig}")
+        except Exception:
+            sig_name = f"signal {sig}"
+        return False, f"init 子进程崩溃（{sig_name}）：{snippet[:300]}", elapsed
+    return False, f"init 失败（exit {rc}）：{snippet[:300]}", elapsed

@@ -138,6 +138,11 @@ class DetectorEvent:
     The shape is what the frontend already expects (id / frame_pos / ts
     / prompt / text); the LMOutput instance is also attached so future
     consumers can pull ``attachment`` or other structured fields.
+
+    ``tool_call`` / ``bbox`` are populated when the model selected a
+    ``@Callable`` tool (crop_region / annotate_roi / tts_alert). The
+    front-end renders a 5s-fade red rectangle for any event that
+    carries a ``bbox``.
     """
     id: int
     frame_pos: int
@@ -146,6 +151,8 @@ class DetectorEvent:
     text: str
     level: Optional[str] = None
     attachment_count: int = 0
+    tool_call: Optional[str] = None
+    bbox: Optional[list] = None
 
     def to_dict(self) -> dict:
         return {
@@ -156,6 +163,8 @@ class DetectorEvent:
             "text":             self.text,
             "level":            self.level,
             "attachment_count": self.attachment_count,
+            "tool_call":        self.tool_call,
+            "bbox":             self.bbox,
         }
 
 
@@ -181,6 +190,7 @@ class RkaiDetector:
         self._enabled = False
         self._prompt = ""
         self._every_n = 30
+        self._enabled_tools: List[str] = []
         self._frame_count = 0
         self._model_name = "qwen3-vl-4b"
         # LLMSession 不再由 detector 持有，统一在 ComputeRegistry 里管理。
@@ -221,21 +231,42 @@ class RkaiDetector:
                 "session_ready":  session_ready,
                 "worker_alive":   self._worker is not None and self._worker.is_alive(),
                 "queue_size":     self._item_q.qsize(),
+                "enabled_tools":  list(self._enabled_tools),
             }
 
     # ------------------------------------------------------------------ #
-    def start(self, prompt: str, every_n: int = 30) -> dict:
+    def start(self, prompt: str, every_n: int = 30, enabled_tools: Optional[List[str]] = None) -> dict:
         if not self.available:
             raise RuntimeError("rkai 不可用")
         if not (prompt or "").strip():
             raise ValueError("prompt 不能为空")
-        # 业务级校验：算力是否就绪。这一步失败 → 立刻 raise，前端能
-        # 区分"功能未启用"和"运行时错误"。
+        # 工具名校验放在最前面：未知 key → 400（与 capability
+        # 区分开）。这一步独立于 VLM 是否可用，纯字符串 / 注册表
+        # 校验。
+        from app.services.tools import get_tool_registry
+        reg = get_tool_registry()
+        tool_keys: List[str] = []
+        for key in enabled_tools or []:
+            if not isinstance(key, str):
+                raise ValueError(f"enabled_tools 项必须是字符串: {key!r}")
+            if not reg.has(key):
+                raise ValueError(f"未知工具: {key!r}")
+            tool_keys.append(key)
+        # 业务级校验：算力是否就绪。这一步失败 → 503 / RuntimeError，
+        # 前端能区分"功能未启用"和"运行时错误"。
         from app.services.compute_registry import get_registry
         try:
             get_registry().get_session("video_query")
         except RuntimeError as e:
             raise RuntimeError(str(e))
+        # 工具依赖的 capability 校验（双层防护第二层）
+        for key in tool_keys:
+            spec = reg.get(key)
+            if spec.requires_capability:
+                try:
+                    get_registry().get_session(spec.requires_capability)
+                except RuntimeError as e:
+                    raise RuntimeError(str(e)) from e
         # Build the structured-output class now (lazy) so that any
         # import failure surfaces here instead of inside the worker.
         _get_vlm_doc_cls()
@@ -243,6 +274,7 @@ class RkaiDetector:
             self._enabled = True
             self._prompt = prompt
             self._every_n = max(1, int(every_n))
+            self._enabled_tools = tool_keys
             self._frame_count = 0
         if self._worker is None or not self._worker.is_alive():
             self._stop_event.clear()
@@ -337,6 +369,12 @@ class RkaiDetector:
 
         LLMSession 由 ComputeRegistry 统一管理（"算力配置"页面启用）。
         找不到 video_query capability → 报错 "功能未启用"。
+
+        工具调用：模型可选中 ``@Callable`` 工具（crop_region /
+        annotate_roi / tts_alert），SDK 返回一个已填充字段的实例；
+        ``RkaiDetector`` 自己 ``__call__`` 执行副作用（裁图 / 广播 bbox
+        / 触发 TTS），并把 tool key + bbox 写入事件，前端在 canvas 上
+        画 5 秒淡出的红框。
         """
         try:
             from app.services.compute_registry import get_registry
@@ -351,19 +389,133 @@ class RkaiDetector:
                 level="disabled",
                 attachment_count=0,
             )
+
+        with self._lock:
+            enabled_tools = list(self._enabled_tools)
+
         try:
             ok, Attachment, *_ = _load_rkai()
             VLMDoc = _get_vlm_doc_cls()
+
+            from app.services.tools import get_tool_registry
+            reg = get_tool_registry()
+            tool_classes = [reg.get_class(k) for k in enabled_tools] if enabled_tools else None
 
             sess.reset()
             coro = sess.respond(
                 prompt=prompt,
                 attachment=[Attachment(frame_bgr)],     # v2: list of Attachments
                 generating=VLMDoc,                      # v2: LMOutput subclass
+                tools=tool_classes,
             )
             result = asyncio.run(coro)
-            # `result` is a ``VLMDoc`` (LMOutput subclass). Backend
-            # currently produces no audio outputs, so ``attachment`` is [].
+
+            # ---- tool branch -------------------------------------------------
+            # ``@Callable`` 工具的优先级高于 ``VLMDoc`` 结构化输出 —— 即
+            # 模型可以选其中之一。``isinstance`` 区分，匹配示例
+            # ``function_call.py`` 的写法。
+            from app.services.tools.annotate_roi import AnnotateROI
+            from app.services.tools.crop_region import CropRegion
+            from app.services.tools.tts_alert import TtsAlert
+
+            h, w = frame_bgr.shape[:2]
+            from app.services.tools.registry import ToolContext
+            ctx = ToolContext(width=w, height=h, prompt=prompt)
+
+            if isinstance(result, AnnotateROI):
+                try:
+                    side = result(frame_bgr, ctx)
+                    bbox = side.get("bbox")
+                except Exception as e:  # noqa: BLE001
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text=f"(目标标注失败: {e})", level="error",
+                        attachment_count=0, tool_call="annotate_roi",
+                    )
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text="目标标注",
+                    level=None, attachment_count=0,
+                    tool_call="annotate_roi",
+                    bbox=bbox if not side.get("invalid") else None,
+                )
+
+            if isinstance(result, TtsAlert):
+                try:
+                    side = result(frame_bgr, ctx)
+                except RuntimeError as e:
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text=f"({e})", level="disabled",
+                        attachment_count=0, tool_call="tts_alert",
+                    )
+                except Exception as e:  # noqa: BLE001
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text=f"(语音提醒失败: {e})", level="error",
+                        attachment_count=0, tool_call="tts_alert",
+                    )
+                if side.get("played"):
+                    text = (side.get("text") or "").strip()
+                    snippet = text if len(text) <= 60 else text[:57] + "..."
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text=f"语音提醒: {snippet}",
+                        level=None, attachment_count=0,
+                        tool_call="tts_alert",
+                    )
+                err = side.get("error") or "unknown"
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text=f"(语音提醒失败: {err})", level="error",
+                    attachment_count=0, tool_call="tts_alert",
+                )
+
+            if isinstance(result, CropRegion):
+                try:
+                    side = result(frame_bgr, ctx)
+                except Exception as e:  # noqa: BLE001
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text=f"(原图缩放失败: {e})", level="error",
+                        attachment_count=0, tool_call="crop_region",
+                    )
+                crop = side.get("crop")
+                followup_prompt = side.get("followup_prompt") or prompt
+                if crop is None:
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text="(原图缩放: 裁剪区域为空)", level="warn",
+                        attachment_count=0, tool_call="crop_region",
+                        bbox=side.get("bbox_pixels"),
+                    )
+                # 二次推理：用裁剪图 + 拼接 prompt 再喂一次 VLM。
+                try:
+                    sess.reset()
+                    coro2 = sess.respond(
+                        prompt=followup_prompt,
+                        attachment=[Attachment(crop)],
+                        generating=VLMDoc,
+                    )
+                    inner = asyncio.run(coro2)
+                except Exception as e:  # noqa: BLE001
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text=f"(二次推理失败: {e})", level="error",
+                        attachment_count=0, tool_call="crop_region",
+                        bbox=side.get("bbox_pixels"),
+                    )
+                inner_att_count = len(getattr(inner, "attachment", []) or [])
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text=str(getattr(inner, "text", "") or ""),
+                    level=getattr(inner, "level", None),
+                    attachment_count=inner_att_count,
+                    tool_call="crop_region",
+                    bbox=side.get("bbox_pixels"),
+                )
+
+            # ---- default: VLMDoc ------------------------------------------
             att_count = len(getattr(result, "attachment", []) or [])
             return DetectorEvent(
                 id=-1,                   # filled in by worker_loop

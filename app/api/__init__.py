@@ -13,6 +13,7 @@ from . import (
     surveillance,
     system_logs,
     system_monitor,
+    tools,
     tts,
     video_detection,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "surveillance",
     "system_logs",
     "system_monitor",
+    "tools",
     "tts",
     "video_detection",
 ]

@@ -18,6 +18,7 @@ from app.api import (
     surveillance,
     system_logs,
     system_monitor,
+    tools,
     tts,
     video_detection,
 )
@@ -81,6 +82,7 @@ def create_app() -> FastAPI:
     app.include_router(tts.router, prefix="/api")
     app.include_router(surveillance.router, prefix="/api")
     app.include_router(compute.router, prefix="/api")
+    app.include_router(tools.router, prefix="/api")
 
     # 异步启动算力实例（不阻塞 UI 启动）。后台 daemon thread 串行
     # 从 config.json["compute"]["instances"] 加载；UI 在算力配置页

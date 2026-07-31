@@ -595,3 +595,61 @@ RIFF header by hand.
 | Anything that needs a new endpoint    | Add a route inside `create_app()` in `app/main.py`        |
 | Added/removed a model preset          | `MODEL_PRESETS` in `app/services/compute_registry.py` + `register` the new capability in the same table; update `app/static/index.html` and `app/static/js/app.js` only if the UI needs new model cards |
 | `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
+## Tools (音视频检测页工具)
+
+`app/services/tools/` 装的是给音视频检测页 (RkaiDetector) 用的
+rkai ``@Callable`` 工具集合，**不**进入视频监控 (16 路) — 那条
+通路有自己的 surveillance manager，工具语义不同，这一轮不动。
+
+* **三个内置工具**：
+  - ``crop_region`` — 原图缩放：模型给出 0–1000 归一化 bbox，
+    后端按 bbox 切出 BGR，拼接“原 prompt + 一句 ROI 描述”
+    二次送 VLM 推理。
+  - ``annotate_roi`` — 目标标注：模型给出 bbox，前端在 canvas
+    上叠红色矩形（5 秒淡出）。
+  - ``tts_alert`` — 语音提醒：模型给出 ``text`` / ``language``
+    / ``ref_speaker``，``TtsSession.start`` 触发本机播放。
+* **能力门控（双层防护）**：
+  - UI：``GET /api/video-detection/tools`` 列表里每条带
+    ``available`` / ``reason``；不可用时 checkbox 置灰、显示
+    原因。
+  - 后端：``RkaiDetector.start()`` 校验每个 ``enabled_tools``
+    的 capability (``get_registry().get_session(spec.requires_capability)``)，
+    未启用抛 503。
+* **会话级，不持久化**：用户在音视频检测页勾选的 tools 集合只
+  存在内存里 (``RkaiDetector._enabled_tools``)；重启 / 关闭页
+  面 / 停止检测都清空，不写 ``config.json``。
+* **二次推理 prompt** 在服务端拼接：``ctx.prompt + ' 本次只关注 ROI（像素坐标 ...）内的内容。'``；
+  用户只编辑第一段，第二段后端自动加。
+* **bbox 渲染**：后端把 bbox 通过 ``DetectorEvent.bbox`` 字段推到
+  WS（事件类型仍是 ``type:"event"``，仅追加字段），前端在
+  ``#vd-canvas`` 之上叠 ``<svg viewBox="0 0 1000 1000">``，
+  ``rect`` 5 秒后淡出。**不下发裁剪图**。
+* **新页面 “工具列表”**：sidebar 顺序
+  系统信息 / 系统配置 / 算力配置 / **工具列表** / 视频监控 …；
+  2 秒轮询 ``GET /api/tools``，能力启用状态变化无需手动刷新。
+
+
+## LLMSession init 子进程隔离
+
+`ComputeRegistry._run_one` 把 `LLMSession(...)` 的构造放到 **子进程**
+（`subprocess.run([sys.executable, "-c", script], ...)`）里跑，理由
+是 rknn3 的 `MODEL_SETUP` 失败 / 模型文件缺失时，rknn3 native lib
+会直接 `std::terminate()`，Python `try/except` 抓不住，整 uvicorn
+进程跟着挂（"网页卡住"症状）。
+
+子进程：
+
+* 成功 → exit 0，写 sentinel + JSON 报告到 stdout；父进程再构造一
+  份（在父进程里 consumer 要拿 LLMSession 句柄用），标
+  `status='running'`。**双倍 init 是已知代价**，避免要写 IPC。
+* 失败（Python 异常 / `BaseException` / `SIGABRT` / `SIGSEGV` /
+  timeout）→ 父进程读 stderr/stdout 拼一段原因，写到
+  `inst.error`，实例标 `status='error'`。
+
+子进程错误信息直接进 `compute` snapshot 的 `instances[].error`，
+前端算力配置页已经有 `is-error` 红框 + `<pre class="cc-model-error">`
+展示错误文本，用户能直接看到原因；UI 上 disable → enable 单条实例
+会重新触发同一路径（`DELETE /api/compute/instances` + `POST`），不
+需要重启服务。
+
