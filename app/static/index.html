@@ -10,7 +10,7 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-title">守望者系统</span>
+        <span class="brand-title">守望者系统演示</span>
         <div class="brand-meta">
           <span class="brand-subtitle">Wardner</span>
           <span class="brand-version" id="brand-version">v0.4.0</span>
@@ -21,17 +21,13 @@
       <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
       <a href="#compute-config"  data-page="compute-config"  class="nav-item">算力配置</a>
       <a href="#tools"           data-page="tools"           class="nav-item">工具列表</a>
-      <a href="#surveillance"    data-page="surveillance"    class="nav-item">视频监控</a>
-        <a href="#audio-monitor"   data-page="audio-monitor"   class="nav-item">音频监控</a>
-        <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
-        <a href="#im-bridge"       data-page="im-bridge"       class="nav-item">应用对接</a>
-        <div class="nav-group" data-group="debug">
-          <span class="nav-group-title">能力调测</span>
-          <a href="#video-detection"      data-page="video-detection"      class="nav-item">音视频检测</a>
-          <a href="#video-content-search" data-page="video-content-search" class="nav-item">视频内容检索</a>
-          <a href="#tts"                  data-page="tts"                  class="nav-item">语音生成</a>
-        </div>
-        <a href="#system-logs" data-page="system-logs" class="nav-item">系统日志</a>
+      <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
+      <a href="#im-bridge"       data-page="im-bridge"       class="nav-item">应用对接</a>
+      <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
+      <hr class="nav-divider" />
+      <a href="#video-detection"      data-page="video-detection"      class="nav-item">音视频检测</a>
+      <a href="#video-content-search" data-page="video-content-search" class="nav-item">视频内容检索</a>
+      <a href="#tts"                  data-page="tts"                  class="nav-item">语音生成</a>
       </nav>
 
       <div class="sidebar-foot">
@@ -263,41 +259,6 @@
             </div>
           </section>
 
-          <section class="bc-section bc-section-surveillance">
-            <header class="bc-section-head">
-              <h3>视频监控</h3>
-              <span class="bc-hint">16路通道配置</span>
-            </header>
-            <div class="bc-surv-toolbar">
-              <span class="bc-hint" id="bc-surv-summary">--</span>
-              <span class="vd-spacer"></span>
-              <button type="button" class="vd-btn" id="bc-surv-all-on">全部启用播放</button>
-              <button type="button" class="vd-btn" id="bc-surv-all-off">全部停用播放</button>
-            </div>
-            <div class="bc-surv-table-wrap">
-              <table class="bc-surv-table" id="bc-surv-table">
-                <thead>
-                  <tr>
-                    <th class="bc-surv-col-id">#</th>
-                    <th class="bc-surv-col-name">名称</th>
-                    <th class="bc-surv-col-source">视频源</th>
-                    <th class="bc-surv-col-prompt">检测提示词</th>
-                    <th class="bc-surv-col-size">检测尺寸</th>
-                    <th class="bc-surv-col-toggle">播放</th>
-                    <th class="bc-surv-col-toggle">检测</th>
-                  </tr>
-                </thead>
-                <tbody id="bc-surv-tbody"></tbody>
-              </table>
-            </div>
-            <div class="bc-actions">
-              <span class="vd-spacer"></span>
-              <button type="button" class="vd-btn" id="bc-surv-reload">放弃修改</button>
-              <button type="button" class="vd-btn vd-btn-primary" id="bc-surv-save">保存所有通道</button>
-            </div>
-            <div class="bc-foot" id="bc-surv-foot"></div>
-          </section>
-
           <div class="bc-actions">
             <span class="vd-spacer"></span>
             <button type="button" class="vd-btn" id="bc-reload">放弃修改</button>
@@ -322,8 +283,7 @@
           </div>
         </header>
 
-        <div class="cc-tabs" id="cc-tabs"></div>
-        <div class="cc-panels" id="cc-panels"></div>
+        <div class="cc-cols" id="cc-panels"></div>
         <div class="cc-foot" id="cc-foot"></div>
       </section>
 
@@ -348,50 +308,6 @@
           <summary>完整 JSON</summary>
           <pre class="payload" id="data-tools"></pre>
         </details>
-      </section>
-
-      <section id="page-surveillance" class="page hidden" data-page="surveillance">
-        <header class="page-header">
-          <h2>视频监控</h2>
-          <div class="header-meta">
-            <span class="collected-at" id="surveillance-status">--</span>
-            <button class="refresh-btn" id="surveillance-refresh">刷新</button>
-          </div>
-        </header>
-
-        <div id="surveillance-unavailable" class="surv-banner surv-banner-error hidden">
-          <span class="surv-banner-icon" aria-hidden="true">⚠</span>
-          <span class="surv-banner-text">
-            视频监控不可用：<span id="surveillance-unavailable-reason">--</span>
-          </span>
-        </div>
-
-        <div class="surv-toolbar">
-          <span class="surv-hint">点击任一通道放大查看；每路独立线程与 RKNN 解释器，避免相互锁干扰。</span>
-          <span class="vd-spacer"></span>
-          <button class="vd-btn" id="surveillance-reset">恢复默认</button>
-          <button class="vd-btn vd-btn-primary" id="surveillance-save-all">保存所有修改</button>
-        </div>
-
-        <div class="surv-grid" id="surveillance-grid"></div>
-
-        <details class="raw-output">
-          <summary>完整 JSON</summary>
-          <pre class="payload" id="data-surveillance"></pre>
-        </details>
-      </section>
-
-      <section id="page-audio-monitor" class="page hidden" data-page="audio-monitor">
-        <header class="page-header">
-          <h2>音频监控</h2>
-        </header>
-        <div class="page-placeholder">
-          <div class="page-placeholder-icon" aria-hidden="true">♪</div>
-          <div class="page-placeholder-title">尚未实现</div>
-          <div class="page-placeholder-text">
-            该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
-          </div>
-        </div>
       </section>
 
       <section id="page-discovery" class="page hidden" data-page="discovery">
@@ -547,122 +463,6 @@
           <pre class="payload" id="data-video-detection"></pre>
         </details>
       </section>
-
-      <div id="surv-modal" class="surv-modal hidden" role="dialog" aria-modal="true">
-        <div class="surv-modal-card">
-          <div class="surv-modal-head">
-            <div class="surv-modal-titles">
-              <span class="surv-modal-title" id="surv-modal-title">通道</span>
-              <span class="surv-modal-sub" id="surv-modal-sub">--</span>
-            </div>
-            <button class="vd-btn surv-modal-close" id="surv-modal-close" aria-label="关闭">×</button>
-          </div>
-          <div class="surv-modal-body">
-            <div class="surv-modal-stage">
-              <canvas id="surv-modal-canvas" width="1280" height="720"></canvas>
-              <div class="surv-modal-overlay" id="surv-modal-overlay"></div>
-              <div class="vd-event-badge hidden" id="surv-modal-event-badge">
-                <span class="vd-event-badge-text" id="surv-modal-event-badge-text"></span>
-              </div>
-            </div>
-
-            <aside class="surv-modal-side">
-              <form class="surv-form" id="surv-modal-form" autocomplete="off">
-                <section class="surv-form-section">
-                  <header class="surv-form-head">
-                    <h3>通道信息</h3>
-                  </header>
-                  <div class="surv-field">
-                    <label class="surv-label" for="surv-name">名称</label>
-                    <input type="text" id="surv-name" class="surv-input"
-                           placeholder="通道 1" spellcheck="false" />
-                  </div>
-                </section>
-
-                <section class="surv-form-section">
-                  <header class="surv-form-head">
-                    <h3>视频源</h3>
-                  </header>
-                  <div class="surv-field">
-                    <div class="surv-input-row">
-                      <input type="text" id="surv-source" class="surv-input"
-                             placeholder="网络流或本地文件/文件夹" spellcheck="false" />
-                      <button type="button" class="vd-btn" id="surv-browse">浏览…</button>
-                    </div>
-                  </div>
-                </section>
-
-                <section class="surv-form-section">
-                  <header class="surv-form-head">
-                    <h3>检测提示词</h3>
-                    <span class="surv-hint">用于 VLM 推理</span>
-                  </header>
-                  <div class="surv-field">
-                    <textarea id="surv-prompt" class="surv-input surv-textarea" rows="3"
-                              placeholder="例：检查画面中是否有人进入或异常情况"></textarea>
-                  </div>
-                </section>
-
-                <section class="surv-form-section">
-                  <header class="surv-form-head">
-                    <h3>检测尺寸</h3>
-                    <span class="surv-hint">VLM 推理帧大小</span>
-                  </header>
-                  <div class="surv-field">
-                    <label class="surv-input-split">
-                      <span>尺寸</span>
-                      <select id="surv-detect-size" class="surv-input">
-                        <option value="384">384x384（默认）</option>
-                        <option value="768">768x768</option>
-                      </select>
-                    </label>
-                  </div>
-                </section>
-
-                <section class="surv-form-section">
-                  <header class="surv-form-head">
-                    <h3>运行</h3>
-                    <span class="surv-hint">两个开关可独立控制</span>
-                  </header>
-                  <div class="surv-field surv-run-row">
-                    <label class="surv-toggle" title="开启后解码+编码管线会启动，画面会通过 WS 推出去">
-                      <input type="checkbox" id="surv-playback" />
-                      <span class="surv-toggle-track"><span class="surv-toggle-thumb"></span></span>
-                      <span class="surv-toggle-label" id="surv-playback-label">播放关闭</span>
-                    </label>
-                    <label class="surv-toggle" title="开启后每 N 帧调用一次 rkai 解释器（吃 NPU 资源）">
-                      <input type="checkbox" id="surv-detection" />
-                      <span class="surv-toggle-track"><span class="surv-toggle-thumb"></span></span>
-                      <span class="surv-toggle-label" id="surv-detection-label">检测关闭</span>
-                    </label>
-                    <span class="vd-spacer"></span>
-                    <span class="surv-meta" id="surv-modal-meta">--</span>
-                  </div>
-                </section>
-
-                <div class="surv-actions">
-                  <button type="button" class="vd-btn" id="surv-reload">放弃修改</button>
-                  <span class="vd-spacer"></span>
-                  <button type="submit" class="vd-btn vd-btn-primary" id="surv-save">保存</button>
-                </div>
-                <div class="surv-foot" id="surv-foot"></div>
-              </form>
-
-              <section class="surv-form-section surv-events">
-                <header class="surv-form-head">
-                  <h3>事件历史</h3>
-                  <span class="vd-spacer"></span>
-                  <span class="surv-meta" id="surv-events-count">0 条</span>
-                  <button class="vd-btn" id="surv-events-clear">清空</button>
-                </header>
-                <ol class="vd-event-list" id="surv-event-list">
-                  <li class="vd-event-empty">尚未检测到事件，启动通道后结果显示在这里。</li>
-                </ol>
-              </section>
-            </aside>
-          </div>
-        </div>
-      </div>
 
       <div id="vd-modal" class="vd-modal hidden" role="dialog" aria-modal="true">
         <div class="vd-modal-card">

@@ -15,7 +15,6 @@ from app.api import (
     config,
     coprocessor,
     power,
-    surveillance,
     system_logs,
     system_monitor,
     tools,
@@ -25,7 +24,6 @@ from app.api import (
 from app.services.compute_registry import get_registry
 from app.services.config import get_config
 from app.services.detector import get_detector
-from app.services.surveillance import get_manager as get_surveillance_manager
 from app.services.tts_session import get_session as get_tts_session
 from app.services.video_session import get_session
 
@@ -80,7 +78,6 @@ def create_app() -> FastAPI:
     app.include_router(config.router, prefix="/api")
     app.include_router(coprocessor.router, prefix="/api")
     app.include_router(tts.router, prefix="/api")
-    app.include_router(surveillance.router, prefix="/api")
     app.include_router(compute.router, prefix="/api")
     app.include_router(tools.router, prefix="/api")
 
@@ -126,13 +123,6 @@ def create_app() -> FastAPI:
         # Free the Qwen3-TTS RKNN sessions if any were built.
         try:
             get_tts_session().close()
-        except Exception:
-            pass
-        # Tear down every surveillance channel (decoder threads +
-        # per-channel RKNN sessions). Lazy: the manager only materialises
-        # RKNN sessions on first inference, so an idle board pays nothing.
-        try:
-            get_surveillance_manager().close_all()
         except Exception:
             pass
 

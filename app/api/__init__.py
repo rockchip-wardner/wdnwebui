@@ -10,7 +10,6 @@ from . import (
     config,
     coprocessor,
     power,
-    surveillance,
     system_logs,
     system_monitor,
     tools,
@@ -23,10 +22,9 @@ __all__ = [
     "config",
     "coprocessor",
     "power",
-    "surveillance",
     "system_logs",
     "system_monitor",
     "tools",
     "tts",
     "video_detection",
-]
+] 
