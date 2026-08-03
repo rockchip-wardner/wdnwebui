@@ -19,6 +19,7 @@
       <nav class="nav">
       <div class="nav-section-label">演示</div>
       <a href="#video-detection"      data-page="video-detection"      class="nav-item nav-item--demo" data-icon="▶">音视频描述</a>
+      <a href="#video-target-detection" data-page="video-target-detection" class="nav-item nav-item--demo" data-icon="◎">视频目标检测</a>
       <a href="#video-content-search" data-page="video-content-search" class="nav-item nav-item--demo" data-icon="⌕">视频内容检索</a>
       <a href="#tts"                  data-page="tts"                  class="nav-item nav-item--demo" data-icon="♪">语音生成</a>
       <hr class="nav-divider" />
@@ -347,7 +348,6 @@
               <button id="vd-play"  class="vd-btn">▶ 播放</button>
               <button id="vd-pause" class="vd-btn">⏸ 暂停</button>
               <button id="vd-stop"  class="vd-btn">⏹ 停止</button>
-              <button id="vd-replay" class="vd-btn" disabled title="从开头重新播放">↻ 重播</button>
               <span class="vd-spacer"></span>
               <span class="vd-meta" id="vd-meta">--</span>
             </div>
@@ -372,6 +372,10 @@
                   <div class="vd-actions-row">
                     <button type="button" class="vd-btn vd-btn-primary" id="vd-open">打开</button>
                     <button type="button" class="vd-btn" id="vd-close">关闭</button>
+                    <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
+                      <input type="checkbox" id="vd-loop" />
+                      <span>循环播放</span>
+                    </label>
                   </div>
                 </div>
               </section>
@@ -442,6 +446,118 @@
         <details class="raw-output">
           <summary>完整 JSON</summary>
           <pre class="payload" id="data-video-detection"></pre>
+        </details>
+      </section>
+
+      <section id="page-video-target-detection" class="page hidden" data-page="video-target-detection">
+        <header class="page-header">
+          <h2>视频目标检测</h2>
+          <button class="refresh-btn" data-refresh>刷新</button>
+        </header>
+
+        <div class="vd-layout">
+          <div class="vd-stage-col">
+            <div class="vd-stage">
+              <canvas id="vtd-canvas" width="960" height="540"></canvas>
+              <svg id="vtd-bbox-svg" class="vd-bbox-svg"
+                   viewBox="0 0 1000 1000" preserveAspectRatio="none"
+                   xmlns="http://www.w3.org/2000/svg"></svg>
+              <div class="vd-overlay" id="vtd-overlay"></div>
+              <div class="vd-event-badge hidden" id="vtd-event-badge">
+                <span class="vd-event-badge-text" id="vtd-event-badge-text"></span>
+              </div>
+            </div>
+
+            <div class="vd-controls">
+              <button id="vtd-play"  class="vd-btn">▶ 播放</button>
+              <button id="vtd-pause" class="vd-btn">⏸ 暂停</button>
+              <button id="vtd-stop"  class="vd-btn">⏹ 停止</button>
+              <span class="vd-spacer"></span>
+              <span class="vd-meta" id="vtd-meta">--</span>
+            </div>
+
+            <div class="vd-progress">
+              <div class="vd-progress-bar" id="vtd-progress"></div>
+            </div>
+          </div>
+
+          <aside class="vd-side">
+            <form class="surv-form" id="vtd-form" autocomplete="off" onsubmit="return false;">
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>视频源</h3>
+                </header>
+                <div class="surv-field">
+                  <div class="surv-input-row">
+                    <input type="text" id="vtd-source" class="surv-input"
+                           placeholder="网络流或本地文件/文件夹" spellcheck="false" />
+                    <button type="button" class="vd-btn" id="vtd-browse">浏览…</button>
+                  </div>
+                  <div class="vd-actions-row">
+                    <button type="button" class="vd-btn vd-btn-primary" id="vtd-open">打开</button>
+                    <button type="button" class="vd-btn" id="vtd-close">关闭</button>
+                    <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
+                      <input type="checkbox" id="vtd-loop" />
+                      <span>循环播放</span>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section class="surv-form-section vd-grow">
+                <header class="surv-form-head">
+                  <h3>检测提示词</h3>
+                  <span class="surv-hint" id="vtd-detector-status">未启动</span>
+                </header>
+                <div class="surv-field">
+                  <textarea id="vtd-prompt" class="surv-input surv-textarea"
+                            placeholder="例如：当画面中出现需要标注的目标时调用 annotate_roi 工具，给出 ROI 坐标"></textarea>
+                  <div class="vd-detector-row">
+                    <label class="vd-detector-label">
+                      隔
+                      <input type="number" id="vtd-every-n" min="1" max="600" step="1" value="30" />
+                      帧
+                    </label>
+                    <button type="button" class="vd-btn vd-btn-primary" id="vtd-detector-start">启动检测</button>
+                    <button type="button" class="vd-btn" id="vtd-detector-stop" disabled>停止检测</button>
+                  </div>
+                </div>
+              </section>
+
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>检测尺寸</h3>
+                  <span class="surv-hint">VLM 推理帧大小（UI 占位）</span>
+                </header>
+                <div class="surv-field">
+                  <label class="surv-input-split">
+                    <span>尺寸</span>
+                    <select id="vtd-detect-size" class="surv-input">
+                      <option value="384" selected>384×384（默认）</option>
+                      <option value="768">768×768</option>
+                    </select>
+                  </label>
+                </div>
+              </section>
+
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>工具</h3>
+                  <span class="surv-hint" id="vtd-tools-summary">未启用</span>
+                </header>
+                <div class="surv-field">
+                  <div id="vtd-tools-list" class="vd-tools-list">
+                    <div class="vd-tools-empty">加载中…</div>
+                  </div>
+                </div>
+              </section>
+            </form>
+          </aside>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-target-detection"></pre>
         </details>
       </section>
 
@@ -619,6 +735,6 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js?v=27" defer></script>
+  <script src="/static/js/app.js?v=28" defer></script>
 </body>
 </html>
