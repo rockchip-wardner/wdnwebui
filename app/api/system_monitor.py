@@ -185,6 +185,62 @@ def _parse_memory(s: str) -> tuple[float | None, float | None]:
         return None, None
 
 
+def _rkai_canonical_device_index(bus_id: str | None) -> int | None:
+    """Resolve a ``bus_id`` (PCI BDF, e.g. ``0001:11:00.0``) to its
+    enumerate-index in ``RKNN3Lite().get_devices_id()``.
+
+    rkai (and therefore 算力配置页) uses ``enumerate(get_devices_id())``
+    as the canonical ``npu_index``; ``rknn-smi info`` numbers devices by
+    its own internal order, which doesn't always match. This helper
+    bridges the two so 系统信息 / 算力卡信息 and 算力配置 label the same
+    physical card with the same ``#K``. Returns ``None`` when rkai is
+    unavailable (non-RK dev box) or ``bus_id`` is missing/unmatched —
+    callers fall back to the rknn-smi native idx in that case.
+    """
+    if not bus_id:
+        return None
+    try:
+        from rknn3lite.api import RKNN3Lite
+        ids = RKNN3Lite().get_devices_id()
+    except Exception:
+        return None
+    for i, x in enumerate(ids):
+        raw = x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8")
+        if raw.decode("utf-8", errors="replace") == bus_id:
+            return i
+    return None
+
+
+def _align_npu_indices(devices: list[dict]) -> list[dict]:
+    """Re-index each rknn-smi row to the rkai-canonical ``npu_index``.
+
+    Sorts the returned list by the canonical index (rknn-smi-only
+    orphans come last, in their original order) so the UI sees
+    ``#0, #1, #2, ...`` in the same order the 算力配置 page does. The
+    rknn-smi native idx is preserved as ``rknn_smi_idx`` for debugging.
+    Orphans (cards rkai can't see, e.g. rknn-smi mis-scan) get a
+    negative ``index`` and an ``orphan=True`` flag so they render
+    after the canonical rows without colliding on the same ``#N``.
+    """
+    aligned: list[tuple[int, int, int, dict]] = []
+    for smi_order, dev in enumerate(devices):
+        canonical = _rkai_canonical_device_index(dev.get("bus_id"))
+        if canonical is None:
+            dev["rknn_smi_idx"] = dev.get("index")
+            dev["index"] = -(smi_order + 1)
+            dev["orphan"] = True
+            key = (1, 0, smi_order, dev)
+            aligned.append(key)
+            continue
+        dev["rknn_smi_idx"] = dev.get("index")
+        dev["index"] = canonical
+        dev.pop("orphan", None)
+        key = (0, canonical, smi_order, dev)
+        aligned.append(key)
+    aligned.sort(key=lambda t: (t[0], t[1], t[2]))
+    return [t[3] for t in aligned]
+
+
 async def _collect_npu() -> dict:
     if shutil.which(_RKNNSMI_BIN) is None:
         return {
@@ -205,10 +261,11 @@ async def _collect_npu() -> dict:
             "raw_output": stdout,
             "stderr": stderr,
         }
+    devices = _align_npu_indices(_parse_rknn_smi_table(stdout))
     return {
         "available": True,
         "source": _RKNNSMI_BIN,
-        "devices": _parse_rknn_smi_table(stdout),
+        "devices": devices,
         "raw_output": stdout,
         "stderr": stderr,
     }

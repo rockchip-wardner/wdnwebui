@@ -61,17 +61,27 @@ def _qwen3_asr_spec():
 
 # 每个 model 的 ``estimated_init_seconds`` 是经验值，用来渲染"加载中"倒计时
 # 的初始起点；loading 段倒计时按 (estimate - (now - started_at)) 实算，estimate
-# 只影响倒计时的**起点**。实测（dev box，无 PyTorch；真机会更快）：
-#   * Qwen3-VL-4B: ~28-32s（2.32 GB LLM + 740 MB embed + 230 MB vision 加载）
-#   * Qwen3-TTS:   ~4-6s（4 个小 rknn + embed tables，加起来 ~1.9 GB）
-#   * Qwen3-ASR:   估 ~10s（未实测；按编码器+LLM 推算）
+# 只影响倒计时的**起点**。真机冷启动实测（page cache dropped 之后）：
+#   * Qwen3-VL-4B: 57s → +3s buffer → 60s
+#   * Qwen3-TTS:   改 rkai 加上 ensure_loaded() 后变成 eager init：
+#                  - load_resources:  ~4s
+#                  - init_text_projection: ~0.4s
+#                  - init_speech_decoder:  ~2s
+#                  - init_code_predictor:  ~1.6s
+#                  - init_talker (785MB weight + 24MB rknn, 8-core AR): dev box
+#                    init_talker 直接 MODEL_SETUP fail，没法在 dev box 测真机
+#                    时延；真机用户体感"首次等非常久"，按 VL-4B 同档拍 60s
+#                    + buffer → 60s（无真机实测，等你测完再调）
+#   * Qwen3-ASR:   未实测（模型文件不在板上），按编码器+LLM 推算 ~15s + 10s buffer → 25s
+# 取"最冷"加载时间（即用户首次加载，不是文件页缓存命中后的二次加载）+ 小 buffer，
+# 保证倒计时结束时实际加载大概率已就绪，避免 UI 卡很久才更新。
 MODEL_PRESETS: dict[str, dict] = {
     "qwen3-vl-4b": {
         "label":            "Qwen3-VL-4B",
         "preset_factory":   _qwen3_vl_4b_spec,
         "model_dir_name":   "Qwen3-VL-4B",
         "memory_estimate_mb": 3500,
-        "estimated_init_seconds": 30,
+        "estimated_init_seconds": 60,
         "capability_types": ["video_query", "video_describe"],
         "instance_name":    "llm-vl",
     },
@@ -80,7 +90,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "preset_factory":   _qwen3_tts_spec,
         "model_dir_name":   "Qwen3-TTS",
         "memory_estimate_mb": 1900,
-        "estimated_init_seconds": 6,
+        "estimated_init_seconds": 30,
         "capability_types": ["audio_output"],
         "instance_name":    "llm-tts",
     },
@@ -89,7 +99,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "preset_factory":   _qwen3_asr_spec,
         "model_dir_name":   "Qwen3-ASR",
         "memory_estimate_mb": 2500,
-        "estimated_init_seconds": 10,
+        "estimated_init_seconds": 25,
         "capability_types": ["audio_query", "audio_analyse"],
         "instance_name":    "llm-asr",
     },
@@ -521,7 +531,7 @@ _INIT_SENTINEL = b"__PYRKAIWEB_INIT_DONE__"
 
 
 def _init_session_subprocess(
-    npu_index: int, model_id: str, *, timeout: float = 180.0,
+    npu_index: int, model_id: str, *, timeout: float = 600.0,
 ) -> Tuple[bool, str, float]:
     """在子进程里尝试构造一次 LLMSession。
 
