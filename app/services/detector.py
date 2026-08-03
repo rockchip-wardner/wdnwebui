@@ -411,11 +411,30 @@ class RkaiDetector:
             # ``@Callable`` 工具的优先级高于 ``VLMDoc`` 结构化输出 —— 即
             # 模型可以选其中之一。``isinstance`` 区分，匹配示例
             # ``function_call.py`` 的写法。
+            from app.services.tools.annotate_roi import AnnotateROI
             from app.services.tools.tts_alert import TtsAlert
 
             h, w = frame_bgr.shape[:2]
             from app.services.tools.registry import ToolContext
             ctx = ToolContext(width=w, height=h, prompt=prompt)
+
+            if isinstance(result, AnnotateROI):
+                try:
+                    side = result(frame_bgr, ctx)
+                    bbox = side.get("bbox")
+                except Exception as e:  # noqa: BLE001
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text=f"(目标标注失败: {e})", level="error",
+                        attachment_count=0, tool_call="annotate_roi",
+                    )
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text="目标标注",
+                    level=None, attachment_count=0,
+                    tool_call="annotate_roi",
+                    bbox=bbox if not side.get("invalid") else None,
+                )
 
             if isinstance(result, TtsAlert):
                 try:
@@ -491,12 +510,25 @@ class RkaiDetector:
 
 
 _detector: Optional[RkaiDetector] = None
+_target_detector: Optional[RkaiDetector] = None
 _detector_lock = threading.Lock()
 
 
 def get_detector() -> RkaiDetector:
+    """音视频描述页（tts_alert）后端 detector 单例。"""
     global _detector
     with _detector_lock:
         if _detector is None:
             _detector = RkaiDetector()
         return _detector
+
+
+def get_target_detector() -> RkaiDetector:
+    """视频目标检测页（annotate_roi）后端 detector 单例 — 与音视频描述共用
+    ``RkaiDetector`` 类，但状态独立（prompt / enabled_tools / 事件历史各自维护）；
+    frame sink 共享同一个 ``VideoSession`` 的解码流。"""
+    global _target_detector
+    with _detector_lock:
+        if _target_detector is None:
+            _target_detector = RkaiDetector()
+        return _target_detector

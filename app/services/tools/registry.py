@@ -120,9 +120,21 @@ def get_tool_registry() -> ToolRegistry:
     global _registry
     with _registry_lock:
         if _registry is None:
+            from .annotate_roi import AnnotateROI
             from .tts_alert import TtsAlert
 
             reg = ToolRegistry()
+            reg.register(
+                key="annotate_roi",
+                name="目标标注",
+                description=(
+                    "目标标注工具：当画面中检测到需要标注的目标，"
+                    "给出 ROI 坐标，前端会在视频画布上以红色矩形框出，"
+                    "5 秒后淡出。"
+                ),
+                requires_capability=None,
+                tool_class=AnnotateROI,
+            )
             reg.register(
                 key="tts_alert",
                 name="语音提醒",

@@ -20,10 +20,11 @@ from app.api import (
     tools,
     tts,
     video_detection,
+    video_target_detection,
 )
 from app.services.compute_registry import get_registry
 from app.services.config import get_config
-from app.services.detector import get_detector
+from app.services.detector import get_detector, get_target_detector
 from app.services.tts_session import get_session as get_tts_session
 from app.services.video_session import get_session
 
@@ -80,6 +81,7 @@ def create_app() -> FastAPI:
     app.include_router(tts.router, prefix="/api")
     app.include_router(compute.router, prefix="/api")
     app.include_router(tools.router, prefix="/api")
+    app.include_router(video_target_detection.router, prefix="/api")
 
     # 暂时关闭：boot 时**不**自动加载 config.json["compute"]["instances"]
     # 里的实例 —— 用户必须从算力配置页手动启用。Worker 线程在第一次
@@ -92,6 +94,13 @@ def create_app() -> FastAPI:
     # decoded BGR frame is offered to it (it picks the Nth one).
     get_session().add_frame_sink(
         lambda frame, frame_pos: get_detector().submit_frame(
+            frame, frame_pos
+        )
+    )
+    # Same for the video-target-detection page — second detector
+    # instance with its own prompt / history.
+    get_session().add_frame_sink(
+        lambda frame, frame_pos: get_target_detector().submit_frame(
             frame, frame_pos
         )
     )
@@ -118,6 +127,10 @@ def create_app() -> FastAPI:
         # Free the RKNN session handle if one was ever built.
         try:
             get_detector().close()
+        except Exception:
+            pass
+        try:
+            get_target_detector().close()
         except Exception:
             pass
         # Free the Qwen3-TTS RKNN sessions if any were built.

@@ -25,6 +25,10 @@ from app.services.config import get_config
 
 router = APIRouter(tags=["video-detection"])
 
+# 音视频描述页只允许「语音提醒」工具。其他工具即便注册表里有也不
+# 在这里暴露 —— 该页面是面向「描述+提醒」场景的固定工具集。
+ALLOWED_TOOLS = ("tts_alert",)
+
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "services" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -220,8 +224,9 @@ async def open_source(payload: dict) -> dict:
     source = (payload or {}).get("source")
     if not source or not isinstance(source, str):
         raise HTTPException(status_code=400, detail="source required")
+    loop = bool((payload or {}).get("loop", False))
     try:
-        return get_session().open(source)
+        return get_session().open(source, loop=loop)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -272,6 +277,9 @@ async def set_prompt(payload: dict) -> dict:
     enabled_tools = payload.get("enabled_tools") or []
     if not isinstance(enabled_tools, list):
         raise HTTPException(status_code=400, detail="enabled_tools 必须是列表")
+    # 后端兜底：仅允许白名单内的工具，丢弃其他项。前端 UI 已经按
+    # ``ALLOWED_TOOLS`` 过滤；这里再卡一层避免直接 curl 越权。
+    enabled_tools = [k for k in enabled_tools if k in ALLOWED_TOOLS]
     try:
         return get_detector().start(prompt, every_n=every_n, enabled_tools=enabled_tools)
     except ValueError as e:
@@ -286,6 +294,8 @@ async def list_tools() -> dict:
 
     每条记录包含 ``key`` / ``name`` / ``description`` /
     ``requires_capability`` / ``available`` / ``reason`` / ``fields``。
+    该页只暴露 ``ALLOWED_TOOLS`` 集合里的工具（语音提醒）；其他工具
+    注册在 ``app.services.tools.registry`` 里但不在这里展示。
     """
     from app.services.compute_registry import get_registry
     from app.services.tools import get_tool_registry
@@ -293,6 +303,8 @@ async def list_tools() -> dict:
     reg = get_tool_registry()
     out = []
     for spec in reg.list_specs():
+        if spec.key not in ALLOWED_TOOLS:
+            continue
         available = True
         reason = ""
         if spec.requires_capability:

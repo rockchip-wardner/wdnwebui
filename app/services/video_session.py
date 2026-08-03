@@ -57,6 +57,7 @@ class VideoSession:
         self._fps = 0.0
         self._frame_pos = 0
         self._last_frame_ts = 0.0
+        self._loop = False
         # Per-frame sinks (e.g. the rkai detector). Notified on each
         # decoded BGR frame; called from the decode thread so sinks must
         # be cheap or marshal work elsewhere themselves.
@@ -74,11 +75,19 @@ class VideoSession:
                 "fps": self._fps,
                 "frame_pos": self._frame_pos,
                 "is_live": self._is_live,
+                "loop": self._loop,
                 "last_frame_ts": self._last_frame_ts,
             }
 
-    def open(self, source: str, timeout: float = 10.0) -> dict:
-        """Tear down any active source and open a new one."""
+    def open(self, source: str, timeout: float = 10.0, loop: bool = False) -> dict:
+        """Tear down any active source and open a new one.
+
+        ``loop``: when True the decode thread restarts the same source on
+        EOF instead of emitting EOF and dying — useful for replaying
+        short demo clips without the user clicking 重播. Live sources
+        (rtsp/rtmp/http/device nodes) are unaffected since they don't
+        EOF.
+        """
         if _RkvVideoCapture is None:
             with self._lock:
                 self._state = self.STATE_ERROR
@@ -96,6 +105,7 @@ class VideoSession:
             self._is_live = (
                 "://" in source or source.startswith("/dev/video")
             )
+            self._loop = bool(loop)
             self._frame_pos = 0
             self._last_frame_ts = 0.0
             self._width = 0
@@ -267,10 +277,15 @@ class VideoSession:
                 break
 
     def _decode_loop(self) -> None:
-        with self._lock:
-            cap = self._cap
-        if cap is None:
-            return
+        """Read frames until the source is exhausted or the user stops.
+
+        Owns a local ``cap`` reference so the EOF + loop path can
+        release the old capture and reopen the same source without
+        going through ``open()`` (which would try to join the thread
+        we're currently running on).
+        """
+        cap: Optional[object] = None
+        OPEN_TIMEOUT = 10.0
         while True:
             # Block here whenever _play_event is clear (paused).
             # Returns immediately when play() lifts the event, so resume
@@ -278,30 +293,78 @@ class VideoSession:
             # Timeout just lets us recheck _stop_event during long pauses.
             self._play_event.wait(timeout=0.5)
             if self._stop_event.is_set():
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
                 return
             if not self._play_event.is_set():
                 continue
+
+            # (Re-)open the capture if we don't have one yet — either
+            # fresh start, or we just looped back after EOF.
+            if cap is None:
+                with self._lock:
+                    source = self._source
+                if not source:
+                    return
+                try:
+                    new_cap = _RkvVideoCapture(source, timeout=OPEN_TIMEOUT)
+                except Exception as e:
+                    self._fail(f"打开失败: {e}")
+                    return
+                if not new_cap.isOpened():
+                    try:
+                        new_cap.release()
+                    except Exception:
+                        pass
+                    self._fail("VideoCapture.isOpened() = False")
+                    return
+                cap = new_cap
+                with self._lock:
+                    self._cap = cap
+                    self._width = cap.width
+                    self._height = cap.height
+                    self._fps = float(getattr(cap, "fps", 0.0) or 0.0)
+                    self._frame_pos = 0
+                    self._state = self.STATE_PLAYING
+                continue
+
             try:
                 ret, frame = cap.read()
             except Exception as e:  # pragma: no cover - depends on source
                 self._fail(f"read() 异常: {e}")
                 return
+
             if not ret or frame is None:
+                # EOF. Decide whether to loop or to die and notify.
                 with self._lock:
-                    # EOF regardless of whether we were paused — file
-                    # finished during the previous frame's read. Without
-                    # this, state would stay stuck at PAUSED with a dead
-                    # thread, and play() couldn't recover.
                     if self._state in (
                         self.STATE_PLAYING,
                         self.STATE_PAUSED,
                     ):
                         self._state = self.STATE_EOF
+                    should_loop = self._loop
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = None
+                with self._lock:
+                    self._cap = None
+                if should_loop:
+                    # Reset frame counter; next iteration reopens the cap.
+                    with self._lock:
+                        self._frame_pos = 0
+                        self._state = self.STATE_PLAYING
+                    continue
                 try:
                     self._frame_queue.put_nowait(self._EOF)
                 except queue.Full:
                     pass
                 return
+
             ok, buf = cv2.imencode(
                 ".jpg",
                 frame,

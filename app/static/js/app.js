@@ -369,6 +369,35 @@ async function drawVdFrame(jpgBytes) {
   ctx.drawImage(img, 0, 0);
 }
 
+/* Draw a red bbox overlay (5s fade) on the page whose SVG element
+ * matches the given id. Each page (vd / vtd) keeps its own SVG; if
+ * the requested id is missing, the call is a no-op so the same hook
+ * can be reused from both pages' WS handlers.
+ */
+function pushVdBbox(svgId, bbox, toolKey) {
+  const svg = document.getElementById(svgId);
+  if (!svg || !Array.isArray(bbox) || bbox.length !== 4) return;
+  const [x1, y1, x2, y2] = bbox.map((v) => Number(v));
+  if (![x1, y1, x2, y2].every((v) => Number.isFinite(v))) return;
+  const ns = "http://www.w3.org/2000/svg";
+  const rect = document.createElementNS(ns, "rect");
+  const x = Math.max(0, Math.min(1000, Math.min(x1, x2)));
+  const y = Math.max(0, Math.min(1000, Math.min(y1, y2)));
+  const w = Math.max(0, Math.abs(x2 - x1));
+  const h = Math.max(0, Math.abs(y2 - y1));
+  rect.setAttribute("x", x);
+  rect.setAttribute("y", y);
+  rect.setAttribute("width", w);
+  rect.setAttribute("height", h);
+  rect.setAttribute("rx", 8);
+  rect.setAttribute("class", "vd-bbox-rect");
+  if (toolKey) rect.setAttribute("data-tool", toolKey);
+  svg.appendChild(rect);
+  setTimeout(() => {
+    try { rect.remove(); } catch (_) { /* already gone */ }
+  }, 5200);
+}
+
 function connectVdWs() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${proto}//${location.host}${API_PREFIX}/video-detection/ws`;
@@ -391,6 +420,9 @@ function connectVdWs() {
       } else if (snap.type === "event") {
         addVdEvent(snap);
         showVdEventBadge(snap);
+        if (Array.isArray(snap.bbox) && snap.tool_call === "annotate_roi") {
+          pushVdBbox("vd-bbox-svg", snap.bbox, snap.tool_call);
+        }
         return;
       } else if (snap.type === "status" && snap.detector) {
         updateVdDetectorStatus(snap.detector);
@@ -450,6 +482,8 @@ async function vdStatus() {
   setVdMeta(snap);
   setVdProgress(snap);
   refreshVdButtons(snap.state);
+  const loopEl = document.getElementById("vd-loop");
+  if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
   document.getElementById("data-video-detection").textContent =
     JSON.stringify(snap, null, 2);
   return snap;
@@ -908,19 +942,13 @@ function initVideoDetection() {
   window.__vdInit = true;
 
   const sourceEl = document.getElementById("vd-source");
+  const loopEl   = document.getElementById("vd-loop");
   const openBtn = document.getElementById("vd-open");
   const closeBtn = document.getElementById("vd-close");
   const browseBtn = document.getElementById("vd-browse");
   const playBtn = document.getElementById("vd-play");
   const pauseBtn = document.getElementById("vd-pause");
   const stopBtn = document.getElementById("vd-stop");
-  const replayBtn = document.getElementById("vd-replay");
-
-  function refreshReplayBtn() {
-    replayBtn.disabled = !(sourceEl.value || "").trim();
-  }
-  sourceEl.addEventListener("input", refreshReplayBtn);
-  refreshReplayBtn();
 
   sourceEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter") openBtn.click();
@@ -935,9 +963,10 @@ function initVideoDetection() {
     openBtn.disabled = true;
     setVdOverlay("正在打开 " + src + " …", false);
     try {
-      const snap = await vdOpen({ source: src });
+      const snap = await vdOpen({ source: src, loop: !!(loopEl && loopEl.checked) });
       setVdMeta(snap);
       setVdProgress(snap);
+      if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
     } catch (e) {
       setVdOverlay("打开失败: " + e.message, true);
     } finally {
@@ -1003,24 +1032,6 @@ function initVideoDetection() {
       setVdOverlay("停止失败: " + e.message, true);
     }
   });
-  replayBtn.addEventListener("click", async () => {
-    const src = (sourceEl.value || "").trim();
-    if (!src) {
-      setVdOverlay("请先输入视频源", true);
-      return;
-    }
-    replayBtn.disabled = true;
-    setVdOverlay("正在重播 " + src + " …", false);
-    try {
-      const snap = await vdOpen({ source: src });
-      setVdMeta(snap);
-      setVdProgress(snap);
-    } catch (e) {
-      setVdOverlay("重播失败: " + e.message, true);
-    } finally {
-      refreshReplayBtn();
-    }
-  });
 
   // --- detection control buttons ---
   const detStartBtn = document.getElementById("vd-detector-start");
@@ -1035,6 +1046,510 @@ function initVideoDetection() {
   vdLoadTools();
 
   if (!VD.ws && !VD.wsTimer) connectVdWs();
+}
+
+/* ------------------------------------------------------------------ *
+ * 视频目标检测 (Video Target Detection) — annotate_roi                *
+ * ------------------------------------------------------------------ *
+ * 与音视频描述页 (`VD`) 结构一致；区别：                               *
+ *   - API 前缀 `/api/video-target-detection/*`                         *
+ *   - 工具固定为 `annotate_roi`（前端不暴露工具选择）                   *
+ *   - canvas 之上叠 `#vtd-bbox-svg`，annotate_roi 返回 bbox 时画红框  *
+ *   - 后端 detector 实例独立 (`get_target_detector()`)，与描述页互不干扰 *
+ * ------------------------------------------------------------------ */
+const VTD = {
+  ws: null,
+  wsRetry: 0,
+  wsTimer: null,
+  blobUrl: null,
+  tools: [],
+  enabledTools: [],
+};
+const VTDDetector = {
+  events: [],
+  refresh() { return refreshVtdDetector(); },
+};
+
+function setVtdOverlay(text, isError) {
+  const el = document.getElementById("vtd-overlay");
+  if (!el) return;
+  el.textContent = text || "";
+  el.classList.toggle("error", !!isError);
+  el.style.display = text ? "" : "none";
+}
+
+function setVtdMeta(snap) {
+  const el = document.getElementById("vtd-meta");
+  if (!el) return;
+  const parts = [];
+  if (snap.width && snap.height) parts.push(snap.width + "x" + snap.height);
+  if (snap.fps) parts.push(fmtNum(snap.fps, 2) + " fps");
+  if (snap.frame_pos != null) parts.push("帧 " + snap.frame_pos);
+  if (snap.is_live) parts.push("LIVE");
+  if (snap.state) parts.push("[" + snap.state + "]");
+  el.textContent = parts.join(" · ") || "--";
+}
+
+function setVtdProgress(snap) {
+  const el = document.getElementById("vtd-progress");
+  if (!el) return;
+  el.classList.toggle("live", !!snap.is_live);
+  el.style.width = snap.is_live ? "100%" : "0%";
+}
+
+async function drawVtdFrame(jpgBytes) {
+  const canvas = document.getElementById("vtd-canvas");
+  if (!canvas || !jpgBytes || !jpgBytes.byteLength) return;
+  const blob = new Blob([jpgBytes], { type: "image/jpeg" });
+  if (VTD.blobUrl) URL.revokeObjectURL(VTD.blobUrl);
+  VTD.blobUrl = URL.createObjectURL(blob);
+  const img = new Image();
+  await new Promise((resolve, reject) => {
+    img.onload = resolve;
+    img.onerror = reject;
+    img.src = VTD.blobUrl;
+  });
+  const ctx = canvas.getContext("2d");
+  canvas.width = img.naturalWidth || canvas.width;
+  canvas.height = img.naturalHeight || canvas.height;
+  ctx.drawImage(img, 0, 0);
+}
+
+function connectVtdWs() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${proto}//${location.host}${API_PREFIX}/video-target-detection/ws`;
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  VTD.ws = ws;
+
+  ws.onopen = () => {
+    VTD.wsRetry = 0;
+    setVtdOverlay("", false);
+  };
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data === "string") {
+      let snap;
+      try { snap = JSON.parse(ev.data); } catch (_) { return; }
+      if (snap.type === "eof") {
+        setVtdOverlay("文件已结束 (EOF)，点 播放 可恢复", true);
+      } else if (snap.type === "error") {
+        setVtdOverlay("WS 错误: " + (snap.detail || ""), true);
+      } else if (snap.type === "event") {
+        addVtdEvent(snap);
+        showVtdEventBadge(snap);
+        if (Array.isArray(snap.bbox) && snap.tool_call === "annotate_roi") {
+          pushVdBbox("vtd-bbox-svg", snap.bbox, snap.tool_call);
+        }
+        return;
+      } else if (snap.type === "status" && snap.detector) {
+        updateVtdDetectorStatus(snap.detector);
+      }
+      setVtdMeta(snap);
+      setVtdProgress(snap);
+      refreshVtdButtons(snap.state);
+      const payload = document.getElementById("data-video-target-detection");
+      if (payload) payload.textContent = JSON.stringify(snap, null, 2);
+      return;
+    }
+    try {
+      await drawVtdFrame(new Uint8Array(ev.data));
+      setVtdOverlay("", false);
+    } catch (e) {
+      setVtdOverlay("帧渲染失败: " + e, true);
+    }
+  };
+  ws.onclose = () => {
+    VTD.ws = null;
+    const wait = Math.min(5000, 500 * Math.pow(2, VTD.wsRetry++));
+    VTD.wsTimer = setTimeout(connectVtdWs, wait);
+  };
+  ws.onerror = () => {
+    try { ws.close(); } catch (_) {}
+  };
+}
+
+async function vtdOpen(payload) {
+  const r = await fetch(API_PREFIX + "/video-target-detection/open", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => "");
+    throw new Error("HTTP " + r.status + " " + detail);
+  }
+  return r.json();
+}
+async function vtdAction(action) {
+  const r = await fetch(API_PREFIX + "/video-target-detection/control", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action }),
+  });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+async function vtdStatus() {
+  const r = await fetch(API_PREFIX + "/video-target-detection", { cache: "no-store" });
+  if (!r.ok) return null;
+  const snap = await r.json();
+  setVtdMeta(snap);
+  setVtdProgress(snap);
+  refreshVtdButtons(snap.state);
+  const loopEl = document.getElementById("vtd-loop");
+  if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
+  const payload = document.getElementById("data-video-target-detection");
+  if (payload) payload.textContent = JSON.stringify(snap, null, 2);
+  return snap;
+}
+async function vtdClose() {
+  const r = await fetch(API_PREFIX + "/video-target-detection/close", { method: "POST" });
+  return r.ok ? r.json() : null;
+}
+function refreshVtdButtons(state) {
+  const playBtn = document.getElementById("vtd-play");
+  const pauseBtn = document.getElementById("vtd-pause");
+  const stopBtn = document.getElementById("vtd-stop");
+  if (!playBtn || !pauseBtn || !stopBtn) return;
+  const active = state === "playing" || state === "paused" || state === "eof";
+  stopBtn.disabled = !active;
+  if (state === "playing") {
+    playBtn.disabled = true;
+    pauseBtn.disabled = false;
+  } else if (state === "paused") {
+    playBtn.disabled = false;
+    pauseBtn.disabled = true;
+  } else {
+    playBtn.disabled = !active;
+    pauseBtn.disabled = !active;
+  }
+}
+
+function addVtdEvent(ev) {
+  VTDDetector.events.unshift(ev);
+  if (VTDDetector.events.length > 200) VTDDetector.events.length = 200;
+  renderVtdEventList();
+}
+function renderVtdEventList() {
+  const list = document.getElementById("vtd-event-list");
+  const count = document.getElementById("vtd-events-count");
+  if (!list || !count) return;
+  count.textContent = VTDDetector.events.length + " 条";
+  if (VTDDetector.events.length === 0) {
+    list.innerHTML =
+      '<li class="vd-event-empty">尚未检测到目标，启动检测后结果显示在这里。</li>';
+    return;
+  }
+  list.innerHTML = "";
+  VTDDetector.events.forEach((ev, idx) => {
+    const li = document.createElement("li");
+    li.className = "vd-event" + (idx === 0 ? " latest" : "");
+    const meta = document.createElement("div");
+    meta.className = "vd-event-meta";
+    const tsSpan = document.createElement("span");
+    tsSpan.textContent = fmtEventTime(ev.ts);
+    const fpSpan = document.createElement("span");
+    fpSpan.textContent = "帧 " + (ev.frame_pos ?? "?");
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = "#" + ev.id;
+    meta.appendChild(tsSpan);
+    meta.appendChild(fpSpan);
+    meta.appendChild(tag);
+    const text = document.createElement("div");
+    text.className = "vd-event-text";
+    text.textContent = ev.text || "(空)";
+    li.appendChild(meta);
+    li.appendChild(text);
+    list.appendChild(li);
+  });
+}
+let vtdBadgeHideTimer = null;
+function showVtdEventBadge(ev) {
+  const badge = document.getElementById("vtd-event-badge");
+  const text = document.getElementById("vtd-event-badge-text");
+  if (!badge || !text) return;
+  text.textContent = ev.text || "(空)";
+  badge.classList.remove("hidden");
+  badge.style.animation = "none";
+  badge.offsetHeight;
+  badge.style.animation = "";
+  if (vtdBadgeHideTimer) clearTimeout(vtdBadgeHideTimer);
+  vtdBadgeHideTimer = setTimeout(() => badge.classList.add("hidden"), 6000);
+}
+function updateVtdDetectorStatus(snap) {
+  const statusEl = document.getElementById("vtd-detector-status");
+  const startBtn = document.getElementById("vtd-detector-start");
+  const stopBtn  = document.getElementById("vtd-detector-stop");
+  if (!snap || !statusEl) return;
+  if (!snap.available) {
+    statusEl.textContent = "不可用: " + (snap.init_error || "rkai 未安装");
+  } else if (snap.init_error) {
+    statusEl.textContent = "模型加载失败: " + snap.init_error;
+  } else if (snap.enabled && snap.session_ready) {
+    statusEl.textContent =
+      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size} · 目标标注`;
+  } else if (snap.enabled) {
+    statusEl.textContent =
+      `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
+  } else if (snap.session_ready) {
+    statusEl.textContent = `已加载 (${snap.model})`;
+  } else {
+    statusEl.textContent = "已安装但未启动";
+  }
+  if (startBtn) startBtn.disabled = !snap.available || !!snap.enabled;
+  if (stopBtn)  stopBtn.disabled  = !snap.enabled;
+}
+async function refreshVtdDetector() {
+  try {
+    const r = await fetch(API_PREFIX + "/video-target-detection/events");
+    if (!r.ok) return null;
+    const data = await r.json();
+    updateVtdDetectorStatus(data.snapshot || {});
+    if (VTDDetector.events.length === 0 && Array.isArray(data.events)) {
+      VTDDetector.events = data.events.slice();
+      renderVtdEventList();
+    }
+    return data;
+  } catch (_) { return null; }
+}
+async function vtdDetectorStart() {
+  const promptEl = document.getElementById("vtd-prompt");
+  const everyEl  = document.getElementById("vtd-every-n");
+  const prompt = (promptEl?.value || "").trim();
+  const every_n = parseInt(everyEl?.value || "30", 10);
+  if (!prompt) {
+    setVtdOverlay("请先填写检测提示词", true);
+    return;
+  }
+  const enabled_tools = vtdCollectEnabledTools();
+  try {
+    const r = await fetch(API_PREFIX + "/video-target-detection/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, every_n, enabled_tools }),
+    });
+    if (!r.ok) {
+      const detail = await r.text().catch(() => "");
+      setVtdOverlay("启动检测失败: " + detail, true);
+      return;
+    }
+    const snap = await r.json();
+    updateVtdDetectorStatus(snap);
+    setVtdOverlay("", false);
+  } catch (e) {
+    setVtdOverlay("启动检测失败: " + e.message, true);
+  }
+}
+async function vtdDetectorStop() {
+  try {
+    const r = await fetch(API_PREFIX + "/video-target-detection/prompt/stop", { method: "POST" });
+    if (r.ok) updateVtdDetectorStatus(await r.json());
+  } catch (e) {
+    setVtdOverlay("停止检测失败: " + e.message, true);
+  }
+}
+async function vtdEventsClear() {
+  try {
+    await fetch(API_PREFIX + "/video-target-detection/events/clear", { method: "POST" });
+    VTDDetector.events = [];
+    renderVtdEventList();
+  } catch (_) {}
+}
+
+function vtdCollectEnabledTools() {
+  const root = document.getElementById("vtd-tools-list");
+  if (!root) return [];
+  const out = [];
+  root.querySelectorAll("input[type=checkbox][data-tool-key]").forEach((el) => {
+    if (el.checked && !el.disabled) out.push(el.dataset.toolKey);
+  });
+  return out;
+}
+
+async function vtdLoadTools() {
+  const root = document.getElementById("vtd-tools-list");
+  const summary = document.getElementById("vtd-tools-summary");
+  if (!root) return;
+  let data = { tools: [] };
+  try {
+    const r = await fetch(API_PREFIX + "/video-target-detection/tools");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    data = await r.json();
+  } catch (e) {
+    root.innerHTML = `<div class="vd-tools-empty">加载失败: ${e.message}</div>`;
+    if (summary) summary.textContent = "加载失败";
+    return;
+  }
+  VTD.tools = data.tools || [];
+  renderVtdTools();
+}
+
+function renderVtdTools() {
+  const root = document.getElementById("vtd-tools-list");
+  const summary = document.getElementById("vtd-tools-summary");
+  if (!root) return;
+  const tools = VTD.tools || [];
+  if (!tools.length) {
+    root.innerHTML = `<div class="vd-tools-empty">当前无工具</div>`;
+    if (summary) summary.textContent = "0 个工具";
+    return;
+  }
+  root.innerHTML = "";
+  tools.forEach((t) => {
+    const card = document.createElement("label");
+    card.className = "vd-tool-card" + (t.available ? "" : " is-disabled");
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.dataset.toolKey = t.key;
+    check.disabled = !t.available;
+    if (VTD.enabledTools.includes(t.key)) check.checked = true;
+    check.addEventListener("change", () => {
+      if (check.checked) {
+        if (!VTD.enabledTools.includes(t.key)) VTD.enabledTools.push(t.key);
+      } else {
+        VTD.enabledTools = VTD.enabledTools.filter((k) => k !== t.key);
+      }
+      updateVtdToolsSummary();
+    });
+    const body = document.createElement("div");
+    body.className = "vd-tool-card-body";
+    const title = document.createElement("div");
+    title.className = "vd-tool-card-title";
+    const name = document.createElement("span");
+    name.className = "vd-tool-card-name";
+    name.textContent = t.name;
+    const key = document.createElement("span");
+    key.className = "vd-tool-card-key";
+    key.textContent = t.key;
+    title.appendChild(name);
+    title.appendChild(key);
+    const desc = document.createElement("div");
+    desc.className = "vd-tool-card-desc";
+    desc.textContent = t.description;
+    body.appendChild(title);
+    body.appendChild(desc);
+    if (t.requires_capability) {
+      const dep = document.createElement("div");
+      dep.className = "vd-tool-card-dep " + (t.available ? "is-ok" : "is-bad");
+      dep.textContent = t.available
+        ? `依赖 ${t.requires_capability} · ✓ 可用`
+        : `依赖 ${t.requires_capability} · ⚠ ${t.reason || "未启用"}`;
+      body.appendChild(dep);
+    }
+    card.appendChild(check);
+    card.appendChild(body);
+    card.addEventListener("click", (ev) => {
+      if (ev.target.tagName === "INPUT") return;
+      if (check.disabled) return;
+      check.checked = !check.checked;
+      check.dispatchEvent(new Event("change"));
+    });
+    root.appendChild(card);
+  });
+  updateVtdToolsSummary();
+}
+
+function updateVtdToolsSummary() {
+  const summary = document.getElementById("vtd-tools-summary");
+  if (!summary) return;
+  const enabled = vtdCollectEnabledTools();
+  const total = (VTD.tools || []).length;
+  summary.textContent = enabled.length
+    ? `已启用 ${enabled.length} / ${total}`
+    : `未启用（${total} 个可选）`;
+}
+
+function initVideoTargetDetection() {
+  if (window.__vtdInit) return;
+  window.__vtdInit = true;
+
+  const sourceEl = document.getElementById("vtd-source");
+  const loopEl   = document.getElementById("vtd-loop");
+  const openBtn = document.getElementById("vtd-open");
+  const closeBtn = document.getElementById("vtd-close");
+  const browseBtn = document.getElementById("vtd-browse");
+  const playBtn = document.getElementById("vtd-play");
+  const pauseBtn = document.getElementById("vtd-pause");
+  const stopBtn = document.getElementById("vtd-stop");
+
+  sourceEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") openBtn.click();
+  });
+
+  openBtn.addEventListener("click", async () => {
+    const src = (sourceEl.value || "").trim();
+    if (!src) {
+      setVtdOverlay("请输入或选择视频源", true);
+      return;
+    }
+    openBtn.disabled = true;
+    setVtdOverlay("正在打开 " + src + " …", false);
+    try {
+      const snap = await vtdOpen({ source: src, loop: !!(loopEl && loopEl.checked) });
+      setVtdMeta(snap);
+      setVtdProgress(snap);
+      if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
+    } catch (e) {
+      setVtdOverlay("打开失败: " + e.message, true);
+    } finally {
+      openBtn.disabled = false;
+    }
+  });
+
+  // Browse button: open the same server-side file picker modal as the
+  // description page, but route the picked path back into #vtd-source.
+  browseBtn.addEventListener("click", () => {
+    VdFsModal._sourceTarget = sourceEl;
+    VdFsModal.open("");
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      const m = document.getElementById("vd-modal");
+      if (!m.classList.contains("hidden")) VdFsModal.close();
+    }
+  });
+
+  closeBtn.addEventListener("click", async () => {
+    try { await vtdClose(); } catch (_) {}
+    setVtdOverlay("已关闭", false);
+  });
+
+  playBtn.addEventListener("click", async () => {
+    try {
+      const r = await vtdAction("play");
+      await vtdStatus();
+      if (r && r.ok === false) setVtdOverlay("播放失败: " + (r.reason || r.state), true);
+      else setVtdOverlay("", false);
+    } catch (e) { setVtdOverlay("播放失败: " + e.message, true); }
+  });
+  pauseBtn.addEventListener("click", async () => {
+    try {
+      const r = await vtdAction("pause");
+      await vtdStatus();
+      if (r && r.ok === false) setVtdOverlay("暂停失败: " + (r.reason || r.state), true);
+      else setVtdOverlay("", false);
+    } catch (e) { setVtdOverlay("暂停失败: " + e.message, true); }
+  });
+  stopBtn.addEventListener("click", async () => {
+    try {
+      const r = await vtdAction("stop");
+      await vtdStatus();
+      if (r && r.ok === false) setVtdOverlay("停止失败: " + (r.reason || r.state), true);
+      else setVtdOverlay("已停止", false);
+    } catch (e) { setVtdOverlay("停止失败: " + e.message, true); }
+  });
+
+  const detStartBtn = document.getElementById("vtd-detector-start");
+  const detStopBtn  = document.getElementById("vtd-detector-stop");
+  const evClearBtn  = document.getElementById("vtd-events-clear");
+  if (detStartBtn) detStartBtn.addEventListener("click", vtdDetectorStart);
+  if (detStopBtn)  detStopBtn.addEventListener("click",  vtdDetectorStop);
+  if (evClearBtn)  evClearBtn.addEventListener("click",  vtdEventsClear);
+
+  refreshVtdDetector();
+  vtdLoadTools();
+  if (!VTD.ws && !VTD.wsTimer) connectVtdWs();
 }
 
 /* ------------------------------------------------------------------ *
@@ -1520,6 +2035,12 @@ async function loadPageData(name) {
     return;
   }
 
+  if (name === "video-target-detection") {
+    initVideoTargetDetection();
+    await vtdStatus();
+    return;
+  }
+
   if (name === "system-logs") {
     Logs.init();
     await Logs.refresh();
@@ -1532,13 +2053,20 @@ async function loadPageData(name) {
     return;
   }
 
-if (name === "tts") {
+  if (name === "tts") {
     TTS.init();
     await TTS.refresh();
     // Open the WS proactively so the page stays live even before the
     // first click on "开始生成". The server only pushes on state change,
     // so this is cheap.
     TTS.ensureWs();
+    return;
+  }
+
+  if (name === "video-content-search") {
+    // 占位页 —— 没有后端 API 也不需要 WS，仅展示静态 placeholder
+    // 文案；提前 return 避免走 default 分支去 fetch 不存在的
+    // ``/api/video-content-search`` 而打 log 404。
     return;
   }
 
@@ -2772,6 +3300,37 @@ fetchVersion();
   if (pickDirBtn) pickDirBtn.addEventListener("click", () => VdFsModal.pickCurrentDir());
   if (pickFileBtn) pickFileBtn.addEventListener("click", () => VdFsModal.pickSelectedFile());
 }
+
+// File picker modal picks into whichever source input set _sourceTarget
+// before opening (currently only the vtd page does so); otherwise
+// default to the 音视频描述 page's #vd-source.
+VdFsModal._sourceTarget = null;
+const _vdOrigPickFile = VdFsModal.pickSelectedFile.bind(VdFsModal);
+VdFsModal.pickSelectedFile = function () {
+  if (VdFsModal._sourceTarget) {
+    if (this.selected) {
+      VdFsModal._sourceTarget.value = this.selected.path;
+      VdFsModal._sourceTarget = null;
+      this.close();
+    }
+    return;
+  }
+  _vdOrigPickFile();
+};
+const _vdOrigPickDir = VdFsModal.pickCurrentDir.bind(VdFsModal);
+VdFsModal.pickCurrentDir = function () {
+  if (VdFsModal._sourceTarget) {
+    const btn = document.getElementById("vd-modal-pick-dir");
+    const p = btn && btn.dataset.path;
+    if (p) {
+      VdFsModal._sourceTarget.value = p;
+      VdFsModal._sourceTarget = null;
+      this.close();
+    }
+    return;
+  }
+  _vdOrigPickDir();
+};
 
 /* ---------------------------------------------------------------- *
  * 算力配置 (Compute Config) page                                   *

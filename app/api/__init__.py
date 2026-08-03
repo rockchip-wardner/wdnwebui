@@ -15,6 +15,7 @@ from . import (
     tools,
     tts,
     video_detection,
+    video_target_detection,
 )
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "tools",
     "tts",
     "video_detection",
+    "video_target_detection",
 ] 

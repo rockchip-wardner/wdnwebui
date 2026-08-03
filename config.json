@@ -1,19 +1,15 @@
 {
+  "base": {
+    "device_name": "HvMpL346",
+    "model_path": "/userdata/models/",
+    "resource_dir": "/userdata"
+  },
   "compute": {
     "instances": [
       {
-        "npu_index": 0,
-        "model": "qwen3-tts"
-      },
-      {
         "npu_index": 1,
-        "model": "qwen3-vl-4b"
+        "model": "qwen3-tts"
       }
     ]
-  },
-  "base": {
-    "device_name": "eU6RwQXc",
-    "model_path": "/userdata/models/",
-    "resource_dir": "/userdata"
   }
 }
