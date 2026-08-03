@@ -120,34 +120,9 @@ def get_tool_registry() -> ToolRegistry:
     global _registry
     with _registry_lock:
         if _registry is None:
-            from .crop_region import CropRegion
-            from .annotate_roi import AnnotateROI
             from .tts_alert import TtsAlert
 
             reg = ToolRegistry()
-            reg.register(
-                key="crop_region",
-                name="原图缩放",
-                description=(
-                    "原图缩放工具：当画面中存在主体不清晰、"
-                    "或希望放大观察某区域时调用此工具，"
-                    "给出 0–1000 归一化坐标 [x1, y1, x2, y2]，"
-                    "后端会裁剪该区域并二次送 VLM 推理。"
-                ),
-                requires_capability="video_query",
-                tool_class=CropRegion,
-            )
-            reg.register(
-                key="annotate_roi",
-                name="目标标注",
-                description=(
-                    "目标标注工具：当画面中检测到需要标注的目标，"
-                    "给出 ROI 坐标，前端会在视频画布上以红色矩形框出，"
-                    "5 秒后淡出。"
-                ),
-                requires_capability=None,
-                tool_class=AnnotateROI,
-            )
             reg.register(
                 key="tts_alert",
                 name="语音提醒",

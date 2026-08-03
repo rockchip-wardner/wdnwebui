@@ -78,6 +78,27 @@ html, body {
   margin: 0.85rem 1.1rem 0.45rem;
 }
 
+.nav-section-label {
+  font-size: 0.74rem;
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  padding: 0.55rem 1.25rem 0.3rem;
+}
+.nav-item--demo {
+  color: #ffffff;
+  font-weight: 500;
+}
+.nav-item--demo::before {
+  content: attr(data-icon);
+  display: inline-block;
+  width: 1.25em;
+  margin-right: 0.4em;
+  text-align: center;
+  opacity: 0.75;
+  font-size: 0.85em;
+}
+
 .content {
   flex: 1;
   padding: 2rem 2.5rem;
@@ -387,6 +408,143 @@ html, body {
 .thermal-card.warn .thermal-value { color: #b45309; }
 .thermal-card.hot  .thermal-value { color: #c2410c; }
 .thermal-card.crit .thermal-value { color: #b91c1c; }
+
+/* ---------- npu cards (system-monitor) ---------- */
+.npu-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.95rem;
+  margin-top: 0.4rem;
+}
+@media (max-width: 720px) {
+  .npu-grid { grid-template-columns: 1fr; }
+}
+.npu-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 1.2rem;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+.npu-card {
+  background: linear-gradient(180deg, #f9fafb 0%, #ffffff 60%);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.95rem 1.05rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  min-width: 0;
+}
+.npu-card.is-error  { border-color: #fca5a5; background: linear-gradient(180deg, #fef2f2, #fff5f5 60%); }
+.npu-card.is-warn   { border-color: #fcd34d; }
+.npu-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.npu-card-title {
+  font-weight: 600;
+  font-size: 1rem;
+  color: #111827;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.npu-card-title::before {
+  content: "";
+  display: inline-block;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+}
+.npu-card.is-warn  .npu-card-title::before { background: #f59e0b; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.18); }
+.npu-card.is-error .npu-card-title::before { background: #ef4444; box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18); }
+.npu-card-meta {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.npu-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  padding: 0.55rem 0.1rem 0.2rem;
+  border-top: 1px dashed var(--border);
+}
+.npu-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  min-width: 0;
+}
+.npu-stat-num {
+  display: flex;
+  align-items: baseline;
+  gap: 0.15rem;
+  line-height: 1.05;
+}
+.npu-stat-value {
+  font-family: var(--mono);
+  font-size: 1.4rem;
+  font-weight: 600;
+  line-height: 1.05;
+  color: #111827;
+  letter-spacing: -0.01em;
+}
+.npu-stat-value.is-warn  { color: #b45309; }
+.npu-stat-value.is-error { color: #b91c1c; }
+.npu-stat-label {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.npu-stat-unit {
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-weight: 400;
+}
+.npu-mem {
+  border-top: 1px dashed var(--border);
+  padding-top: 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.npu-mem-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.npu-mem-meta strong {
+  color: #111827;
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.npu-mem-bar {
+  position: relative;
+  height: 8px;
+  background: #f3f4f6;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.npu-mem-bar-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #60a5fa, #2563eb);
+  transition: width 0.4s ease;
+}
+.npu-mem-bar-fill.is-warn  { background: linear-gradient(90deg, #facc15, #f59e0b); }
+.npu-mem-bar-fill.is-error { background: linear-gradient(90deg, #fb923c, #ea580c); }
 .section-header {
   display: flex;
   align-items: center;
@@ -1683,7 +1841,7 @@ html, body {
   border-color: #fecaca;
 }
 
-/* ---------- shared surv-* form controls (音视频检测 page) ---------- */
+/* ---------- shared surv-* form controls (音视频描述 page) ---------- */
 .surv-hint {
   font-size: 0.82rem;
   color: var(--muted);
@@ -2020,28 +2178,7 @@ html, body {
   color: var(--text-2);
 }
 
-/* ---------- tools (音视频检测 + 工具列表) ---------- */
-.vd-bbox-svg {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-  z-index: 2;
-}
-.vd-bbox-rect {
-  fill: rgba(239, 68, 68, 0.10);
-  stroke: #ef4444;
-  stroke-width: 6;
-  vector-effect: non-scaling-stroke;
-  animation: vd-bbox-fade 5s ease-out forwards;
-}
-@keyframes vd-bbox-fade {
-  0%   { opacity: 0; }
-  10%  { opacity: 1; }
-  85%  { opacity: 1; }
-  100% { opacity: 0; }
-}
+/* ---------- tools (音视频描述 + 工具列表) ---------- */
 
 .vd-tools-list {
   display: flex;

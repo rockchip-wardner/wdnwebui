@@ -76,7 +76,7 @@ function renderSystemMonitor(data) {
   const npu = data.npu || {};
   const badge = document.getElementById("npu-badge");
   const msgEl = document.getElementById("npu-message");
-  const tbody = document.getElementById("npu-tbody");
+  const grid = document.getElementById("npu-grid");
   const rawEl = document.getElementById("npu-raw");
 
   const thermal = data.thermal || {};
@@ -177,34 +177,130 @@ function renderSystemMonitor(data) {
   }
   rawEl.textContent = JSON.stringify(npu, null, 2);
 
-  tbody.innerHTML = "";
+  grid.innerHTML = "";
   const devices = npu.devices || [];
   if (!devices.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty-row">未检测到 NPU 设备</td></tr>';
+    const empty = document.createElement("div");
+    empty.className = "npu-empty";
+    empty.textContent = "未检测到 NPU 设备";
+    grid.appendChild(empty);
     return;
   }
   devices.forEach(d => {
-    const tr = document.createElement("tr");
-    const memStr = (d.mem_used_mb != null && d.mem_total_mb != null)
-      ? fmtNum(d.mem_used_mb, 0) + " / " + fmtNum(d.mem_total_mb, 0)
-      : "--";
-    const cells = [
-      d.index,
-      d.id || "--",
-      d.bus_id || "--",
-      d.status || "--",
-      d.health || "--",
-      d.temp_c == null ? "--" : fmtNum(d.temp_c, 1),
-      d.power_mw == null ? "--" : d.power_mw,
-      d.npu_percent == null ? "--" : fmtNum(d.npu_percent, 1),
-      memStr,
-    ];
-    cells.forEach(v => {
-      const td = document.createElement("td");
-      td.textContent = v;
-      tr.appendChild(td);
-    });
-    tbody.appendChild(tr);
+    const tempC = d.temp_c == null ? null : Number(d.temp_c);
+    const npuPct = d.npu_percent == null ? null : Number(d.npu_percent);
+    const powerMw = d.power_mw == null ? null : Number(d.power_mw);
+    const memUsed = d.mem_used_mb == null ? null : Number(d.mem_used_mb);
+    const memTotal = d.mem_total_mb == null ? null : Number(d.mem_total_mb);
+    const memPct = (memUsed != null && memTotal && memTotal > 0)
+      ? Math.min(100, Math.max(0, (memUsed / memTotal) * 100))
+      : null;
+
+    // Card-level severity: error if temp >= 85 or NPU% saturated, warn if >= 70 / 80
+    let level = "ok";
+    if (tempC != null && tempC >= 85) level = "error";
+    else if (tempC != null && tempC >= 75) level = "warn";
+    else if (npuPct != null && npuPct >= 95) level = "warn";
+    if (d.status && /error|fail|down|offline/i.test(d.status) && level === "ok") level = "error";
+
+    const card = document.createElement("div");
+    card.className = "npu-card" + (level === "ok" ? "" : " is-" + level);
+
+    // --- head ---
+    const head = document.createElement("div");
+    head.className = "npu-card-head";
+    const title = document.createElement("span");
+    title.className = "npu-card-title";
+    title.textContent = (d.id || "NPU") + " #" + d.index;
+    head.appendChild(title);
+    if (d.status) {
+      const statusBadge = document.createElement("span");
+      statusBadge.className = "badge " + (level === "ok" ? "ok" : (level === "warn" ? "warn" : "err"));
+      statusBadge.textContent = d.status;
+      head.appendChild(statusBadge);
+    }
+    const meta = document.createElement("span");
+    meta.className = "npu-card-meta";
+    meta.textContent = d.bus_id || "";
+    meta.title = d.bus_id || "";
+    head.appendChild(meta);
+    card.appendChild(head);
+
+    // --- 3-stat row ---
+    const stats = document.createElement("div");
+    stats.className = "npu-stats";
+    const mkStat = (label, value, unit, level) => {
+      const stat = document.createElement("div");
+      stat.className = "npu-stat";
+      const num = document.createElement("div");
+      num.className = "npu-stat-num";
+      const val = document.createElement("span");
+      val.className = "npu-stat-value" + (level ? " is-" + level : "");
+      if (value == null || Number.isNaN(value)) {
+        val.textContent = "--";
+      } else {
+        val.textContent = fmtNum(value, Number.isInteger(value) ? 0 : 1);
+      }
+      num.appendChild(val);
+      if (unit && value != null && !Number.isNaN(value)) {
+        const u = document.createElement("span");
+        u.className = "npu-stat-unit";
+        u.textContent = unit;
+        num.appendChild(u);
+      }
+      stat.appendChild(num);
+      const lbl = document.createElement("span");
+      lbl.className = "npu-stat-label";
+      lbl.textContent = label;
+      stat.appendChild(lbl);
+      return stat;
+    };
+    let tempLevel = null;
+    if (tempC != null) {
+      if (tempC >= 85) tempLevel = "error";
+      else if (tempC >= 75) tempLevel = "warn";
+    }
+    let npuLevel = null;
+    if (npuPct != null && npuPct >= 95) npuLevel = "warn";
+    stats.appendChild(mkStat("温度", tempC, "°C", tempLevel));
+    stats.appendChild(mkStat("功率", powerMw == null ? null : powerMw / 1000, "W", null));
+    stats.appendChild(mkStat("NPU 占用", npuPct, "%", npuLevel));
+    card.appendChild(stats);
+
+    // --- memory bar ---
+    if (memUsed != null || memTotal != null) {
+      const memBlock = document.createElement("div");
+      memBlock.className = "npu-mem";
+      const memMeta = document.createElement("div");
+      memMeta.className = "npu-mem-meta";
+      const memLabel = document.createElement("span");
+      memLabel.innerHTML = "显存 <strong>" +
+        (memUsed != null ? fmtNum(memUsed, 0) : "--") +
+        " / " +
+        (memTotal != null ? fmtNum(memTotal, 0) : "--") +
+        "</strong> MB";
+      memMeta.appendChild(memLabel);
+      const memPctText = document.createElement("span");
+      memPctText.textContent = memPct == null ? "--" : memPct.toFixed(0) + " %";
+      memMeta.appendChild(memPctText);
+      memBlock.appendChild(memMeta);
+
+      const bar = document.createElement("div");
+      bar.className = "npu-mem-bar";
+      const fill = document.createElement("div");
+      let memLevel = null;
+      if (memPct != null) {
+        if (memPct >= 90) memLevel = "error";
+        else if (memPct >= 70) memLevel = "warn";
+      }
+      fill.className = "npu-mem-bar-fill" + (memLevel ? " is-" + memLevel : "");
+      fill.style.width = (memPct == null ? 0 : memPct) + "%";
+      bar.appendChild(fill);
+      memBlock.appendChild(bar);
+      card.appendChild(memBlock);
+    }
+
+    grid.appendChild(card);
   });
 }
 
@@ -273,35 +369,6 @@ async function drawVdFrame(jpgBytes) {
   ctx.drawImage(img, 0, 0);
 }
 
-/* Draw a red bbox overlay (5s fade) when a tool_call event arrives
- * with bbox. The SVG viewBox is fixed at 1000x1000 to match the
- * @Callable tools' normalised 0–1000 coordinate space. Coordinates
- * are passed through verbatim — we never scale to canvas pixels.
- */
-function pushVdBbox(bbox, toolKey) {
-  const svg = document.getElementById("vd-bbox-svg");
-  if (!svg || !Array.isArray(bbox) || bbox.length !== 4) return;
-  const [x1, y1, x2, y2] = bbox.map((v) => Number(v));
-  if (![x1, y1, x2, y2].every((v) => Number.isFinite(v))) return;
-  const ns = "http://www.w3.org/2000/svg";
-  const rect = document.createElementNS(ns, "rect");
-  const x = Math.max(0, Math.min(1000, Math.min(x1, x2)));
-  const y = Math.max(0, Math.min(1000, Math.min(y1, y2)));
-  const w = Math.max(0, Math.abs(x2 - x1));
-  const h = Math.max(0, Math.abs(y2 - y1));
-  rect.setAttribute("x", x);
-  rect.setAttribute("y", y);
-  rect.setAttribute("width", w);
-  rect.setAttribute("height", h);
-  rect.setAttribute("rx", 8);
-  rect.setAttribute("class", "vd-bbox-rect");
-  if (toolKey) rect.setAttribute("data-tool", toolKey);
-  svg.appendChild(rect);
-  setTimeout(() => {
-    try { rect.remove(); } catch (_) { /* already gone */ }
-  }, 5200);
-}
-
 function connectVdWs() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${proto}//${location.host}${API_PREFIX}/video-detection/ws`;
@@ -324,9 +391,6 @@ function connectVdWs() {
       } else if (snap.type === "event") {
         addVdEvent(snap);
         showVdEventBadge(snap);
-        if (Array.isArray(snap.bbox) && (snap.tool_call === "annotate_roi" || snap.tool_call === "crop_region")) {
-          pushVdBbox(snap.bbox, snap.tool_call);
-        }
         return;
       } else if (snap.type === "status" && snap.detector) {
         updateVdDetectorStatus(snap.detector);

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>通用智能监视平台</title>
+  <title>守望者系统演示</title>
   <link rel="stylesheet" href="/static/css/style.css" />
 </head>
 <body>
@@ -17,6 +17,11 @@
         </div>
       </div>
       <nav class="nav">
+      <div class="nav-section-label">演示</div>
+      <a href="#video-detection"      data-page="video-detection"      class="nav-item nav-item--demo" data-icon="▶">音视频描述</a>
+      <a href="#video-content-search" data-page="video-content-search" class="nav-item nav-item--demo" data-icon="⌕">视频内容检索</a>
+      <a href="#tts"                  data-page="tts"                  class="nav-item nav-item--demo" data-icon="♪">语音生成</a>
+      <hr class="nav-divider" />
       <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
       <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
       <a href="#compute-config"  data-page="compute-config"  class="nav-item">算力配置</a>
@@ -24,10 +29,6 @@
       <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
       <a href="#im-bridge"       data-page="im-bridge"       class="nav-item">应用对接</a>
       <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
-      <hr class="nav-divider" />
-      <a href="#video-detection"      data-page="video-detection"      class="nav-item">音视频检测</a>
-      <a href="#video-content-search" data-page="video-content-search" class="nav-item">视频内容检索</a>
-      <a href="#tts"                  data-page="tts"                  class="nav-item">语音生成</a>
       </nav>
 
       <div class="sidebar-foot">
@@ -165,29 +166,12 @@
 
         <section class="npu-section">
           <header class="section-header">
-            <h3>RKNN NPU 资源</h3>
+            <h3>算力卡信息</h3>
             <span class="badge" id="npu-badge">--</span>
           </header>
           <div id="npu-message" class="npu-message hidden"></div>
-          <div class="table-wrap">
-            <table class="data-table" id="npu-table">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>芯片</th>
-                  <th>Bus-Id</th>
-                  <th>状态</th>
-                  <th>健康</th>
-                  <th>温度 (°C)</th>
-                  <th>功率 (mW)</th>
-                  <th>NPU %</th>
-                  <th>显存 (MB)</th>
-                </tr>
-              </thead>
-              <tbody id="npu-tbody">
-                <tr><td colspan="9" class="empty-row">加载中…</td></tr>
-              </tbody>
-            </table>
+          <div class="npu-grid" id="npu-grid">
+            <div class="npu-empty">加载中…</div>
           </div>
           <details class="raw-output">
             <summary>完整 JSON</summary>
@@ -297,7 +281,7 @@
         </header>
 
         <div class="tools-hint">
-          当前内置工具集合，可在音视频检测页面右侧勾选使用。工具运行依赖的算力（VLM / TTS 等）必须在“算力配置”页启用；未启用时该工具会显示为灰色不可用。
+          当前内置工具集合，可在音视频描述页面右侧勾选使用。工具运行依赖的算力（VLM / TTS 等）必须在“算力配置”页启用；未启用时该工具会显示为灰色不可用。
         </div>
 
         <div class="tools-list" id="tools-list">
@@ -345,7 +329,7 @@
 
       <section id="page-video-detection" class="page hidden" data-page="video-detection">
         <header class="page-header">
-          <h2>音视频检测</h2>
+          <h2>音视频描述</h2>
           <button class="refresh-btn" data-refresh>刷新</button>
         </header>
 
@@ -353,9 +337,6 @@
           <div class="vd-stage-col">
             <div class="vd-stage">
               <canvas id="vd-canvas" width="960" height="540"></canvas>
-              <svg id="vd-bbox-svg" class="vd-bbox-svg"
-                   viewBox="0 0 1000 1000" preserveAspectRatio="none"
-                   xmlns="http://www.w3.org/2000/svg"></svg>
               <div class="vd-overlay" id="vd-overlay"></div>
               <div class="vd-event-badge hidden" id="vd-event-badge">
                 <span class="vd-event-badge-text" id="vd-event-badge-text"></span>
