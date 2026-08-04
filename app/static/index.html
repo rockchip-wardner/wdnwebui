@@ -355,14 +355,78 @@
       <section id="page-im-bridge" class="page hidden" data-page="im-bridge">
         <header class="page-header">
           <h2>应用对接</h2>
+          <span class="page-header-sub">微信机器人（iLink）</span>
         </header>
-        <div class="page-placeholder">
-          <div class="page-placeholder-icon" aria-hidden="true">✉</div>
-          <div class="page-placeholder-title">尚未实现</div>
-          <div class="page-placeholder-text">
-            该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
-          </div>
+
+        <div class="imb-grid">
+          <!-- ============== 登录面板 ============== -->
+          <section class="imb-card imb-card--login">
+            <header class="imb-card-head">
+              <h3>登录</h3>
+              <span class="imb-status" id="imb-status-badge" data-state="idle">未登录</span>
+            </header>
+
+            <div class="imb-card-body">
+              <dl class="imb-meta">
+                <dt>凭证路径</dt>
+                <dd id="imb-cred-path">--</dd>
+                <dt>user_id</dt>
+                <dd id="imb-user-id">--</dd>
+                <dt>long-poll</dt>
+                <dd id="imb-running">--</dd>
+                <dt>SDK</dt>
+                <dd id="imb-runtime">--</dd>
+              </dl>
+
+              <div class="imb-qr-wrap" id="imb-qr-wrap">
+                <div class="imb-qr-stage" id="imb-qr-stage"></div>
+                <div class="imb-qr-hint" id="imb-qr-hint">点击「登录」开始扫码</div>
+              </div>
+
+              <div class="imb-actions">
+                <button class="vd-btn" id="imb-login-btn"   type="button">登录</button>
+                <button class="vd-btn" id="imb-cancel-btn"  type="button" disabled>取消扫码</button>
+                <button class="vd-btn imb-btn--danger" id="imb-logout-btn" type="button" disabled>退出登录</button>
+                <span class="imb-error" id="imb-error"></span>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============== 调试收发 ============== -->
+          <section class="imb-card imb-card--chat">
+            <header class="imb-card-head">
+              <h3>调试收发</h3>
+              <span class="imb-meta-inline" id="imb-known-count">已知 0 人</span>
+            </header>
+
+            <div class="imb-card-body imb-card-body--chat">
+              <div class="imb-conv">
+                <div class="imb-conv-title" id="imb-conv-title">消息记录</div>
+                <div class="imb-conv-list" id="imb-conv-list">
+                  <div class="page-placeholder imb-empty">
+                    <div class="page-placeholder-text">
+                      登录后会话与消息会出现在这里。<br/>
+                      发送默认发给本机 user_id（用于测试 round-trip）。
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="imb-composer">
+                <textarea class="imb-textarea" id="imb-text-input" rows="2"
+                          placeholder="输入文本，Cmd/Ctrl + Enter 发送"></textarea>
+                <div class="imb-composer-actions">
+                  <button class="vd-btn" id="imb-send-btn"  type="button" disabled>发送</button>
+                  <button class="vd-btn" id="imb-clear-btn" type="button">清屏</button>
+                  <span class="imb-status-inline" id="imb-chat-status"></span>
+                </div>
+              </div>
+            </div>
+          </section>
         </div>
+
+        <!-- 引入 vendored QR encoder（Kazuhiko Arase, MIT, qrcode-generator@1.4.4） -->
+        <script src="/static/js/qrcode.js"></script>
       </section>
 
       <section id="page-video-detection" class="page hidden" data-page="video-detection">

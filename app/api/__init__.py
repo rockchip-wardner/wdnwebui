@@ -16,6 +16,7 @@ from . import (
     tts,
     video_detection,
     video_target_detection,
+    wechat,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "tts",
     "video_detection",
     "video_target_detection",
+    "wechat",
 ] 

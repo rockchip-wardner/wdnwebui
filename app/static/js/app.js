@@ -2165,6 +2165,13 @@ async function loadPageData(name) {
     return;
   }
 
+  if (name === "im-bridge") {
+    ImBridge.init();
+    await ImBridge.load();
+    ImBridge.ensureWs();
+    return;
+  }
+
   const target = document.getElementById("data-" + name);
   if (!target) return;
   target.textContent = "加载中…";
@@ -2188,6 +2195,9 @@ function showPage(name) {
   }
   if (prev === "discovery" && name !== "discovery") {
     DiscoveryLan.stopTicking();
+  }
+  if (prev === "im-bridge" && name !== "im-bridge") {
+    ImBridge.closeWs();
   }
   document.querySelectorAll(".page").forEach(p => {
     p.classList.toggle("hidden", p.dataset.page !== name);
@@ -4283,6 +4293,471 @@ const DiscoveryLan = {
 
   _esc(s) {
     return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  },
+};
+
+/* ------------------------------------------------------------------ *
+ *  im-bridge page — WeChat iLink bot (login + 调试收发)             *
+ *                                                                    *
+ *  调试收发 把发送简化为"发给本机 user_id" —— 即自动用 bot 自己登录      *
+ *  后的 user_id 作为收件人，验证 round-trip。不暴露输入框也避免用户       *
+ *  手动输入尚未建立 context_token 的陌生 user_id 后报 NoContextError。 *
+ * ------------------------------------------------------------------ */
+const ImBridge = {
+  ws: null,
+  wsRetry: 0,
+  wsTimer: null,
+  snapshot: null,
+  messages: [],          // most recent first (in + out mixed)
+
+  init() {
+    const $ = (id) => document.getElementById(id);
+    $("imb-login-btn")?.addEventListener("click", () => this.login());
+    $("imb-cancel-btn")?.addEventListener("click", () => this.cancelLogin());
+    $("imb-logout-btn")?.addEventListener("click", () => this.logout());
+    $("imb-send-btn")?.addEventListener("click", () => this.send());
+    $("imb-clear-btn")?.addEventListener("click", () => this.clearChat());
+    $("imb-text-input")?.addEventListener("keydown", (e) => {
+      // Cmd/Ctrl + Enter sends; plain Enter inserts a newline.
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        this.send();
+      }
+    });
+  },
+
+  async load() {
+    try {
+      const r = await fetch(API_PREFIX + "/wechat");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const snap = await r.json();
+      this._applySnapshot(snap);
+      // Pull runtime info (SDK version + wechatbot-sdk available flag)
+      // for the "SDK" row; failures are non-fatal.
+      try {
+        const rr = await fetch(API_PREFIX + "/wechat/runtime");
+        if (rr.ok) {
+          const rt = await rr.json();
+          const el = document.getElementById("imb-runtime");
+          if (el) {
+            el.textContent = rt.available
+              ? (rt.module + " " + (rt.version || ""))
+              : ("missing: " + (rt.error || "unavailable"));
+            el.classList.toggle("imb-muted", !rt.available);
+          }
+        }
+      } catch (_) { /* ignore */ }
+    } catch (err) {
+      this._setChatStatus("加载失败: " + err.message, true);
+    }
+  },
+
+  ensureWs() {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN ||
+                    this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    this._openWs();
+  },
+
+  closeWs() {
+    if (this.wsTimer) {
+      clearTimeout(this.wsTimer);
+      this.wsTimer = null;
+    }
+    if (this.ws) {
+      try { this.ws.close(); } catch (_) { /* ignore */ }
+      this.ws = null;
+    }
+    this.wsRetry = 0;
+  },
+
+  _openWs() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = proto + "//" + location.host + API_PREFIX + "/wechat/ws";
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch (err) {
+      this._scheduleReconnect();
+      return;
+    }
+    this.ws = ws;
+    ws.onopen = () => {
+      this.wsRetry = 0;
+    };
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      this._onWsMessage(msg);
+    };
+    ws.onclose = () => {
+      this.ws = null;
+      this._scheduleReconnect();
+    };
+    ws.onerror = () => {
+      // onclose will fire after; reconnect logic lives there.
+    };
+  },
+
+  _scheduleReconnect() {
+    if (this.wsTimer) return;
+    this.wsRetry = Math.min(this.wsRetry + 1, 10);
+    const delay = Math.min(1000 * (1 << (this.wsRetry - 1)), 30000);
+    this.wsTimer = setTimeout(() => {
+      this.wsTimer = null;
+      this._openWs();
+    }, delay);
+  },
+
+  _onWsMessage(msg) {
+    if (!msg || !msg.type) return;
+    if (msg.type === "snapshot") {
+      this._applySnapshot(msg.snapshot);
+      return;
+    }
+    if (msg.type === "state") {
+      if (!this.snapshot) this.snapshot = {};
+      Object.assign(this.snapshot, msg.state || {});
+      this._renderState();
+      this._renderButtons();
+      this._renderQr();
+      return;
+    }
+    if (msg.type === "message") {
+      this._recordMessage(msg.message);
+      this._renderChat();
+      this._renderKnown();
+      return;
+    }
+  },
+
+  _applySnapshot(snap) {
+    if (!snap) return;
+    this.snapshot = snap;
+    this.messages = Array.isArray(snap.recent_messages) ? snap.recent_messages.slice() : [];
+    this._renderState();
+    this._renderButtons();
+    this._renderQr();
+    this._renderKnown();
+    this._renderChat();
+  },
+
+  _renderState() {
+    const s = this.snapshot || {};
+    const set = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = (val === null || val === undefined || val === "") ? "--" : String(val);
+    };
+    set("imb-cred-path", s.cred_path);
+    set("imb-user-id", s.user_id);
+    set("imb-running", s.started ? "运行中" : "停止");
+
+    const badge = document.getElementById("imb-status-badge");
+    if (badge) {
+      const state = s.login_state || "idle";
+      const labelMap = {
+        idle: "未登录",
+        awaiting_scan: "等待扫码",
+        scanned: "已扫码",
+        confirmed: "已登录",
+        running: "已登录",
+        expired: "二维码已过期",
+        error: "错误",
+        cancelled: "已取消",
+        login_failed: "登录失败",
+      };
+      badge.dataset.state = state;
+      badge.textContent = labelMap[state] || state;
+    }
+
+    const errEl = document.getElementById("imb-error");
+    if (errEl) {
+      if (s.error) {
+        errEl.textContent = "· " + s.error;
+        errEl.classList.add("visible");
+      } else {
+        errEl.textContent = "";
+        errEl.classList.remove("visible");
+      }
+    }
+  },
+
+  _renderButtons() {
+    const s = this.snapshot || {};
+    const state = s.login_state || "idle";
+    const loginBtn = document.getElementById("imb-login-btn");
+    const cancelBtn = document.getElementById("imb-cancel-btn");
+    const logoutBtn = document.getElementById("imb-logout-btn");
+    const sendBtn = document.getElementById("imb-send-btn");
+    const textInput = document.getElementById("imb-text-input");
+
+    const loggedIn = state === "confirmed" || state === "running" || !!s.started;
+    const active = state === "awaiting_scan" || state === "scanned";
+
+    if (loginBtn) loginBtn.disabled = loggedIn || active;
+    if (cancelBtn) cancelBtn.disabled = !active;
+    if (logoutBtn) logoutBtn.disabled = !loggedIn && state !== "error";
+    if (sendBtn) sendBtn.disabled = !loggedIn;
+    if (textInput) textInput.disabled = !loggedIn;
+  },
+
+  _renderQr() {
+    const stage = document.getElementById("imb-qr-stage");
+    const hint = document.getElementById("imb-qr-hint");
+    if (!stage || !hint) return;
+    const s = this.snapshot || {};
+    const state = s.login_state || "idle";
+    const url = s.qr_url;
+    const lastEvent = s.last_event || "";
+
+    stage.innerHTML = "";
+    // While ``login_state`` is still ``idle`` but ``last_event`` flipped
+    // to ``"starting"``, the user just clicked 登录 and the SDK is in
+    // the middle of fetching a QR — show a transient hint instead of
+    // falling back to the "click 登录" prompt.
+    if (state === "idle" && lastEvent === "starting") {
+      hint.textContent = "正在向微信申请二维码…";
+      hint.classList.remove("imb-qr-hint--muted");
+      return;
+    }
+    if (state === "idle" && lastEvent === "logged_out") {
+      hint.textContent = "已退出登录，点「登录」重新扫码";
+      hint.classList.remove("imb-qr-hint--muted");
+      return;
+    }
+    if (state === "idle" && lastEvent === "cancelled") {
+      hint.textContent = "已取消本次扫码";
+      hint.classList.add("imb-qr-hint--muted");
+      return;
+    }
+    if (state === "awaiting_scan" && url) {
+      try {
+        // Vendored qrcode-generator (Kazuhiko Arase, MIT).
+        // ``qrcode(0, 'M')`` auto-picks the smallest type number that fits.
+        const qr = window.qrcode(0, "M");
+        qr.addData(url);
+        qr.make();
+        const svg = qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true });
+        stage.innerHTML = svg;
+        hint.textContent = "请用微信扫描二维码（120 秒内有效）";
+        hint.classList.remove("imb-qr-hint--muted");
+      } catch (err) {
+        hint.textContent = "QR 渲染失败: " + err.message;
+        hint.classList.add("imb-qr-hint--muted");
+      }
+      return;
+    }
+    if (state === "scanned") {
+      hint.textContent = "已扫码，请在手机上点「登录」确认";
+      hint.classList.remove("imb-qr-hint--muted");
+      return;
+    }
+    if (state === "confirmed" || state === "running") {
+      hint.textContent = "已登录，user_id = " + (s.user_id || "?");
+      hint.classList.remove("imb-qr-hint--muted");
+      return;
+    }
+    if (state === "expired") {
+      hint.textContent = "二维码已过期，点「登录」重新获取";
+      hint.classList.add("imb-qr-hint--muted");
+      return;
+    }
+    if (state === "error" || state === "login_failed") {
+      hint.textContent = "登录失败：" + (s.error || state);
+      hint.classList.add("imb-qr-hint--muted");
+      return;
+    }
+    if (state === "cancelled") {
+      hint.textContent = "已取消本次扫码";
+      hint.classList.add("imb-qr-hint--muted");
+      return;
+    }
+    hint.textContent = "点击「登录」开始扫码";
+    hint.classList.remove("imb-qr-hint--muted");
+  },
+
+  _renderKnown() {
+    const el = document.getElementById("imb-known-count");
+    if (!el) return;
+    const known = (this.snapshot && Array.isArray(this.snapshot.known_users))
+      ? this.snapshot.known_users.length
+      : 0;
+    el.textContent = "已知 " + known + " 人";
+  },
+
+  _recordMessage(msg) {
+    if (!msg) return;
+    // Dedup: the SDK and the poller can both produce the same item;
+    // skip if it's already the head of the list.
+    if (this.messages.length &&
+        this.messages[0].ts_ms === msg.ts_ms &&
+        this.messages[0].direction === msg.direction &&
+        this.messages[0].user_id === msg.user_id &&
+        this.messages[0].text === msg.text) {
+      return;
+    }
+    this.messages.unshift(msg);
+    if (this.messages.length > 200) this.messages.length = 200;
+  },
+
+  _renderChat() {
+    const list = document.getElementById("imb-conv-list");
+    const title = document.getElementById("imb-conv-title");
+    if (!list || !title) return;
+    if (!this.messages.length) {
+      title.textContent = "消息记录";
+      list.innerHTML = `
+        <div class="page-placeholder imb-empty">
+          <div class="page-placeholder-text">
+            登录后会话与消息会出现在这里。<br/>
+            发送默认发给本机 user_id（用于测试 round-trip）。
+          </div>
+        </div>`;
+      return;
+    }
+    // Show all messages (any user) — the sender is locked to the bot's
+    // own user_id, so almost everything will be to/from that account;
+    // a real user messaging the bot will still surface here.
+    const rows = this.messages.map((m) => {
+      const dir = m.direction === "out" ? "out" : "in";
+      const errTag = m.error ? `<span class="imb-msg-error">[${this._esc(m.error)}]</span>` : "";
+      const time = m.ts ? this._fmtTime(m.ts_ms) : "";
+      const media = m.has_media ? " 📎" : "";
+      const kindLabel = m.type ? `[${this._esc(m.type)}]` : "";
+      return `<li class="imb-msg imb-msg--${dir}">
+        <span class="imb-msg-meta">${this._esc(m.user_id)} · ${time}${media}</span>
+        <div class="imb-msg-body">${kindLabel} ${this._esc(m.text || "")} ${errTag}</div>
+      </li>`;
+    });
+    const header = (() => {
+      const self = this.snapshot && this.snapshot.user_id;
+      return self ? `消息记录（发送目标：${this._esc(self)}）` : "消息记录";
+    })();
+    title.textContent = header;
+    list.innerHTML = `<ul class="imb-conv-ul">${rows.join("")}</ul>`;
+  },
+
+  refreshChat() {
+    this._renderChat();
+  },
+
+  clearChat() {
+    this.messages = [];
+    this._renderChat();
+  },
+
+  _setChatStatus(text, danger) {
+    const el = document.getElementById("imb-chat-status");
+    if (!el) return;
+    el.textContent = text || "";
+    el.classList.toggle("danger", !!danger);
+  },
+
+  async login() {
+    const btn = document.getElementById("imb-login-btn");
+    if (btn) btn.disabled = true;
+    this._setChatStatus("正在发起登录…");
+    try {
+      const r = await fetch(API_PREFIX + "/wechat/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: false }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      if (data.snapshot) this._applySnapshot(data.snapshot);
+      this._setChatStatus("");
+    } catch (err) {
+      this._setChatStatus("登录失败: " + err.message, true);
+      this._renderButtons();
+    }
+  },
+
+  async cancelLogin() {
+    try {
+      const r = await fetch(API_PREFIX + "/wechat/cancel-login", {
+        method: "POST",
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      if (data.snapshot) this._applySnapshot(data.snapshot);
+    } catch (err) {
+      this._setChatStatus("取消失败: " + err.message, true);
+    }
+  },
+
+  async logout() {
+    if (!confirm("确认退出登录？已保存的凭证将被删除，下次需要重新扫码。")) return;
+    try {
+      const r = await fetch(API_PREFIX + "/wechat/logout", { method: "POST" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      if (data.snapshot) this._applySnapshot(data.snapshot);
+      else await this.load();
+      this._setChatStatus("已退出登录");
+    } catch (err) {
+      this._setChatStatus("退出失败: " + err.message, true);
+    }
+  },
+
+  async send() {
+    const textEl = document.getElementById("imb-text-input");
+    if (!textEl) return;
+    // The receiver is locked to the bot's own user_id — the dialog
+    // exists to verify the SDK's round-trip, not to message arbitrary
+    // users. We accept whatever the backend has for ``user_id``; the
+    // send button is disabled when it's null so this branch is rare.
+    const userId = (this.snapshot && this.snapshot.user_id) || "";
+    const text = textEl.value;
+    if (!userId) {
+      this._setChatStatus("未登录，无法发送", true);
+      return;
+    }
+    if (!text.trim()) {
+      this._setChatStatus("消息内容不能为空", true);
+      textEl.focus();
+      return;
+    }
+    const btn = document.getElementById("imb-send-btn");
+    if (btn) btn.disabled = true;
+    this._setChatStatus("发送中…");
+    try {
+      const r = await fetch(API_PREFIX + "/wechat/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, text: text }),
+      });
+      if (!r.ok) {
+        let detail = "HTTP " + r.status;
+        try {
+          const errBody = await r.json();
+          if (errBody && errBody.detail) detail = errBody.detail;
+        } catch (_) { /* ignore */ }
+        throw new Error(detail);
+      }
+      textEl.value = "";
+      this._setChatStatus("已发送");
+    } catch (err) {
+      this._setChatStatus("发送失败: " + err.message, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  },
+
+  _fmtTime(ms) {
+    if (!ms) return "";
+    const d = new Date(ms);
+    const pad = (n) => (n < 10 ? "0" + n : "" + n);
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  },
+
+  _esc(s) {
+    return String(s == null ? "" : s)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")

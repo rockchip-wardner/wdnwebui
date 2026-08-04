@@ -737,3 +737,82 @@ rkai ``@Callable`` 工具集合，**不**进入视频监控 (16 路) — 那条
 会重新触发同一路径（`DELETE /api/compute/instances` + `POST`），不
 需要重启服务。
 
+## Im-bridge page (应用对接 — 微信 iLink)
+
+`#page-im-bridge` 拆成两块：左侧登录面板 + 右侧调试收发对话
+（user_id 下拉 + 文本框 + 消息列表）。底层走 [`wechatbot-sdk` 0.3.0](https://www.wechatbot.dev/zh/python)，
+但调用入口是 `.venv/src/wdiot/src/wdiot/wechat.py` 里 `wdiot.Wechat` 的
+**同步门面**（自带 daemon-thread asyncio loop），不是直接 `await` SDK。
+
+* **服务** (`app/services/wechat.py`)：
+  - 单例 `_WechatManager`（lazy，``get_wechat()``），内部持一个 `wdiot.Wechat`。
+  - 后台线程 1Hz 轮询 `login_status()`，状态变化时 push 给 WS 订阅者；
+    新入站消息通过 `register_message_handler` 立即触发推送，不等下一轮。
+  - 内存里维护最近 200 条消息（in/out 各保留）+ 已知 user_id 集合。
+  - **不自动 start()** —— 必须由 UI 点 登录 才进入 long-poll。凭证存在
+    也只存不启动，决策与 `ComputeRegistry` "boot 不自动加载" 一致。
+  - ``close_wechat()`` 用于 app shutdown；如果 manager 从未被创建过
+    （用户从来没进过 im-bridge 页面）则是 no-op，避免空跑 daemon loop。
+
+* **API** (`app/api/wechat.py`)：
+
+  | Method | Path | 用途 |
+  |---|---|---|
+  | `GET`  | `/api/wechat`              | snapshot：state + qr_url + recent + known_users |
+  | `GET`  | `/api/wechat/users`        | 已知 user_id 列表 |
+  | `GET`  | `/api/wechat/runtime`      | SDK 版本 + available 标志（前端 "SDK" 行展示） |
+  | `POST` | `/api/wechat/login` `{force?: bool}` | 触发 QR 登录 |
+  | `POST` | `/api/wechat/cancel-login` | 取消正在进行的 QR 流程 |
+  | `POST` | `/api/wechat/logout`       | 删凭证 + 停 bot |
+  | `POST` | `/api/wechat/send` `{user_id, text}` | 发文本；`NoContextError` → 400 |
+  | `WS`   | `/api/wechat/ws`           | 推 `snapshot` / `state` (diff) / `message` 帧 |
+
+  - send 端点对 `wechatbot.NoContextError` 返回 400 并附中文提示（"该用户
+    尚未向你发送过消息，context_token 未建立"）；其他错误 502。
+  - WS 握手后**立刻**推一帧 `{"type":"snapshot", "snapshot":...}` 让客户端
+    无需额外 GET 也能 hydrate。
+
+* **前端** (`app/static/js/app.js` `ImBridge` 模块 + `#page-im-bridge`):
+  - 左侧：登录按钮 / 取消 / 退出 + 凭证路径 + user_id + long-poll 状态
+    + SDK 版本 + QR `<svg>` 渲染（vendored Kazuhiko Arase
+    `qrcode-generator` 1.4.4，MIT，文件 `app/static/js/qrcode.js`，**不**
+    引外部 CDN 也不增加 Python 依赖）。
+  - 右侧：user_id `<datalist>` 下拉 + 文本框 + 发送按钮（Cmd/Ctrl+Enter
+    触发）；消息列表按 user_id 过滤，in/out 分色（`imb-msg--in` /
+    `imb-msg--out`）。
+  - WS 自动重连 + 指数退避（与 TTS / VD 一致）。
+  - 状态徽章按 `login_state` 上色：未登录（灰）/ 等待扫码（黄）/ 已扫码
+    （蓝）/ 已登录（绿）/ 过期 / 错误（红）。
+
+* **消息流**：
+  ```text
+  [微信用户扫码]
+      ↓ SDK 推送 QR URL → on_qr_url
+  wdiot.Wechat._qr_url set, login_state=awaiting_scan
+      ↓ 1Hz 轮询 + 回调即推
+  _WechatManager._push_state_diff → WS broadcast {type:"state", state:{login_state:..., qr_url:...}}
+      ↓ 前端 _renderQr() 用 qrcode-generator 把 URL 渲染成 <svg>
+  [用户在手机点确认]
+      ↓ SDK 回调 on_scanned → on_confirmed → bot.start() 自动起 long-poll
+  login_state=confirmed + started=True
+      ↓ [用户A 发消息]
+  wechatbot bot._dispatch(msg) → wdiot._on_incoming → _WechatManager._handle_incoming
+      ↓ _push_state_diff → WS broadcast {type:"message", message:{direction:"in", ...}}
+      ↓ 前端 _recordMessage + _renderChat → 追加到列表
+  [用户点发送]
+      ↓ POST /api/wechat/send
+  wdiot.Wechat.send_text → wechatbot.bot.send(user_id, text)
+      ↓ SDK _send_content + _send_text
+      ↓ wdiot._record_outbound → _push_state_diff → WS broadcast {type:"message", direction:"out"}
+  ```
+
+* **凭证路径** = `~/.wechatbot/credentials.json`（`wdiot.wechat.DEFAULT_CRED_PATH`），
+  也可设 `WDIOT_WECHAT_CRED_PATH` 环境变量覆盖。这是 SDK 默认路径，
+  多 pyrkaiweb 实例不会冲突。
+
+* **资源预算** —— `wdiot.Wechat` 单实例长期驻留一个 daemon thread + 一个
+  aiohttp 连接池；未登录时 SDK 不会建任何连接（`bot.login()` 之前
+  `_api` 只在 `poll_qr_status` 时拉 HTTP）。登录失败 / QR 过期 → SDK
+  内部走 `MAX_QR_REFRESH_COUNT=3` 轮后抛 `AuthError`，wrapper 把
+  `login_state` 切到 `error`，UI 看到红色徽章 + 点 登录 重试。
+
