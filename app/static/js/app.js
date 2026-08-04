@@ -1806,6 +1806,8 @@ function onLogsFilterChanged() {
 const Base = {
   initialized: false,
   dirty: false,
+  // 缓存 HW capability 当前状态（DOM 改 checkbox 时同步到此结构）
+  _hwCaps: [],
 
   init() {
     if (this.initialized) return;
@@ -1822,6 +1824,9 @@ const Base = {
     form.addEventListener("input", () => {
       this.dirty = true;
       this.updateFieldStatus();
+    });
+    form.addEventListener("change", () => {
+      this.dirty = true;
     });
 
     if (form) {
@@ -1840,6 +1845,18 @@ const Base = {
       this.render(data);
     } catch (e) {
       this.setFoot("加载失败: " + e.message, "danger");
+    }
+    // 异步拉 HW capability 状态并渲染到系统配置页
+    try {
+      const r2 = await fetch(API_PREFIX + "/compute/capabilities");
+      if (r2.ok) {
+        const caps = (await r2.json()).hw_capabilities || [];
+        this.renderHwCaps(caps);
+      } else {
+        this.renderHwCapsError("加载失败: HTTP " + r2.status);
+      }
+    } catch (e2) {
+      this.renderHwCapsError("加载失败: " + e2.message);
     }
   },
 
@@ -1862,6 +1879,42 @@ const Base = {
     this.updateFieldStatus(data.model_path_exists);
     this.updateResourceDirStatus(data.resource_dir_exists);
     this.setFoot("", "");
+  },
+
+  renderHwCaps(caps) {
+    this._hwCaps = caps.map((c) => ({ ...c }));
+    const root = document.getElementById("bc-hw-caps-list");
+    if (!root) return;
+    if (!caps.length) {
+      root.innerHTML = `<div class="bc-status">无可配置项</div>`;
+      return;
+    }
+    root.innerHTML = "";
+    for (const c of this._hwCaps) {
+      const card = document.createElement("label");
+      card.className = "bc-hw-cap";
+      card.dataset.cap = c.capability_type;
+      card.innerHTML = `
+        <input type="checkbox" ${c.enabled ? "checked" : ""} />
+        <div class="bc-hw-cap-body">
+          <div class="bc-hw-cap-title">${c.label}</div>
+          <div class="bc-hw-cap-type">${c.capability_type} · ${c.class_name}</div>
+          <div class="bc-hw-cap-desc">${c.description}</div>
+        </div>
+      `;
+      const cb = card.querySelector('input[type="checkbox"]');
+      cb.addEventListener("change", () => {
+        c.enabled = cb.checked;
+        this.dirty = true;
+      });
+      root.appendChild(card);
+    }
+  },
+
+  renderHwCapsError(msg) {
+    const root = document.getElementById("bc-hw-caps-list");
+    if (!root) return;
+    root.innerHTML = `<div class="bc-status danger">${msg}</div>`;
   },
 
   updateFieldStatus(existsOverride) {
@@ -1980,6 +2033,33 @@ const Base = {
       const parts = [];
       parts.push(body.model_path_exists ? "模型目录存在" : "⚠ 模型目录不存在");
       parts.push(body.resource_dir_exists ? "资源存放目录存在" : "⚠ 资源存放目录不存在");
+
+      // HW capability checkbox 持久化：与“注册发现”页共用同一个 endpoint。
+      // 只在有本地缓存时才发请求（首次加载后才有 _hwCaps）。
+      if (this._hwCaps && this._hwCaps.length) {
+        const updates = {};
+        for (const c of this._hwCaps) updates[c.capability_type] = !!c.enabled;
+        try {
+          const r2 = await fetch(API_PREFIX + "/compute/hardware-capabilities", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ updates }),
+          });
+          if (r2.ok) {
+            const body2 = await r2.json();
+            if (Array.isArray(body2.hw_capabilities)) {
+              this._hwCaps = body2.hw_capabilities.map((c) => ({ ...c }));
+              this.renderHwCaps(this._hwCaps);
+            }
+            parts.push(`硬件能力已保存（${body2.applied.length} 项）`);
+          } else {
+            parts.push("⚠ 硬件能力保存失败");
+          }
+        } catch {
+          parts.push("⚠ 硬件能力保存失败");
+        }
+      }
+
       this.setFoot("已保存（" + parts.join(" · ") + "）", "ok");
     } catch (e) {
       this.setFoot("保存失败: " + e.message, "danger");
@@ -2077,13 +2157,6 @@ async function loadPageData(name) {
     return;
   }
 
-  if (name === "tools") {
-    Tools.init();
-    await Tools.load();
-    Tools.startTicking();
-    return;
-  }
-
   if (name === "discovery") {
     await Discovery.load();
     return;
@@ -2109,9 +2182,6 @@ function showPage(name) {
   const prev = currentPage();
   if (prev === "compute-config" && name !== "compute-config") {
     ComputeConfigPage.stopTicking();
-  }
-  if (prev === "tools" && name !== "tools") {
-    Tools.stopTicking();
   }
   document.querySelectorAll(".page").forEach(p => {
     p.classList.toggle("hidden", p.dataset.page !== name);
@@ -3423,6 +3493,7 @@ const ComputeConfigPage = {
     this._renderCols();
     this._renderSummary();
     this._renderModelStates(this._snapshot);
+    this._renderTools(this._snapshot);
   },
 
   _renderCols() {
@@ -3475,11 +3546,11 @@ const ComputeConfigPage = {
     const body = document.createElement("div");
     body.className = "cc-col-body";
     if (npuIndex === null || npuIndex === undefined) {
-      // RK3588 —— 占位
-      const ph = document.createElement("div");
-      ph.className = "cc-placeholder";
-      ph.textContent = "占位 — 未来将列出主控上能运行的模型列表";
-      body.appendChild(ph);
+      // RK3588 —— 列出内置工具（默认启用，仅展示依赖状态，不可禁用）。
+      const ul = document.createElement("ul");
+      ul.className = "cc-tools-list";
+      ul.id = "cc-tools-list";
+      body.appendChild(ul);
     } else if (missing) {
       // 这张 182x 卡没检测到
       const ph = document.createElement("div");
@@ -3631,6 +3702,63 @@ const ComputeConfigPage = {
     return 0;
   },
 
+  // 渲染 RK3588 列的内置工具列表（从 snapshot.tools 取数据）。
+  // 默认全部启用 —— 用户不能从这一列 toggle；可用性仅取决于依赖 capability 是否启用。
+  _renderTools(snapshot) {
+    const ul = document.getElementById("cc-tools-list");
+    if (!ul) return;
+    const tools = (snapshot && snapshot.tools) || [];
+    ul.innerHTML = "";
+    if (!tools.length) {
+      const empty = document.createElement("li");
+      empty.className = "cc-tools-empty";
+      empty.textContent = "当前没有可用工具";
+      ul.appendChild(empty);
+      return;
+    }
+    for (const t of tools) {
+      const li = document.createElement("li");
+      li.className = "cc-tool-card";
+      const head = document.createElement("div");
+      head.className = "cc-tool-card-head";
+      const name = document.createElement("span");
+      name.className = "cc-tool-card-name";
+      name.textContent = t.name;
+      const key = document.createElement("span");
+      key.className = "cc-tool-card-key";
+      key.textContent = t.key;
+      const badge = document.createElement("span");
+      badge.className = "cc-tool-card-badge is-on";
+      badge.textContent = "已启用";
+      head.appendChild(name);
+      head.appendChild(key);
+      head.appendChild(badge);
+      const desc = document.createElement("div");
+      desc.className = "cc-tool-card-desc";
+      desc.textContent = t.description;
+      const state = document.createElement("div");
+      if (t.requires_capability) {
+        if (t.available) {
+          state.className = "cc-tool-card-state is-ok";
+          state.textContent = `✓ 可用 · 依赖 ${t.requires_capability}`;
+        } else {
+          state.className = "cc-tool-card-state is-bad";
+          state.textContent = `⚠ 依赖未启用 · ${t.reason || t.requires_capability}`;
+          badge.classList.remove("is-on");
+          badge.classList.add("is-off");
+          badge.textContent = "不可用";
+        }
+      } else {
+        state.className = "cc-tool-card-state is-neutral";
+        state.textContent = "无外部依赖";
+      }
+      li.appendChild(head);
+      li.appendChild(desc);
+      li.appendChild(state);
+      ul.appendChild(li);
+    }
+  },
+
   _renderSummary() {
     const snap = this._snapshot || {};
     const cards = snap.cards || [];
@@ -3671,7 +3799,25 @@ const ComputeConfigPage = {
  * 注册发现 (Discovery) page — 读 registry，不调 wdiot              *
  * ---------------------------------------------------------------- */
 const Discovery = {
+  // 缓存上一次 HW 渲染状态（用户改 checkbox 但未保存时需要回填 / diff）
+  _hwCaps: [],
+  _hwDirty: false,
+
+  init() {
+    if (this.initialized) return;
+    this.initialized = true;
+
+    const enableAll  = document.getElementById("discovery-hw-enable-all");
+    const disableAll = document.getElementById("discovery-hw-disable-all");
+    const saveBtn    = document.getElementById("discovery-hw-save");
+
+    if (enableAll)  enableAll .addEventListener("click", () => this.setAllHw(true));
+    if (disableAll) disableAll.addEventListener("click", () => this.setAllHw(false));
+    if (saveBtn)    saveBtn   .addEventListener("click", () => this.saveHw());
+  },
+
   async load() {
+    this.init();
     try {
       const r = await fetch(API_PREFIX + "/compute/capabilities");
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -3684,16 +3830,27 @@ const Discovery = {
   },
 
   render(data) {
+    const swCaps = (data && data.sw_capabilities) || [];
+    const hwCaps = (data && data.hw_capabilities) || [];
+
+    this._hwCaps = hwCaps.map((c) => ({ ...c }));
+    this._hwDirty = false;
+    this._renderHwPane();
+    this._renderSwPane(swCaps);
+  },
+
+  _renderSwPane(caps) {
     const at = document.getElementById("discovery-collected-at");
     const list = document.getElementById("discovery-list");
-    const summary = document.getElementById("discovery-summary");
+    const summary = document.getElementById("discovery-sw-summary");
+    const hint = document.getElementById("discovery-sw-hint");
     if (!list) return;
-    const caps = (data && data.capabilities) || [];
-    if (at) at.textContent = `${caps.length} 个 capability`;
+    if (hint) hint.textContent = `${caps.length} 个 SW capability`;
+    if (at) at.textContent = `SW ${caps.length} · HW ${this._hwCaps.length}`;
     if (summary) {
       summary.textContent = caps.length === 0
-        ? "当前没有活跃的 capability —— 到 算力配置 启用模型后这里会显示。"
-        : "当前本机暴露的 capability 列表（用于注册发现）。";
+        ? "当前没有 SW capability —— 到 算力配置 启用模型后这里会显示。"
+        : "运行中实例暴露的软件能力（SW）。每个能力由一个 RKNN 模型承载。";
     }
     if (caps.length === 0) {
       list.innerHTML = `
@@ -3724,109 +3881,111 @@ const Discovery = {
       list.appendChild(card);
     }
   },
-};
 
-/* ------------------------------------------------------------------ *
- *  工具列表 (Tools) page — sidebar entry between 算力配置 and 视频监控.  *
- *  Renders the registry's tool cards + per-tool capability status;     *
- *  polls /api/tools every 2s so enabling/disabling compute instances   *
- *  on the 算力配置 page reflects here without a manual refresh.        *
- * ------------------------------------------------------------------ */
-const Tools = {
-  initialized: false,
-  _tickHandle: null,
-  _loading: false,
-  _lastData: null,
-
-  init() {
-    if (this.initialized) return;
-    this.initialized = true;
-    document.getElementById("tools-refresh")?.addEventListener("click", () => this.load());
-  },
-
-  async load() {
-    if (this._loading) return;
-    this._loading = true;
-    try {
-      const r = await fetch(API_PREFIX + "/tools", { cache: "no-store" });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const data = await r.json();
-      this._lastData = data;
-      this.render(data);
-    } catch (e) {
-      const list = document.getElementById("tools-list");
-      if (list) {
-        list.innerHTML = `<div class="tools-empty danger">加载失败: ${e.message}</div>`;
-      }
-    } finally {
-      this._loading = false;
-    }
-  },
-
-  startTicking() {
-    if (this._tickHandle) return;
-    this._tickHandle = setInterval(() => this.load(), 2000);
-  },
-
-  stopTicking() {
-    if (this._tickHandle) {
-      clearInterval(this._tickHandle);
-      this._tickHandle = null;
-    }
-  },
-
-  render(data) {
-    const list = document.getElementById("tools-list");
-    const collectedAt = document.getElementById("tools-collected-at");
-    const payload = document.getElementById("data-tools");
+  _renderHwPane() {
+    const list = document.getElementById("discovery-hw-list");
+    const summary = document.getElementById("discovery-hw-summary");
+    const hint = document.getElementById("discovery-hw-hint");
+    const saveBtn = document.getElementById("discovery-hw-save");
     if (!list) return;
-    const tools = (data && data.tools) || [];
-    list.innerHTML = "";
-    if (!tools.length) {
-      list.innerHTML = `<div class="tools-empty">当前没有可用工具</div>`;
+
+    const enabledCount = this._hwCaps.filter((c) => c.enabled).length;
+    if (hint) hint.textContent = `${enabledCount} / ${this._hwCaps.length} 已启用`;
+    if (summary) {
+      summary.textContent = this._hwDirty
+        ? "有未保存的修改 —— 点“保存修改”写入 config.json。"
+        : "本机硬件能力（HW）配置；勾选/取消勾选后保存即生效。";
     }
-    for (const t of tools) {
+    if (saveBtn) {
+      saveBtn.disabled = !this._hwDirty;
+      saveBtn.classList.toggle("vd-btn-primary", this._hwDirty);
+    }
+
+    list.innerHTML = "";
+    for (const c of this._hwCaps) {
       const card = document.createElement("article");
-      card.className = "tool-card";
-      const head = document.createElement("div");
-      head.className = "tool-card-head";
-      const name = document.createElement("span");
-      name.className = "tool-card-name";
-      name.textContent = t.name;
-      const key = document.createElement("span");
-      key.className = "tool-card-key";
-      key.textContent = t.key;
-      head.appendChild(name);
-      head.appendChild(key);
-      const desc = document.createElement("div");
-      desc.className = "tool-card-desc";
-      desc.textContent = t.description;
-      const state = document.createElement("div");
-      state.className = "tool-card-state";
-      if (t.requires_capability) {
-        if (t.available) {
-          state.classList.add("is-ok");
-          state.textContent = `✓ 可用 · 依赖 ${t.requires_capability}`;
-        } else {
-          state.classList.add("is-bad");
-          state.textContent = `⚠ 未启用 · ${t.reason || "依赖未启用"}`;
-        }
-      } else {
-        state.classList.add("is-neutral");
-        state.textContent = "无外部依赖";
-      }
-      card.appendChild(head);
-      card.appendChild(desc);
-      card.appendChild(state);
+      card.className = "discovery-card" + (c.enabled ? "" : " is-disabled");
+      card.dataset.cap = c.capability_type;
+      card.innerHTML = `
+        <header class="discovery-card-head">
+          <span class="discovery-cap-type is-hw">${c.capability_type}</span>
+          <code class="discovery-cap-name">${c.class_name}</code>
+          <label class="toggle" title="${c.enabled ? "点击禁用" : "点击启用"}">
+            <input type="checkbox" ${c.enabled ? "checked" : ""} />
+            <span class="toggle-track"></span>
+          </label>
+        </header>
+        <div class="discovery-card-meta">
+          <span>类别：<strong>${c.category}</strong></span>
+          <span class="discovery-card-status ${c.enabled ? "is-on" : "is-off"}">${c.enabled ? "已启用" : "已禁用"}</span>
+        </div>
+        <div class="discovery-card-desc">${c.description}</div>
+      `;
+      const cb = card.querySelector('input[type="checkbox"]');
+      cb.addEventListener("change", () => {
+        c.enabled = cb.checked;
+        card.classList.toggle("is-disabled", !c.enabled);
+        const status = card.querySelector(".discovery-card-status");
+        status.textContent = c.enabled ? "已启用" : "已禁用";
+        status.classList.toggle("is-on", c.enabled);
+        status.classList.toggle("is-off", !c.enabled);
+        cb.parentElement.title = c.enabled ? "点击禁用" : "点击启用";
+        this._hwDirty = true;
+        this._renderHwPane();
+      });
       list.appendChild(card);
     }
-    if (collectedAt) {
-      const d = new Date();
-      const pad = (n) => String(n).padStart(2, "0");
-      collectedAt.textContent =
-        `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  },
+
+  setAllHw(value) {
+    for (const c of this._hwCaps) c.enabled = !!value;
+    this._hwDirty = true;
+    this._renderHwPane();
+  },
+
+  async saveHw() {
+    const saveBtn = document.getElementById("discovery-hw-save");
+    if (saveBtn) saveBtn.disabled = true;
+    const updates = {};
+    for (const c of this._hwCaps) updates[c.capability_type] = !!c.enabled;
+    try {
+      const r = await fetch(API_PREFIX + "/compute/hardware-capabilities", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates }),
+      });
+      const text = await r.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = { detail: text }; }
+      if (!r.ok) {
+        const msg = body.detail || ("HTTP " + r.status);
+        const summary = document.getElementById("discovery-hw-summary");
+        if (summary) {
+          summary.textContent = "保存失败: " + msg;
+          summary.classList.add("danger");
+        }
+        return;
+      }
+      // 用服务端权威响应回填（含 rejected 等）
+      if (Array.isArray(body.hw_capabilities)) {
+        this._hwCaps = body.hw_capabilities.map((c) => ({ ...c }));
+      }
+      this._hwDirty = false;
+      this._renderHwPane();
+      const summary = document.getElementById("discovery-hw-summary");
+      if (summary) {
+        summary.classList.remove("danger");
+        summary.textContent = `已保存 · applied=${body.applied.length} rejected=${body.rejected.length}`;
+      }
+    } catch (e) {
+      const summary = document.getElementById("discovery-hw-summary");
+      if (summary) {
+        summary.textContent = "保存失败: " + e.message;
+        summary.classList.add("danger");
+      }
+    } finally {
+      if (saveBtn) saveBtn.disabled = !this._hwDirty;
     }
-    if (payload) payload.textContent = JSON.stringify(data, null, 2);
   },
 };
 

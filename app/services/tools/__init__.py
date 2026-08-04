@@ -3,7 +3,7 @@
 一个内置工具：
 
 * ``tts_alert``     — 语音提醒工具：模型给出文本，触发 TtsSession
-  在本机播放；依赖 ``audio_output`` capability。
+  在本机播放；依赖 ``swcap_audio_tts`` capability。
 
 工具按 ``@Callable`` 协议暴露给 rkai，会话模型选中时 SDK 返回一个
 已填充字段的实例，detector 再执行 ``instance(frame, ctx)`` 拿到

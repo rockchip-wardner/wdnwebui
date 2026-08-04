@@ -7,10 +7,10 @@
 能力门控：
 
 * ``RkaiDetector._infer_sync`` 已经在 worker 内先做了一次
-  ``get_registry().get_session("video_query")`` 校验；
+  ``get_registry().get_session("swcap_video_describe")`` 校验；
 * TTS 工具启用时，本 ``__call__`` 仍会再做一次 capability
-  检查（``get_session("audio_output")``），未启用则直接抛
-  ``RuntimeError("功能未启用: audio_output")``，由 detector
+  检查（``get_session("swcap_audio_tts")``），未启用则直接抛
+  ``RuntimeError("功能未启用: swcap_audio_tts")``，由 detector
   写入 ``DetectorEvent(level="error")``。
 """
 from __future__ import annotations
@@ -43,10 +43,10 @@ class TtsAlert:
         if not text:
             return {"text": "", "played": False, "error": "text 为空"}
 
-        # 能力门控：未启用 audio_output → 抛错，由 detector 写入错误事件。
+        # 能力门控：未启用 swcap_audio_tts → 抛错，由 detector 写入错误事件。
         from app.services.compute_registry import get_registry
         try:
-            get_registry().get_session("audio_output")
+            get_registry().get_session("swcap_audio_tts")
         except RuntimeError as e:
             raise RuntimeError(str(e)) from e
 

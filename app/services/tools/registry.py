@@ -142,7 +142,7 @@ def get_tool_registry() -> ToolRegistry:
                     "语音提醒工具：检测到需要立即提醒的场景时调用，"
                     "传入提醒文本，将通过 Qwen3-TTS 在本机播放。"
                 ),
-                requires_capability="audio_output",
+                requires_capability="swcap_audio_tts",
                 tool_class=TtsAlert,
             )
             _registry = reg

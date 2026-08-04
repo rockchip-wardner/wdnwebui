@@ -213,7 +213,7 @@ class RkaiDetector:
     def snapshot(self) -> dict:
         from app.services.compute_registry import get_registry
         try:
-            sess = get_registry().get_session("video_query")
+            sess = get_registry().get_session("swcap_video_describe")
             session_ready = sess is not None
             session_error = ""
         except RuntimeError as e:
@@ -255,7 +255,7 @@ class RkaiDetector:
         # 前端能区分"功能未启用"和"运行时错误"。
         from app.services.compute_registry import get_registry
         try:
-            get_registry().get_session("video_query")
+            get_registry().get_session("swcap_video_describe")
         except RuntimeError as e:
             raise RuntimeError(str(e))
         # 工具依赖的 capability 校验（双层防护第二层）
@@ -367,7 +367,7 @@ class RkaiDetector:
         """One synchronous inference call against the v2 SDK surface.
 
         LLMSession 由 ComputeRegistry 统一管理（"算力配置"页面启用）。
-        找不到 video_query capability → 报错 "功能未启用"。
+        找不到 swcap_video_describe capability → 报错 "功能未启用"。
 
         工具调用：模型可选中 ``@Callable`` 工具（tts_alert），SDK
         返回一个已填充字段的实例；``RkaiDetector`` 自己 ``__call__``
@@ -375,7 +375,7 @@ class RkaiDetector:
         """
         try:
             from app.services.compute_registry import get_registry
-            sess = get_registry().get_session("video_query")
+            sess = get_registry().get_session("swcap_video_describe")
         except RuntimeError as e:
             return DetectorEvent(
                 id=-1,

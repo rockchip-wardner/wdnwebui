@@ -26,7 +26,6 @@
       <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
       <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
       <a href="#compute-config"  data-page="compute-config"  class="nav-item">算力配置</a>
-      <a href="#tools"           data-page="tools"           class="nav-item">工具列表</a>
       <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
       <a href="#im-bridge"       data-page="im-bridge"       class="nav-item">应用对接</a>
       <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
@@ -244,6 +243,19 @@
             </div>
           </section>
 
+          <section class="bc-section" id="bc-hw-caps-section">
+            <header class="bc-section-head">
+              <h3>硬件能力 (HW)</h3>
+              <span class="bc-hint">本机对外公开的硬件能力；与“注册发现”页同步。</span>
+            </header>
+            <div class="bc-hw-caps-list" id="bc-hw-caps-list">
+              <div class="bc-status">加载中…</div>
+            </div>
+            <div class="bc-meta">
+              <span class="bc-hint">取消勾选会从 <code>config.json["compute"]["hardware_capabilities"]</code> 中写入 <code>false</code>；保存后立即生效。</span>
+            </div>
+          </section>
+
           <div class="bc-actions">
             <span class="vd-spacer"></span>
             <button type="button" class="vd-btn" id="bc-reload">放弃修改</button>
@@ -272,29 +284,6 @@
         <div class="cc-foot" id="cc-foot"></div>
       </section>
 
-      <section id="page-tools" class="page hidden" data-page="tools">
-        <header class="page-header">
-          <h2>工具列表</h2>
-          <div class="header-meta">
-            <span class="collected-at" id="tools-collected-at">--</span>
-            <button class="refresh-btn" id="tools-refresh">刷新</button>
-          </div>
-        </header>
-
-        <div class="tools-hint">
-          当前内置工具集合，可在音视频描述页面右侧勾选使用。工具运行依赖的算力（VLM / TTS 等）必须在“算力配置”页启用；未启用时该工具会显示为灰色不可用。
-        </div>
-
-        <div class="tools-list" id="tools-list">
-          <div class="tools-empty">加载中…</div>
-        </div>
-
-        <details class="raw-output">
-          <summary>完整 JSON</summary>
-          <pre class="payload" id="data-tools"></pre>
-        </details>
-      </section>
-
       <section id="page-discovery" class="page hidden" data-page="discovery">
         <header class="page-header">
           <h2>注册发现</h2>
@@ -303,16 +292,37 @@
             <button class="refresh-btn" id="discovery-refresh">刷新</button>
           </div>
         </header>
-        <div class="discovery-summary" id="discovery-summary"></div>
-        <div class="discovery-list" id="discovery-list">
-          <div class="page-placeholder">
-            <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
-            <div class="page-placeholder-title">等待算力实例</div>
-            <div class="page-placeholder-text">
-              启用 算力配置 中的实例后，这里会列出对应的能力。
+
+        <section class="discovery-pane" data-pane="hw">
+          <header class="discovery-pane-head">
+            <h3>硬件能力 (HW)</h3>
+            <span class="discovery-pane-hint" id="discovery-hw-hint">--</span>
+            <div class="discovery-pane-actions">
+              <button class="vd-btn" id="discovery-hw-enable-all">全部启用</button>
+              <button class="vd-btn" id="discovery-hw-disable-all">全部禁用</button>
+              <button class="vd-btn vd-btn-primary" id="discovery-hw-save">保存修改</button>
+            </div>
+          </header>
+          <div class="discovery-summary" id="discovery-hw-summary"></div>
+          <div class="discovery-list" id="discovery-hw-list"></div>
+        </section>
+
+        <section class="discovery-pane" data-pane="sw">
+          <header class="discovery-pane-head">
+            <h3>软件能力 (SW)</h3>
+            <span class="discovery-pane-hint" id="discovery-sw-hint">--</span>
+          </header>
+          <div class="discovery-summary" id="discovery-sw-summary"></div>
+          <div class="discovery-list" id="discovery-list">
+            <div class="page-placeholder">
+              <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
+              <div class="page-placeholder-title">等待算力实例</div>
+              <div class="page-placeholder-text">
+                启用 算力配置 中的实例后，这里会列出对应的能力。
+              </div>
             </div>
           </div>
-        </div>
+        </section>
       </section>
 
       <section id="page-im-bridge" class="page hidden" data-page="im-bridge">

@@ -417,8 +417,8 @@ holds it in memory. The file is seeded with a `base` section at
   启动 **不阻塞 UI**：`apply_boot_config_async()` 起一个 daemon thread
   串行加载；UI 通过 `GET /api/compute` 每秒轮询状态，queued / loading
   实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL = 8s`）。
-  Capability 概念作为内部 key 使用（`get_session("video_query")` /
-  `"audio_output"`），**这一轮不做** wdiot 真实注册发现；discovery
+  Capability 概念作为内部 key 使用（`get_session("swcap_video_describe")` /
+  `"swcap_audio_tts"`），**这一轮不做** wdiot 真实注册发现；discovery
   页面只读 registry 内存状态。
 
 ## System logs page
@@ -505,7 +505,7 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   `POST /api/compute/instances` / `start_one` 写到 `inst.model`，
   重启后配置保留，但**不会**自动启动 —— 用户必须从算力配置页手动启用。
   Detector 等消费方在第一次 inference 时才调
-  `get_registry().get_session("video_query")`—— registry 还是空就会抛
+  `get_registry().get_session("swcap_video_describe")`—— registry 还是空就会抛
   "功能未启用"，这是预期行为（不是 bug）。
 - **`apply_boot_config_async` 的后台线程只在 reload 模式下被杀掉**：
   uvicorn `reload=True` 重启父进程时 daemon thread 跟着挂掉；
@@ -631,9 +631,15 @@ rkai ``@Callable`` 工具集合，**不**进入视频监控 (16 路) — 那条
   WS（事件类型仍是 ``type:"event"``，仅追加字段），前端在
   ``#vd-canvas`` 之上叠 ``<svg viewBox="0 0 1000 1000">``，
   ``rect`` 5 秒后淡出。**不下发裁剪图**。
-* **新页面 “工具列表”**：sidebar 顺序
-  系统信息 / 系统配置 / 算力配置 / **工具列表** / 视频监控 …；
-  2 秒轮询 ``GET /api/tools``，能力启用状态变化无需手动刷新。
+* **工具列表已并入算力配置页 RK3588 列**：原 ``#page-tools`` 页面与
+  ``GET /api/tools`` 端点都已移除；工具元数据现通过
+  ``GET /api/compute`` snapshot 的 ``tools`` 字段返回（懒导入
+  ``app.services.tools``，避免在 compute 模块加载时触发 rkai 装饰器）。
+  RK3588 列只读展示：默认全部"已启用"badge，依赖 capability
+  未启用时切到"不可用"红色 badge；该列不允许手动 toggle 工具，
+  仅作为状态展示。音视频描述页 / 视频目标检测页各自的 per-detector
+  工具勾选（``/api/video-detection/tools`` /
+  ``/api/video-target-detection/tools``）不受影响。
 
 
 ## LLMSession init 子进程隔离

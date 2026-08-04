@@ -11,8 +11,12 @@ Endpoints
 * ``POST   /api/compute/instances``  ``{npu_index, model}`` → live 启动（后台 worker
                                    真正加载）+ persist。
 * ``DELETE /api/compute/instances``  ``{npu_index, model}`` → live 停止 + persist。
-* ``GET    /api/compute/capabilities``  当前 running 实例的 capability 列表（discovery
-                                       页面渲染源）。
+* ``GET    /api/compute/capabilities``  discovery 页面渲染源 —— 拆分为
+                                       ``sw_capabilities``（running 实例暴露的 SW 能力）
+                                       + ``hw_capabilities``（来自 ``hardware_capabilities``
+                                       配置的静态 HW 能力 + enabled 状态）。
+* ``PUT    /api/compute/hardware-capabilities``  更新 HW 能力启用状态，persist 到
+                                              ``config.json["compute"]["hardware_capabilities"]``。
 * ``POST   /api/compute/stop-all``   全部停止 + 清空 config.json["compute"].instances。
 
 错误处理：
@@ -158,8 +162,64 @@ async def stop_instance(req: InstanceRequest) -> dict:
 
 @router.get("/compute/capabilities")
 async def get_capabilities() -> dict:
-    """当前 running 实例的 capability 列表（discovery 页面渲染源）。"""
-    return {"capabilities": get_registry().list_active_capabilities()}
+    """Discovery 页面渲染源 —— 拆分为 SW + HW 两部分。
+
+    * ``sw_capabilities`` 来自 running 实例（与之前一致）。
+    * ``hw_capabilities`` 来自 ``HARDWARE_CAPABILITIES`` 静态列表
+      + ``config.json["compute"]["hardware_capabilities"]`` 的 enabled 状态。
+    """
+    reg = get_registry()
+    return {
+        "sw_capabilities": reg.list_active_capabilities(),
+        "hw_capabilities": reg.list_hardware_capabilities(),
+    }
+
+
+class HardwareCapabilityUpdate(BaseModel):
+    """PUT /api/compute/hardware-capabilities 的请求体。
+
+    key 必须是已注册的 HW capability_type（如 ``hwcap_video_input``），
+    value 必须是严格的 bool（不接受字符串 / 数字 0/1 等的隐式转换）。
+    未知的 key 静默忽略（响应里 rejected 列出）。
+    """
+
+    model_config = {"extra": "ignore"}
+
+    updates: dict[str, bool] = Field(
+        default_factory=dict,
+        description="HW capability_type → enabled 映射。",
+    )
+
+    @field_validator("updates", mode="before")
+    @classmethod
+    def _strict_bools(cls, v):
+        # Pydantic 默认对 ``dict[str, bool]`` 做强制转换（任何 truthy 字符串
+        # / 非零数字都变 True），需要先在 raw input 阶段拦截，强制只接受 bool。
+        if not isinstance(v, dict):
+            raise ValueError("updates 必须是 object")
+        for k, val in v.items():
+            if not isinstance(val, bool):
+                # 显式拒绝 int / str / None 等 —— 即便它们"看起来像"bool。
+                # Pydantic v2 的 bool 字段如果允许 coerce 会把 'true' 当 True 用，
+                # 这对能力开关语义不安全。
+                raise ValueError(
+                    f"updates[{k!r}] 必须是 bool (true/false), got {type(val).__name__}"
+                )
+        return v
+
+
+@router.put("/compute/hardware-capabilities")
+async def put_hardware_capabilities(payload: HardwareCapabilityUpdate) -> dict:
+    """更新 HW 能力启用状态，落盘到 ``config.json["compute"]["hardware_capabilities"]``。"""
+    reg = get_registry()
+    result = reg.set_hardware_capability_state(payload.updates)
+    return {
+        "ok":       True,
+        "applied":   result["applied"],
+        "rejected":  result["rejected"],
+        "state":     result["state"],
+        "hw_capabilities": reg.list_hardware_capabilities(),
+    }
 
 
 @router.post("/compute/stop-all")
