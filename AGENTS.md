@@ -421,6 +421,78 @@ holds it in memory. The file is seeded with a `base` section at
   `"swcap_audio_tts"`），**这一轮不做** wdiot 真实注册发现；discovery
   页面只读 registry 内存状态。
 
+## Discovery page (注册发现)
+
+`#page-discovery` 内部按从上到下三个 pane 排布：
+
+1. **局域网设备 (LAN)** —— 新增，详见下文。
+2. **硬件能力 (HW)** —— 本机硬件能力开关，源自 `HARDWARE_CAPABILITIES` 静态表 +
+   `config.json["compute"]["hardware_capabilities"]` 启用状态。checkbox 修改后
+   点"保存修改"才落盘，避免误触。
+3. **软件能力 (SW)** —— 当前 running 实例暴露的能力（每条来自一个 RKNN 模型实例）。
+
+### 局域网设备 (LAN) 子面板
+
+LAN 子面板（`data-pane="lan"`）做同网段 pyrkaiweb 互相识别：
+
+* **开关 "在网注册"** —— 开启后：
+  * 后台线程（`lan-discovery-worker` daemon）周期性扫描本机所有 IPv4 私有 /24 子网；
+  * 对每个候选 host 做 TCP connect（端口 = `config.port`，默认 8000）+ HTTP
+    `GET /api/lan-discovery/announce`；
+  * 响应成功的设备写入内存表：`(ip, port) → LanDevice(device_name,
+    sw_capabilities, hw_capabilities, last_seen, last_rtt_ms, last_error)`；
+  * TTL 5 分钟 —— 连续 5 分钟没再扫到自动剔除，避免僵尸节点堆积。
+* **`PUT /api/lan-discovery`** `{enabled, port, scan_interval_seconds}`：
+  * `enabled` 一旦切到 `true`，内存里的旧设备列表会被清空，并立刻触发首轮扫描；
+  * 切到 `false` 后停止扫描，但内存里的设备保留供用户回顾；
+  * `port` 默认 8000，`scan_interval_seconds` 范围 5–600（默认 30）。
+* **`POST /api/lan-discovery/scan`** —— "立即扫描"按钮：不等 interval 到点，
+  立刻唤醒 worker；即使 `enabled=false` 也允许手动跑一次（用于临时探测）。
+* **`DELETE /api/lan-discovery/devices`** —— "清空列表"按钮，仅清内存，不动
+  enabled 开关与 config.json。
+* **`GET /api/lan-discovery/announce`** —— **永远可用**的对端探测接口，跟
+  `enabled` 无关。对端 pyrkaiweb 扫描时打这个 URL，本机返回
+  `{device_name, ip, sw_capabilities, hw_capabilities, timestamp,
+  protocol_version}`。device_name 来自 `config.json["base"]["device_name"]`，
+  capability 来自 `ComputeRegistry.list_active_capabilities()` +
+  `list_hardware_capabilities()`。
+* **`GET /api/lan-discovery`** —— Discovery 页每秒轮询的完整 snapshot：
+  `config / enabled / scanning / last_scan_started / last_scan_finished /
+  local_ips / subnets / hosts_per_subnet / devices[] / ttl_seconds /
+  probe_timeout_seconds / default_port`。
+* **持久化** —— `enabled / port / scan_interval_seconds` 写到
+  `config.json["compute"]["lan_discovery"]`，重启后保留 `enabled` 状态但**不会**
+  自动启动扫描线程（与 compute instances 一样，遵循
+  "boot 不自动加载"原则 —— 用户必须手动打开开关）。
+* **实现细节**：
+  * 子网枚举走 `psutil.net_if_addrs()`（已有依赖），过滤 loopback / link-local /
+    公网 IP；同一 /24 出现多次合并；本机 IP 自身从候选列表剔除。
+  * 并行探测用 `ThreadPoolExecutor(max_workers=64)`，单 host 超时 0.7s；
+    一轮 /24（253 主机）≈ 2.8s。
+  * TCP connect 失败直接返回（不浪费 HTTP 超时）；成功才发 HTTP。
+  * 失败的探测**不更新** `last_seen` —— 设备掉线后自然在 TTL 到期后从表里
+    剔除；`last_error` 字段保留最近一次的失败原因供 UI 展示。
+
+### Discovery 页前端模块拆分
+
+`app/static/js/app.js` 里 Discovery 相关代码分两个独立模块：
+
+* **`Discovery`** —— 注册发现页主入口。`load()` 拉 `/api/compute/capabilities`
+  渲染 HW + SW pane（一次拉取，不轮询）；HW pane 的 checkbox 修改是 dirty
+  状态，点"保存修改"才 PUT 到 `/api/compute/hardware-capabilities`。
+* **`DiscoveryLan`** —— LAN 子面板独立模块。`load()` 拉
+  `/api/lan-discovery`；进入页面后 `startTicking()` 起 1Hz 轮询，让
+  `scanning / last_seen / devices` 实时刷新；离开页面 `stopTicking()`
+  释放定时器。
+  * `onToggle()` 处理"在网注册"开关：PUT 时设 `_toggleInflight=true`
+    防止 1Hz 轮询在 PUT 完成前把乐观 UI 覆盖回旧值；失败回滚 checkbox。
+  * `scanNow()` / `clear()` 触发对应 POST / DELETE，失败写
+    `discovery-lan-summary` 红字提示。
+  * `render()` 把 snapshot 渲成 4 段 UI：toggle 状态 + hint（在网/总设备数）
+    + summary（扫描中 / 已发现 / 未启用）+ meta（本机 IP / 端口 / 间隔 / 子网）
+    + device 卡片（device_name + ip:port + 在线/离线 + RTT + 最近探测 +
+    SW/HW capability chips）。
+
 ## System logs page
 
 The `#page-system-logs` section is wired to `app/api/system_logs.py`,

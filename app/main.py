@@ -14,6 +14,7 @@ from app.api import (
     compute,
     config,
     coprocessor,
+    lan_discovery,
     power,
     system_logs,
     system_monitor,
@@ -79,6 +80,7 @@ def create_app() -> FastAPI:
     app.include_router(coprocessor.router, prefix="/api")
     app.include_router(tts.router, prefix="/api")
     app.include_router(compute.router, prefix="/api")
+    app.include_router(lan_discovery.router, prefix="/api")
     app.include_router(video_target_detection.router, prefix="/api")
 
     # 暂时关闭：boot 时**不**自动加载 config.json["compute"]["instances"]

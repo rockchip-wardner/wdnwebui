@@ -293,6 +293,33 @@
           </div>
         </header>
 
+        <section class="discovery-pane" data-pane="lan">
+          <header class="discovery-pane-head">
+            <h3>局域网设备 (LAN)</h3>
+            <span class="discovery-pane-hint" id="discovery-lan-hint">--</span>
+            <div class="discovery-pane-actions">
+              <label class="lan-toggle" title="在网注册：开启后周期性扫描本机所在 /24 子网">
+                <input type="checkbox" id="discovery-lan-toggle" />
+                <span class="lan-toggle-track"></span>
+                <span class="lan-toggle-label">在网注册</span>
+              </label>
+              <button class="vd-btn" id="discovery-lan-scan-now">立即扫描</button>
+              <button class="vd-btn" id="discovery-lan-clear">清空列表</button>
+            </div>
+          </header>
+          <div class="discovery-summary" id="discovery-lan-summary"></div>
+          <div class="discovery-lan-meta" id="discovery-lan-meta"></div>
+          <div class="discovery-list" id="discovery-lan-list">
+            <div class="page-placeholder">
+              <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
+              <div class="page-placeholder-title">未开启在网注册</div>
+              <div class="page-placeholder-text">
+                打开"在网注册"开关后，会周期性扫描本机所在 /24 子网内的其他 pyrkaiweb 实例，并把它们的设备名与能力列出来。
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section class="discovery-pane" data-pane="hw">
           <header class="discovery-pane-head">
             <h3>硬件能力 (HW)</h3>
