@@ -440,7 +440,7 @@ class ComputeRegistry:
             "default_estimated_init_seconds":  DEFAULT_ESTIMATED_INIT_SECONDS,
             "worker_alive":      worker_alive,
             "last_updated":      time.time(),
-"capabilities":      capabilities,
+            "capabilities":      capabilities,
             "tools":             tools,
         }
 
@@ -824,18 +824,50 @@ def _probe_session_setup(npu_index: int, model_id: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"preset 工厂失败: {type(e).__name__}: {e}"
 
-    paths = [
-        ("rknn",     getattr(spec, "rknn_path", "")),
-        ("weight",   getattr(spec, "weight_path", "")),
-        ("embed",    getattr(spec, "embed_path", "")),
-        ("tokenizer", getattr(spec, "tokenizer_path", "")),
-    ]
+    # 模型文件路径按 spec.kind 分支：
+    #   * kind="llm"  → rknn_path / weight_path + embed_path + tokenizer_path
+    #   * kind="vlm"  → rknn_llm_path / rknn_vision_path（weight 由
+    #                   .1828.rknn 路径自动 derive，probe 不单独校验）
+    #                   + embed_path + tokenizer_path
+    #   * kind="tts"  → tts_model_dir（目录下 4 个 .1828.rknn + embed/bin
+    #                   + tokenizer.json；TTS 不用顶层 embed_path/
+    #                   tokenizer_path，probe 不强求）
+    #   * kind="asr"  → asr_model_dir + embed_path + tokenizer_path
+    # 缺字段视为"未配置"，跟"路径为空"同样报 missing。
+    paths: List[Tuple[str, str]] = []
+    kind = getattr(spec, "kind", "")
+    if kind == "vlm":
+        paths.append(("rknn_llm",      getattr(spec, "rknn_llm_path", "")))
+        paths.append(("rknn_vision",   getattr(spec, "rknn_vision_path", "")))
+    elif kind == "tts":
+        tts_dir = getattr(spec, "tts_model_dir", "")
+        if tts_dir:
+            paths.append(("tts_model_dir", tts_dir))
+    elif kind == "asr":
+        asr_dir = getattr(spec, "asr_model_dir", "")
+        if asr_dir:
+            paths.append(("asr_model_dir", asr_dir))
+    else:  # llm 及其它
+        paths.append(("rknn",   getattr(spec, "rknn_path", "")))
+        paths.append(("weight", getattr(spec, "weight_path", "")))
+
+    # embed / tokenizer 不是所有 kind 都需要：tts 用目录内自带的 token 表，
+    # 不在 spec 顶层。其它 kind（llm / vlm / asr）都直接走 spec.embed_path
+    # / spec.tokenizer_path。
+    if kind != "tts":
+        paths.append(("embed",    getattr(spec, "embed_path", "")))
+        paths.append(("tokenizer", getattr(spec, "tokenizer_path", "")))
+
     missing = []
     for label, p in paths:
         if not p:
             missing.append(f"{label}=<empty>")
             continue
         pp = Path(p)
+        # 目录类条目（tts_model_dir / asr_model_dir）只看目录是否存在；
+        # 文件类条目走 is_file() + size 检查。
+        if pp.is_dir():
+            continue
         if not pp.is_file():
             missing.append(f"{label}={p} (不存在)")
         elif pp.stat().st_size == 0:
