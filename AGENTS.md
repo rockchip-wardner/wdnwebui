@@ -683,6 +683,108 @@ to taste.
 format-3; for inspection, use ``soundfile.read(...)`` or parse the
 RIFF header by hand.
 
+## Text chat (文本对话) page
+
+`#page-text-chat` 暴露 Qwen3-8B 纯文本对话（`swcap_text_chat` capability），
+流式逐字渲染 `<think>...</think>` 与正式回答，单页实例串行推理，
+多轮上下文由 app 端消息 deque + ChatML 拼接维持。
+
+* **Backend** (`app/api/text_chat.py`):
+  - `GET /api/text-chat` — snapshot：state / busy / error / history_count /
+    history_tokens / context_limit / max_new_tokens / current_request_id /
+    last_result。
+  - `POST /api/text-chat/send` `{text}` — 发起一轮推理；返回
+    `{request_id, snapshot}`。400 text 为空 / 409 还在生成中 /
+    502 capability 未启用。
+  - `POST /api/text-chat/stop` — 立即调 `session._backend.rknn.session_stop()`
+    中断 C 端正在跑的推理；当前轮丢弃，不写历史。
+  - `POST /api/text-chat/reset` — 清空 history + history_tokens，回到 idle。
+  - `WS /api/text-chat/ws` — server-push 流式 token + 状态变更；连接后立即
+    推 `{type:"snapshot", snapshot:...}` hydrate。
+
+* **Service** (`app/services/text_chat.py`):
+  - `_TextChatManager` 单例（`get_chat_service()`，lazy）；状态机
+    `idle → loading → running → done/error/stopped`，与 pyrkaiweb
+    其它服务风格一致。
+  - **LLMSession 必须从 ComputeRegistry 取**（`get_session("swcap_text_chat")`）；
+    找不到抛 `RuntimeError("功能未启用: swcap_text_chat")`，HTTP 502 透传。
+  - **rkai 导入懒加载** —— 模块顶层只 import `os / queue / re / threading / asyncio`；
+    `_install_patches()` 在第一次构造实例时才 import `rkai.backends._common`。
+  - **流式回调 = monkey-patch**：模块加载时把
+    `rkai.backends._common.make_result_callback` 替换成包装版。包装版
+    在原 callback 完成后读 `sink.text` 算增量，调用 `register_observer`
+    注册的 callable（key = `id(sink)`）。未注册的 sink 走原 callback，
+    零开销（其它业务 detector / tts 不受影响）。
+  - **`_ThinkingRouter`**：observer 每次拿到 delta 增量时按 `</think>` 切频道
+    推到 `thinking` / `answer` 两条流；`done` 时再正则
+    `<think>(.*?)</think>` 兜底切一次，处理 token 边界切碎等极端情况。
+  - 单 daemon worker thread（`text-chat-worker`）串行消费 `request_queue`；
+    `session_run` 是同步阻塞，worker 在 `loop.get(timeout=1.0)` 期间
+    监听 `_worker_stop_event`，stop 事件置位即调
+    `session._backend.rknn.session_stop()`。
+  - **32K token 限制**：每收到 `done` 用 `tokenizer.encode(content)` 累加
+    `history_tokens`；超过 `context_limit - max_new_tokens` 时拒绝发新
+    请求（HTTP 400 + 中文提示）。预留输出 = `max_new_tokens = 2048`，
+    spec `max_context_len = 32768`。
+  - **多轮上下文**：app 端消息 deque，每轮 `session.reset()` 清 C 端 KV，
+    再用 ChatML（`<|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...`
+    系列）拼整段 prompt 喂进 `session._backend.run(prompt, keep_history=0)`。
+    **历史中只写 `content:answer`，不写 thinking** —— 下轮 prompt 看不到
+    thinking，保证模型下一轮从干净的对话记忆开始。spec.options 的
+    `keep_history=1` 是 init runtime 默认值（按用户要求保留），但
+    per-call override 设为 0，所以 KV 不跨 run 续接。
+  - WS broadcaster pattern：worker 线程 push 到 `asyncio.Queue` 列表，
+    WS handler 在主 event loop 里 `await queue.get()` drain；observer
+    也走同一条路径，避免第二条 channel。
+
+* **ComputeRegistry** preset（`app/services/compute_registry.py:136-164`）：
+  - 新增 `MODEL_PRESETS["qwen3-8b"]`：`capability_types=["swcap_text_chat"]`，
+    `memory_estimate_mb=5500`，`estimated_init_seconds=90`（实测待校准）。
+  - `_qwen3_8b_spec()` 工厂用 `dataclasses.replace(spec, max_context_len=32768)`
+    + `with_options(max_new_tokens=2048, keep_history=1, enable_thinking=True)`。
+    注意 `max_context_len` 是 `ModelSpec` 的 dataclass 字段（被
+    `_common.build_llm_args` 直接读），**不能用 `with_options` 设**，必须
+    `replace`。
+  - `_init_session_subprocess` 子进程硬编码分支加 `elif model_id == 'qwen3-8b'`。
+
+* **Frontend** (`app/static/index.html` + `app/static/js/app.js` + `style.css`)：
+  - 左栏 demo 区第 5 项 `<a data-page="text-chat" data-icon="✎">文本对话</a>`，
+    排在 `#tts` 之后。
+  - `<section id="page-text-chat">`：复用 `.imb-card` / `.imb-conv` /
+    `.imb-composer` / `.imb-msg--in/out` 等现有样式；新增
+    `.text-chat-thinking`（折叠块，初始折叠，有内容时自动展开）、
+    `.text-chat-cursor`（打字机光标 blink 动画）、`.text-chat-stopped` /
+    `.text-chat-error`。
+  - JS 模块 `TextChat`（仿 `ImBridge` 模式）：
+    - `init()` 绑定 send / stop / reset / Cmd+Enter；
+    - `refresh()` 拉 snapshot；
+    - `ensureWs()` / `closeWs()` 指数退避重连（`1 << (wsRetry-1)` ms，
+      上限 30s）；
+    - `_onWsMessage(msg)` 分发 `snapshot` / `state` / `user_echo` /
+      `thinking` / `answer` / `done` / `stopped` / `error` 八种帧；
+    - `pending: Map<request_id, ...>` 维护每轮推理的"用户气泡 →
+      assistant 气泡"三段渲染状态；
+    - `_scrollToBottom()` 仅在用户靠近底部时自动滚动（避免抢焦点）。
+  - `loadPageData("text-chat")` 调 `TextChat.init() + refresh() + ensureWs()`；
+    `showPage()` 离开时调 `TextChat.closeWs()`。
+
+* **资源预算** —— 单实例常驻 ~5.5 GB（Qwen3-8B 量化权重 + embed table +
+  KV cache 200×2K token）。板上 8 GB 统一内存比较紧张，但与 Qwen3-VL-4B
+  单实例不冲突（2 个同时跑超 9 GB）。多用户并发首版不支持 —— worker
+  串行；如需横向扩展，在算力配置页加第 2 个 Qwen3-8B 实例（多卡环境）。
+
+* **限制 / 已知问题**：
+  - 32K 上下文硬上限写死；改需同步 `spec.max_context_len` + 服务端
+    `CONTEXT_LIMIT` 常量 + 前端 token 计数器。
+  - thinking 不写历史 —— 用户"接着问"时下一轮 prompt 看不到上轮思考；
+    想要延续 thinking 行为需把 `thinking` 也 push 到 history 的 assistant
+    content 字段，但代价是污染 KV 且长对话下 token 增长更快。
+  - 重生成按钮首版不做（plan §十三已确认）。
+  - 真机首次初始化 ~90s（按经验值，需真机 page-cache-dropped 实测校准）。
+  - 取消正在跑的轮次靠 `rknn3lite.session_stop()`；C 库收到 stop 信号后
+    回调走 FINISH state=3，`session_run` 返回。当前 `sink.text` 丢弃，
+    不写历史。
+
 ## When you change things, also update
 
 | You changed…                          | Then update…                                              |
@@ -749,28 +851,36 @@ rkai ``@Callable`` 工具集合，**不**进入视频监控 (16 路) — 那条
   ``/api/video-target-detection/tools``）不受影响。
 
 
-## LLMSession init 子进程隔离
+## LLMSession init 轻量预检（v0.5.0 起的优化）
 
-`ComputeRegistry._run_one` 把 `LLMSession(...)` 的构造放到 **子进程**
-（`subprocess.run([sys.executable, "-c", script], ...)`）里跑，理由
-是 rknn3 的 `MODEL_SETUP` 失败 / 模型文件缺失时，rknn3 native lib
-会直接 `std::terminate()`，Python `try/except` 抓不住，整 uvicorn
-进程跟着挂（"网页卡住"症状）。
+`ComputeRegistry._run_one` 启动一条实例的流程：
 
-子进程：
+1. **轻量预检** (`_probe_session_setup`，<1s)：
+   * model_id 在 preset 白名单
+   * preset 工厂能正常构造 `ModelSpec`（不调 rknn3）
+   * 4 个模型文件（rknn / weight / embed / tokenizer）齐全且非空
+   * `RKNN3Lite().get_devices_id()` 枚举得到 ≥ `npu_index + 1` 张卡
+2. **父进程完整 init** (`LLMSession(model=spec, npu=npu_index)`，~55s)：
+   * `try/except` 包住；非 std::terminate 错误都进 `inst.error`
+3. **持久化** + LOG 显示 `probe=Xs init=Ys total=Zs`
 
-* 成功 → exit 0，写 sentinel + JSON 报告到 stdout；父进程再构造一
-  份（在父进程里 consumer 要拿 LLMSession 句柄用），标
-  `status='running'`。**双倍 init 是已知代价**，避免要写 IPC。
-* 失败（Python 异常 / `BaseException` / `SIGABRT` / `SIGSEGV` /
-  timeout）→ 父进程读 stderr/stdout 拼一段原因，写到
-  `inst.error`，实例标 `status='error'`。
+**历史**：v0.5.0 之前是先在**子进程**里做完整 init 当探针（55s），
+父进程再完整 init 一次（55s）—— 总耗时 ~110s，是 demo `summarize_text.py`
+（55s）的两倍。优化后实测 56s（probe 1s + init 55s），与 demo 一致。
 
-子进程错误信息直接进 `compute` snapshot 的 `instances[].error`，
-前端算力配置页已经有 `is-error` 红框 + `<pre class="cc-model-error">`
-展示错误文本，用户能直接看到原因；UI 上 disable → enable 单条实例
-会重新触发同一路径（`DELETE /api/compute/instances` + `POST`），不
-需要重启服务。
+**权衡**：失去"rknn3 native abort 子进程隔离"保护 —— 但 AGENTS.md
+里记载的 `std::terminate()` 现象**仅在非 RK 开发板 / 算力配置错的板
+子**上见过，真机 RK3588 极少发生。旧版 `_init_session_subprocess`
+完整函数**保留**在 `app/services/compute_registry.py:756+`（当前不
+调用），将来真机若出现 abort，可以把 `_run_one` 改回原路径（恢复
+双 init）或加 fallback 策略。
+
+**实例配置**（`MODEL_PRESETS["qwen3-8b"]`）：
+
+| 字段 | 值 | 备注 |
+|---|---|---|
+| `memory_estimate_mb` | **4950** | 真机 4 卡板 RK1828 实际占用 |
+| `estimated_init_seconds` | **60** | 实测 ~55s + 5s buffer |
 
 ## Im-bridge page (应用对接 — 微信 iLink)
 
