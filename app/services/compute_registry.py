@@ -344,11 +344,11 @@ class ComputeRegistry:
                 continue
             per_card_mb[inst["npu_index"]] = per_card_mb.get(inst["npu_index"], 0) + inst["memory_estimate_mb"]
             total_mb += inst["memory_estimate_mb"]
-        # 状态计数
-        running_count = sum(1 for inst in instances if inst.status == "running")
-        queued_count  = sum(1 for inst in instances if inst.status == "queued")
-        loading_count = sum(1 for inst in instances if inst.status == "loading")
-        error_count   = sum(1 for inst in instances if inst.status == "error")
+        # 状态计数（instances 来自上面 to_dict()，已是 dict；要按 key 取）
+        running_count = sum(1 for inst in instances if inst["status"] == "running")
+        queued_count  = sum(1 for inst in instances if inst["status"] == "queued")
+        loading_count = sum(1 for inst in instances if inst["status"] == "loading")
+        error_count   = sum(1 for inst in instances if inst["status"] == "error")
         # 当前活跃 capability
         capabilities = self.list_active_capabilities()
         # 工具列表（懒导入，避免触发 rkai 装饰器在 compute 模块加载时执行）
