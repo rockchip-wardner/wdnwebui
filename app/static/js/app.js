@@ -315,6 +315,8 @@ const VD = {
   inflight: 0,
   tools: [],
   enabledTools: [],
+  lastSnap: null,
+  detectorSnap: null,
   init() { return initVideoDetection(); },
 };
 
@@ -342,6 +344,10 @@ function setVdMeta(snap) {
   if (snap.is_live) parts.push("LIVE");
   if (snap.state) parts.push("[" + snap.state + "]");
   el.textContent = parts.join(" · ") || "--";
+  VD.lastSnap = snap;
+  if (typeof DemoGuard !== "undefined") {
+    DemoGuard.report("video-detection", { session: VD.lastSnap, detector: VD.detectorSnap });
+  }
 }
 
 function setVdProgress(snap) {
@@ -769,6 +775,10 @@ function updateVdDetectorStatus(snap) {
   }
   if (startBtn) startBtn.disabled = !snap.available || !!snap.enabled;
   if (stopBtn)  stopBtn.disabled  = !snap.enabled;
+  VD.detectorSnap = snap;
+  if (typeof DemoGuard !== "undefined") {
+    DemoGuard.report("video-detection", { session: VD.lastSnap, detector: VD.detectorSnap });
+  }
 }
 
 async function refreshVdDetector() {
@@ -1064,6 +1074,8 @@ const VTD = {
   blobUrl: null,
   tools: [],
   enabledTools: [],
+  lastSnap: null,
+  detectorSnap: null,
 };
 const VTDDetector = {
   events: [],
@@ -1088,6 +1100,10 @@ function setVtdMeta(snap) {
   if (snap.is_live) parts.push("LIVE");
   if (snap.state) parts.push("[" + snap.state + "]");
   el.textContent = parts.join(" · ") || "--";
+  VTD.lastSnap = snap;
+  if (typeof DemoGuard !== "undefined") {
+    DemoGuard.report("video-target-detection", { session: VTD.lastSnap, detector: VTD.detectorSnap });
+  }
 }
 
 function setVtdProgress(snap) {
@@ -1299,6 +1315,10 @@ function updateVtdDetectorStatus(snap) {
   }
   if (startBtn) startBtn.disabled = !snap.available || !!snap.enabled;
   if (stopBtn)  stopBtn.disabled  = !snap.enabled;
+  VTD.detectorSnap = snap;
+  if (typeof DemoGuard !== "undefined") {
+    DemoGuard.report("video-target-detection", { session: VTD.lastSnap, detector: VTD.detectorSnap });
+  }
 }
 async function refreshVtdDetector() {
   try {
@@ -2213,8 +2233,162 @@ function currentPage() {
   return hash || DEFAULT_PAGE;
 }
 
+/* ------------------------------------------------------------------ *
+ *  DemoGuard: 演示页 (音视频描述 / 视频目标检测 / 视频内容检索 /     *
+ *  语音生成) 离开时的"必须关闭后台"守卫。                              *
+ * ------------------------------------------------------------------ *
+ *  三处入口：                                                          *
+ *    1. 点击 sidebar 切换页面：confirm + await 后端 stop              *
+ *    2. beforeunload（关 tab / 刷新 / 关闭浏览器）：原生对话框 +      *
+ *       sendBeacon/keepalive 兜底发停                                  *
+ *    3. popstate（前进/后退）：静默 fire-and-forget 停后端            *
+ * ------------------------------------------------------------------ */
+const DemoGuard = {
+  _ACTIVE_STATES: ["opening", "playing", "paused", "eof"],
+
+  // 每页：判定 + 关闭（await 版，给 in-app 导航用）
+  _registry: {
+    "video-detection": {
+      active(snap = {}) {
+        const dec = snap.session && this._ACTIVE_STATES.includes(snap.session.state);
+        const det = snap.detector && snap.detector.enabled;
+        return !!(dec || det);
+      },
+      async stop() {
+        await Promise.allSettled([
+          fetch(API_PREFIX + "/video-detection/close",       { method: "POST" }),
+          fetch(API_PREFIX + "/video-detection/prompt/stop", { method: "POST" }),
+        ]);
+      },
+    },
+    "video-target-detection": {
+      active(snap = {}) {
+        const dec = snap.session && this._ACTIVE_STATES.includes(snap.session.state);
+        const det = snap.detector && snap.detector.enabled;
+        return !!(dec || det);
+      },
+      async stop() {
+        await Promise.allSettled([
+          fetch(API_PREFIX + "/video-target-detection/close",       { method: "POST" }),
+          fetch(API_PREFIX + "/video-target-detection/prompt/stop", { method: "POST" }),
+        ]);
+      },
+    },
+    "tts": {
+      active(snap = {}) {
+        const s = snap.session;
+        return !!(s && (s.busy === true || s.running === true ||
+                        s.state === "loading" || s.state === "running"));
+      },
+      async stop() {
+        try {
+          await fetch(API_PREFIX + "/tts/stop", { method: "POST" });
+        } catch (_) { /* beforeunload path: best-effort */ }
+      },
+    },
+    "video-content-search": {
+      active() { return false; },
+      async stop() { /* no-op: 无后端 */ },
+    },
+  },
+
+  // 各页模块主动 push 最新快照
+  _cache: {},
+  report(page, snap) {
+    this._cache[page] = snap || {};
+  },
+
+  isActive(page) {
+    const reg = this._registry[page];
+    if (!reg) return false;
+    return !!reg.active.call(this, this._cache[page] || {});
+  },
+
+  // 同步版：beforeunload 不能 await，走 sendBeacon + keepalive
+  stopSync(page) {
+    const map = {
+      "video-detection": [
+        [API_PREFIX + "/video-detection/close",       "POST"],
+        [API_PREFIX + "/video-detection/prompt/stop", "POST"],
+      ],
+      "video-target-detection": [
+        [API_PREFIX + "/video-target-detection/close",       "POST"],
+        [API_PREFIX + "/video-target-detection/prompt/stop", "POST"],
+      ],
+      "tts": [[API_PREFIX + "/tts/stop", "POST"]],
+      "video-content-search": [],
+    };
+    const urls = map[page] || [];
+    const body = new Blob(["{}"], { type: "application/json" });
+    for (const [url, method] of urls) {
+      try {
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon(url, body);
+        } else {
+          fetch(url, { method, keepalive: true, body: "{}" });
+        }
+      } catch (_) { /* swallow — best-effort */ }
+    }
+  },
+
+  async confirmLeave(fromPage) {
+    if (!this.isActive(fromPage)) return true;
+    const labels = {
+      "video-detection":        "音视频描述",
+      "video-target-detection": "视频目标检测",
+      "video-content-search":   "视频内容检索",
+      "tts":                    "语音生成",
+    };
+    const msg =
+      `【${labels[fromPage] || fromPage}】后台正在运行。\n\n` +
+      `离开此页面将自动停止当前任务并释放算力。\n确定继续吗？`;
+    return window.confirm(msg);
+  },
+
+  // stop 后清理缓存，避免兜底 hashchange 监听把同一组 POST 再发一遍
+  async stopAndClear(page) {
+    const reg = this._registry[page];
+    if (reg) await reg.stop();
+    this._cache[page] = { session: null, detector: null };
+  },
+};
+
 document.querySelectorAll(".nav-item").forEach(a => {
-  a.addEventListener("click", () => { /* hashchange handles the rest */ });
+  a.addEventListener("click", async (e) => {
+    const target = a.dataset.page;
+    const cur = currentPage();
+    if (!target || target === cur) return;
+    if (!DemoGuard.isActive(cur)) return;
+    if (!await DemoGuard.confirmLeave(cur)) {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    await DemoGuard.stopAndClear(cur);
+    location.hash = "#" + target;
+  });
+});
+
+window.addEventListener("beforeunload", (e) => {
+  const cur = currentPage();
+  if (!DemoGuard.isActive(cur)) return;
+  DemoGuard.stopSync(cur);
+  e.preventDefault();
+  e.returnValue = "后台任务正在运行；离开将自动停止并释放算力。";
+  return e.returnValue;
+});
+
+// 浏览器前进/后退（hash 变化但不经过 .nav-item click）：静默 stopOnLeave 兜底
+window.addEventListener("hashchange", () => {
+  // 仅作为兜底：若当前已切到非演示页，而旧页（现在 currentPage 反映不出来，
+  // 但 DemoGuard._cache 仍记着）有后台残留，sendBeacon 兜底。
+  // 真正的拦截逻辑已在 nav-item click 路径里。
+  const cur = currentPage();
+  if (DemoGuard._registry[cur]) return;     // 当前是已注册页，不动
+  // 切到非演示页（system-monitor / base-config / ...）：遍历注册表兜底
+  for (const page of Object.keys(DemoGuard._registry)) {
+    if (DemoGuard.isActive(page)) DemoGuard.stopSync(page);
+  }
 });
 
 document.querySelectorAll("[data-refresh]").forEach(btn => {
@@ -2780,6 +2954,10 @@ const TTS = {
   },
 
   render(snap) {
+    this.lastSnap = snap;
+    if (typeof DemoGuard !== "undefined") {
+      DemoGuard.report("tts", { session: snap });
+    }
     const banner = document.getElementById("tts-unavailable");
     const reasonEl = document.getElementById("tts-unavailable-reason");
     const startBtn = document.getElementById("tts-start");

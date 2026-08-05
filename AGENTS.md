@@ -32,8 +32,28 @@ creation); everything below is verified against the current tree.
    找不到对应 capability 就抛 `RuntimeError("功能未启用: <capability>")`，
    由调用方决定如何向上层报告（视频监控选择静默 error 返回，不阻塞 16 路
    解码；视频检测 / 语音生成选择 raise，由 HTTP 层 502 透传给前端）。
-   实例集合在 算力配置 页配置，存到 `config.json["compute"]["instances"]`，
-   `run.py` 启动时后台线程串行加载，不阻塞 UI。
+实例集合在 算力配置 页配置，存到 `config.json["compute"]["instances"]`，
+    `run.py` 启动时后台线程串行加载，不阻塞 UI。
+5. **所有演示页（音视频描述 / 视频目标检测 / 视频内容检索 / 语音生成）
+   离开时必须主动关闭后台运行**。`app/static/js/app.js` 的 `DemoGuard`
+   统一负责：
+   * in-app 导航（点击 sidebar）：若当前页后台在跑（解码
+     `state ∈ {opening, playing, paused, eof}` 或 detector `enabled=true`，
+     TTS `busy=true`），先弹 `confirm()`，用户确认后 await 后端
+     `/close` + `/prompt/stop`（或 `/tts/stop`）再放行；用户取消则
+     `preventDefault()` 阻止跳转。
+   * `beforeunload`（关 tab / 刷新 / 关闭浏览器）：同步触发原生警告
+     对话框，并通过 `navigator.sendBeacon` 或 `fetch({keepalive:true})`
+     异步发停请求，best-effort 兜底。
+   * `hashchange`（浏览器前进/后退）：静默 sendBeacon 兜底停掉所有
+     在跑演示页的后端，避免路径绕过 click handler 时残留。
+   * 判定由各页模块主动 push：`setVdMeta` / `updateVdDetectorStatus` /
+     `setVtdMeta` / `updateVtdDetectorStatus` / `TTS.render` 在更新
+     DOM 的同时 `DemoGuard.report(<page>, { session, detector })`。
+   **浏览器限制**：beforeunload 期间 JS 不能保证请求送达（用户强杀、
+   浏览器崩溃、某些移动浏览器会丢弃 beacon）；AGENTS 不做超出此限制
+   的承诺。若可靠性要求更高，需要服务端按 session TTL / 心跳
+   自动回收 —— 不在本期范围。
 
 ## TL;DR commands
 
