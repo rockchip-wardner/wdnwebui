@@ -2166,10 +2166,65 @@ html, body {
   max-height: 8em;
   overflow: auto;
 }
+.cc-model-error-wrap {
+  grid-column: 1 / -1;
+  display: flex; align-items: stretch; gap: 8px;
+}
+.cc-model-error-wrap .cc-model-error {
+  grid-column: auto;
+  flex: 1 1 auto;
+  margin-top: 8px;
+}
+.cc-model-error-wrap .cc-model-error-retry {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  margin-top: 8px;
+  color: var(--danger);
+}
 
 .cc-foot { margin-top: 12px; color: var(--text-2); font-size: 12px; }
 .cc-foot.danger { color: var(--danger); }
 .cc-foot.warn   { color: #b45309; }
+
+/* 顶部告警条：错误实例 / worker 死亡 / 卡住 —— 一眼能扫到，避免被忽略。 */
+.cc-banner-stack { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.cc-banner {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 12px; border-radius: 6px;
+  font-size: 13px; line-height: 1.45;
+}
+.cc-banner-icon { font-size: 1.1rem; flex: 0 0 auto; line-height: 1.5; }
+.cc-banner-body { flex: 1 1 auto; min-width: 0; }
+.cc-banner-title { font-weight: 600; margin-bottom: 4px; }
+.cc-banner-list {
+  margin: 4px 0 0; padding-left: 18px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.cc-banner-list li { list-style: disc; }
+.cc-banner-msg {
+  font-family: var(--mono); font-size: 12px;
+  background: rgba(0,0,0,0.04); padding: 4px 6px; border-radius: 3px;
+  margin-top: 4px; white-space: pre-wrap; word-break: break-all;
+  max-height: 6em; overflow: auto;
+}
+.cc-banner-actions { flex: 0 0 auto; display: flex; gap: 6px; flex-wrap: wrap; }
+.cc-banner-btn {
+  font: inherit; font-size: 12px; cursor: pointer;
+  padding: 4px 10px; border-radius: 4px; border: 1px solid currentColor;
+  background: transparent; color: inherit;
+}
+.cc-banner-btn:hover { background: rgba(0,0,0,0.05); }
+.cc-banner.is-error {
+  background: #fef2f2; border: 1px solid #fecaca; color: #991b1b;
+}
+.cc-banner.is-warn {
+  background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
+}
+.cc-banner.is-dead {
+  background: #fef2f2; border: 1px solid #fca5a5; color: #7f1d1d;
+  font-weight: 500;
+}
+.cc-banner.empty { display: none; }
 
 @media (max-width: 1100px) {
   .cc-cols {

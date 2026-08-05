@@ -3684,10 +3684,140 @@ const ComputeConfigPage = {
 
   // -------------------------------------------------------------- render
   render() {
+    this._renderBanners();
     this._renderCols();
     this._renderSummary();
     this._renderModelStates(this._snapshot);
     this._renderTools(this._snapshot);
+  },
+
+  // -------------------------------------------------------------- banners
+  // 顶部告警条：错误实例 / 卡住的 loading / worker 死亡 —— 一眼能扫到，
+  // 避免被埋在每行的小字 <pre class="cc-model-error"> 里看不到。每秒
+  // tick 都重新渲染（_renderSummary 一样），状态变化即时反映。
+  _renderBanners() {
+    const stack = document.getElementById("cc-banner-stack");
+    if (!stack) return;
+    const snap = this._snapshot || {};
+    const errored = (snap.instances || []).filter(i => i.status === "error");
+    const stuck = this._detectStuck(snap);
+    const workerDead = snap.worker_alive === false && (snap.loading_count || 0) > 0;
+
+    stack.innerHTML = "";
+
+    if (errored.length) {
+      const ul = document.createElement("ul");
+      ul.className = "cc-banner-list";
+      for (const inst of errored) {
+        const li = document.createElement("li");
+        const head = document.createElement("div");
+        head.textContent = `${inst.label || inst.model} · NPU #${inst.npu_index}`;
+        li.appendChild(head);
+        const msg = document.createElement("pre");
+        msg.className = "cc-banner-msg";
+        msg.textContent = inst.error || "(无错误信息)";
+        li.appendChild(msg);
+        ul.appendChild(li);
+      }
+      stack.appendChild(this._makeBanner({
+        kind: "is-error",
+        icon: "✖",
+        title: `${errored.length} 个算力实例启动失败`,
+        body: ul,
+        actions: [
+          {label: "全部清空", onClick: () => this.stopAll()},
+        ],
+      }));
+    }
+
+    if (stuck.length) {
+      const ul = document.createElement("ul");
+      ul.className = "cc-banner-list";
+      for (const s of stuck) {
+        const li = document.createElement("li");
+        li.textContent = `${s.label} · NPU #${s.npu_index} · ${s.status} 累计 ${s.elapsed}s`;
+        ul.appendChild(li);
+      }
+      stack.appendChild(this._makeBanner({
+        kind: "is-warn",
+        icon: "⚠",
+        title: `${stuck.length} 个实例加载疑似卡住`,
+        body: ul,
+        actions: [
+          {label: "刷新", onClick: () => this.load()},
+        ],
+      }));
+    }
+
+    if (workerDead) {
+      const body = document.createElement("div");
+      body.className = "cc-banner-msg";
+      body.textContent =
+        "后台加载 worker 已停止响应。当前 loading 实例会一直停在加载中，" +
+        "需要重启服务或重新启用实例才会恢复。";
+      stack.appendChild(this._makeBanner({
+        kind: "is-dead",
+        icon: "✖",
+        title: "算力加载 worker 已停止",
+        body,
+      }));
+    }
+  },
+
+  _makeBanner({kind, icon, title, body, actions}) {
+    const el = document.createElement("div");
+    el.className = `cc-banner ${kind}`;
+    const iconEl = document.createElement("span");
+    iconEl.className = "cc-banner-icon";
+    iconEl.textContent = icon;
+    const bodyEl = document.createElement("div");
+    bodyEl.className = "cc-banner-body";
+    const t = document.createElement("div");
+    t.className = "cc-banner-title";
+    t.textContent = title;
+    bodyEl.appendChild(t);
+    if (body) bodyEl.appendChild(body);
+    el.appendChild(iconEl);
+    el.appendChild(bodyEl);
+    if (actions && actions.length) {
+      const acts = document.createElement("div");
+      acts.className = "cc-banner-actions";
+      for (const a of actions) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "cc-banner-btn";
+        btn.textContent = a.label;
+        btn.addEventListener("click", a.onClick);
+        acts.appendChild(btn);
+      }
+      el.appendChild(acts);
+    }
+    return el;
+  },
+
+  // 检测疑似卡住：queued/loading 累计时间超过 (2 × estimate + 30s)，且
+  // 当前没有错误实例（避免和 error banner 重复提示）。返回数组 [{...}]。
+  _detectStuck(snap) {
+    const now = Date.now() / 1000;
+    const perModel = snap.estimated_init_seconds_per_model || {};
+    const out = [];
+    for (const inst of snap.instances || []) {
+      if (inst.status !== "queued" && inst.status !== "loading") continue;
+      const est = perModel[inst.model] ?? snap.default_estimated_init_seconds ?? 10;
+      const startTs = inst.status === "queued"
+        ? (inst.queued_at || 0)
+        : (inst.started_at || inst.queued_at || 0);
+      const elapsed = Math.max(0, Math.round(now - startTs));
+      const threshold = est * 2 + 30;
+      if (elapsed >= threshold) {
+        out.push({
+          ...inst,
+          elapsed,
+          threshold,
+        });
+      }
+    }
+    return out;
   },
 
   _renderCols() {
@@ -3801,11 +3931,8 @@ const ComputeConfigPage = {
         </div>
       `;
       // error 时把错误信息单独拎一行显眼显示（默认在 state 里只是 inline 文字）
-      if (inst && inst.status === "error" && inst.error) {
-        const errBox = document.createElement("pre");
-        errBox.className = "cc-model-error";
-        errBox.textContent = inst.error;
-        li.appendChild(errBox);
+      if (inst && inst.status === "error") {
+        li.appendChild(this._makeErrorBlock(inst, npuIndex, m.id));
       }
       if (!existsFlag) {
         const missing = document.createElement("div");
@@ -3842,18 +3969,46 @@ const ComputeConfigPage = {
       li.classList.toggle("has-error", newState === "error");
       li.classList.toggle("is-pending", newState === "queued" || newState === "loading");
       // error 信息：增/删 <pre> 节点
-      let errBox = li.querySelector(".cc-model-error");
-      if (inst && inst.status === "error" && inst.error) {
+      let errBox = li.querySelector(".cc-model-error-wrap");
+      if (inst && inst.status === "error") {
         if (!errBox) {
-          errBox = document.createElement("pre");
-          errBox.className = "cc-model-error";
+          errBox = this._makeErrorBlock(inst, npu, model);
           li.appendChild(errBox);
+        } else {
+          // 错误文本 / 按钮都在 _makeErrorBlock 里重建，避免就地改 text 的细碎 DOM。
+          const newBox = this._makeErrorBlock(inst, npu, model);
+          errBox.replaceWith(newBox);
         }
-        errBox.textContent = inst.error;
       } else if (errBox) {
         errBox.remove();
       }
     });
+  },
+
+  // 构造一条实例的错误块：<pre> 错误文本 + 重试按钮。重试按钮 = 先
+  // DELETE 再 POST，等同于重新启用。失败时复用 toggle() 的 alert。
+  _makeErrorBlock(inst, npuIndex, model) {
+    const wrap = document.createElement("div");
+    wrap.className = "cc-model-error-wrap";
+    const errBox = document.createElement("pre");
+    errBox.className = "cc-model-error";
+    errBox.textContent = inst.error || "(无错误信息)";
+    wrap.appendChild(errBox);
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "cc-banner-btn cc-model-error-retry";
+    retry.textContent = "重试";
+    retry.addEventListener("click", async () => {
+      retry.disabled = true;
+      try {
+        await this.toggle(npuIndex, model, false);
+        await this.toggle(npuIndex, model, true);
+      } finally {
+        retry.disabled = false;
+      }
+    });
+    wrap.appendChild(retry);
+    return wrap;
   },
 
   _statusLabel(inst) {

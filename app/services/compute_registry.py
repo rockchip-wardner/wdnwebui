@@ -327,6 +327,13 @@ class ComputeRegistry:
         return out
 
     def snapshot(self) -> dict:
+        # worker 存活状态：让 UI 能识别 "worker 已死，但 inst.status 还停在
+        # loading" 这种场景（用户会看到"卡住"，需要提示）。
+        worker_alive = bool(
+            self._worker_thread is not None
+            and self._worker_thread.is_alive()
+            and not self._stop_worker.is_set()
+        )
         with self._lock:
             instances = [inst.to_dict() for inst in self._instances.values()]
         # ``list_cards`` 内部用 ``_raw_device_id`` 缓存 RKNN3 raw bytes，
@@ -391,6 +398,7 @@ class ComputeRegistry:
             "error_count":       error_count,
             "estimated_init_seconds_per_model": estimated_per_model,
             "default_estimated_init_seconds":  DEFAULT_ESTIMATED_INIT_SECONDS,
+            "worker_alive":      worker_alive,
             "last_updated":      time.time(),
 "capabilities":      capabilities,
             "tools":             tools,
@@ -616,13 +624,24 @@ class ComputeRegistry:
 
     def _worker_loop(self) -> None:
         while not self._stop_worker.is_set():
-            inst = self._take_next_queued()
-            if inst is None:
-                # 没有任务，等 1s 或被 wake
-                self._wake_event.wait(timeout=1.0)
-                self._wake_event.clear()
-                continue
-            self._run_one(inst)
+            try:
+                inst = self._take_next_queued()
+                if inst is None:
+                    # 没有任务，等 1s 或被 wake
+                    self._wake_event.wait(timeout=1.0)
+                    self._wake_event.clear()
+                    continue
+                self._run_one(inst)
+            except BaseException as e:  # noqa: BLE001
+                # 防御性兜底：任何从 _take_next_queued / _run_one 里逃逸出来
+                # 的异常都不能让 worker thread 死掉。worker 一旦死掉，正在
+                # loading 的实例永远停在 loading，后面 queued 的实例再也
+                # 不会被拾取 —— 算力配置页就会"卡住"，用户看不到任何错误。
+                # 这里记一条日志 + 继续循环，下次 wake 时再重试。
+                LOG.exception(
+                    "compute worker caught unexpected exception (loop continues): %s",
+                    e,
+                )
 
     def _take_next_queued(self) -> Optional[ModelInstance]:
         with self._lock:
@@ -644,54 +663,91 @@ class ComputeRegistry:
         所以这里把构造放到 **子进程** 里跑：subprocess 挂了不影响
         父进程，父进程把实例标 ``status='error'``，算力配置页可
         以看到错误原因 + 重试（disable → enable）。
+
+        失败兜底：整段包在 ``try/except BaseException`` 里，**任何**
+        异常（包括 ``except Exception`` 抓不住的 ``SystemExit`` /
+        ``KeyboardInterrupt`` 等 ``BaseException`` 子类）都会把实例
+        标 ``status='error'`` 并写错误原因。**绝不**让实例停在
+        ``loading`` 状态 —— 那意味着 worker 已经放弃了这个实例，但
+        UI 永远看不到错误。
         """
         npu_index = inst.npu_index
         model_id = inst.model_id
-
-        ok, err, probe = _init_session_subprocess(npu_index, model_id)
-        if not ok:
-            with self._lock:
-                inst.status = "error"
-                inst.error = err
-                inst.finished_at = time.time()
-            LOG.warning(
-                "compute init subprocess failed (%d, %s): %s",
-                npu_index, model_id, err,
-            )
-            return
-
-        # 子进程构造成功 —— 父进程也构造一份（consumers 要拿
-        # ``llm_session`` 句柄用）。这一步是**双倍代价**，但只
-        # 在 init 成功路径上出现，且确保 web 不会因为 native abort
-        # 而挂。失败依旧标 error。
         try:
-            preset = MODEL_PRESETS[model_id]
-            spec = preset["preset_factory"]()
-            from rkai import LLMSession  # 懒导入
-            sess = LLMSession(model=spec, npu=npu_index)
-        except Exception as e:
+            ok, err, probe = _init_session_subprocess(npu_index, model_id)
+            if not ok:
+                with self._lock:
+                    inst.status = "error"
+                    inst.error = err
+                    inst.finished_at = time.time()
+                LOG.warning(
+                    "compute init subprocess failed (%d, %s): %s",
+                    npu_index, model_id, err,
+                )
+                return
+
+            # 子进程构造成功 —— 父进程也构造一份（consumers 要拿
+            # ``llm_session`` 句柄用）。这一步是**双倍代价**，但只
+            # 在 init 成功路径上出现，且确保 web 不会因为 native abort
+            # 而挂。失败依旧标 error。
+            try:
+                preset = MODEL_PRESETS[model_id]
+                spec = preset["preset_factory"]()
+                from rkai import LLMSession  # 懒导入
+                sess = LLMSession(model=spec, npu=npu_index)
+            except BaseException as e:  # noqa: BLE001
+                # 用 BaseException 而不是 Exception：rkai / rknn3 native
+                # 代码可能在 LLMSession() 构造期间抛 SystemExit / 自定义
+                # BaseException 子类，except Exception 抓不到 → 实例
+                # 永远停在 loading → UI 卡住。
+                with self._lock:
+                    inst.status = "error"
+                    inst.error = (
+                        f"subprocess 探针 ok，但父进程 init 失败: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    inst.finished_at = time.time()
+                LOG.warning(
+                    "compute parent init failed (%d, %s) after subprocess ok: %s",
+                    npu_index, model_id, e,
+                )
+                return
+
+            with self._lock:
+                inst.llm_session = sess
+                inst.status = "running"
+                inst.error = ""
+                inst.finished_at = time.time()
+            LOG.info(
+                "compute instance running (%d, %s, probe=%.1fs)", npu_index, model_id, probe,
+            )
+        except BaseException as e:  # noqa: BLE001
+            # 兜底：_init_session_subprocess 自己抛（FileNotFoundError /
+            # OSError / 别的意料外情况），或上面任何一个分支出错。**必须**
+            # 把实例标 error，否则 status 会停在 loading 永远不变 —— 网页
+            # 端只能看到 "初始化中..." 倒计时不动，用户没有任何线索。
+            err_text = str(e) or "未知异常"
             with self._lock:
                 inst.status = "error"
-                inst.error = f"subprocess 探针 ok，但父进程 init 失败: {e}"
+                inst.error = f"worker 内部异常: {type(e).__name__}: {err_text}"
                 inst.finished_at = time.time()
-            LOG.warning(
-                "compute parent init failed (%d, %s) after subprocess ok: %s",
-                npu_index, model_id, e,
+            LOG.exception(
+                "compute _run_one caught unexpected exception (%d, %s)", npu_index, model_id,
             )
             return
 
-        with self._lock:
-            inst.llm_session = sess
-            inst.status = "running"
-            inst.error = ""
-            inst.finished_at = time.time()
-        # 持久化：实例集写回 config.json（live start 后）
+        # 持久化：实例集写回 config.json（live start 后）。
+        # 故意放在 try/except 之外 —— LLMSession 已成功 init，_persist 失败
+        # 不应该回滚 status='error'。持久化失败只记日志，进程不退。
         # 注意：这是后台 thread 调，_persist 会调 config.set_section，
         # 已经 thread-safe（ConfigStore 内部有 RLock）。
-        self._persist()
-        LOG.info(
-            "compute instance running (%d, %s, probe=%.1fs)", npu_index, model_id, probe,
-        )
+        try:
+            self._persist()
+        except Exception as pe:  # noqa: BLE001
+            LOG.warning(
+                "compute _persist failed after successful init (%d, %s): %s",
+                npu_index, model_id, pe,
+            )
 
 
 # --------------------------------------------------------------------------- #
