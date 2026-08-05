@@ -18,6 +18,7 @@ from app.api import (
     power,
     system_logs,
     system_monitor,
+    text_chat,
     tts,
     video_detection,
     video_target_detection,
@@ -26,6 +27,7 @@ from app.api import (
 from app.services.compute_registry import get_registry
 from app.services.config import get_config
 from app.services.detector import get_detector, get_target_detector
+from app.services.text_chat import close_chat, get_chat_service
 from app.services.tts_session import get_session as get_tts_session
 from app.services.video_session import get_session
 from app.services.wechat import close_wechat, get_wechat
@@ -85,6 +87,7 @@ def create_app() -> FastAPI:
     app.include_router(lan_discovery.router, prefix="/api")
     app.include_router(video_target_detection.router, prefix="/api")
     app.include_router(wechat.router, prefix="/api")
+    app.include_router(text_chat.router, prefix="/api")
 
     # 暂时关闭：boot 时**不**自动加载 config.json["compute"]["instances"]
     # 里的实例 —— 用户必须从算力配置页手动启用。Worker 线程在第一次
@@ -145,6 +148,13 @@ def create_app() -> FastAPI:
         # underlying wdiot.Wechat which owns the long-poll task).
         try:
             close_wechat()
+        except Exception:
+            pass
+        # Stop the text-chat service worker thread (singleton lives in
+        # app.services.text_chat; the underlying LLMSession is owned by
+        # the ComputeRegistry and was already closed by close_all()).
+        try:
+            close_chat()
         except Exception:
             pass
 
