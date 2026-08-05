@@ -5,9 +5,14 @@
 前端 / detector / API 都通过 ``get_tool_registry()`` 取这一份
 真源，不会重复装饰器。
 
-rkai 在工具模块顶部 import：detect_video 等用例直接 ``from rkai
+rkai 在工具模块顶部 import：tts_alert 等用例直接 ``from rkai
 import Callable, Field``，注册过程不引入任何 lazy 间接层，
 与设计要求一致。
+
+注意：原 ``target_detection`` 工具（bbox + ROI 描述）已下线 —
+视频目标检测页直接用 ``session.respond(generating=TargetDoc)``
+结构化输出，不再走 @Callable 工具链路。当前唯一保留的工具是
+``tts_alert``（音视频描述页使用）。
 """
 from __future__ import annotations
 
@@ -110,7 +115,7 @@ class ToolRegistry:
 
 
 # --------------------------------------------------------------------------- #
-# 单例 + 三件内置工具的注册
+# 单例 + 仅保留的一个内置工具
 # --------------------------------------------------------------------------- #
 _registry: Optional[ToolRegistry] = None
 _registry_lock = RLock()
@@ -120,34 +125,9 @@ def get_tool_registry() -> ToolRegistry:
     global _registry
     with _registry_lock:
         if _registry is None:
-            from .annotate_roi import AnnotateROI
-            from .crop_region import CropRegion
             from .tts_alert import TtsAlert
 
             reg = ToolRegistry()
-            reg.register(
-                key="annotate_roi",
-                name="目标标注",
-                description=(
-                    "目标标注工具：当画面中检测到需要标注的目标，"
-                    "给出 ROI 坐标，前端会在视频画布上以红色矩形框出，"
-                    "5 秒后淡出。"
-                ),
-                requires_capability=None,
-                tool_class=AnnotateROI,
-            )
-            reg.register(
-                key="crop_region",
-                name="目标剪裁",
-                description=(
-                    "目标剪裁工具：模型给出 0–1000 归一化坐标 [x1, y1, x2, y2]，"
-                    "后端按 bbox 裁切原图，JPEG 编码后 base64 内嵌到事件 JSON，"
-                    "前端在画布上叠红框 + 浮动窗展示剪裁图，"
-                    "事件历史列表里挂小缩略图。"
-                ),
-                requires_capability=None,
-                tool_class=CropRegion,
-            )
             reg.register(
                 key="tts_alert",
                 name="语音提醒",

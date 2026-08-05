@@ -1,11 +1,14 @@
-"""视频目标检测 endpoints: REST 控制 + WebSocket 帧流 + annotate_roi / crop_region 检测。
+"""视频目标检测 endpoints: REST 控制 + WebSocket 帧流 + TargetDoc 检测。
 
 页面结构与 ``app/api/video_detection.py`` 一致；区别仅：
+
 * ``/video-target-detection`` 前缀；
-* 后端 detector 用 ``get_target_detector()``，prompt / enabled_tools / 事件
-  历史与音视频描述页相互独立；
-* 工具默认 ``annotate_roi`` + ``crop_region``（红框标注 / 剪裁），用户
-  可以单选 / 多选 / 都不选；空列表时回退到默认集合。
+* 后端 detector 用 ``get_target_detector()``，prompt / 事件历史与
+  音视频描述页相互独立；
+* 检测走 ``session.respond(generating=TargetDoc)`` 结构化输出直
+  接拿 ``x1, y1, x2, y2`` + ``desc``，**不**再挂任何 ``@Callable``
+  工具 —— 该页面没有"工具集合"概念，``/video-target-detection/tools``
+  端点也不存在。
 """
 from __future__ import annotations
 
@@ -18,10 +21,6 @@ from app.services.video_session import get_session
 
 
 router = APIRouter(tags=["video-target-detection"])
-
-# 视频目标检测页允许「目标标注」「目标剪裁」两个工具。其他工具即便
-# 注册表里有也不在这里暴露 —— 该页面是面向「目标检测」场景的固定工具集。
-ALLOWED_TOOLS = ("annotate_roi", "crop_region")
 
 
 @router.get("/video-target-detection")
@@ -59,7 +58,7 @@ async def close_source() -> dict:
 
 
 # --------------------------------------------------------------------- #
-# annotate_roi 检测                                                       #
+# TargetDoc 检测                                                         #
 # --------------------------------------------------------------------- #
 @router.get("/video-target-detection/prompt")
 async def get_prompt() -> dict:
@@ -68,11 +67,13 @@ async def get_prompt() -> dict:
 
 @router.post("/video-target-detection/prompt")
 async def set_prompt(payload: dict) -> dict:
-    """Start (or update) annotate_roi target detection.
+    """Start (or update) target-detection.
 
-    Body: ``{prompt: str, every_n: int, enabled_tools: list[str]}``
-    ``enabled_tools`` 可选 —— 后端会按 ``ALLOWED_TOOLS`` 兜底过滤，
-    当前只允许 ``annotate_roi``。
+    Body: ``{prompt: str, every_n: int}``
+
+    旧版 ``enabled_tools`` 字段不再生效 —— 该页只走 ``TargetDoc``
+    结构化输出，不再挂任何 ``@Callable`` 工具。仍接受该字段以便
+    老前端过渡期不掉请求体；忽略即可。
     """
     payload = payload or {}
     prompt = (payload.get("prompt") or "").strip()
@@ -84,61 +85,13 @@ async def set_prompt(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail="every_n 必须为整数")
     if every_n < 1:
         raise HTTPException(status_code=400, detail="every_n 必须 >= 1")
-    enabled_tools = payload.get("enabled_tools") or []
-    if not isinstance(enabled_tools, list):
-        raise HTTPException(status_code=400, detail="enabled_tools 必须是列表")
-    enabled_tools = [k for k in enabled_tools if k in ALLOWED_TOOLS]
-    if not enabled_tools:
-        # 没有任何可用工具时回退到该页唯一允许的工具，避免误传空导致
-        # detector 启动后没工具可调。
-        enabled_tools = list(ALLOWED_TOOLS)
     try:
-        return get_target_detector().start(
-            prompt, every_n=every_n, enabled_tools=enabled_tools
-        )
+        # enabled_tools 显式置 [] — 该页不再挂工具。
+        return get_target_detector().start(prompt, every_n=every_n, enabled_tools=[])
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
-
-
-@router.get("/video-target-detection/tools")
-async def list_tools() -> dict:
-    """返回当前 detector 可启用的工具列表 + 能力可用性。
-
-    每条记录包含 ``key`` / ``name`` / ``description`` /
-    ``requires_capability`` / ``available`` / ``reason`` / ``fields``。
-    该页只暴露 ``ALLOWED_TOOLS`` 集合里的工具（目标标注）。
-    """
-    from app.services.compute_registry import get_registry
-    from app.services.tools import get_tool_registry
-
-    reg = get_tool_registry()
-    out = []
-    for spec in reg.list_specs():
-        if spec.key not in ALLOWED_TOOLS:
-            continue
-        available = True
-        reason = ""
-        if spec.requires_capability:
-            try:
-                get_registry().get_session(spec.requires_capability)
-            except RuntimeError as e:
-                available = False
-                reason = str(e)
-        out.append({
-            "key":                 spec.key,
-            "name":                spec.name,
-            "description":         spec.description,
-            "requires_capability": spec.requires_capability,
-            "available":           available,
-            "reason":              reason,
-            "fields":              [
-                {"name": fname, "description": fdesc}
-                for fname, fdesc in spec.fields
-            ],
-        })
-    return {"tools": out}
 
 
 @router.post("/video-target-detection/prompt/stop")
@@ -167,17 +120,16 @@ async def clear_events() -> dict:
 # --------------------------------------------------------------------- #
 @router.websocket("/video-target-detection/ws")
 async def stream_ws(ws: WebSocket) -> None:
-    """Push decoded JPEG frames + annotate_roi / crop_region events to the browser.
+    """Push decoded JPEG frames + TargetDoc events to the browser.
 
     Protocol (server -> client):
       - JSON text: {"type":"status", ...session snapshot, detector snapshot...}
       - Binary:    raw JPEG bytes for one frame
       - JSON text: {"type":"eof"} when a file source reaches end
-      - JSON text: {"type":"event", ...detector event...} when annotate_roi
-                   (event.tool_call == "annotate_roi" 且 event.bbox 不为空)
-                   或 crop_region (event.tool_call == "crop_region"，
-                   event.bbox 不为空 + event.crop_b64 是裁图的 base64 JPEG)
-                   fires.
+      - JSON text: {"type":"event", ...detector event...} when  ``TargetDoc``
+                   fires (event.bbox 是 4 元 [x1,y1,x2,y2] + event.crop_b64
+                   是裁图的 base64 JPEG + event.desc 是模型对 ROI 的描述
+                   文本)。
     """
     await ws.accept()
     session = get_session()

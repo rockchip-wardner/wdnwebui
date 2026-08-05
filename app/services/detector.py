@@ -12,6 +12,24 @@ later) and an ``LMOutput``-derived ``generating`` schema; for VLM
 same schema could be reused with a TTS-style backend without
 code changes here.
 
+**两种 generating schema，按 detector 实例分别配置**：
+
+* ``VLMDoc`` —— 音视频描述页（``get_detector()``）使用，模型返回
+  ``text`` + 可选 ``level``。
+* ``TargetDoc`` —— 视频目标检测页（``get_target_detector()``）使
+  用，模型直接给出 ``x1, y1, x2, y2``（0–1000 归一化）和 ``desc``
+  （ROI 内描述文本）。后端按 bbox 裁切原帧、JPEG 编码、base64 内
+  嵌到事件 JSON（``crop_b64`` / ``crop_w`` / ``crop_h``），``desc``
+  同时写到事件 ``text`` 字段（沿用历史展示路径）。
+
+**单帧多轮工具循环**（agent-loop）：``_infer_sync`` 现在会对一帧
+跑最多 ``compute.tool_call_max_iters``（默认 5，``0`` 无限）轮
+``sess.respond``；每轮若模型返回 ``@Callable`` 实例就执行副作用
+并把"调用 + 返回"作为文本 attachment 喂回下一轮 prompt，直到模型
+返回 ``generating`` schema 实例或循环上限命中。循环上限 + 兜底硬
+上限共同防止失控模型锁死 worker。``TargetDoc`` 模式不挂任何
+``@Callable`` 工具，因此循环天然只跑一轮就退出。
+
 ``rkai`` is heavy (RKNN model load is several seconds) and inference
 is single-shot — one worker, one session, queue maxsize=1 (latest-only).
 On boxes without the model files ``start()`` records an error in
@@ -21,13 +39,16 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
+
+from app.services.config import get_config
 
 
 _RKAI_IMPORT_ERROR = ""
@@ -36,6 +57,22 @@ _RKAI_IMPORT_ERROR = ""
 # eagerly, and a missing wheel on dev boxes would otherwise crash app startup
 # even for users who never touch the detection panel.
 _RKAI_CACHE: dict = {}
+
+import logging
+LOG = logging.getLogger("detector")
+# Uvicorn 的 logging config 把 root logger 设为 WARNING，detector 的
+# named logger 虽然 propagate 到 root，但 root 不显示 INFO / DEBUG。
+# 这里给 detector 自带一个 StreamHandler（stderr），不依赖 root 的
+# 配置，reload 模式下也不会重复挂载（用 getattr 检测）。
+if not getattr(LOG, "_pyrkaiweb_handler_attached", False):
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("[detector] %(asctime)s %(levelname)s %(message)s")
+    )
+    LOG.addHandler(_handler)
+    LOG.setLevel(logging.INFO)
+    LOG._pyrkaiweb_handler_attached = True  # type: ignore[attr-defined]
+    LOG.propagate = False
 
 
 def _load_rkai():
@@ -108,8 +145,21 @@ def _build_vlm_doc_class():
 
     _, _, _, _, LMOutput, Generable, Field, _ = _load_rkai()
 
+    # 注意：继承 LMOutput 会带上 ``attachment: List[Attachment]`` 字段，
+    # 但 Attachment 不是 pydantic 模型 —— pydantic v2 的
+    # ``model_json_schema()`` 遇到非 pydantic 类型会抛
+    # ``PydanticInvalidForJsonSchema``，SDK 的 ``_safe_schema`` catch
+    # 后返回空字符串。**直接后果**：模型在 prompt 里看到的
+    # "Option B — Structured response" schema hint 是空的，根本不知
+    # 道该输出什么结构 → 模型倾向于反复调工具而不返回 structured
+    # output → 触发 ``loop hit effective_max=N without VLMDoc``。
+    #
+    # VLMDoc 实际不会从模型产出 attachment（detector 也不会读它），
+    # 改成继承 BaseModel 即可让 schema 正常生成。
+    from pydantic import BaseModel as _PydBaseModel
+
     @Generable
-    class VLMDoc(LMOutput):
+    class VLMDoc(_PydBaseModel):
         """Structured VLM output for pyrkaiweb's video-detection panel."""
         text: str = Field(description="The model's free-form description of the frame.")
         level: Optional[str] = Field(
@@ -131,6 +181,57 @@ def _get_vlm_doc_cls():
     return _VLM_DOC_CLS
 
 
+# --------------------------------------------------------------------------- #
+# TargetDoc —— 视频目标检测页 structured-output schema                       #
+# --------------------------------------------------------------------------- #
+# 取代旧版 ``target_detection`` @Callable 工具：模型在生成结构化输出时
+# 直接给出 ``x1, y1, x2, y2``（0–1000 归一化） + ``desc``（ROI 内描
+# 述文本），detector 在 worker 线程里按 bbox 裁原帧、JPEG 编码、base64
+# 内嵌进事件 JSON（``crop_b64`` / ``crop_w`` / ``crop_h``），``desc``
+# 复制到 ``text`` 字段，事件历史列表沿用现有展示路径。
+def _build_target_doc_class():
+    """Build the ``TargetDoc`` schema lazily, once rkai is importable.
+
+    与 ``VLMDoc`` 一样继承 ``BaseModel`` 而非 ``LMOutput`` —— 避免
+    ``attachment: List[Attachment]`` 字段污染 ``model_json_schema``，
+    否则 SDK 的 ``_safe_schema`` 会返回空串，模型看不到字段含义。
+    """
+    from typing import Optional  # noqa: F401  (kept for parity w/ VLMDoc)
+
+    _, _, _, _, _, Generable, Field, _ = _load_rkai()
+
+    from pydantic import BaseModel as _PydBaseModel
+
+    @Generable
+    class TargetDoc(_PydBaseModel):
+        """Structured target-detection output for pyrkaiweb's
+        video-target-detection panel.
+
+        模型应给出 0–1000 归一化 ROI 坐标 ``x1, y1, x2, y2``（左上 +
+        右下）以及 ``desc``（对 ROI 框出内容的描述）。detector 会按
+        坐标裁原图 + JPEG 编码 + base64 内嵌，把 ``desc`` 写到事件
+        ``text`` 字段。
+        """
+        x1: float = Field(description="ROI 左上角 x，0–1000 归一化。")
+        y1: float = Field(description="ROI 左上角 y，0–1000 归一化。")
+        x2: float = Field(description="ROI 右下角 x，0–1000 归一化。")
+        y2: float = Field(description="ROI 右下角 y，0–1000 归一化。")
+        desc: str = Field(description="对 ROI 框出区域内容的描述文本。")
+
+    return TargetDoc
+
+
+# Cached after first build.
+_TARGET_DOC_CLS = None
+
+
+def _get_target_doc_cls():
+    global _TARGET_DOC_CLS
+    if _TARGET_DOC_CLS is None:
+        _TARGET_DOC_CLS = _build_target_doc_class()
+    return _TARGET_DOC_CLS
+
+
 @dataclass
 class DetectorEvent:
     """Public-facing event payload pushed to WS subscribers.
@@ -140,14 +241,19 @@ class DetectorEvent:
     consumers can pull ``attachment`` or other structured fields.
 
     ``tool_call`` is populated when the model selected the
-    ``@Callable`` tool (annotate_roi / crop_region / tts_alert);
+    ``@Callable`` tool (``tts_alert`` currently);
     the front-end renders the event in the events list, with optional
-    canvas overlay (annotate_roi / crop_region).
+    crop thumbnail + description text overlay.
 
     ``crop_b64`` / ``crop_w`` / ``crop_h`` are populated only for
-    ``crop_region`` events: the cropped JPEG bytes (base64) plus the
-    crop pixel dimensions. Lives entirely in memory — not persisted
-    to disk.
+    视频目标检测页 events (model returned ``TargetDoc``): the cropped
+    JPEG bytes (base64) plus the crop pixel dimensions. Lives entirely
+    in memory — not persisted to disk.
+
+    ``desc`` carries the model-provided free-form description of the
+    ROI; populated only for ``TargetDoc`` events. ``text`` is the same
+    string (or the fallback "目标检测"), so legacy consumers that read
+    ``text`` keep working.
     """
     id: int
     frame_pos: int
@@ -161,6 +267,7 @@ class DetectorEvent:
     crop_b64: Optional[str] = None
     crop_w: Optional[int] = None
     crop_h: Optional[int] = None
+    desc: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -176,11 +283,51 @@ class DetectorEvent:
             "crop_b64":         self.crop_b64,
             "crop_w":           self.crop_w,
             "crop_h":           self.crop_h,
+            "desc":             self.desc,
         }
 
 
 # --------------------------------------------------------------------------- #
-# crop_region helper
+# 事件文本清洗：去除模型可能漏出的 chatml / vision / 特殊 token + 控制字符
+# --------------------------------------------------------------------------- #
+# 模型在 VLM 推理时偶尔会把内部 token（如 ``<|im_start|>`` /
+# ``<|im_end|>`` / ``<|vision_start|>`` / ``<|image_pad|>``）漏出到
+# 文本里，或在 JSON 解析失败回退到 raw text 时把整段半截 JSON（带
+# 不闭合的 `{"bbox":...`）也塞进 ``DetectorEvent.text`` / ``desc``，
+# 前端展示就成了"乱码"。这里统一过一遍再写到事件：
+#
+# 1. 去掉所有 ``<|...|>`` chatml 风格特殊 token
+# 2. 去掉 ASCII 控制字符（保留 \n \r \t —— 这三种算"普通空白"）
+# 3. 去掉 Unicode replacement char U+FFFD（解码失败留下的）
+# 4. 折叠 3+ 连续换行为 2 个，避免事件历史里出现大段空行
+# 5. 整体 strip
+#
+# 不做更激进的清洗（如去 emoji / 去 HTML 标签）—— 那些是合法内容。
+_SANITIZE_CHATML_TOKEN = re.compile(r"<\|[^|]*\|>")
+_SANITIZE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_SANITIZE_BLANK_LINES = re.compile(r"\n{3,}")
+
+
+def _sanitize_event_text(s: Optional[str]) -> Optional[str]:
+    """清洗模型/SDK 漏出的特殊 token 与控制字符。
+
+    用于 ``DetectorEvent.text`` / ``DetectorEvent.desc`` 写入前过滤。
+    返回 ``None`` 当且仅当输入是 ``None``；空字符串清洗后仍是空
+    字符串（调用方自行决定是否替换为 "(空)" 之类的占位文本）。
+    """
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        s = str(s)
+    s = _SANITIZE_CHATML_TOKEN.sub("", s)
+    s = _SANITIZE_CONTROL.sub("", s)
+    s = s.replace("\ufffd", "")
+    s = _SANITIZE_BLANK_LINES.sub("\n\n", s)
+    return s.strip()
+
+
+# --------------------------------------------------------------------------- #
+# 视频目标检测页专用：bbox 区域裁切 + JPEG 编码 + base64 内嵌
 # --------------------------------------------------------------------------- #
 def _crop_and_encode(frame_bgr: "np.ndarray", bbox_0_1000) -> tuple:
     """Crop ``frame_bgr`` at the given 0–1000 normalized bbox, JPEG-encode,
@@ -189,7 +336,7 @@ def _crop_and_encode(frame_bgr: "np.ndarray", bbox_0_1000) -> tuple:
 
     Kept module-private (no leading underscore on import) so a unit test
     can target it directly. OpenCV import is lazy: we only need it on
-    crop_region invocation, and opencv-python-headless is a hard dep
+    TargetDoc invocation, and opencv-python-headless is a hard dep
     already used by the upload pipeline.
     """
     if frame_bgr is None or frame_bgr.ndim < 2:
@@ -223,7 +370,6 @@ def _crop_and_encode(frame_bgr: "np.ndarray", bbox_0_1000) -> tuple:
         return "", 0, 0
     return base64.b64encode(buf.tobytes()).decode("ascii"), crop.shape[1], crop.shape[0]
 
-
 # --------------------------------------------------------------------------- #
 class RkaiDetector:
     """Single VLM session shared by the video-detection page.
@@ -233,15 +379,52 @@ class RkaiDetector:
         result = await session.respond(
             prompt=prompt,
             attachment=[Attachment(frame)],     # list
-            generating=VLMDoc,                  # @Generable subclassing LMOutput
+            generating=VLMOutputCls,            # @Generable subclass — VLMDoc or TargetDoc
+            tools=[AlarmCls, ...],
         )
         # result.text, result.level, result.attachment
+
+    **两个工厂函数绑定不同的 ``generating`` schema**：
+
+    * ``get_detector()`` —— 音视频描述页，用 ``VLMDoc``，可选挂
+      ``@Callable`` 工具（如 ``tts_alert``）。
+    * ``get_target_detector()`` —— 视频目标检测页，用 ``TargetDoc``
+      （``x1, y1, x2, y2`` + ``desc``），**不**挂任何工具，由模型
+      在结构化输出里直接给出 ROI 坐标 + 描述文本。
+
+    一帧推理支持**多轮工具循环**（agent-loop）：模型可在同一帧内连
+    续调多次 ``@Callable`` 工具（如 ``tts_alert``），每轮的"工具调
+    用 + 返回"会以**文本 attachment** 形式回灌到下一轮的 prompt，
+    直到模型返回 ``generating`` schema 的实例或循环上限命中。循环
+    上限从 ``config.json["compute"]["tool_call_max_iters"]`` 读取，
+    默认 5；``0`` 表示无限循环（仍受 ``_ABSOLUTE_MAX_ITERS`` 硬上
+    限兜底，防止失控模型锁死 worker）。``TargetDoc`` 模式没有工
+    具，因此循环天然只跑一轮就跳出。
     """
 
     HISTORY_MAX = 200
     ITEM_QUEUE_MAX = 1  # latest-only — older frames are dropped
+    # 工具调用循环的硬上限。即使 ``tool_call_max_iters=0``（无限）
+    # 也会卡在这里 —— 兜底避免失控模型在同一帧里无限循环把 worker
+    # 锁死。200 次 × 1s/inference ≈ 3 分钟单帧最坏延迟，足够 cover
+    # 任何合理的多工具串联场景，又不至于把队列永久堵住。
+    _ABSOLUTE_MAX_ITERS = 200
+    # 默认循环上限（config.json 缺失 / 类型不对 / 负值时使用）。
+    _DEFAULT_MAX_ITERS = 5
 
-    def __init__(self) -> None:
+    def __init__(self, *, generating_cls=None) -> None:
+        """``generating_cls`` —— 该 detector 实例要传给
+        ``session.respond(generating=...)`` 的 ``@Generable`` 子类。
+
+        * ``None``（默认）→ ``VLMDoc``（音视频描述页 schema）
+        * 显式 ``TargetDoc`` 类 → 视频目标检测页 schema
+        * callable（无参函数 / lambda），返回上面的 schema 类——
+          ``start()`` 里会调一次拿到真正的类，避免 worker 线程首次
+          import 卡顿；工厂通常传这种。
+
+        解析延迟到 ``start()``：rkai 第一次 import 的失败路径在那里
+        走 ``available`` 兜底。
+        """
         self._lock = threading.Lock()
         self._enabled = False
         self._prompt = ""
@@ -249,6 +432,11 @@ class RkaiDetector:
         self._enabled_tools: List[str] = []
         self._frame_count = 0
         self._model_name = "qwen3-vl-4b"
+        self._generating_cls = generating_cls
+        # 缓存本实例对应的 schema 类，避免每次推理都重读缓存字典。
+        # start() 里再赋值一次（要拿到已 build 好的类 ——
+        # ``_get_vlm_doc_cls`` / ``_get_target_doc_cls`` 仅在首次
+        # ``_load_rkai()`` 成功后才返回有效类）。
         # LLMSession 不再由 detector 持有，统一在 ComputeRegistry 里管理。
         self._init_error = ""
         self._events: deque = deque(maxlen=self.HISTORY_MAX)
@@ -260,6 +448,7 @@ class RkaiDetector:
         self._stop_event = threading.Event()
         self._broadcaster_lock = threading.Lock()
         self._broadcasters: List[Callable[[dict], None]] = []
+
 
     # ------------------------------------------------------------------ #
     @property
@@ -325,7 +514,22 @@ class RkaiDetector:
                     raise RuntimeError(str(e)) from e
         # Build the structured-output class now (lazy) so that any
         # import failure surfaces here instead of inside the worker.
-        _get_vlm_doc_cls()
+        # 该 detector 实例的 schema 在 ``__init__`` 时记录，未指定
+        # 时回退到 ``VLMDoc``（音视频描述页）。视频目标检测页实例会
+        # 显式传 ``TargetDoc`` 进来。
+        if self._generating_cls is None:
+            self._generating_cls = _get_vlm_doc_cls()
+        elif callable(self._generating_cls):
+            # 工厂通常传 ``_get_target_doc_cls`` 这种 callable —— 调
+            # 用一次拿到真正的 schema 类，避开 worker 线程里首次
+            # build 的卡顿。直接传 class 时跳过这一步。
+            self._generating_cls = self._generating_cls()
+        # 验证类型 —— ``isinstance(cls, type)`` 排除残留的 None /
+        # lambda 之类，失败抛 ValueError 让 HTTP 层 400。
+        if not isinstance(self._generating_cls, type):
+            raise ValueError(
+                f"generating_cls 解析后不是类: {self._generating_cls!r}"
+            )
         with self._lock:
             self._enabled = True
             self._prompt = prompt
@@ -420,167 +624,410 @@ class RkaiDetector:
                 pass
 
     # ------------------------------------------------------------------ #
-    def _infer_sync(self, frame_bgr: "np.ndarray", prompt: str) -> DetectorEvent:
-        """One synchronous inference call against the v2 SDK surface.
+    def _infer_sync(self, frame_bgr: "np.ndarray", prompt: str) -> List[DetectorEvent]:
+        """Run a multi-turn tool loop on one frame; return a list of events.
 
-        LLMSession 由 ComputeRegistry 统一管理（"算力配置"页面启用）。
-        找不到 swcap_video_describe capability → 报错 "功能未启用"。
+        每帧开头 ``sess.reset()`` 清一次 KV cache（保留原帧间隔离语
+        义）；之后循环 ``sess.respond``：
 
-        工具调用：模型可选中 ``@Callable`` 工具（tts_alert），SDK
-        返回一个已填充字段的实例；``RkaiDetector`` 自己 ``__call__``
-        执行副作用（触发 TTS），并把 tool key 写入事件。
+        * 模型返回 ``@Callable`` 实例 → 执行 ``result(frame_bgr, ctx)``
+          拿副作用 dict → 构造 ``DetectorEvent`` → 把"调用 + 返回"
+          作为文本 attachment 喂回下一轮 prompt → 继续循环。
+        * 模型返回该 detector 实例配置的 ``generating`` schema
+          （``VLMDoc`` 或 ``TargetDoc``）→ 构造 ``DetectorEvent`` →
+          跳出循环：
+          - ``VLMDoc``：取 ``text`` / ``level``；
+          - ``TargetDoc``：取 ``x1, y1, x2, y2, desc``，按 bbox 裁原
+            图 + JPEG 编码 + base64 内嵌进 ``crop_b64``，``desc`` 复
+            制到 ``text``。
+        * 工具抛异常 → 构造 error/disabled ``DetectorEvent`` → **直接**
+          跳出循环（按设计：异常立即报 error，不再继续喂回 prompt）。
+        * 命中循环上限（``compute.tool_call_max_iters``，默认 5）→ 跳出
+          循环；``0`` 视为无限，仍受 ``_ABSOLUTE_MAX_ITERS`` 兜底。
+        ``TargetDoc`` 模式 ``enabled_tools`` 为空，因此循环天然只跑
+        一轮就跳出。
+
+        返回 ``List[DetectorEvent]`` —— 一帧可产出多个事件
+        （多次工具调用 + 一次 schema 实例），由 ``_worker_loop`` 分配
+        连续 id 并依次广播。
         """
         try:
             from app.services.compute_registry import get_registry
             sess = get_registry().get_session("swcap_video_describe")
         except RuntimeError as e:
-            return DetectorEvent(
-                id=-1,
-                frame_pos=-1,
-                ts=time.time(),
-                prompt=prompt,
-                text=f"({e})",
-                level="disabled",
-                attachment_count=0,
+            LOG.warning(
+                "frame infer: capability disabled (swcap_video_describe): %s",
+                e,
             )
+            return [DetectorEvent(
+                id=-1, frame_pos=-1, ts=time.time(),
+                prompt=prompt, text=f"({e})",
+                level="disabled", attachment_count=0,
+            )]
 
         with self._lock:
             enabled_tools = list(self._enabled_tools)
+            # 本实例的 generating schema；start() 已经解析过
+            # （None 时回退到 ``VLMDoc``）。
+            generating_cls = self._generating_cls
 
         try:
             ok, Attachment, *_ = _load_rkai()
-            VLMDoc = _get_vlm_doc_cls()
+            if generating_cls is None:
+                # 兜底：start() 之前没跑过（实际不会发生——start() 第一
+                # 件事就是解析 schema，这里只是防御性 null-check）。
+                generating_cls = _get_vlm_doc_cls()
+            TargetDoc = (
+                _get_target_doc_cls()
+                if generating_cls is not _get_vlm_doc_cls()
+                else None
+            )
 
             from app.services.tools import get_tool_registry
             reg = get_tool_registry()
             tool_classes = [reg.get_class(k) for k in enabled_tools] if enabled_tools else None
 
             sess.reset()
-            coro = sess.respond(
-                prompt=prompt,
-                attachment=[Attachment(frame_bgr)],     # v2: list of Attachments
-                generating=VLMDoc,                      # v2: LMOutput subclass
-                tools=tool_classes,
-            )
-            result = asyncio.run(coro)
 
-            # ---- tool branch -------------------------------------------------
-            # ``@Callable`` 工具的优先级高于 ``VLMDoc`` 结构化输出 —— 即
-            # 模型可以选其中之一。``isinstance`` 区分，匹配示例
-            # ``function_call.py`` 的写法。
-            from app.services.tools.annotate_roi import AnnotateROI
-            from app.services.tools.crop_region import CropRegion
-            from app.services.tools.tts_alert import TtsAlert
+            max_iters_cfg = self._get_tool_call_max_iters()
+            # 安全规则：用户显式设值用 ``min(cfg, _ABSOLUTE_MAX_ITERS)``，
+            # ``0``（无限）退化为硬上限 —— 任何路径都不能让 worker 在
+            # 单帧里跑超过 _ABSOLUTE_MAX_ITERS 次，避免失控模型锁死
+            # 队列或用户误填超大值导致前端无响应。
+            effective_max = (
+                min(max_iters_cfg, self._ABSOLUTE_MAX_ITERS)
+                if max_iters_cfg > 0
+                else self._ABSOLUTE_MAX_ITERS
+            )
 
             h, w = frame_bgr.shape[:2]
             from app.services.tools.registry import ToolContext
             ctx = ToolContext(width=w, height=h, prompt=prompt)
 
-            if isinstance(result, AnnotateROI):
-                try:
-                    side = result(frame_bgr, ctx)
-                    bbox = side.get("bbox")
-                except Exception as e:  # noqa: BLE001
-                    return DetectorEvent(
-                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                        text=f"(目标标注失败: {e})", level="error",
-                        attachment_count=0, tool_call="annotate_roi",
-                    )
-                return DetectorEvent(
-                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                    text="目标标注",
-                    level=None, attachment_count=0,
-                    tool_call="annotate_roi",
-                    bbox=bbox if not side.get("invalid") else None,
-                )
+            frame_attachment = Attachment(frame_bgr)
+            events: List[DetectorEvent] = []
+            tool_transcripts: List[str] = []
 
-            if isinstance(result, CropRegion):
-                try:
-                    side = result(frame_bgr, ctx)
-                    bbox = side.get("bbox")
-                except Exception as e:  # noqa: BLE001
-                    return DetectorEvent(
-                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                        text=f"(目标剪裁失败: {e})", level="error",
-                        attachment_count=0, tool_call="crop_region",
-                    )
-                if side.get("invalid") or not isinstance(bbox, (list, tuple)):
-                    return DetectorEvent(
-                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                        text="(目标剪裁失败: 无效 bbox)", level="error",
-                        attachment_count=0, tool_call="crop_region",
-                    )
-                crop_b64, crop_w, crop_h = _crop_and_encode(frame_bgr, bbox)
-                if not crop_b64:
-                    return DetectorEvent(
-                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                        text="(目标剪裁失败: 裁切区域为空)", level="error",
-                        attachment_count=0, tool_call="crop_region",
-                        bbox=[float(v) for v in bbox],
-                    )
-                return DetectorEvent(
-                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                    text="目标剪裁",
-                    level=None, attachment_count=0,
-                    tool_call="crop_region",
-                    bbox=[float(v) for v in bbox],
-                    crop_b64=crop_b64,
-                    crop_w=crop_w,
-                    crop_h=crop_h,
-                )
-
-            if isinstance(result, TtsAlert):
-                try:
-                    side = result(frame_bgr, ctx)
-                except RuntimeError as e:
-                    return DetectorEvent(
-                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                        text=f"({e})", level="disabled",
-                        attachment_count=0, tool_call="tts_alert",
-                    )
-                except Exception as e:  # noqa: BLE001
-                    return DetectorEvent(
-                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                        text=f"(语音提醒失败: {e})", level="error",
-                        attachment_count=0, tool_call="tts_alert",
-                    )
-                if side.get("played"):
-                    text = (side.get("text") or "").strip()
-                    snippet = text if len(text) <= 60 else text[:57] + "..."
-                    return DetectorEvent(
-                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                        text=f"语音提醒: {snippet}",
-                        level=None, attachment_count=0,
-                        tool_call="tts_alert",
-                    )
-                err = side.get("error") or "unknown"
-                return DetectorEvent(
-                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                    text=f"(语音提醒失败: {err})", level="error",
-                    attachment_count=0, tool_call="tts_alert",
-                )
-
-            # ---- default: VLMDoc ------------------------------------------
-            att_count = len(getattr(result, "attachment", []) or [])
-            return DetectorEvent(
-                id=-1,                   # filled in by worker_loop
-                frame_pos=-1,            # ditto
-                ts=time.time(),
-                prompt=prompt,
-                text=str(getattr(result, "text", "") or ""),
-                level=getattr(result, "level", None),
-                attachment_count=att_count,
+            LOG.info(
+                "frame infer start: schema=%s tools=%s max_iters(cfg=%s, effective=%s) prompt=%r",
+                generating_cls.__name__,
+                enabled_tools or "(none)",
+                max_iters_cfg,
+                effective_max,
+                (prompt[:60] + "…") if len(prompt) > 60 else prompt,
             )
+
+            exit_reason = "none"
+            for i in range(effective_max):
+                # attachments: 第一轮只放帧，后续轮追加文本 transcript。
+                attachments = [frame_attachment]
+                if tool_transcripts:
+                    blob = (
+                        "# Prior tool calls in this turn\n"
+                        "You have already called the following tools in this turn. "
+                        "You may call another tool, or emit the structured response "
+                        "(`generating=` schema). Do NOT repeat an identical call "
+                        "verbatim — vary the arguments or finalize.\n\n"
+                        + "\n\n".join(tool_transcripts)
+                    )
+                    attachments.append(Attachment(blob, kind="text"))
+
+                iter_prompt = prompt if i == 0 else None
+
+                LOG.debug(
+                    "frame iter %d/%d: sess.respond(tools=%s, with_transcript=%s)",
+                    i + 1,
+                    effective_max,
+                    [c.__name__ for c in (tool_classes or [])],
+                    bool(tool_transcripts),
+                )
+                coro = sess.respond(
+                    prompt=iter_prompt,
+                    attachment=attachments,
+                    generating=generating_cls,
+                    tools=tool_classes,
+                )
+                result = asyncio.run(coro)
+
+                # ---- tool branch -------------------------------------------
+                tool_ev, is_fatal = self._run_tool_side_effect(
+                    frame_bgr, ctx, result, prompt,
+                )
+                if tool_ev is not None:
+                    events.append(tool_ev)
+                    LOG.info(
+                        "frame iter %d: tool_call=%s is_fatal=%s level=%s",
+                        i + 1,
+                        tool_ev.tool_call,
+                        is_fatal,
+                        tool_ev.level,
+                    )
+                    # 工具成功 → 写 transcript 进下一轮 prompt，继续循环；
+                    # 工具失败 → 直接跳出（按设计：异常 → error → 不再喂回）。
+                    if is_fatal:
+                        exit_reason = f"tool_error[{tool_ev.tool_call}]"
+                        break
+                    tool_transcripts.append(
+                        self._format_tool_transcript(result, tool_ev)
+                    )
+                    continue
+
+                # ---- TargetDoc branch --------------------------------------
+                # 视频目标检测页：模型直接给出 x1, y1, x2, y2 + desc。
+                # 后端按 bbox 裁原图 + JPEG 编码 + base64 内嵌到事件
+                # JSON，``desc`` 复制到 ``text`` 字段。事件历史列表沿
+                # 用现有展示路径。
+                if TargetDoc is not None and isinstance(result, TargetDoc):
+                    target_ev = self._build_target_event(result, frame_bgr, prompt)
+                    events.append(target_ev)
+                    bbox = target_ev.bbox or [0.0, 0.0, 0.0, 0.0]
+                    LOG.info(
+                        "frame iter %d: TargetDoc bbox=[%.0f,%.0f,%.0f,%.0f] crop=%dx%d",
+                        i + 1,
+                        bbox[0], bbox[1], bbox[2], bbox[3],
+                        target_ev.crop_w or 0,
+                        target_ev.crop_h or 0,
+                    )
+                    exit_reason = "target_doc"
+                    break
+
+                # ---- VLMDoc branch (default) ------------------------------
+                # VLMDoc 的 text 字段直接来自模型输出（SDK `_parse_output` 在
+                # JSON 解析失败时会回退到 raw text，可能含特殊 token 或半截
+                # JSON），写事件前统一过 sanitize 兜底。
+                att_count = len(getattr(result, "attachment", []) or [])
+                raw_text = str(getattr(result, "text", "") or "")
+                clean_text = _sanitize_event_text(raw_text) or ""
+                final_ev = DetectorEvent(
+                    id=-1,
+                    frame_pos=-1,
+                    ts=time.time(),
+                    prompt=prompt,
+                    text=clean_text,
+                    level=getattr(result, "level", None),
+                    attachment_count=att_count,
+                )
+                events.append(final_ev)
+                LOG.info(
+                    "frame iter %d: VLMDoc level=%s text_len=%d (sanitized %d)",
+                    i + 1,
+                    final_ev.level,
+                    len(raw_text),
+                    len(clean_text),
+                )
+                exit_reason = "vlm_doc"
+                break
+
+            if exit_reason == "none":
+                exit_reason = (
+                    f"cap_hit(max_iters={effective_max})"
+                )
+                LOG.warning(
+                    "frame infer: loop hit effective_max=%d without schema, "
+                    "final tool still calling — likely runaway model",
+                    effective_max,
+                )
+
+            LOG.info(
+                "frame infer done: iters=%d events=%d tools_called=%s exit=%s",
+                len(events),
+                len(events),
+                [e.tool_call for e in events if e.tool_call],
+                exit_reason,
+            )
+            return events
         except Exception as e:  # pragma: no cover - depends on model
+            LOG.exception("frame infer crashed: %s", e)
+            return [DetectorEvent(
+                id=-1, frame_pos=-1, ts=time.time(),
+                prompt=prompt, text=f"(推理失败: {e})",
+                level=None, attachment_count=0,
+            )]
+
+    # ------------------------------------------------------------------ #
+    def _build_target_event(
+        self,
+        result: "object",
+        frame_bgr: "np.ndarray",
+        prompt: str,
+    ) -> DetectorEvent:
+        """把 ``TargetDoc`` 实例 + 原帧包成 ``DetectorEvent``。
+
+        * 从 ``x1, y1, x2, y2`` 拼 ``bbox`` 数组；
+        * ``desc`` 过 sanitize（防 chatml token / 控制字符 / 半截
+          JSON 漏出），再复制到 ``text``（沿用历史展示路径）；
+        * 按 bbox 裁原图 + JPEG 编码 + base64 内嵌到 ``crop_b64``；
+          裁切为空时 ``crop_b64=""``，事件仍写出，``level='error'``。
+        * ``tool_call='target_detection'`` —— 沿用历史事件的判别
+          字段，前端用它识别"带 bbox / crop 的目标检测事件"。
+          注意这里不再是 ``@Callable`` 工具调用，而是 schema 名
+          语义化产物；与 ``tts_alert`` 区分（后者
+          ``tool_call='tts_alert'`` 仍是真正的工具调用路径）。
+        """
+        try:
+            bbox = [
+                float(result.x1),
+                float(result.y1),
+                float(result.x2),
+                float(result.y2),
+            ]
+        except Exception as e:  # noqa: BLE001
             return DetectorEvent(
-                id=-1,
-                frame_pos=-1,
-                ts=time.time(),
-                prompt=prompt,
-                text=f"(推理失败: {e})",
-                level=None,
+                id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                text=f"(目标检测失败: 字段缺失: {e})",
+                level="error",
                 attachment_count=0,
+                tool_call="target_detection",
             )
+        desc = _sanitize_event_text(getattr(result, "desc", "") or "") or ""
+        crop_b64, crop_w, crop_h = _crop_and_encode(frame_bgr, bbox)
+        if not crop_b64:
+            return DetectorEvent(
+                id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                text=f"(目标检测失败: 裁切区域为空){(': ' + desc) if desc else ''}",
+                level="error",
+                attachment_count=0,
+                tool_call="target_detection",
+                bbox=bbox,
+                desc=desc,
+            )
+        display_text = desc if desc else "目标检测"
+        return DetectorEvent(
+            id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+            text=display_text,
+            level=None,
+            attachment_count=0,
+            tool_call="target_detection",
+            bbox=bbox,
+            crop_b64=crop_b64,
+            crop_w=crop_w,
+            crop_h=crop_h,
+            desc=desc,
+        )
+
+    # ------------------------------------------------------------------ #
+    def _get_tool_call_max_iters(self) -> int:
+        """读 ``config.json["compute"]["tool_call_max_iters"]``。
+
+        默认 ``5``；``0`` 表示无限（仍受 ``_ABSOLUTE_MAX_ITERS`` 兜底）；
+        缺失 / 类型错误 / 负值 → 回退到 ``5``。每次推理前重读，配置热生效。
+        """
+        try:
+            cfg = get_config().get_section("compute", {})
+            if not isinstance(cfg, dict):
+                return self._DEFAULT_MAX_ITERS
+            v = cfg.get("tool_call_max_iters", self._DEFAULT_MAX_ITERS)
+            iv = int(v)
+            if iv < 0:
+                return self._DEFAULT_MAX_ITERS
+            return iv
+        except Exception:
+            return self._DEFAULT_MAX_ITERS
+
+    # ------------------------------------------------------------------ #
+    def _run_tool_side_effect(
+        self,
+        frame_bgr: "np.ndarray",
+        ctx,
+        result,
+        prompt: str,
+    ) -> Tuple[Optional[DetectorEvent], bool]:
+        """如果 ``result`` 是某个 ``@Callable`` 工具的实例，执行副作用
+        并返回 ``(DetectorEvent, is_fatal)``。
+
+        * ``is_fatal=True`` 表示工具抛异常或返回无效结果 —— 调用方应
+          立即跳出循环，不再把这一笔喂回 prompt（按设计：异常 → error
+          → 跳出）。
+        * ``is_fatal=False`` 表示工具正常执行 —— 调用方应把"调用 +
+          返回"写进 transcript 继续下一轮。
+        * ``result`` 不是任何已知工具实例 → 返回 ``(None, False)``，
+          调用方按 ``VLMDoc`` / ``TargetDoc`` 默认分支处理。
+
+        当前唯一保留的 ``@Callable`` 工具是 ``tts_alert``（音视频描述
+        页）。视频目标检测页的检测逻辑走 ``TargetDoc`` 结构化输出，
+        不经工具分支。
+
+        单帧可多次调用本方法（每次 iter 一次）；返回值 ``is_fatal``
+        控制是否中断循环。
+        """
+        from app.services.tools.tts_alert import TtsAlert
+
+        if isinstance(result, TtsAlert):
+            try:
+                side = result(frame_bgr, ctx)
+            except RuntimeError as e:
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text=f"({e})", level="disabled",
+                    attachment_count=0, tool_call="tts_alert",
+                ), True
+            except Exception as e:  # noqa: BLE001
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text=f"(语音提醒失败: {e})", level="error",
+                    attachment_count=0, tool_call="tts_alert",
+                ), True
+            if side.get("played"):
+                text_v = (side.get("text") or "").strip()
+                snippet = text_v if len(text_v) <= 60 else text_v[:57] + "..."
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text=f"语音提醒: {snippet}",
+                    level=None, attachment_count=0,
+                    tool_call="tts_alert",
+                ), False
+            err = side.get("error") or "unknown"
+            return DetectorEvent(
+                id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                text=f"(语音提醒失败: {err})", level="error",
+                attachment_count=0, tool_call="tts_alert",
+            ), True
+
+        return None, False
+
+    # ------------------------------------------------------------------ #
+    def _format_tool_transcript(self, tool_result, event: DetectorEvent) -> str:
+        """Format a tool call + its return into a prose block the model
+        will see as a text attachment on the next iteration's prompt.
+
+        **Deliberately prose, not JSON** —— SDK 的
+        ``try_parse_tool_call`` 只解析模型的 *response*，但模型看到
+        prompt 里有 JSON block 时倾向于把那段 JSON 抄回去当自己的
+        输出（"respond with only JSON"），导致 transcript 里的旧
+        工具调用被误当成新调用重发。用纯文本 + 仿 Python repr 的
+        写法让模型"读懂"但不"复制"。
+
+        当前唯一保留的工具是 ``tts_alert``（音视频描述页）；
+        ``target_detection`` 已下线（视频目标检测改走 ``TargetDoc``
+        结构化输出），因此这里不再有 ``target_detection`` 分支。
+        """
+        name = tool_result.__class__.__name__
+        try:
+            arguments = tool_result.model_dump()
+        except Exception:
+            try:
+                arguments = dict(tool_result.__dict__)
+            except Exception:
+                arguments = {}
+
+        # model_dump 可能含 chatml token / 控制字符（模型把 token 漏到
+        # 字段里时），repr 序列化后再 sanitize，防止 transcript 进下一
+        # 轮 prompt 后干扰模型。
+        try:
+            arguments = _sanitize_event_text(repr(arguments)) or ""
+        except Exception:
+            arguments = repr(arguments)[:200]
+
+        if event.tool_call == "tts_alert":
+            played = event.level is None and (event.text or "").startswith("语音提醒")
+            result_str = "played" if played else f"failed: {event.text}"
+        else:
+            result_str = "(no result)"
+
+        return (
+            f"Step: you called {name} with arguments={arguments!r}. "
+            f"Result: {result_str}."
+        )
 
     # ------------------------------------------------------------------ #
     def _worker_loop(self) -> None:
@@ -592,14 +1039,19 @@ class RkaiDetector:
             if item is None:
                 return
             frame_bgr, frame_pos, prompt = item
-            ev = self._infer_sync(frame_bgr, prompt)
+            events = self._infer_sync(frame_bgr, prompt)
             with self._events_lock:
-                ev.id = self._next_event_id
-                ev.frame_pos = frame_pos
-                self._next_event_id += 1
-                self._events.append(ev)
-                self._latest = ev.to_dict()
-            self._broadcast(ev.to_dict())
+                for ev in events:
+                    ev.id = self._next_event_id
+                    ev.frame_pos = frame_pos
+                    self._next_event_id += 1
+                    self._events.append(ev)
+                    self._latest = ev.to_dict()
+                # ``latest`` 在多 event 帧下指向最后一个；前端
+                # ``addVtdEvent`` 用 unshift() 重新排序，最终列表的
+                # 顺序仍是 frame_pos 内 id 倒序（最新在前）。
+            for ev in events:
+                self._broadcast(ev.to_dict())
 
 
 _detector: Optional[RkaiDetector] = None
@@ -608,7 +1060,11 @@ _detector_lock = threading.Lock()
 
 
 def get_detector() -> RkaiDetector:
-    """音视频描述页（tts_alert）后端 detector 单例。"""
+    """音视频描述页（``VLMDoc`` + 可选 ``tts_alert`` 工具）后端 detector 单例。
+
+    ``generating_cls`` 留空 → ``RkaiDetector.__init__`` 默认走
+    ``VLMDoc``。
+    """
     global _detector
     with _detector_lock:
         if _detector is None:
@@ -617,11 +1073,19 @@ def get_detector() -> RkaiDetector:
 
 
 def get_target_detector() -> RkaiDetector:
-    """视频目标检测页（annotate_roi）后端 detector 单例 — 与音视频描述共用
-    ``RkaiDetector`` 类，但状态独立（prompt / enabled_tools / 事件历史各自维护）；
-    frame sink 共享同一个 ``VideoSession`` 的解码流。"""
+    """视频目标检测页（``TargetDoc`` 直接结构化输出）后端 detector 单例。
+
+    与音视频描述共用 ``RkaiDetector`` 类，但实例上挂的是 ``TargetDoc``
+    schema（``x1, y1, x2, y2`` + ``desc``），不挂任何 ``@Callable``
+    工具。状态独立（prompt / 事件历史各自维护）；frame sink 共享同一
+    个 ``VideoSession`` 的解码流。
+
+    把 ``_get_target_doc_cls`` 函数传给 detector（而非 class 本身）
+    —— 这样 ``start()`` 里按"callable → class"两步解析，首次 build
+    与 rkai import 失败路径跟 ``VLMDoc`` 走同一条逻辑。
+    """
     global _target_detector
     with _detector_lock:
         if _target_detector is None:
-            _target_detector = RkaiDetector()
+            _target_detector = RkaiDetector(generating_cls=_get_target_doc_cls)
         return _target_detector

@@ -375,33 +375,22 @@ async function drawVdFrame(jpgBytes) {
   ctx.drawImage(img, 0, 0);
 }
 
-/* Draw a red bbox overlay (5s fade) on the page whose SVG element
- * matches the given id. Each page (vd / vtd) keeps its own SVG; if
- * the requested id is missing, the call is a no-op so the same hook
- * can be reused from both pages' WS handlers.
+/* Strip chatml / vision / control characters that the model may have
+ * leaked into desc / text fields. Mirrors the backend
+ * ``_sanitize_event_text`` so legacy in-memory events get cleaned too.
  */
-function pushVdBbox(svgId, bbox, toolKey) {
-  const svg = document.getElementById(svgId);
-  if (!svg || !Array.isArray(bbox) || bbox.length !== 4) return;
-  const [x1, y1, x2, y2] = bbox.map((v) => Number(v));
-  if (![x1, y1, x2, y2].every((v) => Number.isFinite(v))) return;
-  const ns = "http://www.w3.org/2000/svg";
-  const rect = document.createElementNS(ns, "rect");
-  const x = Math.max(0, Math.min(1000, Math.min(x1, x2)));
-  const y = Math.max(0, Math.min(1000, Math.min(y1, y2)));
-  const w = Math.max(0, Math.abs(x2 - x1));
-  const h = Math.max(0, Math.abs(y2 - y1));
-  rect.setAttribute("x", x);
-  rect.setAttribute("y", y);
-  rect.setAttribute("width", w);
-  rect.setAttribute("height", h);
-  rect.setAttribute("rx", 8);
-  rect.setAttribute("class", "vd-bbox-rect");
-  if (toolKey) rect.setAttribute("data-tool", toolKey);
-  svg.appendChild(rect);
-  setTimeout(() => {
-    try { rect.remove(); } catch (_) { /* already gone */ }
-  }, 5200);
+function sanitizeEventText(s) {
+  if (s == null) return "";
+  let out = String(s);
+  // <|...|> chatml / rknn special tokens
+  out = out.replace(/<\|[^|]*\|>/g, "");
+  // ASCII control chars except \n \r \t
+  out = out.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  // Unicode replacement char (decoding failures)
+  out = out.replace(/\uFFFD/g, "");
+  // Collapse 3+ consecutive newlines to 2
+  out = out.replace(/\n{3,}/g, "\n\n");
+  return out.trim();
 }
 
 function connectVdWs() {
@@ -426,9 +415,6 @@ function connectVdWs() {
       } else if (snap.type === "event") {
         addVdEvent(snap);
         showVdEventBadge(snap);
-        if (Array.isArray(snap.bbox) && snap.tool_call === "annotate_roi") {
-          pushVdBbox("vd-bbox-svg", snap.bbox, snap.tool_call);
-        }
         return;
       } else if (snap.type === "status" && snap.detector) {
         updateVdDetectorStatus(snap.detector);
@@ -726,7 +712,7 @@ function renderVdEventList() {
     meta.appendChild(tag);
     const text = document.createElement("div");
     text.className = "vd-event-text";
-    text.textContent = ev.text || "(空)";
+    text.textContent = sanitizeEventText(ev.text) || "(空)";
     li.appendChild(meta);
     li.appendChild(text);
     list.appendChild(li);
@@ -738,7 +724,7 @@ function showVdEventBadge(ev) {
   const badge = document.getElementById("vd-event-badge");
   const text = document.getElementById("vd-event-badge-text");
   if (!badge || !text) return;
-  text.textContent = ev.text || "(空)";
+  text.textContent = sanitizeEventText(ev.text) || "(空)";
   badge.classList.remove("hidden");
   // restart animation by toggling a class
   badge.style.animation = "none";
@@ -1059,21 +1045,24 @@ function initVideoDetection() {
 }
 
 /* ------------------------------------------------------------------ *
- * 视频目标检测 (Video Target Detection) — annotate_roi                *
+ * 视频目标检测 (Video Target Detection) — TargetDoc 结构化输出           *
  * ------------------------------------------------------------------ *
  * 与音视频描述页 (`VD`) 结构一致；区别：                               *
  *   - API 前缀 `/api/video-target-detection/*`                         *
- *   - 工具固定为 `annotate_roi`（前端不暴露工具选择）                   *
- *   - canvas 之上叠 `#vtd-bbox-svg`，annotate_roi 返回 bbox 时画红框  *
- *   - 后端 detector 实例独立 (`get_target_detector()`)，与描述页互不干扰 *
+ *   - 后端 detector 直接走 `session.respond(generating=TargetDoc)`   *
+ *     结构化输出拿 `x1, y1, x2, y2` + `desc`，**不**挂任何           *
+ *     `@Callable` 工具，因此本页没有工具集合概念，也没有              *
+ *     `/video-target-detection/tools` 端点                            *
+ *   - 后端 detector 实例独立 (`get_target_detector()`)，与描述页互不   *
+ *     干扰                                                              *
+ *   - 事件历史：`ev.tool_call === "target_detection"` 用于识别 TargetDoc *
+ *     事件；带 `crop_b64` 的事件同时挂缩略图 + 描述文本               *
  * ------------------------------------------------------------------ */
 const VTD = {
   ws: null,
   wsRetry: 0,
   wsTimer: null,
   blobUrl: null,
-  tools: [],
-  enabledTools: [],
   lastSnap: null,
   detectorSnap: null,
 };
@@ -1153,10 +1142,7 @@ function connectVtdWs() {
       } else if (snap.type === "event") {
         addVtdEvent(snap);
         showVtdEventBadge(snap);
-        if (Array.isArray(snap.bbox) && (snap.tool_call === "annotate_roi" || snap.tool_call === "crop_region")) {
-          pushVdBbox("vtd-bbox-svg", snap.bbox, snap.tool_call);
-        }
-        if (snap.tool_call === "crop_region" && snap.crop_b64) {
+        if (snap.tool_call === "target_detection" && snap.crop_b64) {
           showVtdCropPopup(snap.crop_b64, snap.crop_w, snap.crop_h);
         }
         return;
@@ -1277,16 +1263,21 @@ function renderVtdEventList() {
     meta.appendChild(tag);
     const body = document.createElement("div");
     body.className = "vd-event-body";
-    if (ev.tool_call === "crop_region" && ev.crop_b64) {
+    if (ev.tool_call === "target_detection" && ev.crop_b64) {
       const thumb = document.createElement("img");
       thumb.className = "vtd-crop-thumb";
-      thumb.alt = "目标剪裁";
+      thumb.alt = "目标检测剪裁";
       thumb.src = "data:image/jpeg;base64," + ev.crop_b64;
       body.appendChild(thumb);
     }
     const text = document.createElement("div");
     text.className = "vd-event-text";
-    text.textContent = ev.text || "(空)";
+    // ``ev.desc`` 是模型对 ROI 的描述（target_detection 专用字段）；
+    // 若为空回退到 ``ev.text``。前端始终展示模型给出的描述文本。
+    const rawText = (ev.desc && String(ev.desc).trim())
+                 || (ev.text && String(ev.text).trim())
+                 || "(空)";
+    text.textContent = sanitizeEventText(rawText);
     body.appendChild(text);
     li.appendChild(meta);
     li.appendChild(body);
@@ -1298,7 +1289,11 @@ function showVtdEventBadge(ev) {
   const badge = document.getElementById("vtd-event-badge");
   const text = document.getElementById("vtd-event-badge-text");
   if (!badge || !text) return;
-  text.textContent = ev.text || "(空)";
+  // VTD badge 用 desc（target_detection 专用）回退 text，再 sanitize
+  const raw = (ev.desc && String(ev.desc).trim())
+            || (ev.text && String(ev.text).trim())
+            || "(空)";
+  text.textContent = sanitizeEventText(raw);
   badge.classList.remove("hidden");
   badge.style.animation = "none";
   badge.offsetHeight;
@@ -1321,7 +1316,7 @@ function showVtdCropPopup(cropB64, w, h) {
   }
   const img = document.createElement("img");
   img.className = "vtd-crop-popup";
-  img.alt = "目标剪裁" + (w && h ? ` (${w}×${h})` : "");
+  img.alt = "目标检测剪裁" + (w && h ? ` (${w}×${h})` : "");
   img.src = "data:image/jpeg;base64," + cropB64;
   overlay.appendChild(img);
   vtdCropHideTimer = setTimeout(() => {
@@ -1342,7 +1337,7 @@ function updateVtdDetectorStatus(snap) {
     statusEl.textContent = "模型加载失败: " + snap.init_error;
   } else if (snap.enabled && snap.session_ready) {
     statusEl.textContent =
-      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size} · 目标标注`;
+      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size} · 目标检测`;
   } else if (snap.enabled) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
@@ -1380,12 +1375,11 @@ async function vtdDetectorStart() {
     setVtdOverlay("请先填写检测提示词", true);
     return;
   }
-  const enabled_tools = vtdCollectEnabledTools();
   try {
     const r = await fetch(API_PREFIX + "/video-target-detection/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, every_n, enabled_tools }),
+      body: JSON.stringify({ prompt, every_n }),
     });
     if (!r.ok) {
       const detail = await r.text().catch(() => "");
@@ -1415,108 +1409,12 @@ async function vtdEventsClear() {
   } catch (_) {}
 }
 
-function vtdCollectEnabledTools() {
-  const root = document.getElementById("vtd-tools-list");
-  if (!root) return [];
-  const out = [];
-  root.querySelectorAll("input[type=checkbox][data-tool-key]").forEach((el) => {
-    if (el.checked && !el.disabled) out.push(el.dataset.toolKey);
-  });
-  return out;
-}
-
-async function vtdLoadTools() {
-  const root = document.getElementById("vtd-tools-list");
-  const summary = document.getElementById("vtd-tools-summary");
-  if (!root) return;
-  let data = { tools: [] };
-  try {
-    const r = await fetch(API_PREFIX + "/video-target-detection/tools");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    data = await r.json();
-  } catch (e) {
-    root.innerHTML = `<div class="vd-tools-empty">加载失败: ${e.message}</div>`;
-    if (summary) summary.textContent = "加载失败";
-    return;
-  }
-  VTD.tools = data.tools || [];
-  renderVtdTools();
-}
-
-function renderVtdTools() {
-  const root = document.getElementById("vtd-tools-list");
-  const summary = document.getElementById("vtd-tools-summary");
-  if (!root) return;
-  const tools = VTD.tools || [];
-  if (!tools.length) {
-    root.innerHTML = `<div class="vd-tools-empty">当前无工具</div>`;
-    if (summary) summary.textContent = "0 个工具";
-    return;
-  }
-  root.innerHTML = "";
-  tools.forEach((t) => {
-    const card = document.createElement("label");
-    card.className = "vd-tool-card" + (t.available ? "" : " is-disabled");
-    const check = document.createElement("input");
-    check.type = "checkbox";
-    check.dataset.toolKey = t.key;
-    check.disabled = !t.available;
-    if (VTD.enabledTools.includes(t.key)) check.checked = true;
-    check.addEventListener("change", () => {
-      if (check.checked) {
-        if (!VTD.enabledTools.includes(t.key)) VTD.enabledTools.push(t.key);
-      } else {
-        VTD.enabledTools = VTD.enabledTools.filter((k) => k !== t.key);
-      }
-      updateVtdToolsSummary();
-    });
-    const body = document.createElement("div");
-    body.className = "vd-tool-card-body";
-    const title = document.createElement("div");
-    title.className = "vd-tool-card-title";
-    const name = document.createElement("span");
-    name.className = "vd-tool-card-name";
-    name.textContent = t.name;
-    const key = document.createElement("span");
-    key.className = "vd-tool-card-key";
-    key.textContent = t.key;
-    title.appendChild(name);
-    title.appendChild(key);
-    const desc = document.createElement("div");
-    desc.className = "vd-tool-card-desc";
-    desc.textContent = t.description;
-    body.appendChild(title);
-    body.appendChild(desc);
-    if (t.requires_capability) {
-      const dep = document.createElement("div");
-      dep.className = "vd-tool-card-dep " + (t.available ? "is-ok" : "is-bad");
-      dep.textContent = t.available
-        ? `依赖 ${t.requires_capability} · ✓ 可用`
-        : `依赖 ${t.requires_capability} · ⚠ ${t.reason || "未启用"}`;
-      body.appendChild(dep);
-    }
-    card.appendChild(check);
-    card.appendChild(body);
-    card.addEventListener("click", (ev) => {
-      if (ev.target.tagName === "INPUT") return;
-      if (check.disabled) return;
-      check.checked = !check.checked;
-      check.dispatchEvent(new Event("change"));
-    });
-    root.appendChild(card);
-  });
-  updateVtdToolsSummary();
-}
-
-function updateVtdToolsSummary() {
-  const summary = document.getElementById("vtd-tools-summary");
-  if (!summary) return;
-  const enabled = vtdCollectEnabledTools();
-  const total = (VTD.tools || []).length;
-  summary.textContent = enabled.length
-    ? `已启用 ${enabled.length} / ${total}`
-    : `未启用（${total} 个可选）`;
-}
+// 视频目标检测页不再有工具集合概念 —— 模型直接返回
+// `TargetDoc` (x1, y1, x2, y2 + desc) 结构化输出，不挂任何
+// `@Callable` 工具。因此 ``vtdCollectEnabledTools`` / ``vtdLoadTools``
+// / ``renderVtdTools`` / ``updateVtdToolsSummary`` 已删除，原本调用
+// `vtdLoadTools()` 的初始化路径只在页面空跑一行 no-op（防止将来
+// 误改后端时悄悄引入工具流程）。
 
 function initVideoTargetDetection() {
   if (window.__vtdInit) return;
@@ -1606,7 +1504,7 @@ function initVideoTargetDetection() {
   if (evClearBtn)  evClearBtn.addEventListener("click",  vtdEventsClear);
 
   refreshVtdDetector();
-  vtdLoadTools();
+  // 视频目标检测页不再有工具集合概念，因此不再调用 ``vtdLoadTools()``。
   if (!VTD.ws && !VTD.wsTimer) connectVtdWs();
 }
 

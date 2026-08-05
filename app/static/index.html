@@ -562,9 +562,6 @@
           <div class="vd-stage-col">
             <div class="vd-stage">
               <canvas id="vtd-canvas" width="960" height="540"></canvas>
-              <svg id="vtd-bbox-svg" class="vd-bbox-svg"
-                   viewBox="0 0 1000 1000" preserveAspectRatio="none"
-                   xmlns="http://www.w3.org/2000/svg"></svg>
               <div class="vd-overlay" id="vtd-overlay"></div>
               <div class="vd-event-badge hidden" id="vtd-event-badge">
                 <span class="vd-event-badge-text" id="vtd-event-badge-text"></span>
@@ -614,7 +611,7 @@
                 </header>
                 <div class="surv-field">
                   <textarea id="vtd-prompt" class="surv-input surv-textarea"
-                            placeholder="例如：当画面中出现需要标注的目标时调用 annotate_roi 工具，给出 ROI 坐标"></textarea>
+                            placeholder="例如：描述画面中需要标注的目标位置，直接返回 0–1000 归一化 ROI 坐标 x1,y1,x2,y2 和该 ROI 内的描述文本"></textarea>
                   <div class="vd-detector-row">
                     <label class="vd-detector-label">
                       隔
@@ -642,21 +639,21 @@
                   </label>
                 </div>
               </section>
-
-              <section class="surv-form-section">
-                <header class="surv-form-head">
-                  <h3>工具</h3>
-                  <span class="surv-hint" id="vtd-tools-summary">未启用</span>
-                </header>
-                <div class="surv-field">
-                  <div id="vtd-tools-list" class="vd-tools-list">
-                    <div class="vd-tools-empty">加载中…</div>
-                  </div>
-                </div>
-              </section>
             </form>
           </aside>
         </div>
+
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>检测事件历史</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="vtd-events-count">0 条</span>
+            <button id="vtd-events-clear" class="vd-btn">清空</button>
+          </header>
+          <ol class="vd-event-list" id="vtd-event-list">
+            <li class="vd-event-empty">尚未检测到目标，启动检测后结果显示在这里。</li>
+          </ol>
+        </section>
 
         <details class="raw-output">
           <summary>完整 JSON</summary>

@@ -166,9 +166,21 @@ The `#page-video-detection` section is wired to:
     (latest-only); the decode-loop sink drops whatever's pending and
     replaces it with the freshest frame so the detector always sees
     the most recent state.
-  - Each inference calls `session.reset()` (clears history + KV cache)
-    and `session.respond(prompt=prompt, attachment=[Attachment(frame)])` — free-text
-    response, no schema. ~1s after model warm-up.
+  - **单帧多轮工具循环（agent-loop）**：`_infer_sync` 现在对一帧跑最多
+    `compute.tool_call_max_iters`（默认 5，`0` = 无限，受
+    `RkaiDetector._ABSOLUTE_MAX_ITERS = 200` 硬上限兜底）次
+    `sess.respond`；每轮若模型返回 `@Callable` 实例就执行副作用
+    并把"调用 + 返回"作为**文本 attachment** 喂回下一轮 prompt，
+    直到模型返回 `VLMDoc` 或循环上限命中。`sess.reset()` 每帧开头
+    调一次（保留帧间 KV 隔离）；循环内不 reset。
+    * 工具抛异常 → 直接发 error 事件跳出循环（不再喂回 prompt）。
+    * 工具成功 → 写 transcript 继续循环。
+    * `tool_call_max_iters=0` → 视为无限；`min(cfg, _ABSOLUTE_MAX_ITERS)`
+      兜底，永远不会让 worker 单帧跑超过 200 次（防失控模型锁死）。
+    * `_infer_sync` 返回 `List[DetectorEvent]`（一帧可多个事件），
+      `worker_loop` 依次分配连续 id + 广播；前端 WS 协议不变。
+    * transcript 格式刻意用 prose（不是 JSON），避免模型把 transcript
+      里的旧 JSON 抄回去当成自己的工具调用重发。
   - History is an in-memory deque (max 200). Events carry `id`, `frame_pos`,
     `ts`, `prompt`, `text`.
   - On app shutdown, `close()` releases the RKNN session handle.
@@ -589,7 +601,7 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   `include_router(compute.router)`，**再**（可选）调
   `get_registry().apply_boot_config_async()`，**再**注册 detector 的
   frame sink。
-  
+
   **当前 boot 不自动加载**：`apply_boot_config_async()` 在 `app/main.py`
   里被注释掉。ComputeRegistry worker 线程在第一次 `POST /api/compute/instances`
   时由 `start_one` → `_wake_worker` → `_ensure_worker` 按需起 daemon thread。
@@ -599,6 +611,12 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   Detector 等消费方在第一次 inference 时才调
   `get_registry().get_session("swcap_video_describe")`—— registry 还是空就会抛
   "功能未启用"，这是预期行为（不是 bug）。
+- **单帧工具循环硬上限**：`RkaiDetector._ABSOLUTE_MAX_ITERS = 200`
+  是兜底，不论 `config.json["compute"]["tool_call_max_iters"]` 是 0
+  （无限）还是用户显式填了超大值，单帧推理都不会超过 200 次
+  `sess.respond`。200 次 × 1s/inference ≈ 3 分钟单帧最坏延迟 —
+  — 失控模型可以跑很久但不会锁死整个 worker 线程 / 队列。
+  配置热生效：每次推理前 `_get_tool_call_max_iters()` 重读 config.json。
 - **`apply_boot_config_async` 的后台线程只在 reload 模式下被杀掉**：
   uvicorn `reload=True` 重启父进程时 daemon thread 跟着挂掉；
   production（`reload=False`）下要靠 `create_app` 的
@@ -797,49 +815,114 @@ RIFF header by hand.
 | `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
 ## Tools (音视频检测页工具)
 
-`app/services/tools/` 装的是给音视频检测页 (RkaiDetector) 用的
-rkai ``@Callable`` 工具集合，**不**进入视频监控 (16 路) — 那条
-通路有自己的 surveillance manager，工具语义不同，这一轮不动。
+`app/services/tools/` 装的是给音视频描述页 (`RkaiDetector` 走
+`VLMDoc` schema 时) 用的 rkai ``@Callable`` 工具集合，**不**进入
+视频监控 (16 路) — 那条通路有自己的 surveillance manager，工具
+语义不同，这一轮不动。
 
-* **三个内置工具**：
-  - ``crop_region`` — 目标剪裁：模型给出 0–1000 归一化 bbox，
-    后端按 bbox 切出 BGR，JPEG 编码（quality 85）后 **base64
-    内嵌到事件 JSON 的 ``crop_b64`` / ``crop_w`` / ``crop_h`` 字段**，不
-    落盘、不二次送 VLM 推理。前端在画布上叠红框（5 秒淡出），
-    同时在右下角弹一个浮动窗展示剪裁图（5 秒淡出），事件历史
-    列表里挂小缩略图。无独立 capability 门控（detector 启动时
-    的 ``swcap_video_describe`` 校验已兜底，工具本身不重复卡）。
-  - ``annotate_roi`` — 目标标注：模型给出 bbox，前端在 canvas
-    上叠红色矩形（5 秒淡出）。无 capability 依赖。
-  - ``tts_alert`` — 语音提醒：模型给出 ``text`` / ``language``
-    / ``ref_speaker``，``TtsSession.start`` 触发本机播放。
-    能力门控 ``requires_capability="swcap_audio_tts"``。
+* **唯一保留的内置工具** — ``tts_alert``：语音提醒，模型给出
+  ``text`` / ``language`` / ``ref_speaker``，``TtsSession.start``
+  触发本机播放。能力门控
+  ``requires_capability="swcap_audio_tts"``。
+  工具注册中心 ``app/services/tools/registry.py`` 中
+  ``get_tool_registry()`` 启动时只挂载 ``tts_alert`` 一条。
+
 * **页面归属**：
-  - ``crop_region`` + ``annotate_roi`` 只在 **视频目标检测页**
-    暴露（``ALLOWED_TOOLS = ("annotate_roi", "crop_region")`` 在
-    ``app/api/video_target_detection.py``）。
   - ``tts_alert`` 只在 **音视频描述页** 暴露
     （``ALLOWED_TOOLS = ("tts_alert",)`` 在
     ``app/api/video_detection.py``）。
-  - 算力配置页 RK3588 列则只读展示全部三个工具的状态。
+  - 算力配置页 RK3588 列只读展示全部工具的状态（当前只有
+    ``tts_alert`` 一条）。
+
+* **历史下线 — ``target_detection`` 工具**：原本是给 **视频目标
+  检测页** 用的 ``@Callable``，模型给出 0–1000 归一化 bbox + ROI
+  描述，后端裁切 + JPEG 编码 + base64 内嵌。本版本已**完全下线**：
+  - 工具文件 ``app/services/tools/target_detection.py`` 已删除；
+  - 注册表不再有 ``target_detection`` 项；
+  - ``app/api/video_target_detection.py`` 不再有
+    ``ALLOWED_TOOLS`` 常量与 ``/video-target-detection/tools``
+    端点（视频目标检测页没有"工具集合"概念）；
+  - 替代实现见下方 "TargetDoc 结构化输出"段。
+
 * **能力门控（双层防护）**：
-  - UI：``GET /api/video-detection/tools`` /
-    ``GET /api/video-target-detection/tools`` 列表里每条带
+  - UI：``GET /api/video-detection/tools`` 列表里每条带
     ``available`` / ``reason``；不可用时 checkbox 置灰、显示
     原因。
   - 后端：``RkaiDetector.start()`` 校验每个 ``enabled_tools``
     的 capability (``get_registry().get_session(spec.requires_capability)``)，
     未启用抛 503。
+
 * **会话级，不持久化**：用户在检测页勾选的 tools 集合只
   存在内存里 (``RkaiDetector._enabled_tools``)；重启 / 关闭页
-  面 / 停止检测都清空，不写 ``config.json``。``crop_region``
-  推的 ``crop_b64`` 同样在 ``DetectorEvent`` deque 里活，刷新
-  页面 / 重启就丢；不写盘、不另开缓存。
+  面 / 停止检测都清空，不写 ``config.json``。``tts_alert`` 触发
+  的副作用（已播放 / 失败等）只在 ``DetectorEvent`` deque 里活，
+  刷新页面 / 重启就丢；不写盘、不另开缓存。
+
+* **单帧多轮工具调用（agent-loop）**：详见上文 detector 段。
+  配置入口 ``config.json["compute"]["tool_call_max_iters"``（默认
+  5，``0`` = 无限，缺失 / 负值 / 类型错 → 回退默认 5）；任何路径
+  都被 ``RkaiDetector._ABSOLUTE_MAX_ITERS = 200`` 硬上限兜底。
+  工具调用 + 返回按 prose 格式写进下一轮 prompt（不是 JSON，避免
+  模型复读），由 detector 内部维护。视频目标检测页无工具，循环
+  天然只跑一轮就跳出。
+
+## TargetDoc 结构化输出 (视频目标检测页)
+
+取代旧的 ``target_detection`` ``@Callable`` 工具 —— 模型在生成
+结构化输出时**直接**给出 ROI 坐标 + 描述文本，不需要再跑工具
+链路。
+
+* **Schema 定义** (``app/services/detector.py``)：
+  ```python
+  @Generable
+  class TargetDoc(BaseModel):
+      x1: float   # 0–1000 归一化
+      y1: float   # 0–1000 归一化
+      x2: float   # 0–1000 归一化
+      y2: float   # 0–1000 归一化
+      desc: str   # 对 ROI 框出内容的描述
+  ```
+  由 ``_get_target_doc_cls()`` 懒加载（首次 start() 时 build 一
+  次），存到模块级 ``_TARGET_DOC_CLS`` 缓存。同 ``VLMDoc`` 一样
+  继承 ``pydantic.BaseModel`` 而非 ``LMOutput``，避免
+  ``attachment: List[Attachment]`` 字段污染 ``model_json_schema``。
+
+* **Detector 实例绑定 schema** — ``RkaiDetector.__init__`` 接
+  ``generating_cls`` 参数；工厂函数按页面分别绑定：
+  - ``get_detector()``         → ``generating_cls`` 留空 → ``VLMDoc``
+  - ``get_target_detector()``  → ``generating_cls=_get_target_doc_cls``
+    → ``TargetDoc``
+
+* **推理分支** (``RkaiDetector._infer_sync``) — 跑的多轮工具循
+  环不变，但 ``generating=`` 按实例配置；拿到结果后三路分发：
+  1. ``@Callable`` 工具实例 → ``_run_tool_side_effect``
+     （当前只有 ``tts_alert``）；
+  2. ``TargetDoc`` 实例      → ``_build_target_event``
+     （视频目标检测页走这条）；
+  3. 其他（``VLMDoc`` 等）  → ``text`` / ``level`` 兜底分支
+     （音视频描述页走这条）。
+
+* **TargetDoc → DetectorEvent 构造**
+  (``RkaiDetector._build_target_event``)：
+  - 从 ``x1, y1, x2, y2`` 拼 ``bbox: List[float]``；
+  - ``desc`` 过 sanitize（防 chatml token / 控制字符 / 半截 JSON
+    漏出）→ 复制到事件 ``text`` 字段（沿用历史展示路径）；
+  - 按 bbox 裁原图 + JPEG 编码 (quality 85) + base64 内嵌到
+    ``crop_b64``，事件含 ``crop_w`` / ``crop_h``；
+  - ``tool_call='target_detection'`` 字段仍然写入事件 JSON —— 作
+    为"TargetDoc 事件"的判别字段，前端
+    (``ev.tool_call === "target_detection"``) 用来定位带 bbox /
+    crop 的目标检测事件。语义上不再是 "工具被调用"，而是
+    "TargetDoc schema 产生了事件"；与 ``tts_alert`` 的真实工具
+    调用路径区分。
+  - 裁切为空时 ``crop_b64=""``，事件仍写出，``level='error'``。
+
 * **bbox 渲染**：后端把 bbox 通过 ``DetectorEvent.bbox`` 字段推到
-  WS（事件类型仍是 ``type:"event"``，仅追加字段），前端在
-  ``#vtd-canvas`` 之上叠 ``<svg viewBox="0 0 1000 1000">``，
-  ``rect`` 5 秒后淡出。``crop_region`` 复用同一渲染路径（再
-  加 ``showVtdCropPopup`` 浮动窗 + 历史缩略图）。
+  WS（事件类型仍是 ``type:"event"``，仅追加字段）。前端**不**
+  在画布上绘制矩形框 —— bbox 只在事件历史列表里记录。浮动窗 /
+  历史缩略图仍展示裁切图本身。
+  ``target_detection`` 在浮动窗 + 历史缩略图里展示裁剪图本身，浮动窗
+  5 秒后淡出。
 * **工具列表已并入算力配置页 RK3588 列**：原 ``#page-tools`` 页面与
   ``GET /api/tools`` 端点都已移除；工具元数据现通过
   ``GET /api/compute`` snapshot 的 ``tools`` 字段返回（懒导入
@@ -858,7 +941,15 @@ rkai ``@Callable`` 工具集合，**不**进入视频监控 (16 路) — 那条
 1. **轻量预检** (`_probe_session_setup`，<1s)：
    * model_id 在 preset 白名单
    * preset 工厂能正常构造 `ModelSpec`（不调 rknn3）
-   * 4 个模型文件（rknn / weight / embed / tokenizer）齐全且非空
+   * **模型文件**按 `spec.kind` 分支校验（v0.5.x 起）：
+     - `kind="llm"`：`rknn_path` + `weight_path` + `embed_path` + `tokenizer_path`
+     - `kind="vlm"`：`rknn_llm_path` + `rknn_vision_path` + `embed_path` +
+       `tokenizer_path`（`weight_llm_path` / `weight_vision_path` 由
+       `.1828.rknn` 路径自动 derive，probe 不单独校验）
+     - `kind="tts"`：`tts_model_dir` 目录存在即可；具体
+       `.1828.rknn` / `.weight` / `.fp16.bin` 清单交给 backend 真实 init
+       阶段报更精确错误
+     - `kind="asr"`：`asr_model_dir` 目录 + `embed_path` + `tokenizer_path`
    * `RKNN3Lite().get_devices_id()` 枚举得到 ≥ `npu_index + 1` 张卡
 2. **父进程完整 init** (`LLMSession(model=spec, npu=npu_index)`，~55s)：
    * `try/except` 包住；非 std::terminate 错误都进 `inst.error`
