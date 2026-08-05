@@ -117,6 +117,35 @@ def _qwen3_asr_spec():
     return SystemLanguageModel.qwen3_asr()
 
 
+def _qwen3_8b_spec():
+    """Qwen3-8B 纯文本对话 preset。
+
+    覆盖：
+    * ``max_context_len=32768`` —— 官方 32K 上限；预留 ``max_new_tokens``
+      之后剩下的 prompt 上下文仍能容纳长对话。注意 ``max_context_len``
+      是 ``ModelSpec`` 的 dataclass 字段（被 ``_common.build_llm_args``
+      直接读），不能用 ``with_options`` 设，必须用 ``dataclasses.replace``。
+    * ``max_new_tokens=2048`` —— 给单轮回答留足输出空间。
+    * ``keep_history=1`` —— init runtime 默认值；app 侧每轮 ``session.reset()``
+      + ChatML 拼接整段 prompt，所以 ``keep_history`` 实际效果是
+      "KV cache 在单次 run 期间保持"。多轮对话的"记忆"通过 app 端
+      消息 deque + ChatML 拼接实现，thinking 不进入下一轮。
+    * ``enable_thinking=True`` —— 让模型输出 ``<think>...</think>``；
+      app 侧 observer 状态机切分两段流。
+    """
+    from dataclasses import replace
+    from rkai import SystemLanguageModel
+    spec = SystemLanguageModel.qwen3_8b()
+    return replace(
+        spec,
+        max_context_len=32768,
+    ).with_options(
+        max_new_tokens=2048,
+        keep_history=1,
+        enable_thinking=True,
+    )
+
+
 # 每个 model 的 ``estimated_init_seconds`` 是经验值，用来渲染"加载中"倒计时
 # 的初始起点；loading 段倒计时按 (estimate - (now - started_at)) 实算，estimate
 # 只影响倒计时的**起点**。真机冷启动实测（page cache dropped 之后）：
@@ -160,6 +189,15 @@ MODEL_PRESETS: dict[str, dict] = {
         "estimated_init_seconds": 25,
         "capability_types": ["swcap_audio_query", "swcap_audio_analyse"],
         "instance_name":    "llm-asr",
+    },
+    "qwen3-8b": {
+        "label":            "Qwen3-8B",
+        "preset_factory":   _qwen3_8b_spec,
+        "model_dir_name":   "Qwen3-8B",
+        "memory_estimate_mb": 4950,        # 真机实测：4 卡板上 1828 占 ~4950MB
+        "estimated_init_seconds": 60,      # 真机实测 ~55s（单 init）；预留 5s buffer
+        "capability_types": ["swcap_text_chat"],
+        "instance_name":    "llm-chat",
     },
 }
 
@@ -657,14 +695,11 @@ class ComputeRegistry:
     def _run_one(self, inst: ModelInstance) -> None:
         """真正调 rkai.LLMSession()。失败 → status='error'。
 
-        关键约束：**LLMSession(...)** 内部会触发 rknn3 native lib 的
-        ``MODEL_SETUP``。在非 RK 开发板 / 算力配置错的板子上，该
-        调用可能会直接走 ``std::terminate()``，把整 uvicorn 进程
-        拖死 —— 之前亲眼见过 ``terminate called without an active
-        exception`` 之后整个 web 服务整个挂掉、网页卡死。
-        所以这里把构造放到 **子进程** 里跑：subprocess 挂了不影响
-        父进程，父进程把实例标 ``status='error'``，算力配置页可
-        以看到错误原因 + 重试（disable → enable）。
+        流程：轻量预检（<1s，文件 + NPU）→ 父进程完整 init（~55s，
+        try/except 包住）。旧版先在子进程跑完整 init 探针再父进程
+        跑一次，总耗时 ~110s；现在 ~55s，与 demo 一致。失去 rknn3
+        native abort 隔离保护（旧函数 ``_init_session_subprocess``
+        保留未删，将来真机若出现可恢复）。
 
         失败兜底：整段包在 ``try/except BaseException`` 里，**任何**
         异常（包括 ``except Exception`` 抓不住的 ``SystemExit`` /
@@ -676,7 +711,12 @@ class ComputeRegistry:
         npu_index = inst.npu_index
         model_id = inst.model_id
         try:
-            ok, err, stderr_full, probe = _init_session_subprocess(npu_index, model_id)
+            t_probe = time.time()
+            ok, err = _probe_session_setup(npu_index, model_id)
+            probe_sec = time.time() - t_probe
+            # 轻量预检无子进程 → stderr_full 留空（保留字段以匹配上游
+            # ModelInstance schema；前端"展开"按钮拿不到更多就显示空）。
+            stderr_full = ""
             if not ok:
                 with self._lock:
                     inst.status = "error"
@@ -684,15 +724,12 @@ class ComputeRegistry:
                     inst.stderr_full = stderr_full
                     inst.finished_at = time.time()
                 LOG.warning(
-                    "compute init subprocess failed (%d, %s): %s",
-                    npu_index, model_id, err,
+                    "compute init probe failed (%d, %s, probe=%.1fs): %s",
+                    npu_index, model_id, probe_sec, err,
                 )
                 return
 
-            # 子进程构造成功 —— 父进程也构造一份（consumers 要拿
-            # ``llm_session`` 句柄用）。这一步是**双倍代价**，但只
-            # 在 init 成功路径上出现，且确保 web 不会因为 native abort
-            # 而挂。失败依旧标 error。
+            t0 = time.time()
             try:
                 preset = MODEL_PRESETS[model_id]
                 spec = preset["preset_factory"]()
@@ -705,16 +742,15 @@ class ComputeRegistry:
                 # 永远停在 loading → UI 卡住。
                 with self._lock:
                     inst.status = "error"
-                    inst.error = (
-                        f"subprocess 探针 ok，但父进程 init 失败: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                    inst.error = f"init 失败: {type(e).__name__}: {e}"
                     inst.finished_at = time.time()
                 LOG.warning(
-                    "compute parent init failed (%d, %s) after subprocess ok: %s",
-                    npu_index, model_id, e,
+                    "compute init failed (%d, %s, init=%.1fs): %s",
+                    npu_index, model_id, time.time() - t0, e,
                 )
                 return
+
+            init_sec = time.time() - t0
 
             with self._lock:
                 inst.llm_session = sess
@@ -722,14 +758,10 @@ class ComputeRegistry:
                 inst.error = ""
                 inst.stderr_full = ""
                 inst.finished_at = time.time()
-            LOG.info(
-                "compute instance running (%d, %s, probe=%.1fs)", npu_index, model_id, probe,
-            )
         except BaseException as e:  # noqa: BLE001
-            # 兜底：_init_session_subprocess 自己抛（FileNotFoundError /
-            # OSError / 别的意料外情况），或上面任何一个分支出错。**必须**
-            # 把实例标 error，否则 status 会停在 loading 永远不变 —— 网页
-            # 端只能看到 "初始化中..." 倒计时不动，用户没有任何线索。
+            # 兜底：_probe_session_setup / 任何意料外情况。**必须**把实例
+            # 标 error，否则 status 会停在 loading 永远不变 —— 网页端只能
+            # 看到 "初始化中..." 倒计时不动，用户没有任何线索。
             err_text = str(e) or "未知异常"
             with self._lock:
                 inst.status = "error"
@@ -752,6 +784,10 @@ class ComputeRegistry:
                 "compute _persist failed after successful init (%d, %s): %s",
                 npu_index, model_id, pe,
             )
+        LOG.info(
+            "compute instance running (%d, %s, probe=%.1fs, init=%.1fs, total=%.1fs)",
+            npu_index, model_id, probe_sec, init_sec, probe_sec + init_sec,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -770,7 +806,59 @@ def get_registry() -> ComputeRegistry:
 
 
 # --------------------------------------------------------------------------- #
-# 子进程隔离的 LLMSession 构造探针
+# 轻量预检（替代旧 _init_session_subprocess 的完整 init；省 55s）
+# --------------------------------------------------------------------------- #
+def _probe_session_setup(npu_index: int, model_id: str) -> Tuple[bool, str]:
+    """启动 LLMSession 前的轻量预检。检查 model_id / preset 工厂 /
+    模型文件 / NPU 设备，不做 rknn3 init_runtime。错误时返回
+    (ok=False, detail) 供 ``_run_one`` 写入 ``inst.error``。
+
+    旧路径 ``_init_session_subprocess``（下方保留）在子进程跑完整 init
+    防 rknn3 native abort，仅在非 RK 板 / 错配场景需要。
+    """
+    if model_id not in MODEL_PRESETS:
+        return False, f"未知 model: {model_id!r}"
+
+    try:
+        spec = MODEL_PRESETS[model_id]["preset_factory"]()
+    except Exception as e:
+        return False, f"preset 工厂失败: {type(e).__name__}: {e}"
+
+    paths = [
+        ("rknn",     getattr(spec, "rknn_path", "")),
+        ("weight",   getattr(spec, "weight_path", "")),
+        ("embed",    getattr(spec, "embed_path", "")),
+        ("tokenizer", getattr(spec, "tokenizer_path", "")),
+    ]
+    missing = []
+    for label, p in paths:
+        if not p:
+            missing.append(f"{label}=<empty>")
+            continue
+        pp = Path(p)
+        if not pp.is_file():
+            missing.append(f"{label}={p} (不存在)")
+        elif pp.stat().st_size == 0:
+            missing.append(f"{label}={p} (空文件)")
+    if missing:
+        return False, f"模型文件缺失: {'; '.join(missing)}"
+
+    try:
+        from rknn3lite.api import RKNN3Lite  # 懒导入
+        ids = RKNN3Lite().get_devices_id()
+    except Exception as e:
+        return False, f"NPU 检测失败: {type(e).__name__}: {e}"
+    if not ids:
+        return False, "未检测到任何 NPU 设备（RKNN3Lite.get_devices_id() 返回空）"
+    if not (0 <= npu_index < len(ids)):
+        return False, f"npu_index 越界: {npu_index}（当前有 {len(ids)} 张卡）"
+
+    return True, ""
+
+
+# --------------------------------------------------------------------------- #
+# 子进程隔离的 LLMSession 构造探针（旧版，保留未调用）
+# 当前不再调用，但保留函数便于将来真机出现 rknn3 native abort 时恢复。
 # --------------------------------------------------------------------------- #
 _INIT_SENTINEL = b"__PYRKAIWEB_INIT_DONE__"
 
@@ -836,6 +924,12 @@ def _init_session_subprocess(
         "        spec = SystemLanguageModel.qwen3_tts()\n"
         "    elif model_id == 'qwen3-asr':\n"
         "        spec = SystemLanguageModel.qwen3_asr()\n"
+        "    elif model_id == 'qwen3-8b':\n"
+        "        from dataclasses import replace as _dc_replace\n"
+        "        _spec = SystemLanguageModel.qwen3_8b()\n"
+        "        spec = _dc_replace(_spec, max_context_len=32768).with_options(\n"
+        "            max_new_tokens=2048, keep_history=1, enable_thinking=True,\n"
+        "        )\n"
         "    else:\n"
         "        raise ValueError('unknown model: ' + model_id)\n"
         "    _ = LLMSession(model=spec, npu=npu_index)\n"
