@@ -283,13 +283,41 @@ class VideoSession:
         release the old capture and reopen the same source without
         going through ``open()`` (which would try to join the thread
         we're currently running on).
+
+        Frame pacing uses presentation timestamps (PTS) rather than a
+        fixed ``1/fps`` interval: ``cap.read()`` returns frames as fast
+        as the MPP hardware decoder produces them (typically 100-500
+        fps for local files) AND the JPEG encode can easily take
+        50-100 ms per frame on RK3588 — a fixed-sleep pacing drifts
+        whenever the loop period exceeds ``1/fps`` and produces
+        visible stutter. PTS-based pacing instead computes each
+        frame's target release wall-clock time from
+        ``frame.pts * stream.time_base`` (relative to the first
+        decoded frame), so playback honours the file's actual
+        timestamps regardless of decode/encode jitter.
+
+        Falls back to ``1/fps`` pacing if ``time_base`` is unavailable
+        (V4L2 sources don't expose it). Live sources (``self._is_live``)
+        skip pacing entirely — the producer is already real-time, just
+        relay. Pause resets the schedule so the first frame after
+        resume plays immediately instead of catching up on missed
+        intervals.
         """
         cap: Optional[object] = None
         OPEN_TIMEOUT = 10.0
+        # Wall-clock (monotonic) anchor for PTS-based pacing, plus the
+        # matching pts value at that anchor. Both 0 = unanchored; the
+        # first decoded frame sets both, and every subsequent frame's
+        # target is ``play_start + (pts - pts_start) * time_base``.
+        play_start_wall: float = 0.0
+        pts_start: int = 0
+        # Fallback pacing state used when PTS / time_base are unavailable.
+        interval: float = 0.0
+        next_frame_wall: float = 0.0
         while True:
             # Block here whenever _play_event is clear (paused).
             # Returns immediately when play() lifts the event, so resume
-            # latency is bounded only by cap.read() / queue dispatch.
+            # latency is bounded only by cap.read0() / queue dispatch.
             # Timeout just lets us recheck _stop_event during long pauses.
             self._play_event.wait(timeout=0.5)
             if self._stop_event.is_set():
@@ -300,6 +328,11 @@ class VideoSession:
                         pass
                 return
             if not self._play_event.is_set():
+                # Entering pause — drop the schedule so resume doesn't
+                # fast-forward to catch up on missed intervals.
+                play_start_wall = 0.0
+                pts_start = 0
+                next_frame_wall = 0.0
                 continue
 
             # (Re-)open the capture if we don't have one yet — either
@@ -329,15 +362,23 @@ class VideoSession:
                     self._fps = float(getattr(cap, "fps", 0.0) or 0.0)
                     self._frame_pos = 0
                     self._state = self.STATE_PLAYING
+                # Pre-compute the fallback interval (PTS path overrides
+                # it at decode time when time_base is available).
+                if self._fps > 0:
+                    interval = 1.0 / self._fps
+                # First frame after (re-)open fires immediately.
+                play_start_wall = 0.0
+                pts_start = 0
+                next_frame_wall = 0.0
                 continue
 
             try:
-                ret, frame = cap.read()
+                ret, frame0 = cap.read0()
             except Exception as e:  # pragma: no cover - depends on source
-                self._fail(f"read() 异常: {e}")
+                self._fail(f"read0() 异常: {e}")
                 return
 
-            if not ret or frame is None:
+            if not ret or frame0 is None:
                 # EOF. Decide whether to loop or to die and notify.
                 with self._lock:
                     if self._state in (
@@ -358,12 +399,30 @@ class VideoSession:
                     with self._lock:
                         self._frame_pos = 0
                         self._state = self.STATE_PLAYING
+                    play_start_wall = 0.0
+                    pts_start = 0
+                    next_frame_wall = 0.0
                     continue
                 try:
                     self._frame_queue.put_nowait(self._EOF)
                 except queue.Full:
                     pass
                 return
+
+            # Grab pts from the zero-copy frame BEFORE materialising
+            # the BGR ndarray — cheaper, and we need the value for the
+            # pacing calculation that runs after encode.
+            try:
+                pts = int(getattr(frame0, "pts", 0) or 0)
+            except Exception:
+                pts = 0
+
+            try:
+                frame = frame0.numpy()
+            except Exception as e:
+                # RGA conversion failure (e.g. unsupported size on this
+                # board). Skip this frame rather than crashing the loop.
+                continue
 
             ok, buf = cv2.imencode(
                 ".jpg",
@@ -377,6 +436,7 @@ class VideoSession:
                 self._frame_pos = cap.frame_pos
                 self._last_frame_ts = time.time()
                 cur_frame_pos = cap.frame_pos
+                is_live = self._is_live
             # Per-frame sinks get the raw BGR. Sinks must not raise —
             # a misbehaving one shouldn't take down the decode loop.
             sinks = self._current_sinks()
@@ -397,6 +457,79 @@ class VideoSession:
                     self._frame_queue.put_nowait(jpg)
                 except queue.Full:
                     pass
+
+            # Pacing — PTS-driven when available, else 1/fps, else
+            # pass through. Live sources skip pacing (already real-time).
+            if is_live:
+                continue
+
+            # Resolve time_base from the PyAV stream. Falls back to
+            # fixed-interval pacing when PTS / time_base are missing
+            # (V4L2 cameras, malformed streams, etc.).
+            time_base = 0.0
+            stream_obj = getattr(cap, "_stream", None)
+            if stream_obj is not None and pts > 0:
+                tb = getattr(stream_obj, "time_base", None)
+                if tb is not None:
+                    try:
+                        time_base = float(tb.numerator) / float(tb.denominator)
+                    except Exception:
+                        time_base = 0.0
+
+            now = time.monotonic()
+
+            if time_base > 0 and pts > 0:
+                # Anchor on the first decoded frame so target_wall
+                # references ``time_base`` seconds before play_start.
+                if play_start_wall <= 0.0:
+                    play_start_wall = now
+                    pts_start = pts
+                target_wall = play_start_wall + (pts - pts_start) * time_base
+                wait = target_wall - now
+                if wait < -0.5:
+                    # Fell badly behind (decoder stalled or we just
+                    # resumed after a long pause) — re-anchor instead
+                    # of spamming catch-up frames.
+                    play_start_wall = now
+                    pts_start = pts
+            elif interval > 0:
+                # Fallback: fixed 1/fps pacing (may drift under heavy
+                # encode load — better than nothing).
+                if next_frame_wall <= 0.0:
+                    next_frame_wall = now + interval
+                else:
+                    next_frame_wall += interval
+                    if next_frame_wall < now - 0.5:
+                        next_frame_wall = now + interval
+                wait = next_frame_wall - now
+            else:
+                # Unknown fps / no PTS — pass through.
+                continue
+
+            # Sleep in short slices so pause / stop stay responsive.
+            while wait > 0:
+                if self._stop_event.wait(timeout=min(wait, 0.05)):
+                    if cap is not None:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                    return
+                if not self._play_event.is_set():
+                    # Paused mid-sleep — outer loop will block on
+                    # _play_event and reset play_start_wall = 0.0.
+                    play_start_wall = 0.0
+                    pts_start = 0
+                    next_frame_wall = 0.0
+                    break
+                now = time.monotonic()
+                if time_base > 0 and pts > 0:
+                    target_wall = (
+                        play_start_wall + (pts - pts_start) * time_base
+                    )
+                else:
+                    target_wall = next_frame_wall
+                wait = target_wall - now
 
 
 _session: Optional[VideoSession] = None
