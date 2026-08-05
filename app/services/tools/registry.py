@@ -121,6 +121,7 @@ def get_tool_registry() -> ToolRegistry:
     with _registry_lock:
         if _registry is None:
             from .annotate_roi import AnnotateROI
+            from .crop_region import CropRegion
             from .tts_alert import TtsAlert
 
             reg = ToolRegistry()
@@ -134,6 +135,18 @@ def get_tool_registry() -> ToolRegistry:
                 ),
                 requires_capability=None,
                 tool_class=AnnotateROI,
+            )
+            reg.register(
+                key="crop_region",
+                name="目标剪裁",
+                description=(
+                    "目标剪裁工具：模型给出 0–1000 归一化坐标 [x1, y1, x2, y2]，"
+                    "后端按 bbox 裁切原图，JPEG 编码后 base64 内嵌到事件 JSON，"
+                    "前端在画布上叠红框 + 浮动窗展示剪裁图，"
+                    "事件历史列表里挂小缩略图。"
+                ),
+                requires_capability=None,
+                tool_class=CropRegion,
             )
             reg.register(
                 key="tts_alert",

@@ -199,7 +199,8 @@ class ModelInstance:
     label: str = ""
     memory_estimate_mb: int = 0
     status: str = "queued"                     # queued | loading | running | error | stopped
-    error: str = ""
+    error: str = ""                            # 短摘要：1-2 行，前端默认展示
+    stderr_full: str = ""                      # 子进程完整 stderr，前端"展开"按钮展示
     queued_at: float = 0.0
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -212,6 +213,7 @@ class ModelInstance:
             "instance_name":      self.instance_name,
             "status":             self.status,
             "error":              self.error,
+            "stderr_full":        self.stderr_full,
             "capability_types":   list(self.capability_types),
             "memory_estimate_mb": self.memory_estimate_mb,
             "device_id":          self.device_id.decode("utf-8", errors="replace") if self.device_id else None,
@@ -674,11 +676,12 @@ class ComputeRegistry:
         npu_index = inst.npu_index
         model_id = inst.model_id
         try:
-            ok, err, probe = _init_session_subprocess(npu_index, model_id)
+            ok, err, stderr_full, probe = _init_session_subprocess(npu_index, model_id)
             if not ok:
                 with self._lock:
                     inst.status = "error"
                     inst.error = err
+                    inst.stderr_full = stderr_full
                     inst.finished_at = time.time()
                 LOG.warning(
                     "compute init subprocess failed (%d, %s): %s",
@@ -717,6 +720,7 @@ class ComputeRegistry:
                 inst.llm_session = sess
                 inst.status = "running"
                 inst.error = ""
+                inst.stderr_full = ""
                 inst.finished_at = time.time()
             LOG.info(
                 "compute instance running (%d, %s, probe=%.1fs)", npu_index, model_id, probe,
@@ -772,8 +776,8 @@ _INIT_SENTINEL = b"__PYRKAIWEB_INIT_DONE__"
 
 
 def _init_session_subprocess(
-    npu_index: int, model_id: str, *, timeout: float = 600.0,
-) -> Tuple[bool, str, float]:
+    npu_index: int, model_id: str, *, timeout: float = 90.0,
+) -> Tuple[bool, str, str, float]:
     """在子进程里尝试构造一次 LLMSession。
 
     **目的**：rkai 的 ``LLMSession(...)`` 在 rknn3 加载失败 / 模型文件
@@ -782,12 +786,13 @@ def _init_session_subprocess(
 
     * 子进程 exit 0 → 子进程构造成功，父进程也照着构造一份（consumers
       要拿句柄），构造时再失败同样标 error。
-    * 子进程 exit 非 0 / SIGABRT → 父进程捕获，把 stderr/stdout
-      截一段写到 ``inst.error``，实例标 ``error``，网页不挂。
+    * 子进程 exit 非 0 / SIGABRT → 父进程捕获，把 stderr 完整保留
+      到 ``inst.stderr_full``，前 1-2 行作为摘要写到 ``inst.error``，
+      实例标 ``error``，网页不挂。
 
     Returns:
-        (ok, error_str, probe_seconds)
-        ok=True 时 error_str 为空；ok=False 时 error_str 含原因。
+        (ok, error_summary, stderr_full, probe_seconds)
+        ok=True 时 error_summary/stderr_full 为空。
     """
     import subprocess
     import sys
@@ -855,6 +860,7 @@ def _init_session_subprocess(
     elapsed = time.time() - t0
     # 找 sentinel + JSON 行
     out = proc.stdout or b""
+    err_full = (proc.stderr or b"").decode("utf-8", errors="replace")
     idx = out.find(_INIT_SENTINEL)
     if idx >= 0:
         tail = out[idx + len(_INIT_SENTINEL):]
@@ -868,21 +874,48 @@ def _init_session_subprocess(
             err = str(payload.get("error") or "")
             if not ok and not err:
                 err = "subprocess returned error but empty message"
-            return ok, err, elapsed
-        return False, f"subprocess stdout 无法解析: {line!r}", elapsed
+            # 成功时 stderr 通常无关；失败时合并 stderr 给前端展开
+            if not ok and err_full.strip():
+                err = f"{err}\n--- 子进程 stderr ---\n{err_full.rstrip()}"
+            return ok, err, err_full, elapsed
+        # 解析失败：把 stdout 截前 200 字符当 hint，stderr 完整保留
+        return False, f"subprocess stdout 无法解析: {line[:200]!r}", err_full, elapsed
 
     # 没有 sentinel：subprocess 崩了 / 输出没到。常见是 rknn3
     # `std::terminate()` —— exit code 是 -6 (SIGABRT) 或 -11 (SIGSEGV)。
     rc = proc.returncode
-    tail_err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
-    tail_out = out.decode("utf-8", errors="replace").strip()
-    snippet = tail_err.splitlines()[-3:] if tail_err else []
-    snippet = "\n".join(snippet) or (tail_out[-300:] if tail_out else "(无输出)")
+    err_text = err_full.strip()
+    out_text = out.decode("utf-8", errors="replace").strip()
+    if err_text:
+        # stderr 是 RKNNAPI 这种 native 报错的事实源；优先用它做摘要。
+        # 取末尾非空行（最后真错），避免被前面的 PyTorch warning 噪声挤掉。
+        lines = [ln for ln in err_text.splitlines() if ln.strip()]
+        summary_line = lines[-1] if lines else ""
+        # 摘要：head 1 行 + 真错 1 行（带冒号），最多 240 字符
+        head_line = lines[0] if lines else ""
+        if summary_line and summary_line != head_line:
+            summary = f"{head_line[:120]}\n{summary_line[:240]}"
+        else:
+            summary = summary_line[:240] or "(stderr 为空)"
+    elif out_text:
+        summary = out_text.splitlines()[-1][:240] if out_text.splitlines() else "(无输出)"
+    else:
+        # stderr 和 stdout 都空 —— 多半是 std::terminate 在写入任何缓冲之前就
+        # 把进程干掉了。给用户一个明确诊断：通常是 rknn3 driver 不匹配或
+        # /dev/rknn_list 不存在。
+        summary = (
+            "子进程无任何 stdout/stderr 输出即被中止（exit " + str(rc) + "）。"
+            "常见原因：\n"
+            "  - rknn3 native 驱动未安装或版本与模型不匹配\n"
+            "  - /dev/rknn_list 不存在或权限不足\n"
+            "  - rkai 子模块未正确安装（pip install -e ...）\n"
+            "请检查 pyrkaiweb 启动日志中的 RKNN 设备枚举是否成功。"
+        )
     if rc < 0:
         sig = -rc
         try:
             sig_name = {6: "SIGABRT", 11: "SIGSEGV", 9: "SIGKILL"}.get(sig, f"signal {sig}")
         except Exception:
             sig_name = f"signal {sig}"
-        return False, f"init 子进程崩溃（{sig_name}）：{snippet[:300]}", elapsed
-    return False, f"init 失败（exit {rc}）：{snippet[:300]}", elapsed
+        return False, f"init 子进程崩溃（{sig_name}，exit {rc}）：\n{summary}", err_full, elapsed
+    return False, f"init 失败（exit {rc}）：\n{summary}", err_full, elapsed

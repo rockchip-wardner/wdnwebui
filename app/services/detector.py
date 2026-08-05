@@ -140,8 +140,14 @@ class DetectorEvent:
     consumers can pull ``attachment`` or other structured fields.
 
     ``tool_call`` is populated when the model selected the
-    ``@Callable`` tool (tts_alert); the front-end renders the event
-    in the events list, no canvas overlay.
+    ``@Callable`` tool (annotate_roi / crop_region / tts_alert);
+    the front-end renders the event in the events list, with optional
+    canvas overlay (annotate_roi / crop_region).
+
+    ``crop_b64`` / ``crop_w`` / ``crop_h`` are populated only for
+    ``crop_region`` events: the cropped JPEG bytes (base64) plus the
+    crop pixel dimensions. Lives entirely in memory — not persisted
+    to disk.
     """
     id: int
     frame_pos: int
@@ -152,6 +158,9 @@ class DetectorEvent:
     attachment_count: int = 0
     tool_call: Optional[str] = None
     bbox: Optional[list] = None
+    crop_b64: Optional[str] = None
+    crop_w: Optional[int] = None
+    crop_h: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -164,7 +173,55 @@ class DetectorEvent:
             "attachment_count": self.attachment_count,
             "tool_call":        self.tool_call,
             "bbox":             self.bbox,
+            "crop_b64":         self.crop_b64,
+            "crop_w":           self.crop_w,
+            "crop_h":           self.crop_h,
         }
+
+
+# --------------------------------------------------------------------------- #
+# crop_region helper
+# --------------------------------------------------------------------------- #
+def _crop_and_encode(frame_bgr: "np.ndarray", bbox_0_1000) -> tuple:
+    """Crop ``frame_bgr`` at the given 0–1000 normalized bbox, JPEG-encode,
+    base64 the bytes. Returns ``(b64_str, w, h)``. Empty / invalid bbox
+    → ``("", 0, 0)``.
+
+    Kept module-private (no leading underscore on import) so a unit test
+    can target it directly. OpenCV import is lazy: we only need it on
+    crop_region invocation, and opencv-python-headless is a hard dep
+    already used by the upload pipeline.
+    """
+    if frame_bgr is None or frame_bgr.ndim < 2:
+        return "", 0, 0
+    try:
+        if not isinstance(bbox_0_1000, (list, tuple)) or len(bbox_0_1000) != 4:
+            return "", 0, 0
+        x1f, y1f, x2f, y2f = (float(v) for v in bbox_0_1000)
+    except (TypeError, ValueError):
+        return "", 0, 0
+
+    h, w = frame_bgr.shape[:2]
+    x1 = max(0, min(w, int(round(x1f / 1000.0 * w))))
+    x2 = max(0, min(w, int(round(x2f / 1000.0 * w))))
+    y1 = max(0, min(h, int(round(y1f / 1000.0 * h))))
+    y2 = max(0, min(h, int(round(y2f / 1000.0 * h))))
+    if x1 > x2:
+        x1, x2 = x2, x1
+    if y1 > y2:
+        y1, y2 = y2, y1
+    if x2 - x1 <= 0 or y2 - y1 <= 0:
+        return "", 0, 0
+
+    crop = frame_bgr[y1:y2, x1:x2]
+
+    import base64
+    import cv2
+
+    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        return "", 0, 0
+    return base64.b64encode(buf.tobytes()).decode("ascii"), crop.shape[1], crop.shape[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -412,6 +469,7 @@ class RkaiDetector:
             # 模型可以选其中之一。``isinstance`` 区分，匹配示例
             # ``function_call.py`` 的写法。
             from app.services.tools.annotate_roi import AnnotateROI
+            from app.services.tools.crop_region import CropRegion
             from app.services.tools.tts_alert import TtsAlert
 
             h, w = frame_bgr.shape[:2]
@@ -434,6 +492,41 @@ class RkaiDetector:
                     level=None, attachment_count=0,
                     tool_call="annotate_roi",
                     bbox=bbox if not side.get("invalid") else None,
+                )
+
+            if isinstance(result, CropRegion):
+                try:
+                    side = result(frame_bgr, ctx)
+                    bbox = side.get("bbox")
+                except Exception as e:  # noqa: BLE001
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text=f"(目标剪裁失败: {e})", level="error",
+                        attachment_count=0, tool_call="crop_region",
+                    )
+                if side.get("invalid") or not isinstance(bbox, (list, tuple)):
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text="(目标剪裁失败: 无效 bbox)", level="error",
+                        attachment_count=0, tool_call="crop_region",
+                    )
+                crop_b64, crop_w, crop_h = _crop_and_encode(frame_bgr, bbox)
+                if not crop_b64:
+                    return DetectorEvent(
+                        id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                        text="(目标剪裁失败: 裁切区域为空)", level="error",
+                        attachment_count=0, tool_call="crop_region",
+                        bbox=[float(v) for v in bbox],
+                    )
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text="目标剪裁",
+                    level=None, attachment_count=0,
+                    tool_call="crop_region",
+                    bbox=[float(v) for v in bbox],
+                    crop_b64=crop_b64,
+                    crop_w=crop_w,
+                    crop_h=crop_h,
                 )
 
             if isinstance(result, TtsAlert):

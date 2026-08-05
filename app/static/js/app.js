@@ -1153,8 +1153,11 @@ function connectVtdWs() {
       } else if (snap.type === "event") {
         addVtdEvent(snap);
         showVtdEventBadge(snap);
-        if (Array.isArray(snap.bbox) && snap.tool_call === "annotate_roi") {
+        if (Array.isArray(snap.bbox) && (snap.tool_call === "annotate_roi" || snap.tool_call === "crop_region")) {
           pushVdBbox("vtd-bbox-svg", snap.bbox, snap.tool_call);
+        }
+        if (snap.tool_call === "crop_region" && snap.crop_b64) {
+          showVtdCropPopup(snap.crop_b64, snap.crop_w, snap.crop_h);
         }
         return;
       } else if (snap.type === "status" && snap.detector) {
@@ -1272,11 +1275,21 @@ function renderVtdEventList() {
     meta.appendChild(tsSpan);
     meta.appendChild(fpSpan);
     meta.appendChild(tag);
+    const body = document.createElement("div");
+    body.className = "vd-event-body";
+    if (ev.tool_call === "crop_region" && ev.crop_b64) {
+      const thumb = document.createElement("img");
+      thumb.className = "vtd-crop-thumb";
+      thumb.alt = "目标剪裁";
+      thumb.src = "data:image/jpeg;base64," + ev.crop_b64;
+      body.appendChild(thumb);
+    }
     const text = document.createElement("div");
     text.className = "vd-event-text";
     text.textContent = ev.text || "(空)";
+    body.appendChild(text);
     li.appendChild(meta);
-    li.appendChild(text);
+    li.appendChild(body);
     list.appendChild(li);
   });
 }
@@ -1292,6 +1305,31 @@ function showVtdEventBadge(ev) {
   badge.style.animation = "";
   if (vtdBadgeHideTimer) clearTimeout(vtdBadgeHideTimer);
   vtdBadgeHideTimer = setTimeout(() => badge.classList.add("hidden"), 6000);
+}
+
+let vtdCropHideTimer = null;
+function showVtdCropPopup(cropB64, w, h) {
+  const overlay = document.getElementById("vtd-overlay");
+  if (!overlay || !cropB64) return;
+  const existing = overlay.querySelector(".vtd-crop-popup");
+  if (existing) {
+    try { existing.remove(); } catch (_) { /* ignore */ }
+  }
+  if (vtdCropHideTimer) {
+    clearTimeout(vtdCropHideTimer);
+    vtdCropHideTimer = null;
+  }
+  const img = document.createElement("img");
+  img.className = "vtd-crop-popup";
+  img.alt = "目标剪裁" + (w && h ? ` (${w}×${h})` : "");
+  img.src = "data:image/jpeg;base64," + cropB64;
+  overlay.appendChild(img);
+  vtdCropHideTimer = setTimeout(() => {
+    img.classList.add("is-fading");
+    setTimeout(() => {
+      try { img.remove(); } catch (_) { /* ignore */ }
+    }, 600);
+  }, 4600);
 }
 function updateVtdDetectorStatus(snap) {
   const statusEl = document.getElementById("vtd-detector-status");
@@ -3717,6 +3755,18 @@ const ComputeConfigPage = {
         msg.className = "cc-banner-msg";
         msg.textContent = inst.error || "(无错误信息)";
         li.appendChild(msg);
+        if (inst.stderr_full && inst.stderr_full.trim()) {
+          const details = document.createElement("details");
+          details.className = "cc-banner-details";
+          const summary = document.createElement("summary");
+          summary.textContent = "查看完整 stderr";
+          details.appendChild(summary);
+          const full = document.createElement("pre");
+          full.className = "cc-banner-stderr";
+          full.textContent = inst.stderr_full;
+          details.appendChild(full);
+          li.appendChild(details);
+        }
         ul.appendChild(li);
       }
       stack.appendChild(this._makeBanner({
@@ -3985,8 +4035,8 @@ const ComputeConfigPage = {
     });
   },
 
-  // 构造一条实例的错误块：<pre> 错误文本 + 重试按钮。重试按钮 = 先
-  // DELETE 再 POST，等同于重新启用。失败时复用 toggle() 的 alert。
+  // 构造一条实例的错误块：<pre> 错误摘要 + "查看完整 stderr" 折叠 +
+  // 重试按钮。重试按钮 = 先 DELETE 再 POST，等同于重新启用。
   _makeErrorBlock(inst, npuIndex, model) {
     const wrap = document.createElement("div");
     wrap.className = "cc-model-error-wrap";
@@ -3994,6 +4044,18 @@ const ComputeConfigPage = {
     errBox.className = "cc-model-error";
     errBox.textContent = inst.error || "(无错误信息)";
     wrap.appendChild(errBox);
+    if (inst.stderr_full && inst.stderr_full.trim()) {
+      const details = document.createElement("details");
+      details.className = "cc-model-error-details";
+      const summary = document.createElement("summary");
+      summary.textContent = "查看完整 stderr";
+      details.appendChild(summary);
+      const full = document.createElement("pre");
+      full.className = "cc-model-error-stderr";
+      full.textContent = inst.stderr_full;
+      details.appendChild(full);
+      wrap.appendChild(details);
+    }
     const retry = document.createElement("button");
     retry.type = "button";
     retry.className = "cc-banner-btn cc-model-error-retry";

@@ -1,10 +1,11 @@
-"""视频目标检测 endpoints: REST 控制 + WebSocket 帧流 + annotate_roi 检测。
+"""视频目标检测 endpoints: REST 控制 + WebSocket 帧流 + annotate_roi / crop_region 检测。
 
 页面结构与 ``app/api/video_detection.py`` 一致；区别仅：
 * ``/video-target-detection`` 前缀；
 * 后端 detector 用 ``get_target_detector()``，prompt / enabled_tools / 事件
   历史与音视频描述页相互独立；
-* 工具默认只有 ``annotate_roi``（接口强制传入 / 忽略）。
+* 工具默认 ``annotate_roi`` + ``crop_region``（红框标注 / 剪裁），用户
+  可以单选 / 多选 / 都不选；空列表时回退到默认集合。
 """
 from __future__ import annotations
 
@@ -18,9 +19,9 @@ from app.services.video_session import get_session
 
 router = APIRouter(tags=["video-target-detection"])
 
-# 视频目标检测页只允许「目标标注」工具。其他工具即便注册表里有也不
-# 在这里暴露 —— 该页面是面向「目标检测+红框标注」场景的固定工具集。
-ALLOWED_TOOLS = ("annotate_roi",)
+# 视频目标检测页允许「目标标注」「目标剪裁」两个工具。其他工具即便
+# 注册表里有也不在这里暴露 —— 该页面是面向「目标检测」场景的固定工具集。
+ALLOWED_TOOLS = ("annotate_roi", "crop_region")
 
 
 @router.get("/video-target-detection")
@@ -166,14 +167,17 @@ async def clear_events() -> dict:
 # --------------------------------------------------------------------- #
 @router.websocket("/video-target-detection/ws")
 async def stream_ws(ws: WebSocket) -> None:
-    """Push decoded JPEG frames + annotate_roi events to the browser.
+    """Push decoded JPEG frames + annotate_roi / crop_region events to the browser.
 
     Protocol (server -> client):
       - JSON text: {"type":"status", ...session snapshot, detector snapshot...}
       - Binary:    raw JPEG bytes for one frame
       - JSON text: {"type":"eof"} when a file source reaches end
       - JSON text: {"type":"event", ...detector event...} when annotate_roi
-                   fires (event.tool_call == "annotate_roi" 且 event.bbox 不为空)
+                   (event.tool_call == "annotate_roi" 且 event.bbox 不为空)
+                   或 crop_region (event.tool_call == "crop_region"，
+                   event.bbox 不为空 + event.crop_b64 是裁图的 base64 JPEG)
+                   fires.
     """
     await ws.accept()
     session = get_session()

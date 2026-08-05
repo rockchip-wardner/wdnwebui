@@ -700,29 +700,44 @@ rkai ``@Callable`` 工具集合，**不**进入视频监控 (16 路) — 那条
 通路有自己的 surveillance manager，工具语义不同，这一轮不动。
 
 * **三个内置工具**：
-  - ``crop_region`` — 原图缩放：模型给出 0–1000 归一化 bbox，
-    后端按 bbox 切出 BGR，拼接“原 prompt + 一句 ROI 描述”
-    二次送 VLM 推理。
+  - ``crop_region`` — 目标剪裁：模型给出 0–1000 归一化 bbox，
+    后端按 bbox 切出 BGR，JPEG 编码（quality 85）后 **base64
+    内嵌到事件 JSON 的 ``crop_b64`` / ``crop_w`` / ``crop_h`` 字段**，不
+    落盘、不二次送 VLM 推理。前端在画布上叠红框（5 秒淡出），
+    同时在右下角弹一个浮动窗展示剪裁图（5 秒淡出），事件历史
+    列表里挂小缩略图。无独立 capability 门控（detector 启动时
+    的 ``swcap_video_describe`` 校验已兜底，工具本身不重复卡）。
   - ``annotate_roi`` — 目标标注：模型给出 bbox，前端在 canvas
-    上叠红色矩形（5 秒淡出）。
+    上叠红色矩形（5 秒淡出）。无 capability 依赖。
   - ``tts_alert`` — 语音提醒：模型给出 ``text`` / ``language``
     / ``ref_speaker``，``TtsSession.start`` 触发本机播放。
+    能力门控 ``requires_capability="swcap_audio_tts"``。
+* **页面归属**：
+  - ``crop_region`` + ``annotate_roi`` 只在 **视频目标检测页**
+    暴露（``ALLOWED_TOOLS = ("annotate_roi", "crop_region")`` 在
+    ``app/api/video_target_detection.py``）。
+  - ``tts_alert`` 只在 **音视频描述页** 暴露
+    （``ALLOWED_TOOLS = ("tts_alert",)`` 在
+    ``app/api/video_detection.py``）。
+  - 算力配置页 RK3588 列则只读展示全部三个工具的状态。
 * **能力门控（双层防护）**：
-  - UI：``GET /api/video-detection/tools`` 列表里每条带
+  - UI：``GET /api/video-detection/tools`` /
+    ``GET /api/video-target-detection/tools`` 列表里每条带
     ``available`` / ``reason``；不可用时 checkbox 置灰、显示
     原因。
   - 后端：``RkaiDetector.start()`` 校验每个 ``enabled_tools``
     的 capability (``get_registry().get_session(spec.requires_capability)``)，
     未启用抛 503。
-* **会话级，不持久化**：用户在音视频检测页勾选的 tools 集合只
+* **会话级，不持久化**：用户在检测页勾选的 tools 集合只
   存在内存里 (``RkaiDetector._enabled_tools``)；重启 / 关闭页
-  面 / 停止检测都清空，不写 ``config.json``。
-* **二次推理 prompt** 在服务端拼接：``ctx.prompt + ' 本次只关注 ROI（像素坐标 ...）内的内容。'``；
-  用户只编辑第一段，第二段后端自动加。
+  面 / 停止检测都清空，不写 ``config.json``。``crop_region``
+  推的 ``crop_b64`` 同样在 ``DetectorEvent`` deque 里活，刷新
+  页面 / 重启就丢；不写盘、不另开缓存。
 * **bbox 渲染**：后端把 bbox 通过 ``DetectorEvent.bbox`` 字段推到
   WS（事件类型仍是 ``type:"event"``，仅追加字段），前端在
-  ``#vd-canvas`` 之上叠 ``<svg viewBox="0 0 1000 1000">``，
-  ``rect`` 5 秒后淡出。**不下发裁剪图**。
+  ``#vtd-canvas`` 之上叠 ``<svg viewBox="0 0 1000 1000">``，
+  ``rect`` 5 秒后淡出。``crop_region`` 复用同一渲染路径（再
+  加 ``showVtdCropPopup`` 浮动窗 + 历史缩略图）。
 * **工具列表已并入算力配置页 RK3588 列**：原 ``#page-tools`` 页面与
   ``GET /api/tools`` 端点都已移除；工具元数据现通过
   ``GET /api/compute`` snapshot 的 ``tools`` 字段返回（懒导入
