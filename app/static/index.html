@@ -13,7 +13,7 @@
         <span class="brand-title">守望者系统演示</span>
         <div class="brand-meta">
           <span class="brand-subtitle">Wardner</span>
-          <span class="brand-version" id="brand-version">v0.4.0</span>
+          <span class="brand-version" id="brand-version">v0.5.0</span>
         </div>
       </div>
       <nav class="nav">
@@ -22,6 +22,7 @@
       <a href="#video-target-detection" data-page="video-target-detection" class="nav-item nav-item--demo" data-icon="◎">视频目标检测</a>
       <a href="#video-content-search" data-page="video-content-search" class="nav-item nav-item--demo" data-icon="⌕">视频内容检索</a>
       <a href="#tts"                  data-page="tts"                  class="nav-item nav-item--demo" data-icon="♪">语音生成</a>
+      <a href="#text-chat"            data-page="text-chat"            class="nav-item nav-item--demo" data-icon="✎">文本对话</a>
       <hr class="nav-divider" />
       <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
       <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
@@ -778,6 +779,63 @@
         <details class="raw-output">
           <summary>完整 JSON</summary>
           <pre class="payload" id="data-tts"></pre>
+        </details>
+      </section>
+
+      <section id="page-text-chat" class="page hidden" data-page="text-chat">
+        <header class="page-header">
+          <h2>文本对话</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="text-chat-status-line">空闲</span>
+            <button class="refresh-btn" id="text-chat-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div id="text-chat-unavailable" class="tts-banner tts-banner-error hidden">
+          <span class="tts-banner-icon" aria-hidden="true">⚠</span>
+          <span class="tts-banner-text">
+            模型未启用：请到「算力配置」页启动 Qwen3-8B 实例。
+          </span>
+        </div>
+
+        <div class="imb-card">
+          <div class="imb-card-head">
+            <h3>对话</h3>
+            <span class="imb-status" id="text-chat-state-badge" data-state="idle">空闲</span>
+            <span class="vd-spacer"></span>
+            <span class="imb-meta-inline" id="text-chat-tokens">0 / 32768 tokens</span>
+            <button class="vd-btn vd-btn-mini" id="text-chat-reset-btn">清空对话</button>
+          </div>
+          <div class="imb-card-body imb-card-body--chat">
+            <div class="imb-conv">
+              <div class="imb-conv-title">消息记录</div>
+              <div class="imb-conv-list" id="text-chat-conv-list">
+                <ul class="imb-conv-ul" id="text-chat-conv-ul"></ul>
+                <div class="page-placeholder imb-empty" id="text-chat-empty">
+                  <div class="page-placeholder-icon" aria-hidden="true">💬</div>
+                  <div class="page-placeholder-title">还没有对话</div>
+                  <div class="page-placeholder-text">
+                    在下方输入框提问，模型会逐字回复（thinking 自动折叠）。
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="imb-composer">
+              <textarea id="text-chat-input" class="imb-textarea" rows="3"
+                        placeholder="输入你的问题…（Cmd/Ctrl + Enter 发送）"></textarea>
+              <div class="imb-composer-actions">
+                <span class="imb-status-inline" id="text-chat-hint">就绪</span>
+                <button class="vd-btn" id="text-chat-stop-btn" disabled>停止</button>
+                <button class="vd-btn vd-btn-primary" id="text-chat-send-btn">发送</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-text-chat"></pre>
         </details>
       </section>
 
