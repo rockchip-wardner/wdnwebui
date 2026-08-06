@@ -261,15 +261,19 @@ class DdsDiscoveryManager:
                     self._state = self.STATE_UNAVAILABLE
                     self._last_error = (
                         runtime.get("error")
-                        or "FastDDS native bindings 不可用"
+                        or "FastDDS Python bindings 未安装（apt 上没有对应包，需从 Fast-DDS-Python 源码构建）"
                     )
                 raise HTTPException(
                     status_code=503,
                     detail={
                         "reason": "fastdds_unavailable",
                         "message": (
-                            "FastDDS native bindings 未安装，DDS 注册功能不可用。"
-                            " 请参考 wdndds 文档安装 libfastdds + fastdds-python。"
+                            "FastDDS Python bindings 未安装，DDS 注册功能不可用。"
+                            " Debian/Ubuntu 上没有 apt 包（注意不是 "
+                            "libfastdds-dev / fastdds-python3 —— 后者根本不存在），"
+                            " 只能从 Fast-DDS-Python 源码 colcon 构建。"
+                            " 构建依赖：sudo apt install -y libasio-dev "
+                            "libtinyxml2-dev libfastrtps-dev。"
                         ),
                         "dds_runtime": runtime,
                     },

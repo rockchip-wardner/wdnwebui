@@ -4395,7 +4395,7 @@ const DiscoveryDds = {
     if (want && this._runtime && !this._runtime.available) {
       toggle.checked = false;
       this._setSummary(
-        "FastDDS native bindings 未安装，无法启用 DDS 注册。请参考 wdndds 文档安装 libfastdds + fastdds-python。",
+        "FastDDS Python bindings 未安装，无法启用 DDS 注册。Debian/Ubuntu 上没有 apt 包（不是 libfastdds-dev / fastdds-python3 —— 后者根本不存在），只能从 Fast-DDS-Python 源码构建。",
         true,
       );
       return;
@@ -4460,7 +4460,7 @@ const DiscoveryDds = {
       } else {
         banner.className = "discovery-runtime-banner is-danger";
         banner.textContent =
-          "FastDDS native bindings 未安装，DDS 注册功能不可用。" +
+          "FastDDS Python bindings 未安装，DDS 注册功能不可用。" +
           (rt.error ? " 错误：" + rt.error : "");
       }
     }
@@ -4504,7 +4504,7 @@ const DiscoveryDds = {
           break;
         case "unavailable":
           summary.textContent =
-            "FastDDS 不可用。安装 libfastdds-dev + fastdds-python3 后重启服务即可。";
+            "FastDDS Python bindings 未安装。Debian/Ubuntu 上没有 apt 包（不是 libfastdds-dev / fastdds-python3 —— 后者根本不存在），只能从 Fast-DDS-Python 源码构建。";
           summary.classList.add("danger");
           break;
         case "error":
