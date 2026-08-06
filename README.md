@@ -71,7 +71,7 @@ not on PyPI. Install them by hand after the SSH key is set up:
 ```bash
 pip install -e "git+ssh://git@10.10.10.10/pythonsdk/pyrkv.git#egg=rkv"
 pip install -e "git+ssh://git@10.10.10.10/pythonsdk/pyrkai.git#egg=rkai"
-pip install -e "git+ssh://git@10.10.10.10/pythonsdk/wdiot.git#egg=wdiot"
+pip install -e "git+ssh://git@10.10.10.10/pythonsdk/wdndds.git#egg=wdndds"
 ```
 
 If either command fails with `Permission denied (publickey)`, the host

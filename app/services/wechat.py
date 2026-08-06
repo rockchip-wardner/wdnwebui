@@ -1,6 +1,6 @@
 """WeChat bot service for pyrkaiweb.
 
-Thin singleton wrapper around :class:`wdiot.Wechat` that adds:
+Thin singleton wrapper around :class:`wdndds.Wechat` that adds:
 
 * a WebSocket broadcaster so the im-bridge page can watch the login state
   machine and stream new incoming messages in real time;
@@ -8,7 +8,7 @@ Thin singleton wrapper around :class:`wdiot.Wechat` that adds:
   subscribers (the SDK only fires callbacks on its own private asyncio
   loop, so the FastAPI event loop needs an explicit bridge).
 
-The :class:`wdiot.Wechat` instance is constructed lazily on first access
+The :class:`wdndds.Wechat` instance is constructed lazily on first access
 (``get_wechat()``); it never auto-starts the long-poll, so the user must
 explicitly POST ``/api/wechat/login`` from the UI to begin. This matches
 the "always manual login" decision in the design doc.
@@ -23,8 +23,8 @@ import time
 from collections import deque
 from typing import Any, Deque, Optional
 
-import wdiot
-from wdiot import Wechat
+import wdndds
+from wdndds import Wechat
 
 
 _LOG = logging.getLogger("wechat")
@@ -39,12 +39,12 @@ def _wechat_log(msg: str) -> None:
 
 
 class _WechatManager:
-    """Owns the process-wide :class:`wdiot.Wechat` instance + WS fan-out."""
+    """Owns the process-wide :class:`wdndds.Wechat` instance + WS fan-out."""
 
     POLL_INTERVAL = 1.0  # login-state poll cadence
 
     def __init__(self) -> None:
-        self._wechat: Wechat = wdiot.Wechat()
+        self._wechat: Wechat = wdndds.Wechat()
         # Subscribe to inbound messages so we can push them to WS clients.
         self._wechat.register_message_handler(self._handle_incoming)
 
@@ -84,7 +84,7 @@ class _WechatManager:
     def _broadcast(self, payload: dict) -> None:
         """Push ``payload`` to all subscribers (thread-safe).
 
-        Runs on whichever thread the caller is on — usually the wdiot
+        Runs on whichever thread the caller is on — usually the wdndds
         loop thread (callbacks) or the poller thread. Each subscriber
         queue is an :class:`asyncio.Queue` owned by the FastAPI event
         loop; we use ``put_nowait`` and drop the oldest item on overflow
@@ -146,14 +146,14 @@ class _WechatManager:
         return {"ok": True}
 
     def send_text(self, user_id: str, text: str) -> None:
-        # ``send_text`` records the outbound in the wdiot cache; pushing
+        # ``send_text`` records the outbound in the wdndds cache; pushing
         # the diff afterwards surfaces it to the UI.
         self._wechat.send_text(user_id, text)
         self._push_state_diff()
 
     # ------------------------------------------------------------- events
     def _handle_incoming(self, msg: Any) -> None:
-        """Called from the wdiot loop thread for each user message."""
+        """Called from the wdndds loop thread for each user message."""
         # ``recent_messages`` is now one item longer; the diff logic in
         # ``_push_state_diff`` will detect that and forward the tail to
         # subscribers. We still call it directly so the user sees the

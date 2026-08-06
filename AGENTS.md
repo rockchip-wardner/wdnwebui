@@ -25,7 +25,7 @@ creation); everything below is verified against the current tree.
 
 1. 必须通过rkai的LLMSession调用rknn，不得直接调用
 2. 必须通过rkv调用mpp和rga，做编解码和图片缩放、格式转换等操作，不得直接调用或者通过其他库进行软编解和格式转换、resize等操作。
-3. 必须通过wdiot做发现和注册服务。
+3. 必须通过wdndds做发现和注册服务。
 4. **LLMSession 必须从 `ComputeRegistry` 取，禁止各业务模块自建**。视频检测
    / 语音生成 / 视频监控等服务只能通过
    `get_registry().get_session("<capability>")` 拿到 session；
@@ -450,7 +450,7 @@ holds it in memory. The file is seeded with a `base` section at
   串行加载；UI 通过 `GET /api/compute` 每秒轮询状态，queued / loading
   实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL = 8s`）。
   Capability 概念作为内部 key 使用（`get_session("swcap_video_describe")` /
-  `"swcap_audio_tts"`），**这一轮不做** wdiot 真实注册发现；discovery
+  `"swcap_audio_tts"`），**这一轮不做** wdndds 真实注册发现；discovery
   页面只读 registry 内存状态。
 
 ## Discovery page (注册发现)
@@ -977,11 +977,11 @@ RIFF header by hand.
 
 `#page-im-bridge` 拆成两块：左侧登录面板 + 右侧调试收发对话
 （user_id 下拉 + 文本框 + 消息列表）。底层走 [`wechatbot-sdk` 0.3.0](https://www.wechatbot.dev/zh/python)，
-但调用入口是 `.venv/src/wdiot/src/wdiot/wechat.py` 里 `wdiot.Wechat` 的
+但调用入口是 `.venv/src/wdndds/src/wdndds/wechat.py` 里 `wdndds.Wechat` 的
 **同步门面**（自带 daemon-thread asyncio loop），不是直接 `await` SDK。
 
 * **服务** (`app/services/wechat.py`)：
-  - 单例 `_WechatManager`（lazy，``get_wechat()``），内部持一个 `wdiot.Wechat`。
+  - 单例 `_WechatManager`（lazy，``get_wechat()``），内部持一个 `wdndds.Wechat`。
   - 后台线程 1Hz 轮询 `login_status()`，状态变化时 push 给 WS 订阅者；
     新入站消息通过 `register_message_handler` 立即触发推送，不等下一轮。
   - 内存里维护最近 200 条消息（in/out 各保留）+ 已知 user_id 集合。
@@ -1024,7 +1024,7 @@ RIFF header by hand.
   ```text
   [微信用户扫码]
       ↓ SDK 推送 QR URL → on_qr_url
-  wdiot.Wechat._qr_url set, login_state=awaiting_scan
+  wdndds.Wechat._qr_url set, login_state=awaiting_scan
       ↓ 1Hz 轮询 + 回调即推
   _WechatManager._push_state_diff → WS broadcast {type:"state", state:{login_state:..., qr_url:...}}
       ↓ 前端 _renderQr() 用 qrcode-generator 把 URL 渲染成 <svg>
@@ -1032,21 +1032,21 @@ RIFF header by hand.
       ↓ SDK 回调 on_scanned → on_confirmed → bot.start() 自动起 long-poll
   login_state=confirmed + started=True
       ↓ [用户A 发消息]
-  wechatbot bot._dispatch(msg) → wdiot._on_incoming → _WechatManager._handle_incoming
+  wechatbot bot._dispatch(msg) → wdndds._on_incoming → _WechatManager._handle_incoming
       ↓ _push_state_diff → WS broadcast {type:"message", message:{direction:"in", ...}}
       ↓ 前端 _recordMessage + _renderChat → 追加到列表
   [用户点发送]
       ↓ POST /api/wechat/send
-  wdiot.Wechat.send_text → wechatbot.bot.send(user_id, text)
+  wdndds.Wechat.send_text → wechatbot.bot.send(user_id, text)
       ↓ SDK _send_content + _send_text
-      ↓ wdiot._record_outbound → _push_state_diff → WS broadcast {type:"message", direction:"out"}
+      ↓ wdndds._record_outbound → _push_state_diff → WS broadcast {type:"message", direction:"out"}
   ```
 
-* **凭证路径** = `~/.wechatbot/credentials.json`（`wdiot.wechat.DEFAULT_CRED_PATH`），
-  也可设 `WDIOT_WECHAT_CRED_PATH` 环境变量覆盖。这是 SDK 默认路径，
+* **凭证路径** = `~/.wechatbot/credentials.json`（`wdndds.wechat.DEFAULT_CRED_PATH`），
+  也可设 `WDNDDS_WECHAT_CRED_PATH` 环境变量覆盖。这是 SDK 默认路径，
   多 pyrkaiweb 实例不会冲突。
 
-* **资源预算** —— `wdiot.Wechat` 单实例长期驻留一个 daemon thread + 一个
+* **资源预算** —— `wdndds.Wechat` 单实例长期驻留一个 daemon thread + 一个
   aiohttp 连接池；未登录时 SDK 不会建任何连接（`bot.login()` 之前
   `_api` 只在 `poll_qr_status` 时拉 HTTP）。登录失败 / QR 过期 → SDK
   内部走 `MAX_QR_REFRESH_COUNT=3` 轮后抛 `AuthError`，wrapper 把

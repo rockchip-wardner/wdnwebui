@@ -4115,7 +4115,7 @@ const ComputeConfigPage = {
 };
 
 /* ---------------------------------------------------------------- *
- * 注册发现 (Discovery) page — 读 registry，不调 wdiot              *
+ * 注册发现 (Discovery) page — 读 registry，不调 wdndds              *
  * ---------------------------------------------------------------- */
 const Discovery = {
   // 缓存上一次 HW 渲染状态（用户改 checkbox 但未保存时需要回填 / diff）

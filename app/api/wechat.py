@@ -60,9 +60,9 @@ async def get_wechat_users() -> dict:
 
 @router.get("/wechat/runtime")
 async def get_wechat_runtime() -> dict:
-    import wdiot
+    import wdndds
 
-    info = wdiot.Wechat.check_runtime()
+    info = wdndds.Wechat.check_runtime()
     info["wechat_loaded"] = info.get("available", False)
     return info
 

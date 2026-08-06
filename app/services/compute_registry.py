@@ -7,7 +7,7 @@
 * 启动阶段不阻塞 FastAPI：``apply_boot_config_async()`` 起一个 daemon thread
   串行从 config.json 加载实例，每条实例状态机走
   ``queued → loading → running``，附带时间戳供前端算倒计时。
-* wdiot 注册发现这一轮**不做** —— capability 仅作内部 key 用，
+* wdndds 注册发现这一轮**不做** —— capability 仅作内部 key 用，
   discovery 页面只读 registry 内存状态。
 
 时间字段：
@@ -36,7 +36,7 @@ from app.services.config import get_config
 
 # --------------------------------------------------------------------------- #
 # 硬件能力（HW）目录 —— 注册发现页面与系统配置页共用同一份 source-of-truth。
-# 顺序决定 UI 渲染顺序；新增 HW 能力时在这里登记并同步 wdiot 子类。
+# 顺序决定 UI 渲染顺序；新增 HW 能力时在这里登记并同步 wdndds 子类。
 # --------------------------------------------------------------------------- #
 HARDWARE_CAPABILITIES: list[dict] = [
     {

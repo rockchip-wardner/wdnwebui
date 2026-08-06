@@ -145,7 +145,7 @@ def create_app() -> FastAPI:
         except Exception:
             pass
         # Stop the WeChat bot manager (cancels its poller, closes the
-        # underlying wdiot.Wechat which owns the long-poll task).
+        # underlying wdndds.Wechat which owns the long-poll task).
         try:
             close_wechat()
         except Exception:
