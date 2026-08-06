@@ -470,6 +470,33 @@ DDS 子面板（`data-pane="dds"`）通过 wdndds 调 FastDDS 把本机能力广
 —— FastDDS 的 SPDP / SEDP 走 UDPv4 + 组播 239.255.0.1 / discovery port
 7400+ 即可。
 
+* **FastDDS 版本** —— 当前 bundled 的是 **FastDDS 2.6.12**（FastRTPS
+  命名）+ **Fast-DDS-Python 1.1.x**（输出 flat ``fastdds.py``）+
+  **FastCDR 1.0.24**（``libfastcdr.so.1``）。3.6.x master 配套的
+  ``Fast-DDS-Python 2.6.x`` 在本机环境下 ``DataWriter::enable()`` 会
+  在 ``EDP::new_writer_proxy_data`` 挂死（实测 30s watchdog 触发仍
+  收不到返回），无 patch 可绕；切回 2.6.12 后 ``create_writer``
+  0.00s 返回。
+  - WDnddsStringTopicDataType（`wdndds_cxx/`）按 2.6.x API 重写：
+    ``getKey(void*, InstanceHandle_t*, bool)`` 全指针，
+    ``eprosima::fastrtps::rtps`` 命名空间，
+    ``SerializedPayload_t::reserve`` (非 resize)，``setName(const char*)``
+    (非 set_name)。
+  - wdndds bootstrap (`wdndds/dds/_fastdds.py`) 同时认 3.x 包形式
+    （``fastdds/__init__.py`` + ``fastdds/_fastdds_python.so``）和
+    1.x flat 形式（``fastdds.py`` + ``_fastdds_python.so``）；
+    preloader 列表里两种 SONAME 都列着，谁在 ``lib/`` 下谁被
+    ``RTLD_GLOBAL``-load。切 FastDDS 主版本 = 跑
+    ``FASTDDDS_BRANCH=origin/2.14.x build_native.sh`` 重 build。
+  - 1.x 与 2.x 在 Python API 上有两处差异，bootstrap 已兜底：
+    * ``fastdds.RETCODE_OK`` —— 1.x 是 ``ReturnCode_t.RETCODE_OK``
+      类属性，bootstrap 注到模块级（值不变 = 0）。
+    * ``DataWriter.write(void*)`` —— 1.x 要求 SwigPyObject 指向
+      ``std::string*``，不接 Python ``str``；新 helper
+      ``wdndds_create_string_data_with(value)`` 在 C 端建
+      ``std::string`` 给 Python 喂。``publisher.Writer.write``
+      内部对 ``str`` payload 自动走这个 fallback，非 str 透传。
+
 * **开关 "在网注册"** —— 开启后：
   * 后端调 ``wdndds.connect()`` 起 DomainParticipant（domain_id 默认为 0）；
   * 调 ``wdndds.register(device_name, capabilities)``：device_name 来自
