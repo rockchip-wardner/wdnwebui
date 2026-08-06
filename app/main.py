@@ -14,7 +14,7 @@ from app.api import (
     compute,
     config,
     coprocessor,
-    lan_discovery,
+    discovery,
     power,
     system_logs,
     system_monitor,
@@ -26,6 +26,7 @@ from app.api import (
 )
 from app.services.compute_registry import get_registry
 from app.services.config import get_config
+from app.services.dds_discovery import close_dds_discovery
 from app.services.detector import get_detector, get_target_detector
 from app.services.text_chat import close_chat, get_chat_service
 from app.services.tts_session import get_session as get_tts_session
@@ -84,7 +85,7 @@ def create_app() -> FastAPI:
     app.include_router(coprocessor.router, prefix="/api")
     app.include_router(tts.router, prefix="/api")
     app.include_router(compute.router, prefix="/api")
-    app.include_router(lan_discovery.router, prefix="/api")
+    app.include_router(discovery.router, prefix="/api")
     app.include_router(video_target_detection.router, prefix="/api")
     app.include_router(wechat.router, prefix="/api")
     app.include_router(text_chat.router, prefix="/api")
@@ -155,6 +156,12 @@ def create_app() -> FastAPI:
         # the ComputeRegistry and was already closed by close_all()).
         try:
             close_chat()
+        except Exception:
+            pass
+        # Tear down wdndds DDS Hub (if any) — close_scan + close Hub so the
+        # remote SPDP participants see us disappear cleanly.
+        try:
+            close_dds_discovery()
         except Exception:
             pass
 

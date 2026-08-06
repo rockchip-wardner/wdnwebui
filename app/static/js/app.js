@@ -2115,9 +2115,9 @@ async function loadPageData(name) {
 
   if (name === "discovery") {
     await Discovery.load();
-    // Discovery.load() 内部已经 await DiscoveryLan.load()；再启 1Hz 轮询
-    // 让 enabled 时实时刷新 last_seen / scanning / 设备增删。
-    DiscoveryLan.startTicking();
+    // Discovery.load() 内部已经 await DiscoveryDds.load()；再启 1Hz 轮询
+    // 让 enabled 时实时刷新 discovered / state。
+    DiscoveryDds.startTicking();
     return;
   }
 
@@ -2157,7 +2157,7 @@ function showPage(name) {
     ComputeConfigPage.stopTicking();
   }
   if (prev === "discovery" && name !== "discovery") {
-    DiscoveryLan.stopTicking();
+    DiscoveryDds.stopTicking();
   }
   if (prev === "im-bridge" && name !== "im-bridge") {
     ImBridge.closeWs();
@@ -4146,10 +4146,13 @@ const Discovery = {
       const list = document.getElementById("discovery-list");
       if (list) list.innerHTML = `<div class="page-placeholder danger">加载失败: ${e.message}</div>`;
     }
-    // LAN 面板独立拉，失败也不影响 HW/SW 渲染
-    DiscoveryLan.load().catch((e) => {
-      const list = document.getElementById("discovery-lan-list");
-      if (list) list.innerHTML = `<div class="page-placeholder danger">加载失败: ${e.message}</div>`;
+    // DDS 面板独立拉，失败也不影响 HW/SW 渲染
+    DiscoveryDds.load().catch((e) => {
+      const banner = document.getElementById("discovery-dds-runtime-banner");
+      if (banner) {
+        banner.className = "discovery-runtime-banner is-danger";
+        banner.textContent = "DDS 面板加载失败: " + e.message;
+      }
     });
   },
 
@@ -4313,37 +4316,34 @@ const Discovery = {
   },
 };
 
-/* ---------------------------------------------------------------- *
- * 局域网设备 (LAN Discovery) — Discovery 页内的子面板            *
- *                                                                    *
- * 单独成模块（不挤进 ``Discovery``）的原因：                             *
- *  1. 拉取路径独立 — `/api/lan-discovery` vs `/api/compute/capabilities`，*
- *     互不影响；HW/SW 拉挂时 LAN 还能正常刷新；                          *
- *  2. 轮询节奏独立 — LAN 在 enabled 时按 1Hz 拉（用户需要看到          *
- *     last_seen/扫描状态实时刷新），HW/SW 一次性 render；                 *
- *  3. 状态管理独立 — toggle / port / interval 跟 HW/SW dirty 状态分开。  *
- * ---------------------------------------------------------------- */
-const DiscoveryLan = {
+/* ------------------------------------------------------------------ *
+ *  在网注册 (DDS) — Discovery 页内的子面板                              *
+ *                                                                     *
+ * 单独成模块（不挤进 ``Discovery``）的原因：                              *
+ *  1. 拉取路径独立 — `/api/discovery/dds` vs `/api/compute/capabilities`，*
+ *     互不影响；HW/SW 拉挂时 DDS 面板还能正常刷新；                     *
+ *  2. 轮询节奏独立 — DDS 在 ready 时按 1Hz 拉，让 discovered / state    *
+ *     实时刷新，HW/SW 一次性 render；                                   *
+ *  3. 状态管理独立 — toggle 跟 HW dirty 状态分开。                     *
+ *                                                                     *
+ *  FastDDS native bindings 没装时，后端 ``POST /start`` 返回 503，      *
+ *  UI 直接渲染 ``discovery-dds-runtime-banner`` 上的红色错误条，         *
+ *  toggle 被禁用（避免用户空操作）。                                    *
+ * ------------------------------------------------------------------ */
+const DiscoveryDds = {
   initialized: false,
   _snapshot: null,
+  _runtime: null,
   _tickHandle: null,
   _inflight: false,
-  _lastToggle: null,        // 防止 toggle onchange 竞态：记住"用户最后操作意图"
-  _toggleInflight: false,   // PUT /api/lan-discovery 进行中 —— 期间禁止从服务端
-                            // snapshot 回写 toggle.checked，避免乐观 UI
-                            // 被下一轮 1Hz poll 提前拉回的旧值覆盖。
-  _busyScan: false,
+  _lastToggle: null,
+  _toggleInflight: false,
 
   init() {
     if (this.initialized) return;
     this.initialized = true;
-
-    const toggle = document.getElementById("discovery-lan-toggle");
-    const scanBtn = document.getElementById("discovery-lan-scan-now");
-    const clearBtn = document.getElementById("discovery-lan-clear");
+    const toggle = document.getElementById("discovery-dds-toggle");
     if (toggle) toggle.addEventListener("change", () => this.onToggle());
-    if (scanBtn) scanBtn.addEventListener("click", () => this.scanNow());
-    if (clearBtn) clearBtn.addEventListener("click", () => this.clear());
   },
 
   async load() {
@@ -4351,9 +4351,21 @@ const DiscoveryLan = {
     if (this._inflight) return;
     this._inflight = true;
     try {
-      const r = await fetch(API_PREFIX + "/lan-discovery", {
+      // 先拉一次 fastdds runtime（不触发 connect），决定 toggle 是否可用
+      try {
+        const rr = await fetch(API_PREFIX + "/discovery/dds/runtime", {
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+        });
+        if (rr.ok) this._runtime = await rr.json();
+        else this._runtime = { available: false, error: "HTTP " + rr.status };
+      } catch (e) {
+        this._runtime = { available: false, error: e.message };
+      }
+      // 再拉 snapshot
+      const r = await fetch(API_PREFIX + "/discovery/dds", {
         cache: "no-store",
-        headers: {"Cache-Control": "no-cache"},
+        headers: { "Cache-Control": "no-cache" },
       });
       if (!r.ok) throw new Error("HTTP " + r.status);
       this._snapshot = await r.json();
@@ -4365,8 +4377,6 @@ const DiscoveryLan = {
 
   startTicking() {
     if (this._tickHandle) return;
-    // 1Hz 刷新：enabled 时才能感知 scanning / last_seen 实时变化；
-    // disabled 时也保持 ticking，让本机 IP / 子网配置变化也能反映出来。
     this._tickHandle = setInterval(() => this.load().catch(() => {}), 1000);
   },
 
@@ -4377,36 +4387,53 @@ const DiscoveryLan = {
     }
   },
 
-  // ------------------------------------------------------------ toggle
   async onToggle() {
-    const toggle = document.getElementById("discovery-lan-toggle");
+    const toggle = document.getElementById("discovery-dds-toggle");
     if (!toggle) return;
     const want = toggle.checked;
+    // fastdds 不可用 → 拒绝切换
+    if (want && this._runtime && !this._runtime.available) {
+      toggle.checked = false;
+      this._setSummary(
+        "FastDDS native bindings 未安装，无法启用 DDS 注册。请参考 wdndds 文档安装 libfastdds + fastdds-python。",
+        true,
+      );
+      return;
+    }
     this._lastToggle = want;
     this._toggleInflight = true;
     try {
-      const r = await fetch(API_PREFIX + "/lan-discovery", {
-        method: "PUT",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({enabled: want}),
-      });
+      const url = API_PREFIX + "/discovery/dds/" + (want ? "start" : "stop");
+      const r = await fetch(url, { method: "POST" });
       const text = await r.text();
       let body;
-      try { body = JSON.parse(text); } catch { body = {detail: text}; }
+      try { body = JSON.parse(text); } catch { body = { detail: text }; }
       if (!r.ok) {
-        const msg = body.detail || ("HTTP " + r.status);
-        this._setSummary("切换失败: " + msg, "danger");
-        // 回滚 UI
+        const detail = body && body.detail;
+        let msg;
+        if (typeof detail === "object" && detail !== null) {
+          msg = detail.message || detail.reason || JSON.stringify(detail);
+        } else {
+          msg = detail || ("HTTP " + r.status);
+        }
+        this._setSummary("切换失败: " + msg, true);
         toggle.checked = !want;
         this._lastToggle = !want;
+        // 503 → fastdds 不可用：刷新 runtime 缓存，确保下次 onToggle 也拒
+        if (r.status === 503 && typeof detail === "object") {
+          this._runtime = detail.dds_runtime || { available: false, error: msg };
+        }
         return;
       }
       if (body && body.snapshot) {
         this._snapshot = body.snapshot;
+      } else {
+        await this.load();
+        return;
       }
       this.render();
     } catch (e) {
-      this._setSummary("切换失败: " + e.message, "danger");
+      this._setSummary("切换失败: " + e.message, true);
       toggle.checked = !want;
       this._lastToggle = !want;
     } finally {
@@ -4414,128 +4441,102 @@ const DiscoveryLan = {
     }
   },
 
-  async scanNow() {
-    if (this._busyScan) return;
-    const btn = document.getElementById("discovery-lan-scan-now");
-    if (btn) btn.disabled = true;
-    this._busyScan = true;
-    try {
-      const r = await fetch(API_PREFIX + "/lan-discovery/scan", {
-        method: "POST",
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        this._setSummary("触发失败: " + text, "danger");
-      } else {
-        this._setSummary("已触发扫描，等待结果…");
-      }
-    } catch (e) {
-      this._setSummary("触发失败: " + e.message, "danger");
-    } finally {
-      if (btn) btn.disabled = false;
-      this._busyScan = false;
-      // 扫描大约 2-5s 完成，期间 load() 会带回新设备
-      setTimeout(() => this.load().catch(() => {}), 1500);
-      setTimeout(() => this.load().catch(() => {}), 4000);
-    }
-  },
-
-  async clear() {
-    if (!confirm("确定要清空已发现的局域网设备列表吗？\n（仅清内存，下次扫描会重新填充）")) return;
-    try {
-      const r = await fetch(API_PREFIX + "/lan-discovery/devices", {
-        method: "DELETE",
-      });
-      const text = await r.text();
-      let body;
-      try { body = JSON.parse(text); } catch { body = {detail: text}; }
-      if (!r.ok) {
-        this._setSummary("清空失败: " + (body.detail || ("HTTP " + r.status)), "danger");
-        return;
-      }
-      if (body && body.snapshot) this._snapshot = body.snapshot;
-      this.render();
-    } catch (e) {
-      this._setSummary("清空失败: " + e.message, "danger");
-    }
-  },
-
-  // ------------------------------------------------------------ render
   render() {
     const snap = this._snapshot;
+    const rt = this._runtime;
     if (!snap) return;
-    const toggle = document.getElementById("discovery-lan-toggle");
-    const hint = document.getElementById("discovery-lan-hint");
-    const summary = document.getElementById("discovery-lan-summary");
-    const meta = document.getElementById("discovery-lan-meta");
-    const list = document.getElementById("discovery-lan-list");
-    const scanBtn = document.getElementById("discovery-lan-scan-now");
-    const clearBtn = document.getElementById("discovery-lan-clear");
 
-    if (toggle && this._lastToggle === null) {
-      toggle.checked = !!snap.enabled;
-      this._lastToggle = !!snap.enabled;
-    } else if (toggle && !this._toggleInflight && toggle.checked !== snap.enabled) {
-      // 服务端状态跟 UI 不一致：只在非"用户刚刚主动切"的瞬间才同步
-      // （onToggle 内部已经维护 _lastToggle 与服务端对齐，不会跑到这里）。
-      // _toggleInflight 期间跳过同步，否则 1Hz 轮询可能在 PUT 完成前
-      // 拉回旧 enabled 值把用户的乐观 UI 覆盖掉。
-      toggle.checked = !!snap.enabled;
-      this._lastToggle = !!snap.enabled;
-    }
-
-    const enabled = !!snap.enabled;
-    const devices = snap.devices || [];
-    const online = devices.filter((d) => d.online).length;
-
-    if (hint) {
-      hint.textContent = enabled
-        ? `在线 ${online} · 总计 ${devices.length}`
-        : `未启用 · 列表 ${devices.length}`;
-    }
-
-    if (scanBtn) scanBtn.disabled = this._busyScan;
-    if (clearBtn) clearBtn.disabled = devices.length === 0;
-
-    if (summary) {
-      summary.classList.remove("danger");
-      if (!enabled) {
-        summary.textContent = "在网注册已关闭。打开开关后，浏览器会周期性拉取本机所在 /24 子网的设备列表。";
-      } else if (snap.scanning) {
-        const subs = (snap.subnets || []).join(", ") || "—";
-        summary.textContent = `扫描中… 候选子网 ${subs}（每 ${snap.config?.scan_interval_seconds ?? "—"} 秒自动复扫）`;
-      } else if (devices.length === 0) {
-        summary.textContent = `已启用但暂未发现设备（最近一次扫描：${this._fmtTime(snap.last_scan_finished)}）`;
+    // ---- runtime banner ----
+    const banner = document.getElementById("discovery-dds-runtime-banner");
+    if (banner && rt) {
+      if (rt.available) {
+        const ver = rt.version || "?";
+        const path = rt.path || "";
+        banner.className = "discovery-runtime-banner is-ok";
+        banner.innerHTML =
+          `FastDDS 可用 · <code>${this._esc(rt.module || "fastdds")}</code>` +
+          ` <code>${this._esc(ver)}</code>` +
+          (path ? ` <code>${this._esc(path)}</code>` : "");
       } else {
-        summary.textContent = `已发现 ${devices.length} 台设备，在线 ${online}（最近一次扫描：${this._fmtTime(snap.last_scan_finished)}）`;
+        banner.className = "discovery-runtime-banner is-danger";
+        banner.textContent =
+          "FastDDS native bindings 未安装，DDS 注册功能不可用。" +
+          (rt.error ? " 错误：" + rt.error : "");
       }
     }
 
-    if (meta) {
-      const cfg = snap.config || {};
-      const localIps = snap.local_ips || [];
-      const subnets = snap.subnets || [];
-      const subList = subnets.length
-        ? subnets.map((s) => `<span class="discovery-lan-meta-item"><strong>${this._esc(s)}</strong> · ${snap.hosts_per_subnet?.[s] ?? "?"} 主机</span>`).join("")
-        : `<span class="discovery-lan-meta-item is-error">无可用私有子网</span>`;
-      meta.innerHTML = `
-        <span class="discovery-lan-meta-item">本机 IP：${localIps.length ? localIps.map((ip) => `<strong>${this._esc(ip)}</strong>`).join(" · ") : `<strong class="is-error">未取到</strong>`}</span>
-        <span class="discovery-lan-meta-item">扫描端口：<strong>${cfg.port ?? snap.default_port}</strong></span>
-        <span class="discovery-lan-meta-item">扫描间隔：<strong>${cfg.scan_interval_seconds ?? "—"}s</strong></span>
-        ${subList}
-      `;
+    // ---- toggle state ----
+    const toggle = document.getElementById("discovery-dds-toggle");
+    const isReady = snap.state === "ready";
+    if (toggle && this._lastToggle === null) {
+      toggle.checked = isReady;
+      this._lastToggle = isReady;
+    } else if (toggle && !this._toggleInflight && toggle.checked !== isReady) {
+      toggle.checked = isReady;
+      this._lastToggle = isReady;
+    }
+    if (toggle) {
+      const unavailable = !!(rt && !rt.available);
+      toggle.disabled = unavailable || snap.state === "starting" || snap.state === "stopping";
+      toggle.parentElement.title = unavailable
+        ? "FastDDS 未安装，无法启用"
+        : "开启后通过 wdndds + FastDDS 广播本机能力";
     }
 
+    // ---- hint + summary ----
+    const hint = document.getElementById("discovery-dds-hint");
+    if (hint) hint.textContent = `${snap.discovered_count} 个对端`;
+
+    const summary = document.getElementById("discovery-dds-summary");
+    if (summary) {
+      summary.classList.remove("danger");
+      switch (snap.state) {
+        case "ready":
+          summary.textContent =
+            `已注册为「${snap.device_name || "pyrkaiweb"}」 · domain=0 · ` +
+            `对端 ${snap.discovered_count} 个`;
+          break;
+        case "starting":
+          summary.textContent = "正在连接 FastDDS…";
+          break;
+        case "stopping":
+          summary.textContent = "正在断开…";
+          break;
+        case "unavailable":
+          summary.textContent =
+            "FastDDS 不可用。安装 libfastdds-dev + fastdds-python3 后重启服务即可。";
+          summary.classList.add("danger");
+          break;
+        case "error":
+          summary.textContent =
+            "上次启动失败：" + (snap.last_error || "未知错误");
+          summary.classList.add("danger");
+          break;
+        case "uninitialized":
+        default:
+          summary.textContent =
+            "未开启。打开开关后通过 wdndds 把本机能力广播到同网段 FastDDS participant。";
+          break;
+      }
+    }
+
+    // ---- device list ----
+    const list = document.getElementById("discovery-dds-list");
     if (!list) return;
+    const devices = Array.isArray(snap.discovered) ? snap.discovered : [];
+    if (snap.state !== "ready") {
+      // 非 ready 状态下不展示 discovered（可能在停机中）
+      list.innerHTML = "";
+      return;
+    }
     if (devices.length === 0) {
       list.innerHTML = `
         <div class="page-placeholder">
           <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
-          <div class="page-placeholder-title">${enabled ? "尚未发现设备" : "未开启在网注册"}</div>
+          <div class="page-placeholder-title">等待对端</div>
           <div class="page-placeholder-text">
-            ${enabled
-              ? "扫描正在进行中；如果长时间没有设备出现，请确认其它 pyrkaiweb 实例在同一网段且端口可访问。"
-              : "打开\"在网注册\"开关后，会周期性扫描本机所在 /24 子网内的其他 pyrkaiweb 实例，并把它们的设备名与能力列出来。"}
+            已注册，但本网段还没有其他 FastDDS participant 出现。
+            确认网络允许 UDP 组播 239.255.0.1 / discovery port 7400+。
           </div>
         </div>`;
       return;
@@ -4543,36 +4544,20 @@ const DiscoveryLan = {
     list.innerHTML = "";
     for (const d of devices) {
       const card = document.createElement("article");
-      const cls = ["discovery-card"];
-      if (!d.online) cls.push("is-offline");
-      card.className = cls.join(" ");
-
-      const swCaps = Array.isArray(d.sw_capabilities) ? d.sw_capabilities : [];
-      const hwCaps = Array.isArray(d.hw_capabilities) ? d.hw_capabilities : [];
-      const capChips = [];
-      for (const c of swCaps) {
-        const t = this._esc(c.type || "?");
-        const n = c.model ? ` · ${this._esc(c.model)}` : "";
-        capChips.push(`<span class="discovery-card-lan-cap" title="${t}${n}">${t}</span>`);
-      }
-      for (const c of hwCaps) {
-        const t = this._esc(c.capability_type || "?");
-        capChips.push(`<span class="discovery-card-lan-cap is-hw" title="${t}">${t}</span>`);
-      }
+      card.className = "discovery-card";
+      const capChips = (d.capabilities || []).map((t) =>
+        `<span class="discovery-card-lan-cap" title="${this._esc(t)}">${this._esc(t)}</span>`,
+      );
       if (capChips.length === 0) {
         capChips.push(`<span class="discovery-card-lan-cap is-empty">无能力</span>`);
       }
-
       card.innerHTML = `
         <header class="discovery-card-head">
-          <code class="discovery-cap-name">${this._esc(d.device_name || d.ip)}</code>
-          <span class="discovery-card-lan-ip">${this._esc(d.ip)}:${d.port}</span>
+          <code class="discovery-cap-name">${this._esc(d.name)}</code>
         </header>
         <div class="discovery-card-meta">
-          <span>${d.online ? '<span class="discovery-card-status is-on">在线</span>' : '<span class="discovery-card-status is-off">离线</span>'}</span>
-          <span>RTT <strong>${d.last_rtt_ms ?? "—"}</strong> ms</span>
-          <span>最近探测：<strong>${this._fmtTime(d.last_seen)}</strong></span>
-          ${d.last_error ? `<span style="color:#b91c1c">${this._esc(d.last_error)}</span>` : ""}
+          <span>首次出现：<strong>${this._fmtTime(d.first_seen)}</strong></span>
+          <span>最近出现：<strong>${this._fmtTime(d.last_seen)}</strong></span>
         </div>
         <div class="discovery-card-lan-caps">${capChips.join("")}</div>
       `;
@@ -4581,7 +4566,7 @@ const DiscoveryLan = {
   },
 
   _setSummary(text, danger) {
-    const summary = document.getElementById("discovery-lan-summary");
+    const summary = document.getElementById("discovery-dds-summary");
     if (!summary) return;
     summary.textContent = text;
     summary.classList.toggle("danger", !!danger);
@@ -4603,6 +4588,8 @@ const DiscoveryLan = {
   },
 };
 
+/* ------------------------------------------------------------------ *
+ *  im-bridge page — WeChat iLink bot (login + 调试收发)             *
 /* ------------------------------------------------------------------ *
  *  im-bridge page — WeChat iLink bot (login + 调试收发)             *
  *                                                                    *

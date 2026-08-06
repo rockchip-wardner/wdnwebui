@@ -450,60 +450,81 @@ holds it in memory. The file is seeded with a `base` section at
   串行加载；UI 通过 `GET /api/compute` 每秒轮询状态，queued / loading
   实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL = 8s`）。
   Capability 概念作为内部 key 使用（`get_session("swcap_video_describe")` /
-  `"swcap_audio_tts"`），**这一轮不做** wdndds 真实注册发现；discovery
-  页面只读 registry 内存状态。
+  `"swcap_audio_tts"`），注册发现的 wire 侧由 :mod:`app.services.dds_discovery`
+  负责把当前活跃实例的能力转换成 wdndds ``Capability`` 实例广播到 DDS。
 
 ## Discovery page (注册发现)
 
 `#page-discovery` 内部按从上到下三个 pane 排布：
 
-1. **局域网设备 (LAN)** —— 新增，详见下文。
+1. **在网注册 (DDS)** —— wdndds + FastDDS 广播本机能力 + 接收对端，详见下文。
 2. **硬件能力 (HW)** —— 本机硬件能力开关，源自 `HARDWARE_CAPABILITIES` 静态表 +
    `config.json["compute"]["hardware_capabilities"]` 启用状态。checkbox 修改后
    点"保存修改"才落盘，避免误触。
 3. **软件能力 (SW)** —— 当前 running 实例暴露的能力（每条来自一个 RKNN 模型实例）。
 
-### 局域网设备 (LAN) 子面板
+### 在网注册 (DDS) 子面板
 
-LAN 子面板（`data-pane="lan"`）做同网段 pyrkaiweb 互相识别：
+DDS 子面板（`data-pane="dds"`）通过 wdndds 调 FastDDS 把本机能力广播给
+同网段其它 FastDDS participant，并显示对端列表。**不再走 HTTP / TCP 探测**
+—— FastDDS 的 SPDP / SEDP 走 UDPv4 + 组播 239.255.0.1 / discovery port
+7400+ 即可。
 
 * **开关 "在网注册"** —— 开启后：
-  * 后台线程（`lan-discovery-worker` daemon）周期性扫描本机所有 IPv4 私有 /24 子网；
-  * 对每个候选 host 做 TCP connect（端口 = `config.port`，默认 8000）+ HTTP
-    `GET /api/lan-discovery/announce`；
-  * 响应成功的设备写入内存表：`(ip, port) → LanDevice(device_name,
-    sw_capabilities, hw_capabilities, last_seen, last_rtt_ms, last_error)`；
-  * TTL 5 分钟 —— 连续 5 分钟没再扫到自动剔除，避免僵尸节点堆积。
-* **`PUT /api/lan-discovery`** `{enabled, port, scan_interval_seconds}`：
-  * `enabled` 一旦切到 `true`，内存里的旧设备列表会被清空，并立刻触发首轮扫描；
-  * 切到 `false` 后停止扫描，但内存里的设备保留供用户回顾；
-  * `port` 默认 8000，`scan_interval_seconds` 范围 5–600（默认 30）。
-* **`POST /api/lan-discovery/scan`** —— "立即扫描"按钮：不等 interval 到点，
-  立刻唤醒 worker；即使 `enabled=false` 也允许手动跑一次（用于临时探测）。
-* **`DELETE /api/lan-discovery/devices`** —— "清空列表"按钮，仅清内存，不动
-  enabled 开关与 config.json。
-* **`GET /api/lan-discovery/announce`** —— **永远可用**的对端探测接口，跟
-  `enabled` 无关。对端 pyrkaiweb 扫描时打这个 URL，本机返回
-  `{device_name, ip, sw_capabilities, hw_capabilities, timestamp,
-  protocol_version}`。device_name 来自 `config.json["base"]["device_name"]`，
-  capability 来自 `ComputeRegistry.list_active_capabilities()` +
-  `list_hardware_capabilities()`。
-* **`GET /api/lan-discovery`** —— Discovery 页每秒轮询的完整 snapshot：
-  `config / enabled / scanning / last_scan_started / last_scan_finished /
-  local_ips / subnets / hosts_per_subnet / devices[] / ttl_seconds /
-  probe_timeout_seconds / default_port`。
-* **持久化** —— `enabled / port / scan_interval_seconds` 写到
-  `config.json["compute"]["lan_discovery"]`，重启后保留 `enabled` 状态但**不会**
-  自动启动扫描线程（与 compute instances 一样，遵循
-  "boot 不自动加载"原则 —— 用户必须手动打开开关）。
-* **实现细节**：
-  * 子网枚举走 `psutil.net_if_addrs()`（已有依赖），过滤 loopback / link-local /
-    公网 IP；同一 /24 出现多次合并；本机 IP 自身从候选列表剔除。
-  * 并行探测用 `ThreadPoolExecutor(max_workers=64)`，单 host 超时 0.7s；
-    一轮 /24（253 主机）≈ 2.8s。
-  * TCP connect 失败直接返回（不浪费 HTTP 超时）；成功才发 HTTP。
-  * 失败的探测**不更新** `last_seen` —— 设备掉线后自然在 TTL 到期后从表里
-    剔除；`last_error` 字段保留最近一次的失败原因供 UI 展示。
+  * 后端调 ``wdndds.connect()`` 起 DomainParticipant（domain_id 默认为 0）；
+  * 调 ``wdndds.register(device_name, capabilities)``：device_name 来自
+    `config.json["base"]["device_name"]`，capabilities 由
+    `_build_capabilities` 根据 `ComputeRegistry.list_active_capabilities()`（SW,
+    只看 status=running 的实例）+ `list_hardware_capabilities()`（HW,
+    只看 enabled=True 的项）现拼 wdndds 叶子类（`SWVideoDescribe` /
+    `HWVideoInput` / …）；
+  * 调 ``wdndds.start_scan(callback)`` 订阅对端 ``wdndds/registry`` topic，
+    维护内存 `discovered: {name -> {name, capabilities, first_seen, last_seen}}`。
+  * 关 toggle → ``stop_scan`` + ``Hub.close()`` + 重置 wdndds 内部 ``_hub``
+    全局变量；对端通过 SPDP participant 失活自然从它们的列表里移除。
+* **FastDDS native bindings 未装时** → ``POST /start`` 直接返回 **503**，
+  ``detail`` 为 dict（含 ``reason: "fastdds_unavailable"`` + 中文 message +
+  ``dds_runtime``），前端把这条错误渲到 ``discovery-dds-runtime-banner``
+  红色条 + 禁用 toggle，避免空操作。
+* **`GET /api/discovery/dds`** —— Discovery 页每秒轮询的完整 snapshot：
+  `state`（uninitialized / unavailable / starting / ready / stopping / error）
+  / `available` / `dds_runtime` / `device_name` / `discovered[]` /
+  `discovered_count` / `last_error` / `started_at` / `stopped_at` /
+  `last_updated`。
+* **`GET /api/discovery/dds/runtime`** —— 只读 FastDDS 可用性快照
+  （调 ``wdndds.dds.check_runtime()`` 但不 connect），UI 进页面就拉一次
+  渲 banner。
+* **`POST /api/discovery/dds/start`** —— 幂等（state 已经是 ready 时直接返 200
+  + 当前 snapshot）。**不持久化 enabled 状态** —— 跟 ComputeRegistry 一样遵
+  循 "boot 不自动加载" 原则：重启后状态归零，用户必须重新打开。
+* **`POST /api/discovery/dds/stop`** —— 关闭 Hub；state 已经是
+  uninitialized / unavailable 时直接 200 + 当前 snapshot（幂等）。
+* **错误码**：
+  * **503** —— fastdds 不可用（detail 为 dict，UI 直接渲染）
+  * **409** —— 切换中（STARTING / STOPPING）又来一次 POST
+  * **502** —— ``connect / register / start_scan / close`` 流程任一步抛异常
+* **能力 → wdndds 类映射**（`app/services/dds_discovery.py` 内
+  `_CAPABILITY_FACTORIES`）：
+  ```
+  hwcap_video_input  → HWVideoInput    swcap_video_query    → SWVideoQuery
+  hwcap_audio_input  → HWAudioInput    swcap_video_describe → SWVideoDescribe
+  hwcap_audio_output → HWAudioOutput   swcap_video_analyse  → SWVideoAnalyse
+  hwcap_hdmi_display → HWHDMIDisplay   swcap_audio_query    → SWAudioQuery
+                                      swcap_audio_analyse  → SWAudioAnalyse
+                                      swcap_audio_tts      → SWAudioTTS
+                                      swcap_text_chat      → SWTextChat
+  ```
+  未知 ``capability_type`` 静默跳过（不让单个坏数据把整个 register 拖挂）。
+* **没有 invoke handler**：本轮只做"广播自己"，cap 实例不传 ``callback``，
+  对端 invoke 我们就走 ``_default_handle`` 回一个默认应答。
+* **关闭** —— app shutdown 时 ``close_dds_discovery()`` 调
+  ``DdsDiscoveryManager.close()`` → ``stop_scan`` + ``Hub.close()`` +
+  重置 wdndds registry 状态；无 manager 实例（用户从没进过 Discovery 页）时
+  是 no-op。
+* **资源预算** —— 一个 ``wdndds.Hub`` 单实例长期驻留一个 daemon pump 线程
+  + 少量后台 publish/subscribe 协程；不启用 toggle 时**完全空闲**（不连接
+  不发 SPDP）。开启 toggle 时 Groupcast / Discovery port 由 FastDDS 默认
+  0.0.0.0:7400 起动态分配；UDP 组播 239.255.0.1 必须可达。
 
 ### Discovery 页前端模块拆分
 
@@ -512,18 +533,15 @@ LAN 子面板（`data-pane="lan"`）做同网段 pyrkaiweb 互相识别：
 * **`Discovery`** —— 注册发现页主入口。`load()` 拉 `/api/compute/capabilities`
   渲染 HW + SW pane（一次拉取，不轮询）；HW pane 的 checkbox 修改是 dirty
   状态，点"保存修改"才 PUT 到 `/api/compute/hardware-capabilities`。
-* **`DiscoveryLan`** —— LAN 子面板独立模块。`load()` 拉
-  `/api/lan-discovery`；进入页面后 `startTicking()` 起 1Hz 轮询，让
-  `scanning / last_seen / devices` 实时刷新；离开页面 `stopTicking()`
+* **`DiscoveryDds`** —— DDS 子面板独立模块。`load()` 并行拉
+  `/api/discovery/dds/runtime`（banner 状态）+ `/api/discovery/dds`
+  （snapshot）；进入页面后 `startTicking()` 起 1Hz 轮询，让
+  `state / discovered / last_error` 实时刷新；离开页面 `stopTicking()`
   释放定时器。
-  * `onToggle()` 处理"在网注册"开关：PUT 时设 `_toggleInflight=true`
-    防止 1Hz 轮询在 PUT 完成前把乐观 UI 覆盖回旧值；失败回滚 checkbox。
-  * `scanNow()` / `clear()` 触发对应 POST / DELETE，失败写
-    `discovery-lan-summary` 红字提示。
-  * `render()` 把 snapshot 渲成 4 段 UI：toggle 状态 + hint（在网/总设备数）
-    + summary（扫描中 / 已发现 / 未启用）+ meta（本机 IP / 端口 / 间隔 / 子网）
-    + device 卡片（device_name + ip:port + 在线/离线 + RTT + 最近探测 +
-    SW/HW capability chips）。
+  * `onToggle()` 处理"在网注册"开关：根据 `_runtime.available` 预先
+    拦截无 FastDDS 的点击；PUT 时设 `_toggleInflight=true` 防止 1Hz 轮询
+    在 PUT 完成前把乐观 UI 覆盖回旧值；503 时把 `detail.dds_runtime`
+    写回 `_runtime` 让下次 toggle 仍然被拦截。
 
 ## System logs page
 

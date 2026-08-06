@@ -7,8 +7,9 @@
 * 启动阶段不阻塞 FastAPI：``apply_boot_config_async()`` 起一个 daemon thread
   串行从 config.json 加载实例，每条实例状态机走
   ``queued → loading → running``，附带时间戳供前端算倒计时。
-* wdndds 注册发现这一轮**不做** —— capability 仅作内部 key 用，
-  discovery 页面只读 registry 内存状态。
+* 注册发现由 :mod:`app.services.dds_discovery` 负责，本模块只暴露能力
+  列表（``list_active_capabilities`` / ``list_hardware_capabilities``）供其
+  转换成 wdndds ``Capability`` 实例。
 
 时间字段：
 
