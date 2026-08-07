@@ -7,6 +7,11 @@ python-multipart>=0.0.9
 av>=11.0.0
 rknn3-toolkit-lite>=1.0.0
 gguf>=0.10.0
+# wdndds / wechatbot-sdk：im-bridge 页的微信 iLink 机器人依赖。
+#   - wdndds（私有包，配套 rkv/rkai 一起放在 .venv/src/，需要
+#     `pip install -e .venv/src/wdndds` editable 安装；带 vendor 的
+#     _fastdds_python.so + _wdndds_string.so 二进制 + wechatbot-sdk 依赖）
+#   - wechatbot-sdk（PyPI 包，wdndds 依赖会自动装）
 # rkv / rkai are internal SDKs (behind SSH on git@10.10.10.10) and are
 # installed separately — see README §4.
 # gguf is imported by rkai.gguf_tokenizer to load the *.tokenizer.gguf
