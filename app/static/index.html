@@ -21,6 +21,7 @@
       <a href="#video-detection"      data-page="video-detection"      class="nav-item nav-item--demo" data-icon="▶">音视频描述</a>
       <a href="#video-target-detection" data-page="video-target-detection" class="nav-item nav-item--demo" data-icon="◎">视频目标检测</a>
       <a href="#video-content-search" data-page="video-content-search" class="nav-item nav-item--demo" data-icon="⌕">视频内容检索</a>
+      <a href="#video-file-analysis"  data-page="video-file-analysis"  class="nav-item nav-item--demo" data-icon="⏏">视频文件分析</a>
       <a href="#tts"                  data-page="tts"                  class="nav-item nav-item--demo" data-icon="♪">语音生成</a>
       <a href="#text-chat"            data-page="text-chat"            class="nav-item nav-item--demo" data-icon="✎">文本对话</a>
       <hr class="nav-divider" />
@@ -676,6 +677,142 @@
         </div>
       </div>
 
+      <div id="vfa-query" class="vfa-query hidden" role="dialog" aria-modal="true">
+        <div class="vfa-query-card">
+          <div class="vfa-query-head">
+            <div class="vfa-query-title">
+              <span class="vfa-query-title-main">反查</span>
+              <span class="vfa-query-title-sub" id="vfa-query-source">--</span>
+            </div>
+            <button class="vfa-query-close" id="vfa-query-close" aria-label="关闭">×</button>
+          </div>
+
+          <div class="vfa-query-form">
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">场景</label>
+              <select class="vfa-query-select" id="vfa-query-scene">
+                <option value="">不限</option>
+              </select>
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">人物</label>
+              <div class="vfa-query-chips" id="vfa-query-actors">
+                <span class="vfa-query-empty">（加载中…）</span>
+              </div>
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">物体</label>
+              <div class="vfa-query-chips" id="vfa-query-objects">
+                <span class="vfa-query-empty">（加载中…）</span>
+              </div>
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">动作</label>
+              <div class="vfa-query-chips" id="vfa-query-actions">
+                <span class="vfa-query-empty">（加载中…）</span>
+              </div>
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">精准匹配 <span class="vfa-query-hint">（完整字符串）</span></label>
+              <input type="text" class="vfa-query-input" id="vfa-query-exact"
+                     placeholder="完整匹配查询字符串（如：出租车 / 雨天 / 穿红衣）" />
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">模糊搜索 <span class="vfa-query-hint">（n-gram 跨字段）</span></label>
+              <input type="text" class="vfa-query-input" id="vfa-query-q"
+                     placeholder="切 2-gram 模糊匹配（如：雨天 / 穿红衣 / 门岗）" />
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">语义搜索 <span class="vfa-query-hint">（LLM 打分排序）</span></label>
+              <input type="text" class="vfa-query-input" id="vfa-query-semantic"
+                     placeholder="用自然语言描述想找的画面（一次 LLM 调用）" />
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">
+                时间范围
+                <span class="vfa-query-hint" id="vfa-query-range-hint">（共 00:00）</span>
+              </label>
+              <div class="vfa-query-range">
+                <!--
+                  type="text" + inputmode="numeric" 而不是 type="number"：
+                  type="number 不让用户输冒号（MM:SS 解析需要），
+                  移动端键盘仍是数字键盘（小数点和冒号要走切换键，但用户能输）。
+                  严格 HH:MM:SS 格式由 JS regex 校验（_validateTimeInput / _parseTimeToSeconds），
+                  错误时 input 加 .vfa-query-input-invalid 红框 + title 提示。
+                -->
+                <input type="text" inputmode="numeric"
+                       class="vfa-query-input vfa-query-range-min" id="vfa-query-time-min"
+                       placeholder="起始 (00:00:00)" autocomplete="off" />
+                <span class="vfa-query-range-sep">~</span>
+                <input type="text" inputmode="numeric"
+                       class="vfa-query-input vfa-query-range-max" id="vfa-query-time-max"
+                       placeholder="结束 (00:01:13)" autocomplete="off" />
+              </div>
+              <!--
+                截断提示：用户结束时间 > 视频总长度时显示。友好告知"已截断到
+                HH:MM:SS"而不是静默改值或返回 0 条。默认 hidden，由 vfaQueryBuildQuery
+                在检测到截断时去掉 hidden 类。
+              -->
+              <div class="vfa-query-clamp-notice hidden" id="vfa-query-clamp-notice"
+                   role="status" aria-live="polite">
+                <span class="vfa-query-clamp-icon" aria-hidden="true">ⓘ</span>
+                <span id="vfa-query-clamp-text"></span>
+              </div>
+            </div>
+            <div class="vfa-query-actions">
+              <button class="vd-btn" id="vfa-query-clear">清空筛选</button>
+              <button class="vd-btn vd-btn-primary" id="vfa-query-run">反查</button>
+            </div>
+          </div>
+
+          <div class="vfa-query-results">
+            <div class="vfa-query-summary" id="vfa-query-summary">选择筛选条件后点击「反查」</div>
+            <ol class="vfa-query-list" id="vfa-query-list"></ol>
+          </div>
+        </div>
+      </div>
+
+      <div id="vfa-frame-modal" class="vfa-frame-modal hidden" role="dialog" aria-modal="true" aria-label="原始帧预览">
+        <div class="vfa-frame-modal-card">
+          <div class="vfa-frame-modal-head">
+            <div class="vfa-frame-modal-title">
+              <span class="vfa-frame-modal-title-main">原始帧</span>
+              <span class="vfa-frame-modal-title-sub" id="vfa-frame-modal-meta">--</span>
+            </div>
+            <button class="vfa-frame-modal-close" id="vfa-frame-modal-close" aria-label="关闭">×</button>
+          </div>
+          <div class="vfa-frame-modal-body">
+            <div class="vfa-frame-modal-img-wrap" id="vfa-frame-modal-img-wrap">
+              <div class="vfa-frame-modal-loading" id="vfa-frame-modal-loading">从原始视频取帧中…</div>
+              <img class="vfa-frame-modal-img hidden" id="vfa-frame-modal-img" alt="" />
+            </div>
+            <div class="vfa-frame-modal-info">
+              <div class="vfa-frame-modal-info-row">
+                <span class="vfa-frame-modal-info-label">帧位置</span>
+                <span id="vfa-frame-modal-frame-pos">--</span>
+              </div>
+              <div class="vfa-frame-modal-info-row">
+                <span class="vfa-frame-modal-info-label">该帧时间戳</span>
+                <span id="vfa-frame-modal-timestamp">--</span>
+              </div>
+              <div class="vfa-frame-modal-info-row">
+                <span class="vfa-frame-modal-info-label">原始视频</span>
+                <span class="vfa-frame-modal-info-source" id="vfa-frame-modal-source">--</span>
+              </div>
+              <div class="vfa-frame-modal-info-row vfa-frame-modal-info-text-wrap">
+                <span class="vfa-frame-modal-info-label">画面描述</span>
+                <div class="vfa-frame-modal-info-text" id="vfa-frame-modal-text">--</div>
+              </div>
+              <div class="vfa-frame-modal-info-row vfa-frame-modal-info-text-wrap">
+                <span class="vfa-frame-modal-info-label">结构化</span>
+                <div class="vfa-frame-modal-info-text" id="vfa-frame-modal-structured">--</div>
+              </div>
+            </div>
+          </div>
+          <div class="vfa-frame-modal-error hidden" id="vfa-frame-modal-error"></div>
+        </div>
+      </div>
+
       <section id="page-video-content-search" class="page hidden" data-page="video-content-search">
         <header class="page-header">
           <h2>视频内容检索</h2>
@@ -687,6 +824,141 @@
             该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
           </div>
         </div>
+      </section>
+
+      <section id="page-video-file-analysis" class="page hidden" data-page="video-file-analysis">
+        <header class="page-header">
+          <h2>视频文件分析</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="vfa-status">就绪</span>
+            <button class="refresh-btn" id="vfa-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div id="vfa-error-banner" class="vfa-error-banner hidden" role="alert">
+          <span class="vfa-error-icon" aria-hidden="true">⚠</span>
+          <span class="vfa-error-text" id="vfa-error-text"></span>
+          <button class="vfa-error-close" id="vfa-error-close" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <section class="vfa-progress" id="vfa-progress" data-state="idle" aria-label="分析进度">
+          <div class="vfa-progress-info">
+            <span class="vfa-progress-phase" id="vfa-progress-phase">未启动</span>
+            <span class="vfa-progress-meta" id="vfa-progress-meta">--</span>
+            <span class="vfa-progress-count" id="vfa-progress-count">
+              <span id="vfa-progress-count-now">0</span>
+              <span class="vfa-progress-count-sep">/</span>
+              <span id="vfa-progress-count-total">0</span>
+              <span class="vfa-progress-count-unit">帧</span>
+            </span>
+          </div>
+          <div class="vfa-progress-track-wrap">
+            <div class="vfa-progress-track" id="vfa-progress-track" style="--p: 0%;">
+              <div class="vfa-progress-fill" id="vfa-progress-analyze"></div>
+              <div class="vfa-progress-thumb" id="vfa-progress-thumb"></div>
+            </div>
+          </div>
+        </section>
+
+        <div class="vfa-layout">
+          <form class="surv-form" id="vfa-form" autocomplete="off" onsubmit="return false;">
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>视频源</h3>
+                <span class="surv-hint">设备端本地文件</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-input-row">
+                  <input type="text" id="vfa-source" class="surv-input"
+                         placeholder="例如 /userdata/clips/sample.mp4" spellcheck="false" />
+                  <button type="button" class="vd-btn" id="vfa-browse">浏览…</button>
+                </div>
+                <div class="vd-actions-row">
+                  <span class="vd-meta" id="vfa-source-meta">尚未选择</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section vd-grow">
+              <header class="surv-form-head">
+                <h3>分析要求</h3>
+                <span class="surv-hint">将作为 VLM 推理的提示词</span>
+              </header>
+              <div class="surv-field">
+                <textarea id="vfa-prompt" class="surv-input surv-textarea"
+                          placeholder="例如：请对整段视频进行内容总结，给出主题、关键事件与时间线"></textarea>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>采样</h3>
+                <span class="surv-hint">每隔多少帧抽取一次进行分析</span>
+              </header>
+              <div class="surv-field">
+                <label class="vd-detector-label">
+                  隔
+                  <input type="number" id="vfa-every-n" min="1" max="600" step="1" value="60" />
+                  帧
+                </label>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>操作</h3>
+                <span class="surv-hint" id="vfa-runtime">未启动</span>
+              </header>
+              <div class="surv-field vd-actions-row">
+                <button type="button" class="vd-btn vd-btn-primary" id="vfa-start">开始分析</button>
+                <button type="button" class="vd-btn" id="vfa-stop" disabled>停止</button>
+                <button type="button" class="vd-btn" id="vfa-clear">清空记录</button>
+              </div>
+            </section>
+          </form>
+
+          <aside class="vd-side vfa-result-col">
+            <section class="surv-form-section vfa-summary-section">
+              <header class="surv-form-head">
+                <h3>综述</h3>
+                <span class="surv-hint" id="vfa-summary-meta">尚无综述</span>
+              </header>
+              <div class="vfa-summary-box" id="vfa-summary-box">
+                <div class="vfa-summary-empty" id="vfa-summary-empty">
+                  全文件分析完成后，VLM 综述将在此处呈现。
+                </div>
+                <div class="vfa-summary-text hidden" id="vfa-summary-text"></div>
+              </div>
+            </section>
+
+            <section class="vfa-history">
+              <header class="vd-section-head">
+                <h3>历史分析</h3>
+                <span class="vd-spacer"></span>
+                <span class="vd-meta" id="vfa-history-count">0 条</span>
+                <button class="vd-btn" id="vfa-history-refresh">刷新</button>
+              </header>
+              <ol class="vfa-history-list" id="vfa-history-list">
+                <li class="vfa-history-empty">暂无历史分析记录。每次分析完成或中途停止后会自动落盘。</li>
+              </ol>
+            </section>
+          </aside>
+        </div>
+
+        <details class="vfa-events-section" id="vfa-events-details" open>
+          <summary class="vfa-events-summary">
+            <span class="vfa-events-summary-title">逐帧分析</span>
+            <span class="vfa-events-summary-count" id="vfa-events-count">0 条</span>
+          </summary>
+          <ol class="vfa-event-list" id="vfa-event-list">
+            <li class="vfa-event-empty">尚未开始分析。</li>
+          </ol>
+        </details>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-file-analysis"></pre>
+        </details>
       </section>
 
       <section id="page-tts" class="page hidden" data-page="tts">
