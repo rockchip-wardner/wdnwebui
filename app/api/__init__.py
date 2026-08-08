@@ -16,6 +16,7 @@ from . import (
     text_chat,
     tts,
     video_detection,
+    video_file_analysis,
     video_target_detection,
     wechat,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "text_chat",
     "tts",
     "video_detection",
+    "video_file_analysis",
     "video_target_detection",
     "wechat",
-] 
+]

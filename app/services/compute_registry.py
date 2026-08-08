@@ -807,6 +807,25 @@ def get_registry() -> ComputeRegistry:
 
 
 # --------------------------------------------------------------------------- #
+# 进程级 LLMSession 调用锁
+#
+# 多个消费者（detector / 视频文件分析 等）共用同一 capability 的
+# LLMSession。``reset()`` + ``respond(...)`` 不是线程安全的（RKNN
+# native lib 内部维护 KV cache + 流式 token 状态），并发调用会出错。
+# 消费者在调 ``session.respond`` 之前必须 acquire 这个锁；锁本身
+# 不绑 capability，跨 capability 串行化足够保守（VLM 这一轮只有
+# ``swcap_video_describe`` 一个相关 capability，detector 与 VFA 不
+# 会同时跑；TTS 用的是另一组 session，与本锁无关）。
+# --------------------------------------------------------------------------- #
+_llm_session_call_lock = threading.Lock()
+
+
+def get_session_call_lock() -> threading.Lock:
+    """进程级锁；``session.reset()`` + ``session.respond(...)`` 前后必须包住。"""
+    return _llm_session_call_lock
+
+
+# --------------------------------------------------------------------------- #
 # 轻量预检（替代旧 _init_session_subprocess 的完整 init；省 55s）
 # --------------------------------------------------------------------------- #
 def _probe_session_setup(npu_index: int, model_id: str) -> Tuple[bool, str]:

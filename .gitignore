@@ -14,5 +14,6 @@ env/
 .DS_Store
 *.log
 app/services/uploads/
+app/services/vfa_runs/
 app/static/uploads/
 output.wav

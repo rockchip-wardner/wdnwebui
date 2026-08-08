@@ -746,6 +746,88 @@ to taste.
 format-3; for inspection, use ``soundfile.read(...)`` or parse the
 RIFF header by hand.
 
+## Video file analysis (视频文件分析) page
+
+`#page-video-file-analysis` 是演示页第 4 项（`⏏` 图标），提供整段视频的
+批量 VLM 分析 —— 给定本地文件 / RTSP / RTMP / 摄像头，VLM 按 `every_n`
+帧采样输出结构化 `SceneFrame`，文件走完后跑一次 Apollo 三段式综述。
+
+* **Service** (`app/services/video_file_analysis.py`):
+  - `VideoFileAnalysisService` 单例（`get_service()`）。状态机
+    `idle → opening → running → summarizing → done`，`stopped` / `error` 是
+    旁支终态。
+  - **独立 `rkv.VideoCapture`** —— 不挂 `VideoSession.add_frame_sink`，避免
+    抢占音视频描述 / 视频监控的同一源。
+  - **LLMSession 必须从 ComputeRegistry 取** —— `get_session("swcap_video_describe")`，
+    复用 `qwen3-vl-4b` 实例；找不到 capability 抛 `RuntimeError("功能未启用: ...")`，
+    HTTP 502 透传。
+  - **进程级 `_llm_session_call_lock`**：detector 与 VFA 共享同一 LLMSession；
+    `reset() + respond(...)` 不是线程安全的，必须 `with lock:` 包住。锁不绑
+    capability —— VLM 端所有消费者串行化，TTS 用另一组 session 互不干扰。
+    `app.services.compute_registry.get_session_call_lock()` 暴露锁对象。
+  - **decode / infer pipeline 反压**：`_decode_loop` 用 `queue.Queue(maxsize=1)`
+    + `threading.Event` 做 backpressure —— 采样时等 `_worker_ready`，worker
+    拿走样本立即 set；避免新样本覆盖尚未处理的旧样本。
+  - **per-frame SceneFrame schema**：用 rkai `@Generable SceneFrame(LMOutput)`
+    让模型输出 5 字段结构化 JSON（`text` / `scene` / `actors` / `action` /
+    `objects`）；SDK 解析失败时 `_split_scene_frame_result` 五分支兜底
+    （dict 归一化 → JSON parse → markdown regex → raw str）。
+  - **Apollo 三段式综述**：场景检测（cv2 HSV 直方图 + Bhattacharyya 距离）
+    → per-scene chunk 小结（每段 ≤120 字，`max_new_tokens=200`）→ 最终综述
+    （`max_new_tokens=400`）。每完成一个 chunk 广播 `state` 进度，
+    前端用 `summary_progress: [done, total]` 显示 N/M。
+  - **持久化**：每次 `start()` 分配新 `run_id`（uuid4 hex），结束 / 停止 /
+    出错都原子写到 `app/services/vfa_runs/<run_id>.json`（mp temp + os.replace）。
+    JSON 含 `events[]` + `summary` + `fps` + `total_frames`。**老 run 没
+    `fps` 字段时** `list_runs` 走 PyAV 探测自愈并回填。
+* **API** (`app/api/video_file_analysis.py`):
+  - `GET  /api/video-file-analysis`             — 当前快照（state / 总帧 /
+    进度 / 综述 / available / init_error）。
+  - `GET  /api/video-file-analysis/events`      — per-frame events + summary。
+  - `POST /api/video-file-analysis/open` `{source, prompt, every_n}` —
+    启动一次；400 source/prompt/every_n 校验失败；503 rkai 不可用 / 功能未启用。
+  - `POST /api/video-file-analysis/stop`        — 用户中途停止（不出综述）。
+  - `POST /api/video-file-analysis/close`       — 彻底关闭。
+  - `POST /api/video-file-analysis/events/clear` — 清空内存 events + summary。
+  - `GET  /api/video-file-analysis/runs`        — 历史 run 列表（按 finished_at 倒序）。
+  - `GET  /api/video-file-analysis/runs/{run_id}` — 加载历史 run 到内存。
+  - `DELETE /api/video-file-analysis/runs/{run_id}` — 删盘上 JSON。
+  - `GET  /api/video-file-analysis/runs/{run_id}/facets` — scene/actor/object/action
+    去重集合（前端反查 chip 候选）。
+  - `GET  /api/video-file-analysis/runs/{run_id}/query?scene=&actor=&object=&action=&exact=&q=&semantic=&frame_min=&frame_max=&limit=` —
+    反查：多维 AND 过滤 + 三种搜索模式（`semantic` > `exact` > `q` 互斥）。
+  - `GET  /api/video-file-analysis/runs/{run_id}/frame/{frame_pos}` —
+    从原始视频取指定帧的 JPEG（PyAV v4l2m2m seek + rkv read0 fallback）。
+  - `WS   /api/video-file-analysis/ws`          — server-push `{type:"event"|"summary"|"state"|"hello"}`。
+* **前端** (`app/static/js/app.js` `VFA` 模块 + `#page-video-file-analysis`):
+  - 顶部进度条 + 阶段标签（`未启动 / 正在打开 / 分析中 / 生成综述中 / 已完成 /
+    已停止 / 错误`），状态色随 `data-state` 切换；分析中显示"已读 N/M · 已
+    分析 X/Y · LLM 队列 Z"。
+  - 左侧表单：视频源（"浏览…"复用 `VdFsModal._sourceTarget = sourceEl` 机制，
+    current 项目已有，写路径回到 `#vfa-source`）+ 分析要求 textarea + 隔 N
+    帧采样输入 + 开始 / 停止 / 清空记录按钮。
+  - 右侧 `vd-side vfa-result-col`：综述框 + 历史分析列表（每条带状态徽章 +
+    `加载 / 反查 / 删除` 三个 `vda-action-btn` 横排，删除用 `margin-left:auto`
+    推到最右避免误点）。
+  - 下方 `<details open>` 逐帧分析列表（默认折叠，新事件抵达时只 push、
+    不自动滚动；run 终态自动折叠腾出空间给综述）。
+  - **反查 modal** (`#vfa-query`)：场景下拉 + 人物/物体/动作 chip 多选 +
+    精准匹配 / 模糊搜索 / 语义搜索 三选一 + 时间范围 `HH:MM:SS`（on-blur 校验，
+    超总时长自动截断 + 提示）。结果 list 显示 frame_pos / 时间戳 / 结构化 tag
+    / 高亮 `<mark>`。点击结果 → **取帧 modal** (`#vfa-frame-modal`)：从原
+    视频取对应帧 JPEG + 显示 frame_pos / fps / 该帧时间戳 / 画面描述 / 结构化。
+  - 取帧路径：PyAV v4l2m2m `avformat_seek_file` 跳到 keyframe + 顺序 decode 到
+    target（实测比 rkv read0 从头顺序读快 ~150x），失败 fallback 到 rkv。
+* **DemoGuard 注册**：VFA 是演示页第 4 项，离开时弹 confirm 并 POST `/stop`；
+  `active()` 判定 `state ∈ {opening, running, summarizing}`；`stopSync` 走
+  `sendBeacon(/stop, POST)` 兜底。`beforeunload` 期间 JS 不能保证送达，最
+  终兜底依赖服务端的 `get_vfa_service().close()` on shutdown。
+* **资源预算**：与 detector 共用同一 qwen3-vl-4b 实例（~3.5 GB），典型一次
+  VFA 分析 200 帧约 200s（every_n=60 × 1s/inference）。长视频（>10 分钟）
+  建议 every_n ≥ 60。
+* **依赖**：`requirements.txt` 加 `av>=11.0.0`（PyAV，硬取帧走 `v4l2m2m` 后端
+  + `avformat_seek_file`）；`rkv.VideoCapture` 已在内部 SDK 提供。
+
 ## Text chat (文本对话) page
 
 `#page-text-chat` 暴露 Qwen3-8B 纯文本对话（`swcap_text_chat` capability），

@@ -21,6 +21,7 @@ from app.api import (
     text_chat,
     tts,
     video_detection,
+    video_file_analysis,
     video_target_detection,
     wechat,
 )
@@ -30,6 +31,7 @@ from app.services.dds_discovery import close_dds_discovery
 from app.services.detector import get_detector, get_target_detector
 from app.services.text_chat import close_chat, get_chat_service
 from app.services.tts_session import get_session as get_tts_session
+from app.services.video_file_analysis import get_service as get_vfa_service
 from app.services.video_session import get_session
 from app.services.wechat import close_wechat, get_wechat
 
@@ -79,6 +81,7 @@ def create_app() -> FastAPI:
 
     app.include_router(system_monitor.router, prefix="/api")
     app.include_router(video_detection.router, prefix="/api")
+    app.include_router(video_file_analysis.router, prefix="/api")
     app.include_router(system_logs.router, prefix="/api")
     app.include_router(power.router, prefix="/api")
     app.include_router(config.router, prefix="/api")
@@ -143,6 +146,12 @@ def create_app() -> FastAPI:
         # Free the Qwen3-TTS RKNN sessions if any were built.
         try:
             get_tts_session().close()
+        except Exception:
+            pass
+        # Stop the video-file-analysis worker (releases its
+        # rkv.VideoCapture and joins the decode / infer threads).
+        try:
+            get_vfa_service().close()
         except Exception:
             pass
         # Stop the WeChat bot manager (cancels its poller, closes the
