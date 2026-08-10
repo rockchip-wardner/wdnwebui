@@ -116,21 +116,32 @@ def _build_scene_frame_schema():
 
     注意：schema 渲染用 ``str(dict)`` 而不是 ``json.dumps(indent=2)``，
     Qwen3-VL 对 schema 格式敏感（详见 rkai/AGENTS.md）。
+
+    **继承 ``BaseModel`` 而非 ``LMOutput``** —— 与 detector.VLMDoc / TargetDoc
+    同源。``LMOutput`` 自带 ``attachment: List[Attachment]`` 字段会让
+    pydantic 的 ``model_json_schema()`` 抛 ``PydanticInvalidForJsonSchema``，
+    SDK 的 ``_safe_schema`` 兜底返回的"输出 JSON 对象 + 字段名清单"
+    弱 hint 让 Qwen3-VL-4B 在 RKNN3 上 JSON 命中率仅 ~30% (旧版实测)，
+    自由发挥时还会把 schema 例子里的 ``<30-100字描述>`` 占位符抄回去当
+    输出（"乱码"现象）。继承 BaseModel 让 SDK 拿到完整 JSON Schema
+    （含 ``properties.required.description``），模型遵循率显著提升。
+    VFA 不消费 ``attachment`` 槽（TTS 才用），改基类零下游破坏。
     """
     from typing import List, Optional
-    from rkai import Generable, Field, LMOutput
+    from rkai import Generable, Field
+    from pydantic import BaseModel as _PydBaseModel
 
     @Generable
-    class SceneFrame(LMOutput):
+    class SceneFrame(_PydBaseModel):
         """单帧视频的结构化分析 —— 反查 / 检索 / 报告生成的数据基础。
 
-        字段（5 个）:
-          - text:  必填，模型的自然语言描述（30-100 字），同时承担反查模糊匹配
-          - scene: 场景类别
-          - actors: 人物/主体
-          - action: 主要动作
+        字段（5 个 + 1 可选）:
+          - text:    必填，模型的自然语言描述（30-100 字），同时承担反查模糊匹配
+          - scene:   场景类别
+          - actors:  人物/主体
+          - action:  主要动作
           - objects: 关键物体
-          - note:  可选补充观察
+          - note:    可选补充观察
 
         text 是主描述来源 —— 避免之前 text / description / structured.description
         三处重复的问题。``text`` 字段由模型在 JSON 中直接输出，反查和
@@ -174,12 +185,73 @@ def _get_scene_frame_cls():
     return _SCENE_FRAME_CLS
 
 
+def _looks_garbled(text: str) -> bool:
+    """复用 rkai SDK 的启发式检测 VLM 输出是否乱码。
+
+    Qwen3-VL-4B 在 RKNN3 上首 token 不稳定（量化噪声），约 ~15% 的帧
+    会产出 CJK/Latin token salad（典型样本：
+    ``稽abilidade巡射赴abilidade...``）。SDK 自己的
+    ``LLMSession._parse_output`` Path 5 兜底时调同一个函数 bump
+    ``StreamSink.dirty_score``；这里在 pyrkaiweb 端再调用一次做独立
+    检测，避免 ``_looks_garbled`` 内部 bump 被绕过时还能识别。
+
+    **额外规则（针对 SDK 漏判的 subword-level token salad）**：
+    SDK 的启发式依赖 CJK 比例 <30% 等硬阈值，对 "Strand吃过斯顿斯顿斯顿
+    吃过weepweep见过minster吃过吃过吃过..." 这种 CJK 比例 43.8% 但本质
+    是拉丁/西里尔短串被 CJK 包裹的样本漏判。这里追加两条针对 RKNN3
+    量化噪声独有模式的规则：
+
+      1. 任一 Latin/Cyrillic 短串（≥2 字符）在文中出现 ≥3 次
+         （不必连续）→ flag（对应 "稽abilidade..." 的 5+ 次重复）。
+      2. CJK + Latin/Cyrillic(2-8 字符) + CJK 直接相连模式（无空格）
+         出现 ≥3 次 → flag（对应 "吃过weepweep见过minster..." 的 subword
+         交替）。长度上限 8 字符避免 "iPhone"/"Python"/"Windows" 等
+         长词误报；阈值 ≥3 避免单次偶发误报。
+
+    rkai.utils 是 vendored 在 ``.venv/src/rkai/src/rkai/utils.py`` 里；
+    旧版（v0.1.x）可能没这函数，try/except ImportError 兜底返 False
+    （按"宁放过不错杀"策略 —— 真的乱码只是 UI 难看，误杀会导致
+    干净输出被错误重试一次）。
+    """
+    if not text or len(text) < 8:
+        return False
+    # 1. SDK 内置启发式（CJK 比例 <30% / 半截 JSON / 控制字符 / 长 Latin
+    #    连续 / 单字符重复 8+ 等）
+    try:
+        from rkai.utils import _looks_garbled as _sdk_garbled
+        if bool(_sdk_garbled(text)):
+            return True
+    except (ImportError, AttributeError):
+        pass
+
+    # 2. 任一 Latin/Cyrillic 短串（≥2 字符）出现 ≥3 次
+    latin_runs = re.findall(r'[A-Za-zА-Яа-я]{2,}', text)
+    if len(latin_runs) >= 3:
+        from collections import Counter
+        max_count = max(Counter(latin_runs).values())
+        if max_count >= 3:
+            return True
+
+    # 3. CJK + Latin/Cyrillic(2-8 字符) + CJK 直接相连模式 ≥3 次
+    #    长度上限 8 排除 iPhone/Python/Windows 等长英文词；
+    #    无空格要求排除 "新款 iPhone 15" 等带空格自然混合文本。
+    cjk_latin_cjk = re.findall(r'[一-鿿][A-Za-zА-Яа-я]{2,8}[一-鿿]', text)
+    if len(cjk_latin_cjk) >= 3:
+        return True
+
+    return False
+
+
 def _split_scene_frame_result(result) -> tuple:
     """把 ``_call_llm(generating=SceneFrame)`` 的返回值拆成
     ``(structured_dict, text)``：
 
     真实硬件上的 5 个分支（按优先级）：
       1. ``result`` 是 ``SceneFrame`` 实例 → 字段直接取
+         （但若 ``_looks_garbled(text)`` 为 True，视为 SDK Path 5 兜底
+         假象 —— structured 全部 default、text 是 raw token salad；
+         **静默丢弃 raw text**（返回 ``(None, "")``），与 VTD 行为
+         对齐 —— 详见下方注释）
       2. ``result`` 是 dict（pydantic 验证失败的 raw dict）→ 智能归一化：
          已知字段直接映射，未知字段（如 ``analysis`` / ``error``）拼到 ``note``，
          避免数据全丢。
@@ -188,12 +260,34 @@ def _split_scene_frame_result(result) -> tuple:
       4. ``result`` 是 str 含 free-form 文本 → 用正则 + 关键词表抽出
          ``scene / actors / objects``，作为粗粒度结构化字段
       5. 抽不出任何结构 → ``structured=None``，text 保留 raw
+
+    **与 VTD (RkaiDetector) 的行为对齐**：VTD 走 ``detector.py:_infer_sync``
+    对 SDK Path 5 兜底返回的 ``str`` 走 ``getattr(str, "text", "")`` 时拿到
+    空串（str 无 ``text`` 属性），**等同于静默丢弃**。VFA 原本把 raw
+    text 塞给 ``_sanitize_text`` 再传给前端，但真正的 CJK+Latin token
+    salad 既不能 regex 也不能 sanitize 修复 —— 用户看到"乱码"。
+    现统一行为：检测到 garbage 时返回 ``(None, "")``，由 _infer_one
+    构造空事件（_dirty=True，note="(本帧分析失败)"）。
     """
     SceneFrame = _get_scene_frame_cls()
 
-    # Path 1：SDK 解析成功
+    # Path 1：SDK 解析成功 —— 但要警惕 SDK Path 5 兜底：模型输出不是
+    # JSON 时 SDK 把 raw text 包成 SceneFrame(text=raw, 其他字段=default)，
+    # 这种假象下 text 是 token salad，structured 全部空但 Path 1 仍命中。
+    # 用 _looks_garbled 二次判定：乱码则视为失败，**静默丢弃 raw text**
+    # （与 VTD 行为一致 —— VTD 走 detector.py:_infer_sync 时
+    # ``getattr(str, "text", "")`` 自然拿到空串）。
     if isinstance(result, SceneFrame):
         try:
+            text = getattr(result, "text", None) or ""
+            # 检测 SDK Path 5 假象 + 真正的乱码
+            if _looks_garbled(text):
+                LOG.warning(
+                    "vfa: SceneFrame 来自 SDK Path 5 兜底（text=%d chars, garbled），静默丢弃",
+                    len(text),
+                )
+                # 与 VTD 行为对齐：返回空 text，原始 raw_text 仅写入日志
+                return None, ""
             # structured 只放 5 个过滤字段（不含 text，避免与顶层 text 重复）
             structured = {
                 "scene":   getattr(result, "scene", "") or "",
@@ -203,7 +297,6 @@ def _split_scene_frame_result(result) -> tuple:
                 "note":    getattr(result, "note", None),
             }
             # text 单独从 model 拿（顶层 ev.text 用它，不进 structured）
-            text = getattr(result, "text", None) or ""
             if not text:
                 # SDK 没回 text（模型漏输出）时退到短摘要
                 text = f"{structured['scene']}：{structured['action']}".strip("：")
@@ -218,6 +311,14 @@ def _split_scene_frame_result(result) -> tuple:
         try:
             structured = _normalize_structured(result)
             text = _text_from_dict(result)
+            # dict 路径同样需要 _looks_garbled 兜底：SDK Path 5 在 JSON
+            # 解析失败的某些路径会返回 dict（raw input），里头 text 字段
+            # 可能是 token salad。静默丢弃与 Path 1 一致。
+            if text and _looks_garbled(text):
+                LOG.warning(
+                    "vfa: raw dict 路径 text 字段乱码（%d chars），静默丢弃", len(text),
+                )
+                return None, ""
             return structured, text
         except Exception as e:
             LOG.warning("vfa: raw dict 归一化失败: %s", e)
@@ -641,6 +742,11 @@ class FrameEvent:
     ``structured`` 是 @Generable SceneFrame 的 dict，**只存 4 个核心
     字段**（scene/actors/action/objects）+ 可选 note。不再重复存
     description —— ``text`` 已经承担了这个职责。
+
+    ``_dirty`` 标记 SDK Path 5 兜底 + 重试仍乱码的帧（典型：
+    Qwen3-VL-4B 在 RKNN3 上首 token 不稳定，~17% 概率产出 token salad）。
+    前端可据此在事件历史列表 / 反查 modal 里加视觉警告徽章，
+    但事件仍保留（text 可能是部分有效内容）。
     """
     id: int
     frame_pos: int
@@ -648,6 +754,7 @@ class FrameEvent:
     prompt: str
     text: str
     structured: Optional[dict] = None
+    _dirty: bool = False
 
     def to_dict(self) -> dict:
         out = {
@@ -659,6 +766,10 @@ class FrameEvent:
         }
         if self.structured is not None:
             out["structured"] = self.structured
+        if self._dirty:
+            # 下划线开头字段通常前端会忽略；这里显式给出方便
+            # UI / API 消费者识别"该帧 SDK 输出质量异常"。
+            out["_dirty"] = True
         return out
 
 
@@ -693,8 +804,14 @@ FINAL_MAX_NEW_TOKENS           = 400     # pass 2 最终综述硬控输出
 # 的 daemon 线程还会污染后续 session_run。结果：单帧分析时间被人为拉长，
 # 且容易触发 RKNN native 卡死。改方案：把 rescue 推迟到 EOF 后 _run_summary
 # 开头跑一次；同时严格按字符预算控制单次 rescue 事件数，避免超窗口。
-RESCUE_MAX_EVENTS_PER_CALL     = 15      # 单次 rescue LLM 调用最多处理多少 events
-RESCUE_PROMPT_CHAR_BUDGET      = 1800    # rescue prompt 字符上限（输入侧）
+#
+# **加固（v0.5.x 起）**：SceneFrame 改 BaseModel 后 per-frame JSON 命中率
+# 上升，rescue 兜底的 batch 数下降；同步放宽两个上限 —— 让 30 events/batch
+# 真正能装满（之前 1800 字符预算只够 ~13 events/batch，30 限制形同虚设）。
+# 安全校验：5000 字符 ≈ 2500 input tokens；30 events × ~80 token 输出 JSON
+# 行 = 2400 output tokens；总 ~4900 tokens，远低于 8192 token 窗口。
+RESCUE_MAX_EVENTS_PER_CALL     = 30      # 单次 rescue LLM 调用最多处理多少 events（改前 15）
+RESCUE_PROMPT_CHAR_BUDGET      = 5000    # rescue prompt 字符上限（输入侧，改前 1800）
 
 # 场景检测（cv2 HSV 直方图）
 SCENE_HIST_BINS            = (50, 60)        # H×S 直方图格子数
@@ -757,6 +874,7 @@ class VideoFileAnalysisService:
         self._frame_pos = 0
         self._sampled = 0           # 本次分析已抽样的帧数
         self._analyzed = 0          # 已完成的推理数
+        self._dirty_count = 0       # retry 后仍乱码的帧数（监测指标）
         self._started_at = 0.0
         self._finished_at = 0.0
 
@@ -801,6 +919,15 @@ class VideoFileAnalysisService:
     def snapshot(self) -> dict:
         ok, _, rkai_err = _load_rkai()
         with self._lock:
+            events_count = len(self._events)
+        # 监测字段：structured 填充率。修复 SceneFrame → BaseModel 后预期
+        # per-frame JSON 命中率从 ~30% 升到 ~50-70%；rescue 兜底后总填
+        # 充率 ~99%。前端可据此判断修复效果。
+        with self._events_lock:
+            structured_filled = sum(
+                1 for ev in self._events if ev.structured
+            )
+        with self._lock:
             return {
                 "state":         self._state,
                 "error":         self._error,
@@ -816,7 +943,11 @@ class VideoFileAnalysisService:
                 "total_frames_source": getattr(self, "_total_frames_source", "unknown"),
                 "sampled":       self._sampled,
                 "analyzed":      self._analyzed,
-                "events_count":  len(self._events),
+                "dirty_count":   self._dirty_count,
+                "events_count":  events_count,
+                # 监测：SceneFrame 字段填充情况，null/空字典视为未填充
+                "structured_filled": structured_filled,
+                "structured_total":  events_count,
                 "scene_count":    len(self._scene_boundaries),
                 "summary":       self._summary,
                 "summary_progress": list(self._summary_progress),
@@ -824,6 +955,11 @@ class VideoFileAnalysisService:
                 "init_error":    rkai_err,
                 "started_at":    self._started_at,
                 "finished_at":   self._finished_at,
+                # run 标识：每次 start() 重新分配 (uuid.uuid4().hex)，供
+                # WS handler 跨多次连续分析（同一 WS 连接不重连）区分事件
+                # id 空间 —— 见 api/video_file_analysis.py vfa_ws 的
+                # last_run_id / last_event_id 重置逻辑。
+                "run_id":        self._run_id,
             }
 
     def events(self) -> list:
@@ -1286,6 +1422,7 @@ class VideoFileAnalysisService:
             self._frame_pos = 0
             self._sampled = 0
             self._analyzed = 0
+            self._dirty_count = 0
             self._total_frames = 0
             self._width = 0
             self._height = 0
@@ -1468,10 +1605,35 @@ class VideoFileAnalysisService:
         # ``structured`` dict 落盘，方便后续按 scene / actor / object 反查。
         # 用户 prompt 仍可自定义（per-frame 提问），SDK 自动追加 JSON
         # schema hint 让模型按字段输出。
+        #
+        # max_new_tokens=300（旧版 200）：5 字段 JSON 含 30-100 字中文 text
+        # 实测 120-180 token，200 太紧偶尔截断出半截 JSON → 兜底清洗后
+        # 出现"乱码"。300 留 buffer，避免在中文 + JSON 语法双重开销下
+        # 切到错误路径。
+        #
+        # **乱码处理策略（与 VTD 对齐）**：Qwen3-VL-4B 在 RKNN3 上首 token
+        # 不稳定，约 ~15% 帧会产出 token salad（CJK 比例 <30% + 重复
+        # Latin 子串等）。SDK Path 5 兜底会把 raw text 包成
+        # SceneFrame(text=garbage, 其他=default)。
+        #
+        # **不做 retry**（v0.5.x 起）：spec 默认 temperature=1e-6 +
+        # top_k=1（near-greedy），且 ``RKNN3Lite.session_run`` 不支持
+        # per-call 覆盖这两个参数。同 prompt + 同 image 重复调用 N 次
+        # 产生**完全相同的输出**——retry 徒劳。
+        #
+        # **静默丢弃策略**：仿 VTD ``detector.py:_infer_sync`` 行为——
+        # 对 SDK Path 5 兜底返回的 ``str`` 走 ``getattr(str, "text", "")``
+        # 自然拿到空串。VFA 端 ``_split_scene_frame_result`` 检测到
+        # garbage 时返回 ``(None, "")``，本方法构造**空事件 + _dirty=True**：
+        #   text="",
+        #   structured={"scene":"","actors":[],"action":"","objects":[],
+        #               "note":"(本帧分析失败：模型输出乱码)"},
+        #   _dirty=True
+        # 前端看到"空分析"而非乱码；落盘 JSON 保留 note 用于事后排查。
         SceneFrame = _get_scene_frame_cls()
         result = self._call_llm(
             prompt, frame_bgr, generating=SceneFrame,
-            max_new_tokens=200,
+            max_new_tokens=300,
         )
         structured_dict, raw_text = _split_scene_frame_result(result)
 
@@ -1493,10 +1655,38 @@ class VideoFileAnalysisService:
                 "note": err_text,
             }
             text = err_text  # 错误占位不洗，避免吞掉错误信息
+            is_dirty = False
         else:
-            # 正常路径：清洗 raw_text 去除 think 块 / markdown 头 / 控制字符 /
-            # 部分 JSON 残留，避免前端事件列表显示乱码。
-            text = _sanitize_text(raw_text, max_len=500)
+            # 乱码帧已被 _split_scene_frame_result 静默丢弃（返回 text=""），
+            # 这里再二次校验 raw_text 防漏。
+            if not raw_text and structured_dict is None:
+                # structured_dict is None + raw_text == "" → 静默丢弃路径
+                structured_dict = {
+                    "scene": "",
+                    "actors": [],
+                    "action": "",
+                    "objects": [],
+                    "note": "(本帧分析失败：模型输出乱码)",
+                }
+                text = ""
+                is_dirty = True
+            elif structured_dict is None:
+                # 罕见：structured_dict is None + raw_text 非空但 sanitize 后空
+                # （regex 抽不出结构化字段）。同样标 dirty，让 UI 知情。
+                text = _sanitize_text(raw_text, max_len=500) or ""
+                structured_dict = {
+                    "scene": "",
+                    "actors": [],
+                    "action": "",
+                    "objects": [],
+                    "note": "(本帧未能解析结构化字段)",
+                }
+                is_dirty = True
+            else:
+                # 正常路径：清洗 raw_text 去除 think 块 / markdown 头 / 控制字符 /
+                # 部分 JSON 残留，避免前端事件列表显示残留噪声。
+                text = _sanitize_text(raw_text, max_len=500)
+                is_dirty = False
 
         # per-frame 保护：模型可能输出超长 text（>500 字符罕见，但发生会污染
         # 结构化字段大小、拖慢后续处理）。截断 text 字段到 500 字符内，
@@ -1507,6 +1697,8 @@ class VideoFileAnalysisService:
             structured_dict["text"] = structured_dict["text"][:500] + "…"
         with self._lock:
             self._analyzed += 1
+            if is_dirty:
+                self._dirty_count += 1
         with self._events_lock:
             ev = FrameEvent(
                 id=self._next_event_id,
@@ -1515,6 +1707,7 @@ class VideoFileAnalysisService:
                 prompt=prompt,
                 text=text,
                 structured=structured_dict,
+                _dirty=is_dirty,
             )
             self._next_event_id += 1
             self._events.append(ev)
@@ -1523,7 +1716,7 @@ class VideoFileAnalysisService:
 
         # 注意：早期实现里每 30 events 在 worker 线程同步跑一次 batch rescue
         # 提取 structured，但 30 events × 500 字符的 prompt 极易超出 Qwen3-VL
-        # 8192 token 上限，触发 RKNN3 native abort / hang。abort 路径下的
+        # 8192 token 上限，触发 RKNN3 native abort / hang；abort 路径下的
         # daemon 线程还会污染后续 session_run，连锁导致后续 _call_llm 全部
         # 35s 超时，整次分析卡死。改方案：rescue 推迟到 _run_summary 开头
         # 跑一次，由字符预算（RESCUE_PROMPT_CHAR_BUDGET）严格控制单批
@@ -1914,14 +2107,22 @@ class VideoFileAnalysisService:
         用来硬控输出 token 数，避免 chunk 摘要无止境生成挤爆最终 prompt
         窗口。
 
-        ``generating`` 是可选的 @Generable 类 / LMOutput 子类；传了就
+        ``generating`` 是可选的 @Generable 类 / BaseModel 子类；传了就
         让模型按 JSON schema 输出，SDK 自动追加 schema hint 并把结果
         parse 成对应类的实例（不是 str）。调用方拿到原始返回值自己处
         理 —— 综述路径继续用 str，per-frame 路径取 pydantic 字段。
 
-        当 ``generating=SceneFrame`` 时，会在 user prompt 前面 prepend 一
-        段简短的 JSON 输出指令，提升 Qwen3-VL-4B 在 RKNN3 上遵循 schema
-        的概率（实测能把 JSON 命中率从 ~5% 提升到 ~30%）。
+        **prompt 改造（历史 + 回滚开关）**：
+        旧实现会在 ``generating=SceneFrame`` 时在 user prompt 前硬塞一
+        段中文 JSON 指令 + 示例 JSON。问题：与 SDK 自动追加的 schema hint
+        形成"两份指令打架"，且模型偶尔把示例里的 ``<30-100字描述>`` 占
+        位符当模板抄回去当输出（"乱码"）。修复后 SceneFrame 继承
+        ``BaseModel``（不再是 ``LMOutput``），SDK 拿到完整 JSON Schema，
+        schema hint 本身就够强，不再需要手工 prompt 改造。
+
+        **回滚开关** ``VFA_FORCE_JSON_PROMPT=1``：若改动导致填充率反
+        而下降，可设该环境变量恢复旧 prompt 改造（不推荐，仅作为
+        紧急回滚口）。
         """
         from app.services.compute_registry import get_registry, get_session_call_lock
         try:
@@ -1933,8 +2134,12 @@ class VideoFileAnalysisService:
         if not ok:
             return f"(rkai 不可用: {rkai_err})"
 
-        # prompt 改造：明确要求模型输出 JSON（per-frame SceneFrame 时）
-        if generating is not None and prompt:
+        # 回滚开关：env var "1" 时套用旧 prompt 改造（紧急回滚口）
+        if (
+            generating is not None
+            and prompt
+            and os.environ.get("VFA_FORCE_JSON_PROMPT") == "1"
+        ):
             prompt = (
                 "**只输出一个 JSON 对象**，必须包含以下字段：\n"
                 "  - text:    30-100 字自然语言描述（必填，反查模糊匹配的来源字段，\n"

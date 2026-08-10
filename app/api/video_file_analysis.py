@@ -1153,9 +1153,17 @@ async def vfa_ws(ws: WebSocket) -> None:
     svc.register_broadcaster(_push)
 
     last_event_id = 0
+    # 跨多次连续分析（同一 WS 连接不重连）的 id 空间隔离：每次
+    # ``VideoFileAnalysisService.start()`` 都会分配新 ``run_id`` 并把
+    # ``_next_event_id`` 重置回 1；WS handler 的 ``last_event_id`` 是闭
+    # 包内局部变量，不感知 run 切换会让第二轮所有 ``id > 0`` 的事件被过
+    # 滤掉（表现为"第二次开始分析，逐帧结果 + 进度条未刷新"）。
+    # 见 ``video_file_analysis.py:907`` ``_reset_state`` + ``start()``。
+    last_run_id = ""
     try:
         # 初始快照
         await ws.send_json({"type": "hello", **svc.snapshot()})
+        last_run_id = svc._run_id or ""
         # 把已经存在的事件补一遍（用户切换页面再回来时不丢上下文）
         for ev in svc.events():
             if ev["id"] > last_event_id:
@@ -1177,6 +1185,16 @@ async def vfa_ws(ws: WebSocket) -> None:
                     vfa_ws._last_status = now
                     await ws.send_json({"type": "state", **svc.snapshot()})
                 continue
+
+            # run 边界检测：state / hello 广播带 ``run_id``，与上次记录
+            # 不同即视为新一轮分析开始 —— 重置事件 id 过滤器，让新 run
+            # 从 ``id=1`` 起的事件顺利通过。前端 ``vfaStart`` 已经在切到
+            # ``/open`` 前清空 ``VFA.events``，这里不需要补发旧事件。
+            if payload.get("type") in ("state", "hello"):
+                new_run_id = payload.get("run_id", "") or ""
+                if new_run_id and new_run_id != last_run_id:
+                    last_run_id = new_run_id
+                    last_event_id = 0
 
             if payload.get("type") == "event":
                 ev = payload.get("event") or {}
