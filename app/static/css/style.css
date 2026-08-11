@@ -4151,3 +4151,175 @@ html, body {
   .vfa-frame-modal-body { grid-template-columns: 1fr; }
   .vfa-frame-modal-img-wrap { min-height: 220px; }
 }
+
+/* ------------------------------------------------------------------ *
+ * video-content-search page（视频内容检索）
+ * 左控制台（surv-form）+ 右工作区（vd-stage-col）布局；复用 vd-* / surv-*
+ * ------------------------------------------------------------------ */
+.vcs-layout {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 0.85rem;
+  align-items: stretch;
+  margin-bottom: 0.85rem;
+}
+@media (max-width: 900px) {
+  .vcs-layout { grid-template-columns: 1fr; }
+}
+
+#page-video-content-search .vd-grow {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+#page-video-content-search .vd-grow .surv-field {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+#page-video-content-search .vd-grow .surv-textarea {
+  flex: 1 1 auto;
+  min-height: 4rem;
+  resize: none;
+}
+
+/* 切片参数 / 检索参数双列布局 */
+#page-video-content-search .surv-detect-row {
+  flex-direction: row;
+  align-items: flex-end;
+  gap: 0.5rem;
+}
+
+/* 检索问题字数统计（右下角悬浮） */
+.vcs-ta-wrap {
+  position: relative;
+}
+.vcs-ta-count {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.4rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-family: var(--mono);
+  pointer-events: none;
+}
+.vcs-ta-count.over {
+  color: #dc2626;
+}
+
+/* 提取进度条（左控制台内） */
+.vcs-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-top: 0.55rem;
+}
+.vcs-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.vcs-track {
+  height: 8px;
+  border-radius: 4px;
+  background: #e5e7eb;
+  overflow: hidden;
+}
+.vcs-track-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.2s ease-out;
+}
+
+/* 命中结果卡片列表（右工作区） */
+.vcs-results {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.vcs-results-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  min-height: 0;
+}
+.vcs-results-empty {
+  color: var(--muted);
+  font-size: 0.85rem;
+  padding: 1rem 0.2rem;
+  text-align: center;
+}
+.vcs-card {
+  display: flex;
+  gap: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem;
+  cursor: pointer;
+  background: #fff;
+  transition: border-color 0.15s ease;
+}
+.vcs-card:hover { border-color: var(--accent); }
+.vcs-card.active {
+  border-color: var(--accent);
+  background: #eff6ff;
+}
+.vcs-thumb {
+  width: 120px;
+  height: 68px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  background: linear-gradient(135deg, #1f2937, #4b5563);
+  color: #d1d5db;
+  font-size: 0.7rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+}
+.vcs-card-info {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  justify-content: center;
+}
+.vcs-card-time {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.vcs-card-score {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.vcs-card-score b {
+  color: #16a34a;
+  font-variant-numeric: tabular-nums;
+}
+.vcs-card-play {
+  align-self: center;
+  font-size: 0.8rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.6rem;
+}
+
