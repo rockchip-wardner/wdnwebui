@@ -135,40 +135,66 @@ def _build_scene_frame_schema():
     class SceneFrame(_PydBaseModel):
         """单帧视频的结构化分析 —— 反查 / 检索 / 报告生成的数据基础。
 
-        字段（5 个 + 1 可选）:
-          - text:    必填，模型的自然语言描述（30-100 字），同时承担反查模糊匹配
-          - scene:   场景类别
-          - actors:  人物/主体
-          - action:  主要动作
-          - objects: 关键物体
-          - note:    可选补充观察
+        **字段顺序刻意设计**（关键修复：解决"视频文件分析 vs 视频目标检测"
+        在相同视频/提示词下乱码率差异的根因）：
 
-        text 是主描述来源 —— 避免之前 text / description / structured.description
-        三处重复的问题。``text`` 字段由模型在 JSON 中直接输出，反查和
-        事件列表共用这一个字段。
+          1. scene / actors / action / objects 是**约束型字段**（短字符串 +
+             数组，token 候选空间小），**先输出** → 模型在生成阶段就被
+             "锚定"在 JSON 语法 + 短 token 模式里。
+          2. text（最长的 CJK 序列）放到**最末** → 此时 decoder 已 anchor，
+             RKNN3 quantization noise 让首 token 漂移到 Latin/Cyrillic
+             subword 的概率显著降低（VTD 的 TargetDoc 之所以不乱码就是
+             这个原理 —— 4 个数字字段把 decoder 锚定在数字 + 标点 token
+             空间，~30% 输出 token 是数字/标点，相当于隐式 stabilizer）。
+          3. note 仍是 optional（保持向后兼容）。
+
+        **字段长度约束**（pydantic Field(max_length=...) → schema hint 暴露
+        给模型）：
+
+          - scene:   ≤12 字（短场景标识，类似 TargetDoc x1 的"数字约束"）
+          - action:  ≤20 字（短动作描述）
+          - actors:  ≤3 项（数组约束）
+          - objects: ≤4 项（数组约束）
+          - text:    ≤80 字（比改前 ~30-100 字略缩，drift 窗口减小）
+          - note:    ≤30 字
+
+        text 仍承担反查模糊匹配（``?text=...``）的主来源 —— 80 字足够
+        覆盖"含场景、人物动作、关键物体"的简洁描述。
         """
+        # 1. 场景（短字符串先输出 → 锚定 decoder）
+        scene: str = Field(
+            description="场景类别（地点 + 上下文，≤12 字）",
+            max_length=12,
+        )
+        # 2. 人物（数组约束）
+        actors: List[str] = Field(
+            description="画面中的人物或主体，按显著度排序（无则 []，最多 3 项）",
+            max_length=3,
+        )
+        # 3. 动作（短文本）
+        action: str = Field(
+            description="主要动作或事件，一句话（≤20 字）",
+            max_length=20,
+        )
+        # 4. 物体（数组约束）
+        objects: List[str] = Field(
+            description="关键物体，按显著度排序（无则 []，最多 4 项）",
+            max_length=4,
+        )
+        # 5. 文本（最长的 CJK 序列放最后 → decoder 已 anchor 后再生成）
         text: str = Field(
             description=(
-                "自然语言描述（30-100 字）。含场景、人物动作、关键物体、"
-                "环境氛围（天气/光线/情绪等）。这是反查模糊匹配（?text=...）"
-                "的来源字段，模型原话越丰富越好。必填字段。"
+                "简要描述（≤80 字）。含场景、人物动作、关键物体。"
+                "反查模糊匹配（?text=...）的来源字段，模型原话越丰富越好。"
+                "必填字段。"
             ),
+            max_length=80,
         )
-        scene: str = Field(
-            description="场景类别（地点 + 上下文）",
-        )
-        actors: List[str] = Field(
-            description="画面中的人物或主体，按显著度排序，无则 []",
-        )
-        action: str = Field(
-            description="主要动作或事件，一句话（10-30 字）",
-        )
-        objects: List[str] = Field(
-            description="关键物体，按显著度排序，最多 5 项，无则 []",
-        )
+        # 6. 可选备注
         note: Optional[str] = Field(
             default=None,
-            description="补充观察（异常 / 情绪 / 不确定项），无则 null",
+            description="补充观察（异常 / 情绪 / 不确定项，≤30 字，无则 null）",
+            max_length=30,
         )
 
     return SceneFrame
@@ -333,12 +359,26 @@ def _split_scene_frame_result(result) -> tuple:
 
 
 def _text_from_dict(obj: dict) -> str:
-    """从 dict 里抽一个 fallback 文本：取第一个长字符串值。"""
-    for v in obj.values():
-        if isinstance(v, str) and len(v) >= 4:
-            return v
+    """从 dict 里抽一个 fallback 文本。
+
+    优先取 ``text`` 字段（VFA SceneFrame 的主描述字段，承担反查模
+    糊匹配来源），其次取第一个长字符串值。
+
+    **字段顺序无关性**：SceneFrame schema 重排后 ``text`` 不再是 dict
+    的第一个字段，按值顺序遍历会先撞到 ``scene``（短字符串）或
+    ``actors/objects``（数组），导致 fallback 路径下 _text_from_dict
+    返回错误的文本。显式优先 ``text`` 字段规避这个回归。
+    """
+    if isinstance(obj, dict):
+        # 优先取 'text' 字段（SceneFrame 主描述来源）
+        if "text" in obj and isinstance(obj["text"], str) and obj["text"]:
+            return obj["text"]
+        # 兜底：第一个长字符串
+        for v in obj.values():
+            if isinstance(v, str) and len(v) >= 4:
+                return v
     # fallback：把所有 string 拼起来
-    return " ".join(str(v) for v in obj.values() if v)
+    return " ".join(str(v) for v in (obj or {}).values() if v)
 
 
 def _parse_structured_from_str(text: str) -> Optional[dict]:
@@ -1442,6 +1482,10 @@ class VideoFileAnalysisService:
 
         accumulateWeighted 让直方图跟随帧渐变（α=0.1），能容忍渐变场景
         （比如镜头缓慢拉远）不被误切为多个场景。
+
+        **stale run 防护**：若调用方所属 run 已被新 run 取代（_run_id
+        不再是入口值），不再写 _last_scene_hist / _scene_boundaries，
+        否则会污染新 run 的场景检测状态。
         """
         import cv2
         try:
@@ -1454,7 +1498,13 @@ class VideoFileAnalysisService:
             hist = cv2.normalize(hist, hist).flatten()
         except Exception:
             return
+        # stale run 检查：若 _run_id 已被新 run 覆盖（decode 线程 _teardown
+        # join 超时还在跑），不要写 _last_scene_hist / _scene_boundaries
+        # —— 这些状态已被 _reset_state 清空，写入会污染新 run。
+        run_id_at_start = self._run_id
         with self._scenes_lock:
+            if self._run_id != run_id_at_start:
+                return
             if self._last_scene_hist is None:
                 self._last_scene_hist = hist
                 self._scene_boundaries.append(cur_pos)
@@ -1512,6 +1562,14 @@ class VideoFileAnalysisService:
                 cap.release()
             except Exception:
                 pass
+            # 缓解 rkv-shim DMA buffer leak（mpp_buffer deinit 警告）：
+            # rkv.VideoCapture.release() 不释放所有 DMA buffer（vendor bug），
+            # 但 Python 端如有 lingering 引用会延迟 native 端回收。强制 drop
+            # 引用 + GC 可减少 leak 速率（不能根治）。详见日志
+            # ``mpp_buffer: ... with 7311360 bytes not released``。
+            cap = None
+            import gc
+            gc.collect()
         # 推一次 state change 给 WS
         self._broadcast({"type": "state", **self.snapshot()})
 
@@ -1599,6 +1657,12 @@ class VideoFileAnalysisService:
             self._broadcast({"type": "state", **self.snapshot()})
 
     def _infer_one(self, frame_bgr, frame_pos: int) -> None:
+        # 捕获入口 _run_id；后续每次状态写操作前比对，过期则跳过。
+        # _teardown 时 join 超时（1.5s），旧 worker 可能仍在 _call_llm
+        # 等待 reinit（最长 60s）；若该等待期间新 start() 已开始，旧 worker
+        # 完成 LLM 调用后**不应**把结果加到新 run 的 events 列表里，
+        # 否则前端会看到"上一视频的最后一帧塞到当前 run 末尾"。
+        run_id_at_start = self._run_id
         with self._lock:
             prompt = self._prompt
         # 走结构化输出（@Generable SceneFrame）：每个事件都带
@@ -1695,6 +1759,18 @@ class VideoFileAnalysisService:
             text = text[:500] + "…"
         if structured_dict and structured_dict.get("text") and len(structured_dict["text"]) > 500:
             structured_dict["text"] = structured_dict["text"][:500] + "…"
+
+        # stale run 检查：本 worker 可能因 _teardown join 超时还在跑，
+        # 等到 _call_llm 返回时新 run 已开始（_run_id 被覆盖）。这种
+        # 情况下**不要**把旧 run 的结果写进 self._events（已被 _reset_state
+        # 清空，会污染新 run）；也不要 broadcast（前端已切到新 run 的 WS）。
+        if self._run_id != run_id_at_start:
+            LOG.debug(
+                "vfa: _infer_one 检测到 stale run（frame_pos=%d），丢弃结果",
+                frame_pos,
+            )
+            return
+
         with self._lock:
             self._analyzed += 1
             if is_dirty:
@@ -1851,7 +1927,16 @@ class VideoFileAnalysisService:
 
         关键：所有路径都在 try/finally 保护下，**finally 强制设置 STATE_DONE**
         并 broadcast state，避免任何 LLM 异常把前端卡在"分析中"。
+
+        **stale run 防护**：若 ``_teardown`` 调用时本 run_summary 还在跑
+        （join 超时 1.5s 后新 run 已开始），本方法的 finally 会把
+        ``_state`` 改回 "stopped" → 污染新 run 的 state。所有关键状态
+        写操作前检查 ``_run_id`` 是否仍是进入时的 run（被新 run 覆盖即
+        直接 return），避免 stale 完成污染新 run。
         """
+        # 捕获入口 _run_id；后续每次状态写操作前比对，过期则跳过
+        run_id_at_start = self._run_id
+
         # 全部 try/except/finally 包裹，强制设置 STATE_DONE
         # 避免任何 LLM 异常让前端永远"分析中"
         evs = []
@@ -1860,6 +1945,9 @@ class VideoFileAnalysisService:
         # _decode_loop 已发 EOF sentinel 意味着 per-frame 全部完成；
         # 这时继续显示 "分析中" 是误导用户。
         with self._lock:
+            if self._run_id != run_id_at_start:
+                # stale: 新 run 已接管，不要切到 SUMMARIZING 污染新 run
+                return
             self._state = self.STATE_SUMMARIZING
             self._summary = ""
             self._summary_ts = 0.0
@@ -1869,6 +1957,8 @@ class VideoFileAnalysisService:
             with self._events_lock:
                 evs = sorted(self._events, key=lambda e: e.frame_pos)
             if not evs:
+                if self._run_id != run_id_at_start:
+                    return
                 with self._lock:
                     self._state = "done"
                     self._finished_at = time.time()
@@ -1880,6 +1970,8 @@ class VideoFileAnalysisService:
             # 推迟到这里（不在 _infer_one 里跑）—— 之前嵌在每 30 events 同步
             # 跑 batch rescue，prompt 极易超 8192 token 上限，触发 RKNN3 卡死。
             if self._stop_event.is_set():
+                return
+            if self._run_id != run_id_at_start:
                 return
             self._rescue_structured_batch()
 
@@ -1993,40 +2085,45 @@ class VideoFileAnalysisService:
             if not summary_clean:
                 summary_clean = summary.strip() if summary else ""
 
-            with self._lock:
-                self._summary = summary_clean
-                self._summary_ts = time.time()
-                self._state = "done"
-                self._summary_progress = (0, 0)
-                self._finished_at = time.time()
-            self._broadcast({"type": "summary", **self.summary()})
-            self._broadcast({"type": "state", **self.snapshot()})
-            self._maybe_persist()
+            # stale 检查：若 _teardown 让新 run 接管了 self._run_id，
+            # 此处不要再写 self._summary / self._state —— 否则会污染新 run。
+            if self._run_id == run_id_at_start:
+                with self._lock:
+                    self._summary = summary_clean
+                    self._summary_ts = time.time()
+                    self._state = "done"
+                    self._summary_progress = (0, 0)
+                    self._finished_at = time.time()
+                self._broadcast({"type": "summary", **self.summary()})
+                self._broadcast({"type": "state", **self.snapshot()})
+                self._maybe_persist()
         except Exception as e:
             LOG.error("vfa: _run_summary 异常: %s（已降级为简单摘要）", e)
             # 任何异常 → 简单摘要（避免卡死）
-            with self._lock:
-                self._summary = f"（综述生成失败：{e}）"
-                self._summary_ts = time.time()
-                self._state = "done"
-                self._summary_progress = (0, 0)
-                self._finished_at = time.time()
-            self._broadcast({"type": "summary", **self.summary()})
-        finally:
-            # 关键：无论如何都设置 STATE_DONE（除非用户取消），
-            # 避免前端永远"分析中"
-            if self._stop_event.is_set():
+            if self._run_id == run_id_at_start:
                 with self._lock:
-                    self._state = "stopped"
+                    self._summary = f"（综述生成失败：{e}）"
+                    self._summary_ts = time.time()
+                    self._state = "done"
                     self._summary_progress = (0, 0)
                     self._finished_at = time.time()
-            else:
-                with self._lock:
-                    if self._state not in ("done", "stopped", "error"):
-                        self._state = "done"
+                self._broadcast({"type": "summary", **self.summary()})
+        finally:
+            # 关键：无论如何都设置 STATE_DONE（除非用户取消），
+            # 避免前端永远"分析中"。但 stale run 不能污染新 run 的状态。
+            if self._run_id == run_id_at_start:
+                if self._stop_event.is_set():
+                    with self._lock:
+                        self._state = "stopped"
                         self._summary_progress = (0, 0)
                         self._finished_at = time.time()
-            self._broadcast({"type": "state", **self.snapshot()})
+                else:
+                    with self._lock:
+                        if self._state not in ("done", "stopped", "error"):
+                            self._state = "done"
+                            self._summary_progress = (0, 0)
+                            self._finished_at = time.time()
+                self._broadcast({"type": "state", **self.snapshot()})
 
     def _group_by_scenes(self, truncated: List[tuple]) -> List[tuple]:
         """按 _scene_boundaries 把 events 切片。
@@ -2128,7 +2225,9 @@ class VideoFileAnalysisService:
         try:
             sess = get_registry().get_session("swcap_video_describe")
         except RuntimeError as e:
-            return f"(功能未启用: {e})"
+            # get_session 抛 RuntimeError("功能未启用: <cap>")，直接包裹
+            # 不再加 "功能未启用: " 前缀（否则会出现双重前缀）。
+            return f"({e})"
 
         ok, Attachment, rkai_err = _load_rkai()
         if not ok:
