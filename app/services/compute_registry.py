@@ -147,6 +147,18 @@ def _qwen3_8b_spec():
     )
 
 
+def _qwen3_vl_embedding_2b_spec():
+    """Qwen3-VL-Embedding-2B 检索 embedding preset（kind="embedding"）。
+
+    不做 token 生成，LLM 走 RKNN3Lite 普通模型路径输出 2048 维归一化
+    向量；rkai 侧 ``EmbeddingBackend`` 暴露 ``embed_text`` /
+    ``embed_video``。模型路径走 ``RKAI_MODELS_DIR``（默认
+    ``/userdata/models/``），与 Qwen3-VL-4B 同款文件布局。
+    """
+    from rkai import SystemLanguageModel
+    return SystemLanguageModel.qwen3_vl_embedding()
+
+
 # 每个 model 的 ``estimated_init_seconds`` 是经验值，用来渲染"加载中"倒计时
 # 的初始起点；loading 段倒计时按 (estimate - (now - started_at)) 实算，estimate
 # 只影响倒计时的**起点**。真机冷启动实测（page cache dropped 之后）：
@@ -199,6 +211,15 @@ MODEL_PRESETS: dict[str, dict] = {
         "estimated_init_seconds": 60,      # 真机实测 ~55s（单 init）；预留 5s buffer
         "capability_types": ["swcap_text_chat"],
         "instance_name":    "llm-chat",
+    },
+    "qwen3-vl-embedding-2b": {
+        "label":            "Qwen3-VL-Embedding-2B",
+        "preset_factory":   _qwen3_vl_embedding_2b_spec,
+        "model_dir_name":   "Qwen3-VL-Embedding-2B",
+        "memory_estimate_mb": 2000,        # ~1GB 权重 + 622MB embed 表 + vision
+        "estimated_init_seconds": 30,      # 加载两个 rknn + embed 表
+        "capability_types": ["swcap_video_retrieval"],
+        "instance_name":    "llm-embed",
     },
 }
 
@@ -346,9 +367,23 @@ class ComputeRegistry:
             return self._cards_failed
 
     def list_supported_models(self) -> list[dict]:
-        """扫 base.model_path 子目录，结合 preset 白名单返回可用模型。"""
+        """扫模型根目录，结合 preset 白名单返回可用模型。
+
+        模型根目录的解析顺序与 rkai 的 ``_models_root()`` 保持一致：
+        1. config.json 的 ``base.model_path``（生产环境固定路径，``main.py``
+           会在 ``create_app`` 时写入 ``RKAI_MODELS_DIR``）；
+        2. ``RKAI_MODELS_DIR`` 环境变量（dev 调试：``export RKAI_MODELS_DIR=...``）；
+        3. 回退 ``/userdata/models/``。
+
+        这样算力配置页探测到的 exists 与 rkai 实际加载路径必然一致，
+        避免"页面上模型禁用但 rkai 能加载"（或反之）的错位。
+        """
         base = get_config().get_section("base", {})
-        model_path = base.get("model_path") or "/userdata/models/"
+        model_path = (
+            base.get("model_path")
+            or os.environ.get("RKAI_MODELS_DIR")
+            or "/userdata/models/"
+        )
         root = Path(model_path)
         out = []
         for model_id, preset in MODEL_PRESETS.items():
@@ -537,6 +572,19 @@ class ComputeRegistry:
         with self._lock:
             if key in self._instances:
                 raise ValueError(f"重复实例: npu={npu_index} model={model_id}")
+            # 同一 model 全局互斥：无论哪张卡，同一时间只允许一个实例
+            # （queued / loading / running）。embedding / LLM 多份实例没有
+            # 意义 —— ``get_session`` 只取第一个 running，多份只会白白
+            # 占用其它卡的显存。
+            for other in self._instances.values():
+                if (
+                    other.model_id == model_id
+                    and other.status in ("queued", "loading", "running")
+                ):
+                    raise ValueError(
+                        f"该模型已在启用中（NPU #{other.npu_index}），"
+                        f"同一模型全局互斥，请先停用再启用"
+                    )
         preset = MODEL_PRESETS[model_id]
         inst = ModelInstance(
             key=key,
@@ -849,6 +897,9 @@ def _probe_session_setup(npu_index: int, model_id: str) -> Tuple[bool, str]:
     #   * kind="vlm"  → rknn_llm_path / rknn_vision_path（weight 由
     #                   .1828.rknn 路径自动 derive，probe 不单独校验）
     #                   + embed_path + tokenizer_path
+    #   * kind="embedding" → 同 vlm（rknn_llm_path / rknn_vision_path +
+    #                   embed_path + tokenizer_path；embedding 的 LLM 走
+    #                   RKNN3Lite 普通模型路径，weight 同样自动 derive）
     #   * kind="tts"  → tts_model_dir（目录下 4 个 .1828.rknn + embed/bin
     #                   + tokenizer.json；TTS 不用顶层 embed_path/
     #                   tokenizer_path，probe 不强求）
@@ -856,7 +907,7 @@ def _probe_session_setup(npu_index: int, model_id: str) -> Tuple[bool, str]:
     # 缺字段视为"未配置"，跟"路径为空"同样报 missing。
     paths: List[Tuple[str, str]] = []
     kind = getattr(spec, "kind", "")
-    if kind == "vlm":
+    if kind in ("vlm", "embedding"):
         paths.append(("rknn_llm",      getattr(spec, "rknn_llm_path", "")))
         paths.append(("rknn_vision",   getattr(spec, "rknn_vision_path", "")))
     elif kind == "tts":
@@ -982,6 +1033,8 @@ def _init_session_subprocess(
         "        spec = _dc_replace(_spec, max_context_len=32768).with_options(\n"
         "            max_new_tokens=2048, keep_history=1, enable_thinking=True,\n"
         "        )\n"
+        "    elif model_id == 'qwen3-vl-embedding-2b':\n"
+        "        spec = SystemLanguageModel.qwen3_vl_embedding()\n"
         "    else:\n"
         "        raise ValueError('unknown model: ' + model_id)\n"
         "    _ = LLMSession(model=spec, npu=npu_index)\n"

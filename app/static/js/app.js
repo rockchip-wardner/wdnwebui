@@ -5563,12 +5563,13 @@ const VCS = {
   wsTimer: null,
   initialized: false,
   snap: null,
-  // 播放器模拟状态
-  seg: null,        // { start, end, title }
+  // 播放器（WS 帧流）
+  seg: null,        // { source, start, end, dur, title }
   playing: false,
-  ended: false,     // 播放完毕停在末尾帧（可再次点播放重播）
-  rafId: 0,
-  segStartAt: 0,
+  ended: false,     // 播放完毕停在末尾帧（可重播）
+  playWs: null,
+  playPaused: false,
+  lastImg: null,    // 最近一帧 <img> 的 objectURL
 
   init() { return initVideoContentSearch(); },
 };
@@ -5620,6 +5621,10 @@ function vcsApplySnapshot(snap) {
   const st = snap.state || "idle";
   vcsSetStatus({ idle: "就绪", extracting: "● 提取中", ready: "● 提取完成", error: "提取失败" }[st] || st, st === "error");
   vcsSetRuntime({ idle: "未启动", extracting: "提取中", ready: "就绪，可检索", error: snap.error || "错误" }[st] || st);
+  // error 状态同时弹顶部红色 banner（对齐 VFA 行为）
+  if (st === "error") {
+    vcsShowError(snap.error || "处理失败");
+  }
 
   // 进度
   const prog = vcsEl("vcs-progress");
@@ -5682,12 +5687,14 @@ function vcsRenderHits(hits, query) {
     return;
   }
   if (count) count.textContent = hits.length + " 条";
+  const srcBase = (VCS.snap && VCS.snap.source) || "";
   list.innerHTML = hits.map((h, i) => {
     const t = vcsFormatTime(h.start_time) + " – " + vcsFormatTime(h.end_time);
     const sim = (h.similarity != null) ? Number(h.similarity).toFixed(2) : "--";
+    const t0 = (h.start_time != null) ? Number(h.start_time) : 0;
     return (
       '<li class="vcs-card" data-i="' + i + '" role="button" tabindex="0">' +
-        '<div class="vcs-thumb">缩略图</div>' +
+        '<div class="vcs-thumb" data-thumb-t="' + t0 + '">缩略图</div>' +
         '<div class="vcs-card-info">' +
           '<span class="vcs-card-time">' + vcsEsc(t) + "</span>" +
           '<span class="vcs-card-score">相似度 <b>' + sim + "</b></span>" +
@@ -5704,6 +5711,18 @@ function vcsRenderHits(hits, query) {
         vcsPlaySegment(Number(li.dataset.i));
       }
     });
+    // 懒加载缩略图：从源视频取 start_time 对应帧
+    const thumb = li.querySelector(".vcs-thumb");
+    const tSec = thumb && thumb.dataset.thumbT;
+    if (thumb && srcBase && tSec != null) {
+      const url = API_PREFIX + "/video-content-search/frame?source=" +
+        encodeURIComponent(srcBase) + "&t=" + encodeURIComponent(tSec);
+      const img = document.createElement("img");
+      img.alt = "";
+      img.onload = () => { thumb.textContent = ""; thumb.appendChild(img); };
+      img.onerror = () => { thumb.textContent = "取帧失败"; };
+      img.src = url;
+    }
   });
 }
 
@@ -5723,16 +5742,20 @@ function vcsEsc(s) {
     .replace(/"/g, "&quot;");
 }
 
-/* ------------------------- 播放器（mock 动画） ----------------------- */
+/* ------------------------- 播放器（WS 帧流） ----------------------- */
 function vcsPlaySegment(idx) {
   const hits = (VCS.snap && VCS.snap.hits) || [];
   const h = hits[idx];
   if (!h) return;
-  const dur = Math.max(0.5, (h.end_time || 0) - (h.start_time || 0));
-  VCS.seg = { start: h.start_time || 0, end: h.end_time || 0, dur, title: vcsFormatTime(h.start_time) + "–" + vcsFormatTime(h.end_time) };
+  const source = (VCS.snap && VCS.snap.source) || "";
+  if (!source) { vcsShowError("缺少视频源路径，无法播放"); return; }
+  const start = Number(h.start_time) || 0;
+  const end = Number(h.end_time) || start + 1;
+  const dur = Math.max(0.5, end - start);
+  VCS.seg = { source, start, end, dur, title: vcsFormatTime(start) + "–" + vcsFormatTime(end) };
   VCS.playing = true;
+  VCS.playPaused = false;
   VCS.ended = false;
-  VCS.segStartAt = performance.now();
 
   const tag = vcsEl("vcs-player-tag");
   if (tag) tag.textContent = "正在播放 " + VCS.seg.title;
@@ -5741,65 +5764,134 @@ function vcsPlaySegment(idx) {
   vcsEl("vcs-play").disabled = true;
   vcsEl("vcs-pause").disabled = false;
   vcsEl("vcs-stop-play").disabled = false;
+  const bar = vcsEl("vcs-player-progress");
+  if (bar) bar.style.width = "0%";
+  const timeEl = vcsEl("vcs-player-time");
+  if (timeEl) timeEl.textContent = vcsFormatTime(start) + " / " + vcsFormatTime(end);
   Array.from((vcsEl("vcs-results-list") || {}).children || []).forEach((li, i) => {
     li.classList.toggle("active", i === idx);
   });
-  vcsDrawPlayerFrame(0);
-  VCS.rafId = requestAnimationFrame(vcsPlayerTick);
+  vcsSyncCanvasSize();
+  vcsOpenPlayWs(source, start, end);
   if (typeof DemoGuard !== "undefined") {
     DemoGuard.report("video-content-search", { vcs: VCS.snap, playing: true });
   }
 }
 
-function vcsDrawPlayerFrame(frac) {
+function vcsOpenPlayWs(source, start, end) {
+  vcsClosePlayWs(false);
+  const fps = (VCS.snap && Number(VCS.snap.fps)) || 25;
+  if (VCS.seg) {
+    VCS.seg.frameCount = 0;
+    VCS.seg.totalFrames = Math.max(1, Math.round((end - start) * fps));
+  }
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}${API_PREFIX}/video-content-search/play`);
+  VCS.playWs = ws;
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ source, start, end }));
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.type === "eof") {
+        vcsFinishSegment();
+      } else if (msg.type === "error") {
+        vcsShowError(msg.detail || "播放错误");
+        vcsFinishSegment();
+      }
+      return;
+    }
+    // binary JPEG 帧
+    vcsDrawJpeg(new Uint8Array(ev.data));
+    vcsTickProgress();
+  };
+  ws.onclose = () => {
+    VCS.playWs = null;
+  };
+  ws.onerror = () => {
+    try { ws.close(); } catch (_) {}
+  };
+}
+
+function vcsClosePlayWs(settle) {
+  if (VCS.playWs) {
+    try { VCS.playWs.close(); } catch (_) {}
+    VCS.playWs = null;
+  }
+  if (VCS.lastImg) {
+    URL.revokeObjectURL(VCS.lastImg);
+    VCS.lastImg = null;
+  }
+  if (settle) {
+    VCS.playing = false;
+    VCS.ended = true;
+  }
+}
+
+// 把 vcs-canvas 像素尺寸同步为播放器区域（.vd-stage）显示尺寸，
+// 使 canvas 填满窗口、contain 绘制能放大到最大（消除元素级黑边）。
+function vcsSyncCanvasSize() {
+  const canvas = vcsEl("vcs-canvas");
+  if (!canvas || !canvas.parentElement) return;
+  const w = Math.max(2, Math.floor(canvas.parentElement.clientWidth));
+  const h = Math.max(2, Math.floor(canvas.parentElement.clientHeight));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+
+// 用 <img> 承帧后画到 canvas（对齐音视频描述页的 WS 帧流渲染模式）
+function vcsDrawJpeg(jpgBytes) {
   const canvas = vcsEl("vcs-canvas");
   if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  const t = Math.min(1, Math.max(0, frac));
-  // 模拟"画面变化"：按进度做 HSL 色带渐变 + 中央时间水印
-  const hue = (t * 280) % 360;
-  const g = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
-  g.addColorStop(0, "hsl(" + hue + ", 60%, 30%)");
-  g.addColorStop(1, "hsl(" + ((hue + 60) % 360) + ", 65%, 45%)");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = "rgba(255,255,255,0.85)";
-  ctx.font = "28px monospace";
-  ctx.textAlign = "center";
-  if (VCS.seg) {
-    const cur = VCS.seg.start + t * (VCS.seg.end - VCS.seg.start);
-    ctx.fillText(vcsFormatTime(cur), canvas.width / 2, canvas.height / 2);
+  // 窗口 resize 后显示尺寸漂移则重新同步
+  if (Math.abs(canvas.clientWidth - canvas.width) > 1 ||
+      Math.abs(canvas.clientHeight - canvas.height) > 1) {
+    vcsSyncCanvasSize();
   }
-  ctx.textAlign = "left";
+  const blob = new Blob([jpgBytes], { type: "image/jpeg" });
+  if (VCS.lastImg) URL.revokeObjectURL(VCS.lastImg);
+  VCS.lastImg = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onload = () => {
+    const ctx = canvas.getContext("2d");
+    const vw = canvas.width, vh = canvas.height;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, vw, vh);
+    // 等比 contain：完整画面居中，剩余区域黑边
+    const scale = Math.min(vw / img.naturalWidth, vh / img.naturalHeight);
+    const dw = img.naturalWidth * scale;
+    const dh = img.naturalHeight * scale;
+    ctx.drawImage(img, (vw - dw) / 2, (vh - dh) / 2, dw, dh);
+  };
+  img.src = VCS.lastImg;
 }
 
-function vcsPlayerTick() {
-  if (!VCS.playing || !VCS.seg) return;
-  const elapsed = (performance.now() - VCS.segStartAt) / 1000;
-  const frac = Math.min(1, elapsed / VCS.seg.dur);
-  vcsDrawPlayerFrame(frac);
+// 每收到一帧推进进度条 + 时间显示（按已收帧数 / 预计总帧数）
+function vcsTickProgress() {
+  if (!VCS.seg) return;
+  VCS.seg.frameCount = (VCS.seg.frameCount || 0) + 1;
+  const total = VCS.seg.totalFrames || 1;
+  const p = Math.min(1, VCS.seg.frameCount / total);
   const bar = vcsEl("vcs-player-progress");
-  if (bar) bar.style.width = (frac * 100) + "%";
+  if (bar) bar.style.width = (p * 100).toFixed(1) + "%";
   const timeEl = vcsEl("vcs-player-time");
-  if (timeEl) {
-    const cur = VCS.seg.start + frac * (VCS.seg.end - VCS.seg.start);
-    timeEl.textContent = vcsFormatTime(cur) + " / " + vcsFormatTime(VCS.seg.end);
+  if (timeEl && VCS.seg.end) {
+    const t = VCS.seg.start + p * (VCS.seg.end - VCS.seg.start);
+    timeEl.textContent = vcsFormatTime(t) + " / " + vcsFormatTime(VCS.seg.end);
   }
-  if (frac >= 1) {
-    vcsFinishSegment();
-    return;
-  }
-  VCS.rafId = requestAnimationFrame(vcsPlayerTick);
 }
 
-// 播放完毕：画面停在末尾帧、进度条 100%，播放按钮可重播；
-// 不关闭播放窗口（关闭由 ⏹ 停止负责）。
+// 播放完毕：停在末尾帧、进度条 100%，播放按钮可重播（重播需重开 WS）。
 function vcsFinishSegment() {
   if (!VCS.seg) return;
   VCS.playing = false;
   VCS.ended = true;
-  cancelAnimationFrame(VCS.rafId);
-  vcsDrawPlayerFrame(1);
+  vcsClosePlayWs(false);
   const bar = vcsEl("vcs-player-progress");
   if (bar) bar.style.width = "100%";
   const timeEl = vcsEl("vcs-player-time");
@@ -5815,7 +5907,10 @@ function vcsFinishSegment() {
 function vcsPausePlayback() {
   if (!VCS.playing) return;
   VCS.playing = false;
-  cancelAnimationFrame(VCS.rafId);
+  VCS.playPaused = true;
+  if (VCS.playWs && VCS.playWs.readyState === 1) {
+    try { VCS.playWs.send(JSON.stringify({ action: "pause" })); } catch (_) {}
+  }
   vcsEl("vcs-play").disabled = false;
   vcsEl("vcs-pause").disabled = true;
   if (typeof DemoGuard !== "undefined") {
@@ -5826,7 +5921,7 @@ function vcsPausePlayback() {
 function vcsStopPlayback() {
   VCS.playing = false;
   VCS.ended = false;
-  cancelAnimationFrame(VCS.rafId);
+  vcsClosePlayWs(false);
   VCS.seg = null;
   const bar = vcsEl("vcs-player-progress");
   if (bar) bar.style.width = "0%";
@@ -5943,22 +6038,43 @@ async function vcsStopExtract() {
   } catch (_) {}
 }
 
+// 检索进行中可取消（40s 超时兜底，即使后端极端卡死也能反馈）
+let vcsQueryAbort = null;
+
 async function vcsQuery() {
   const text = (vcsEl("vcs-text")?.value || "").trim();
   if (!text) { vcsShowError("请输入检索问题"); return; }
+  if (vcsQueryAbort) return;  // 已在检索中，防重复点击
   const threshold = Number(vcsEl("vcs-threshold")?.value || 0.5);
   const topK = Number(vcsEl("vcs-top-k")?.value || 10);
+  const btn = vcsEl("vcs-query");
+  const meta = vcsEl("vcs-query-meta");
+  vcsQueryAbort = new AbortController();
+  const timer = setTimeout(() => vcsQueryAbort.abort(), 40000);
+  if (btn) { btn.disabled = true; btn.textContent = "检索中"; }
+  if (meta) meta.textContent = "检索中…";
   try {
     const r = await fetch(API_PREFIX + "/video-content-search/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, sim_threshold: threshold, top_k: topK }),
+      signal: vcsQueryAbort.signal,
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || "HTTP " + r.status);
     vcsApplySnapshot(data);
   } catch (err) {
-    vcsShowError(err.message);
+    if (meta) meta.textContent = "";
+    if (err && err.name === "AbortError") {
+      vcsShowError("检索超时：40s 内未完成，请重试");
+    } else {
+      vcsShowError(err.message);
+    }
+  } finally {
+    clearTimeout(timer);
+    vcsQueryAbort = null;
+    if (btn) { btn.disabled = false; btn.textContent = "检索"; }
+    vcsUpdateButtons();
   }
 }
 
@@ -6021,21 +6137,32 @@ function initVideoContentSearch() {
   // 播放器按钮
   vcsEl("vcs-play").addEventListener("click", () => {
     if (!VCS.seg || VCS.playing) return;
-    // 上次已播完：从开头重播（进度条归零）
-    if (VCS.ended) {
+    // 暂停中恢复：发 WS resume
+    if (VCS.playPaused && VCS.playWs && VCS.playWs.readyState === 1) {
+      VCS.playPaused = false;
+      VCS.playing = true;
+      try { VCS.playWs.send(JSON.stringify({ action: "resume" })); } catch (_) {}
+      vcsEl("vcs-play").disabled = true;
+      vcsEl("vcs-pause").disabled = false;
+      if (typeof DemoGuard !== "undefined") {
+        DemoGuard.report("video-content-search", { vcs: VCS.snap, playing: true });
+      }
+      return;
+    }
+    // 播完重播：从头重开 WS
+    if (VCS.seg && VCS.seg.source) {
       VCS.ended = false;
       const bar = vcsEl("vcs-player-progress");
       if (bar) bar.style.width = "0%";
-      VCS.segStartAt = performance.now();
-    } else {
-      VCS.segStartAt = performance.now() - (VCS.seg.dur * 1000 * vcsPlayerFrac());
-    }
-    VCS.playing = true;
-    vcsEl("vcs-play").disabled = true;
-    vcsEl("vcs-pause").disabled = false;
-    VCS.rafId = requestAnimationFrame(vcsPlayerTick);
-    if (typeof DemoGuard !== "undefined") {
-      DemoGuard.report("video-content-search", { vcs: VCS.snap, playing: true });
+      const timeEl = vcsEl("vcs-player-time");
+      if (timeEl) timeEl.textContent = vcsFormatTime(VCS.seg.start) + " / " + vcsFormatTime(VCS.seg.end);
+      vcsEl("vcs-play").disabled = true;
+      vcsEl("vcs-pause").disabled = false;
+      vcsOpenPlayWs(VCS.seg.source, VCS.seg.start, VCS.seg.end);
+      VCS.playing = true;
+      if (typeof DemoGuard !== "undefined") {
+        DemoGuard.report("video-content-search", { vcs: VCS.snap, playing: true });
+      }
     }
   });
   vcsEl("vcs-pause").addEventListener("click", vcsPausePlayback);
@@ -6043,13 +6170,6 @@ function initVideoContentSearch() {
 
   vcsRefresh();
   if (!VCS.ws && !VCS.wsTimer) connectVcsWs();
-}
-
-function vcsPlayerFrac() {
-  const bar = vcsEl("vcs-player-progress");
-  if (!bar || !bar.style.width) return 0;
-  const p = parseFloat(bar.style.width);
-  return isFinite(p) ? p / 100 : 0;
 }
 
 /* ------------------------------------------------------------------ *
