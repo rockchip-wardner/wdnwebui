@@ -680,14 +680,155 @@
       <section id="page-video-content-search" class="page hidden" data-page="video-content-search">
         <header class="page-header">
           <h2>视频内容检索</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="vcs-status">就绪</span>
+            <button class="refresh-btn" id="vcs-refresh">刷新</button>
+          </div>
         </header>
-        <div class="page-placeholder">
-          <div class="page-placeholder-icon" aria-hidden="true">⌕</div>
-          <div class="page-placeholder-title">尚未实现</div>
-          <div class="page-placeholder-text">
-            该模块将在后续版本中提供，当前仅保留入口以便未来扩展。
+
+        <div id="vcs-error-banner" class="vfa-error-banner hidden" role="alert">
+          <span class="vfa-error-icon" aria-hidden="true">⚠</span>
+          <span class="vfa-error-text" id="vcs-error-text"></span>
+          <button class="vfa-error-close" id="vcs-error-close" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <div class="vcs-layout">
+          <!-- 左控制台 -->
+          <form class="surv-form" id="vcs-form" autocomplete="off" onsubmit="return false;">
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>视频源</h3>
+                <span class="surv-hint">设备端本地文件</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-input-row">
+                  <input type="text" id="vcs-source" class="surv-input"
+                         placeholder="例如 /userdata/clips/sample.mp4" spellcheck="false" />
+                  <button type="button" class="vd-btn" id="vcs-browse">浏览…</button>
+                </div>
+                <div class="vd-actions-row">
+                  <span class="vd-meta" id="vcs-source-meta">尚未选择</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>切片参数</h3>
+                <span class="surv-hint">切片 embedding 窗口</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-detect-row">
+                  <label class="surv-input-split">
+                    <span>切片时长</span>
+                    <select id="vcs-chunk-seconds" class="surv-input">
+                      <option value="3">3 秒</option>
+                      <option value="4" selected>4 秒</option>
+                      <option value="5">5 秒</option>
+                      <option value="6">6 秒</option>
+                    </select>
+                  </label>
+                  <label class="surv-input-split">
+                    <span>重叠</span>
+                    <select id="vcs-chunk-overlap" class="surv-input">
+                      <option value="1" selected>1 秒</option>
+                      <option value="2">2 秒</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>操作</h3>
+                <span class="surv-hint" id="vcs-runtime">未启动</span>
+              </header>
+              <div class="surv-field">
+                <div class="vd-actions-row">
+                  <button type="button" class="vd-btn vd-btn-primary" id="vcs-start">开始提取</button>
+                  <button type="button" class="vd-btn" id="vcs-stop" disabled>停止</button>
+                </div>
+                <div class="vcs-progress" id="vcs-progress" hidden>
+                  <div class="vcs-progress-meta">
+                    <span id="vcs-progress-label">已嵌入 0/0 切片</span>
+                    <span id="vcs-progress-pct">0%</span>
+                  </div>
+                  <div class="vcs-track">
+                    <div class="vcs-track-fill" id="vcs-progress-fill"></div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section vd-grow">
+              <header class="surv-form-head">
+                <h3>检索问题</h3>
+                <span class="surv-hint">最多 50 字</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-detect-row">
+                  <label class="surv-input-split">
+                    <span>匹配阈值 (0–1.0)</span>
+                    <input type="number" id="vcs-threshold" class="surv-input"
+                           min="0" max="1" step="0.01" value="0.50" />
+                  </label>
+                  <label class="surv-input-split">
+                    <span>检索上限 (1–10)</span>
+                    <input type="number" id="vcs-top-k" class="surv-input"
+                           min="1" max="10" step="1" value="10" />
+                  </label>
+                </div>
+                <div class="vcs-ta-wrap">
+                  <textarea id="vcs-text" class="surv-input surv-textarea" maxlength="50"
+                            placeholder="例如：有人在搬箱子 / 货车驶入 / 穿红色衣服的人"></textarea>
+                  <span class="vcs-ta-count" id="vcs-ta-count">0 / 50</span>
+                </div>
+                <div class="vd-actions-row">
+                  <button type="button" class="vd-btn vd-btn-primary" id="vcs-query" disabled>检索</button>
+                  <span class="vd-meta" id="vcs-query-meta"></span>
+                </div>
+              </div>
+            </section>
+          </form>
+
+          <!-- 右工作区 -->
+          <div class="vd-stage-col">
+            <div class="vd-stage">
+              <canvas id="vcs-canvas" width="960" height="540"></canvas>
+              <div class="vd-overlay" id="vcs-overlay">选择视频并开始提取，检索后点击命中片段在此播放</div>
+            </div>
+
+            <div class="vd-controls">
+              <button id="vcs-play"     class="vd-btn" disabled>▶ 播放</button>
+              <button id="vcs-pause"    class="vd-btn" disabled>⏸ 暂停</button>
+              <button id="vcs-stop-play" class="vd-btn" disabled>⏹ 停止</button>
+              <span class="vd-meta" id="vcs-player-tag">未播放</span>
+              <span class="vd-spacer"></span>
+              <span class="vd-meta" id="vcs-player-time">--</span>
+            </div>
+            <div class="vd-progress">
+              <div class="vd-progress-bar" id="vcs-player-progress"></div>
+            </div>
+
+            <section class="vcs-results">
+              <header class="vd-section-head">
+                <h3>命中结果</h3>
+                <span class="vd-spacer"></span>
+                <span class="vd-meta" id="vcs-results-count">0 条</span>
+                <button class="vd-btn" id="vcs-results-clear">清空</button>
+              </header>
+              <ol class="vcs-results-list" id="vcs-results-list">
+                <li class="vcs-results-empty">完成提取后输入问题检索，命中片段显示在这里。</li>
+              </ol>
+            </section>
           </div>
         </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-content-search"></pre>
+        </details>
       </section>
 
       <div id="vfa-query" class="vfa-query hidden" role="dialog" aria-modal="true">

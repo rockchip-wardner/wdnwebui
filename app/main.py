@@ -20,6 +20,7 @@ from app.api import (
     system_monitor,
     text_chat,
     tts,
+    video_content_search,
     video_detection,
     video_file_analysis,
     video_target_detection,
@@ -31,6 +32,7 @@ from app.services.dds_discovery import close_dds_discovery
 from app.services.detector import get_detector, get_target_detector
 from app.services.text_chat import close_chat, get_chat_service
 from app.services.tts_session import get_session as get_tts_session
+from app.services.video_content_search import get_service as get_vcs_service
 from app.services.video_file_analysis import get_service as get_vfa_service
 from app.services.video_session import get_session
 from app.services.wechat import close_wechat, get_wechat
@@ -90,6 +92,7 @@ def create_app() -> FastAPI:
     app.include_router(compute.router, prefix="/api")
     app.include_router(discovery.router, prefix="/api")
     app.include_router(video_target_detection.router, prefix="/api")
+    app.include_router(video_content_search.router, prefix="/api")
     app.include_router(wechat.router, prefix="/api")
     app.include_router(text_chat.router, prefix="/api")
 
@@ -152,6 +155,11 @@ def create_app() -> FastAPI:
         # rkv.VideoCapture and joins the decode / infer threads).
         try:
             get_vfa_service().close()
+        except Exception:
+            pass
+        # Stop the video-content-search mock worker thread.
+        try:
+            get_vcs_service().close()
         except Exception:
             pass
         # Stop the WeChat bot manager (cancels its poller, closes the
