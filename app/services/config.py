@@ -112,7 +112,13 @@ class ConfigStore:
         """Atomic write: serialize to a sibling temp file, then ``os.replace``.
 
         ``os.replace`` is atomic on POSIX, so a crash mid-write leaves the
-        previous config.json intact instead of a half-written file."""
+        previous config.json intact instead of a half-written file.
+
+        落盘后强制 ``chmod 0o777`` —— ``tempfile.mkstemp`` 默认 mode 600，
+        ``os.replace`` 之后目标文件继承这个 mode，不管 sudo 还是普通用户
+        启动都会被锁成 root-only 600。这里统一刷成 0777 让同机其它用户
+        （包括 web 前端 / 调试脚本）都能直接读写。
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(
             prefix=".config.", suffix=".json.tmp",
@@ -123,6 +129,11 @@ class ConfigStore:
                 json.dump(self._data, f, ensure_ascii=False, indent=2)
                 f.write("\n")
             os.replace(tmp_name, self._path)
+            try:
+                os.chmod(self._path, 0o777)
+            except OSError:
+                # 非 POSIX / 容器只读 fs 之类，chmod 失败不影响主流程。
+                pass
         except Exception:
             try:
                 os.unlink(tmp_name)

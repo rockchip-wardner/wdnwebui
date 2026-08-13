@@ -3577,10 +3577,76 @@ VdFsModal.pickCurrentDir = function () {
 /* ---------------------------------------------------------------- *
  * 算力配置 (Compute Config) page                                   *
  * ---------------------------------------------------------------- */
+/* ---------------------------------------------------------------- *
+ * 算力配置 (Compute Config) page — v0.6 重构                          *
+ * ---------------------------------------------------------------- *
+ * v0.6 把布局从"NPU 列 × 模型行"改成"模型卡片 × 目标 radio"：
+ *
+ *  顶部一行：内存条（3588 系统内存 + 每张 RK182x 卡显存），复用
+ *           /api/system-monitor 的 memory / npu.devices 字段。
+ *  中间三张：按 preset（Qwen3-VL-4B / Qwen3-TTS / Qwen3-8B）划分
+ *           的 service 卡片 —— 每张卡片列出子模型清单（来自本地
+ *           CC_PRESET_META，按文件后缀标注可用 target），下方用
+ *           radio 选运行在哪张 NPU，点 启用 / 停用 走现有的
+ *           /api/compute/instances 接口；倒计时复用 snapshot
+ *           estimated_init_seconds_per_model。
+ */
+const CC_PRESET_META = {
+  "qwen3-vl-4b": {
+    label: "Qwen3-VL-4B",
+    capability_types: ["swcap_video_describe"],
+    instance_name: "llm-vl",
+    memory_estimate_mb: 3500,
+    estimated_init_seconds: 60,
+    submodels: [
+      { role: "vision", files: ["vision_Qwen3-VL-4B.1828.rknn"], memory_estimate_mb: 300, estimated_init_seconds: 30 },
+      { role: "llm",    files: ["llm_Qwen3-VL-4B.1828.rknn"],    memory_estimate_mb: 3200, estimated_init_seconds: 30 },
+    ],
+    available_targets: ["182x"],
+  },
+  "qwen3-tts": {
+    label: "Qwen3-TTS",
+    capability_types: ["swcap_audio_tts"],
+    instance_name: "llm-tts",
+    memory_estimate_mb: 1900,
+    estimated_init_seconds: 30,
+    submodels: [
+      { role: "text_projection", files: ["text_projection.1828.rknn"], memory_estimate_mb: 50,  estimated_init_seconds: 5 },
+      { role: "talker",          files: ["talker.1828.rknn"],          memory_estimate_mb: 900, estimated_init_seconds: 10 },
+      { role: "code_predictor",  files: ["code_predictor.1828.rknn"],  memory_estimate_mb: 700, estimated_init_seconds: 10 },
+      { role: "speech_decoder",  files: ["speech_decoder.1828.rknn"],  memory_estimate_mb: 250, estimated_init_seconds: 5 },
+    ],
+    available_targets: ["182x"],
+  },
+  "qwen3-8b": {
+    label: "Qwen3-8B",
+    capability_types: ["swcap_text_chat"],
+    instance_name: "llm-chat",
+    memory_estimate_mb: 4950,
+    estimated_init_seconds: 60,
+    submodels: [
+      { role: "llm", files: ["Qwen3-8B.1828.rknn"], memory_estimate_mb: 4950, estimated_init_seconds: 60 },
+    ],
+    available_targets: ["182x"],
+  },
+};
+const CC_PRESET_ORDER = ["qwen3-vl-4b", "qwen3-tts", "qwen3-8b"];
+
+// 系统拓扑：1× RK3588 主控（不占"算力卡"位置） + N× RK182x 协卡。
+// rkai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡多
+// npu_index）返回；按物理协卡数 cap 住，避免 UI 出现重复 option。
+// 增/减协卡时同步改这里 + 各处"渲染 cap" 即可。
+const CC_MAX_RK182X_CARDS = 2;
+
 const ComputeConfigPage = {
   initialized: false,
   _tickHandle: null,
   _snapshot: null,
+  _system: null,        // /api/system-monitor 缓存
+  _loading: false,
+  _selectedTarget: {},  // {model_id: npu_index} —— 用户在 radio 上选的目标
+  _discovery: null,      // /api/discovery/dds 缓存（3s 一次，比 compute 慢）
+  _discoveryTickCount: 0,
 
   init() {
     if (this.initialized) return;
@@ -3593,12 +3659,47 @@ const ComputeConfigPage = {
     if (this._loading) return;
     this._loading = true;
     try {
-      const r = await fetch(API_PREFIX + "/compute", {
+      const fetchCompute = () => fetch(API_PREFIX + "/compute", {
         cache: "no-store",
         headers: {"Cache-Control": "no-cache"},
       });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      this._snapshot = await r.json();
+      const fetchSystem = () => fetch(API_PREFIX + "/system-monitor", {
+        cache: "no-store",
+        headers: {"Cache-Control": "no-cache"},
+      });
+      const fetchDiscovery = () => fetch(API_PREFIX + "/discovery/dds", {
+        cache: "no-store",
+        headers: {"Cache-Control": "no-cache"},
+      });
+
+      // 首屏：并行拉 compute + system-monitor + discovery。
+      // 之后每 tick 只拉 compute（status 变化快）。
+      // system-monitor / discovery 都不再高频轮询 —— system-monitor
+      // 会把 rknn-smi 打挂、discovery 在大网段也偏慢，3s 一次即可。
+      const firstLoad = this._snapshot == null;
+      const rComp = await fetchCompute();
+      if (!rComp.ok) throw new Error("compute HTTP " + rComp.status);
+      this._snapshot = await rComp.json();
+      if (firstLoad) {
+        try {
+          const rSys = await fetchSystem();
+          if (rSys.ok) this._system = await rSys.json();
+        } catch (_e) { /* 容错：不阻塞主路径 */ }
+        try {
+          const rDds = await fetchDiscovery();
+          if (rDds.ok) this._discovery = await rDds.json();
+        } catch (_e) { /* 容错 */ }
+      } else {
+        // 每 3 个 compute tick（约 3s）刷新一次 discovery，
+        // 避免拉垮大网段的 DDS 探测。
+        this._discoveryTickCount = (this._discoveryTickCount + 1) % 3;
+        if (this._discoveryTickCount === 0) {
+          try {
+            const rDds = await fetchDiscovery();
+            if (rDds.ok) this._discovery = await rDds.json();
+          } catch (_e) { /* 容错 */ }
+        }
+      }
       this.render();
     } catch (e) {
       this.setFoot("加载失败: " + e.message, "danger");
@@ -3620,34 +3721,28 @@ const ComputeConfigPage = {
   },
 
   tick() {
-    // 1Hz 拉新数据 —— 只有这样才能让 queued/loading → running/error 的
-    // 状态变化自动反映到 UI（local render 只重画倒计时秒数，不会感知
-    // status 字段变化）。
     if (!this._snapshot) return;
     this.load();
   },
 
-  async toggle(npu, model, enabled) {
-    const url = API_PREFIX + "/compute/instances";
-    const method = enabled ? "POST" : "DELETE";
-    try {
-      const r = await fetch(url, {
-        method,
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({npu_index: npu, model}),
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        alert(`${enabled ? "启用" : "停用"}失败: ${text}`);
-      }
-    } catch (e) {
-      alert("请求失败: " + e.message);
-    }
-    await this.load();
+  async _postInstance(_npu_index, _model) {
+    // Deprecated: replaced by _enableInstance. Kept as no-op stub so any
+    // lingering caller doesn't crash. New callers should use the buttons
+    // wired in _makeLocalCard.
+  },
+
+  async _deleteInstance(_npu_index, _model) {
+    // Deprecated: replaced by _disableInstance.
+  },
+
+  async toggle(_model, _targetNpu) {
+    // Deprecated: old switch UI removed in v0.7; replaced by three
+    // explicit buttons (启用 / 重启 / 禁用) on _makeLocalCard.
   },
 
   async stopAll() {
-    if (!confirm("确定要停止所有算力实例吗？")) return;
+    if (!confirm("确定要停止所有本地算力实例吗？\n"
+                 + "（adopted peer 的实例不受影响；需要到对端机器操作）")) return;
     try {
       const r = await fetch(API_PREFIX + "/compute/stop-all", {method: "POST"});
       if (!r.ok) {
@@ -3662,24 +3757,172 @@ const ComputeConfigPage = {
 
   // -------------------------------------------------------------- render
   render() {
+    this._renderMemStrip();
     this._renderBanners();
-    this._renderCols();
+    this._renderServices();
     this._renderSummary();
-    this._renderModelStates(this._snapshot);
-    this._renderTools(this._snapshot);
   },
 
-  // -------------------------------------------------------------- banners
-  // 顶部告警条：错误实例 / 卡住的 loading / worker 死亡 —— 一眼能扫到，
-  // 避免被埋在每行的小字 <pre class="cc-model-error"> 里看不到。每秒
-  // tick 都重新渲染（_renderSummary 一样），状态变化即时反映。
+  // ---------- 顶部内存条（3588 系统内存 + 每张 RK182x 卡显存） ----------
+  // 卡片选择规则：
+  //   - 第一格固定显示 RK3588 系统内存（即使没有 NPU 卡也展示 psutil）。
+  //   - 后续每张 RK182x 卡占一格，按 npu_index 升序。
+  //   - /api/system-monitor 没拉到时只显示 RK3588，182x 显示 placeholder。
+  _renderMemStrip() {
+    const strip = document.getElementById("cc-mem-strip");
+    if (!strip) return;
+    strip.innerHTML = "";
+    const sys = this._system || {};
+    const cards = (this._snapshot && this._snapshot.cards) || [];
+
+    // 3588 cell：永远先出。数据源 = /api/system-monitor.memory。
+    strip.appendChild(this._makeMemCell({
+      title: "RK3588 系统内存",
+      sub:   "主控 SoC · LPDDR5 共享",
+      usedMb:  sys.memory ? sys.memory.used_mb : null,
+      totalMb: sys.memory ? sys.memory.total_mb : null,
+      pct:     sys.memory ? sys.memory.percent : null,
+      extra:   null,
+    }));
+
+    // 182x cells：以 rkai 枚举（cards）作为唯一可信源。系统拓扑
+    // 是 1× RK3588 主控（不占"算力卡"位置）+ N× RK182x 协卡；
+    // rkai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡
+    // 多个 npu_index），按物理卡数 cap 住。后续如增减协卡，调这里的
+    // MAX_RK182X_CARDS 即可。
+    const devices = (sys.npu && sys.npu.devices) || [];
+    const npuByIdx = new Map(devices.map(d => [d.index, d]));
+    const cardByIdx = new Map(cards.map(c => [c.npu_index, c]));
+
+    const MAX_RK182X_CARDS = CC_MAX_RK182X_CARDS;
+    let rk182xIndices = cards
+      .map(c => c.npu_index)
+      .filter(i => i > 0)
+      .sort((a, b) => a - b)
+      .slice(0, MAX_RK182X_CARDS);
+
+    // rkai 完全枚举不到 NPU 时，rknn-smi 兜底一次（host 没有 rkai
+    // / rknn3 的开发板情况），同样 cap。
+    if (rk182xIndices.length === 0 && devices.length > 0) {
+      for (const d of devices) {
+        if (d.index > 0 && !rk182xIndices.includes(d.index)) {
+          rk182xIndices.push(d.index);
+          if (rk182xIndices.length >= MAX_RK182X_CARDS) break;
+        }
+      }
+      rk182xIndices.sort((a, b) => a - b);
+    }
+
+    if (rk182xIndices.length === 0) {
+      // 没有 182x —— 给一个 placeholder 占位，避免整行塌陷。
+      const ph = document.createElement("div");
+      ph.className = "cc-mem-cell is-missing";
+      const t = document.createElement("div");
+      t.className = "cc-mem-cell-head";
+      const ti = document.createElement("span");
+      ti.className = "cc-mem-cell-title";
+      ti.textContent = "RK182x #0";
+      t.appendChild(ti);
+      ph.appendChild(t);
+      const m = document.createElement("div");
+      m.className = "cc-mem-cell-meta";
+      m.textContent = "未检测到协卡";
+      ph.appendChild(m);
+      strip.appendChild(ph);
+    } else {
+      let ordinal = 0;
+      for (const idx of rk182xIndices) {
+        const dev = npuByIdx.get(idx);
+        const card = cardByIdx.get(idx);
+        const label = `RK182x #${ordinal}`;
+        ordinal += 1;
+        strip.appendChild(this._makeMemCell({
+          title: label,
+          sub:   card ? (card.device_id || `device_id=${idx}`) : `npu #${idx}`,
+          usedMb:  dev ? dev.mem_used_mb : null,
+          totalMb: dev ? dev.mem_total_mb : null,
+          pct:     dev && dev.mem_used_mb != null && dev.mem_total_mb
+                    ? (dev.mem_used_mb / dev.mem_total_mb) * 100 : null,
+          extra:   dev ? {
+            temp:    dev.temp_c,
+            power:   dev.power_mw,
+            npuPct:  dev.npu_percent,
+            status:  dev.status,
+          } : null,
+        }));
+      }
+    }
+  },
+
+  _makeMemCell({title, sub, usedMb, totalMb, pct, extra}) {
+    const cell = document.createElement("div");
+    cell.className = "cc-mem-cell";
+
+    const head = document.createElement("div");
+    head.className = "cc-mem-cell-head";
+    const titleEl = document.createElement("span");
+    titleEl.className = "cc-mem-cell-title";
+    titleEl.textContent = title;
+    head.appendChild(titleEl);
+    const pctEl = document.createElement("span");
+    pctEl.className = "cc-mem-cell-pct";
+    if (pct == null) {
+      pctEl.textContent = "--";
+    } else {
+      pctEl.textContent = fmtNum(pct, 1) + " %";
+      if (pct >= 90)      pctEl.classList.add("is-crit");
+      else if (pct >= 70) pctEl.classList.add("is-warn");
+    }
+    head.appendChild(pctEl);
+    cell.appendChild(head);
+
+    const bar = document.createElement("div");
+    bar.className = "cc-mem-bar";
+    const fill = document.createElement("div");
+    fill.className = "cc-mem-bar-fill";
+    if (pct != null) {
+      fill.style.width = Math.min(100, Math.max(0, pct)) + "%";
+      if (pct >= 90)      fill.classList.add("is-crit");
+      else if (pct >= 70) fill.classList.add("is-warn");
+    }
+    bar.appendChild(fill);
+    cell.appendChild(bar);
+
+    const meta = document.createElement("div");
+    meta.className = "cc-mem-cell-meta";
+    const usedText  = usedMb  != null ? fmtBytes(usedMb)  : "已用 --";
+    const totalText = totalMb != null ? fmtBytes(totalMb) : "--";
+    meta.textContent = `${usedText} / ${totalText}`;
+    cell.appendChild(meta);
+
+    if (sub) {
+      const subEl = document.createElement("div");
+      subEl.className = "cc-mem-cell-meta";
+      subEl.textContent = sub;
+      subEl.title = sub;
+      cell.appendChild(subEl);
+    }
+    if (extra) {
+      const ex = document.createElement("div");
+      ex.className = "cc-mem-cell-meta";
+      const parts = [];
+      if (extra.temp != null)   parts.push(extra.temp.toFixed(1) + "°C");
+      if (extra.npuPct != null) parts.push("NPU " + fmtNum(extra.npuPct, 0) + "%");
+      if (extra.power != null)  parts.push((extra.power / 1000).toFixed(2) + " W");
+      if (extra.status)         parts.push(extra.status);
+      ex.textContent = parts.join(" · ");
+      cell.appendChild(ex);
+    }
+    return cell;
+  },
+
+  // ---------- 顶部告警条 ----------
   _renderBanners() {
     const stack = document.getElementById("cc-banner-stack");
     if (!stack) return;
     const snap = this._snapshot || {};
     const errored = (snap.instances || []).filter(i => i.status === "error");
     const stuck = this._detectStuck(snap);
-    const workerDead = snap.worker_alive === false && (snap.loading_count || 0) > 0;
 
     stack.innerHTML = "";
 
@@ -3695,18 +3938,6 @@ const ComputeConfigPage = {
         msg.className = "cc-banner-msg";
         msg.textContent = inst.error || "(无错误信息)";
         li.appendChild(msg);
-        if (inst.stderr_full && inst.stderr_full.trim()) {
-          const details = document.createElement("details");
-          details.className = "cc-banner-details";
-          const summary = document.createElement("summary");
-          summary.textContent = "查看完整 stderr";
-          details.appendChild(summary);
-          const full = document.createElement("pre");
-          full.className = "cc-banner-stderr";
-          full.textContent = inst.stderr_full;
-          details.appendChild(full);
-          li.appendChild(details);
-        }
         ul.appendChild(li);
       }
       stack.appendChild(this._makeBanner({
@@ -3736,20 +3967,6 @@ const ComputeConfigPage = {
         actions: [
           {label: "刷新", onClick: () => this.load()},
         ],
-      }));
-    }
-
-    if (workerDead) {
-      const body = document.createElement("div");
-      body.className = "cc-banner-msg";
-      body.textContent =
-        "后台加载 worker 已停止响应。当前 loading 实例会一直停在加载中，" +
-        "需要重启服务或重新启用实例才会恢复。";
-      stack.appendChild(this._makeBanner({
-        kind: "is-dead",
-        icon: "✖",
-        title: "算力加载 worker 已停止",
-        body,
       }));
     }
   },
@@ -3785,8 +4002,6 @@ const ComputeConfigPage = {
     return el;
   },
 
-  // 检测疑似卡住：queued/loading 累计时间超过 (2 × estimate + 30s)，且
-  // 当前没有错误实例（避免和 error banner 重复提示）。返回数组 [{...}]。
   _detectStuck(snap) {
     const now = Date.now() / 1000;
     const perModel = snap.estimated_init_seconds_per_model || {};
@@ -3800,249 +4015,582 @@ const ComputeConfigPage = {
       const elapsed = Math.max(0, Math.round(now - startTs));
       const threshold = est * 2 + 30;
       if (elapsed >= threshold) {
-        out.push({
-          ...inst,
-          elapsed,
-          threshold,
-        });
+        out.push({...inst, elapsed, threshold});
       }
     }
     return out;
   },
 
-  _renderCols() {
-    const root = document.getElementById("cc-panels");
-    if (!root) return;
-    root.innerHTML = "";
-    const cards = this._snapshot?.cards || [];
-    const byIdx = new Map(cards.map(c => [c.npu_index, c]));
+  // ---------- 两栏 compute service 卡片 (v0.7) ----------
+  // 数据源：``/api/compute`` snapshot.services —— 后端从
+  // ``list_with_source`` 拼出来，按 source 分组：spawned（本地
+  // Popen 起的 worker）→ 上栏；adopted（peer from LAN daemon）→
+  // 下栏；unavailable（daemon 全 LAN 都没找到 peer）→ 也放下栏
+  // 标"未启用"。下栏卡片只读（peer 不可操作；unavailable 是因为
+  // 没人提供，不是本机能启的）。
+  _renderServices() {
+    const localRoot = document.getElementById("cc-local-cards");
+    const peerRoot  = document.getElementById("cc-peer-cards");
+    if (!localRoot || !peerRoot) return;
+    localRoot.innerHTML = "";
+    peerRoot.innerHTML = "";
+    const snap = this._snapshot || {};
+    const cards = snap.cards || [];
+    const services = snap.services || [];
 
-    // 三栏固定：RK3588（主控 SoC，占位）+ RK182x #0 + RK182x #1
-    this._makeCol("rk3588", "RK3588", "主控 SoC", null, root);
-    for (const idx of [0, 1]) {
-      const card = byIdx.get(idx);
-      this._makeCol(
-        `rk182x-${idx}`,
-        `RK182x #${idx}`,
-        card ? "已用 0 MB" : "未检测到",
-        card ? idx : null,
-        root,
-        !card,
-      );
+    if (!services.length) {
+      const empty = document.createElement("div");
+      empty.className = "cc-services-empty";
+      empty.textContent = "未声明任何 compute service —— 检查 MODEL_PRESETS 配置。";
+      localRoot.appendChild(empty);
+      return;
     }
 
-    const failed = this._snapshot?.cards_failed || "";
-    if (failed) {
-      this.setFoot("枚举 NPU 卡失败: " + failed, "danger");
+    // 按 CC_PRESET_ORDER 排序，保证 UI 默认视觉顺序稳定。
+    const ordered = [];
+    const seen = new Set();
+    for (const id of CC_PRESET_ORDER) {
+      const s = services.find(x => x.model_id === id);
+      if (s) { ordered.push(s); seen.add(s.model_id); }
+    }
+    for (const s of services) {
+      if (!seen.has(s.model_id)) ordered.push(s);
+    }
+
+    for (const s of ordered) {
+      const meta = CC_PRESET_META[s.model_id] || {
+        label: s.label || s.model_id,
+        capability_types: s.capability_types || [],
+        memory_estimate_mb: s.memory_estimate_mb || 0,
+        estimated_init_seconds:
+          (snap.estimated_init_seconds_per_model || {})[s.model_id] || 30,
+        submodels: [],
+        available_targets: ["182x"],
+      };
+      const card = (s._source === "spawned")
+        ? this._makeLocalCard(s.model_id, meta, s, cards)
+        : this._makePeerCard(s.model_id, meta, s);
+      if (s._source === "spawned") localRoot.appendChild(card);
+      else                          peerRoot.appendChild(card);
     }
   },
 
-  _makeCol(colKey, title, memText, npuIndex, root, missing) {
-    const col = document.createElement("section");
-    col.className = "cc-col";
-    col.dataset.col = colKey;
+  // 本机 spawned worker —— 显示 PID + NPU + 启停 / 重启按钮
+  _makeLocalCard(modelId, meta, svc, cards) {
+    const card = document.createElement("article");
+    card.className = "cc-service-card";
+    card.dataset.model = modelId;
+    card.dataset.source = "spawned";
+
+    const state = svc.status || "not_loaded";
+    if (state === "running") card.classList.add("is-running");
+    if (state === "loading") card.classList.add("is-pending");
+    if (state === "error")   card.classList.add("has-error");
 
     const head = document.createElement("header");
-    head.className = "cc-col-head";
-    const titleEl = document.createElement("span");
-    titleEl.className = "cc-col-title";
-    titleEl.textContent = title;
-    const memEl = document.createElement("span");
-    memEl.className = "cc-col-mem";
-    memEl.textContent = memText;
-    if (npuIndex !== null && npuIndex !== undefined) {
-      memEl.dataset.memFor = String(npuIndex);
+    head.className = "cc-service-head";
+    const title = document.createElement("h3");
+    title.className = "cc-service-title";
+    title.textContent = meta.label;
+    head.appendChild(title);
+    for (const cap of meta.capability_types || []) {
+      const c = document.createElement("span");
+      c.className = "cc-service-cap";
+      c.textContent = cap;
+      head.appendChild(c);
     }
-    head.appendChild(titleEl);
-    head.appendChild(memEl);
-    col.appendChild(head);
+    const pid = document.createElement("span");
+    pid.className = "cc-pid";
+    pid.textContent = `PID ${svc.pid || "?"}`;
+    head.appendChild(pid);
+    const badge = document.createElement("span");
+    badge.className = "cc-service-badge";
+    badge.dataset.state = state;
+    if      (state === "running")   { badge.classList.add("is-running");  badge.textContent = "运行中"; }
+    else if (state === "loading")   { badge.classList.add("is-loading");  badge.textContent = "加载中…"; }
+    else if (state === "not_loaded"){ badge.textContent = "未启用"; }
+    else if (state === "error")     { badge.classList.add("is-error");    badge.textContent = "启动失败"; }
+    head.appendChild(badge);
+    card.appendChild(head);
 
     const body = document.createElement("div");
-    body.className = "cc-col-body";
-    if (npuIndex === null || npuIndex === undefined) {
-      // RK3588 —— 列出内置工具（默认启用，仅展示依赖状态，不可禁用）。
-      const ul = document.createElement("ul");
-      ul.className = "cc-tools-list";
-      ul.id = "cc-tools-list";
-      body.appendChild(ul);
-    } else if (missing) {
-      // 这张 182x 卡没检测到
-      const ph = document.createElement("div");
-      ph.className = "cc-placeholder";
-      ph.textContent = "未检测到该 NPU 卡";
-      body.appendChild(ph);
+    body.className = "cc-service-body";
+
+    // ----- NPU picker —— 仅 spawned 可用
+    const fieldset = this._makeTargetFieldset(modelId, meta, svc, cards);
+    body.appendChild(fieldset);
+
+    // ----- 操作行：启用 / 重启 / 禁用
+    const actions = document.createElement("div");
+    actions.className = "cc-service-actions";
+    const noCards = !cards || cards.length === 0;
+    const selectedTarget = this._selectedTarget[modelId] != null
+      ? this._selectedTarget[modelId]
+      : (svc.npu_index >= 0 ? svc.npu_index : this._defaultTargetNpu(cards));
+
+    const startBtn = document.createElement("button");
+    startBtn.className = "cc-btn cc-btn-primary";
+    startBtn.textContent = "启用";
+    startBtn.disabled = noCards || state === "loading";
+    startBtn.title = noCards ? "无可用 NPU 卡" : "选 NPU 后启用并加载模型";
+    startBtn.addEventListener("click", () => {
+      const target = this._selectedTarget[modelId] != null
+        ? this._selectedTarget[modelId]
+        : (svc.npu_index >= 0 ? svc.npu_index : this._defaultTargetNpu(cards));
+      this._enableInstance(target, modelId);
+    });
+
+    const restartBtn = document.createElement("button");
+    restartBtn.className = "cc-btn";
+    restartBtn.textContent = "重启";
+    restartBtn.disabled = state === "loading";
+    restartBtn.title = "Q3 4 步：unload → shutdown → wait/kill → 走 boot 流程（不自动 bind）";
+    restartBtn.addEventListener("click", () => {
+      if (confirm(`确认重启 ${meta.label}？重启后需重新选择 NPU 才能 inference。`)) {
+        this._restartInstance(modelId);
+      }
+    });
+
+    const disableBtn = document.createElement("button");
+    disableBtn.className = "cc-btn cc-btn-danger";
+    disableBtn.textContent = "禁用";
+    disableBtn.disabled = state === "loading" || state === "not_loaded";
+    disableBtn.title = "卸载模型 + 关进程";
+    disableBtn.addEventListener("click", () => {
+      if (confirm(`确认禁用 ${meta.label}？`)) {
+        this._disableInstance(modelId);
+      }
+    });
+
+    actions.appendChild(startBtn);
+    actions.appendChild(restartBtn);
+    actions.appendChild(disableBtn);
+    body.appendChild(actions);
+
+    const statusLine = document.createElement("div");
+    statusLine.className = "cc-service-status-line";
+    statusLine.dataset.state = state;
+    statusLine.textContent = this._statusLineText(modelId, meta, svc);
+    body.appendChild(statusLine);
+
+    if (state === "error" && svc.error) {
+      const pre = document.createElement("pre");
+      pre.className = "cc-service-error-pre";
+      pre.textContent = svc.error;
+      body.appendChild(pre);
+    }
+
+    card.appendChild(body);
+    return card;
+  },
+
+  // adopted peer / unavailable —— 只读
+  _makePeerCard(modelId, meta, svc) {
+    const card = document.createElement("article");
+    card.className = "cc-service-card cc-service-card-peer";
+    card.dataset.model = modelId;
+    card.dataset.source = svc._source;  // "adopted" | "unavailable"
+
+    const state = svc.status || "not_loaded";
+
+    const head = document.createElement("header");
+    head.className = "cc-service-head";
+    const title = document.createElement("h3");
+    title.className = "cc-service-title";
+    title.textContent = meta.label;
+    head.appendChild(title);
+
+    const pid = document.createElement("span");
+    pid.className = "cc-peer-id";
+    if (svc._source === "adopted") {
+      const peerLabel = svc._peer_name || svc._peer_guid.slice(0, 8) || "远端";
+      pid.textContent = `peer: ${peerLabel}`;
     } else {
-      const ul = document.createElement("ul");
-      ul.className = "cc-models";
-      ul.id = `cc-models-${npuIndex}`;
-      body.appendChild(ul);
+      pid.textContent = "无可用 worker";
     }
-    col.appendChild(body);
-    root.appendChild(col);
+    head.appendChild(pid);
 
-    if (npuIndex !== null && npuIndex !== undefined && !missing) {
-      this._renderModels(npuIndex);
+    const badge = document.createElement("span");
+    badge.className = "cc-service-badge";
+    badge.dataset.state = state;
+    if (svc._source === "unavailable") {
+      badge.textContent = "未启用";
+    } else if (state === "running") {
+      badge.classList.add("is-running");
+      badge.textContent = `peer 已加载 · NPU #${svc.npu_index}`;
+    } else if (state === "loading") {
+      badge.classList.add("is-loading");
+      badge.textContent = "peer 加载中";
+    } else {
+      badge.textContent = "peer 未启用";
     }
+    head.appendChild(badge);
+    card.appendChild(head);
+
+    const body = document.createElement("div");
+    body.className = "cc-service-body";
+
+    const statusLine = document.createElement("div");
+    statusLine.className = "cc-service-status-line";
+    statusLine.dataset.state = state;
+    if (svc._source === "unavailable") {
+      statusLine.textContent = "本机 + LAN 都未发现该 service；点本地栏的「启用」会 spawn 新进程";
+    } else if (state === "running") {
+      statusLine.textContent = `peer worker 已加载模型 · NPU #${svc.npu_index} · ${svc.load_time_sec ?? "?"}s`;
+    } else if (state === "loading") {
+      statusLine.textContent = "peer 正在加载模型…";
+    } else {
+      statusLine.textContent = "peer worker 进程已起但未加载模型（需要到对端机器点启用）";
+    }
+    body.appendChild(statusLine);
+
+    const ro = document.createElement("div");
+    ro.className = "cc-readonly";
+    ro.textContent = "只读 · 本机无权操作 peer service";
+    body.appendChild(ro);
+
+    card.appendChild(body);
+    return card;
   },
 
-  _renderModels(npuIndex) {
-    const ul = document.getElementById(`cc-models-${npuIndex}`);
-    if (!ul) return;
-    ul.innerHTML = "";
-    const supported = this._snapshot?.supported_models || [];
-    const instances = this._snapshot?.instances || [];
-    for (const m of supported) {
-      const inst = instances.find(i => i.npu_index === npuIndex && i.model === m.id);
-      const li = document.createElement("li");
-      li.className = "cc-model";
-      li.dataset.npu = npuIndex;
-      li.dataset.model = m.id;
-      const enabled = !!inst && inst.status !== "stopped";
-      const existsFlag = m.exists !== false;
-      // 整行状态类：is-running 蓝边 / has-error 红边 —— 视觉上让"toggle ON 但实际 error"
-      // 这种坑爹情况一眼能看出来。
-      if (inst) {
-        if (inst.status === "running") li.classList.add("is-running");
-        if (inst.status === "error")   li.classList.add("has-error");
-        if (inst.status === "queued" || inst.status === "loading") li.classList.add("is-pending");
+  async _enableInstance(npu_index, model) {
+    try {
+      const r = await fetch(API_PREFIX + "/compute/instances", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({npu_index, model}),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        alert(`启用失败 (HTTP ${r.status}): ${text}`);
       }
-      li.innerHTML = `
-        <label class="cc-toggle">
-          <input type="checkbox" data-role="toggle" ${enabled ? "checked" : ""} ${existsFlag ? "" : "disabled"} />
-          <span class="cc-toggle-track"></span>
-        </label>
-        <div class="cc-model-meta">
-          <strong>${m.label}</strong>
-          <span class="cc-model-cap">${(m.capability_types || []).join(" · ")}</span>
-          <span class="cc-model-mem">~${m.memory_estimate_mb} MB</span>
-        </div>
-        <div class="cc-model-state" data-state="${inst ? inst.status : "disabled"}">
-          <span class="cc-state-text">${this._statusLabel(inst)}</span>
-        </div>
-      `;
-      // error 时把错误信息单独拎一行显眼显示（默认在 state 里只是 inline 文字）
-      if (inst && inst.status === "error") {
-        li.appendChild(this._makeErrorBlock(inst, npuIndex, m.id));
-      }
-      if (!existsFlag) {
-        const missing = document.createElement("div");
-        missing.className = "cc-model-missing";
-        missing.textContent = "模型目录不存在";
-        li.appendChild(missing);
-      }
-      const checkbox = li.querySelector("input[type=checkbox]");
-      checkbox.addEventListener("change", () => this.toggle(npuIndex, m.id, checkbox.checked));
-      ul.appendChild(li);
+    } catch (e) {
+      alert("请求失败: " + e.message);
     }
+    await this.load();
   },
 
-  _renderModelStates(snapshot) {
-    if (!snapshot) return;
-    const perCard = snapshot.per_card_memory_mb || {};
-    for (const [npuIndex, mb] of Object.entries(perCard)) {
-      const el = document.querySelector(`[data-mem-for="${npuIndex}"]`);
-      if (el) el.textContent = `已用 ${mb} MB`;
+  async _disableInstance(model) {
+    try {
+      const r = await fetch(API_PREFIX + "/compute/instances", {
+        method: "DELETE",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({model}),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        alert(`禁用失败 (HTTP ${r.status}): ${text}`);
+      }
+    } catch (e) {
+      alert("请求失败: " + e.message);
     }
-    const ulMap = document.querySelectorAll(".cc-model");
-    ulMap.forEach(li => {
-      const npu = parseInt(li.dataset.npu, 10);
-      const model = li.dataset.model;
-      const inst = (snapshot.instances || []).find(i => i.npu_index === npu && i.model === model);
-      const stateDiv = li.querySelector(".cc-model-state");
-      if (!stateDiv) return;
-      const newState = inst ? inst.status : "disabled";
-      stateDiv.dataset.state = newState;
-      const text = stateDiv.querySelector(".cc-state-text");
-      if (text) text.textContent = this._statusLabel(inst);
-      // 整行状态类同步（status 变化时给整行换边框颜色）
-      li.classList.toggle("is-running", newState === "running");
-      li.classList.toggle("has-error", newState === "error");
-      li.classList.toggle("is-pending", newState === "queued" || newState === "loading");
-      // error 信息：增/删 <pre> 节点
-      let errBox = li.querySelector(".cc-model-error-wrap");
-      if (inst && inst.status === "error") {
-        if (!errBox) {
-          errBox = this._makeErrorBlock(inst, npu, model);
-          li.appendChild(errBox);
-        } else {
-          // 错误文本 / 按钮都在 _makeErrorBlock 里重建，避免就地改 text 的细碎 DOM。
-          const newBox = this._makeErrorBlock(inst, npu, model);
-          errBox.replaceWith(newBox);
+    await this.load();
+  },
+
+  async _restartInstance(model) {
+    try {
+      const r = await fetch(API_PREFIX + "/compute/restart", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({model}),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        alert(`重启失败 (HTTP ${r.status}): ${text}`);
+      }
+    } catch (e) {
+      alert("请求失败: " + e.message);
+    }
+    await this.load();
+  },
+
+  _makeServiceCard(modelId, meta, inst, cards) {
+    const card = document.createElement("article");
+    card.className = "cc-service-card";
+    card.dataset.model = modelId;
+
+    // 状态 → 卡片整体边框色 + badge 文字
+    const state = inst ? inst.status : "disabled";
+    if (state === "running")    card.classList.add("is-running");
+    if (state === "loading" || state === "queued")
+                                card.classList.add("is-pending");
+    if (state === "error")      card.classList.add("has-error");
+
+    // ----- head
+    const head = document.createElement("header");
+    head.className = "cc-service-head";
+    const title = document.createElement("h3");
+    title.className = "cc-service-title";
+    title.textContent = meta.label;
+    head.appendChild(title);
+    for (const cap of meta.capability_types || []) {
+      const c = document.createElement("span");
+      c.className = "cc-service-cap";
+      c.textContent = cap;
+      head.appendChild(c);
+    }
+    const badge = document.createElement("span");
+    badge.className = "cc-service-badge";
+    badge.dataset.state = state;
+    if (state === "running")        { badge.classList.add("is-running");    badge.textContent = "运行中"; }
+    else if (state === "loading")   { badge.classList.add("is-loading");    badge.textContent = "加载中…"; }
+    else if (state === "queued")    { badge.classList.add("is-queued");     badge.textContent = "排队中"; }
+    else if (state === "ready_lazy"){ badge.classList.add("is-ready-lazy"); badge.textContent = "已启用（待加载）"; }
+    else if (state === "error")     { badge.classList.add("is-error");      badge.textContent = "启动失败"; }
+    else                            { badge.textContent = "未启用"; }
+    head.appendChild(badge);
+    card.appendChild(head);
+
+    const body = document.createElement("div");
+    body.className = "cc-service-body";
+
+    // ----- 子模型清单（informational）
+    if (meta.submodels && meta.submodels.length) {
+      const subs = document.createElement("div");
+      subs.className = "cc-submodels";
+      for (const sm of meta.submodels) {
+        const row = document.createElement("div");
+        row.className = "cc-submodel-row";
+        const role = document.createElement("span");
+        role.className = "cc-submodel-role";
+        role.textContent = sm.role;
+        row.appendChild(role);
+        const mem = document.createElement("span");
+        mem.className = "cc-submodel-mem";
+        mem.textContent = `~${sm.memory_estimate_mb} MB · 加载 ${sm.estimated_init_seconds}s`;
+        row.appendChild(mem);
+        const tg = document.createElement("span");
+        tg.className = "cc-submodel-targets";
+        tg.textContent = this._targetsLabel(sm.files);
+        tg.title = (sm.files || []).join(", ");
+        row.appendChild(tg);
+        subs.appendChild(row);
+      }
+      body.appendChild(subs);
+    }
+
+    // ----- 目标 radio（3588 / 182x#0 / 182x#1 / ...）
+    const fieldset = this._makeTargetFieldset(modelId, meta, inst, cards);
+    body.appendChild(fieldset);
+
+    // ----- 操作控件：二元开关（左 off / 右 on）+ 状态行
+    const actions = document.createElement("div");
+    actions.className = "cc-service-actions";
+    const sw = document.createElement("button");
+    sw.type = "button";
+    sw.className = "cc-svc-switch";
+    const selectedTarget = this._selectedTarget[modelId] != null
+      ? this._selectedTarget[modelId]
+      : (inst ? inst.npu_index : this._defaultTargetNpu(cards));
+    sw.dataset.target = String(selectedTarget);
+
+    const noCards = !cards || cards.length === 0;
+    const isOn   = state === "running" || state === "loading" || state === "queued";
+    const isLoad = state === "loading" || state === "queued";
+    const isErr  = state === "error";
+    sw.classList.toggle("is-on", isOn);
+    sw.classList.toggle("is-loading", isLoad);
+    sw.classList.toggle("is-error", isErr);
+    // 加载期间锁定不可点（避免误取消）；无卡时也锁定。
+    if (noCards || isLoad) {
+      sw.classList.add("is-disabled");
+      sw.disabled = true;
+    }
+    sw.title = noCards
+      ? "无可用 NPU 卡"
+      : this._switchTitle(meta, inst, isLoad);
+    sw.setAttribute("aria-label",
+      this._switchAriaLabel(meta, inst, noCards, isLoad));
+
+    const knob = document.createElement("span");
+    knob.className = "cc-svc-switch-knob";
+    sw.appendChild(knob);
+
+    sw.addEventListener("click", () => {
+      if (sw.disabled) return;
+      const target = parseInt(sw.dataset.target, 10);
+      this.toggle(modelId, target);
+    });
+    actions.appendChild(sw);
+    body.appendChild(actions);
+
+    const statusLine = document.createElement("div");
+    statusLine.className = "cc-service-status-line";
+    statusLine.dataset.state = state;
+    statusLine.textContent = this._statusLineText(modelId, meta, inst);
+    body.appendChild(statusLine);
+
+    // error 时挂错误信息块
+    if (inst && inst.status === "error" && inst.error) {
+      const pre = document.createElement("pre");
+      pre.className = "cc-service-error-pre";
+      pre.textContent = inst.error;
+      body.appendChild(pre);
+    }
+
+    card.appendChild(body);
+    return card;
+  },
+
+  // 把 submodel.files（["vision_Qwen3-VL-4B.1828.rknn", ...]）解析成可读标签
+  _targetsLabel(files) {
+    if (!files || !files.length) return "—";
+    const suffixes = new Set();
+    for (const f of files) {
+      if (f.endsWith(".1828.rknn")) suffixes.add("182x");
+      else if (f.endsWith(".3588.rknn")) suffixes.add("3588");
+      else if (f.endsWith(".weight"))   suffixes.add("(共享权重)");
+    }
+    if (!suffixes.size) return files.join(", ");
+    return Array.from(suffixes).join(" + ");
+  },
+
+  _makeTargetFieldset(modelId, meta, inst, cards) {
+    const fs = document.createElement("fieldset");
+    fs.className = "cc-target-pick";
+    const legend = document.createElement("legend");
+    legend.textContent = "运行在";
+    fs.appendChild(legend);
+
+    const opts = document.createElement("div");
+    opts.className = "cc-target-options";
+
+    // 3588 + 每张 182x，npu_index = 0/1/2/...。npu_index == 0 视作 RK3588。
+    // 系统有 N 张 RK182x 协卡；rkai 当前会把单个物理卡拆成多个 context
+    // 索引（同卡多 npu_index），按物理卡数 cap 住。后续如增减协卡，
+    // 调这里的 MAX_RK182X_OPTIONS 即可。
+    const MAX_RK182X_OPTIONS = CC_MAX_RK182X_CARDS;
+    const cardsByIdx = new Map(cards.map(c => [c.npu_index, c]));
+    const sorted = Array.from(new Set(cards.map(c => c.npu_index)))
+      .sort((a, b) => a - b);
+
+    let ordinal182x = 0;
+    let rendered = 0;
+    const renderOpt = (npuIndex, title, sub) => {
+      const label = document.createElement("label");
+      label.className = "cc-target-opt";
+      label.title = sub || "";
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = `cc-target-${modelId}`;
+      input.value = String(npuIndex);
+      const currentTarget = this._selectedTarget[modelId] != null
+        ? this._selectedTarget[modelId]
+        : (inst ? inst.npu_index : (rendered === 0 ? npuIndex : null));
+      const checked = currentTarget === npuIndex;
+      if (checked) input.checked = true;
+      input.addEventListener("change", () => {
+        if (input.checked) {
+          this._selectedTarget[modelId] = npuIndex;
+          const sw = document.querySelector(
+            `.cc-service-card[data-model="${modelId}"] .cc-svc-switch`);
+          if (sw) sw.dataset.target = String(npuIndex);
         }
-      } else if (errBox) {
-        errBox.remove();
-      }
-    });
-  },
+      });
+      label.appendChild(input);
+      const txt = document.createElement("span");
+      txt.textContent = title;
+      label.appendChild(txt);
+      opts.appendChild(label);
+      rendered += 1;
+    };
 
-  // 构造一条实例的错误块：<pre> 错误摘要 + "查看完整 stderr" 折叠 +
-  // 重试按钮。重试按钮 = 先 DELETE 再 POST，等同于重新启用。
-  _makeErrorBlock(inst, npuIndex, model) {
-    const wrap = document.createElement("div");
-    wrap.className = "cc-model-error-wrap";
-    const errBox = document.createElement("pre");
-    errBox.className = "cc-model-error";
-    errBox.textContent = inst.error || "(无错误信息)";
-    wrap.appendChild(errBox);
-    if (inst.stderr_full && inst.stderr_full.trim()) {
-      const details = document.createElement("details");
-      details.className = "cc-model-error-details";
-      const summary = document.createElement("summary");
-      summary.textContent = "查看完整 stderr";
-      details.appendChild(summary);
-      const full = document.createElement("pre");
-      full.className = "cc-model-error-stderr";
-      full.textContent = inst.stderr_full;
-      details.appendChild(full);
-      wrap.appendChild(details);
+    // 优先把 3588（npu_index == 0）放在最前 —— 不存在则跳过。
+    if (sorted.includes(0)) {
+      const c0 = cardsByIdx.get(0);
+      renderOpt(0, "RK3588", c0 ? (c0.device_id || "主控 SoC") : "主控 SoC");
     }
-    const retry = document.createElement("button");
-    retry.type = "button";
-    retry.className = "cc-banner-btn cc-model-error-retry";
-    retry.textContent = "重试";
-    retry.addEventListener("click", async () => {
-      retry.disabled = true;
-      try {
-        await this.toggle(npuIndex, model, false);
-        await this.toggle(npuIndex, model, true);
-      } finally {
-        retry.disabled = false;
-      }
-    });
-    wrap.appendChild(retry);
-    return wrap;
+    for (const idx of sorted) {
+      if (idx === 0) continue;
+      if (ordinal182x >= MAX_RK182X_OPTIONS) break;
+      const c = cardsByIdx.get(idx);
+      renderOpt(idx, `RK182x #${ordinal182x}`, c ? (c.device_id || `npu #${idx}`) : `npu #${idx}`);
+      ordinal182x += 1;
+    }
+    // 兜底：完全没拿到任何 NPU 信息时，给出一个 placeholder。
+    if (rendered === 0) {
+      const ph = document.createElement("span");
+      ph.className = "cc-mem-empty";
+      ph.style.fontSize = "12px";
+      ph.textContent = "未检测到 NPU 卡 —— 等待 enumerate…";
+      opts.appendChild(ph);
+    }
+    fs.appendChild(opts);
+    return fs;
   },
 
-  _statusLabel(inst) {
-    if (!inst || inst.status === "stopped") return "禁用";
-    if (inst.status === "queued") {
-      const waitSec = this._countdownSec(inst, "queued");
-      return `排队中，预计 ${waitSec}s`;
+  _defaultTargetNpu(cards) {
+    if (!cards || !cards.length) return 1;     // 兜底：选 182x #0
+    const sorted = cards.map(c => c.npu_index).sort((a, b) => a - b);
+    return sorted.includes(0) ? Math.max(1, sorted[0]) : sorted[0];
+  },
+
+  _switchTitle(meta, inst, isLoad) {
+    if (!inst) return "点开关加载";
+    switch (inst.status) {
+      case "running":    return "运行中 · 点开关停止";
+      case "loading":
+      case "queued":     return "加载中 · 已锁定不可点";
+      case "not_loaded":
+      case "ready_lazy": return "子进程已起 · 点开关加载";
+      case "error":      return (inst.error || "启动失败") + " · 点开关重试";
+      default:           return isLoad ? "加载中 · 已锁定" : "点开关切换";
+    }
+  },
+
+  _switchAriaLabel(meta, inst, noCards, isLoad) {
+    if (noCards) return `${meta.label}：无可用 NPU 卡，开关不可用`;
+    if (!inst) return `${meta.label}：未启动，点开关加载`;
+    switch (inst.status) {
+      case "running":    return `${meta.label}：运行中，点开关停止`;
+      case "loading":    return `${meta.label}：加载中（已锁定）`;
+      case "queued":     return `${meta.label}：排队中（已锁定）`;
+      case "not_loaded":
+      case "ready_lazy": return `${meta.label}：未启动，点开关加载`;
+      case "error":      return `${meta.label}：启动失败，点开关重试`;
+      default:           return isLoad
+        ? `${meta.label}：加载中`
+        : `${meta.label}：点开关切换`;
+    }
+  },
+
+  _statusLineText(modelId, meta, inst) {
+    if (!inst) {
+      return `点开关加载 · 预计 ${meta.estimated_init_seconds}s`;
+    }
+    if (inst.status === "running") {
+      return `运行中 · NPU #${inst.npu_index} · ~${meta.memory_estimate_mb} MB`;
     }
     if (inst.status === "loading") {
       const left = this._countdownSec(inst, "loading");
-      return `初始化中... ${left}s`;
+      return `初始化中… 约 ${left}s`;
     }
-    if (inst.status === "running") return "运行中";
-    if (inst.status === "error") return "启动失败";
+    if (inst.status === "queued") {
+      const waitSec = this._countdownSec(inst, "queued");
+      return `排队中 · 预计 ${waitSec}s`;
+    }
+    if (inst.status === "ready_lazy") {
+      return `已启用 · 子进程就绪，首次推理触发加载`;
+    }
+    if (inst.status === "error") {
+      return inst.error || "启动失败";
+    }
     return inst.status;
   },
 
   _estimateFor(inst) {
-    const perModel = this._snapshot?.estimated_init_seconds_per_model || {};
-    return perModel[inst?.model] ?? this._snapshot?.default_estimated_init_seconds ?? 10;
+    const perModel = (this._snapshot && this._snapshot.estimated_init_seconds_per_model) || {};
+    return perModel[inst && inst.model] ??
+           (this._snapshot && this._snapshot.default_estimated_init_seconds) ?? 10;
   },
 
   _countdownSec(inst, kind) {
     const est = this._estimateFor(inst);
     if (kind === "queued") {
-      // worker 是单线程串行，同 npu 内严格按 queued_at 顺序。
-      // 跨 npu 理论上能并行，但当前 worker 一次只跑一条，所以也算"队列"里。
-      // 用 queued_at 升序算"前面还有几条"。
       const inQueue = (this._snapshot?.instances || [])
         .filter(i => i.status === "queued" || i.status === "loading")
         .sort((a, b) => (a.queued_at || 0) - (b.queued_at || 0));
-      const idx = inQueue.findIndex(i => i.npu_index === inst.npu_index && i.model === inst.model);
+      const idx = inQueue.findIndex(i => i.npu_index === inst.npu_index && i.model_id === inst.model_id);
       const ahead = idx < 0 ? 0 : idx;
       return Math.max(0, ahead) * est;
     }
@@ -4053,84 +4601,29 @@ const ComputeConfigPage = {
     return 0;
   },
 
-  // 渲染 RK3588 列的内置工具列表（从 snapshot.tools 取数据）。
-  // 默认全部启用 —— 用户不能从这一列 toggle；可用性仅取决于依赖 capability 是否启用。
-  _renderTools(snapshot) {
-    const ul = document.getElementById("cc-tools-list");
-    if (!ul) return;
-    const tools = (snapshot && snapshot.tools) || [];
-    ul.innerHTML = "";
-    if (!tools.length) {
-      const empty = document.createElement("li");
-      empty.className = "cc-tools-empty";
-      empty.textContent = "当前没有可用工具";
-      ul.appendChild(empty);
-      return;
-    }
-    for (const t of tools) {
-      const li = document.createElement("li");
-      li.className = "cc-tool-card";
-      const head = document.createElement("div");
-      head.className = "cc-tool-card-head";
-      const name = document.createElement("span");
-      name.className = "cc-tool-card-name";
-      name.textContent = t.name;
-      const key = document.createElement("span");
-      key.className = "cc-tool-card-key";
-      key.textContent = t.key;
-      const badge = document.createElement("span");
-      badge.className = "cc-tool-card-badge is-on";
-      badge.textContent = "已启用";
-      head.appendChild(name);
-      head.appendChild(key);
-      head.appendChild(badge);
-      const desc = document.createElement("div");
-      desc.className = "cc-tool-card-desc";
-      desc.textContent = t.description;
-      const state = document.createElement("div");
-      if (t.requires_capability) {
-        if (t.available) {
-          state.className = "cc-tool-card-state is-ok";
-          state.textContent = `✓ 可用 · 依赖 ${t.requires_capability}`;
-        } else {
-          state.className = "cc-tool-card-state is-bad";
-          state.textContent = `⚠ 依赖未启用 · ${t.reason || t.requires_capability}`;
-          badge.classList.remove("is-on");
-          badge.classList.add("is-off");
-          badge.textContent = "不可用";
-        }
-      } else {
-        state.className = "cc-tool-card-state is-neutral";
-        state.textContent = "无外部依赖";
-      }
-      li.appendChild(head);
-      li.appendChild(desc);
-      li.appendChild(state);
-      ul.appendChild(li);
-    }
-  },
-
   _renderSummary() {
     const snap = this._snapshot || {};
     const cards = snap.cards || [];
-    const sup = snap.supported_models || [];
     const running = snap.running_count || 0;
     const queued  = snap.queued_count  || 0;
     const loading = snap.loading_count || 0;
     const error   = snap.error_count   || 0;
-    const totalMb = snap.total_memory_mb || 0;
+    // "算力卡" 数：只数 RK182x 协卡，RK3588 主控不占算力卡位。
+    // rkai 可能把单张物理卡拆成多个 context 索引（npu_index > 0），
+    // 按 cap 截到实际物理协卡数。
+    const rk182xCount = Math.min(
+      CC_MAX_RK182X_CARDS,
+      cards.filter(c => c.npu_index > 0).length,
+    );
     const parts = [
-      `${cards.length} 张算力卡`,
-      `${sup.length} 个候选模型`,
+      `${rk182xCount} 张算力卡`,
       `${running} 运行中`,
       error   ? `${error} 失败`  : null,
       loading ? `${loading} 加载中` : null,
       queued  ? `${queued} 排队中`  : null,
-      `已用 ${totalMb} MB`,
     ].filter(Boolean);
-    const summary = parts.join(" · ");
     const at = document.getElementById("cc-collected-at");
-    if (at) at.textContent = summary;
+    if (at) at.textContent = parts.join(" · ");
     const last = snap.last_updated;
     if (last) {
       const ago = Math.max(0, Math.round(Date.now() / 1000 - last));
@@ -4144,6 +4637,16 @@ const ComputeConfigPage = {
     el.className = "cc-foot " + (kind || "");
     el.textContent = msg || "";
   },
+
+  // ---------- 网络算力卡（只读，DDS 发现的对端 compute 服务） ----------
+  // 数据源：``/api/discovery/dds`` 返回的 ``discovered[]`` —— 每条
+  // 对端 FastDDS participant 不再在本页渲染 —— 新设计下算力配置页下栏
+// 直接读 /api/compute snapshot.services（来自 registry 的 adopted /
+// unavailable 分组），数据更新更准且与 capability 路由一致。Discovery
+// 页（单独的注册发现面板）保留 Capability 广播那条路径。
+  _renderNetworkServices() { /* deprecated — kept as no-op for safety */ },
+  _networkEmpty(text) { return document.createTextNode(text); },
+  _makeNetworkCard() { return null; },
 };
 
 /* ---------------------------------------------------------------- *

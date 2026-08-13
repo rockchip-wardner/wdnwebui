@@ -33,7 +33,7 @@ creation); everything below is verified against the current tree.
    由调用方决定如何向上层报告（视频监控选择静默 error 返回，不阻塞 16 路
    解码；视频检测 / 语音生成选择 raise，由 HTTP 层 502 透传给前端）。
 实例集合在 算力配置 页配置，存到 `config.json["compute"]["instances"]`，
-    `run.py` 启动时后台线程串行加载，不阻塞 UI。
+    `run.py` 启动时**逐个 spawn 独立 compute_worker 子进程**（不阻塞 UI）。
 5. **所有演示页（音视频描述 / 视频目标检测 / 视频内容检索 / 语音生成）
    离开时必须主动关闭后台运行**。`app/static/js/app.js` 的 `DemoGuard`
    统一负责：
@@ -41,7 +41,7 @@ creation); everything below is verified against the current tree.
      `state ∈ {opening, playing, paused, eof}` 或 detector `enabled=true`，
      TTS `busy=true`），先弹 `confirm()`，用户确认后 await 后端
      `/close` + `/prompt/stop`（或 `/tts/stop`）再放行；用户取消则
-     `preventDefault()` 阻止跳转。
+    `preventDefault()` 阻止跳转。
    * `beforeunload`（关 tab / 刷新 / 关闭浏览器）：同步触发原生警告
      对话框，并通过 `navigator.sendBeacon` 或 `fetch({keepalive:true})`
      异步发停请求，best-effort 兜底。
@@ -54,6 +54,68 @@ creation); everything below is verified against the current tree.
    浏览器崩溃、某些移动浏览器会丢弃 beacon）；AGENTS 不做超出此限制
    的承诺。若可靠性要求更高，需要服务端按 session TTL / 心跳
    自动回收 —— 不在本期范围。
+
+## 算力注册中心 — per-model-subprocess RPC (v0.4)
+
+v0.4 重大重构：每个 (npu_index, model_id) 实例现在跑在**独立
+compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
+（Request/Reply over RELIABLE Pub-Sub）通信。架构改造的关键点：
+
+* **`wdndds 0.3` = C++ cshim + ctypes Python wrapper**。
+  抛弃了 v0.2 的 bundled python-fastdds SWIG 绑定；
+  C++ 源码在 `wdndds/cshim_src/`，在 `pip install wdndds` 时通过
+  `wdndds/_build.py` 的 setuptools `build_py` 子类编译成
+  `libwdndds_cshim.so`。运行时链接系统 `libfastrtps2.9` /
+  `libfastcdr1`（apt install libfastrtps-dev libfastcdr-dev）。
+* **每个 model = 1 个 compute_worker 进程**。`ComputeRegistry.start
+`     ` 在主进程 spawn 一个 `python app/services/compute_worker.py
+       --model <id> --npu <k>` 子进程（**子进程默认不加载模型** —
+       等首次 RPC 到达时再 lazy `LLMSession(model=spec, npu=k)`）。
+* **主进程持 RpcClient**：`get_registry().get_session(cap)` 返回
+  `app/services/rpc_session_proxy.RpcSessionProxy`，内部转发
+  `reset()` / `respond()` 到 worker 的 `wdndds/rpc/<model_id>` service
+  topic，再从 `<service_name>/reply` shared reply topic 拿回 JSON reply。
+  业务侧（detector / tts / vfa / text_chat）调用方式**不变**
+  —— `RpcSessionProxy` 保持 `rkai.LLMSession` 的 `.reset()` /
+  `await .respond(prompt, attachment, ...)` 表面。
+* **服务端 lock**：worker 进程内一个 cshim pump 线程串行消费请求，
+  处理完 reply 完毕后才接下一个；多个 worker 并行是允许的
+  （不同 NPU / 不同 model 实例各跑各的）。跨进程互斥锁在 v0.4 不需要
+  —— 主进程侧 `RpcSessionProxy.respond` 内部 1 个 ThreadPoolExecutor
+  串行化同一 instance 的并发请求。
+* **`boot_compute_services` 在 boot 默认开启**。`app/main.py`
+  `create_app` 调用一次，遍历 `config.compute.services`
+  （典型 `["qwen3-vl-4b", "qwen3-tts", "qwen3-8b"]`）逐条做
+  probe → adopt-or-spawn。worker 起来后**只**注册 DDS endpoint，
+  不 build LLMSession；npu_index 由用户在算力配置页选 NPU 后通过
+  RPC `{"action":"load","npu_index":N}` 传入。
+  `_probe_instance` daemon 线程周期性 RPC `info` 同步 worker
+  状态（`not_loaded` / `loading` / `running` / `error`）。
+* **`get_session_call_lock()` 留作 no-op 兼容旧调用点**
+  （仅 `video_file_analysis.py` 还在 import）。
+
+### 已知约束 / 待完善
+
+* **本机 FastDDS 2.9 bug**：在 Debian bookworm 板上的系统
+  libfastrtps2.9 包 `DataWriter::enable()` 会 SIGSEGV
+  （在 `get_payload_pool()` 里），所以当前主机跨进程 DDS 收发都
+  跑不通。这是系统库的问题，**不是 wdndds 架构的问题**——
+  改用 SRIO / 共享内存 / Unix socket 等替代传输时，进程间通信照常
+  跑得通。架构在协议层是干净的：每个 worker 一个 service，每个
+  service 一个 request topic + 一个 shared reply topic。
+* **流式 vs 一次性**：`RpcClient.call` 首版只支持一次性 reply
+  (`{"ok": True, "data": {...}}`)。API 层面 `call_streaming`
+  已经预留签名但未实现；如果加回来需要 cshim 多一条 streaming
+  topic 通路。
+* **多 NPU 跨子组件**：当前 `ModelInstance.npu_index: int` 单值；
+  后续 vision@NPU0 + llm@NPU1 这种「一个 model 跨多 NPU」配置要
+  等 rkai SDK 改 spec + pyrkaiweb 解析 `npu_assignments: dict[str, int]`
+  —— 当前每个 model 一个实例，所以 service_name = `wdndds/rpc
+`     <model_id>`（**不带 npu 后缀**），单 model 多 npu 也在子进程
+  内部决策。
+* **同 model 不允许重复实例**：`compute_registry.start_one` 校验
+  `(npu_index, model_id)` 不重复；UI  已经在加「instance_name」
+  之前按 (npu, model) 唯一。
 
 ## TL;DR commands
 
@@ -441,14 +503,16 @@ holds it in memory. The file is seeded with a `base` section at
   `PowerMenu` was untouched and is mutually exclusive with
   `ConfigMenu` via the `_wrapOpenToCloseOther` helper.
 - **算力配置 (`ComputeConfigPage`) + 算力注册中心 (`ComputeRegistry`)**
-  —— 用户在算力配置页启用/禁用实例；每条实例绑定到一张 NPU 卡（由
-  `RKNN3Lite().get_devices_id()` 枚举）+ 一个 model preset。同一 NPU 上
-  多个不同 model 允许（按内存预算自我约束），但同 NPU 重复同 model 拒绝
-  （pydantic 校验 + 注册中心运行时校验双层防护）。内存估算硬编码：
-  Qwen3-VL-4B ≈ 3500 MB / Qwen3-TTS ≈ 1900 MB / Qwen3-ASR ≈ 2500 MB。
-  启动 **不阻塞 UI**：`apply_boot_config_async()` 起一个 daemon thread
-  串行加载；UI 通过 `GET /api/compute` 每秒轮询状态，queued / loading
-  实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL = 8s`）。
+  —— 用户在算力配置页启用/禁用/重启实例；每条实例绑定到一张 NPU 卡
+  （由 `RKNN3Lite().get_devices_id()` 枚举）+ 一个 model preset。同一
+  NPU 上多个不同 model 允许（按内存预算自我约束），但同 NPU 重复同
+  model 拒绝（pydantic 校验 + 注册中心运行时校验双层防护）。内存估算
+  硬编码：Qwen3-VL-4B ≈ 3500 MB / Qwen3-TTS ≈ 1900 MB / Qwen3-8B ≈
+  4950 MB。Boot 流程：`boot_compute_services()` 遍历
+  `config.compute.services` 逐条 probe → adopt-or-spawn；worker 起来
+  后**不** build LLMSession，等用户在算力配置页选 NPU 触发 RPC load
+  才 instantiate（55-90s）。UI 通过 `GET /api/compute` 每秒轮询状态，
+  loading 实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL`）。
   Capability 概念作为内部 key 使用（`get_session("swcap_video_describe")` /
   `"swcap_audio_tts"`），注册发现的 wire 侧由 :mod:`app.services.dds_discovery`
   负责把当前活跃实例的能力转换成 wdndds ``Capability`` 实例广播到 DDS。
@@ -536,9 +600,7 @@ DDS 子面板（`data-pane="dds"`）通过 wdndds 调 FastDDS 把本机能力广
   hwcap_video_input  → HWVideoInput    swcap_video_query    → SWVideoQuery
   hwcap_audio_input  → HWAudioInput    swcap_video_describe → SWVideoDescribe
   hwcap_audio_output → HWAudioOutput   swcap_video_analyse  → SWVideoAnalyse
-  hwcap_hdmi_display → HWHDMIDisplay   swcap_audio_query    → SWAudioQuery
-                                      swcap_audio_analyse  → SWAudioAnalyse
-                                      swcap_audio_tts      → SWAudioTTS
+  hwcap_hdmi_display → HWHDMIDisplay   swcap_audio_tts      → SWAudioTTS
                                       swcap_text_chat      → SWTextChat
   ```
   未知 ``capability_type`` 静默跳过（不让单个坏数据把整个 register 拖挂）。
@@ -642,32 +704,52 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   doesn't expose a `set(1, frame_pos)` API; plumbing one in means
   touching `self._container` internals. The progress bar is currently
   read-only and animates only for live sources.
-- **`ComputeRegistry` 启动顺序**：`app.main.create_app()` 必须先
-  `include_router(compute.router)`，**再**（可选）调
-  `get_registry().apply_boot_config_async()`，**再**注册 detector 的
+- **`ComputeRegistry` 启动顺序 (v0.7)**：`app.main.create_app()` 必须先
+  `include_router(compute.router)`，**再**调
+  `get_registry().boot_compute_services()`，**再**注册 detector 的
   frame sink。
 
-  **当前 boot 不自动加载**：`apply_boot_config_async()` 在 `app/main.py`
-  里被注释掉。ComputeRegistry worker 线程在第一次 `POST /api/compute/instances`
-  时由 `start_one` → `_wake_worker` → `_ensure_worker` 按需起 daemon thread。
-  config.json["compute"]["instances"] 里的条目仍会被
-  `POST /api/compute/instances` / `start_one` 写到 `inst.model`，
-  重启后配置保留，但**不会**自动启动 —— 用户必须从算力配置页手动启用。
-  Detector 等消费方在第一次 inference 时才调
-  `get_registry().get_session("swcap_video_describe")`—— registry 还是空就会抛
-  "功能未启用"，这是预期行为（不是 bug）。
+  **`boot_compute_services()`**：遍历 `config.compute.services`
+  列表（典型：``["qwen3-vl-4b", "qwen3-tts", "qwen3-8b"]``），逐条
+  做 probe → adopt-or-spawn：
+   - **probe**：对 `wdndds/rpc/<model_id>` 走短超时 RPC ``info``（~1.5s）
+   - **命中**（LAN peer 已响应或上轮孤儿 worker 还在）→ ``_adopt_existing_worker``，
+     `proc=None` + `_source="adopted"`，**不** spawn 新进程
+   - **未命中** → ``_spawn_compute_worker`` 拉新子进程
+     （`python compute_worker.py --model <id>`，**不传 --npu**）
+
+  worker 启动后**只**起 Hub + Service + Replier，不 build LLMSession。
+  状态停在 ``not_loaded``；用户在算力配置页选 NPU 后触发
+  ``POST /api/compute/instances {model, npu_index}`` →
+  ``bind_instance`` 走 RPC ``load{npu_index}`` 才 instantiate
+  ``LLMSession(model=spec, npu=N)``。这条 boot 流程**不**自动 bind
+  任何 NPU —— 完全解耦 web 与 worker：web shutdown 不 kill worker，
+  worker 独立进程生命周期由 systemd / 手动 / 跨主机发现共同管理。
+
 - **单帧工具循环硬上限**：`RkaiDetector._ABSOLUTE_MAX_ITERS = 200`
   是兜底，不论 `config.json["compute"]["tool_call_max_iters"]` 是 0
   （无限）还是用户显式填了超大值，单帧推理都不会超过 200 次
-  `sess.respond`。200 次 × 1s/inference ≈ 3 分钟单帧最坏延迟 —
+  `sess.respond`。200 次 × 1s/inference ≈ 3 分钟单帧最坏延迟 -
   — 失控模型可以跑很久但不会锁死整个 worker 线程 / 队列。
   配置热生效：每次推理前 `_get_tool_call_max_iters()` 重读 config.json。
-- **`apply_boot_config_async` 的后台线程只在 reload 模式下被杀掉**：
-  uvicorn `reload=True` 重启父进程时 daemon thread 跟着挂掉；
-  production（`reload=False`）下要靠 `create_app` 的
-  `on_event("shutdown")` 调 `get_registry().close_all()`，会 join
-  worker thread（最长 2s）。正在 loading 的模型被中断后会留在
-  `status='error'`，下次启动时由 `apply_boot_config_async` 重新尝试。
+- **probe 线程（per-instance daemon）**：每个 spawned / adopted
+  ModelInstance 在创建时起一个 daemon ``_probe_instance`` 线程，1Hz
+  轮询 ``info`` RPC，把 worker 的 ``not_loaded / loading / running / error``
+  同步到 registry。worker 进程意外退出时 probe 把 inst 翻 ``error``
+  并捕获 stderr。Reload 模式下 uvicorn 重启父进程会杀掉 daemon thread；
+  production 下靠 `close_all`（但 v0.7 起 `close_all` 不杀 worker）。
+- **Local-only operations**：算力配置页的"启用 / 禁用 / 重启"按钮
+  只对 ``ModelInstance.proc is not None``（本机 spawned）的 service 可见
+  可点；``adopted``（peer 提供的 service，本机无 proc）或
+  ``unavailable``（daemon 全 LAN 没找到 peer）只能查看状态。后端通过
+  ``_require_owned(inst, action)`` 拦 403；前端按钮按
+  ``snapshot.services[]._source`` 渲染可见性。当前网络推理不做（Q2：
+  "网络推理我们后面再设计"）—— LAN peer 的 service 在本机只读 view。
+- **重启 4 步 (Q3)**：`POST /api/compute/restart {model}` →
+  ``stop_instance_local(model)`` (unload → RPC shutdown → wait 3s →
+  kill -9) → ``ensure_worker_for_model(model)``（probe → adopt /
+  spawn）。**不**自动 bind —— 重启后 worker 回到 ``not_loaded``，
+  用户需在算力配置页再点"启用" + 选 NPU 才完成 reload。
 
 ## TTS (语音生成) page
 
@@ -1149,11 +1231,10 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
      - `kind="vlm"`：`rknn_llm_path` + `rknn_vision_path` + `embed_path` +
        `tokenizer_path`（`weight_llm_path` / `weight_vision_path` 由
        `.1828.rknn` 路径自动 derive，probe 不单独校验）
-     - `kind="tts"`：`tts_model_dir` 目录存在即可；具体
-       `.1828.rknn` / `.weight` / `.fp16.bin` 清单交给 backend 真实 init
-       阶段报更精确错误
-     - `kind="asr"`：`asr_model_dir` 目录 + `embed_path` + `tokenizer_path`
-   * `RKNN3Lite().get_devices_id()` 枚举得到 ≥ `npu_index + 1` 张卡
+- `kind="tts"`：`tts_model_dir` 目录存在即可；具体
+        `.1828.rknn` / `.weight` / `.fp16.bin` 清单交给 backend 真实 init
+        阶段报更精确错误
+    * `RKNN3Lite().get_devices_id()` 枚举得到 ≥ `npu_index + 1` 张卡
 2. **父进程完整 init** (`LLMSession(model=spec, npu=npu_index)`，~55s)：
    * `try/except` 包住；非 std::terminate 错误都进 `inst.error`
 3. **持久化** + LOG 显示 `probe=Xs init=Ys total=Zs`
@@ -1254,4 +1335,227 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   `_api` 只在 `poll_qr_status` 时拉 HTTP）。登录失败 / QR 过期 → SDK
   内部走 `MAX_QR_REFRESH_COUNT=3` 轮后抛 `AuthError`，wrapper 把
   `login_state` 切到 `error`，UI 看到红色徽章 + 点 登录 重试。
+
+
+## wdndds_daemon — FastDDS Discovery Server (v0.5)
+
+v0.5 在 v0.4 的 per-model-subprocess RPC 之上加了**集中式发现 daemon**，
+绕开 FastDDS 2.9 在本机的 SPDP multicast 发现 bug（**改用 SERVER/CLIENT
+协议 + UDP 单播**）。
+
+### 架构
+
+```
+       ┌───────────────────────┐
+       │   wdndds_daemon       │   唯一一个进程
+       │   (FastDDS SERVER     │   默认端口：UDP 7411 / HTTP 7412
+       │    discovery protocol)│   (可在 config.json 里改)
+       └───────────────────────┘
+                 │  (UDP 单播：peers 互相发现)
+       ┌─────────┼─────────┼─────────┐
+       ▼         ▼         ▼         ▼
+   pyrkaiweb  worker   worker   worker     (CLIENT protocol,
+     main     qwen3   qwen3      qwen8      discovery_servers 指向 daemon)
+```
+
+* 每个 LAN 跑一个 `wdndds_daemon` 进程。**没有 fallback**（多播 / SIMPLE
+  在嵌入式板不可靠；server 故障 = 整个 LAN 不通）。
+* 所有 pyrkaiweb 进程（main / compute_worker / im-bridge / 任意）
+  通过 `config.json["compute"]["discovery_servers"]` 指向 daemon 的
+  `host:port`。
+* daemon 同时服务于「compute RPC 跨机器发现」和「Discovery 页在网注册」
+  —— **同一个 daemon，两个用途**。
+
+### wdndds_daemon 启动方式
+
+**1) 主进程随 pyrkaiweb 一起启动（dev / 小部署）**
+
+`config.json["compute"]["auto_start_daemon"]: true` 时，`app/main.py`
+`create_app()` 会 `subprocess.Popen` 拉起 daemon（默认端口可改）。
+
+**2) 手动启动（生产 / systemd）**
+
+```bash
+# 前台
+.venv/bin/python -m app.services.wdndds_daemon --udp-port 7411 --http-port 7412
+
+# 通过 systemd unit（生产推荐）
+[Unit]
+Description=wdndds discovery daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/userdata/pyrkaiweb/.venv/bin/python -m app.services.wdndds_daemon     --udp-port 7411 --http-port 7412
+WorkingDirectory=/userdata/pyrkaiweb
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**3) HTTP API（前端 / 调试用）**
+
+```
+GET  /status   {"running", "started_at", "uptime_sec", "udp_port", "guid", "participant_count"}
+GET  /peers    {"peers": [{"guid", "name"}, ...]}   (基于 DomainParticipantListener)
+GET  /health   {"ok": true}
+```
+
+### pyrkaiweb 端配置
+
+`config.json["compute"]` 字段：
+
+```json
+{
+  "instances": [{"npu_index": 0, "model": "qwen3-vl-4b"}],
+  "discovery_servers": ["127.0.0.1:7411"],   // 主进程 / worker 都读这个
+  "discovery_server_port": 7411,            // 仅 auto_start_daemon 用
+  "daemon_http_port": 7412,                 // 同上
+  "auto_start_daemon": false                // 默认 false（生产用 systemd）
+}
+```
+
+`compute_registry._persist()` **保留** `discovery_servers` / `ports` /
+`auto_start_daemon` 字段（v0.5.1 修复：之前会覆盖整个 compute section）。
+
+### 跨进程 RPC：发现 + 数据平面
+
+* **发现**：daemon 跑 SERVER 协议，所有 client 跑 CLIENT 协议 →
+  daemon 监听 UDP 7411 → 每个 client 把自己的 participant + endpoint
+  注册到 daemon → daemon 把 endpoint 信息分发给所有 client。
+* **数据平面**：compute_worker 用 `SHM + UDPv4 + TCPv4` 三种 transport；
+  SHM 走同机零拷贝，UDPv4 走同 LAN，TCPv4 走跨子网。
+* **共享 reply topic**：request / reply 两个 topic 复用 shared reply。
+  请求 ID 在 ComputeRequest/ComputeReply 里匹配（参见
+  `wdndds/idl/compute.idl`）。
+* **首次调用 race**：daemon 刚启动时 endpoint 还没匹配，第一次
+  `RpcClient.call()` 会 timeout（约 5s），第二次起成功。pyrkaiweb
+  probe 自动 retry（每 1s 一次，5s timeout）。
+
+### 注意事项
+
+* **本机 FastDDS 3.6.2 编译 + 源码安装**（参见
+  `.venv/src/wdndds/build_native.sh`）：libfastdds / libfastcdr /
+  libwdndds_idl / libwdndds_cshim 全部安装到 `wdndds/native/`，不依赖
+  系统 apt 包。
+* **FastDDS 3.6 的 rrpc API 还是 stub 状态**：DomainParticipant::create_service
+  等返回 `RETCODE_UNSUPPORTED`（参见 Fast-DDS `DomainParticipantImpl.cpp`）。
+  wdndds_cshim 直接用 raw `DataReader` / `DataWriter` 模拟 Request/Reply
+  —— 等 FastDDS 真实现 rrpc 后可以简化。
+* **disable_builtin_multicast=true** + **avoid_builtin_multicast=true**：
+  cshim 在 SERVER/CLIENT 模式下禁用 multicast，单纯走 UDP 单播。
+  这是 FastDDS 3.6 的官方推荐（embedded board 不保证有 multicast 路由）。
+
+
+## wdndds_daemon — FastDDS Discovery Server (v0.5)
+
+v0.5 在 v0.4 的 per-model-subprocess RPC 之上加了**集中式发现 daemon**，
+绕开 FastDDS 2.9 在本机的 SPDP multicast 发现 bug（**改用 SERVER/CLIENT
+协议 + UDP 单播**）。
+
+### 架构
+
+```
+       ┌───────────────────────┐
+       │   wdndds_daemon       │   唯一一个进程
+       │   (FastDDS SERVER     │   默认端口：UDP 7411 / HTTP 7412
+       │    discovery protocol)│   (可在 config.json 里改)
+       └───────────────────────┘
+                 │  (UDP 单播：peers 互相发现)
+       ┌─────────┼─────────┼─────────┐
+       ▼         ▼         ▼         ▼
+   pyrkaiweb  worker   worker   worker     (CLIENT protocol,
+     main     qwen3   qwen3      qwen8      discovery_servers 指向 daemon)
+```
+
+* 每个 LAN 跑一个 `wdndds_daemon` 进程。**没有 fallback**（多播 / SIMPLE
+  在嵌入式板不可靠；server 故障 = 整个 LAN 不通）。
+* 所有 pyrkaiweb 进程（main / compute_worker / im-bridge / 任意）
+  通过 `config.json["compute"]["discovery_servers"]` 指向 daemon 的
+  `host:port`。
+* daemon 同时服务于「compute RPC 跨机器发现」和「Discovery 页在网注册」
+  —— **同一个 daemon，两个用途**。
+
+### wdndds_daemon 启动方式
+
+**1) 主进程随 pyrkaiweb 一起启动（dev / 小部署）**
+
+`config.json["compute"]["auto_start_daemon"]: true` 时，`app/main.py`
+`create_app()` 会 `subprocess.Popen` 拉起 daemon（默认端口可改）。
+
+**2) 手动启动（生产 / systemd）**
+
+```bash
+# 前台
+.venv/bin/python -m app.services.wdndds_daemon --udp-port 7411 --http-port 7412
+
+# 通过 systemd unit（生产推荐）
+[Unit]
+Description=wdndds discovery daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/userdata/pyrkaiweb/.venv/bin/python -m app.services.wdndds_daemon \
+    --udp-port 7411 --http-port 7412
+WorkingDirectory=/userdata/pyrkaiweb
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**3) HTTP API（前端 / 调试用）**
+
+```
+GET  /status   {"running", "started_at", "uptime_sec", "udp_port", "guid", "participant_count"}
+GET  /peers    {"peers": [{"guid", "name"}, ...]}   (基于 DomainParticipantListener)
+GET  /health   {"ok": true}
+```
+
+### pyrkaiweb 端配置
+
+`config.json["compute"]` 字段：
+
+```json
+{
+  "instances": [{"npu_index": 0, "model": "qwen3-vl-4b"}],
+  "discovery_servers": ["127.0.0.1:7411"],   // 主进程 / worker 都读这个
+  "discovery_server_port": 7411,            // 仅 auto_start_daemon 用
+  "daemon_http_port": 7412,                 // 同上
+  "auto_start_daemon": false                // 默认 false（生产用 systemd）
+}
+```
+
+`compute_registry._persist()` **保留** `discovery_servers` / `ports` /
+`auto_start_daemon` 字段（v0.5.1 修复：之前会覆盖整个 compute section）。
+
+### 跨进程 RPC：发现 + 数据平面
+
+* **发现**：daemon 跑 SERVER 协议，所有 client 跑 CLIENT 协议 →
+  daemon 监听 UDP 7411 → 每个 client 把自己的 participant + endpoint
+  注册到 daemon → daemon 把 endpoint 信息分发给所有 client。
+* **数据平面**：compute_worker 用 `SHM + UDPv4 + TCPv4` 三种 transport；
+  SHM 走同机零拷贝，UDPv4 走同 LAN，TCPv4 走跨子网。
+* **共享 reply topic**：request / reply 两个 topic 复用 shared reply。
+  请求 ID 在 ComputeRequest/ComputeReply 里匹配（参见
+  `wdndds/idl/compute.idl`）。
+* **首次调用 race**：daemon 刚启动时 endpoint 还没匹配，第一次
+  `RpcClient.call()` 会 timeout（约 5s），第二次起成功。pyrkaiweb
+  probe 自动 retry（每 1s 一次，5s timeout）。
+
+### 注意事项
+
+* **本机 FastDDS 3.6.2 编译 + 源码安装**（参见
+  `.venv/src/wdndds/build_native.sh`）：libfastdds / libfastcdr /
+  libwdndds_idl / libwdndds_cshim 全部安装到 `wdndds/native/`，不依赖
+  系统 apt 包。
+* **FastDDS 3.6 的 rrpc API 还是 stub 状态**：DomainParticipant::create_service
+  等返回 `RETCODE_UNSUPPORTED`（参见 Fast-DDS `DomainParticipantImpl.cpp`）。
+  wdndds_cshim 直接用 raw `DataReader` / `DataWriter` 模拟 Request/Reply
+  —— 等 FastDDS 真实现 rrpc 后可以简化。
+* **disable_builtin_multicast=true** + **avoid_builtin_multicast=true**：
+  cshim 在 SERVER/CLIENT 模式下禁用 multicast，单纯走 UDP 单播。
+  这是 FastDDS 3.6 的官方推荐（embedded board 不保证有 multicast 路由）。
 

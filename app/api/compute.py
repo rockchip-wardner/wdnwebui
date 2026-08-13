@@ -1,34 +1,37 @@
-"""算力注册中心 REST API。
+"""算力注册中心 REST API (v0.7)。
 
 Endpoints
 ---------
-* ``GET    /api/compute``           完整 snapshot（cards / supported_models /
-                                   instances / 内存汇总 / 队列长度 / 当前 capabilities）。
-                                   UI 算力配置页 / discovery 页都从这里读。
-* ``GET    /api/compute/config``     读 ``config.json["compute"]``（仅数据，不启动）。
-* ``PUT    /api/compute/config``     全量替换（仅持久化，不触发启动）。Pydantic 校验
-                                   （同 npu 重复 model 拒绝）。
-* ``POST   /api/compute/instances``  ``{npu_index, model}`` → live 启动（后台 worker
-                                   真正加载）+ persist。
-* ``DELETE /api/compute/instances``  ``{npu_index, model}`` → live 停止 + persist。
-* ``GET    /api/compute/capabilities``  discovery 页面渲染源 —— 拆分为
-                                       ``sw_capabilities``（running 实例暴露的 SW 能力）
-                                       + ``hw_capabilities``（来自 ``hardware_capabilities``
-                                       配置的静态 HW 能力 + enabled 状态）。
-* ``PUT    /api/compute/hardware-capabilities``  更新 HW 能力启用状态，persist 到
-                                              ``config.json["compute"]["hardware_capabilities"]``。
-* ``POST   /api/compute/stop-all``   全部停止 + 清空 config.json["compute"].instances。
+* ``GET    /api/compute``                  完整 snapshot（cards / services /
+                                          instances / capabilities / tools）。
+                                          UI 算力配置页 / discovery 页都从这里读。
+* ``GET    /api/compute/config``           读 ``config.json["compute"]`` 数据。
+* ``PUT    /api/compute/config``           全量替换 ``compute`` section。
+* ``POST   /api/compute/instances``        ``{npu_index, model}`` → 用户在算力
+                                          配置页点"启用"。两步：
+                                          (1) ensure worker（probe → adopt /
+                                          spawn）；(2) RPC ``load`` 绑定 npu。
+                                          adopted peer → 403（本机无权 bind）。
+* ``DELETE /api/compute/instances``        ``{npu_index, model}`` → "禁用"。
+                                          仅 spawned 允许；adopted → 403。
+* ``POST   /api/compute/restart``          ``{npu_index?, model}`` → Q3 4 步：
+                                          unload → shutdown → wait/kill →
+                                          走 boot 流程（不自动 bind）。
+                                          仅 spawned 允许。
+* ``POST   /api/compute/stop-all``         全部停止（仅 spawned，adopted 不动）。
+* ``GET    /api/compute/capabilities``     discovery 页用：``sw_capabilities``
+                                          + ``hw_capabilities``。
+* ``PUT    /api/compute/hardware-capabilities``   HW 能力 enable/disable。
 
-错误处理：
+错误码：
 
-* 400 —— pydantic 校验失败（缺字段、model 未知、npu_index 越界、重复实例）。
-* 404 —— list_cards 返回空（未检测到 NPU），或 stop 时实例不存在。
-* 500 —— 后台启动抛了非预期异常（理论上不应该 —— ``_run_one`` 内已经 try/except
-  捕获并写到 ``status='error'``）。
+* 400 —— pydantic 校验失败（缺字段、model 未知、npu_index 越界）。
+* 403 —— 操作的是 adopted / unavailable service（本机无权启停）。
+* 404 —— list_cards 返回空（未检测到 NPU）或 stop 时实例不存在。
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
@@ -45,7 +48,11 @@ router = APIRouter(tags=["compute"])
 # --------------------------------------------------------------------------- #
 # Pydantic 模型
 # --------------------------------------------------------------------------- #
-class InstanceSpec(BaseModel):
+class InstanceRequest(BaseModel):
+    """``POST /compute/instances`` 入参：用户选好 (model, npu) 后启用。
+
+    npu_index 必填，因为 enable 步骤包含 RPC load 绑定 NPU。
+    """
     npu_index: int = Field(ge=0, le=15)
     model: str
 
@@ -59,8 +66,29 @@ class InstanceSpec(BaseModel):
         return v
 
 
-class InstanceRequest(BaseModel):
-    npu_index: int = Field(ge=0, le=15)
+class StopInstanceRequest(BaseModel):
+    """``DELETE /compute/instances`` 入参：只需要 model_id。
+
+    删除不需要 npu_index（registry 内部按 model 唯一索引）。
+    """
+    model: str
+
+    @field_validator("model")
+    @classmethod
+    def _known_model(cls, v: str) -> str:
+        if v not in MODEL_PRESETS:
+            raise ValueError(
+                f"未知 model: {v!r}（可选: {sorted(MODEL_PRESETS.keys())}）"
+            )
+        return v
+
+
+class RestartRequest(BaseModel):
+    """``POST /compute/restart`` 入参：只需要 model_id。
+
+    重启后 worker 回到 ``not_loaded`` 状态；用户在算力配置页再点"启用"
+    + 选 NPU 才完成 reload（per Q3 "走 run.py 启动流程" 语义）。
+    """
     model: str
 
     @field_validator("model")
@@ -74,20 +102,32 @@ class InstanceRequest(BaseModel):
 
 
 class ComputeConfigPayload(BaseModel):
-    instances: List[InstanceSpec] = Field(default_factory=list)
+    """``PUT /api/compute/config`` 入参。
 
-    @field_validator("instances")
-    @classmethod
-    def _no_duplicate_per_npu(cls, v: List[InstanceSpec]) -> List[InstanceSpec]:
-        seen: set[tuple[int, str]] = set()
-        for inst in v:
-            key = (inst.npu_index, inst.model)
-            if key in seen:
-                raise ValueError(
-                    f"重复实例: npu={inst.npu_index} model={inst.model}"
-                )
-            seen.add(key)
-        return v
+    其它字段（discovery_servers / ports / auto_start_daemon /
+    hardware_capabilities 等）按现有语义落盘；``instances`` 若存在被
+    ``extra="ignore"`` 丢弃（实例选择不在 config 持久化）。
+    """
+
+    model_config = {"extra": "ignore"}
+
+
+# --------------------------------------------------------------------------- #
+# 权限 / 状态工具
+# --------------------------------------------------------------------------- #
+def _require_owned(inst, action: str) -> None:
+    """确保 ``inst`` 是本机 spawn 的（proc 非空）；否则抛 403。
+
+    Used by 禁用 / 重启 endpoints。
+    """
+    if inst is None or inst.proc is None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"不能 {action}：该 service 是 {'adopted from peer' if inst else 'unavailable'}，"
+                "请到对端机器操作，或在本机先启动一个本地实例"
+            ),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -110,17 +150,17 @@ async def get_compute_config() -> dict:
     """读 ``config.json["compute"]``（不触发任何启动）。"""
     from app.services.config import get_config
     section = get_config().get_section("compute", {})
-    instances = section.get("instances") if isinstance(section, dict) else None
-    if not isinstance(instances, list):
-        instances = []
-    return {"instances": instances}
+    services = section.get("services") if isinstance(section, dict) else None
+    if not isinstance(services, list):
+        services = []
+    return {"services": services}
 
 
 @router.put("/compute/config")
 async def put_compute_config(payload: ComputeConfigPayload) -> dict:
     """全量替换 ``config.json["compute"]``，**不**触发 live 启动。
 
-    Pydantic 校验：model 必须是 preset 白名单成员；同 npu 重复 model 拒绝。
+    Pydantic ``extra="ignore"``：未知字段（``instances`` 等）静默丢弃。
     """
     from app.services.config import get_config
     try:
@@ -132,31 +172,89 @@ async def put_compute_config(payload: ComputeConfigPayload) -> dict:
 
 @router.post("/compute/instances")
 async def start_instance(req: InstanceRequest) -> dict:
-    """Live 启动一条实例。后台 worker 异步加载；返回时 status="queued"。
+    """用户在算力配置页点"启用"（model + NPU 已选定）。
+
+    流程：
+      1. ``ensure_worker_for_model(model)``：
+         - 本机已有 → 复用
+         - daemon 上有 peer → adopt
+         - 否则 → spawn 本机新进程
+      2. ``bind_instance(model, npu_index)``：RPC ``load{npu_index}`` →
+         worker 调 ``LLMSession(model, npu=N)``。仅 spawned 允许，
+         adopted 抛 RuntimeError → 403。
 
     Raises:
-        400: 重复实例 / npu_index 越界 / 未知 model。
-        404: list_cards 返回空（未检测到 NPU 卡）。
+        400: npu_index 越界 / 未知 model。
+        403: model 是 adopted from peer，本机无权 bind。
     """
     reg = get_registry()
-    if not reg.list_cards():
+    try:
+        inst = reg.ensure_worker_for_model(req.model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if inst.proc is None:
+        # adopted from peer — can only view status, not bind.
+        peer_label = inst._peer_name or inst._peer_guid[:8]
         raise HTTPException(
-            status_code=404,
-            detail="未检测到任何 NPU 卡（RKNN3Lite.get_devices_id() 返回空）",
+            status_code=403,
+            detail=(
+                f"{req.model} 是 peer ({peer_label}) 提供的 service，"
+                "本机无权 bind。请到对端机器上点启用，或先在本机启动"
+                "一个新实例（unavailable → spawned）。"
+            ),
         )
     try:
-        inst = reg.start_one(req.npu_index, req.model)
-    except ValueError as e:
+        inst = reg.bind_instance(req.model, req.npu_index)
+    except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "instance": inst.to_dict(), "snapshot": reg.snapshot()}
 
 
 @router.delete("/compute/instances")
-async def stop_instance(req: InstanceRequest) -> dict:
-    """Live 停止一条实例 + 从 config.json 移除。"""
+async def stop_instance(req: StopInstanceRequest) -> dict:
+    """用户在算力配置页点"禁用"。
+
+    仅 spawned 允许；adopted peer → 403（peer 上的实例只能去对端机器停）。
+
+    Raises:
+        404: model 不在 registry。
+        403: model 是 adopted from peer。
+    """
     reg = get_registry()
-    reg.stop_one(req.npu_index, req.model)
-    reg._persist()  # 重新写一次（已 stop 的不写）
+    inst = reg._find_by_model(req.model)
+    if inst is None:
+        raise HTTPException(
+            status_code=404, detail=f"{req.model} 不在 registry")
+    _require_owned(inst, "禁用")
+    try:
+        reg.stop_instance_local(req.model)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "snapshot": reg.snapshot()}
+
+
+@router.post("/compute/restart")
+async def restart_instance(req: RestartRequest) -> dict:
+    """用户在算力配置页点"重启"——Q3 4 步：
+      1. RPC ``unload``
+      2. RPC ``shutdown``
+      3. wait 3s → kill -9 fallback
+      4. 走 boot 流程（probe → adopt / spawn）。不自动 bind。
+
+    重启后 worker 回到 ``not_loaded``，用户需在算力配置页再点"启用"选 NPU。
+
+    仅 spawned 允许；adopted peer → 403。
+    """
+    reg = get_registry()
+    inst = reg._find_by_model(req.model)
+    if inst is None:
+        raise HTTPException(
+            status_code=404, detail=f"{req.model} 不在 registry")
+    _require_owned(inst, "重启")
+    try:
+        reg.restart_instance_local(req.model)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "snapshot": reg.snapshot()}
 
 
@@ -164,7 +262,7 @@ async def stop_instance(req: InstanceRequest) -> dict:
 async def get_capabilities() -> dict:
     """Discovery 页面渲染源 —— 拆分为 SW + HW 两部分。
 
-    * ``sw_capabilities`` 来自 running 实例（与之前一致）。
+    * ``sw_capabilities`` 来自 running/loading/not_loaded 实例
     * ``hw_capabilities`` 来自 ``HARDWARE_CAPABILITIES`` 静态列表
       + ``config.json["compute"]["hardware_capabilities"]`` 的 enabled 状态。
     """
@@ -193,15 +291,10 @@ class HardwareCapabilityUpdate(BaseModel):
     @field_validator("updates", mode="before")
     @classmethod
     def _strict_bools(cls, v):
-        # Pydantic 默认对 ``dict[str, bool]`` 做强制转换（任何 truthy 字符串
-        # / 非零数字都变 True），需要先在 raw input 阶段拦截，强制只接受 bool。
         if not isinstance(v, dict):
             raise ValueError("updates 必须是 object")
         for k, val in v.items():
             if not isinstance(val, bool):
-                # 显式拒绝 int / str / None 等 —— 即便它们"看起来像"bool。
-                # Pydantic v2 的 bool 字段如果允许 coerce 会把 'true' 当 True 用，
-                # 这对能力开关语义不安全。
                 raise ValueError(
                     f"updates[{k!r}] 必须是 bool (true/false), got {type(val).__name__}"
                 )
@@ -224,12 +317,7 @@ async def put_hardware_capabilities(payload: HardwareCapabilityUpdate) -> dict:
 
 @router.post("/compute/stop-all")
 async def stop_all_instances() -> dict:
-    """全部停止 + 清空 config.json["compute"].instances。"""
+    """全部停止 —— 只停 spawned workers；adopted peers 不动。"""
     reg = get_registry()
-    reg.stop_all()
-    try:
-        from app.services.config import get_config
-        get_config().set_section("compute", {"instances": []})
-    except Exception:
-        pass
+    reg.stop_all_local()
     return {"ok": True, "snapshot": reg.snapshot()}

@@ -282,8 +282,29 @@
           </div>
         </header>
 
+        <div class="cc-mem-strip" id="cc-mem-strip">
+          <div class="cc-mem-empty">加载中…</div>
+        </div>
+
         <div class="cc-banner-stack" id="cc-banner-stack"></div>
-        <div class="cc-cols" id="cc-panels"></div>
+        <div class="cc-grid">
+          <div class="cc-col cc-col-local">
+            <header class="cc-col-head">
+              <h3>本地算力</h3>
+              <span class="cc-col-hint">本机 spawn 的 compute_worker 进程（PID 可见）</span>
+            </header>
+            <div class="cc-services" id="cc-local-cards"></div>
+          </div>
+          <div class="cc-divider" aria-hidden="true"></div>
+          <div class="cc-col cc-col-peer">
+            <header class="cc-col-head">
+              <h3>网络发现</h3>
+              <span class="cc-col-hint">从 DDS 发现的 peer worker；只读，不可启用 / 停用 / 重启</span>
+            </header>
+            <div class="cc-services cc-services-peer" id="cc-peer-cards"></div>
+          </div>
+        </div>
+
         <div class="cc-foot" id="cc-foot"></div>
       </section>
 
@@ -1291,6 +1312,6 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js?v=28" defer></script>
+  <script src="/static/js/app.js?v=41" defer></script>
 </body>
 </html>

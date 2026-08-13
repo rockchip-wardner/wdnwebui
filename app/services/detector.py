@@ -160,8 +160,16 @@ def _build_vlm_doc_class():
 
     @Generable
     class VLMDoc(_PydBaseModel):
-        """Structured VLM output for pyrkaiweb's video-detection panel."""
-        text: str = Field(description="The model's free-form description of the frame.")
+        text: str = Field(
+            description=(
+                "Natural-language description of what is happening in the "
+                "frame: scene, main subjects (people/objects), their actions "
+                "and the surrounding environment. Reply in the same language "
+                "as the user's request. Ignore on-screen overlays such as "
+                "timestamps, watermarks, subtitles or captions — they are "
+                "not part of the actual scene."
+            ),
+        )
         level: Optional[str] = Field(
             default=None,
             description="Optional severity tag (e.g. 'normal' / 'warning' / 'danger').",
@@ -519,10 +527,14 @@ class RkaiDetector:
         # 显式传 ``TargetDoc`` 进来。
         if self._generating_cls is None:
             self._generating_cls = _get_vlm_doc_cls()
-        elif callable(self._generating_cls):
+        elif callable(self._generating_cls) and not isinstance(self._generating_cls, type):
             # 工厂通常传 ``_get_target_doc_cls`` 这种 callable —— 调
             # 用一次拿到真正的 schema 类，避开 worker 线程里首次
-            # build 的卡顿。直接传 class 时跳过这一步。
+            # build 的卡顿。**注意**：pydantic model 类也是 callable
+            # （``VLMDoc()`` 会触发实例化校验），所以必须先排除
+            # ``isinstance(_, type)``，否则已经缓存的 class 会被当成
+            # 工厂再调一次，撞到 ``text`` 必填字段抛 ValidationError，
+            # 让第二次 POST /prompt 拿 400。
             self._generating_cls = self._generating_cls()
         # 验证类型 —— ``isinstance(cls, type)`` 排除残留的 None /
         # lambda 之类，失败抛 ValueError 让 HTTP 层 400。

@@ -1,7 +1,11 @@
 """FastAPI application factory."""
+import logging
+LOG = logging.getLogger("pyrkaiweb")
 import os
 from pathlib import Path
 
+import logging
+LOG = logging.getLogger("pyrkaiweb")
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -81,6 +85,27 @@ def create_app() -> FastAPI:
     if isinstance(model_path, str) and model_path.strip():
         os.environ["RKAI_MODELS_DIR"] = model_path
 
+    # Optionally start the wdndds_daemon if config.json says so.
+    # The daemon brokers FastDDS discovery across the LAN — every
+    # pyrkaiweb process (main, compute workers, im-bridge, …) points
+    # at it. Production deployments usually run the daemon as its
+    # own systemd unit; dev can launch it via this flag.
+    compute_cfg = cfg.get_section("compute", {})
+    if (compute_cfg or {}).get("auto_start_daemon"):
+        try:
+            from app.services import wdndds_daemon
+            udp_port = int((compute_cfg or {}).get(
+                "discovery_server_port", 7411))
+            http_port = int((compute_cfg or {}).get(
+                "daemon_http_port", 7412))
+            wdndds_daemon.start_in_subprocess(
+                port=udp_port, http_port=http_port,
+                logfile=(compute_cfg or {}).get("daemon_logfile"))
+            LOG.info("wdndds_daemon launched (udp=%d http=%d)",
+                     udp_port, http_port)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("Failed to launch wdndds_daemon: %s", e)
+
     app.include_router(system_monitor.router, prefix="/api")
     app.include_router(video_detection.router, prefix="/api")
     app.include_router(video_file_analysis.router, prefix="/api")
@@ -96,12 +121,11 @@ def create_app() -> FastAPI:
     app.include_router(wechat.router, prefix="/api")
     app.include_router(text_chat.router, prefix="/api")
 
-    # 暂时关闭：boot 时**不**自动加载 config.json["compute"]["instances"]
-    # 里的实例 —— 用户必须从算力配置页手动启用。Worker 线程在第一次
-    # POST /api/compute/instances 时由 ``start_one`` 走 ``_wake_worker``
-    # → ``_ensure_worker`` 按需起 daemon thread。
-    # 重新打开 boot 自动加载：
-    #   get_registry().apply_boot_config_async()
+    # Boot：按 config.compute.services 列表为每条 model 做 probe →
+    # adopt-or-spawn。worker 起来后只注册 DDS endpoint，不 build
+    # LLMSession；用户随后在算力配置页选 NPU 触发 RPC load 完成绑定。
+    # boot 自身不阻塞 UI（_spawn_compute_worker 立即返回，spawn 异步）。
+    get_registry().boot_compute_services()
 
     # Wire the detector as a frame sink on the video session so each
     # decoded BGR frame is offered to it (it picks the Nth one).
@@ -130,9 +154,12 @@ def create_app() -> FastAPI:
 
     @app.on_event("shutdown")
     async def _on_shutdown():
-        # Stop all compute instances (close their LLMSession handles
-        # and join the worker thread). Done first so other shutdown
-        # steps that touch the SDK see a clean state.
+        # Close the main process's wdndds Hub. Compute workers are
+        # independent OS processes and are intentionally NOT killed
+        # here — they may outlive this web process, be restarted by
+        # systemd, or be required by a peer. (stop_all_local is NOT
+        # called by close_all; if a graceful shutdown of spawned
+        # workers is desired, call it explicitly.)
         try:
             get_registry().close_all()
         except Exception:

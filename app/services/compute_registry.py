@@ -1,43 +1,75 @@
-"""算力注册中心：算力卡 + 模型实例的统一管理。
+"""算力注册中心：算力卡 + 模型实例的统一管理（per-model-subprocess RPC）。
 
-设计目标：
+设计目标（v0.4）：
 
-* 所有 LLMSession 都从这里出，**任何业务模块（视频检测 / 语音生成 / 视频监控）
-  都禁止自己初始化** —— 找不到对应 capability 就报错"功能未启用"。
-* 启动阶段不阻塞 FastAPI：``apply_boot_config_async()`` 起一个 daemon thread
-  串行从 config.json 加载实例，每条实例状态机走
-  ``queued → loading → running``，附带时间戳供前端算倒计时。
-* 注册发现由 :mod:`app.services.dds_discovery` 负责，本模块只暴露能力
-  列表（``list_active_capabilities`` / ``list_hardware_capabilities``）供其
-  转换成 wdndds ``Capability`` 实例。
+* **每个 (npu_index, model_id) 实例 = 一个独立 compute_worker 子进程**。
+  父子进程通过 **wdndds cshim RPC**（标准 Pub-Sub on
+  ``wdndds/rpc/<model_id>``）通信，**支持跨机器 LAN 互联**
+  —— 这是 v0.4 设计的核心目标。
+* **算力配置页 toggle click → ``start_one`` 立即 spawn 子进程**。
+  worker argparse 默认 ``--lazy=False``（eager load），子进程起
+  后自动启后台线程跑 ``load_handler``，状态机走
+  ``not_loaded → loading → running`` (or ``error`` on NPU setup
+  failure)；主进程通过 cshim ``RpcClient.call("info")`` poll 镜像。
+* **跨进程崩溃隔离**：rkai 的 ``LLMSession()`` 在 RKNN 失败时会
+  ``terminate()`` 整个进程（不可被 Python 捕获）。子进程死了主进程
+  不受牵连 —— 探针线程读 worker stderr，标记实例为 ``error``。
+* **FastDDS 2.9 在本机有 DataWriter::enable SIGSEGV bug**。
+  wdndds cshim 的修补方案：建 writer 之前**先建一个 no-op reader**
+  on the same topic，让 FastDDS 初始化共享 payload pool。
 
 时间字段：
 
-* ``queued_at``  —— 进队列时刻（start_one 返回那一刻）
-* ``started_at`` —— status 转 loading 的时刻
-* ``finished_at`` —— status 转 running/error 的时刻
+* ``queued_at``  —— start_one 那一刻
+* ``started_at`` —— 子进程 spawn 那一刻
+* ``loaded_at``  —— worker 通过 ``info`` RPC 回报的模型就绪时刻
 
-前端倒计时（每秒重算）：
+snapshot 字段：
 
-* 对 ``queued`` 实例： ``(同 npu 前面 queued+loading 数) × MODEL_PRESETS[model_id].estimated_init_seconds``
-* 对 ``loading`` 实例： ``max(0, MODEL_PRESETS[model_id].estimated_init_seconds - (now - started_at))``
+* ``status``     — ``queued`` (spawn 还没回包) / ``spawning`` / ``loading`` /
+                  ``running`` / ``error`` / ``stopped`` / ``ready_lazy``
+                  (boot 时设的)
+* ``pid``        —— 子进程 PID；用于诊断
 """
 from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from app.services.config import get_config
 
 
 # --------------------------------------------------------------------------- #
-# 硬件能力（HW）目录 —— 注册发现页面与系统配置页共用同一份 source-of-truth。
-# 顺序决定 UI 渲染顺序；新增 HW 能力时在这里登记并同步 wdndds 子类。
+# Compute mode: only ``subprocess`` (v0.4)                                  #
+# --------------------------------------------------------------------------- #
+# One compute_worker subprocess per (npu, model) instance; the worker
+# exposes a wdndds cshim RPC service (``wdndds/rpc/<model_id>``). The
+# main process talks to it via ``wdndds.RpcClient``. The subprocess
+# boundary isolates rkai's uncatchable ``terminate()`` on a broken NPU
+# setup. ``PYRKAIWEB_COMPUTE_MODE=inprocess`` is reserved for the case
+# where the cshim DDS layer can't run (e.g. kernel blocklists UDP
+# multicast); the v0.4 inprocess mode is otherwise a no-go on hosts
+# where rkai RKNN init can call ``terminate()``.
+import os as _os
+import contextlib as _contextlib
+
+
+def _resolve_compute_mode() -> str:
+    env = _os.environ.get("PYRKAIWEB_COMPUTE_MODE", "").strip().lower()
+    if env in ("subprocess", "inprocess"):
+        return env
+    return "subprocess"
+
+
+# --------------------------------------------------------------------------- #
+# 硬件能力（HW）目录                                                       #
 # --------------------------------------------------------------------------- #
 HARDWARE_CAPABILITIES: list[dict] = [
     {
@@ -72,17 +104,10 @@ HARDWARE_CAPABILITIES: list[dict] = [
 
 
 def _hardware_capability_default_state() -> dict[str, bool]:
-    """首次配置时所有 HW 能力默认启用。"""
     return {entry["capability_type"]: True for entry in HARDWARE_CAPABILITIES}
 
 
 def _load_hardware_capability_state() -> dict[str, bool]:
-    """从 ``config.json["compute"]["hardware_capabilities"]`` 读启用状态。
-
-    缺失字段默认 ``True``（"全部启用"），但**只在内存中**补齐 —— 不主动写
-    回磁盘；用户实际改 checkbox 并保存时才落盘，避免冷启动就写一次
-    config.json。
-    """
     cfg = get_config().get_section("compute", {})
     stored = cfg.get("hardware_capabilities") if isinstance(cfg, dict) else None
     state = _hardware_capability_default_state()
@@ -95,16 +120,14 @@ def _load_hardware_capability_state() -> dict[str, bool]:
 
 LOG = logging.getLogger("compute_registry")
 
-
-# 默认倒计时兜底（per-model 没有 ``estimated_init_seconds`` 字段时使用）。
 DEFAULT_ESTIMATED_INIT_SECONDS = 10
 
 
 # --------------------------------------------------------------------------- #
-# preset 映射表 —— 唯一来源；任何新增 model 必须在这里注册。
+# preset 映射表                                                              #
 # --------------------------------------------------------------------------- #
 def _qwen3_vl_4b_spec():
-    from rkai import SystemLanguageModel  # 懒导入：保持 rkai native lib 懒加载
+    from rkai import SystemLanguageModel  # noqa: F401  lazy
     return SystemLanguageModel.qwen3_vl_4b()
 
 
@@ -113,34 +136,11 @@ def _qwen3_tts_spec():
     return SystemLanguageModel.qwen3_tts()
 
 
-def _qwen3_asr_spec():
-    from rkai import SystemLanguageModel
-    return SystemLanguageModel.qwen3_asr()
-
-
 def _qwen3_8b_spec():
-    """Qwen3-8B 纯文本对话 preset。
-
-    覆盖：
-    * ``max_context_len=32768`` —— 官方 32K 上限；预留 ``max_new_tokens``
-      之后剩下的 prompt 上下文仍能容纳长对话。注意 ``max_context_len``
-      是 ``ModelSpec`` 的 dataclass 字段（被 ``_common.build_llm_args``
-      直接读），不能用 ``with_options`` 设，必须用 ``dataclasses.replace``。
-    * ``max_new_tokens=2048`` —— 给单轮回答留足输出空间。
-    * ``keep_history=1`` —— init runtime 默认值；app 侧每轮 ``session.reset()``
-      + ChatML 拼接整段 prompt，所以 ``keep_history`` 实际效果是
-      "KV cache 在单次 run 期间保持"。多轮对话的"记忆"通过 app 端
-      消息 deque + ChatML 拼接实现，thinking 不进入下一轮。
-    * ``enable_thinking=True`` —— 让模型输出 ``<think>...</think>``；
-      app 侧 observer 状态机切分两段流。
-    """
-    from dataclasses import replace
+    from dataclasses import replace as _dc_replace
     from rkai import SystemLanguageModel
     spec = SystemLanguageModel.qwen3_8b()
-    return replace(
-        spec,
-        max_context_len=32768,
-    ).with_options(
+    return _dc_replace(spec, max_context_len=32768).with_options(
         max_new_tokens=2048,
         keep_history=1,
         enable_thinking=True,
@@ -173,6 +173,7 @@ def _qwen3_vl_embedding_2b_spec():
 #                    时延；真机用户体感"首次等非常久"，按 VL-4B 同档拍 60s
 #                    + buffer → 60s（无真机实测，等你测完再调）
 #   * Qwen3-ASR:   未实测（模型文件不在板上），按编码器+LLM 推算 ~15s + 10s buffer → 25s
+#   * Qwen3-VL-Embedding-2B：~30s（加载 2 个 rknn + embed 表）
 # 取"最冷"加载时间（即用户首次加载，不是文件页缓存命中后的二次加载）+ 小 buffer，
 # 保证倒计时结束时实际加载大概率已就绪，避免 UI 卡很久才更新。
 MODEL_PRESETS: dict[str, dict] = {
@@ -194,21 +195,12 @@ MODEL_PRESETS: dict[str, dict] = {
         "capability_types": ["swcap_audio_tts"],
         "instance_name":    "llm-tts",
     },
-    "qwen3-asr": {
-        "label":            "Qwen3-ASR",
-        "preset_factory":   _qwen3_asr_spec,
-        "model_dir_name":   "Qwen3-ASR",
-        "memory_estimate_mb": 2500,
-        "estimated_init_seconds": 25,
-        "capability_types": ["swcap_audio_query", "swcap_audio_analyse"],
-        "instance_name":    "llm-asr",
-    },
     "qwen3-8b": {
         "label":            "Qwen3-8B",
         "preset_factory":   _qwen3_8b_spec,
         "model_dir_name":   "Qwen3-8B",
-        "memory_estimate_mb": 4950,        # 真机实测：4 卡板上 1828 占 ~4950MB
-        "estimated_init_seconds": 60,      # 真机实测 ~55s（单 init）；预留 5s buffer
+        "memory_estimate_mb": 4950,
+        "estimated_init_seconds": 60,
         "capability_types": ["swcap_text_chat"],
         "instance_name":    "llm-chat",
     },
@@ -225,9 +217,7 @@ MODEL_PRESETS: dict[str, dict] = {
 
 
 # --------------------------------------------------------------------------- #
-# 老 capability_type 字符串 → 新字符串（hwcap_/swcap_ 前缀）
-# 在 ComputeRegistry.__init__ 末尾一次性把 config.json["compute"]["instances"]
-# 里的旧字段改写成新字符串并写回磁盘，避免老配置直接失配。
+# Legacy capability_type migration (kept for backward compat with old configs) #
 # --------------------------------------------------------------------------- #
 _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
     "video_input":    "hwcap_video_input",
@@ -235,8 +225,6 @@ _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
     "video_describe": "swcap_video_describe",
     "audio_input":    "hwcap_audio_input",
     "audio_output":   "hwcap_audio_output",
-    "audio_query":    "swcap_audio_query",
-    "audio_analyse":  "swcap_audio_analyse",
     "hdmi_display":   "hwcap_hdmi_display",
     "audio_tts":      "swcap_audio_tts",
     "video_analyse":  "swcap_video_analyse",
@@ -245,30 +233,56 @@ _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
 
 
 # --------------------------------------------------------------------------- #
-# ModelInstance
+# ModelInstance                                                             #
 # --------------------------------------------------------------------------- #
 @dataclass
 class ModelInstance:
-    key: Tuple[int, str]                       # (npu_index, model_id)
-    npu_index: int
+    """One compute service instance, either local (spawned) or remote (adopted).
+
+    Lifecycle (v0.7):
+      1. ``_spawn_compute_worker(model)`` or ``_adopt_existing_worker(model)``
+         creates the record; key is ``(-1, model_id)`` until the user binds
+         an NPU via RPC ``load``.
+      2. ``bind_instance(model, npu_index)`` sends RPC ``load`` and the
+         worker instantiates ``LLMSession``. key becomes
+         ``(npu_index, model_id)``.
+      3. ``unload_instance(model)`` sends RPC ``unload``; worker drops the
+         session, status returns to ``not_loaded``, npu_index resets to -1.
+      4. ``stop_instance_local(model)`` is spawned-only: RPC unload →
+         RPC shutdown → wait → kill. Adopted peers are not affected.
+    """
+    key: Tuple[int, str]                        # (-1, model_id) → (npu, model_id)
+    npu_index: int                             # -1 until bound
     model_id: str
-    device_id: Optional[bytes] = None          # resolved from RKNN3Lite().get_devices_id()[npu_index]
-    llm_session: Any = None                    # status="running" 时才有
-    capability_types: List[str] = field(default_factory=list)
+    device_id: Optional[bytes] = None
+    llm_session: Any = None
+    capability_types: list[str] = field(default_factory=list)
     instance_name: str = ""
     label: str = ""
     memory_estimate_mb: int = 0
-    status: str = "queued"                     # queued | loading | running | error | stopped
-    error: str = ""                            # 短摘要：1-2 行，前端默认展示
-    stderr_full: str = ""                      # 子进程完整 stderr，前端"展开"按钮展示
+    status: str = "not_loaded"                  # not_loaded | loading | running | error
+    error: str = ""
+    stderr_full: str = ""
     queued_at: float = 0.0
     started_at: float = 0.0
     finished_at: float = 0.0
+    load_time_sec: Optional[float] = None
+    loaded_at: Optional[float] = None
+    # RPC subprocess state
+    proc: Optional[subprocess.Popen] = None
+    rpc_client: Any = None
+    rpc_session_proxy: Any = None
+    _probe_thread: Optional[threading.Thread] = None
+    # Provenance / discovery
+    _source: str = "spawned"                    # "spawned" | "adopted"
+    _peer_guid: str = ""                       # adopted: peer participant GUID
+    _peer_name: str = ""                       # adopted: peer participant name
 
     def to_dict(self) -> dict:
+        pid = self.proc.pid if (self.proc is not None) else 0
         return {
             "npu_index":          self.npu_index,
-            "model":              self.model_id,
+            "model_id":           self.model_id,
             "label":              self.label,
             "instance_name":      self.instance_name,
             "status":             self.status,
@@ -276,33 +290,108 @@ class ModelInstance:
             "stderr_full":        self.stderr_full,
             "capability_types":   list(self.capability_types),
             "memory_estimate_mb": self.memory_estimate_mb,
-            "device_id":          self.device_id.decode("utf-8", errors="replace") if self.device_id else None,
+            "device_id":          self.device_id.decode("utf-8", errors="replace")
+                                    if self.device_id else None,
             "queued_at":          self.queued_at,
             "started_at":         self.started_at,
             "finished_at":        self.finished_at,
+            "load_time_sec":      self.load_time_sec,
+            "loaded_at":          self.loaded_at,
+            "pid":                pid,
+            "_source":            self._source,
+            "_peer_guid":         self._peer_guid,
+            "_peer_name":         self._peer_name,
         }
 
 
 # --------------------------------------------------------------------------- #
-# ComputeRegistry (singleton)
+# ComputeRegistry                                                           #
 # --------------------------------------------------------------------------- #
 class ComputeRegistry:
-    """算力注册中心：管理 LLMSession 生命周期 + capability 路由。"""
+    """算力注册中心：管理 subprocess 实例 + capability 路由。"""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._instances: dict[Tuple[int, str], ModelInstance] = {}
-        self._worker_thread: Optional[threading.Thread] = None
-        self._stop_worker = threading.Event()
-        self._wake_event = threading.Event()
-        self._cards: list[dict] = []           # 缓存 list_cards() 结果
-        self._cards_failed: str = ""           # list_cards 失败的错误信息
-        # 一次性把 config.json["compute"]["instances"][].capability_types 里
-        # 残留的老字符串（video_query / audio_output / …）改写成新前缀
-        # （swcap_video_query / hwcap_audio_output / …）。幂等，老配置会
-        # 被原位更新并写回磁盘；不存在旧字段时静默通过。
+        self._cards: list[dict] = []            # not used by RPC path
+        self._cards_failed: str = ""
+        self._hub: Any = None                   # wdndds Hub for client side
+        self._hub_lock = threading.Lock()
+        self._mode: str = _resolve_compute_mode()
         self._migrate_legacy_capability_types()
+        if self._mode == "subprocess":
+            self._ensure_hub()
 
+    @property
+    def compute_mode(self) -> str:
+        return self._mode
+
+    # ------------------------------------------------------------------ #
+    # Hub bring-up (client side)                                         #
+    # ------------------------------------------------------------------ #
+    def _ensure_hub(self) -> None:
+        """Bring up the wdndds Hub that the main process uses to talk
+        to all compute_worker subprocesses. The Hub points at the LAN's
+        wdndds discovery daemon (one per LAN, configured in
+        config.json["compute"]["discovery_server"]). All pyrkaiweb
+        processes on the LAN share this daemon for participant +
+        endpoint discovery, replacing the unreliable SIMPLE discovery
+        that broke on embedded boards (Raspberry Pi, RK3588)."""
+        with self._hub_lock:
+            if self._hub is not None:
+                return
+        try:
+            from wdndds.dds._rpc import Hub as _RpcHub
+            # Register a fixed list of services (one per model_id)
+            # upfront so the cshim Hub has them at start time.
+            service_names = [
+                f"wdndds/rpc/{mid}" for mid in MODEL_PRESETS.keys()
+            ]
+            # Read the discovery server list from config; default
+            # is empty (SIMPLE discovery, single-host) when no
+            # daemon is configured.
+            discovery_servers = self._read_discovery_servers()
+            self._hub = _RpcHub(
+                participant_name="pyrkaiweb-main",
+                domain_id=0,
+                discovery_servers=discovery_servers,
+            )
+            self._hub.start()
+            LOG.info(
+                "ComputeRegistry Hub started: services=%s "
+                "discovery_servers=%s",
+                service_names, discovery_servers)
+        except Exception as e:  # noqa: BLE001
+            LOG.exception("ComputeRegistry Hub bring-up failed")
+            self._cards_failed = str(e)
+            self._hub = None
+
+    def _read_discovery_servers(self) -> list[str]:
+        """Read the discovery server list from config.json.
+
+        Returns ["host:port", ...] or [] for default SIMPLE discovery.
+        """
+        cfg = get_config().get_section("compute")
+        if not cfg:
+            return []
+        servers = cfg.get("discovery_servers") or []
+        if isinstance(servers, str):
+            servers = [s.strip() for s in servers.split(",") if s.strip()]
+        return [s for s in servers if s]
+
+    def _hub_or_raise(self):
+        if self._hub is None:
+            raise RuntimeError(
+                "wdndds Hub not available (fastdds init failed). "
+                f"Reason: {self._cards_failed}"
+            )
+        return self._hub
+
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # Legacy migration                                                  #
+    # ------------------------------------------------------------------ #
     def _migrate_legacy_capability_types(self) -> None:
         cfg = get_config().get_section("compute", {})
         instances = cfg.get("instances") if isinstance(cfg, dict) else None
@@ -327,21 +416,17 @@ class ComputeRegistry:
                 get_config().set_section("compute", cfg)
             except Exception as e:  # noqa: BLE001
                 LOG.warning("failed to persist migrated capability_types: %s", e)
-            LOG.info(
-                "migrated %d legacy capability_type entries to hwcap_/swcap_ prefix",
-                renamed_total,
-            )
 
     # ------------------------------------------------------------------ #
-    # 元数据查询
+    # 元数据查询                                                          #
     # ------------------------------------------------------------------ #
     def list_cards(self, force_refresh: bool = False) -> list[dict]:
-        """枚举当前 RKNN3 device id 列表。失败（rknn3lite 不可用 / 非 RK 主机）返回 []。"""
+        """NPU enumeration (rkai path still needed for non-RPC metadata)."""
         with self._lock:
             if self._cards and not force_refresh:
                 return list(self._cards)
         try:
-            from rknn3lite.api import RKNN3Lite  # 懒导入
+            from rknn3lite.api import RKNN3Lite  # lazy
             ids = RKNN3Lite().get_devices_id()
         except Exception as e:
             with self._lock:
@@ -362,22 +447,10 @@ class ComputeRegistry:
         return list(cards)
 
     def cards_failed_reason(self) -> str:
-        """``list_cards`` 失败时的错误信息（UI 提示用）。"""
         with self._lock:
             return self._cards_failed
 
     def list_supported_models(self) -> list[dict]:
-        """扫模型根目录，结合 preset 白名单返回可用模型。
-
-        模型根目录的解析顺序与 rkai 的 ``_models_root()`` 保持一致：
-        1. config.json 的 ``base.model_path``（生产环境固定路径，``main.py``
-           会在 ``create_app`` 时写入 ``RKAI_MODELS_DIR``）；
-        2. ``RKAI_MODELS_DIR`` 环境变量（dev 调试：``export RKAI_MODELS_DIR=...``）；
-        3. 回退 ``/userdata/models/``。
-
-        这样算力配置页探测到的 exists 与 rkai 实际加载路径必然一致，
-        避免"页面上模型禁用但 rkai 能加载"（或反之）的错位。
-        """
         base = get_config().get_section("base", {})
         model_path = (
             base.get("model_path")
@@ -388,53 +461,43 @@ class ComputeRegistry:
         out = []
         for model_id, preset in MODEL_PRESETS.items():
             dir_name = preset["model_dir_name"]
-            if dir_name:
-                d = root / dir_name
-                exists = d.is_dir()
-            else:
-                exists = None
+            d = root / dir_name if dir_name else None
             out.append({
                 "id":                 model_id,
                 "label":              preset["label"],
-                "exists":             exists,
+                "exists":             d.is_dir() if d else None,
                 "memory_estimate_mb": preset["memory_estimate_mb"],
                 "capability_types":   list(preset["capability_types"]),
             })
         return out
 
+    # ------------------------------------------------------------------ #
+    # Snapshot                                                           #
+    # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
-        # worker 存活状态：让 UI 能识别 "worker 已死，但 inst.status 还停在
-        # loading" 这种场景（用户会看到"卡住"，需要提示）。
-        worker_alive = bool(
-            self._worker_thread is not None
-            and self._worker_thread.is_alive()
-            and not self._stop_worker.is_set()
-        )
         with self._lock:
             instances = [inst.to_dict() for inst in self._instances.values()]
-        # ``list_cards`` 内部用 ``_raw_device_id`` 缓存 RKNN3 raw bytes，
-        # 但 snapshot 是对外接口，不应暴露内部字段。
+
         cards = [
             {"npu_index": c["npu_index"], "device_id": c["device_id"]}
             for c in self.list_cards()
         ]
         supported = self.list_supported_models()
-        # 内存汇总
         per_card_mb: dict[int, int] = {}
         total_mb = 0
         for inst in instances:
             if inst["status"] != "running":
                 continue
-            per_card_mb[inst["npu_index"]] = per_card_mb.get(inst["npu_index"], 0) + inst["memory_estimate_mb"]
+            per_card_mb[inst["npu_index"]] = per_card_mb.get(
+                inst["npu_index"], 0) + inst["memory_estimate_mb"]
             total_mb += inst["memory_estimate_mb"]
-        # 状态计数（instances 来自上面 to_dict()，已是 dict；要按 key 取）
-        running_count = sum(1 for inst in instances if inst["status"] == "running")
-        queued_count  = sum(1 for inst in instances if inst["status"] == "queued")
-        loading_count = sum(1 for inst in instances if inst["status"] == "loading")
-        error_count   = sum(1 for inst in instances if inst["status"] == "error")
-        # 当前活跃 capability
+        running_count = sum(1 for i in instances if i["status"] == "running")
+        error_count   = sum(1 for i in instances if i["status"] == "error")
+        loaded_count = sum(1 for i in instances
+                           if i["status"] in {"running", "loading"})
         capabilities = self.list_active_capabilities()
-        # 工具列表（懒导入，避免触发 rkai 装饰器在 compute 模块加载时执行）
+        services = self.list_with_source()
+
         from app.services.tools import get_tool_registry
         tool_reg = get_tool_registry()
         tools = []
@@ -455,7 +518,7 @@ class ComputeRegistry:
                 "available":           available,
                 "reason":              reason,
             })
-        # per-model 启动预估（前端渲染倒计时查这个）
+
         estimated_per_model = {
             mid: preset.get("estimated_init_seconds", DEFAULT_ESTIMATED_INIT_SECONDS)
             for mid, preset in MODEL_PRESETS.items()
@@ -464,45 +527,50 @@ class ComputeRegistry:
             "cards":             cards,
             "cards_failed":      self.cards_failed_reason(),
             "supported_models":  supported,
+            "services":          services,
             "instances":         instances,
             "total_memory_mb":   total_mb,
             "per_card_memory_mb": per_card_mb,
-            "queue_length":      queued_count + loading_count,
+            "queue_length":      sum(1 for s in services
+                                     if s["status"] in {"not_loaded", "loading"}),
             "running_count":     running_count,
-            "queued_count":      queued_count,
-            "loading_count":     loading_count,
+            "queued_count":      sum(1 for s in services
+                                     if s["status"] == "not_loaded"),
+            "loaded_count":      loaded_count,
             "error_count":       error_count,
             "estimated_init_seconds_per_model": estimated_per_model,
             "default_estimated_init_seconds":  DEFAULT_ESTIMATED_INIT_SECONDS,
-            "worker_alive":      worker_alive,
+            "worker_alive":      True,
             "last_updated":      time.time(),
             "capabilities":      capabilities,
             "tools":             tools,
         }
 
     def list_active_capabilities(self) -> list[dict]:
-        """当前 running 实例的 capability 列表（discovery 页面渲染源）。"""
+        """Capabilities advertised to consumer APIs (detector / tts / chat / vfa).
+
+        A capability is "active" when its host instance has at least
+        *some* live worker (not_loaded / loading / running all qualify).
+        Only consumers calling ``get_session(capability)`` need the
+        worker to be in ``running`` state; UI listings can show
+        "available, not loaded" cards too.
+        """
         with self._lock:
             out = []
             for inst in self._instances.values():
-                if inst.status != "running":
+                if inst.status not in {"running", "loading", "not_loaded"}:
                     continue
                 for cap_type in inst.capability_types:
                     out.append({
-                        "type":              cap_type,
-                        "name":              inst.instance_name,
-                        "model":             inst.model_id,
-                        "npu_index":         inst.npu_index,
+                        "type":               cap_type,
+                        "name":               inst.instance_name,
+                        "model":              inst.model_id,
+                        "npu_index":          inst.npu_index,
                         "memory_estimate_mb": inst.memory_estimate_mb,
                     })
         return out
 
     def list_hardware_capabilities(self) -> list[dict]:
-        """所有 HW 能力的静态定义 + 当前启用状态（来自 config.json）。
-
-        discovery 页面与系统配置页都从这里读。enabled 字段反映
-        ``config.json["compute"]["hardware_capabilities"]`` 的最新值。
-        """
         state = _load_hardware_capability_state()
         out = []
         for entry in HARDWARE_CAPABILITIES:
@@ -512,11 +580,6 @@ class ComputeRegistry:
         return out
 
     def set_hardware_capability_state(self, updates: dict[str, bool]) -> dict[str, bool]:
-        """更新 HW 能力启用状态。未知 cap_type 静默忽略；非法值返回错误。
-
-        写入 ``config.json["compute"]["hardware_capabilities"]`` 并返回新
-        的完整状态（包含未知 key 在内的"全集"），便于 UI 刷新展示。
-        """
         if not isinstance(updates, dict):
             raise ValueError("updates 必须是 dict[str, bool]")
         valid_keys = {entry["capability_type"] for entry in HARDWARE_CAPABILITIES}
@@ -541,306 +604,679 @@ class ComputeRegistry:
                     get_config().set_section("compute", cfg)
                 except Exception as e:  # noqa: BLE001
                     LOG.warning("failed to persist hardware_capabilities: %s", e)
-            LOG.info("updated hardware_capabilities: %s", applied)
-        return {
-            "applied":  applied,
-            "rejected": rejected,
-            "state":    new_state,
-        }
+        return {"applied": applied, "rejected": rejected, "state": new_state}
 
     # ------------------------------------------------------------------ #
-    # 启停
+    # 启停                                                              #
     # ------------------------------------------------------------------ #
-    def start_one(self, npu_index: int, model_id: str) -> ModelInstance:
-        """同步建 ModelInstance(status="queued")，返回。后台 worker 拾取后
-        转 loading → 调 rkai.LLMSession → running/error。
+    # v0.7: 启停拆成 spawn / adopt / bind / unload / stop 五步。
+    # boot 由 ``boot_compute_services`` 触发；用户在算力配置页的"启用 /
+    # 禁用 / 重启"对应 ensure_worker_for_model / stop_instance_local /
+    # restart_instance_local。npu_index 通过 RPC load action 传给 worker，
+    # 而不是命令行；worker 启动后只注册 DDS endpoint，不建 LLMSession。
 
-        Raises:
-            ValueError: model_id 不在 preset 白名单 / npu_index 越界 / 已存在。
-            RuntimeError: list_cards() 拿不到卡（无法 resolve device_id）。
+    def _spawn_compute_worker(self, model_id: str) -> ModelInstance:
+        """Spawn a fresh ``compute_worker.py --model <id>`` subprocess.
+
+        The worker boots up with no ``--npu``: it brings its Hub +
+        Service + Replier online and waits in ``not_loaded`` state
+        until the main process sends ``{"action":"load","npu_index":N}``.
+
+        Returns the new ``ModelInstance`` keyed ``(-1, model_id)``.
         """
         if model_id not in MODEL_PRESETS:
             raise ValueError(f"未知 model: {model_id!r}")
-        cards = self.list_cards()
-        if not cards:
-            raise RuntimeError(
-                "未检测到任何 NPU 卡（RKNN3Lite.get_devices_id() 返回空）"
-            )
-        if not (0 <= npu_index < len(cards)):
-            raise ValueError(f"npu_index 越界: {npu_index}（当前有 {len(cards)} 张卡）")
-        key = (npu_index, model_id)
-        with self._lock:
-            if key in self._instances:
-                raise ValueError(f"重复实例: npu={npu_index} model={model_id}")
-            # 同一 model 全局互斥：无论哪张卡，同一时间只允许一个实例
-            # （queued / loading / running）。embedding / LLM 多份实例没有
-            # 意义 —— ``get_session`` 只取第一个 running，多份只会白白
-            # 占用其它卡的显存。
-            for other in self._instances.values():
-                if (
-                    other.model_id == model_id
-                    and other.status in ("queued", "loading", "running")
-                ):
-                    raise ValueError(
-                        f"该模型已在启用中（NPU #{other.npu_index}），"
-                        f"同一模型全局互斥，请先停用再启用"
-                    )
+        if model_id not in MODEL_PRESETS:
+            raise ValueError(f"未知 model: {model_id!r}")
         preset = MODEL_PRESETS[model_id]
         inst = ModelInstance(
-            key=key,
-            npu_index=npu_index,
+            key=(-1, model_id),
+            npu_index=-1,
             model_id=model_id,
-            device_id=cards[npu_index].get("_raw_device_id"),
             capability_types=list(preset["capability_types"]),
             instance_name=preset["instance_name"],
             label=preset["label"],
             memory_estimate_mb=preset["memory_estimate_mb"],
-            status="queued",
+            status="not_loaded",
             queued_at=time.time(),
+            started_at=time.time(),
+            _source="spawned",
         )
-        with self._lock:
-            self._instances[key] = inst
-        self._wake_worker()
-        return inst
 
-    def stop_one(self, npu_index: int, model_id: str) -> None:
-        key = (npu_index, model_id)
-        with self._lock:
-            inst = self._instances.pop(key, None)
-        if inst is None:
-            return
-        sess = inst.llm_session
-        if sess is not None:
+        env = os.environ.copy()
+        env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2]))
+        env.setdefault("RKAI_MODELS_DIR",
+                       get_config().get_section("base", {}).get(
+                           "model_path", "/userdata/models/"))
+
+        cmd = [
+            sys.executable, "-u",
+            str(Path(__file__).resolve().parent / "compute_worker.py"),
+            "--model", model_id,
+            # 不传 --npu：npu_index 由用户在算力配置页选 NPU 后通过 RPC 传入
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd, env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            inst.proc = proc
+        except Exception as e:
+            inst.status = "error"
+            inst.error = f"spawn failed: {e}"
+            return inst
+
+        try:
+            self._setup_rpc_client(inst)
+        except Exception as e:  # noqa: BLE001
+            LOG.exception("RpcClient create failed")
+            inst.status = "error"
+            inst.error = f"RpcClient: {e}"
             try:
-                sess.close()
+                proc.terminate()
+                proc.wait(timeout=2)
             except Exception:
                 pass
+            inst.proc = None
+            return inst
 
-    def stop_all(self) -> None:
+        # Probe thread keeps inst.status in sync with worker's actual
+        # not_loaded / loading / running state.
+        probe = threading.Thread(
+            target=self._probe_instance,
+            args=(inst,),
+            name=f"compute-probe-{model_id}",
+            daemon=True,
+        )
+        inst._probe_thread = probe
+        probe.start()
+
         with self._lock:
-            keys = list(self._instances.keys())
-        for k in keys:
-            self.stop_one(*k)
+            self._instances[inst.key] = inst
+        LOG.info("spawned compute_worker for %s (pid=%d)",
+                 model_id, proc.pid)
+        return inst
 
-    def close_all(self) -> None:
-        """app shutdown：停所有实例 + 停后台 worker。"""
-        self.stop_all()
-        self._stop_worker.set()
-        self._wake_worker()
-        t = self._worker_thread
-        if t is not None and t.is_alive():
-            t.join(timeout=2.0)
+    def _adopt_existing_worker(self, model_id: str) -> Optional[ModelInstance]:
+        """Probe the LAN daemon for a peer worker providing
+        ``wdndds/rpc/<model_id>``. If found, register a ``ModelInstance``
+        pointing at it (proc=None, _source='adopted').
 
-    # ------------------------------------------------------------------ #
-    # 启动 / 配置持久化
-    # ------------------------------------------------------------------ #
-    def apply_boot_config_async(self) -> None:
-        """读 config.json["compute"]["instances"]，逐条 start_one。立即返回。
-
-        后台 daemon thread 串行执行真正加载；UI 通过 ``/api/compute`` 轮询状态。
+        Returns the adopted instance or ``None`` if no peer is
+        responding within ~1.5 s.
         """
-        self._ensure_worker()
-        stored = get_config().get_section("compute", {})
-        instances = stored.get("instances") if isinstance(stored, dict) else None
-        if not isinstance(instances, list):
-            return
-        # 第一次访问 cards，让 start_one 能拿到 device_id
-        self.list_cards()
-        for entry in instances:
-            if not isinstance(entry, dict):
-                continue
-            npu_index = entry.get("npu_index")
-            model_id = entry.get("model")
-            if not isinstance(npu_index, int) or not isinstance(model_id, str):
-                continue
-            if model_id not in MODEL_PRESETS:
-                LOG.warning("config.json 跳过未知 model: %s", model_id)
-                continue
-            try:
-                self.start_one(npu_index, model_id)
-            except ValueError as e:
-                # 重复实例 / npu_index 越界 —— 已经在跑或 config 错误，记录日志但不让启动挂
-                LOG.warning("boot start_one 跳过 (%d, %s): %s", npu_index, model_id, e)
-
-    def _persist(self) -> None:
-        """把当前 instances 列表写回 config.json["compute"]。"""
-        with self._lock:
-            payload = {
-                "instances": [
-                    {"npu_index": inst.npu_index, "model": inst.model_id}
-                    for inst in self._instances.values()
-                ]
-            }
+        if model_id not in MODEL_PRESETS:
+            return None
+        info = self._probe_service(model_id)
+        if not info:
+            return None
+        preset = MODEL_PRESETS[model_id]
+        worker_npu = info.get("npu_index")
+        inst = ModelInstance(
+            key=(-1, model_id),
+            npu_index=worker_npu if isinstance(worker_npu, int) else -1,
+            model_id=model_id,
+            capability_types=list(preset["capability_types"]),
+            instance_name=preset["instance_name"],
+            label=preset["label"],
+            memory_estimate_mb=preset["memory_estimate_mb"],
+            status=info.get("status", "not_loaded"),
+            started_at=time.time(),
+            finished_at=info.get("loaded_at"),
+            load_time_sec=info.get("load_time_sec"),
+            loaded_at=info.get("loaded_at"),
+            _source="adopted",
+            _peer_guid=info.get("_peer_guid", ""),
+            _peer_name=info.get("_peer_name", ""),
+        )
         try:
-            get_config().set_section("compute", payload)
-        except Exception as e:  # pragma: no cover - disk failure
-            LOG.warning("compute config persist failed: %s", e)
+            self._setup_rpc_client(inst)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("adopt: rpc setup failed for %s: %s",
+                        model_id, e)
+            return None
+        with self._lock:
+            existing = next((v for v in self._instances.values()
+                             if v.model_id == model_id), None)
+            if existing is not None:
+                return existing
+            if inst.npu_index >= 0:
+                inst.key = (inst.npu_index, model_id)
+            self._instances[inst.key] = inst
+        probe = threading.Thread(
+            target=self._probe_instance,
+            args=(inst,),
+            name=f"compute-probe-adopted-{model_id}",
+            daemon=True,
+        )
+        inst._probe_thread = probe
+        probe.start()
+        LOG.info("adopted peer worker for %s (guid=%s npu=%s status=%s)",
+                 model_id, inst._peer_guid, inst.npu_index, inst.status)
+        return inst
 
-    # ------------------------------------------------------------------ #
-    # 消费者 API
-    # ------------------------------------------------------------------ #
-    def get_session(self, capability_type: str) -> Any:
-        """返回第一个 status='running' 且 capability_types 包含此 type 的 LLMSession。
+    # Legacy single-step entry point kept for back-compat with code
+    # written before the v0.7 split (UI now drives ensure + bind).
+    def start_one(self, npu_index: int, model_id: str) -> ModelInstance:
+        """Deprecated: use ``ensure_worker_for_model`` + ``bind_instance``.
 
-        没有 → RuntimeError(f"功能未启用: {capability_type}")。
+        For back-compat: spawns the worker (no --npu), then issues an
+        RPC ``load`` with the supplied ``npu_index`` so behaviour looks
+        identical to callers expecting ``status='running'`` on return.
+        """
+        inst = self.ensure_worker_for_model(model_id)
+        if inst._source != "spawned":
+            raise RuntimeError(
+                f"{model_id} 是 peer 提供的 service，本机无权 spawn")
+        return self.bind_instance(model_id, npu_index)
+
+    def ensure_worker_for_model(self, model_id: str) -> ModelInstance:
+        """User-facing: ensure *some* worker exists for this model.
+
+        Order:
+          1. already in ``_instances``? return it
+          2. probe the LAN daemon — if a peer responds, adopt
+          3. otherwise spawn a fresh local subprocess
+
+        Status returned may be ``not_loaded`` if the worker is up but
+        the user has not yet bound an NPU (call ``bind_instance`` for
+        that).
         """
         with self._lock:
             for inst in self._instances.values():
-                if inst.status == "running" and capability_type in inst.capability_types:
-                    return inst.llm_session
-        raise RuntimeError(f"功能未启用: {capability_type}")
+                if inst.model_id == model_id:
+                    return inst
+        adopted = self._adopt_existing_worker(model_id)
+        if adopted is not None:
+            return adopted
+        return self._spawn_compute_worker(model_id)
 
-    # ------------------------------------------------------------------ #
-    # 后台 worker —— 串行从队列里拾取 queued 实例，转 loading → 启动 → running/error
-    # ------------------------------------------------------------------ #
-    def _ensure_worker(self) -> None:
+    def bind_instance(self, model_id: str, npu_index: int) -> ModelInstance:
+        """RPC ``load`` with the chosen npu_index → worker instantiates
+        ``LLMSession``. ``inst.npu_index`` and ``inst.key`` are updated.
+
+        Raises ``RuntimeError`` if the instance is adopted (proc is
+        None) — only locally-spawned workers can be bound from this
+        machine.
+        """
+        inst = self._find_by_model(model_id)
+        if inst is None:
+            raise RuntimeError(f"本地无 {model_id} 的 worker")
+        if inst.proc is None:
+            raise RuntimeError(
+                f"{model_id} 是 peer 提供的 service，本机无权 bind")
+        if inst.rpc_client is None:
+            raise RuntimeError(f"{model_id} worker RPC client 未就绪")
+        if not isinstance(npu_index, int) or npu_index < 0:
+            raise RuntimeError(f"npu_index 非法: {npu_index!r}")
+        r = inst.rpc_client.call(
+            {"action": "load", "npu_index": npu_index},
+            timeout_ms=120_000,
+        )
+        if not r.get("ok"):
+            raise RuntimeError(
+                f"{model_id} load RPC failed: {r.get('error')}")
+        data = r.get("data") or {}
+        if data.get("status") == "error":
+            raise RuntimeError(
+                f"{model_id} load worker error: {data.get('init_error', '')}")
+        new_key = (npu_index, model_id)
         with self._lock:
-            if self._worker_thread is not None and self._worker_thread.is_alive():
-                return
-            self._stop_worker.clear()
-            self._wake_event.clear()
-            t = threading.Thread(
-                target=self._worker_loop,
-                name="compute-registry-worker",
-                daemon=True,
-            )
-            self._worker_thread = t
-            t.start()
+            self._instances.pop(inst.key, None)
+            inst.npu_index = npu_index
+            inst.key = new_key
+            inst.status = data.get("status", "running")
+            inst.load_time_sec = data.get("load_time_sec")
+            inst.loaded_at = data.get("loaded_at")
+            self._instances[new_key] = inst
+        LOG.info("bound %s @ npu=%d (load=%.1fs)",
+                 model_id, npu_index, inst.load_time_sec or 0.0)
+        return inst
 
-    def _wake_worker(self) -> None:
-        self._ensure_worker()
-        self._wake_event.set()
+    def unload_instance(self, model_id: str) -> None:
+        """RPC ``unload``: worker drops its LLMSession, status returns
+        to ``not_loaded``, npu_index resets to -1.
 
-    def _worker_loop(self) -> None:
-        while not self._stop_worker.is_set():
+        Works for adopted peers too — we just ask the peer to release
+        the resource; we don't terminate anything we don't own.
+        """
+        inst = self._find_by_model(model_id)
+        if inst is None or inst.rpc_client is None:
+            return
+        try:
+            inst.rpc_client.call(
+                {"action": "unload"}, timeout_ms=30_000)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("unload %s RPC failed: %s", model_id, e)
+        with self._lock:
+            old_key = inst.key
+            inst.npu_index = -1
+            inst.key = (-1, model_id)
+            inst.status = "not_loaded"
+            inst.load_time_sec = None
+            inst.loaded_at = None
+            self._instances.pop(old_key, None)
+            self._instances[inst.key] = inst
+
+    def stop_instance_local(self, model_id: str) -> None:
+        """Spawned-only: unload → RPC shutdown → wait 3 s → kill -9.
+
+        Raises ``RuntimeError`` if the instance is adopted (proc is
+        None) — the caller (API layer) turns this into HTTP 403.
+        """
+        inst = self._find_by_model(model_id)
+        if inst is None:
+            raise RuntimeError(f"{model_id} 不在 registry")
+        if inst.proc is None:
+            raise RuntimeError(
+                f"{model_id} 是 peer 提供的 service，本机无权停止")
+        try:
+            self.unload_instance(model_id)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("stop: unload %s raised: %s", model_id, e)
+        try:
+            if inst.rpc_client is not None:
+                inst.rpc_client.call(
+                    {"action": "shutdown"}, timeout_ms=5_000)
+        except Exception as e:  # noqa: BLE001
+            LOG.info("stop: shutdown RPC %s raised: %s", model_id, e)
+        proc = inst.proc
+        if proc is not None and proc.poll() is None:
             try:
-                inst = self._take_next_queued()
-                if inst is None:
-                    # 没有任务，等 1s 或被 wake
-                    self._wake_event.wait(timeout=1.0)
-                    self._wake_event.clear()
-                    continue
-                self._run_one(inst)
-            except BaseException as e:  # noqa: BLE001
-                # 防御性兜底：任何从 _take_next_queued / _run_one 里逃逸出来
-                # 的异常都不能让 worker thread 死掉。worker 一旦死掉，正在
-                # loading 的实例永远停在 loading，后面 queued 的实例再也
-                # 不会被拾取 —— 算力配置页就会"卡住"，用户看不到任何错误。
-                # 这里记一条日志 + 继续循环，下次 wake 时再重试。
-                LOG.exception(
-                    "compute worker caught unexpected exception (loop continues): %s",
-                    e,
-                )
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning("kill %s failed: %s", model_id, e)
+        try:
+            if inst.rpc_session_proxy is not None:
+                inst.rpc_session_proxy.close()
+        except Exception:
+            pass
+        try:
+            if inst.rpc_client is not None:
+                inst.rpc_client.destroy()
+        except Exception:
+            pass
+        with self._lock:
+            self._instances.pop(inst.key, None)
+        LOG.info("stopped local worker for %s", model_id)
 
-    def _take_next_queued(self) -> Optional[ModelInstance]:
+    def restart_instance_local(self, model_id: str) -> None:
+        """Spawned-only 4-step restart (Q3 spec):
+          1. RPC ``unload`` (graceful model release)
+          2. RPC ``shutdown`` (worker self-terminates)
+          3. wait / kill -9 if it doesn't exit
+          4. run ``ensure_worker_for_model`` (probe → adopt-or-spawn).
+
+        Per "走 run.py 启动流程" semantics: we do NOT auto-bind after
+        respawn. The worker comes back up in ``not_loaded`` and the
+        user must re-select an NPU on the compute-config page.
+        """
+        try:
+            self.stop_instance_local(model_id)
+        except RuntimeError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("restart: stop %s raised: %s", model_id, e)
+        self.ensure_worker_for_model(model_id)
+
+    def stop_all_local(self) -> None:
+        """Stop every spawned worker (proc != None). Adopted peers
+        untouched."""
+        models = []
         with self._lock:
             for inst in self._instances.values():
-                if inst.status == "queued":
-                    inst.status = "loading"
-                    inst.started_at = time.time()
+                if inst.proc is not None:
+                    models.append(inst.model_id)
+        for m in models:
+            try:
+                self.stop_instance_local(m)
+            except Exception:  # noqa: BLE001
+                LOG.exception("stop_all_local: %s failed", m)
+
+    # ------------------------------------------------------------------ #
+    # subprocess-mode spawn (wdndds cshim RPC)                           #
+    # ------------------------------------------------------------------ #
+    def _setup_rpc_client(self, inst: ModelInstance) -> None:
+        """Create the RpcClient + RpcSessionProxy for the given instance.
+
+        Used by both ``_start_one_subprocess`` (fresh spawn) and
+        ``_adopt_existing_worker`` (boot-time adoption of an already
+        responding peer). Both paths go through the same wdndds
+        service name ``wdndds/rpc/<model_id>`` so FastDDS discovery
+        routes calls to whichever process is actually hosting the
+        service — local subprocess OR a peer on the LAN.
+        """
+        hub = self._hub_or_raise()
+        svc = hub.create_service(f"wdndds/rpc/{inst.model_id}")
+        rpc_client = svc.create_requester(timeout_ms=10_000)
+        inst.rpc_client = rpc_client
+        try:
+            from app.services.rpc_session_proxy import make_rpc_session_proxy
+            inst.rpc_session_proxy = make_rpc_session_proxy(
+                rpc_client, inst.model_id)
+            inst.llm_session = inst.rpc_session_proxy
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("RpcSessionProxy create failed for %s: %s",
+                        inst.model_id, e)
+
+    def _probe_service(self, model_id: str) -> Optional[dict]:
+        """Short-timeout RPC ``info`` probe on ``wdndds/rpc/<model_id>``.
+
+        Returns the worker's info dict if a worker responds within
+        ~1.5s, else ``None``. Used by ``_adopt_existing_worker`` to
+        avoid spawning duplicate processes when a peer (or a stale
+        orphan from a previous boot) is already providing the
+        service on the LAN.
+        """
+        if self._hub is None:
+            return None
+        try:
+            svc = self._hub.create_service(f"wdndds/rpc/{model_id}")
+            rpc = svc.create_requester(timeout_ms=1500)
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("probe: create requester failed for %s: %s",
+                      model_id, e)
+            return None
+        try:
+            r = rpc.call({"action": "info"}, timeout_ms=1500)
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("probe: call failed for %s: %s", model_id, e)
+            return None
+        finally:
+            try:
+                rpc.destroy()
+            except Exception:
+                pass
+        if not r or not r.get("ok"):
+            return None
+        return r.get("data") or {}
+
+    def _find_by_model(self, model_id: str) -> Optional[ModelInstance]:
+        """Look up a registered instance by model_id (key changes after
+        bind so we can't just key-index)."""
+        with self._lock:
+            for inst in self._instances.values():
+                if inst.model_id == model_id:
                     return inst
         return None
 
-    def _run_one(self, inst: ModelInstance) -> None:
-        """真正调 rkai.LLMSession()。失败 → status='error'。
+    def list_with_source(self) -> list[dict]:
+        """UI-friendly snapshot of every catalog model's current state.
 
-        流程：轻量预检（<1s，文件 + NPU）→ 父进程完整 init（~55s，
-        try/except 包住）。旧版先在子进程跑完整 init 探针再父进程
-        跑一次，总耗时 ~110s；现在 ~55s，与 demo 一致。失去 rknn3
-        native abort 隔离保护（旧函数 ``_init_session_subprocess``
-        保留未删，将来真机若出现可恢复）。
+        Returns one entry per ``MODEL_PRESETS`` key (so the page can
+        always render the full catalog), with a ``source`` field:
 
-        失败兜底：整段包在 ``try/except BaseException`` 里，**任何**
-        异常（包括 ``except Exception`` 抓不住的 ``SystemExit`` /
-        ``KeyboardInterrupt`` 等 ``BaseException`` 子类）都会把实例
-        标 ``status='error'`` 并写错误原因。**绝不**让实例停在
-        ``loading`` 状态 —— 那意味着 worker 已经放弃了这个实例，但
-        UI 永远看不到错误。
+          * ``"spawned"``  — this machine spawned the worker (proc set)
+          * ``"adopted"``  — peer on the LAN is providing the service
+          * ``"unavailable"`` — daemon probed, no peer responded
+
+        Ordered: spawned first, adopted second, unavailable last.
         """
-        npu_index = inst.npu_index
-        model_id = inst.model_id
+        out: list[dict] = []
+        with self._lock:
+            by_model: dict[str, ModelInstance] = {
+                inst.model_id: inst for inst in self._instances.values()
+            }
+        for model_id, preset in MODEL_PRESETS.items():
+            inst = by_model.get(model_id)
+            if inst is None:
+                out.append({
+                    "model_id":           model_id,
+                    "label":              preset["label"],
+                    "instance_name":      preset["instance_name"],
+                    "capability_types":   list(preset["capability_types"]),
+                    "memory_estimate_mb": preset["memory_estimate_mb"],
+                    "status":             "unavailable",
+                    "error":              "",
+                    "npu_index":          -1,
+                    "pid":                0,
+                    "load_time_sec":      None,
+                    "loaded_at":          None,
+                    "_source":            "unavailable",
+                    "_peer_guid":         "",
+                    "_peer_name":         "",
+                })
+                continue
+            d = inst.to_dict()
+            out.append(d)
+        # Stable ordering: spawned → adopted → unavailable.
+        order = {"spawned": 0, "adopted": 1, "unavailable": 2}
+        out.sort(key=lambda x: (order.get(x.get("_source", ""), 9),
+                                x.get("model_id", "")))
+        return out
+
+    def boot_compute_services(self) -> None:
+        """App boot: ensure every model in ``config.compute.services``
+        has *some* live worker reachable on the LAN.
+
+        For each model_id in the list:
+          1. if we already have a record, skip
+          2. probe the LAN daemon — adopt if a peer responds
+          3. otherwise spawn a fresh local subprocess
+
+        Workers are NOT bound to an NPU at boot; they wait in
+        ``not_loaded`` until the user clicks 启用 on the compute-config
+        page (which triggers ``bind_instance``).
+        """
         try:
-            t_probe = time.time()
-            ok, err = _probe_session_setup(npu_index, model_id)
-            probe_sec = time.time() - t_probe
-            # 轻量预检无子进程 → stderr_full 留空（保留字段以匹配上游
-            # ModelInstance schema；前端"展开"按钮拿不到更多就显示空）。
-            stderr_full = ""
-            if not ok:
-                with self._lock:
-                    inst.status = "error"
-                    inst.error = err
-                    inst.stderr_full = stderr_full
-                    inst.finished_at = time.time()
-                LOG.warning(
-                    "compute init probe failed (%d, %s, probe=%.1fs): %s",
-                    npu_index, model_id, probe_sec, err,
-                )
-                return
-
-            t0 = time.time()
-            try:
-                preset = MODEL_PRESETS[model_id]
-                spec = preset["preset_factory"]()
-                from rkai import LLMSession  # 懒导入
-                sess = LLMSession(model=spec, npu=npu_index)
-            except BaseException as e:  # noqa: BLE001
-                # 用 BaseException 而不是 Exception：rkai / rknn3 native
-                # 代码可能在 LLMSession() 构造期间抛 SystemExit / 自定义
-                # BaseException 子类，except Exception 抓不到 → 实例
-                # 永远停在 loading → UI 卡住。
-                with self._lock:
-                    inst.status = "error"
-                    inst.error = f"init 失败: {type(e).__name__}: {e}"
-                    inst.finished_at = time.time()
-                LOG.warning(
-                    "compute init failed (%d, %s, init=%.1fs): %s",
-                    npu_index, model_id, time.time() - t0, e,
-                )
-                return
-
-            init_sec = time.time() - t0
-
+            self.list_cards()
+        except Exception:
+            pass
+        try:
+            stored = get_config().get_section("compute", {})
+        except Exception:
+            stored = {}
+        services = stored.get("services") if isinstance(stored, dict) else None
+        if not isinstance(services, list):
+            return
+        for entry in services:
+            if not isinstance(entry, str):
+                continue
+            model_id = entry
+            if model_id not in MODEL_PRESETS:
+                LOG.warning("config.compute.services 跳过未知 model: %s",
+                            model_id)
+                continue
             with self._lock:
-                inst.llm_session = sess
-                inst.status = "running"
-                inst.error = ""
-                inst.stderr_full = ""
-                inst.finished_at = time.time()
-        except BaseException as e:  # noqa: BLE001
-            # 兜底：_probe_session_setup / 任何意料外情况。**必须**把实例
-            # 标 error，否则 status 会停在 loading 永远不变 —— 网页端只能
-            # 看到 "初始化中..." 倒计时不动，用户没有任何线索。
-            err_text = str(e) or "未知异常"
+                if any(i.model_id == model_id for i in self._instances.values()):
+                    continue
+            adopted = None
+            try:
+                adopted = self._adopt_existing_worker(model_id)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("boot probe failed for %s: %s", model_id, e)
+            if adopted is not None:
+                LOG.info("boot: adopted %s (peer guid=%s status=%s)",
+                         model_id, adopted._peer_guid, adopted.status)
+                continue
+            try:
+                self._spawn_compute_worker(model_id)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("boot spawn %s failed: %s", model_id, e)
+
+    def close_all(self) -> None:
+        """Web shutdown: close the main process Hub ONLY.
+
+        Workers are independent processes; we must NOT terminate them
+        from here — they may outlive this web process, be restarted
+        by systemd, or be required by a peer. Adopted peers obviously
+        can't be killed by us anyway.
+
+        ``stop_all_local`` is intentionally NOT called.
+        """
+        try:
+            if self._hub is not None:
+                self._hub.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Boot                                                              #
+    # ------------------------------------------------------------------ #
+    # Note: boot 不再自动 spawn worker。实例 (npu, model) 由用户在算力
+    # 配置页点击启动时通过 ``POST /api/compute/instances`` 指定，npu_index
+    # 作为命令行 ``--npu <idx>`` 透传给子进程，不写 config.json；主进程
+    # 重启后用户需重新点击启用。registry 单例本身仍会被构造（_ensure_hub
+    # 起主进程 Hub 做 RPC client），但 _instances 一律为空起步。
+
+    def _probe_instance(self, inst: ModelInstance) -> None:
+        """Background: keep polling the worker's ``info`` RPC.
+
+        Loop exits when the worker reaches a **terminal** state:
+
+          * ``running``  — LLMSession is up; probe no longer needed
+          * ``error``    — worker reported init_error / probe gave up
+          * spawned worker subprocess exits (proc.poll() != None)
+          * adopted peer disappears (>= 3 consecutive RPC timeouts)
+
+        For ``not_loaded`` / ``loading`` we keep polling indefinitely.
+        Previously this loop had a 10-min deadline that incorrectly
+        flipped long-idle workers to ``error`` — the new design lets
+        a worker sit in ``not_loaded`` until the user binds an NPU
+        via the compute-config page (which can be arbitrarily late).
+        """
+        consecutive_failures = 0
+        try:
+            while True:
+                # Check subprocess liveness first (spawned only).
+                if inst.proc is not None:
+                    rc = inst.proc.poll()
+                    if rc is not None:
+                        err = ""
+                        try:
+                            if inst.proc.stderr:
+                                err = inst.proc.stderr.read().decode(
+                                    "utf-8", errors="replace")
+                        except Exception:
+                            pass
+                        with self._lock:
+                            inst.status = "error"
+                            inst.error = (
+                                f"compute_worker exited rc={rc}; "
+                                f"stderr: {err[:1500]}"
+                            )
+                            inst.finished_at = time.time()
+                        LOG.warning(
+                            "compute_worker for %s @ npu=%d exited rc=%d; "
+                            "stderr (last 800 chars):\n%s",
+                            inst.model_id, inst.npu_index, rc, err[-800:],
+                        )
+                        return
+
+                # Probe worker.
+                if inst.rpc_client is not None:
+                    try:
+                        r = inst.rpc_client.call(
+                            {"action": "info"}, timeout_ms=5000)
+                    except Exception as e:
+                        consecutive_failures += 1
+                        LOG.warning("info call failed for %s (%d): %s",
+                                   inst.model_id, consecutive_failures, e)
+                        # For adopted: after several consecutive failures
+                        # we conclude the peer is gone.
+                        if (inst.proc is None
+                                and consecutive_failures >= 3
+                                and inst.status != "error"):
+                            with self._lock:
+                                inst.status = "error"
+                                inst.error = "peer 已失联"
+                                LOG.warning(
+                                    "adopted peer %s lost (consecutive "
+                                    "RPC failures=%d)",
+                                    inst.model_id, consecutive_failures)
+                        time.sleep(2.0)
+                        continue
+                    if not r.get("ok"):
+                        consecutive_failures += 1
+                        time.sleep(1.0)
+                        continue
+                    consecutive_failures = 0
+                    data = r.get("data") or {}
+                    worker_status = data.get("status", "not_loaded")
+                    if worker_status == "running":
+                        with self._lock:
+                            inst.status = "running"
+                            worker_npu = data.get("npu_index")
+                            if (isinstance(worker_npu, int)
+                                    and worker_npu >= 0
+                                    and inst.npu_index != worker_npu):
+                                self._instances.pop(inst.key, None)
+                                inst.npu_index = worker_npu
+                                inst.key = (worker_npu, inst.model_id)
+                                self._instances[inst.key] = inst
+                            inst.finished_at = data.get(
+                                "loaded_at", time.time())
+                            inst.load_time_sec = data.get("load_time_sec", 0.0)
+                            inst.loaded_at = inst.finished_at
+                            inst.error = ""
+                        LOG.info(
+                            "instance %s @ npu=%d → running (load=%.1fs)",
+                            inst.model_id, inst.npu_index,
+                            inst.load_time_sec)
+                        return
+                    if worker_status == "error":
+                        with self._lock:
+                            inst.status = "error"
+                            inst.error = data.get("init_error", "")
+                            inst.finished_at = time.time()
+                        LOG.warning(
+                            "instance %s @ npu=%d → error: %s",
+                            inst.model_id, inst.npu_index, inst.error)
+                        return
+                    if worker_status == "loading":
+                        with self._lock:
+                            if inst.status != "loading":
+                                inst.status = "loading"
+                                LOG.info("instance %s @ npu=%d → loading",
+                                          inst.model_id, inst.npu_index)
+                    elif worker_status == "not_loaded":
+                        with self._lock:
+                            if inst.status not in {"not_loaded", "loading",
+                                                    "running", "error"}:
+                                inst.status = "not_loaded"
+
+                time.sleep(1.0)
+        except Exception as e:
+            LOG.exception("probe_instance crashed")
             with self._lock:
                 inst.status = "error"
-                inst.error = f"worker 内部异常: {type(e).__name__}: {err_text}"
-                inst.finished_at = time.time()
-            LOG.exception(
-                "compute _run_one caught unexpected exception (%d, %s)", npu_index, model_id,
-            )
-            return
+                inst.error = f"probe crashed: {type(e).__name__}: {e}"
 
-        # 持久化：实例集写回 config.json（live start 后）。
-        # 故意放在 try/except 之外 —— LLMSession 已成功 init，_persist 失败
-        # 不应该回滚 status='error'。持久化失败只记日志，进程不退。
-        # 注意：这是后台 thread 调，_persist 会调 config.set_section，
-        # 已经 thread-safe（ConfigStore 内部有 RLock）。
-        try:
-            self._persist()
-        except Exception as pe:  # noqa: BLE001
-            LOG.warning(
-                "compute _persist failed after successful init (%d, %s): %s",
-                npu_index, model_id, pe,
-            )
-        LOG.info(
-            "compute instance running (%d, %s, probe=%.1fs, init=%.1fs, total=%.1fs)",
-            npu_index, model_id, probe_sec, init_sec, probe_sec + init_sec,
-        )
+    def _persist(self) -> None:
+        """No-op stub kept for backward compat with older call sites.
+
+        ``config.json["compute"]["instances"]`` 不再被 registry 维护——
+        实例 (npu, model) 由用户在算力配置页点击启动时通过
+        ``POST /api/compute/instances`` 指定并作为子进程命令行
+        （``--npu <idx>``）传入，不持久化。
+        """
+        return
+
+    # ------------------------------------------------------------------ #
+    # 消费者 API                                                         #
+    # ------------------------------------------------------------------ #
+    def get_session(self, capability_type: str) -> Any:
+        """Return the RpcSessionProxy for the first running instance
+        exposing ``capability_type``. Raises RuntimeError if none."""
+        with self._lock:
+            for inst in self._instances.values():
+                if (inst.status == "running"
+                        and capability_type in inst.capability_types):
+                    if inst.rpc_session_proxy is None:
+                        raise RuntimeError(
+                            f"功能未启用: {capability_type} (instance has no proxy)")
+                    return inst.rpc_session_proxy
+        raise RuntimeError(f"功能未启用: {capability_type}")
 
 
 # --------------------------------------------------------------------------- #
-# Singleton
+# Singleton                                                                  #
 # --------------------------------------------------------------------------- #
 _registry: Optional[ComputeRegistry] = None
 _registry_lock = threading.Lock()
@@ -855,266 +1291,17 @@ def get_registry() -> ComputeRegistry:
 
 
 # --------------------------------------------------------------------------- #
-# 进程级 LLMSession 调用锁
-#
-# 多个消费者（detector / 视频文件分析 等）共用同一 capability 的
-# LLMSession。``reset()`` + ``respond(...)`` 不是线程安全的（RKNN
-# native lib 内部维护 KV cache + 流式 token 状态），并发调用会出错。
-# 消费者在调 ``session.respond`` 之前必须 acquire 这个锁；锁本身
-# 不绑 capability，跨 capability 串行化足够保守（VLM 这一轮只有
-# ``swcap_video_describe`` 一个相关 capability，detector 与 VFA 不
-# 会同时跑；TTS 用的是另一组 session，与本锁无关）。
+# Backward-compat: legacy ``get_session_call_lock()`` API.                       #
+# In the v0.4 per-subprocess RPC refactor the call lock is no longer needed     #
+# in the main process (server-side lock in compute_worker serializes per       #
+# instance). We keep this function returning a no-op context manager so        #
+# existing call sites (video_file_analysis.py) keep working.                  #
 # --------------------------------------------------------------------------- #
-_llm_session_call_lock = threading.Lock()
+import contextlib
 
 
-def get_session_call_lock() -> threading.Lock:
-    """进程级锁；``session.reset()`` + ``session.respond(...)`` 前后必须包住。"""
-    return _llm_session_call_lock
-
-
-# --------------------------------------------------------------------------- #
-# 轻量预检（替代旧 _init_session_subprocess 的完整 init；省 55s）
-# --------------------------------------------------------------------------- #
-def _probe_session_setup(npu_index: int, model_id: str) -> Tuple[bool, str]:
-    """启动 LLMSession 前的轻量预检。检查 model_id / preset 工厂 /
-    模型文件 / NPU 设备，不做 rknn3 init_runtime。错误时返回
-    (ok=False, detail) 供 ``_run_one`` 写入 ``inst.error``。
-
-    旧路径 ``_init_session_subprocess``（下方保留）在子进程跑完整 init
-    防 rknn3 native abort，仅在非 RK 板 / 错配场景需要。
-    """
-    if model_id not in MODEL_PRESETS:
-        return False, f"未知 model: {model_id!r}"
-
-    try:
-        spec = MODEL_PRESETS[model_id]["preset_factory"]()
-    except Exception as e:
-        return False, f"preset 工厂失败: {type(e).__name__}: {e}"
-
-    # 模型文件路径按 spec.kind 分支：
-    #   * kind="llm"  → rknn_path / weight_path + embed_path + tokenizer_path
-    #   * kind="vlm"  → rknn_llm_path / rknn_vision_path（weight 由
-    #                   .1828.rknn 路径自动 derive，probe 不单独校验）
-    #                   + embed_path + tokenizer_path
-    #   * kind="embedding" → 同 vlm（rknn_llm_path / rknn_vision_path +
-    #                   embed_path + tokenizer_path；embedding 的 LLM 走
-    #                   RKNN3Lite 普通模型路径，weight 同样自动 derive）
-    #   * kind="tts"  → tts_model_dir（目录下 4 个 .1828.rknn + embed/bin
-    #                   + tokenizer.json；TTS 不用顶层 embed_path/
-    #                   tokenizer_path，probe 不强求）
-    #   * kind="asr"  → asr_model_dir + embed_path + tokenizer_path
-    # 缺字段视为"未配置"，跟"路径为空"同样报 missing。
-    paths: List[Tuple[str, str]] = []
-    kind = getattr(spec, "kind", "")
-    if kind in ("vlm", "embedding"):
-        paths.append(("rknn_llm",      getattr(spec, "rknn_llm_path", "")))
-        paths.append(("rknn_vision",   getattr(spec, "rknn_vision_path", "")))
-    elif kind == "tts":
-        tts_dir = getattr(spec, "tts_model_dir", "")
-        if tts_dir:
-            paths.append(("tts_model_dir", tts_dir))
-    elif kind == "asr":
-        asr_dir = getattr(spec, "asr_model_dir", "")
-        if asr_dir:
-            paths.append(("asr_model_dir", asr_dir))
-    else:  # llm 及其它
-        paths.append(("rknn",   getattr(spec, "rknn_path", "")))
-        paths.append(("weight", getattr(spec, "weight_path", "")))
-
-    # embed / tokenizer 不是所有 kind 都需要：tts 用目录内自带的 token 表，
-    # 不在 spec 顶层。其它 kind（llm / vlm / asr）都直接走 spec.embed_path
-    # / spec.tokenizer_path。
-    if kind != "tts":
-        paths.append(("embed",    getattr(spec, "embed_path", "")))
-        paths.append(("tokenizer", getattr(spec, "tokenizer_path", "")))
-
-    missing = []
-    for label, p in paths:
-        if not p:
-            missing.append(f"{label}=<empty>")
-            continue
-        pp = Path(p)
-        # 目录类条目（tts_model_dir / asr_model_dir）只看目录是否存在；
-        # 文件类条目走 is_file() + size 检查。
-        if pp.is_dir():
-            continue
-        if not pp.is_file():
-            missing.append(f"{label}={p} (不存在)")
-        elif pp.stat().st_size == 0:
-            missing.append(f"{label}={p} (空文件)")
-    if missing:
-        return False, f"模型文件缺失: {'; '.join(missing)}"
-
-    try:
-        from rknn3lite.api import RKNN3Lite  # 懒导入
-        ids = RKNN3Lite().get_devices_id()
-    except Exception as e:
-        return False, f"NPU 检测失败: {type(e).__name__}: {e}"
-    if not ids:
-        return False, "未检测到任何 NPU 设备（RKNN3Lite.get_devices_id() 返回空）"
-    if not (0 <= npu_index < len(ids)):
-        return False, f"npu_index 越界: {npu_index}（当前有 {len(ids)} 张卡）"
-
-    return True, ""
-
-
-# --------------------------------------------------------------------------- #
-# 子进程隔离的 LLMSession 构造探针（旧版，保留未调用）
-# 当前不再调用，但保留函数便于将来真机出现 rknn3 native abort 时恢复。
-# --------------------------------------------------------------------------- #
-_INIT_SENTINEL = b"__PYRKAIWEB_INIT_DONE__"
-
-
-def _init_session_subprocess(
-    npu_index: int, model_id: str, *, timeout: float = 90.0,
-) -> Tuple[bool, str, str, float]:
-    """在子进程里尝试构造一次 LLMSession。
-
-    **目的**：rkai 的 ``LLMSession(...)`` 在 rknn3 加载失败 / 模型文件
-    缺失等情况下会触发 ``std::terminate()``（而不是抛 Python 异常），
-    整 uvicorn 跟着挂。把构造放到子进程里：
-
-    * 子进程 exit 0 → 子进程构造成功，父进程也照着构造一份（consumers
-      要拿句柄），构造时再失败同样标 error。
-    * 子进程 exit 非 0 / SIGABRT → 父进程捕获，把 stderr 完整保留
-      到 ``inst.stderr_full``，前 1-2 行作为摘要写到 ``inst.error``，
-      实例标 ``error``，网页不挂。
-
-    Returns:
-        (ok, error_summary, stderr_full, probe_seconds)
-        ok=True 时 error_summary/stderr_full 为空。
-    """
-    import subprocess
-    import sys
-    import json as _json
-
-    env = os.environ.copy()
-    # rkai 用 RKAI_MODELS_DIR 找模型；保留主进程里已经写过的值。
-    repo_root = str(Path(__file__).resolve().parents[2])
-    env.setdefault("PYTHONPATH", repo_root)
-    if "PYTHONPATH" in env and repo_root not in env["PYTHONPATH"].split(":"):
-        env["PYTHONPATH"] = repo_root + ":" + env["PYTHONPATH"]
-
-    # 子进程脚本：import rkai, 构建 LLMSession, 把结果写到 stdout。
-    # **故意**把 rkai 构造包在 try/except BaseException 里 —— 既捕
-    # Python 异常，也避免 C++ 异常 unwind 把 Python 解释器拖死（虽然
-    # std::terminate 我们抓不住，但至少 import 错误 / TypeError 等
-    # 能被截到）。脚本**完全**用 ``.format()`` 风格字符串拼接，
-    # 避开 ``%`` 模板 —— 下面整段作为 ``python -c`` 的代码不能
-    # 含 ``%`` 字符。
-    model_id_js = model_id.replace("'", "\\'")
-    script = (
-        "import sys, json, os\n"
-        "sys.path.insert(0, " + repr(repo_root) + ")\n"
-        "def _emit(ok, error=''):\n"
-        "    sys.stdout.buffer.write(\n"
-        "        b'__PYRKAIWEB_INIT_DONE__' +\n"
-        "        json.dumps({'ok': bool(ok), 'error': str(error)}).encode('utf-8') +\n"
-        "        b'\\n')\n"
-        "    sys.stdout.flush()\n"
-        "try:\n"
-        "    from rkai import LLMSession, SystemLanguageModel\n"
-        "except BaseException as _e:\n"
-        "    _emit(False, 'import rkai failed: ' + repr(_e))\n"
-        "    sys.exit(0)\n"
-        "try:\n"
-        "    model_id = '" + model_id_js + "'\n"
-        "    npu_index = " + str(int(npu_index)) + "\n"
-        "    if model_id == 'qwen3-vl-4b':\n"
-        "        spec = SystemLanguageModel.qwen3_vl_4b()\n"
-        "    elif model_id == 'qwen3-tts':\n"
-        "        spec = SystemLanguageModel.qwen3_tts()\n"
-        "    elif model_id == 'qwen3-asr':\n"
-        "        spec = SystemLanguageModel.qwen3_asr()\n"
-        "    elif model_id == 'qwen3-8b':\n"
-        "        from dataclasses import replace as _dc_replace\n"
-        "        _spec = SystemLanguageModel.qwen3_8b()\n"
-        "        spec = _dc_replace(_spec, max_context_len=32768).with_options(\n"
-        "            max_new_tokens=2048, keep_history=1, enable_thinking=True,\n"
-        "        )\n"
-        "    elif model_id == 'qwen3-vl-embedding-2b':\n"
-        "        spec = SystemLanguageModel.qwen3_vl_embedding()\n"
-        "    else:\n"
-        "        raise ValueError('unknown model: ' + model_id)\n"
-        "    _ = LLMSession(model=spec, npu=npu_index)\n"
-        "    _emit(True)\n"
-        "except BaseException as _e:\n"
-        "    _emit(False, 'LLMSession() raised: ' + type(_e).__name__ + ': ' + str(_e))\n"
-        "finally:\n"
-        "    sys.exit(0)\n"
-    )
-
-    t0 = time.time()
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            env=env,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"init 超时 (>={timeout}s)", time.time() - t0
-
-    elapsed = time.time() - t0
-    # 找 sentinel + JSON 行
-    out = proc.stdout or b""
-    err_full = (proc.stderr or b"").decode("utf-8", errors="replace")
-    idx = out.find(_INIT_SENTINEL)
-    if idx >= 0:
-        tail = out[idx + len(_INIT_SENTINEL):]
-        line = tail.split(b"\n", 1)[0].strip()
-        try:
-            payload = _json.loads(line.decode("utf-8", errors="replace"))
-        except Exception:
-            payload = None
-        if isinstance(payload, dict):
-            ok = bool(payload.get("ok"))
-            err = str(payload.get("error") or "")
-            if not ok and not err:
-                err = "subprocess returned error but empty message"
-            # 成功时 stderr 通常无关；失败时合并 stderr 给前端展开
-            if not ok and err_full.strip():
-                err = f"{err}\n--- 子进程 stderr ---\n{err_full.rstrip()}"
-            return ok, err, err_full, elapsed
-        # 解析失败：把 stdout 截前 200 字符当 hint，stderr 完整保留
-        return False, f"subprocess stdout 无法解析: {line[:200]!r}", err_full, elapsed
-
-    # 没有 sentinel：subprocess 崩了 / 输出没到。常见是 rknn3
-    # `std::terminate()` —— exit code 是 -6 (SIGABRT) 或 -11 (SIGSEGV)。
-    rc = proc.returncode
-    err_text = err_full.strip()
-    out_text = out.decode("utf-8", errors="replace").strip()
-    if err_text:
-        # stderr 是 RKNNAPI 这种 native 报错的事实源；优先用它做摘要。
-        # 取末尾非空行（最后真错），避免被前面的 PyTorch warning 噪声挤掉。
-        lines = [ln for ln in err_text.splitlines() if ln.strip()]
-        summary_line = lines[-1] if lines else ""
-        # 摘要：head 1 行 + 真错 1 行（带冒号），最多 240 字符
-        head_line = lines[0] if lines else ""
-        if summary_line and summary_line != head_line:
-            summary = f"{head_line[:120]}\n{summary_line[:240]}"
-        else:
-            summary = summary_line[:240] or "(stderr 为空)"
-    elif out_text:
-        summary = out_text.splitlines()[-1][:240] if out_text.splitlines() else "(无输出)"
-    else:
-        # stderr 和 stdout 都空 —— 多半是 std::terminate 在写入任何缓冲之前就
-        # 把进程干掉了。给用户一个明确诊断：通常是 rknn3 driver 不匹配或
-        # /dev/rknn_list 不存在。
-        summary = (
-            "子进程无任何 stdout/stderr 输出即被中止（exit " + str(rc) + "）。"
-            "常见原因：\n"
-            "  - rknn3 native 驱动未安装或版本与模型不匹配\n"
-            "  - /dev/rknn_list 不存在或权限不足\n"
-            "  - rkai 子模块未正确安装（pip install -e ...）\n"
-            "请检查 pyrkaiweb 启动日志中的 RKNN 设备枚举是否成功。"
-        )
-    if rc < 0:
-        sig = -rc
-        try:
-            sig_name = {6: "SIGABRT", 11: "SIGSEGV", 9: "SIGKILL"}.get(sig, f"signal {sig}")
-        except Exception:
-            sig_name = f"signal {sig}"
-        return False, f"init 子进程崩溃（{sig_name}，exit {rc}）：\n{summary}", err_full, elapsed
-    return False, f"init 失败（exit {rc}）：\n{summary}", err_full, elapsed
+@contextlib.contextmanager
+def get_session_call_lock():
+    """Legacy no-op call lock. Kept for backward compat with code
+    written before the per-subprocess RPC refactor."""
+    yield
