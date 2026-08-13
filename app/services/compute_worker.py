@@ -98,6 +98,11 @@ def _build_session(model_id: str, npu_index: int):
         spec = _dc_replace(spec, max_context_len=32768).with_options(
             max_new_tokens=2048, keep_history=1, enable_thinking=True,
         )
+    elif model_id == "qwen3-vl-embedding-2b":
+        # Embedding 模型：RKNN3Lite 普通模型路径输出 2048 维归一化向量；
+        # 不做 token 生成，rkai 内部用 EmbeddingBackend 跑 embed_text /
+        # embed_video_chunk；模型文件布局与 Qwen3-VL-4B 同款。
+        spec = mod["SystemLanguageModel"].qwen3_vl_embedding()
     else:
         raise ValueError(f"unknown model_id: {model_id!r}")
     LOG.info("building LLMSession(model=%s, npu=%d) ...", model_id, npu_index)
@@ -192,6 +197,87 @@ def unload_handler(state: dict) -> dict:
     state["load_time_sec"] = None
     state["loaded_at"] = None
     return {"status": "unloaded"}
+
+
+def embed_text_handler(state: dict, payload: dict) -> dict:
+    """Embedding text query (Qwen3-VL-Embedding-2B only).
+
+    Payload: ``{"text": str}``
+    Reply:   ``{"vec": List[float], "dim": int}`` — already-normalized
+             2048-dim vector for cosine-similarity ranking.
+    """
+    sess = state.get("session")
+    if sess is None:
+        return {"status": "error",
+                "error": "session not loaded; send action='load' first"}
+    text = payload.get("text") or ""
+    if not isinstance(text, str) or not text:
+        return {"status": "error", "error": "text 必须是非空字符串"}
+    try:
+        vec = sess.embed_text(text)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error",
+                "error": f"{type(e).__name__}: {e}"}
+    # numpy array → JSON-friendly list. C extension returns either
+    # np.ndarray or sequence-like; normalize via numpy when available.
+    try:
+        import numpy as _np
+        arr = _np.asarray(vec, dtype=_np.float32).reshape(-1)
+        return {"vec": arr.tolist(), "dim": int(arr.size)}
+    except Exception:
+        flat = list(vec) if hasattr(vec, "__iter__") else [float(x) for x in vec]
+        return {"vec": flat, "dim": len(flat)}
+
+
+def embed_video_handler(state: dict, payload: dict) -> dict:
+    """Embedding video chunk (Qwen3-VL-Embedding-2B only).
+
+    Payload: ``{"frames": [bgr-ndarray, ...], "prompt": str (optional)}``
+    Reply:   ``{"vec": List[float], "dim": int, "n_frames": int}``
+
+    Frames are encoded as base64-encoded JPEG bytes (decoded to BGR
+    here). Wire size matters: a typical 16-frame chunk at JPEG q=85
+    fits comfortably; we don't compress further server-side.
+    """
+    sess = state.get("session")
+    if sess is None:
+        return {"status": "error",
+                "error": "session not loaded; send action='load' first"}
+    import base64 as _b64
+    import numpy as _np
+    import cv2 as _cv2
+    frames_meta = payload.get("frames", [])
+    if not isinstance(frames_meta, list) or not frames_meta:
+        return {"status": "error", "error": "frames 必须是非空 list"}
+    frames: list = []
+    for item in frames_meta:
+        if isinstance(item, dict) and "data_b64" in item:
+            data_b64 = item["data_b64"]
+        elif isinstance(item, str):
+            data_b64 = item
+        else:
+            return {"status": "error",
+                    "error": f"frame 项必须是 b64 string 或 {{data_b64}} dict: {type(item).__name__}"}
+        raw = _b64.b64decode(data_b64)
+        arr = _np.frombuffer(raw, dtype=_np.uint8)
+        img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
+        if img is None:
+            return {"status": "error", "error": "cv2.imdecode returned None"}
+        frames.append(img)
+    prompt = payload.get("prompt", "")
+    try:
+        vec = sess.embed_video(frames, prompt=prompt or "")
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error",
+                "error": f"{type(e).__name__}: {e}"}
+    try:
+        arr = _np.asarray(vec, dtype=_np.float32).reshape(-1)
+        return {"vec": arr.tolist(),
+                "dim": int(arr.size),
+                "n_frames": len(frames)}
+    except Exception:
+        flat = list(vec) if hasattr(vec, "__iter__") else [float(x) for x in vec]
+        return {"vec": flat, "dim": len(flat), "n_frames": len(frames)}
 
 
 def reset_handler(state: dict) -> dict:
@@ -331,6 +417,10 @@ def router(service_name: str, payload: Any, state: dict,
         return reset_handler(state)
     if action == "unload":
         return unload_handler(state)
+    if action == "embed_text":
+        return embed_text_handler(state, payload)
+    if action == "embed_video":
+        return embed_video_handler(state, payload)
     if action == "shutdown":
         # Trigger graceful exit of the worker main loop. The caller
         # (ComputeRegistry.stop_instance_local) waits up to 3 s, then

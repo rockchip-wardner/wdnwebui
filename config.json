@@ -8,7 +8,8 @@
     "services": [
       "qwen3-vl-4b",
       "qwen3-tts",
-      "qwen3-8b"
+      "qwen3-8b",
+      "qwen3-vl-embedding-2b"
     ],
     "discovery_servers": [
       "127.0.0.1:7500"

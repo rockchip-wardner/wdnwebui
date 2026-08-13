@@ -12,10 +12,12 @@ The cshim wraps each request/reply in a ``{wdndds_reply_suffix,
 data}`` envelope so the client can match replies to in-flight calls.
 
 The proxy preserves the LLMSession surface that detector / tts /
-text_chat / vfa use:
+text_chat / vfa / video_content_search use:
 
   * ``session.reset()``              → ``RpcClient.call({"action": "reset"})``
   * ``await session.respond(...)``   → ``RpcClient.call({"action": "infer", ...})``
+  * ``session.embed_text(text)``     → ``RpcClient.call({"action": "embed_text", ...})``
+  * ``session.embed_video(frames)``   → ``RpcClient.call({"action": "embed_video", ...})``
 """
 from __future__ import annotations
 
@@ -139,6 +141,64 @@ class _RpcSessionProxy:
             crop_b64=data.get("crop_b64"),
             raw=data,
         )
+
+    # ---- Embedding surface (Qwen3-VL-Embedding-2B only) -------------------
+    # ``video_content_search`` service calls session.embed_text / embed_video.
+    # Unlike ``respond`` (which is async), these are sync rkai APIs, so we
+    # call the proxy's sync path directly via the executor. The cshim RPC
+    # worker side picks them up via the new ``embed_text`` / ``embed_video``
+    # actions in compute_worker.py.
+
+    def embed_text(self, text: str) -> "np.ndarray":
+        """Encoding text query → 2048-dim normalized vector.
+
+        Returns a numpy ``float32`` array on the calling thread. Synchronous
+        version of the rkai LLMSession.embed_text API.
+        """
+        reply = self._client.call(
+            {"action": "embed_text", "text": text},
+            timeout_ms=60_000,
+        )
+        if not reply.get("ok"):
+            err = reply.get("error", "unknown error")
+            raise RuntimeError(
+                f"compute_worker[{self._model_id}] embed_text failed: {err}")
+        data = reply.get("data") or {}
+        vec = data.get("vec") or []
+        import numpy as _np
+        return _np.asarray(vec, dtype=_np.float32).reshape(-1)
+
+    def embed_video(self, frames, prompt: str = "") -> "np.ndarray":
+        """Embedding one video chunk (list of BGR ndarrays) → 2048-dim vector.
+
+        Frames are JPEG-encoded + base64'd here; the worker decodes them
+        back to BGR ndarrays via cv2.imdecode. We don't bypass this
+        encoding (which would require sharing DMA-BUFs across the cshim
+        boundary) because the per-call payload already fits in one DDS
+        message for typical 16-frame chunks at JPEG q=85.
+        """
+        import base64 as _b64
+        encoded = []
+        for fr in frames:
+            if hasattr(fr, "shape") and hasattr(fr, "dtype"):
+                encoded.append(_bgr_ndarray_to_b64(fr))
+            elif isinstance(fr, (bytes, bytearray)):
+                encoded.append(_b64.b64encode(bytes(fr)).decode("ascii"))
+            else:
+                raise TypeError(
+                    f"frame must be BGR ndarray or bytes, got {type(fr).__name__}")
+        reply = self._client.call(
+            {"action": "embed_video", "frames": encoded, "prompt": prompt or ""},
+            timeout_ms=120_000,
+        )
+        if not reply.get("ok"):
+            err = reply.get("error", "unknown error")
+            raise RuntimeError(
+                f"compute_worker[{self._model_id}] embed_video failed: {err}")
+        data = reply.get("data") or {}
+        vec = data.get("vec") or []
+        import numpy as _np
+        return _np.asarray(vec, dtype=_np.float32).reshape(-1)
 
     def _encode_attachments(self, attachment) -> list:
         if attachment is None:

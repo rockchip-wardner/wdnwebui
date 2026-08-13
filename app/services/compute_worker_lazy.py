@@ -80,6 +80,10 @@ def _preset_for(model_id: str) -> Any:
             keep_history=1,
             enable_thinking=True,
         )
+    if model_id == "qwen3-vl-embedding-2b":
+        # Embedding 走 RKNN3Lite 普通模型路径输出 2048 维归一化向量；
+        # LLM 推理不走 token 生成。
+        return SLM.qwen3_vl_embedding()
     raise ValueError(f"unknown model_id: {model_id!r}")
 
 

@@ -4,8 +4,6 @@ LOG = logging.getLogger("pyrkaiweb")
 import os
 from pathlib import Path
 
-import logging
-LOG = logging.getLogger("pyrkaiweb")
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -84,27 +82,6 @@ def create_app() -> FastAPI:
     model_path = (base or {}).get("model_path")
     if isinstance(model_path, str) and model_path.strip():
         os.environ["RKAI_MODELS_DIR"] = model_path
-
-    # Optionally start the wdndds_daemon if config.json says so.
-    # The daemon brokers FastDDS discovery across the LAN — every
-    # pyrkaiweb process (main, compute workers, im-bridge, …) points
-    # at it. Production deployments usually run the daemon as its
-    # own systemd unit; dev can launch it via this flag.
-    compute_cfg = cfg.get_section("compute", {})
-    if (compute_cfg or {}).get("auto_start_daemon"):
-        try:
-            from app.services import wdndds_daemon
-            udp_port = int((compute_cfg or {}).get(
-                "discovery_server_port", 7411))
-            http_port = int((compute_cfg or {}).get(
-                "daemon_http_port", 7412))
-            wdndds_daemon.start_in_subprocess(
-                port=udp_port, http_port=http_port,
-                logfile=(compute_cfg or {}).get("daemon_logfile"))
-            LOG.info("wdndds_daemon launched (udp=%d http=%d)",
-                     udp_port, http_port)
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("Failed to launch wdndds_daemon: %s", e)
 
     app.include_router(system_monitor.router, prefix="/api")
     app.include_router(video_detection.router, prefix="/api")
