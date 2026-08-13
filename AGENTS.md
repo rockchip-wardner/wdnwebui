@@ -828,6 +828,82 @@ RIFF header by hand.
 * **依赖**：`requirements.txt` 加 `av>=11.0.0`（PyAV，硬取帧走 `v4l2m2m` 后端
   + `avformat_seek_file`）；`rkv.VideoCapture` 已在内部 SDK 提供。
 
+## Video content search (视频内容检索) page
+
+`#page-video-content-search`（侧栏演示项，`⌕` 图标）暴露
+Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时间窗
+切片 → 每片 embedding → 文本余弦检索出命中片段 → 点命中卡片用真实
+帧流播放。状态机 `idle → extracting → ready`，`stopped` / `error` 是
+旁支终态。
+
+* **Service** (`app/services/video_content_search.py`)：
+  - `VideoContentSearchService` 单例（`get_service()`）。
+  - **LLMSession 必须从 ComputeRegistry 取** —— `get_session("swcap_video_retrieval")`，
+    复用 qwen3-vl-embedding-2b 实例；找不到 capability 抛
+    `RuntimeError("功能未启用: ...")`，HTTP 503 透传。`start_extract`
+    加预检 `_ensure_session()`，不用等 worker 探测才报错。
+  - **进程级 `_llm_session_call_lock`**：与 detector / VFA 共用同一套锁，
+    `embed_text` / `embed_video` 的 `reset() + respond` 类推理必须
+    `with lock:` 包住（embedding 的 `embed_*` 也是 NPU 推理，同样要
+    与 VLM 端串行化）。
+  - **切片 embedding**：PyAV 按 `[start, start+chunk_seconds)` 时间窗
+    推进（步进 = chunk_seconds - overlap），每片取 `chunk_seconds` 个
+    等距帧（1 秒/帧）缩放到 576×576，`embed_video` 得 2048 维 L2
+    归一化向量，存内存 `List[{video_path, start_time, end_time,
+    chunk_idx, fps, vec}]`。逐片推进 `slices_embedded` 并 WS 广播
+    `progress`。`_probe_video_meta` 用 PyAV 探测 fps / 总帧数 / 时长。
+  - **检索**：`embed_text` 编码查询 → 遍历索引算余弦相似度 → 阈值
+    过滤（默认 `sim_threshold=0.5`）+ `top_k`（默认 10）截断。索引为
+    空时直接返回空命中。
+  - **`iter_segment_jpeg(source, start_s, end_s, paced=...)`**：按播放
+    顺序生成区间内每帧 JPEG（PyAV seek 到 keyframe + 顺序 decode +
+    cv2 编码）；`paced=True` 时按源视频 fps 节流（**绝对时钟对齐**，
+    sleep 补偿编码耗时，帧间隔精确 = 1/fps，缺失回退 `fallback_fps=25`）。
+* **API** (`app/api/video_content_search.py`)：
+  - `GET  /api/video-content-search` — 快照（state / 进度 / query /
+    hits / fps / source_exists）。
+  - `POST /api/video-content-search/open` `{source}` — 选单个视频文件。
+  - `POST /api/video-content-search/extract` `{chunk_seconds,
+    chunk_overlap_seconds}` — 开始切片 embedding；chunk_seconds ∈
+    {3,4,5,6}、overlap ∈ {1,2}（Pydantic/service 校验，非法 400）；
+    实例未启用 503。
+  - `POST /api/video-content-search/extract/stop` — 中途停止（退回 idle）。
+  - `POST /api/video-content-search/query` `{text, sim_threshold,
+    top_k}` — 文本检索；`embed_text` 同步 NPU 推理挪
+    `run_in_executor` + **35s 超时**（SDK 卡死返 504，不阻塞 event
+    loop；对齐 VFA 做法）。
+  - `WS   /api/video-content-search/ws` — server→client：`hello`
+    （连接即发快照）/ `progress`（embedded, total）/ `state`。
+  - `WS   /api/video-content-search/play` — 播放命中片段：客户端首条
+    JSON `{source, start, end}` → 服务端 daemon 线程跑
+    `iter_segment_jpeg(..., paced=True)` 推二进制 JPEG 帧；客户端
+    `{"action":"pause"}` / `{"action":"resume"}` 控制（
+    `threading.Event`，pause 时阻塞 reader）；播完 `{"type":"eof"}`、
+    出错 `{"type":"error"}`；断开连接即停线程。首条参数 10s 超时，
+    非法 source / `end<=start` 直接 1008。
+  - `GET  /api/video-content-search/frame?source=&t=` — PyAV seek 到
+    `t` 秒附近取帧 JPEG（命中卡片缩略图），失败 404。
+* **前端** (`app/static/js/app.js` `VCS` 模块 + `#page-video-content-search`)：
+  - 左侧表单：视频源（"浏览…"复用 `VdFsModal._sourceTarget` 机制）+
+    切片档位（3/4/5/6s，重叠 1/2s）+ 提取按钮；中间进度条 + 阶段标签。
+  - 右侧命中结果列表（相似度降序，每条带开始/结束时间），点卡片 →
+    `vcsPlaySegment` 连 play WS 真实帧播放：等比 contain 填满播放
+    窗口（`vcsSyncCanvasSize` 把 canvas 像素同步为 `.vd-stage` 显示
+    尺寸，消除元素级黑边）、进度条按已收帧数/总帧数实时推进
+    （`VCS.snap.fps` 算总帧数）、暂停/恢复/停止/播完重播。
+  - `DemoGuard` 注册 `video-content-search`，离开页面 confirm + 停
+    play WS + sendBeacon 兜底，与其它演示页一致。
+* **ComputeRegistry preset**（`app/services/compute_registry.py`）：
+  - `MODEL_PRESETS["qwen3-vl-embedding-2b"]`：`capability_types=
+    ["swcap_video_retrieval"]`，`memory_estimate_mb=2000`，
+    `estimated_init_seconds=30`。`kind="embedding"` 的 probe /
+    `_init_session_subprocess` 分支按 vlm 文件布局校验（rknn_llm +
+    rknn_vision + embed + tokenizer）。
+* **资源预算**：qwen3-vl-embedding-2b 单实例 ~2 GB（LLM + vision 权重
+  + 622MB embed 表）。检索单视频索引在内存，长视频（>1h @ 4s 片 /
+  1s 重叠 ≈ 1200 片 × 2048 维 fp32 ≈ 10MB 向量）可忽略。播放走 PyAV
+  顺序解码，不占 NPU。
+
 ## Text chat (文本对话) page
 
 `#page-text-chat` 暴露 Qwen3-8B 纯文本对话（`swcap_text_chat` capability），
