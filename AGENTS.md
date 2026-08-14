@@ -147,6 +147,47 @@ If `git clone` fails, the host either lacks SSH access to `10.10.10.10` or
 the deploy key isn't loaded. Do **not** fall back to a public mirror — these
 SDKs aren't published.
 
+**wdndds also needs native libs built before `run.py` will boot.** Unlike
+wdnav/wdnai, `pip install wdndds` does not ship pre-built `.so` files —
+the `wdndds/_build.py` `build_py` hook is supposed to compile
+`libwdndds_cshim.so` + `libwdndds_idl.so` from `cshim_src/` + `idl/`
+into `src/wdndds/dds/_native/` at install time. The hook needs a
+FastDDS 3.6 dev install with `libfoonathan_memory.so.0.7.2` reachable.
+
+* Symptom when missing — `run.py` boots with `FileNotFoundError: wdndds:
+  …/native/lib/libwdndds_cshim.so not found.` followed by 4×
+  `RuntimeError: wdndds Hub not available (fastdds init failed)`. The
+  Hub can never come up, so every worker in `boot_compute_services()`
+  fails to register. Quick check:
+
+  ```bash
+  .venv/bin/python -c "from wdndds.dds._cshim import check_runtime; print(check_runtime())"
+  # expect (True, None)
+  ```
+
+* `native/lib/libfastdds.so.3.6.2.0` + `libfastcdr.so.2.3.6` already
+  vendored (typical partial build) — skip `build_native.sh`, just
+  install foonathan + force-reinstall wdndds to fire the build_py hook:
+
+  ```bash
+  sudo apt install libfoonathan-memory-dev libfoonathan-memory0.7.2
+  .venv/bin/pip install --force-reinstall --no-deps -e .venv/src/wdndds
+  ls .venv/src/wdndds/src/wdndds/dds/_native/libwdndds_*.so
+  ```
+
+* `native/` empty (fresh clone after `git clean -fd`, or new board) —
+  run `build_native.sh` first (20-30 min, builds FastDDS 3.6 + FastCDR
+  2.3 from source), then the two commands above. **Do NOT** try to fall
+  back to `apt install libfastrtps-dev` — that's FastDDS 2.x and
+  incompatible with the v0.5 cshim ABI.
+
+The wdndds-owned `.so` files (`libwdndds_cshim.so`,
+`libwdndds_idl.so`) are **never in git** — gitignored at both
+`native/lib/` and `src/wdndds/dds/_native/`, built fresh per install.
+A `git clean -fd` that wipes `native/lib/` is recoverable; a
+`git clean -fdx` that also wipes `idl/build/` + `cshim_src/build/`
+needs the `pip install --force-reinstall` line above to rebuild them.
+
 ## Layout
 
 ```
