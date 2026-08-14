@@ -982,6 +982,25 @@ class ComputeRegistry:
     # 禁用 = unload（worker 进程保留，可秒级重启用）；stop_instance_local
     # 仅 restart 路径会走到，不再由 UI "禁用"按钮触发。
 
+    def _register_errored_instance(self, inst: ModelInstance) -> None:
+        """把 spawn / RPC setup 失败的 errored inst 加进 _instances，让
+        算力卡能渲染红色 "启动失败" banner + 错误文案，而不是被
+        list_with_source 的 fallback 当成 "unavailable" 隐藏起来。
+
+        Key 用 ``(-1, model_id)``（_spawn_compute_worker 创建 inst 时
+        的初始 key）。如果同一 model 已经在 _instances 里就覆盖（理论上
+        不会 —— stop_instance_local 会先 pop 干净，但万一有 stale 条目
+        也清掉）。
+        """
+        with self._lock:
+            old_key = inst.key
+            inst.key = (-1, inst.model_id)
+            if old_key != inst.key:
+                self._instances.pop(old_key, None)
+            self._instances[inst.key] = inst
+        LOG.info("registered errored instance: %s status=error err=%r",
+                 inst.model_id, inst.error[:200])
+
     def _spawn_compute_worker(self, model_id: str) -> ModelInstance:
         """Spawn a fresh ``compute_worker.py --model <id>`` subprocess.
 
@@ -1059,6 +1078,11 @@ class ComputeRegistry:
         except Exception as e:
             inst.status = "error"
             inst.error = f"spawn failed: {e}"
+            # errored inst 也得进 _instances，否则 UI 走 list_with_source
+            # fallback 把它当 "unavailable" 渲染（看不到红色 banner + 错误
+            # 文案）。下面是 Popen 失败，inst.proc 还是 None —— probe
+            # 跑不起来也没关系，UI 直接读 inst.error 显示。
+            self._register_errored_instance(inst)
             return inst
 
         try:
@@ -1073,6 +1097,7 @@ class ComputeRegistry:
             except Exception:
                 pass
             inst.proc = None
+            self._register_errored_instance(inst)
             return inst
 
         # Probe thread keeps inst.status in sync with worker's actual
@@ -1560,6 +1585,26 @@ class ComputeRegistry:
         for m in models:
             try:
                 self.restart_instance_local(m)
+                # 重启后强制归零：race window 期间（OLD worker 收到 RPC
+                # shutdown → Python main loop 检测到 stop_event 并 sys.exit
+                # 之间 ~1s，cshim pump 还没退、info RPC 还能 reply），
+                # _adopt_existing_worker 可能把 OLD worker 临死前的
+                # status（"running" / "loading" / "error"）继承进新 inst。
+                # OLD worker 死掉之后 _probe_instance 对 adopted_local
+                # 不翻 error（那个分支只对 adopted 远端 peer 生效），算
+                # 力卡就永久停在 stale 颜色。这里直接 normalize 成
+                # not_loaded —— 新 spawn 出来的 worker 没绑 NPU，本就应
+                # 该是这个状态；只是兜底。跳过 adopted（远端 peer），它们
+                # 的 status 应该如实反映。
+                new_inst = self._find_by_model(m)
+                if new_inst is not None and new_inst._source != "adopted":
+                    with self._lock:
+                        new_inst.status = "not_loaded"
+                        new_inst.npu_index = -1
+                        new_inst.error = ""
+                        new_inst.finished_at = 0.0
+                        new_inst.load_time_sec = None
+                        new_inst.loaded_at = None
                 lines.append(f"{m}: 重启 OK")
             except Exception as e:  # noqa: BLE001
                 LOG.exception("restart_all_local: %s failed", m)
