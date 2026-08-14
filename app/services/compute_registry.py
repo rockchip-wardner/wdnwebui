@@ -951,9 +951,11 @@ class ComputeRegistry:
     # ------------------------------------------------------------------ #
     # v0.7: 启停拆成 spawn / adopt / bind / unload / stop 五步。
     # boot 由 ``boot_compute_services`` 触发；用户在算力配置页的"启用 /
-    # 禁用 / 重启"对应 ensure_worker_for_model / stop_instance_local /
+    # 禁用 / 重启"对应 ensure_worker_for_model / unload_instance /
     # restart_instance_local。npu_index 通过 RPC load action 传给 worker，
     # 而不是命令行；worker 启动后只注册 DDS endpoint，不建 LLMSession。
+    # 禁用 = unload（worker 进程保留，可秒级重启用）；stop_instance_local
+    # 仅 restart 路径会走到，不再由 UI "禁用"按钮触发。
 
     def _spawn_compute_worker(self, model_id: str) -> ModelInstance:
         """Spawn a fresh ``compute_worker.py --model <id>`` subprocess.

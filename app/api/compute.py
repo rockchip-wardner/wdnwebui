@@ -13,7 +13,10 @@ Endpoints
                                           spawn）；(2) RPC ``load`` 绑定 npu。
                                           adopted peer → 403（本机无权 bind）。
 * ``DELETE /api/compute/instances``        ``{npu_index, model}`` → "禁用"。
-                                          仅 spawned 允许；adopted → 403。
+                                          仅卸载模型（worker 进程保留，
+                                          status=not_loaded），可秒级重
+                                          启用。spawned / adopted_local /
+                                          adopted 三类都允许。
 * ``POST   /api/compute/restart``          ``{npu_index?, model}`` → Q3 4 步：
                                           unload → shutdown → wait/kill →
                                           走 boot 流程（不自动 bind）。
@@ -221,22 +224,32 @@ async def start_instance(req: InstanceRequest) -> dict:
 
 @router.delete("/compute/instances")
 async def stop_instance(req: StopInstanceRequest) -> dict:
-    """用户在算力配置页点"禁用"。
+    """用户在算力配置页点"禁用"——只卸载模型，**不**关 worker 进程。
 
-    仅 spawned 允许；adopted peer → 403（peer 上的实例只能去对端机器停）。
+    worker 进程保留在 ``not_loaded`` 状态：NPU 显存释放（LLMSession 句柄
+    drop），但 cshim Hub / RpcClient / 进程句柄全部保留；用户在算力配置
+    页再次点"启用"可秒级走 RPC ``load`` 重载，无需重启 worker。
+
+    对 spawned / adopted_local / adopted 三类都允许：
+      * spawned / adopted_local —— 本机 RPC 给本机 worker，LLMSession
+        释放后 worker 回到 ``not_loaded``；
+      * adopted —— RPC 让对端 peer 释放 LLMSession，本机 registry 状态
+        同步翻成 ``not_loaded``；peer 进程不被本机关。
+
+    完全 kill worker 进程的能力已**移除**（"重启服务"按钮走 Q3 4 步自带
+    unload+shutdown+respawn）；孤儿 worker 由下次 boot 的
+    ``_find_workers_by_name`` 兜底。
 
     Raises:
         404: model 不在 registry。
-        403: model 是 adopted from peer。
     """
     reg = get_registry()
     inst = reg._find_by_model(req.model)
     if inst is None:
         raise HTTPException(
             status_code=404, detail=f"{req.model} 不在 registry")
-    _require_owned(inst, "禁用")
     try:
-        reg.stop_instance_local(req.model)
+        reg.unload_instance(req.model)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "snapshot": reg.snapshot()}

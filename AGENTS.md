@@ -711,14 +711,20 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   （`adopted` 卡片标题为 `<model> @ <device_name>`，device_name 来自
   worker `info_handler` 的 device_name 字段）。
 - **Local-only operations**：算力配置页的 "启用 / 禁用 / 重启" 按钮
-  可见性：
-  - **spawed**：启用 / 重启 / 禁用 三按钮全开
-  - **adopted_local**：只 启用 可点（走 RPC `load` 同 spawned）；重启/
-    禁用 disable 提示 `kill <pid>` 手动清理
-  - **adopted**：三按钮全 disable（远端机子，本机无权操作）
-  - **unavailable**：只有 启用 可点（spawn 新进程）
-  后端 `_require_owned(inst, action)` 对 ``_source == "adopted"`` 拦
-  403，对 spawned / adopted_local 放行。
+  可见性 / 行为：
+  - **spawed**：启用 / 重启 / 禁用 三按钮全开；禁用 = RPC `unload`
+    （worker 进程保留，status=not_loaded，可秒级重启用）。
+  - **adopted_local**：启用 / 禁用 两按钮可点（重启 disable 提示
+    `kill <pid>` 手动清理）；禁用走 RPC `unload` 同 spawned。
+  - **adopted**：启用 / 禁用 两按钮可点（重启 disable）；禁用走
+    RPC `unload` 让对端 peer 释放 LLMSession，本机 registry 同步
+    not_loaded，但**不**碰 peer 进程。
+  - **unavailable**：只有 启用 可点（spawn 新进程）。
+  - "完全关 worker 进程" 唯一入口：重启服务按钮（Q3 4 步：unload →
+    shutdown → wait/kill → 走 boot 流程重 spawn）。孤儿 worker
+    由下次 boot 的 `_find_workers_by_name` 兜底。
+  后端 `_require_owned` 仅对 **重启** 仍拦 adopted → 403（restart
+  要 kill 进程）；禁用走 `unload_instance()` 对三类来源都允许。
 - **Orphan worker 处理（v0.8 dedup → v0.9 强化）**：uvicorn reload 路径下
   `Popen(start_new_session=True)` 起的 worker 脱离原进程组，reload
   SIGTERM 不会传过来 —— 每次 reload 都会留一个孤儿。`_spawn_compute_worker`
