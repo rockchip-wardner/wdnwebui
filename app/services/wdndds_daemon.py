@@ -41,6 +41,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import http.server
 import json
 import logging
@@ -60,6 +62,12 @@ _LOG = logging.getLogger("wdndds.daemon")
 DEFAULT_UDP_PORT = 7411
 DEFAULT_HTTP_PORT = 7412
 
+# Process comm name (visible in ``ps -c`` / ``top`` / ``/proc/<pid>/comm``).
+# Matches the systemd unit filename in ``install_autostart.sh`` so
+# ``pgrep -f`` / process listings all line up. 14 bytes — fits in
+# TASK_COMM_LEN - 1 = 15.
+DAEMON_COMM_NAME = "wdndds-daemon"
+
 # Global state for the REST handler.
 _state_lock = threading.Lock()
 _state: dict = {
@@ -69,6 +77,92 @@ _state: dict = {
     "participant_count": 0,
     "peers": [],   # [{guid, name, host}, ...]  best-effort
 }
+
+
+# --------------------------------------------------------------------------- #
+# Process comm (comm field) — for auto-start dedup                            #
+# --------------------------------------------------------------------------- #
+_PR_SET_NAME = 15
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_libc.prctl.restype = ctypes.c_int
+_libc.prctl.argtypes = [
+    ctypes.c_int,                       # option
+    ctypes.c_char_p,                    # arg2
+    ctypes.c_ulong, ctypes.c_ulong,     # arg3, arg4
+    ctypes.c_ulong,                     # arg5
+]
+
+
+def _set_comm_name(name: str) -> None:
+    """Set this process's comm (visible in ``ps -c`` / ``top`` /
+    ``/proc/<pid>/comm``) via ``prctl(PR_SET_NAME)``.
+
+    Truncated to 15 bytes (TASK_COMM_LEN - 1). The main process's
+    :func:`_find_daemon_pids` walks ``/proc/*/comm`` looking for
+    :data:`DAEMON_COMM_NAME` so the auto-start path can skip when one
+    is already up (uvicorn reload otherwise leaves an orphan per
+    restart, same problem compute_worker had).
+
+    Why not preexec_fn? See compute_worker._set_comm_name for the
+    full story; tl;dr preexec_fn's PR_SET_NAME is immediately
+    overwritten by the subsequent execvp (argv[0] becomes new comm).
+    Setting it here, after Python has already started, sticks.
+    """
+    name_bytes = name.encode("utf-8")[:15]
+    try:
+        _libc.prctl(_PR_SET_NAME, name_bytes, 0, 0, 0)
+    except Exception as e:  # noqa: BLE001
+        _LOG.warning("set comm name to %r failed: %s", name, e)
+
+
+def find_daemon_pids(comm_name: str = DAEMON_COMM_NAME,
+                     exclude_self: bool = True) -> list[int]:
+    """Walk ``/proc/*/comm`` looking for processes whose comm equals
+    :data:`DAEMON_COMM_NAME`. Used by the main process's
+    ``_spawn_daemon_once`` to skip Popen when one is already running.
+
+    Falls back to a cmdline substring match for legacy daemons started
+    before the comm was renamed (comm == ``"python"`` + cmdline
+    contains ``app.services.wdndds_daemon``). That branch becomes a
+    no-op once every old daemon has been replaced.
+
+    Returns the list of matching PIDs (possibly several during a
+    restart window). The caller is expected to treat "any match" as
+    "already running".
+    """
+    own_pid = os.getpid() if exclude_self else -1
+    comm_needle = comm_name.encode("utf-8")
+    cmdline_needle = b"app.services.wdndds_daemon"
+    pids: list[int] = []
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == own_pid:
+                continue
+            try:
+                with open(f"/proc/{pid}/comm", "rb") as f:
+                    comm = f.read().rstrip(b"\x00").rstrip()
+            except (OSError, FileNotFoundError):
+                continue
+            if comm == comm_needle:
+                pids.append(pid)
+                continue
+            # Legacy: daemon started before PR_SET_NAME was added;
+            # comm is still "python", match by cmdline substring.
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read()
+            except (OSError, FileNotFoundError):
+                continue
+            if cmdline_needle in cmdline:
+                pids.append(pid)
+    except OSError:
+        # /proc not mounted (containers without procfs etc.) — assume
+        # nothing's running and let the caller Popen.
+        pass
+    return pids
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +331,13 @@ def main() -> int:
     ap.add_argument("--logfile", type=str, default=None,
                     help="Redirect stdout+stderr here")
     args = ap.parse_args()
+
+    # Rename our comm BEFORE the hub starts so the main process's
+    # auto-start dedup (``_find_daemon_pids`` walks /proc/*/comm)
+    # can see us immediately. Must come after argparse / sys imports
+    # — preexec_fn PR_SET_NAME would be clobbered by execvp, so we
+    # set it here in main() once Python is fully up.
+    _set_comm_name(DAEMON_COMM_NAME)
 
     # Set up logging
     log_handlers = [logging.StreamHandler(stream=sys.stderr)]

@@ -425,9 +425,9 @@ function renderSystemMonitor(data) {
 
   // --- wdndds_daemon ----------------------------------------------------
   // 系统信息页把 daemon 一起露出来：用户不必为了「这板子到底有没有
-  // 拉 daemon」来回切到「注册发现」页。状态由 system-monitor 后端
-  // 聚合（HTTP /status + /peers + pgrep PID），启停按钮走原
-  // /api/discovery/daemon/start|stop。
+  // 拉 daemon」来回切到其它页。状态由 system-monitor 后端
+  // 聚合（HTTP /status + /peers + pgrep PID），启停按钮走
+  // /api/system-monitor/daemon/start|stop。
   const dm = data.daemon || {};
   const dBadge = document.getElementById("daemon-badge");
   const dMsgEl = document.getElementById("daemon-message");
@@ -499,7 +499,7 @@ function renderSystemMonitor(data) {
 }
 
 async function daemonControl(action) {
-  const r = await fetch(API_PREFIX + "/discovery/daemon/" + action, { method: "POST" });
+  const r = await fetch(API_PREFIX + "/system-monitor/daemon/" + action, { method: "POST" });
   if (!r.ok) {
     const detail = await r.text().catch(() => "");
     throw new Error("HTTP " + r.status + " " + detail);
@@ -2347,9 +2347,6 @@ async function loadPageData(name) {
 
   if (name === "discovery") {
     await Discovery.load();
-    // Discovery.load() 内部已经 await DiscoveryDds.load()；再启 1Hz 轮询
-    // 让 enabled 时实时刷新 discovered / state。
-    DiscoveryDds.startTicking();
     return;
   }
 
@@ -2387,9 +2384,6 @@ function showPage(name) {
   const prev = currentPage();
   if (prev === "compute-config" && name !== "compute-config") {
     ComputeConfigPage.stopTicking();
-  }
-  if (prev === "discovery" && name !== "discovery") {
-    DiscoveryDds.stopTicking();
   }
   if (prev === "im-bridge" && name !== "im-bridge") {
     ImBridge.closeWs();
@@ -3874,8 +3868,6 @@ const ComputeConfigPage = {
   _system: null,        // /api/system-monitor 缓存
   _loading: false,
   _selectedTarget: {},  // {model_id: npu_index} —— 用户在 radio 上选的目标
-  _discovery: null,      // /api/discovery/dds 缓存（3s 一次，比 compute 慢）
-  _discoveryTickCount: 0,
 
   init() {
     if (this.initialized) return;
@@ -3896,15 +3888,10 @@ const ComputeConfigPage = {
         cache: "no-store",
         headers: {"Cache-Control": "no-cache"},
       });
-      const fetchDiscovery = () => fetch(API_PREFIX + "/discovery/dds", {
-        cache: "no-store",
-        headers: {"Cache-Control": "no-cache"},
-      });
 
-      // 首屏：并行拉 compute + system-monitor + discovery。
-      // 之后每 tick 只拉 compute（status 变化快）。
-      // system-monitor / discovery 都不再高频轮询 —— system-monitor
-      // 会把 rknn-smi 打挂、discovery 在大网段也偏慢，3s 一次即可。
+      // 首屏：并行拉 compute + system-monitor。
+      // 之后每 tick 只拉 compute（status 变化快）。system-monitor 不
+      // 再高频轮询 —— 会把 rknn-smi 打挂，3s 一次即可。
       const firstLoad = this._snapshot == null;
       const rComp = await fetchCompute();
       if (!rComp.ok) throw new Error("compute HTTP " + rComp.status);
@@ -3913,27 +3900,11 @@ const ComputeConfigPage = {
       if (firstLoad || this._systemTickCount % 3 === 0) {
         // 每 3 个 compute tick（约 3s）刷新一次 system-monitor，
         // 顶部 3588 内存 + 每张 182x 卡显存 / 温度 / 功耗才能动。
-        // rknn-smi 不扛高频轮询，与 discovery 共用同一节奏。
+        // rknn-smi 不扛高频轮询。
         try {
           const rSys = await fetchSystem();
           if (rSys.ok) this._system = await rSys.json();
         } catch (_e) { /* 容错：不阻塞主路径 */ }
-      }
-      if (firstLoad) {
-        try {
-          const rDds = await fetchDiscovery();
-          if (rDds.ok) this._discovery = await rDds.json();
-        } catch (_e) { /* 容错 */ }
-      } else {
-        // 每 3 个 compute tick（约 3s）刷新一次 discovery，
-        // 避免拉垮大网段的 DDS 探测。
-        this._discoveryTickCount = (this._discoveryTickCount + 1) % 3;
-        if (this._discoveryTickCount === 0) {
-          try {
-            const rDds = await fetchDiscovery();
-            if (rDds.ok) this._discovery = await rDds.json();
-          } catch (_e) { /* 容错 */ }
-        }
       }
       this.render();
     } catch (e) {
@@ -5466,14 +5437,6 @@ const Discovery = {
       const list = document.getElementById("discovery-list");
       if (list) list.innerHTML = `<div class="page-placeholder danger">加载失败: ${e.message}</div>`;
     }
-    // DDS 面板独立拉，失败也不影响 HW/SW 渲染
-    DiscoveryDds.load().catch((e) => {
-      const banner = document.getElementById("discovery-dds-runtime-banner");
-      if (banner) {
-        banner.className = "discovery-runtime-banner is-danger";
-        banner.textContent = "DDS 面板加载失败: " + e.message;
-      }
-    });
   },
 
   render(data) {
@@ -5636,277 +5599,6 @@ const Discovery = {
   },
 };
 
-/* ------------------------------------------------------------------ *
- *  在网注册 (DDS) — Discovery 页内的子面板                              *
- *                                                                     *
- * 单独成模块（不挤进 ``Discovery``）的原因：                              *
- *  1. 拉取路径独立 — `/api/discovery/dds` vs `/api/compute/capabilities`，*
- *     互不影响；HW/SW 拉挂时 DDS 面板还能正常刷新；                     *
- *  2. 轮询节奏独立 — DDS 在 ready 时按 1Hz 拉，让 discovered / state    *
- *     实时刷新，HW/SW 一次性 render；                                   *
- *  3. 状态管理独立 — toggle 跟 HW dirty 状态分开。                     *
- *                                                                     *
- *  FastDDS native bindings 没装时，后端 ``POST /start`` 返回 503，      *
- *  UI 直接渲染 ``discovery-dds-runtime-banner`` 上的红色错误条，         *
- *  toggle 被禁用（避免用户空操作）。                                    *
- * ------------------------------------------------------------------ */
-const DiscoveryDds = {
-  initialized: false,
-  _snapshot: null,
-  _runtime: null,
-  _tickHandle: null,
-  _inflight: false,
-  _lastToggle: null,
-  _toggleInflight: false,
-
-  init() {
-    if (this.initialized) return;
-    this.initialized = true;
-    const toggle = document.getElementById("discovery-dds-toggle");
-    if (toggle) toggle.addEventListener("change", () => this.onToggle());
-  },
-
-  async load() {
-    this.init();
-    if (this._inflight) return;
-    this._inflight = true;
-    try {
-      // 先拉一次 fastdds runtime（不触发 connect），决定 toggle 是否可用
-      try {
-        const rr = await fetch(API_PREFIX + "/discovery/dds/runtime", {
-          cache: "no-store",
-          headers: { "Cache-Control": "no-cache" },
-        });
-        if (rr.ok) this._runtime = await rr.json();
-        else this._runtime = { available: false, error: "HTTP " + rr.status };
-      } catch (e) {
-        this._runtime = { available: false, error: e.message };
-      }
-      // 再拉 snapshot
-      const r = await fetch(API_PREFIX + "/discovery/dds", {
-        cache: "no-store",
-        headers: { "Cache-Control": "no-cache" },
-      });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      this._snapshot = await r.json();
-      this.render();
-    } finally {
-      this._inflight = false;
-    }
-  },
-
-  startTicking() {
-    if (this._tickHandle) return;
-    this._tickHandle = setInterval(() => this.load().catch(() => {}), 1000);
-  },
-
-  stopTicking() {
-    if (this._tickHandle) {
-      clearInterval(this._tickHandle);
-      this._tickHandle = null;
-    }
-  },
-
-  async onToggle() {
-    const toggle = document.getElementById("discovery-dds-toggle");
-    if (!toggle) return;
-    const want = toggle.checked;
-    // fastdds 不可用 → 拒绝切换
-    if (want && this._runtime && !this._runtime.available) {
-      toggle.checked = false;
-      this._setSummary(
-        "FastDDS Python bindings 未安装，无法启用 DDS 注册。Debian/Ubuntu 上没有 apt 包（不是 libfastdds-dev / fastdds-python3 —— 后者根本不存在），只能从 Fast-DDS-Python 源码构建。",
-        true,
-      );
-      return;
-    }
-    this._lastToggle = want;
-    this._toggleInflight = true;
-    try {
-      const url = API_PREFIX + "/discovery/dds/" + (want ? "start" : "stop");
-      const r = await fetch(url, { method: "POST" });
-      const text = await r.text();
-      let body;
-      try { body = JSON.parse(text); } catch { body = { detail: text }; }
-      if (!r.ok) {
-        const detail = body && body.detail;
-        let msg;
-        if (typeof detail === "object" && detail !== null) {
-          msg = detail.message || detail.reason || JSON.stringify(detail);
-        } else {
-          msg = detail || ("HTTP " + r.status);
-        }
-        this._setSummary("切换失败: " + msg, true);
-        toggle.checked = !want;
-        this._lastToggle = !want;
-        // 503 → fastdds 不可用：刷新 runtime 缓存，确保下次 onToggle 也拒
-        if (r.status === 503 && typeof detail === "object") {
-          this._runtime = detail.dds_runtime || { available: false, error: msg };
-        }
-        return;
-      }
-      if (body && body.snapshot) {
-        this._snapshot = body.snapshot;
-      } else {
-        await this.load();
-        return;
-      }
-      this.render();
-    } catch (e) {
-      this._setSummary("切换失败: " + e.message, true);
-      toggle.checked = !want;
-      this._lastToggle = !want;
-    } finally {
-      this._toggleInflight = false;
-    }
-  },
-
-  render() {
-    const snap = this._snapshot;
-    const rt = this._runtime;
-    if (!snap) return;
-
-    // ---- runtime banner ----
-    const banner = document.getElementById("discovery-dds-runtime-banner");
-    if (banner && rt) {
-      if (rt.available) {
-        const ver = rt.version || "?";
-        const path = rt.path || "";
-        banner.className = "discovery-runtime-banner is-ok";
-        banner.innerHTML =
-          `FastDDS 可用 · <code>${this._esc(rt.module || "fastdds")}</code>` +
-          ` <code>${this._esc(ver)}</code>` +
-          (path ? ` <code>${this._esc(path)}</code>` : "");
-      } else {
-        banner.className = "discovery-runtime-banner is-danger";
-        banner.textContent =
-          "FastDDS Python bindings 未安装，DDS 注册功能不可用。" +
-          (rt.error ? " 错误：" + rt.error : "");
-      }
-    }
-
-    // ---- toggle state ----
-    const toggle = document.getElementById("discovery-dds-toggle");
-    const isReady = snap.state === "ready";
-    if (toggle && this._lastToggle === null) {
-      toggle.checked = isReady;
-      this._lastToggle = isReady;
-    } else if (toggle && !this._toggleInflight && toggle.checked !== isReady) {
-      toggle.checked = isReady;
-      this._lastToggle = isReady;
-    }
-    if (toggle) {
-      const unavailable = !!(rt && !rt.available);
-      toggle.disabled = unavailable || snap.state === "starting" || snap.state === "stopping";
-      toggle.parentElement.title = unavailable
-        ? "FastDDS 未安装，无法启用"
-        : "开启后通过 wdndds + FastDDS 广播本机能力";
-    }
-
-    // ---- hint + summary ----
-    const hint = document.getElementById("discovery-dds-hint");
-    if (hint) hint.textContent = `${snap.discovered_count} 个对端`;
-
-    const summary = document.getElementById("discovery-dds-summary");
-    if (summary) {
-      summary.classList.remove("danger");
-      switch (snap.state) {
-        case "ready":
-          summary.textContent =
-            `已注册为「${snap.device_name || "wdnwebui"}」 · domain=0 · ` +
-            `对端 ${snap.discovered_count} 个`;
-          break;
-        case "starting":
-          summary.textContent = "正在连接 FastDDS…";
-          break;
-        case "stopping":
-          summary.textContent = "正在断开…";
-          break;
-        case "unavailable":
-          summary.textContent =
-            "FastDDS Python bindings 未安装。Debian/Ubuntu 上没有 apt 包（不是 libfastdds-dev / fastdds-python3 —— 后者根本不存在），只能从 Fast-DDS-Python 源码构建。";
-          summary.classList.add("danger");
-          break;
-        case "error":
-          summary.textContent =
-            "上次启动失败：" + (snap.last_error || "未知错误");
-          summary.classList.add("danger");
-          break;
-        case "uninitialized":
-        default:
-          summary.textContent =
-            "未开启。打开开关后通过 wdndds 把本机能力广播到同网段 FastDDS participant。";
-          break;
-      }
-    }
-
-    // ---- device list ----
-    const list = document.getElementById("discovery-dds-list");
-    if (!list) return;
-    const devices = Array.isArray(snap.discovered) ? snap.discovered : [];
-    if (snap.state !== "ready") {
-      // 非 ready 状态下不展示 discovered（可能在停机中）
-      list.innerHTML = "";
-      return;
-    }
-    if (devices.length === 0) {
-      list.innerHTML = `
-        <div class="page-placeholder">
-          <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
-          <div class="page-placeholder-title">等待对端</div>
-          <div class="page-placeholder-text">
-            已注册，但本网段还没有其他 FastDDS participant 出现。
-            确认网络允许 UDP 组播 239.255.0.1 / discovery port 7400+。
-          </div>
-        </div>`;
-      return;
-    }
-    list.innerHTML = "";
-    for (const d of devices) {
-      const card = document.createElement("article");
-      card.className = "discovery-card";
-      const capChips = (d.capabilities || []).map((t) =>
-        `<span class="discovery-card-lan-cap" title="${this._esc(t)}">${this._esc(t)}</span>`,
-      );
-      if (capChips.length === 0) {
-        capChips.push(`<span class="discovery-card-lan-cap is-empty">无能力</span>`);
-      }
-      card.innerHTML = `
-        <header class="discovery-card-head">
-          <code class="discovery-cap-name">${this._esc(d.name)}</code>
-        </header>
-        <div class="discovery-card-meta">
-          <span>首次出现：<strong>${this._fmtTime(d.first_seen)}</strong></span>
-          <span>最近出现：<strong>${this._fmtTime(d.last_seen)}</strong></span>
-        </div>
-        <div class="discovery-card-lan-caps">${capChips.join("")}</div>
-      `;
-      list.appendChild(card);
-    }
-  },
-
-  _setSummary(text, danger) {
-    const summary = document.getElementById("discovery-dds-summary");
-    if (!summary) return;
-    summary.textContent = text;
-    summary.classList.toggle("danger", !!danger);
-  },
-
-  _fmtTime(t) {
-    if (!t || t <= 0) return "—";
-    const d = new Date(t * 1000);
-    const pad = (n) => (n < 10 ? "0" + n : "" + n);
-    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  },
-
-  _esc(s) {
-    return String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  },
-};
 
 /* ------------------------------------------------------------------ *
  *  im-bridge page — WeChat iLink bot (login + 调试收发)             *

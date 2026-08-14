@@ -666,3 +666,70 @@ async def get_system_monitor() -> dict:
     base["section"] = "system-monitor"
     base["collected_at"] = datetime.now(timezone.utc).isoformat()
     return base
+
+
+# --------------------------------------------------------------------------- #
+# wdndds_daemon 控制（启停）                                                  #
+# --------------------------------------------------------------------------- #
+# 这些端点原本挂在 ``/api/discovery/daemon/*`` 下，属于 Discovery 页 DDS
+# 子面板的一部分。Discovery 页 DDS 子面板 v0.10 整体下线（开关只起空
+# Hub、不广播能力、对端列表永远为空，详见设计变更记录）；daemon 启停按
+# 钮真正被消费的地方是「系统信息 → Daemon」section，所以端点挪到这里，
+# URL 同步改成 ``/api/system-monitor/daemon/*``。
+@router.get("/system-monitor/daemon")
+async def get_daemon_status() -> dict:
+    """``GET /api/discovery/daemon`` 的迁移版本 —— 同 payload。"""
+    import urllib.request
+    import urllib.error
+    compute_cfg = get_config().get_section("compute") or {}
+    http_port = int(compute_cfg.get("daemon_http_port", 7412))
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{http_port}/status", timeout=1) as resp:
+            return _json.loads(resp.read())
+    except (urllib.error.URLError, ConnectionRefusedError, TimeoutError, OSError) as e:
+        return {"running": False, "error": str(e)}
+
+
+@router.post("/system-monitor/daemon/start")
+async def post_daemon_start() -> dict:
+    """以 detached subprocess 拉起 ``wdndds_daemon``。幂等。"""
+    from app.services import wdndds_daemon
+    compute_cfg = get_config().get_section("compute") or {}
+    udp_port = int(compute_cfg.get("discovery_server_port", 7411))
+    http_port = int(compute_cfg.get("daemon_http_port", 7412))
+    logfile = compute_cfg.get("daemon_logfile")
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{http_port}/status", timeout=0.5) as resp:
+            return _json.loads(resp.read())
+    except Exception:
+        pass
+    p = wdndds_daemon.start_in_subprocess(
+        port=udp_port, http_port=http_port, logfile=logfile)
+    return {"running": True, "pid": p.pid, "udp_port": udp_port,
+            "http_port": http_port}
+
+
+@router.post("/system-monitor/daemon/stop")
+async def post_daemon_stop() -> dict:
+    """TERM 子进程停掉 ``wdndds_daemon``。幂等。"""
+    http_port = int(
+        (get_config().get_section("compute") or {}).get(
+            "daemon_http_port", 7412))
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{http_port}/status",
+                timeout=0.5) as resp:
+            resp.read()
+    except Exception:
+        return {"running": False, "stopped": False,
+                "note": "daemon was not running"}
+    try:
+        out = subprocess.check_output(["pgrep", "-f", "wdndds_daemon"]).decode()
+    except subprocess.CalledProcessError:
+        return {"running": False, "stopped": False,
+                "note": "no daemon process found"}
+    for pid in out.split():
+        subprocess.run(["kill", "-TERM", pid.strip()])
+    return {"running": False, "stopped": True}

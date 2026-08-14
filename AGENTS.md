@@ -555,123 +555,27 @@ holds it in memory. The file is seeded with a `base` section at
   才 instantiate（55-90s）。UI 通过 `GET /api/compute` 每秒轮询状态，
   loading 实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL`）。
   Capability 概念作为内部 key 使用（`get_session("swcap_video_describe")` /
-  `"swcap_audio_tts"`），注册发现的 wire 侧由 :mod:`app.services.dds_discovery`
-  负责把当前活跃实例的能力转换成 wdndds ``Capability`` 实例广播到 DDS。
+  `"swcap_audio_tts"`）；当前 v0.10 不再广播到 LAN DDS，capability 路由
+  仅走同进程 `ComputeRegistry` —— 跨机器发现完全靠
+  `wdndds_daemon`（SERVER 协议）+ `ComputeRegistry` 的 `Hub` 服务名
+  `wdndds/rpc/<model_id>` 暴露给 peer。
 
 ## Discovery page (注册发现)
 
-`#page-discovery` 内部按从上到下三个 pane 排布：
+`#page-discovery` 内部按从上到下两个 pane 排布：
 
-1. **在网注册 (DDS)** —— wdndds + FastDDS 广播本机能力 + 接收对端，详见下文。
-2. **硬件能力 (HW)** —— 本机硬件能力开关，源自 `HARDWARE_CAPABILITIES` 静态表 +
+1. **硬件能力 (HW)** —— 本机硬件能力开关，源自 `HARDWARE_CAPABILITIES` 静态表 +
    `config.json["compute"]["hardware_capabilities"]` 启用状态。checkbox 修改后
    点"保存修改"才落盘，避免误触。
-3. **软件能力 (SW)** —— 当前 running 实例暴露的能力（每条来自一个 RKNN 模型实例）。
+2. **软件能力 (SW)** —— 当前 running 实例暴露的能力（每条来自一个 RKNN 模型实例）。
 
-### 在网注册 (DDS) 子面板
-
-DDS 子面板（`data-pane="dds"`）通过 wdndds 调 FastDDS 把本机能力广播给
-同网段其它 FastDDS participant，并显示对端列表。**不再走 HTTP / TCP 探测**
-—— FastDDS 的 SPDP / SEDP 走 UDPv4 + 组播 239.255.0.1 / discovery port
-7400+ 即可。
-
-* **FastDDS 版本** —— 当前 bundled 的是 **FastDDS 2.6.12**（FastRTPS
-  命名）+ **Fast-DDS-Python 1.1.x**（输出 flat ``fastdds.py``）+
-  **FastCDR 1.0.24**（``libfastcdr.so.1``）。3.6.x master 配套的
-  ``Fast-DDS-Python 2.6.x`` 在本机环境下 ``DataWriter::enable()`` 会
-  在 ``EDP::new_writer_proxy_data`` 挂死（实测 30s watchdog 触发仍
-  收不到返回），无 patch 可绕；切回 2.6.12 后 ``create_writer``
-  0.00s 返回。
-  - WDnddsStringTopicDataType（`wdndds_cxx/`）按 2.6.x API 重写：
-    ``getKey(void*, InstanceHandle_t*, bool)`` 全指针，
-    ``eprosima::fastrtps::rtps`` 命名空间，
-    ``SerializedPayload_t::reserve`` (非 resize)，``setName(const char*)``
-    (非 set_name)。
-  - wdndds bootstrap (`wdndds/dds/_fastdds.py`) 同时认 3.x 包形式
-    （``fastdds/__init__.py`` + ``fastdds/_fastdds_python.so``）和
-    1.x flat 形式（``fastdds.py`` + ``_fastdds_python.so``）；
-    preloader 列表里两种 SONAME 都列着，谁在 ``lib/`` 下谁被
-    ``RTLD_GLOBAL``-load。切 FastDDS 主版本 = 跑
-    ``FASTDDDS_BRANCH=origin/2.14.x build_native.sh`` 重 build。
-  - 1.x 与 2.x 在 Python API 上有两处差异，bootstrap 已兜底：
-    * ``fastdds.RETCODE_OK`` —— 1.x 是 ``ReturnCode_t.RETCODE_OK``
-      类属性，bootstrap 注到模块级（值不变 = 0）。
-    * ``DataWriter.write(void*)`` —— 1.x 要求 SwigPyObject 指向
-      ``std::string*``，不接 Python ``str``；新 helper
-      ``wdndds_create_string_data_with(value)`` 在 C 端建
-      ``std::string`` 给 Python 喂。``publisher.Writer.write``
-      内部对 ``str`` payload 自动走这个 fallback，非 str 透传。
-
-* **开关 "在网注册"** —— 开启后：
-  * 后端调 ``wdndds.connect()`` 起 DomainParticipant（domain_id 默认为 0）；
-  * 调 ``wdndds.register(device_name, capabilities)``：device_name 来自
-    `config.json["base"]["device_name"]`，capabilities 由
-    `_build_capabilities` 根据 `ComputeRegistry.list_active_capabilities()`（SW,
-    只看 status=running 的实例）+ `list_hardware_capabilities()`（HW,
-    只看 enabled=True 的项）现拼 wdndds 叶子类（`SWVideoDescribe` /
-    `HWVideoInput` / …）；
-  * 调 ``wdndds.start_scan(callback)`` 订阅对端 ``wdndds/registry`` topic，
-    维护内存 `discovered: {name -> {name, capabilities, first_seen, last_seen}}`。
-  * 关 toggle → ``stop_scan`` + ``Hub.close()`` + 重置 wdndds 内部 ``_hub``
-    全局变量；对端通过 SPDP participant 失活自然从它们的列表里移除。
-* **FastDDS native bindings 未装时** → ``POST /start`` 直接返回 **503**，
-  ``detail`` 为 dict（含 ``reason: "fastdds_unavailable"`` + 中文 message +
-  ``dds_runtime``），前端把这条错误渲到 ``discovery-dds-runtime-banner``
-  红色条 + 禁用 toggle，避免空操作。
-* **`GET /api/discovery/dds`** —— Discovery 页每秒轮询的完整 snapshot：
-  `state`（uninitialized / unavailable / starting / ready / stopping / error）
-  / `available` / `dds_runtime` / `device_name` / `discovered[]` /
-  `discovered_count` / `last_error` / `started_at` / `stopped_at` /
-  `last_updated`。
-* **`GET /api/discovery/dds/runtime`** —— 只读 FastDDS 可用性快照
-  （调 ``wdndds.dds.check_runtime()`` 但不 connect），UI 进页面就拉一次
-  渲 banner。
-* **`POST /api/discovery/dds/start`** —— 幂等（state 已经是 ready 时直接返 200
-  + 当前 snapshot）。**不持久化 enabled 状态** —— 跟 ComputeRegistry 一样遵
-  循 "boot 不自动加载" 原则：重启后状态归零，用户必须重新打开。
-* **`POST /api/discovery/dds/stop`** —— 关闭 Hub；state 已经是
-  uninitialized / unavailable 时直接 200 + 当前 snapshot（幂等）。
-* **错误码**：
-  * **503** —— fastdds 不可用（detail 为 dict，UI 直接渲染）
-  * **409** —— 切换中（STARTING / STOPPING）又来一次 POST
-  * **502** —— ``connect / register / start_scan / close`` 流程任一步抛异常
-* **能力 → wdndds 类映射**（`app/services/dds_discovery.py` 内
-  `_CAPABILITY_FACTORIES`）：
-  ```
-  hwcap_video_input  → HWVideoInput    swcap_video_query    → SWVideoQuery
-  hwcap_audio_input  → HWAudioInput    swcap_video_describe → SWVideoDescribe
-  hwcap_audio_output → HWAudioOutput   swcap_video_analyse  → SWVideoAnalyse
-  hwcap_hdmi_display → HWHDMIDisplay   swcap_audio_tts      → SWAudioTTS
-                                      swcap_text_chat      → SWTextChat
-  ```
-  未知 ``capability_type`` 静默跳过（不让单个坏数据把整个 register 拖挂）。
-* **没有 invoke handler**：本轮只做"广播自己"，cap 实例不传 ``callback``，
-  对端 invoke 我们就走 ``_default_handle`` 回一个默认应答。
-* **关闭** —— app shutdown 时 ``close_dds_discovery()`` 调
-  ``DdsDiscoveryManager.close()`` → ``stop_scan`` + ``Hub.close()`` +
-  重置 wdndds registry 状态；无 manager 实例（用户从没进过 Discovery 页）时
-  是 no-op。
-* **资源预算** —— 一个 ``wdndds.Hub`` 单实例长期驻留一个 daemon pump 线程
-  + 少量后台 publish/subscribe 协程；不启用 toggle 时**完全空闲**（不连接
-  不发 SPDP）。开启 toggle 时 Groupcast / Discovery port 由 FastDDS 默认
-  0.0.0.0:7400 起动态分配；UDP 组播 239.255.0.1 必须可达。
-
-### Discovery 页前端模块拆分
-
-`app/static/js/app.js` 里 Discovery 相关代码分两个独立模块：
-
-* **`Discovery`** —— 注册发现页主入口。`load()` 拉 `/api/compute/capabilities`
-  渲染 HW + SW pane（一次拉取，不轮询）；HW pane 的 checkbox 修改是 dirty
-  状态，点"保存修改"才 PUT 到 `/api/compute/hardware-capabilities`。
-* **`DiscoveryDds`** —— DDS 子面板独立模块。`load()` 并行拉
-  `/api/discovery/dds/runtime`（banner 状态）+ `/api/discovery/dds`
-  （snapshot）；进入页面后 `startTicking()` 起 1Hz 轮询，让
-  `state / discovered / last_error` 实时刷新；离开页面 `stopTicking()`
-  释放定时器。
-  * `onToggle()` 处理"在网注册"开关：根据 `_runtime.available` 预先
-    拦截无 FastDDS 的点击；PUT 时设 `_toggleInflight=true` 防止 1Hz 轮询
-    在 PUT 完成前把乐观 UI 覆盖回旧值；503 时把 `detail.dds_runtime`
-    写回 `_runtime` 让下次 toggle 仍然被拦截。
+**v0.10 起下线**：原"在网注册 (DDS)"子面板（含开关 + FastDDS 能力广播 +
+对端列表）整个删除 —— `DdsDiscoveryManager` 之前只起一个 placeholder
+`RpcHub`，既不广播 capability、也不订阅对端列表（`_discovered` 永远为
+0），toggle 是个空壳。跨机器发现改由 `wdndds_daemon`（SERVER 协议，见
+`app/services/wdndds_daemon.py`）承担。daemon 启停按钮搬到「系统信息
+→ Daemon」section（端点从 `/api/discovery/daemon/*` 迁到
+`/api/system-monitor/daemon/*`，前端调用点同步更新）。
 
 ## System logs page
 

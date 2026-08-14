@@ -8,11 +8,58 @@ Usage:
 """
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import uvicorn
 
 from app import __version__
+from app.services import wdndds_daemon
+from app.services.config import get_config
+
+
+def _start_wdndds_daemon() -> None:
+    """Auto-start ``wdndds_daemon`` before uvicorn boots.
+
+    The daemon process renames its comm to ``"wdndds-daemon"`` via
+    ``prctl(PR_SET_NAME)`` immediately after import (see
+    :func:`app.services.wdndds_daemon._set_comm_name`). We walk
+    ``/proc/*/comm`` via
+    :func:`app.services.wdndds_daemon.find_daemon_pids` first; any
+    match — including daemons started by systemd, manually, or by a
+    previous ``run.py`` invocation — short-circuits Popen so reload
+    loops and double-launches are impossible.
+
+    Ports are read from ``config.json["compute"]`` so a board
+    configured with non-default ``discovery_server_port`` /
+    ``daemon_http_port`` still comes up correctly. Falls back to the
+    daemon's CLI defaults (7411 / 7412) when the keys are missing.
+
+    All failures are logged to stderr and swallowed — a daemon crash
+    must not block the web service from coming up. The user can
+    restart manually or fix the config and retry.
+    """
+    existing = wdndds_daemon.find_daemon_pids()
+    if existing:
+        print(f"[run.py] wdndds_daemon already running (pids={existing}), "
+              f"skip auto-start", file=sys.stderr)
+        return
+
+    compute_cfg = get_config().get_section("compute") or {}
+    udp_port = int(compute_cfg.get("discovery_server_port",
+                                  wdndds_daemon.DEFAULT_UDP_PORT))
+    http_port = int(compute_cfg.get("daemon_http_port",
+                                    wdndds_daemon.DEFAULT_HTTP_PORT))
+    logfile = compute_cfg.get("daemon_logfile")
+
+    try:
+        proc = wdndds_daemon.start_in_subprocess(
+            port=udp_port, http_port=http_port, logfile=logfile)
+        print(f"[run.py] wdndds_daemon auto-started pid={proc.pid} "
+              f"udp={udp_port} http={http_port}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(f"[run.py] wdndds_daemon auto-start failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
 
 
 def main() -> None:
@@ -39,6 +86,14 @@ def main() -> None:
     # Propagate to the app via env so app.services.config picks it up
     # before any FastAPI route is hit.
     os.environ["WDNWEBUI_CONFIG"] = str(config_path)
+
+    # Bring up the FastDDS discovery daemon before uvicorn binds the
+    # web port. _start_wdndds_daemon() is idempotent — it walks
+    # /proc/*/comm for the daemon's prctl-set name ("wdndds-daemon")
+    # and skips Popen when one is already running, so re-invoking
+    # run.py, uvicorn reloads, or systemd-started daemons all coexist
+    # without double-spawn.
+    _start_wdndds_daemon()
 
     uvicorn.run(
         "app.main:app",
