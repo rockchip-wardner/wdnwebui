@@ -22,6 +22,7 @@ from app.api import (
     system_monitor,
     text_chat,
     tts,
+    versions,
     video_content_search,
     video_detection,
     video_file_analysis,
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(video_content_search.router, prefix="/api")
     app.include_router(wechat.router, prefix="/api")
     app.include_router(text_chat.router, prefix="/api")
+    app.include_router(versions.router, prefix="/api")
 
     # Boot：按 config.compute.services 列表为每条 model 做 probe →
     # adopt-or-spawn。worker 起来后只注册 DDS endpoint，不 build

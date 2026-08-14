@@ -3,10 +3,24 @@ const DEFAULT_PAGE = "system-monitor";
 
 async function fetchVersion() {
   try {
-    const r = await fetch("/health");
+    const r = await fetch("/api/versions");
     if (!r.ok) return;
+    const data = await r.json();
     const el = document.getElementById("brand-version");
-    if (el) el.textContent = "v" + (window.__APP_VERSION__ || "0.4.0");
+    if (el && data && data.wdnwebui) el.textContent = "v" + data.wdnwebui;
+    if (data && typeof data === "object") {
+      document.querySelectorAll(".brand-component-version[data-component]").forEach((node) => {
+        const key = node.getAttribute("data-component");
+        const v = data[key];
+        if (v == null) {
+          node.textContent = "missing";
+          node.setAttribute("data-missing", "true");
+        } else {
+          node.textContent = "v" + v;
+          node.removeAttribute("data-missing");
+        }
+      });
+    }
   } catch (_) { /* ignore */ }
 }
 
