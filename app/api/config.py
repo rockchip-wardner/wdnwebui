@@ -58,7 +58,7 @@ def _random_device_name() -> str:
 # Users can overwrite it via PUT /api/config/base.
 #
 # `model_path` is the on-device directory where downstream SDKs (e.g.
-# rkai's RKNN model cache) look for weights. Services that consume it
+# wdnai's RKNN model cache) look for weights. Services that consume it
 # should re-read it from `get_config().get_section("base")["model_path"]`
 # after each successful PUT so a save takes effect without a restart.
 #

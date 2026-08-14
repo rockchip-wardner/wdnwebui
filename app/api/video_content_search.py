@@ -58,7 +58,7 @@ async def start_extract(payload: dict) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
-        # rkai 缺失 / 功能未启用（qwen3-vl-embedding-2b 实例未启动）
+        # wdnai 缺失 / 功能未启用（qwen3-vl-embedding-2b 实例未启动）
         raise HTTPException(status_code=503, detail=str(e))
 
 
@@ -91,7 +91,7 @@ async def query_video(payload: dict) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
-        # rkai 缺失 / 功能未启用（实例在提取后被停掉等情况）
+        # wdnai 缺失 / 功能未启用（实例在提取后被停掉等情况）
         raise HTTPException(status_code=503, detail=str(e))
 
 

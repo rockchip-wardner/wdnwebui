@@ -1,10 +1,10 @@
-"""Single-process capture session backed by ``rkv.VideoCapture``.
+"""Single-process capture session backed by ``wdnav.VideoCapture``.
 
 Owns one ``VideoCapture``, a background decode thread, and a frame queue
-that the WebSocket handler drains. Designed to keep ``import rkv.video``
-lazy — the rkv/AGENTS.md gotcha about non-Rockchip dev boxes still applies
+that the WebSocket handler drains. Designed to keep ``import wdnav.video``
+lazy — the wdnav/AGENTS.md gotcha about non-Rockchip dev boxes still applies
 (a missing native lib sets ``VideoCapture`` to ``None`` in
-``rkv/__init__.py``).
+``wdnav/__init__.py``).
 """
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ import cv2
 
 
 try:
-    from rkv import VideoCapture as _RkvVideoCapture
+    from wdnav import VideoCapture as _WdnavVideoCapture
 except Exception:  # pragma: no cover - platform-specific load failure
-    _RkvVideoCapture = None
+    _WdnavVideoCapture = None
 
 
 class VideoSession:
@@ -58,7 +58,7 @@ class VideoSession:
         self._frame_pos = 0
         self._last_frame_ts = 0.0
         self._loop = False
-        # Per-frame sinks (e.g. the rkai detector). Notified on each
+        # Per-frame sinks (e.g. the wdnai detector). Notified on each
         # decoded BGR frame; called from the decode thread so sinks must
         # be cheap or marshal work elsewhere themselves.
         self._frame_sinks: list = []
@@ -88,10 +88,10 @@ class VideoSession:
         (rtsp/rtmp/http/device nodes) are unaffected since they don't
         EOF.
         """
-        if _RkvVideoCapture is None:
+        if _WdnavVideoCapture is None:
             with self._lock:
                 self._state = self.STATE_ERROR
-                self._error = "rkv.VideoCapture 不可用：原生库缺失"
+                self._error = "wdnav.VideoCapture 不可用：原生库缺失"
             raise RuntimeError(self._error)
 
         # Tear down any prior session first; this also flips both events
@@ -115,7 +115,7 @@ class VideoSession:
             self._cap = None  # cleared until init succeeds
 
         try:
-            cap = _RkvVideoCapture(source, timeout=timeout)
+            cap = _WdnavVideoCapture(source, timeout=timeout)
         except Exception as e:
             self._fail(f"打开失败: {e}")
             raise
@@ -343,7 +343,7 @@ class VideoSession:
                 if not source:
                     return
                 try:
-                    new_cap = _RkvVideoCapture(source, timeout=OPEN_TIMEOUT)
+                    new_cap = _WdnavVideoCapture(source, timeout=OPEN_TIMEOUT)
                 except Exception as e:
                     self._fail(f"打开失败: {e}")
                     return

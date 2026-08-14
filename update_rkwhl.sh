@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 更新 .venv/src 下以 editable 模式安装的 rkv / rkai / wdndds
+# 更新 .venv/src 下以 editable 模式安装的 wdnav / wdnai / wdndds
 # 用法：./update_rkwhl.sh
 
 set -euo pipefail
@@ -34,8 +34,8 @@ update_pkg() {
     fi
 }
 
-update_pkg rkv  "git+ssh://git@10.10.10.10/pythonsdk/pyrkv.git#egg=rkv"
-update_pkg rkai "git+ssh://git@10.10.10.10/pythonsdk/pyrkai.git#egg=rkai"
-update_pkg wdndds "git+ssh://git@10.10.10.10/pythonsdk/wdndds.git#egg=wdndds"
+update_pkg wdnav  "git+ssh://git@10.10.10.10/wardner/wdnav.git#egg=wdnav"
+update_pkg wdnai "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
+update_pkg wdndds "git+ssh://git@10.10.10.10/wardner/wdndds.git#egg=wdndds"
 
 echo "更新完成。"

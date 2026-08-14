@@ -139,34 +139,34 @@ _WORKER_STOP_EVENT: threading.Event = threading.Event()
 
 
 # --------------------------------------------------------------------------- #
-# rkai lazy-import + session builder                                          #
+# wdnai lazy-import + session builder                                          #
 # --------------------------------------------------------------------------- #
-_RKAI = None
+_WDNAI = None
 
 
-def _load_rkai() -> dict:
-    global _RKAI
-    if _RKAI is not None:
-        return _RKAI
+def _load_wdnai() -> dict:
+    global _WDNAI
+    if _WDNAI is not None:
+        return _WDNAI
     try:
-        from rkai import (
+        from wdnai import (
             Attachment,
             LLMSession,
             SystemLanguageModel,
         )
     except ImportError as e:
-        raise RuntimeError(f"rkai import failed: {e}")
-    _RKAI = {
+        raise RuntimeError(f"wdnai import failed: {e}")
+    _WDNAI = {
         "Attachment": Attachment,
         "LLMSession": LLMSession,
         "SystemLanguageModel": SystemLanguageModel,
     }
-    return _RKAI
+    return _WDNAI
 
 
 def _build_session(model_id: str, npu_index: int):
     """Construct an LLMSession. May raise (or call terminate())."""
-    mod = _load_rkai()
+    mod = _load_wdnai()
     if model_id == "qwen3-vl-4b":
         spec = mod["SystemLanguageModel"].qwen3_vl_4b()
     elif model_id == "qwen3-tts":
@@ -179,7 +179,7 @@ def _build_session(model_id: str, npu_index: int):
         )
     elif model_id == "qwen3-vl-embedding-2b":
         # Embedding 模型：RKNN3Lite 普通模型路径输出 2048 维归一化向量；
-        # 不做 token 生成，rkai 内部用 EmbeddingBackend 跑 embed_text /
+        # 不做 token 生成，wdnai 内部用 EmbeddingBackend 跑 embed_text /
         # embed_video_chunk；模型文件布局与 Qwen3-VL-4B 同款。
         spec = mod["SystemLanguageModel"].qwen3_vl_embedding()
     else:
@@ -206,7 +206,7 @@ def info_handler(state: dict, model_id: str,
         "npu_index_startup":  startup_npu_index,
         "load_time_sec":      state.get("load_time_sec"),
         "init_error":         state.get("init_error", ""),
-        "rkai_available":     state.get("rkai_available", False),
+        "wdnai_available":     state.get("wdnai_available", False),
         # v0.8: provenance for the main process's boot probe — used
         # to distinguish a local-orphan worker (same hostname as the
         # main process) from a real LAN peer. Hostname is the
@@ -401,7 +401,7 @@ def infer_handler(state: dict, payload: dict) -> dict:
         return {"status": "error", "error": "session not loaded; send action='load' first"}
 
     try:
-        mod = _load_rkai()
+        mod = _load_wdnai()
         Attachment = mod["Attachment"]
         prompt = payload.get("prompt")
         atts_meta = payload.get("attachment", [])
@@ -578,7 +578,7 @@ def main() -> int:
     # Resolve model_dir for the info reply (don't fail if missing).
     model_dir = None
     try:
-        base_dir = os.environ.get("RKAI_MODELS_DIR", "/userdata/models/")
+        base_dir = os.environ.get("WDNAI_MODELS_DIR", "/userdata/models/")
         from app.services.compute_registry import MODEL_PRESETS
         preset = MODEL_PRESETS.get(model_id)
         if preset:
@@ -636,7 +636,7 @@ def main() -> int:
         "loaded_at": None,
         "init_error": "",
         "session": None,
-        "rkai_available": False,
+        "wdnai_available": False,
         "model_dir": model_dir,
     }
 

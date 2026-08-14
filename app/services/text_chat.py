@@ -5,10 +5,10 @@
 
 * **LLMSession 必须从 ComputeRegistry 取**（``get_session("swcap_text_chat")``）；
   找不到抛 ``RuntimeError("功能未启用: swcap_text_chat")``，调用方决定如何上报。
-* **rkai 导入懒加载**：模块顶部只 import ``os / re / queue / threading / asyncio``；
-  rkai / rknn3lite 只在第一次 ``_TextChatManager`` 实例化时 import。
+* **wdnai 导入懒加载**：模块顶部只 import ``os / re / queue / threading / asyncio``；
+  wdnai / rknn3lite 只在第一次 ``_TextChatManager`` 实例化时 import。
 * **流式回调 = monkey-patch**：模块加载时把
-  ``rkai.backends._common.make_result_callback`` 替换成包装版（仅在 chat 路径
+  ``wdnai.backends._common.make_result_callback`` 替换成包装版（仅在 chat 路径
   注册了 observer 才推送，未注册的 sink 走原 callback，零开销）。
 * **thinking 与 answer 分离**：observer 拿到的每个 delta 增量先过一道
   ``_ThinkingRouter`` 状态机，按 ``<think>`` / ``</think>`` 推到对应频道；
@@ -85,7 +85,7 @@ _SUB_QUEUE_MAX = 500
 # callback（不通知 observer），用户看到的就是 "模型没开始推理 / 一直
 # running 没结果 / 直接 done 但内容空"。
 #
-# 模块顶层 ``import rkai.backends._common`` 不触发 RKNN3 native lib 加载
+# 模块顶层 ``import wdnai.backends._common`` 不触发 RKNN3 native lib 加载
 # （_common 只 import dataclasses / typing / time，没有 rknn3lite），所以
 # 这里 import 安全。
 #
@@ -108,7 +108,7 @@ def _do_install_patches() -> None:
     global _PATCH_DONE
     if _PATCH_DONE:
         return
-    import rkai.backends._common as _common
+    import wdnai.backends._common as _common
     _original_factory = _common.make_result_callback
 
     # 内部状态常量（与 _common._STATE_NORMAL / _STATE_FINISH 对齐）
@@ -148,7 +148,7 @@ def _do_install_patches() -> None:
 
     _common.make_result_callback = _patched
     _PATCH_DONE = True
-    _LOG.info("monkey-patched rkai.backends._common.make_result_callback")
+    _LOG.info("monkey-patched wdnai.backends._common.make_result_callback")
 
 
 # **模块顶层立即安装** —— 在 ``_TextChatManager.__init__`` 之前，确保

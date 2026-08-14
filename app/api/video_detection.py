@@ -249,7 +249,7 @@ async def close_source() -> dict:
 
 
 # --------------------------------------------------------------------- #
-# rkai VLM detection                                                     #
+# wdnai VLM detection                                                     #
 # --------------------------------------------------------------------- #
 @router.get("/video-detection/prompt")
 async def get_prompt() -> dict:

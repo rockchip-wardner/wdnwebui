@@ -186,15 +186,15 @@ def _parse_memory(s: str) -> tuple[float | None, float | None]:
         return None, None
 
 
-def _rkai_canonical_device_index(bus_id: str | None) -> int | None:
+def _wdnai_canonical_device_index(bus_id: str | None) -> int | None:
     """Resolve a ``bus_id`` (PCI BDF, e.g. ``0001:11:00.0``) to its
     enumerate-index in ``RKNN3Lite().get_devices_id()``.
 
-    rkai (and therefore 算力配置页) uses ``enumerate(get_devices_id())``
+    wdnai (and therefore 算力配置页) uses ``enumerate(get_devices_id())``
     as the canonical ``npu_index``; ``rknn-smi info`` numbers devices by
     its own internal order, which doesn't always match. This helper
     bridges the two so 系统信息 / 算力卡信息 and 算力配置 label the same
-    physical card with the same ``#K``. Returns ``None`` when rkai is
+    physical card with the same ``#K``. Returns ``None`` when wdnai is
     unavailable (non-RK dev box) or ``bus_id`` is missing/unmatched —
     callers fall back to the rknn-smi native idx in that case.
     """
@@ -213,19 +213,19 @@ def _rkai_canonical_device_index(bus_id: str | None) -> int | None:
 
 
 def _align_npu_indices(devices: list[dict]) -> list[dict]:
-    """Re-index each rknn-smi row to the rkai-canonical ``npu_index``.
+    """Re-index each rknn-smi row to the wdnai-canonical ``npu_index``.
 
     Sorts the returned list by the canonical index (rknn-smi-only
     orphans come last, in their original order) so the UI sees
     ``#0, #1, #2, ...`` in the same order the 算力配置 page does. The
     rknn-smi native idx is preserved as ``rknn_smi_idx`` for debugging.
-    Orphans (cards rkai can't see, e.g. rknn-smi mis-scan) get a
+    Orphans (cards wdnai can't see, e.g. rknn-smi mis-scan) get a
     negative ``index`` and an ``orphan=True`` flag so they render
     after the canonical rows without colliding on the same ``#N``.
     """
     aligned: list[tuple[int, int, int, dict]] = []
     for smi_order, dev in enumerate(devices):
-        canonical = _rkai_canonical_device_index(dev.get("bus_id"))
+        canonical = _wdnai_canonical_device_index(dev.get("bus_id"))
         if canonical is None:
             dev["rknn_smi_idx"] = dev.get("index")
             dev["index"] = -(smi_order + 1)

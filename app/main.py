@@ -71,8 +71,8 @@ def create_app() -> FastAPI:
     # absolute path. Missing files are tolerated — they read as {}.
     cfg = get_config()
 
-    # Propagate RKAI_MODELS_DIR from config.json so downstream SDKs
-    # (rkai's `_models_root()`) pick up the configured model root
+    # Propagate WDNAI_MODELS_DIR from config.json so downstream SDKs
+    # (wdnai's `_models_root()`) pick up the configured model root
     # without each consumer having to read config separately. Setting
     # it before any LLMSession is built means the SDK reads the right
     # path on its first lookup. Done once at app boot — a runtime
@@ -81,7 +81,7 @@ def create_app() -> FastAPI:
     base = cfg.get_section("base", {})
     model_path = (base or {}).get("model_path")
     if isinstance(model_path, str) and model_path.strip():
-        os.environ["RKAI_MODELS_DIR"] = model_path
+        os.environ["WDNAI_MODELS_DIR"] = model_path
 
     app.include_router(system_monitor.router, prefix="/api")
     app.include_router(video_detection.router, prefix="/api")
@@ -156,7 +156,7 @@ def create_app() -> FastAPI:
         except Exception:
             pass
         # Stop the video-file-analysis worker (releases its
-        # rkv.VideoCapture and joins the decode / infer threads).
+        # wdnav.VideoCapture and joins the decode / infer threads).
         try:
             get_vfa_service().close()
         except Exception:

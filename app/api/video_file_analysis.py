@@ -58,7 +58,7 @@ async def open_analysis(payload: dict) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
-        # rkai 缺失 / rkv 缺失 / 功能未启用
+        # wdnai 缺失 / wdnav 缺失 / 功能未启用
         raise HTTPException(status_code=503, detail=str(e))
 
 
@@ -116,7 +116,7 @@ async def delete_run(run_id: str) -> dict:
 # --------------------------------------------------------------------- #
 # 取帧：反查结果点开后，回溯原始视频取出对应 frame_pos 的帧。
 #
-# rkv.VideoCapture 只暴露顺序 read()（无 seek API），所以每帧都要
+# wdnav.VideoCapture 只暴露顺序 read()（无 seek API），所以每帧都要
 # 从头顺序读取到 frame_pos。对长视频这是 O(N) 开销，但对用户典型
 # 用法（点开最近几条结果）足够快（JPEG 编码 ~50ms/帧）。
 #
@@ -157,7 +157,7 @@ async def get_run_frame(run_id: str, frame_pos: int) -> Response:
             detail="live source 不支持回溯取帧（无确定 frame_pos）",
         )
 
-    # fps 优先用实际取帧时从 stream 探测出来的值（PyAV / rkv 两条路径都
+    # fps 优先用实际取帧时从 stream 探测出来的值（PyAV / wdnav 两条路径都
     # 各自测过）。fallback 顺序：探测 fps → meta JSON 里的 fps → 0。
     # 这样：
     #   - 新 run（meta 已存 fps）：两者一致，前端显示正常时间戳。
@@ -173,7 +173,7 @@ async def get_run_frame(run_id: str, frame_pos: int) -> Response:
     def _seek_and_read_with_pyav() -> Optional[Tuple[bytes, float]]:
         """PyAV + V4L2 mem-to-mem 路径：硬件 H.264/HEVC 解码 + libavformat seek。
 
-        跟 rkv 路径共用同一颗 RK3588 VPU，但 PyAV 多了 libavformat 的
+        跟 wdnav 路径共用同一颗 RK3588 VPU，但 PyAV 多了 libavformat 的
         ``avformat_seek_file`` 能力 —— 可以直接跳到离 target 最近的 keyframe，
         不需要从 frame 0 一路顺序读到 target。
 
@@ -182,7 +182,7 @@ async def get_run_frame(run_id: str, frame_pos: int) -> Response:
         run JSON 跨设备迁移时 source 跟当时不同）。
 
         实测对比（960x540 H.264 @ 25fps 取 frame 1220）：
-          rkv.read0() 从头读  : 18.8 s  (15.4 ms/帧 × 1220 帧)
+          wdnav.read0() 从头读  : 18.8 s  (15.4 ms/帧 × 1220 帧)
           PyAV v4l2m2m + seek : 0.12 s  (seek 0 ms + decode 19 帧)
         加速 ~150x，主要赢在**跳过了 keyframe 之前的全部顺序读**。
         """
@@ -209,7 +209,7 @@ async def get_run_frame(run_id: str, frame_pos: int) -> Response:
             try:
                 container.seek(offset, backward=True, any_frame=False, stream=stream)
             except Exception as e:
-                LOG.debug("vfa: PyAV seek 失败（fallback 到 rkv）: %s", e)
+                LOG.debug("vfa: PyAV seek 失败（fallback 到 wdnav）: %s", e)
                 return None
 
             # Decode 找到 target 帧。
@@ -232,7 +232,7 @@ async def get_run_frame(run_id: str, frame_pos: int) -> Response:
                 if frame_number > target + max_extra_frames:
                     break
             if target_ndarray is None:
-                # 视频截断 / seek 没找对位置 → fallback 到 rkv。
+                # 视频截断 / seek 没找对位置 → fallback 到 wdnav。
                 return None
 
             import cv2
@@ -249,28 +249,28 @@ async def get_run_frame(run_id: str, frame_pos: int) -> Response:
             # 不需要手动 drain，process 退出时 mpp_buf_slot 干净。
             container.close()
 
-    def _seek_and_read_with_rkv() -> Optional[Tuple[bytes, float]]:
-        """rkv fallback：硬件 decode 但无 seek，只能从 frame 0 顺序读到 target。
+    def _seek_and_read_with_wdnav() -> Optional[Tuple[bytes, float]]:
+        """wdnav fallback：硬件 decode 但无 seek，只能从 frame 0 顺序读到 target。
 
         适用于 PyAV seek 失败 / 不支持的格式 / h264_v4l2m2m 不可用的情况。
         长视频中段取帧会比较慢（实测 15ms/帧 × target 帧），但至少能用。
 
-        返回 (jpeg_bytes, fps) —— fps 从 cap.fps 读（rkv 在 __init__ 时
+        返回 (jpeg_bytes, fps) —— fps 从 cap.fps 读（wdnav 在 __init__ 时
         已经从 rkv_dec_create 拿到了原视频流的平均帧率，O(1)）。
         """
         try:
-            from rkv import VideoCapture as _RkvCap
+            from wdnav import VideoCapture as _WdnavCap
         except Exception as e:
-            raise RuntimeError(f"rkv 不可用: {e}")
-        if _RkvCap is None:
-            raise RuntimeError("rkv.VideoCapture 不可用（原生库缺失）")
+            raise RuntimeError(f"wdnav 不可用: {e}")
+        if _WdnavCap is None:
+            raise RuntimeError("wdnav.VideoCapture 不可用（原生库缺失）")
 
-        cap = _RkvCap(source, timeout=10.0)
+        cap = _WdnavCap(source, timeout=10.0)
         if not cap.isOpened():
             cap.release()
             raise RuntimeError(f"无法打开原始视频: {source}")
 
-        # rkv 在打开时已经读了 fps（rkv_dec_create 内部从 demuxer 拿 average_rate），
+        # wdnav 在打开时已经读了 fps（rkv_dec_create 内部从 demuxer 拿 average_rate），
         # 这里直接 cap.fps 拿，O(1) 不需要再开一次视频。
         fps = float(getattr(cap, "fps", 0.0) or 0.0)
 
@@ -336,11 +336,11 @@ async def get_run_frame(run_id: str, frame_pos: int) -> Response:
                 pass
 
     def _seek_and_read() -> Tuple[bytes, float]:
-        """主入口：先试 PyAV+v4l2m2m+seek（快 ~150x），失败 fallback 到 rkv。
+        """主入口：先试 PyAV+v4l2m2m+seek（快 ~150x），失败 fallback 到 wdnav。
 
         选 PyAV 作首选的额外好处：
           - PyAV container.close() 自动清理 libavcodec / mpp，process 退出时
-            mpp_buf_slot warning 比 rkv 路径少很多（实测干净退出）。
+            mpp_buf_slot warning 比 wdnav 路径少很多（实测干净退出）。
           - seek 落点后 decode ~keyframe_interval 帧，1-2 秒就够。
 
         返回 (jpeg_bytes, fps) —— fps 来自实际 stream 的探测值，比
@@ -351,10 +351,10 @@ async def get_run_frame(run_id: str, frame_pos: int) -> Response:
             result = _seek_and_read_with_pyav()
             if result is not None:
                 return result
-            LOG.debug("vfa: PyAV 取帧失败，fallback 到 rkv 顺序读")
+            LOG.debug("vfa: PyAV 取帧失败，fallback 到 wdnav 顺序读")
         except Exception as e:
-            LOG.debug("vfa: PyAV 取帧异常，fallback 到 rkv: %s", e)
-        return _seek_and_read_with_rkv()
+            LOG.debug("vfa: PyAV 取帧异常，fallback 到 wdnav: %s", e)
+        return _seek_and_read_with_wdnav()
 
     try:
         jpg_bytes, detected_fps = await asyncio.wait_for(

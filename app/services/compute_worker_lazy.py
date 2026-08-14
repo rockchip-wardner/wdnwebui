@@ -1,9 +1,9 @@
-"""compute_worker_lazy — deferred rkai imports + session factory.
+"""compute_worker_lazy — deferred wdnai imports + session factory.
 
 Imported by ``compute_worker.router`` on the first ``action="infer"``
 or ``action="load"`` call. Keeping the imports out of module top-level
-preserves the "compute_worker can be even if rkai isn't installed"
-behavior — same constraint as ``RkaiDetector._load_rkai``.
+preserves the "compute_worker can be even if wdnai isn't installed"
+behavior — same constraint as ``WdnaiDetector._load_wdnai``.
 
 Worker-side construction differs from main-process:
 
@@ -26,15 +26,15 @@ from typing import Any, Optional
 LOG = logging.getLogger("compute_worker_lazy")
 
 
-_RKAI_CACHE: dict = {}
+_WDNAI_CACHE: dict = {}
 
 
-def _load_rkai() -> dict:
-    """Lazily import rkai. Cached after first call."""
-    if _RKAI_CACHE:
-        return _RKAI_CACHE
+def _load_wdnai() -> dict:
+    """Lazily import wdnai. Cached after first call."""
+    if _WDNAI_CACHE:
+        return _WDNAI_CACHE
     try:
-        from rkai import (
+        from wdnai import (
             Attachment,
             Field,
             Generable,
@@ -43,12 +43,12 @@ def _load_rkai() -> dict:
             SystemLanguageModel,
         )
     except ImportError as e:
-        LOG.exception("rkai import failed")
+        LOG.exception("wdnai import failed")
         raise RuntimeError(
-            f"rkai import failed: {e}. "
-            "compute_worker requires rkai installed in the same venv."
+            f"wdnai import failed: {e}. "
+            "compute_worker requires wdnai installed in the same venv."
         )
-    _RKAI_CACHE.update({
+    _WDNAI_CACHE.update({
         "Attachment": Attachment,
         "Field": Field,
         "Generable": Generable,
@@ -56,17 +56,17 @@ def _load_rkai() -> dict:
         "LMOutput": LMOutput,
         "SystemLanguageModel": SystemLanguageModel,
     })
-    return _RKAI_CACHE
+    return _WDNAI_CACHE
 
 
 # --------------------------------------------------------------------------- #
 # Per-model preset (mirrors app/services/compute_registry.py MODEL_PRESETS)  #
 # --------------------------------------------------------------------------- #
 def _preset_for(model_id: str) -> Any:
-    """Build the rkai ModelSpec for ``model_id``. Same logic as
+    """Build the wdnai ModelSpec for ``model_id``. Same logic as
     ComputeRegistry.MODEL_PRESETS — kept in sync. New models only
     need adding here and to MODEL_PRESETS."""
-    mod = _load_rkai()
+    mod = _load_wdnai()
     SLM = mod["SystemLanguageModel"]
     if model_id == "qwen3-vl-4b":
         return SLM.qwen3_vl_4b()
@@ -91,8 +91,8 @@ def _preset_for(model_id: str) -> Any:
 # Session factory                                                            #
 # --------------------------------------------------------------------------- #
 def build_session(model_id: str, npu_index: int):
-    """Construct the LLMSession for one instance. Lazy-imports rkai."""
-    mod = _load_rkai()
+    """Construct the LLMSession for one instance. Lazy-imports wdnai."""
+    mod = _load_wdnai()
     spec = _preset_for(model_id)
     LOG.info("building LLMSession(model_id=%s, npu=%d, kind=%s)",
              model_id, npu_index, getattr(spec, "kind", "?"))
@@ -132,7 +132,7 @@ def run_infer(session, payload: dict) -> dict:
     here. For now, return a minimal ``{"text": <raw model text>}``
     so the wiring is exercised end-to-end.
     """
-    mod = _load_rkai()
+    mod = _load_wdnai()
     Attachment = mod["Attachment"]
 
     prompt = payload.get("prompt", "")

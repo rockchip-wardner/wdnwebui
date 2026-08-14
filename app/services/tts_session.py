@@ -3,9 +3,9 @@
 Drives TTS inference through the v2 ``LLMSession.respond`` API; the
 service owns the per-call state machine, history, broadcaster, and
 WAV file I/O. ``model_dir`` resolution is the same as the SDK's
-TTSBackend (env var → ``$RKAI_MODELS_DIR/Qwen3-TTS`` →
+TTSBackend (env var → ``$WDNAI_MODELS_DIR/Qwen3-TTS`` →
 ``/userdata/models/Qwen3-TTS``); the layout is documented in
-``rkai/models/README.md``.
+``wdnai/models/README.md``.
 """
 from __future__ import annotations
 
@@ -146,27 +146,27 @@ class AplayWriter:
 
 
 # --------------------------------------------------------------------------- #
-# Lazy rkai SDK loader
+# Lazy wdnai SDK loader
 # --------------------------------------------------------------------------- #
-_RKAI_CACHE: dict = {}
+_WDNAI_CACHE: dict = {}
 
 
-def _load_rkai():
-    """Lazily import rkai + the SDK's TTS bits. Only first call hits
+def _load_wdnai():
+    """Lazily import wdnai + the SDK's TTS bits. Only first call hits
     ``import``; subsequent calls return the cached entry."""
-    if "_ok" in _RKAI_CACHE:
+    if "_ok" in _WDNAI_CACHE:
         return (
-            _RKAI_CACHE["_ok"],
-            _RKAI_CACHE["_Attachment"],
-            _RKAI_CACHE["_LLMSession"],
-            _RKAI_CACHE["_SystemLanguageModel"],
-            _RKAI_CACHE["_LMOutput"],
-            _RKAI_CACHE["_Generable"],
-            _RKAI_CACHE["_Field"],
-            _RKAI_CACHE["_error"],
+            _WDNAI_CACHE["_ok"],
+            _WDNAI_CACHE["_Attachment"],
+            _WDNAI_CACHE["_LLMSession"],
+            _WDNAI_CACHE["_SystemLanguageModel"],
+            _WDNAI_CACHE["_LMOutput"],
+            _WDNAI_CACHE["_Generable"],
+            _WDNAI_CACHE["_Field"],
+            _WDNAI_CACHE["_error"],
         )
     try:
-        from rkai import (
+        from wdnai import (
             Attachment,
             Field,
             Generable,
@@ -174,7 +174,7 @@ def _load_rkai():
             LLMSession,
             SystemLanguageModel,
         )
-        _RKAI_CACHE.update(
+        _WDNAI_CACHE.update(
             _ok=True,
             _Attachment=Attachment,
             _LLMSession=LLMSession,
@@ -186,7 +186,7 @@ def _load_rkai():
         )
         return True, Attachment, LLMSession, SystemLanguageModel, LMOutput, Generable, Field, ""
     except Exception as e:
-        _RKAI_CACHE.update(
+        _WDNAI_CACHE.update(
             _ok=False,
             _Attachment=None,
             _LLMSession=None,
@@ -207,12 +207,12 @@ _TTS_RESULT_CLS = None
 
 
 def _get_tts_result_cls():
-    """Build the ``TTSResult`` schema lazily, once rkai is importable."""
+    """Build the ``TTSResult`` schema lazily, once wdnai is importable."""
     global _TTS_RESULT_CLS
     if _TTS_RESULT_CLS is not None:
         return _TTS_RESULT_CLS
     from typing import Optional
-    _, _, _, _, LMOutput, Generable, Field, _ = _load_rkai()
+    _, _, _, _, LMOutput, Generable, Field, _ = _load_wdnai()
 
     @Generable
     class TTSResult(LMOutput):
@@ -308,7 +308,7 @@ class TtsSession:
               → done / error       (terminal)
               → stop()  → stopped (terminal)
 
-    Mirrors ``VideoSession`` / ``RkaiDetector`` so the JS side can
+    Mirrors ``VideoSession`` / ``WdnaiDetector`` so the JS side can
     treat all three uniformly (same snapshot fields, broadcaster API).
     """
 
@@ -369,7 +369,7 @@ class TtsSession:
 
         # Probe once at boot so the UI can render the banner without
         # waiting for the first /start request.
-        ok, _, _, _, _, _, _, err = _load_rkai()
+        ok, _, _, _, _, _, _, err = _load_wdnai()
         if not ok:
             self._state = self.STATE_UNAVAILABLE
             self._init_error = err
@@ -382,12 +382,12 @@ class TtsSession:
         env = os.environ.get("TTS_MODEL_DIR")
         if env:
             return Path(env)
-        root = os.environ.get("RKAI_MODELS_DIR", "/userdata/models")
+        root = os.environ.get("WDNAI_MODELS_DIR", "/userdata/models")
         return Path(root) / "Qwen3-TTS"
 
     @property
     def available(self) -> bool:
-        ok, *_ = _load_rkai()
+        ok, *_ = _load_wdnai()
         return ok
 
     @property
@@ -681,7 +681,7 @@ class TtsSession:
             self._init_error = str(e)
             raise
         try:
-            ok, Attachment, *_ = _load_rkai()
+            ok, Attachment, *_ = _load_wdnai()
             TTSResult = _get_tts_result_cls()
 
             sess.reset()
@@ -800,7 +800,7 @@ _session_lock = threading.Lock()
 
 
 def get_session() -> TtsSession:
-    """Lazy singleton. The first call probes the rkai SDK; on non-RK
+    """Lazy singleton. The first call probes the wdnai SDK; on non-RK
     dev boxes the returned session just reports ``state="unavailable"``.
     """
     global _session

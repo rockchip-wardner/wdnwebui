@@ -5,7 +5,7 @@
 前端 / detector / API 都通过 ``get_tool_registry()`` 取这一份
 真源，不会重复装饰器。
 
-rkai 在工具模块顶部 import：tts_alert 等用例直接 ``from rkai
+wdnai 在工具模块顶部 import：tts_alert 等用例直接 ``from wdnai
 import Callable, Field``，注册过程不引入任何 lazy 间接层，
 与设计要求一致。
 
@@ -22,8 +22,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import numpy as np
 
-from rkai import Callable as RkaiCallable
-from rkai import Field as RkaiField
+from wdnai import Callable as WdnaiCallable
+from wdnai import Field as WdnaiField
 
 
 @dataclass(frozen=True)

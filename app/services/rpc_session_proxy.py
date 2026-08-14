@@ -1,4 +1,4 @@
-"""rpc_session_proxy — rkai.LLMSession drop-in backed by wdndds cshim RPC.
+"""rpc_session_proxy — wdnai.LLMSession drop-in backed by wdndds cshim RPC.
 
 Each compute instance lives in its own compute_worker subprocess; the
 LLMSession is held by that worker. The main pyrkaiweb process holds
@@ -45,7 +45,7 @@ def _bgr_ndarray_to_b64(arr, quality: int = 85) -> str:
 
 class _ProxyResult:
     """Adapter object: detector/tts/vfa code reads ``result.text`` etc.;
-    this mirrors the fields that rkai returns from ``sess.respond``."""
+    this mirrors the fields that wdnai returns from ``sess.respond``."""
 
     def __init__(self, *, text=None, level=None, tool_call=None,
                  bbox=None, crop_b64=None, raw=None):
@@ -71,7 +71,7 @@ class _ProxyResult:
 
 
 class _RpcSessionProxy:
-    """Drop-in for ``rkai.LLMSession`` that talks to a compute_worker
+    """Drop-in for ``wdnai.LLMSession`` that talks to a compute_worker
     subprocess via wdndds cshim RPC.
 
     Construct via :func:`make_rpc_session_proxy(rpc_client, model_id)`.
@@ -144,7 +144,7 @@ class _RpcSessionProxy:
 
     # ---- Embedding surface (Qwen3-VL-Embedding-2B only) -------------------
     # ``video_content_search`` service calls session.embed_text / embed_video.
-    # Unlike ``respond`` (which is async), these are sync rkai APIs, so we
+    # Unlike ``respond`` (which is async), these are sync wdnai APIs, so we
     # call the proxy's sync path directly via the executor. The cshim RPC
     # worker side picks them up via the new ``embed_text`` / ``embed_video``
     # actions in compute_worker.py.
@@ -153,7 +153,7 @@ class _RpcSessionProxy:
         """Encoding text query → 2048-dim normalized vector.
 
         Returns a numpy ``float32`` array on the calling thread. Synchronous
-        version of the rkai LLMSession.embed_text API.
+        version of the wdnai LLMSession.embed_text API.
         """
         reply = self._client.call(
             {"action": "embed_text", "text": text},
@@ -208,9 +208,9 @@ class _RpcSessionProxy:
         out = []
         for item in attachment:
             try:
-                from rkai import Attachment as _RkAttach
-                if isinstance(item, _RkAttach):
-                    # rkai.Attachment exposes channels by ``kind``:
+                from wdnai import Attachment as _WdnaiAttach
+                if isinstance(item, _WdnaiAttach):
+                    # wdnai.Attachment exposes channels by ``kind``:
                     #   "image" → ``item.images`` (list[BGR ndarray])
                     #   "video" → ``item.frames`` (list[BGR ndarray])
                     #   "text"  → ``item.text``    (str)

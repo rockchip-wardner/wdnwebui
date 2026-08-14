@@ -773,7 +773,7 @@ const VdFsModal = {
 };
 
 /* ------------------------------------------------------------------ *
- *  VLM detection (rkai) — prompt + event history + overlay            *
+ *  VLM detection (wdnai) — prompt + event history + overlay            *
  * ------------------------------------------------------------------ */
 function fmtEventTime(ts) {
   if (!ts) return "--";
@@ -849,7 +849,7 @@ function updateVdDetectorStatus(snap) {
   const stopBtn  = document.getElementById("vd-detector-stop");
   if (!snap || !statusEl) return;
   if (!snap.available) {
-    statusEl.textContent = "不可用: " + (snap.init_error || "rkai 未安装");
+    statusEl.textContent = "不可用: " + (snap.init_error || "wdnai 未安装");
   } else if (snap.init_error) {
     statusEl.textContent = "模型加载失败: " + snap.init_error;
   } else if (snap.enabled && snap.session_ready) {
@@ -1438,7 +1438,7 @@ function updateVtdDetectorStatus(snap) {
   const stopBtn  = document.getElementById("vtd-detector-stop");
   if (!snap || !statusEl) return;
   if (!snap.available) {
-    statusEl.textContent = "不可用: " + (snap.init_error || "rkai 未安装");
+    statusEl.textContent = "不可用: " + (snap.init_error || "wdnai 未安装");
   } else if (snap.init_error) {
     statusEl.textContent = "模型加载失败: " + snap.init_error;
   } else if (snap.enabled && snap.session_ready) {
@@ -3740,7 +3740,7 @@ const CC_PRESET_META = {
 const CC_PRESET_ORDER = ["qwen3-vl-4b", "qwen3-tts", "qwen3-8b", "qwen3-vl-embedding-2b"];
 
 // 系统拓扑：1× RK3588 主控（不占"算力卡"位置） + N× RK182x 协卡。
-// rkai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡多
+// wdnai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡多
 // npu_index）返回；按物理协卡数 cap 住，避免 UI 出现重复 option。
 // 增/减协卡时同步改这里 + 各处"渲染 cap" 即可。
 const CC_MAX_RK182X_CARDS = 2;
@@ -3907,9 +3907,9 @@ const ComputeConfigPage = {
       extra:   null,
     }));
 
-    // 182x cells：以 rkai 枚举（cards）作为唯一可信源。系统拓扑
+    // 182x cells：以 wdnai 枚举（cards）作为唯一可信源。系统拓扑
     // 是 1× RK3588 主控（不占"算力卡"位置）+ N× RK182x 协卡；
-    // rkai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡
+    // wdnai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡
     // 多个 npu_index），按物理卡数 cap 住。后续如增减协卡，调这里的
     // MAX_RK182X_CARDS 即可。
     const devices = (sys.npu && sys.npu.devices) || [];
@@ -3923,7 +3923,7 @@ const ComputeConfigPage = {
       .sort((a, b) => a - b)
       .slice(0, MAX_RK182X_CARDS);
 
-    // rkai 完全枚举不到 NPU 时，rknn-smi 兜底一次（host 没有 rkai
+    // wdnai 完全枚举不到 NPU 时，rknn-smi 兜底一次（host 没有 wdnai
     // / rknn3 的开发板情况），同样 cap。
     if (rk182xIndices.length === 0 && devices.length > 0) {
       for (const d of devices) {
@@ -5052,7 +5052,7 @@ const ComputeConfigPage = {
     // 信息页）对不上 —— 选 #0 实际跑在 #1 上。
     //
     // 真相：``RKNN3Lite().get_devices_id()`` 枚举的是 RK182x 协卡
-    // （rkai SDK 把 3588 走 ``device_id="rk3588"`` 路径，不在
+    // （wdnai SDK 把 3588 走 ``device_id="rk3588"`` 路径，不在
     // npu 枚举里）。enumerate index 就是真实的 NPU 编号，
     // "RK182x #N" 的 N 直接等于 enumerate index，不再 offset。
     const MAX_RK182X_OPTIONS = CC_MAX_RK182X_CARDS;
@@ -7226,7 +7226,7 @@ function initVideoContentSearch() {
 /* ------------------------------------------------------------------ *
  *  video-file-analysis page (后端 VLM 对接)                           *
  *                                                                    *
- *  后端: app/services/video_file_analysis.py —— 独立 rkv.VideoCapture*
+ *  后端: app/services/video_file_analysis.py —— 独立 wdnav.VideoCapture*
  *  + 后台线程,每 N 帧调一次 ComputeRegistry.get_session("video_query")*
  *  出 per-frame 文本,文件走完后跑综述。前端通过 WS 订阅新事件与综述  *
  *  就绪通知,REST 兜底拉取初始快照。                                    *

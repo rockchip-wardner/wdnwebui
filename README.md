@@ -1,8 +1,8 @@
 # pyrkaiweb
 
 A Python web service that exposes the Rockchip platform SDKs
-([`rkv`](https://10.10.10.10/pythonsdk/pyrkv) — MPP / RGA2 / V4L2 video,
-[`rkai`](https://10.10.10.10/pythonsdk/pyrkai) — RKNN LLM / VLM) over
+([`wdnav`](https://10.10.10.10/wardner/wdnav) — MPP / RGA2 / V4L2 video,
+[`wdnai`](https://10.10.10.10/wardner/wdnai) — RKNN LLM / VLM) over
 HTTP via FastAPI. Single-page UI at `http://<host>:8000/` with four
 sections: system monitor, video detection, system logs, and power
 control (shutdown / reboot).
@@ -18,7 +18,7 @@ control (shutdown / reboot).
 
 For the video detection page on a real Rockchip target, the host
 needs `librockchip_mpp` and `librga` from the BSP at runtime.
-`import rkv` works on any host; `import rkv.video` only works on the
+`import wdnav` works on any host; `import wdnav.video` only works on the
 target.
 
 ## 1. Clone
@@ -48,9 +48,9 @@ python-multipart, **`rknn3-toolkit-lite`**, and **`gguf`**.
 - `rknn3-toolkit-lite` — public Rockchip PyPI package; provides the
   Python `rknn3lite` module and the `.so` bindings used by
   `app/services/detector.py` for VLM inference.
-- `gguf` — used by `rkai.gguf_tokenizer` to parse the
+- `gguf` — used by `wdnai.gguf_tokenizer` to parse the
   `*.tokenizer.gguf` files that ship with each RKNN model. The
-  `rkai` SDK imports it but doesn't declare it as a dependency, so
+  `wdnai` SDK imports it but doesn't declare it as a dependency, so
   we pin it here.
 
 > ⚠️  `rknn3-toolkit-lite` only ships the **Python** half of the
@@ -69,16 +69,16 @@ These are **not** in `requirements.txt` because they're behind SSH and
 not on PyPI. Install them by hand after the SSH key is set up:
 
 ```bash
-pip install -e "git+ssh://git@10.10.10.10/pythonsdk/pyrkv.git#egg=rkv"
-pip install -e "git+ssh://git@10.10.10.10/pythonsdk/pyrkai.git#egg=rkai"
-pip install -e "git+ssh://git@10.10.10.10/pythonsdk/wdndds.git#egg=wdndds"
+pip install -e "git+ssh://git@10.10.10.10/wardner/wdnav.git#egg=wdnav"
+pip install -e "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
+pip install -e "git+ssh://git@10.10.10.10/wardner/wdndds.git#egg=wdndds"
 ```
 
 If either command fails with `Permission denied (publickey)`, the host
 either can't reach `10.10.10.10` or the SSH key isn't loaded. There
 is no public fallback — these SDKs aren't published.
 
-After install you'll find them at `.venv/src/rkv/` and `.venv/src/rkai/`.
+After install you'll find them at `.venv/src/wdnav/` and `.venv/src/wdnai/`.
 
 ## 5. Run the service
 
@@ -157,7 +157,7 @@ pyrkaiweb/
 │   ├── services/           # video_session, detector, uploads/
 │   └── static/             # index.html + css + js
 ├── requirements.txt
-└── .venv/                  # editable installs of rkv, rkai live under .venv/src/
+└── .venv/                  # editable installs of wdnav, wdnai live under .venv/src/
 ```
 
 ## Troubleshooting
@@ -165,7 +165,7 @@ pyrkaiweb/
 - **`shutdown: command not found`** when clicking 关机 — the binary is
   in `/sbin/` but the service's PATH doesn't include it. Start with
   `sudo` so /sbin is in PATH, or `PATH=$PATH:/sbin:/usr/sbin python run.py`.
-- **Video page errors with `rkv` / `RKNN` import errors** on a non-RK
+- **Video page errors with `wdnav` / `RKNN` import errors** on a non-RK
   dev box — expected; the SDKs fall back gracefully and the rest of
   the UI keeps working.
 - **`Permission denied` on `.venv/src/*` .pyc files** — the venv was

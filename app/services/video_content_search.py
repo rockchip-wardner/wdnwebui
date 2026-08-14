@@ -4,7 +4,7 @@
 
 1. ``open(source)`` —— 记录视频文件路径，校验存在。
 2. ``start_extract(chunk_seconds, chunk_overlap_seconds)`` —— 后台 daemon
-   线程用 PyAV 按固定时间窗切片，每片取等距帧缩放到 576×576，经 rkai
+   线程用 PyAV 按固定时间窗切片，每片取等距帧缩放到 576×576，经 wdnai
    ``LLMSession.embed_video`` 得到 2048 维归一化向量，存内存
    ``List[{start_time, end_time, chunk_idx, fps, vec}]``。逐片推进
    ``slices_embedded`` 并 WS 广播 ``progress``。

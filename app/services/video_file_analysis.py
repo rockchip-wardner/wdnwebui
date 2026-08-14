@@ -1,10 +1,10 @@
-"""视频文件分析服务：自管理 rkv.VideoCapture + 后台推理线程。
+"""视频文件分析服务：自管理 wdnav.VideoCapture + 后台推理线程。
 
 设计要点：
 
 * **独立于 ``VideoSession``** —— 视频监控 / 音视频描述 各有各的
   capture 生命周期，VFA 跑批量分析时不该把它们的视频源也抢走。
-  所以这里自己持有一个 ``rkv.VideoCapture``（懒加载 + 独立
+  所以这里自己持有一个 ``wdnav.VideoCapture``（懒加载 + 独立
   decode 线程），不挂 ``VideoSession.add_frame_sink``。
 * **LLMSession 不归本服务所有** —— 严格走 ``ComputeRegistry``
   的 ``swcap_video_describe`` capability，遵守设计原则 1。多个消费者
@@ -15,7 +15,7 @@
   所有 per-frame 文本）。事件本身不含帧字节，"回查视频文件取帧"
   走 ``GET /api/video-file-analysis/frame/{frame_pos}`` 重新
   解码源文件（仅 file 源；live 源取帧拒绝）。
-* **rkai 懒加载**：同 detector，只有 ``start()`` 才碰
+* **wdnai 懒加载**：同 detector，只有 ``start()`` 才碰
   ``Attachment`` / ``LLMSession``，避免 web 启动时 segfault。
 """
 from __future__ import annotations
@@ -36,9 +36,9 @@ from typing import Callable, List, Optional
 
 
 try:
-    from rkv import VideoCapture as _RkvVideoCapture
+    from wdnav import VideoCapture as _WdnavVideoCapture
 except Exception:  # pragma: no cover - platform-specific load failure
-    _RkvVideoCapture = None
+    _WdnavVideoCapture = None
 
 
 LOG = logging.getLogger("vfa_service")
@@ -52,7 +52,7 @@ _DEFAULT_RUNS_DIR = Path(__file__).resolve().parent / "vfa_runs"
 def _probe_total_frames(source: str) -> int:
     """读视频总帧数。
 
-    ``rkv.VideoCapture`` 只暴露 ``width / height / fps / frame_pos``，不
+    ``wdnav.VideoCapture`` 只暴露 ``width / height / fps / frame_pos``，不
     暴露 ``total_frames``；这里用 PyAV 单独探一次 metadata 拿全文件帧数。
     返回 0 表示拿不到（RTSP / live / raw / metadata 缺失）—— 前端进度
     会自动退到 indeterminate 模式。
@@ -87,35 +87,35 @@ def _probe_total_frames(source: str) -> int:
         return 0
 
 
-_RKAI_CACHE: dict = {}
+_WDNAI_CACHE: dict = {}
 
 
-def _load_rkai():
-    """懒导入 rkai；和 detector._load_rkai 互不影响，但 cache 共享。"""
-    if "_Attachment" in _RKAI_CACHE:
+def _load_wdnai():
+    """懒导入 wdnai；和 detector._load_wdnai 互不影响，但 cache 共享。"""
+    if "_Attachment" in _WDNAI_CACHE:
         return (
-            _RKAI_CACHE["_ok"],
-            _RKAI_CACHE["_Attachment"],
-            _RKAI_CACHE["_error"],
+            _WDNAI_CACHE["_ok"],
+            _WDNAI_CACHE["_Attachment"],
+            _WDNAI_CACHE["_error"],
         )
     try:
-        from rkai import Attachment  # noqa: F401
-        _RKAI_CACHE.update(_ok=True, _Attachment=Attachment, _error="")
+        from wdnai import Attachment  # noqa: F401
+        _WDNAI_CACHE.update(_ok=True, _Attachment=Attachment, _error="")
         return True, Attachment, ""
     except Exception as e:
-        _RKAI_CACHE.update(_ok=False, _Attachment=None, _error=str(e))
+        _WDNAI_CACHE.update(_ok=False, _Attachment=None, _error=str(e))
         return False, None, str(e)
 
 
 def _build_scene_frame_schema():
     """构建 ``SceneFrame`` @Generable schema。
 
-    ``@Generable`` 修饰的类在 rkai SDK 内部被转成 pydantic BaseModel，
+    ``@Generable`` 修饰的类在 wdnai SDK 内部被转成 pydantic BaseModel，
     ``session.respond(generating=SceneFrame)`` 时 SDK 会自动把 schema
     作为 JSON hint 追加到 prompt 末尾，让模型按字段输出。
 
     注意：schema 渲染用 ``str(dict)`` 而不是 ``json.dumps(indent=2)``，
-    Qwen3-VL 对 schema 格式敏感（详见 rkai/AGENTS.md）。
+    Qwen3-VL 对 schema 格式敏感（详见 wdnai/AGENTS.md）。
 
     **继承 ``BaseModel`` 而非 ``LMOutput``** —— 与 detector.VLMDoc / TargetDoc
     同源。``LMOutput`` 自带 ``attachment: List[Attachment]`` 字段会让
@@ -128,7 +128,7 @@ def _build_scene_frame_schema():
     VFA 不消费 ``attachment`` 槽（TTS 才用），改基类零下游破坏。
     """
     from typing import List, Optional
-    from rkai import Generable, Field
+    from wdnai import Generable, Field
     from pydantic import BaseModel as _PydBaseModel
 
     @Generable
@@ -212,7 +212,7 @@ def _get_scene_frame_cls():
 
 
 def _looks_garbled(text: str) -> bool:
-    """复用 rkai SDK 的启发式检测 VLM 输出是否乱码。
+    """复用 wdnai SDK 的启发式检测 VLM 输出是否乱码。
 
     Qwen3-VL-4B 在 RKNN3 上首 token 不稳定（量化噪声），约 ~15% 的帧
     会产出 CJK/Latin token salad（典型样本：
@@ -234,7 +234,7 @@ def _looks_garbled(text: str) -> bool:
          交替）。长度上限 8 字符避免 "iPhone"/"Python"/"Windows" 等
          长词误报；阈值 ≥3 避免单次偶发误报。
 
-    rkai.utils 是 vendored 在 ``.venv/src/rkai/src/rkai/utils.py`` 里；
+    wdnai.utils 是 vendored 在 ``.venv/src/wdnai/src/wdnai/utils.py`` 里；
     旧版（v0.1.x）可能没这函数，try/except ImportError 兜底返 False
     （按"宁放过不错杀"策略 —— 真的乱码只是 UI 难看，误杀会导致
     干净输出被错误重试一次）。
@@ -244,7 +244,7 @@ def _looks_garbled(text: str) -> bool:
     # 1. SDK 内置启发式（CJK 比例 <30% / 半截 JSON / 控制字符 / 长 Latin
     #    连续 / 单字符重复 8+ 等）
     try:
-        from rkai.utils import _looks_garbled as _sdk_garbled
+        from wdnai.utils import _looks_garbled as _sdk_garbled
         if bool(_sdk_garbled(text)):
             return True
     except (ImportError, AttributeError):
@@ -287,7 +287,7 @@ def _split_scene_frame_result(result) -> tuple:
          ``scene / actors / objects``，作为粗粒度结构化字段
       5. 抽不出任何结构 → ``structured=None``，text 保留 raw
 
-    **与 VTD (RkaiDetector) 的行为对齐**：VTD 走 ``detector.py:_infer_sync``
+    **与 VTD (WdnaiDetector) 的行为对齐**：VTD 走 ``detector.py:_infer_sync``
     对 SDK Path 5 兜底返回的 ``str`` 走 ``getattr(str, "text", "")`` 时拿到
     空串（str 无 ``text`` 属性），**等同于静默丢弃**。VFA 原本把 raw
     text 塞给 ``_sanitize_text`` 再传给前端，但真正的 CJK+Latin token
@@ -641,7 +641,7 @@ def _truncate_lines_keep_edges(text: str, max_chars: int) -> str:
 def _sanitize_text(raw: str, max_len: int = 500) -> str:
     """清洗模型原始输出：去 think 块 / markdown 头 / 控制字符 / 部分 JSON 残留。
 
-    当 VLM 输出不符合 JSON schema 时，rkai SDK 会把 raw 文本塞进
+    当 VLM 输出不符合 JSON schema 时，wdnai SDK 会把 raw 文本塞进
     ``LMOutput.text`` 字段（或 pyrkaiweb 的 ``ev.text``）。这个函数把
     raw 文本整理成干净的自然语言描述，避免前端事件列表里出现：
       - ``<think>...</think>`` 思维链残留（thinking 模型泄漏）
@@ -957,7 +957,7 @@ class VideoFileAnalysisService:
     # 对外状态
     # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
-        ok, _, rkai_err = _load_rkai()
+        ok, _, wdnai_err = _load_wdnai()
         with self._lock:
             events_count = len(self._events)
         # 监测字段：structured 填充率。修复 SceneFrame → BaseModel 后预期
@@ -992,7 +992,7 @@ class VideoFileAnalysisService:
                 "summary":       self._summary,
                 "summary_progress": list(self._summary_progress),
                 "available":     ok,
-                "init_error":    rkai_err,
+                "init_error":    wdnai_err,
                 "started_at":    self._started_at,
                 "finished_at":   self._finished_at,
                 # run 标识：每次 start() 重新分配 (uuid.uuid4().hex)，供
@@ -1022,11 +1022,11 @@ class VideoFileAnalysisService:
     # 控制
     # ------------------------------------------------------------------ #
     def start(self, source: str, prompt: str, every_n: int = 30) -> dict:
-        ok, _, rkai_err = _load_rkai()
+        ok, _, wdnai_err = _load_wdnai()
         if not ok:
-            raise RuntimeError(f"rkai 不可用: {rkai_err}")
-        if _RkvVideoCapture is None:
-            raise RuntimeError("rkv.VideoCapture 不可用：原生库缺失")
+            raise RuntimeError(f"wdnai 不可用: {wdnai_err}")
+        if _WdnavVideoCapture is None:
+            raise RuntimeError("wdnav.VideoCapture 不可用：原生库缺失")
         if not (source or "").strip():
             raise ValueError("source 不能为空")
         if not (prompt or "").strip():
@@ -1062,7 +1062,7 @@ class VideoFileAnalysisService:
             self._started_at = time.time()
 
         try:
-            cap = _RkvVideoCapture(source, timeout=10.0)
+            cap = _WdnavVideoCapture(source, timeout=10.0)
         except Exception as e:
             self._fail(f"打开失败: {e}")
             raise RuntimeError(f"打开失败: {e}") from e
@@ -1082,7 +1082,7 @@ class VideoFileAnalysisService:
             self._total_frames = 0
             self._state = self.STATE_RUNNING
 
-        # rkv.VideoCapture 不暴露 total_frames；用 PyAV 单独探一次 metadata
+        # wdnav.VideoCapture 不暴露 total_frames；用 PyAV 单独探一次 metadata
         # （cap 已就绪后再读，不阻塞 decode）。
         total = int(getattr(cap, "total_frames", 0) or 0)
         if total <= 0:
@@ -1091,7 +1091,7 @@ class VideoFileAnalysisService:
             if total > 0:
                 self._total_frames = total
             self._total_frames_source = (
-                "rkv" if int(getattr(cap, "total_frames", 0) or 0) > 0
+                "wdnav" if int(getattr(cap, "total_frames", 0) or 0) > 0
                 else ("pyav" if total > 0 else "unknown")
             )
         if total > 0:
@@ -1276,7 +1276,7 @@ class VideoFileAnalysisService:
     def _probe_source_meta(source: str) -> Optional[dict]:
         """用 PyAV 探测源视频的 fps 和总帧数。失败返回 None（不要阻塞 list_runs）。
 
-        不走 rkv：PyAV 12.x 之后 libavformat 的 demuxer 比 rkv 自带的轻量很多，
+        不走 wdnav：PyAV 12.x 之后 libavformat 的 demuxer 比 wdnav 自带的轻量很多，
         只读 metadata 不解码，单个文件 ~50-200ms。10 个 run 第一次 list 也只
         多 1-2 秒。
         """
@@ -1562,8 +1562,8 @@ class VideoFileAnalysisService:
                 cap.release()
             except Exception:
                 pass
-            # 缓解 rkv-shim DMA buffer leak（mpp_buffer deinit 警告）：
-            # rkv.VideoCapture.release() 不释放所有 DMA buffer（vendor bug），
+            # 缓解 wdnav-shim DMA buffer leak（mpp_buffer deinit 警告）：
+            # wdnav.VideoCapture.release() 不释放所有 DMA buffer（vendor bug），
             # 但 Python 端如有 lingering 引用会延迟 native 端回收。强制 drop
             # 引用 + GC 可减少 leak 速率（不能根治）。详见日志
             # ``mpp_buffer: ... with 7311360 bytes not released``。
@@ -2229,9 +2229,9 @@ class VideoFileAnalysisService:
             # 不再加 "功能未启用: " 前缀（否则会出现双重前缀）。
             return f"({e})"
 
-        ok, Attachment, rkai_err = _load_rkai()
+        ok, Attachment, wdnai_err = _load_wdnai()
         if not ok:
-            return f"(rkai 不可用: {rkai_err})"
+            return f"(wdnai 不可用: {wdnai_err})"
 
         # 回滚开关：env var "1" 时套用旧 prompt 改造（紧急回滚口）
         if (

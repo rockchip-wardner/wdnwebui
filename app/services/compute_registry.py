@@ -11,7 +11,7 @@
   后自动启后台线程跑 ``load_handler``，状态机走
   ``not_loaded → loading → running`` (or ``error`` on NPU setup
   failure)；主进程通过 cshim ``RpcClient.call("info")`` poll 镜像。
-* **跨进程崩溃隔离**：rkai 的 ``LLMSession()`` 在 RKNN 失败时会
+* **跨进程崩溃隔离**：wdnai 的 ``LLMSession()`` 在 RKNN 失败时会
   ``terminate()`` 整个进程（不可被 Python 捕获）。子进程死了主进程
   不受牵连 —— 探针线程读 worker stderr，标记实例为 ``error``。
 * **FastDDS 2.9 在本机有 DataWriter::enable SIGSEGV bug**。
@@ -56,11 +56,11 @@ from app.services.config import get_config
 # One compute_worker subprocess per (npu, model) instance; the worker
 # exposes a wdndds cshim RPC service (``wdndds/rpc/<model_id>``). The
 # main process talks to it via ``wdndds.RpcClient``. The subprocess
-# boundary isolates rkai's uncatchable ``terminate()`` on a broken NPU
+# boundary isolates wdnai's uncatchable ``terminate()`` on a broken NPU
 # setup. ``PYRKAIWEB_COMPUTE_MODE=inprocess`` is reserved for the case
 # where the cshim DDS layer can't run (e.g. kernel blocklists UDP
 # multicast); the v0.4 inprocess mode is otherwise a no-go on hosts
-# where rkai RKNN init can call ``terminate()``.
+# where wdnai RKNN init can call ``terminate()``.
 import os as _os
 import contextlib as _contextlib
 
@@ -349,18 +349,18 @@ def _resolve_worker_model_id(comm: str) -> Optional[str]:
 # preset 映射表                                                              #
 # --------------------------------------------------------------------------- #
 def _qwen3_vl_4b_spec():
-    from rkai import SystemLanguageModel  # noqa: F401  lazy
+    from wdnai import SystemLanguageModel  # noqa: F401  lazy
     return SystemLanguageModel.qwen3_vl_4b()
 
 
 def _qwen3_tts_spec():
-    from rkai import SystemLanguageModel
+    from wdnai import SystemLanguageModel
     return SystemLanguageModel.qwen3_tts()
 
 
 def _qwen3_8b_spec():
     from dataclasses import replace as _dc_replace
-    from rkai import SystemLanguageModel
+    from wdnai import SystemLanguageModel
     spec = SystemLanguageModel.qwen3_8b()
     return _dc_replace(spec, max_context_len=32768).with_options(
         max_new_tokens=2048,
@@ -373,11 +373,11 @@ def _qwen3_vl_embedding_2b_spec():
     """Qwen3-VL-Embedding-2B 检索 embedding preset（kind="embedding"）。
 
     不做 token 生成，LLM 走 RKNN3Lite 普通模型路径输出 2048 维归一化
-    向量；rkai 侧 ``EmbeddingBackend`` 暴露 ``embed_text`` /
-    ``embed_video``。模型路径走 ``RKAI_MODELS_DIR``（默认
+    向量；wdnai 侧 ``EmbeddingBackend`` 暴露 ``embed_text`` /
+    ``embed_video``。模型路径走 ``WDNAI_MODELS_DIR``（默认
     ``/userdata/models/``），与 Qwen3-VL-4B 同款文件布局。
     """
-    from rkai import SystemLanguageModel
+    from wdnai import SystemLanguageModel
     return SystemLanguageModel.qwen3_vl_embedding()
 
 
@@ -385,7 +385,7 @@ def _qwen3_vl_embedding_2b_spec():
 # 的初始起点；loading 段倒计时按 (estimate - (now - started_at)) 实算，estimate
 # 只影响倒计时的**起点**。真机冷启动实测（page cache dropped 之后）：
 #   * Qwen3-VL-4B: 57s → +3s buffer → 60s
-#   * Qwen3-TTS:   改 rkai 加上 ensure_loaded() 后变成 eager init：
+#   * Qwen3-TTS:   改 wdnai 加上 ensure_loaded() 后变成 eager init：
 #                  - load_resources:  ~4s
 #                  - init_text_projection: ~0.4s
 #                  - init_speech_decoder:  ~2s
@@ -438,7 +438,7 @@ MODEL_PRESETS: dict[str, dict] = {
     "qwen3-vl-embedding-2b": {
         # v0.9 第一次缩成 "Qwen3-VL-Embed-2B"（16 字符），还是嫌长。
         # 再缩成 "Qwen3-VLEmb-2B"（14 字符）—— "VL" + "Emb" 当连续
-        # 缩写，符合 rkai 圈子常见写法（"VLE" / "Emb" 已是行业缩略）。
+        # 缩写，符合 wdnai 圈子常见写法（"VLE" / "Emb" 已是行业缩略）。
         # 文件名 / model_dir_name 不动，只改 UI label。
         "label":            "Qwen3-VLEmb-2B",
         "preset_factory":   _qwen3_vl_embedding_2b_spec,
@@ -679,7 +679,7 @@ class ComputeRegistry:
     # 元数据查询                                                          #
     # ------------------------------------------------------------------ #
     def list_cards(self, force_refresh: bool = False) -> list[dict]:
-        """NPU enumeration (rkai path still needed for non-RPC metadata)."""
+        """NPU enumeration (wdnai path still needed for non-RPC metadata)."""
         with self._lock:
             if self._cards and not force_refresh:
                 return list(self._cards)
@@ -712,7 +712,7 @@ class ComputeRegistry:
         base = get_config().get_section("base", {})
         model_path = (
             base.get("model_path")
-            or os.environ.get("RKAI_MODELS_DIR")
+            or os.environ.get("WDNAI_MODELS_DIR")
             or "/userdata/models/"
         )
         root = Path(model_path)
@@ -952,7 +952,7 @@ class ComputeRegistry:
 
         env = os.environ.copy()
         env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[2]))
-        env.setdefault("RKAI_MODELS_DIR",
+        env.setdefault("WDNAI_MODELS_DIR",
                        get_config().get_section("base", {}).get(
                            "model_path", "/userdata/models/"))
 

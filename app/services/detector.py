@@ -1,4 +1,4 @@
-"""``rkai``-backed video detector (v2 API).
+"""``wdnai``-backed video detector (v2 API).
 
 Frames arrive from ``VideoSession`` via a frame-sink callback; every
 Nth frame is fed to a single ``LLMSession`` with the user prompt.
@@ -30,7 +30,7 @@ code changes here.
 上限共同防止失控模型锁死 worker。``TargetDoc`` 模式不挂任何
 ``@Callable`` 工具，因此循环天然只跑一轮就退出。
 
-``rkai`` is heavy (RKNN model load is several seconds) and inference
+``wdnai`` is heavy (RKNN model load is several seconds) and inference
 is single-shot — one worker, one session, queue maxsize=1 (latest-only).
 On boxes without the model files ``start()`` records an error in
 ``snapshot()["init_error"]`` and the worker exits cleanly.
@@ -51,12 +51,12 @@ import numpy as np
 from app.services.config import get_config
 
 
-_RKAI_IMPORT_ERROR = ""
-# rkai is imported LAZILY (at start() time, not at module load) — RKNN native
-# libraries can race with rkv's mpp init or fork-unsafe state if loaded too
+_WDNAI_IMPORT_ERROR = ""
+# wdnai is imported LAZILY (at start() time, not at module load) — RKNN native
+# libraries can race with wdnav's mpp init or fork-unsafe state if loaded too
 # eagerly, and a missing wheel on dev boxes would otherwise crash app startup
 # even for users who never touch the detection panel.
-_RKAI_CACHE: dict = {}
+_WDNAI_CACHE: dict = {}
 
 import logging
 LOG = logging.getLogger("detector")
@@ -75,23 +75,23 @@ if not getattr(LOG, "_pyrkaiweb_handler_attached", False):
     LOG.propagate = False
 
 
-def _load_rkai():
-    """Lazily import rkai; cache the result so only the first call hits
+def _load_wdnai():
+    """Lazily import wdnai; cache the result so only the first call hits
     the import machinery. Returns ``(ok, Attachment, LLMSession,
     SystemLanguageModel, LMOutput, error_str)``."""
-    if "_Attachment" in _RKAI_CACHE:
+    if "_Attachment" in _WDNAI_CACHE:
         return (
-            _RKAI_CACHE["_ok"],
-            _RKAI_CACHE["_Attachment"],
-            _RKAI_CACHE["_LLMSession"],
-            _RKAI_CACHE["_SystemLanguageModel"],
-            _RKAI_CACHE["_LMOutput"],
-            _RKAI_CACHE["_Generable"],
-            _RKAI_CACHE["_Field"],
-            _RKAI_CACHE["_error"],
+            _WDNAI_CACHE["_ok"],
+            _WDNAI_CACHE["_Attachment"],
+            _WDNAI_CACHE["_LLMSession"],
+            _WDNAI_CACHE["_SystemLanguageModel"],
+            _WDNAI_CACHE["_LMOutput"],
+            _WDNAI_CACHE["_Generable"],
+            _WDNAI_CACHE["_Field"],
+            _WDNAI_CACHE["_error"],
         )
     try:
-        from rkai import (
+        from wdnai import (
             Attachment,
             Field,
             Generable,
@@ -99,7 +99,7 @@ def _load_rkai():
             LLMSession,
             SystemLanguageModel,
         )
-        _RKAI_CACHE.update(
+        _WDNAI_CACHE.update(
             _ok=True,
             _Attachment=Attachment,
             _LLMSession=LLMSession,
@@ -111,7 +111,7 @@ def _load_rkai():
         )
         return True, Attachment, LLMSession, SystemLanguageModel, LMOutput, Generable, Field, ""
     except Exception as e:
-        _RKAI_CACHE.update(
+        _WDNAI_CACHE.update(
             _ok=False,
             _Attachment=None,
             _LLMSession=None,
@@ -130,7 +130,7 @@ def _load_rkai():
 # outputs. Currently empty for VLM (text-only path).
 # --------------------------------------------------------------------------- #
 def _build_vlm_doc_class():
-    """Build the ``VLMDoc`` schema lazily, once rkai is importable.
+    """Build the ``VLMDoc`` schema lazily, once wdnai is importable.
 
     The class is created with ``@Generable`` + ``LMOutput`` as the base so
     the SDK can attach the parsed fields into an instance that also
@@ -143,7 +143,7 @@ def _build_vlm_doc_class():
     # for ``level`` cannot be evaluated and instantiation fails.
     from typing import Optional
 
-    _, _, _, _, LMOutput, Generable, Field, _ = _load_rkai()
+    _, _, _, _, LMOutput, Generable, Field, _ = _load_wdnai()
 
     # 注意：继承 LMOutput 会带上 ``attachment: List[Attachment]`` 字段，
     # 但 Attachment 不是 pydantic 模型 —— pydantic v2 的
@@ -198,7 +198,7 @@ def _get_vlm_doc_cls():
 # 内嵌进事件 JSON（``crop_b64`` / ``crop_w`` / ``crop_h``），``desc``
 # 复制到 ``text`` 字段，事件历史列表沿用现有展示路径。
 def _build_target_doc_class():
-    """Build the ``TargetDoc`` schema lazily, once rkai is importable.
+    """Build the ``TargetDoc`` schema lazily, once wdnai is importable.
 
     与 ``VLMDoc`` 一样继承 ``BaseModel`` 而非 ``LMOutput`` —— 避免
     ``attachment: List[Attachment]`` 字段污染 ``model_json_schema``，
@@ -206,7 +206,7 @@ def _build_target_doc_class():
     """
     from typing import Optional  # noqa: F401  (kept for parity w/ VLMDoc)
 
-    _, _, _, _, _, Generable, Field, _ = _load_rkai()
+    _, _, _, _, _, Generable, Field, _ = _load_wdnai()
 
     from pydantic import BaseModel as _PydBaseModel
 
@@ -379,7 +379,7 @@ def _crop_and_encode(frame_bgr: "np.ndarray", bbox_0_1000) -> tuple:
     return base64.b64encode(buf.tobytes()).decode("ascii"), crop.shape[1], crop.shape[0]
 
 # --------------------------------------------------------------------------- #
-class RkaiDetector:
+class WdnaiDetector:
     """Single VLM session shared by the video-detection page.
 
     Uses the v2 SDK surface:
@@ -430,7 +430,7 @@ class RkaiDetector:
           ``start()`` 里会调一次拿到真正的类，避免 worker 线程首次
           import 卡顿；工厂通常传这种。
 
-        解析延迟到 ``start()``：rkai 第一次 import 的失败路径在那里
+        解析延迟到 ``start()``：wdnai 第一次 import 的失败路径在那里
         走 ``available`` 兜底。
         """
         self._lock = threading.Lock()
@@ -444,7 +444,7 @@ class RkaiDetector:
         # 缓存本实例对应的 schema 类，避免每次推理都重读缓存字典。
         # start() 里再赋值一次（要拿到已 build 好的类 ——
         # ``_get_vlm_doc_cls`` / ``_get_target_doc_cls`` 仅在首次
-        # ``_load_rkai()`` 成功后才返回有效类）。
+        # ``_load_wdnai()`` 成功后才返回有效类）。
         # LLMSession 不再由 detector 持有，统一在 ComputeRegistry 里管理。
         self._init_error = ""
         self._events: deque = deque(maxlen=self.HISTORY_MAX)
@@ -461,7 +461,7 @@ class RkaiDetector:
     # ------------------------------------------------------------------ #
     @property
     def available(self) -> bool:
-        ok, *_ = _load_rkai()
+        ok, *_ = _load_wdnai()
         return ok
 
     def snapshot(self) -> dict:
@@ -490,7 +490,7 @@ class RkaiDetector:
     # ------------------------------------------------------------------ #
     def start(self, prompt: str, every_n: int = 30, enabled_tools: Optional[List[str]] = None) -> dict:
         if not self.available:
-            raise RuntimeError("rkai 不可用")
+            raise RuntimeError("wdnai 不可用")
         if not (prompt or "").strip():
             raise ValueError("prompt 不能为空")
         # 工具名校验放在最前面：未知 key → 400（与 capability
@@ -552,7 +552,7 @@ class RkaiDetector:
             self._stop_event.clear()
             self._worker = threading.Thread(
                 target=self._worker_loop,
-                name="rkai-detect",
+                name="wdnai-detect",
                 daemon=True,
             )
             self._worker.start()
@@ -684,7 +684,7 @@ class RkaiDetector:
             generating_cls = self._generating_cls
 
         try:
-            ok, Attachment, *_ = _load_rkai()
+            ok, Attachment, *_ = _load_wdnai()
             if generating_cls is None:
                 # 兜底：start() 之前没跑过（实际不会发生——start() 第一
                 # 件事就是解析 schema，这里只是防御性 null-check）。
@@ -1066,38 +1066,38 @@ class RkaiDetector:
                 self._broadcast(ev.to_dict())
 
 
-_detector: Optional[RkaiDetector] = None
-_target_detector: Optional[RkaiDetector] = None
+_detector: Optional[WdnaiDetector] = None
+_target_detector: Optional[WdnaiDetector] = None
 _detector_lock = threading.Lock()
 
 
-def get_detector() -> RkaiDetector:
+def get_detector() -> WdnaiDetector:
     """音视频描述页（``VLMDoc`` + 可选 ``tts_alert`` 工具）后端 detector 单例。
 
-    ``generating_cls`` 留空 → ``RkaiDetector.__init__`` 默认走
+    ``generating_cls`` 留空 → ``WdnaiDetector.__init__`` 默认走
     ``VLMDoc``。
     """
     global _detector
     with _detector_lock:
         if _detector is None:
-            _detector = RkaiDetector()
+            _detector = WdnaiDetector()
         return _detector
 
 
-def get_target_detector() -> RkaiDetector:
+def get_target_detector() -> WdnaiDetector:
     """视频目标检测页（``TargetDoc`` 直接结构化输出）后端 detector 单例。
 
-    与音视频描述共用 ``RkaiDetector`` 类，但实例上挂的是 ``TargetDoc``
+    与音视频描述共用 ``WdnaiDetector`` 类，但实例上挂的是 ``TargetDoc``
     schema（``x1, y1, x2, y2`` + ``desc``），不挂任何 ``@Callable``
     工具。状态独立（prompt / 事件历史各自维护）；frame sink 共享同一
     个 ``VideoSession`` 的解码流。
 
     把 ``_get_target_doc_cls`` 函数传给 detector（而非 class 本身）
     —— 这样 ``start()`` 里按"callable → class"两步解析，首次 build
-    与 rkai import 失败路径跟 ``VLMDoc`` 走同一条逻辑。
+    与 wdnai import 失败路径跟 ``VLMDoc`` 走同一条逻辑。
     """
     global _target_detector
     with _detector_lock:
         if _target_detector is None:
-            _target_detector = RkaiDetector(generating_cls=_get_target_doc_cls)
+            _target_detector = WdnaiDetector(generating_cls=_get_target_doc_cls)
         return _target_detector

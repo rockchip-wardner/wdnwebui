@@ -5,7 +5,7 @@ Compact guide for OpenCode sessions in this repo.
 ## What this repo is
 
 Python web service (`pyrkaiweb`) exposing RK-platform hardware / model SDKs
-(`rkv`, `rkai`) over HTTP via FastAPI. Brand-new repo (no commits yet at
+(`wdnav`, `wdnai`) over HTTP via FastAPI. Brand-new repo (no commits yet at
 creation); everything below is verified against the current tree.
 
 ## Stack at a glance
@@ -13,18 +13,18 @@ creation); everything below is verified against the current tree.
 - **Web framework**: FastAPI + Uvicorn (`run.py` boots `app.main:app` on
   `0.0.0.0:8000` with `reload=True`).
 - **Internal SDKs** (installed editable from private SSH git, **not** PyPI):
-  - `rkv` — Rockchip MPP / RGA2 / V4L2 video bindings.
+  - `wdnav` — Rockchip MPP / RGA2 / V4L2 video bindings.
     Native libs (`librockchip_mpp`, `librga`) must be installed on the host;
-    `import rkv` only — `import rkv.video` is what touches the hardware.
-  - `rkai` — RK-chip LLM / VLM SDK (transformers + opencv-python).
-  See `.venv/src/rkv/AGENTS.md` and `.venv/src/rkai/pyproject.toml` for the
+    `import wdnav` only — `import wdnav.video` is what touches the hardware.
+  - `wdnai` — RK-chip LLM / VLM SDK (transformers + opencv-python).
+  See `.venv/src/wdnav/AGENTS.md` and `.venv/src/wdnai/pyproject.toml` for the
   SDK-side gotchas (they're external code, not in this repo, but the
   constraints propagate here).
 
 ## 设计原则
 
-1. 必须通过rkai的LLMSession调用rknn，不得直接调用
-2. 必须通过rkv调用mpp和rga，做编解码和图片缩放、格式转换等操作，不得直接调用或者通过其他库进行软编解和格式转换、resize等操作。
+1. 必须通过wdnai的LLMSession调用rknn，不得直接调用
+2. 必须通过wdnav调用mpp和rga，做编解码和图片缩放、格式转换等操作，不得直接调用或者通过其他库进行软编解和格式转换、resize等操作。
 3. 必须通过wdndds做发现和注册服务。
 4. **LLMSession 必须从 `ComputeRegistry` 取，禁止各业务模块自建**。视频检测
    / 语音生成 / 视频监控等服务只能通过
@@ -76,7 +76,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   `reset()` / `respond()` 到 worker 的 `wdndds/rpc/<model_id>` service
   topic，再从 `<service_name>/reply` shared reply topic 拿回 JSON reply。
   业务侧（detector / tts / vfa / text_chat）调用方式**不变**
-  —— `RpcSessionProxy` 保持 `rkai.LLMSession` 的 `.reset()` /
+  —— `RpcSessionProxy` 保持 `wdnai.LLMSession` 的 `.reset()` /
   `await .respond(prompt, attachment, ...)` 表面。
 * **服务端 lock**：worker 进程内一个 cshim pump 线程串行消费请求，
   处理完 reply 完毕后才接下一个；多个 worker 并行是允许的
@@ -109,7 +109,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   topic 通路。
 * **多 NPU 跨子组件**：当前 `ModelInstance.npu_index: int` 单值；
   后续 vision@NPU0 + llm@NPU1 这种「一个 model 跨多 NPU」配置要
-  等 rkai SDK 改 spec + pyrkaiweb 解析 `npu_assignments: dict[str, int]`
+  等 wdnai SDK 改 spec + pyrkaiweb 解析 `npu_assignments: dict[str, int]`
   —— 当前每个 model 一个实例，所以 service_name = `wdndds/rpc
 `     <model_id>`（**不带 npu 后缀**），单 model 多 npu 也在子进程
   内部决策。
@@ -139,8 +139,8 @@ Both internal SDKs live behind SSH on `git@10.10.10.10`. They are **not** in
 the install succeeds). Run them by hand after cloning:
 
 ```bash
-.venv/bin/pip install -e "git+ssh://git@10.10.10.10/pythonsdk/pyrkv.git#egg=rkv"
-.venv/bin/pip install -e "git+ssh://git@10.10.10.10/pythonsdk/pyrkai.git#egg=rkai"
+.venv/bin/pip install -e "git+ssh://git@10.10.10.10/wardner/wdnav.git#egg=wdnav"
+.venv/bin/pip install -e "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
 ```
 
 If `git clone` fails, the host either lacks SSH access to `10.10.10.10` or
@@ -165,7 +165,7 @@ pyrkaiweb/
 │   ├── services/
 │   │   ├── surveillance.py      # 16 channels sharing ONE LLMSession via a worker thread
 │   │   ├── video_session.py     # VideoCapture + decode thread + JPEG queue
-│   │   ├── detector.py          # rkai VLM wrapper + worker thread
+│   │   ├── detector.py          # wdnai VLM wrapper + worker thread
 │   │   └── uploads/             # local-file upload staging (gitignored)
 │   └── static/
 │       ├── index.html           # single-page UI
@@ -173,7 +173,7 @@ pyrkaiweb/
 │       └── js/app.js            # WebSocket + Canvas + event UI
 ├── requirements.txt      # web deps + opencv-python-headless + python-multipart
 ├── .gitignore            # excludes .venv/, __pycache__/, .env, uploads/, etc.
-└── .venv/                # editable installs of rkv, rkai live under .venv/src/
+└── .venv/                # editable installs of wdnav, wdnai live under .venv/src/
 ```
 
 `app/__init__.py` owns the single version string; bump it there when the
@@ -187,7 +187,7 @@ The `#page-video-detection` section is wired to:
   - `POST /api/video-detection/upload` — multipart file upload; saves to
     `app/services/uploads/<uuid><ext>` and returns `{upload_id, path, …}`.
   - `POST /api/video-detection/open` `{source: str}` — opens via
-    `rkv.VideoCapture`, starts decode thread, returns snapshot.
+    `wdnav.VideoCapture`, starts decode thread, returns snapshot.
   - `POST /api/video-detection/control` `{action: "play"|"pause"|"stop"}`.
   - `POST /api/video-detection/close`.
   - `GET  /api/video-detection` — current snapshot.
@@ -208,21 +208,21 @@ The `#page-video-detection` section is wired to:
     emits `{"type":"event", id, frame_pos, ts, prompt, text}` for each
     VLM detection result.
 - **Service** (`app/services/video_session.py`):
-  - One `VideoSession` singleton, one `rkv.VideoCapture`, one decode
+  - One `VideoSession` singleton, one `wdnav.VideoCapture`, one decode
     `Thread`. Latest-frame-only queue (`maxsize=1`) — drops oldest on
     overflow to keep latency low.
   - Frame sinks: registered callbacks are called on each decoded BGR
     frame (used by the detector). Sinks must not raise.
-  - Lazy `from rkv import VideoCapture` at module top (still behind the
-    `try/except` from `rkv/__init__.py`); never imports `rkv.video`
+  - Lazy `from wdnav import VideoCapture` at module top (still behind the
+    `try/except` from `wdnav/__init__.py`); never imports `wdnav.video`
     explicitly.
 - **Service** (`app/services/detector.py`):
-  - `RkaiDetector` singleton. Wraps `rkai.LLMSession` with
+  - `WdnaiDetector` singleton. Wraps `wdnai.LLMSession` with
     `SystemLanguageModel.qwen3_vl_4b()` (configurable via
-    `RKAI_MODELS_DIR`).
-  - **rkai is imported lazily** at `start()` time — not at module load.
+    `WDNAI_MODELS_DIR`).
+  - **wdnai is imported lazily** at `start()` time — not at module load.
     Loading the RKNN native libs eagerly at app startup caused a
-    segfault on this dev box (RKNN3 init races with rkv's mpp
+    segfault on this dev box (RKNN3 init races with wdnav.s mpp
     bring-up). Don't move the import back to module top.
   - One daemon worker thread consumes a `queue.Queue(maxsize=1)`
     (latest-only); the decode-loop sink drops whatever's pending and
@@ -230,7 +230,7 @@ The `#page-video-detection` section is wired to:
     the most recent state.
   - **单帧多轮工具循环（agent-loop）**：`_infer_sync` 现在对一帧跑最多
     `compute.tool_call_max_iters`（默认 5，`0` = 无限，受
-    `RkaiDetector._ABSOLUTE_MAX_ITERS = 200` 硬上限兜底）次
+    `WdnaiDetector._ABSOLUTE_MAX_ITERS = 200` 硬上限兜底）次
     `sess.respond`；每轮若模型返回 `@Callable` 实例就执行副作用
     并把"调用 + 返回"作为**文本 attachment** 喂回下一轮 prompt，
     直到模型返回 `VLMDoc` 或循环上限命中。`sess.reset()` 每帧开头
@@ -270,10 +270,10 @@ the package object is empty and the routes are silently missing.
 The `#page-surveillance` section (sits **above** 视频检测 in the sidebar)
 shows 16 monitoring cells in a 4x4 grid. Each cell runs its own
 decoder / encoder pipeline — one daemon thread per channel, one
-`rkv.VideoCapture` per thread, one `rkv.VideoWriter` per thread
+`wdnav.VideoCapture` per thread, one `wdnav.VideoWriter` per thread
 (zero-copy — the encoder consumes the decoder's DMA-BUF via
-`rkv+ws://`). The VLM interpreter is **shared across all 16 channels**:
-the ``SurveillanceManager`` owns ONE ``rkai.LLMSession`` (the qwen3-vl-4b
+`wdnav+ws://`). The VLM interpreter is **shared across all 16 channels**:
+the ``SurveillanceManager`` owns ONE ``wdnai.LLMSession`` (the qwen3-vl-4b
 RKNN contexts total ~3.5 GB resident; spinning up 16 would need
 ~56 GB of unified memory, which a single RK3588 board can't supply).
 A single ``_InferenceWorker`` thread serialises all VLM calls into the
@@ -295,7 +295,7 @@ shared session — see "Resource budget" below.
     422, so the API won't accept non-square or out-of-set sizes.
   - Decode loop (per-channel thread):
     ```text
-    rkv.VideoCapture.read0(detect_w, detect_h, fmt="RGB")
+    wdnav.VideoCapture.read0(detect_w, detect_h, fmt="RGB")
         |
         v
     _submit_vlm(...)                  # non-blocking: enqueue on the
@@ -303,16 +303,16 @@ shared session — see "Resource budget" below.
         v
     SurveillanceManager._InferenceWorker (single daemon thread, persistent asyncio loop)
         |   session.reset()  +  await session.respond(prompt, attachment=[Attachment(frame)])
-        |   (always goes through rkai — never direct rknn3lite / rknntoolkit)
+        |   (always goes through wdnai — never direct rknn3lite / rknntoolkit)
         v
     Future resolves; channel._on_inference_done records the event async
         |
         v
-    rkv.VideoWriter("rkv+ws://127.0.0.1:8000/api/surveillance/<id>/ingest", codec="h264")
+    wdnav.VideoWriter("wdnav+ws://127.0.0.1:8000/api/surveillance/<id>/ingest", codec="h264")
         |   (zero-copy: writer.write(frame0) hands the decoder's
         |    DMA-BUF to MPP's encoder)
         v
-    /api/surveillance/<id>/ingest  (server-side WS, rkv encoder connects as client)
+    /api/surveillance/<id>/ingest  (server-side WS, wdnav encoder connects as client)
         |   fan-out to per-subscriber queue
         v
     /api/surveillance/<id}/stream  (browser-facing WS, raw H.264 wire format)
@@ -324,15 +324,15 @@ shared session — see "Resource budget" below.
     decoded BGR frame to 240x135 via OpenCV, JPEG-encodes at quality
     70, and pushes the bytes to all registered
     ``/api/surveillance/<id>/thumb`` WS subscribers at ~5 fps.
-  - rkai is imported lazily (``_load_rkai()``) inside the inference
+  - wdnai is imported lazily (``_load_wdnai()``) inside the inference
     worker — the same module-level cache as
-    :mod:`app.services.detector` so the rkai import only happens once
-    across the whole process. rkv is imported lazily for the same
+    :mod:`app.services.detector` so the wdnai import only happens once
+    across the whole process. wdnav is imported lazily for the same
     reason (non-Rockchip dev boxes still boot).
-  - Packets use the rkv wire format
+  - Packets use the wdnav wire format
     ``<type_byte:u8><pts_us:u64 LE><payload>`` with
     ``0x00 DELTA | 0x01 KEY | 0x02 HEADER (avcC) | 0xFF EOS`` (matches
-    ``rkv.encoder._WebSocketSink`` and ``app/static/js/app.js``'s
+    ``wdnav.encoder._WebSocketSink`` and ``app/static/js/app.js``'s
     ``avccCodecString()``).
   - Each ``Channel`` exposes a thread-safe subscriber queue +
     ``threading.Event`` pair for the H.264 stream and another for the
@@ -355,7 +355,7 @@ shared session — see "Resource budget" below.
   - ``POST   /api/surveillance/reset``        — restore defaults.
   - ``GET    /api/surveillance/{id}/events``  — VLM event history + snapshot.
   - ``POST   /api/surveillance/{id}/events/clear`` — clear history.
-  - ``WS     /api/surveillance/{id}/ingest``  — server-side ingest; the rkv
+  - ``WS     /api/surveillance/{id}/ingest``  — server-side ingest; the wdnav
     encoder connects here as a client (hand-rolled RFC 6455 handshake,
     uvicorn accepts it as a vanilla client WS upgrade).
   - ``WS     /api/surveillance/{id}/stream``  — server pushes the H.264 wire
@@ -395,13 +395,13 @@ shared session — see "Resource budget" below.
 
 * **Two independent toggles per channel** — the per-channel config
   exposes ``playback_enabled`` (decodes + encodes the stream, opens
-  ``VideoCapture`` and the ``VideoWriter`` to ``rkv+ws://...``)
+  ``VideoCapture`` and the ``VideoWriter`` to ``wdnav+ws://...``)
   and ``detection_enabled`` (gates the per-frame submission to the
   shared VLM worker). Playback can run without detection, so you
   can monitor 16 streams without ever touching the NPU. Toggling
   detection alone doesn't restart the decode thread — it's only
   consulted inside the loop.
-* **Resource budget** — the manager owns ONE shared ``rkai.LLMSession``
+* **Resource budget** — the manager owns ONE shared ``wdnai.LLMSession``
   (~3.5 GB resident: 2.32 GB LLM weights + 0.74 GB embed table +
   0.23 GB vision weights + a few hundred MB KV cache, all on RK3588's
   8 GB unified LPDDR5 — no dedicated VRAM, the NPU DMA reads from the
@@ -491,10 +491,10 @@ holds it in memory. The file is seeded with a `base` section at
   `基础配置` calls `Base.load()` (GET `/api/config/base`) **and**
   `Base.loadSurveillance()` (GET `/api/surveillance/config`); each
   section has its own save button that hits its own endpoint.
-- **`RKAI_MODELS_DIR` propagation** — `app/main.py` reads
+- **`WDNAI_MODELS_DIR` propagation** — `app/main.py` reads
   `base.model_path` at `create_app()` time and writes it into
-  `os.environ["RKAI_MODELS_DIR"]` before any `LLMSession` is built.
-  rkai's `_models_root()` reads that env var on first call, so the
+  `os.environ["WDNAI_MODELS_DIR"]` before any `LLMSession` is built.
+  wdnai's `_models_root()` reads that env var on first call, so the
   SDK picks up the configured root automatically. Changing the
   field via the UI after the app has booted only takes effect on
   the next uvicorn reload (i.e. after a restart in production) —
@@ -663,20 +663,20 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   `ruff`/`mypy`/`pytest` invocations — there is nothing to run, and adding
   config requires a decision the user hasn't made.
 - **Reload mode picks up `.venv/src/` edits** because the editable installs
-  live there. Editing rkv/rkai source via Uvicorn reload is fine; the
+  live there. Editing wdnav/wdnai source via Uvicorn reload is fine; the
   installed metadata is in `.venv/lib/python3.11/site-packages/`.
 - **`run.py` defaults to `reload=True` and port 8000** — fine for dev, but
   disable reload (`uvicorn.run(..., reload=False)`) before any production
   command, or use `uvicorn app.main:app` directly.
-- **rkv hardware path requires a Rockchip target.** If `import rkv.video`
+- **wdnav hardware path requires a Rockchip target.** If `import wdnav.video`
   raises on this machine, it's expected — the SDK falls back gracefully for
-  bare `import rkv`. Don't suppress the fallback.
-- **Imports should stay lazy** for `rkv.video` / `rkai.*` so a non-target
+  bare `import wdnav`. Don't suppress the fallback.
+- **Imports should stay lazy** for `wdnav.video` / `wdnai.*` so a non-target
   dev box can still boot the web shell.
-- **`RkaiDetector._load_rkai()` must stay lazy**. The module-top import of
-  `rkai.Attachment / LLMSession / SystemLanguageModel` will pull in
-  RKNN3 native libs at app startup, racing with rkv's mpp init and
-  segfaulting on this dev box. Keep the import behind `_load_rkai()`,
+- **`WdnaiDetector._load_wdnai()` must stay lazy**. The module-top import of
+  `wdnai.Attachment / LLMSession / SystemLanguageModel` will pull in
+  RKNN3 native libs at app startup, racing with wdnav's mpp init and
+  segfaulting on this dev box. Keep the import behind `_load_wdnai()`,
   which is called from `start()` / `_ensure_session()`.
 - **`VideoSession.open()` event ordering matters.** Always `_teardown()`
   before clearing `_stop_event` / setting `_play_event` — teardown flips
@@ -734,7 +734,7 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   任何 NPU —— 完全解耦 web 与 worker：web shutdown 不 kill worker，
   worker 独立进程生命周期由 systemd / 手动 / 跨主机发现共同管理。
 
-- **单帧工具循环硬上限**：`RkaiDetector._ABSOLUTE_MAX_ITERS = 200`
+- **单帧工具循环硬上限**：`WdnaiDetector._ABSOLUTE_MAX_ITERS = 200`
   是兜底，不论 `config.json["compute"]["tool_call_max_iters"]` 是 0
   （无限）还是用户显式填了超大值，单帧推理都不会超过 200 次
   `sess.respond`。200 次 × 1s/inference ≈ 3 分钟单帧最坏延迟 -
@@ -826,7 +826,7 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
 
 The `#page-tts` section drives Qwen3-TTS through the SDK's
 ``TTSBackend`` (defined under
-``.venv/src/rkai/src/rkai/backends/tts.py`). The full RKNN3 driver
+``.venv/src/wdnai/src/wdnai/backends/tts.py`). The full RKNN3 driver
 (four ``.1828.rknn`` models, embed tables, prefill construction,
 talker/code_predictor/speech_decoder pipeline, ``AudioPlayer``
 streaming) is inlined into the same file as ``Qwen3TTSDemo`` —
@@ -834,13 +834,13 @@ vendored in-tree so the SDK is self-contained and no longer has to
 find ``qwen3_tts_demo.py`` anywhere on the host filesystem. The
 model layout, .1828.rknn naming, and AudioPlayer streaming path
 are all documented in
-``.venv/src/rkai/src/rkai/models/README.md`` and
-``.venv/src/rkai/src/rkai/backends/tts.py``.
+``.venv/src/wdnai/src/wdnai/models/README.md`` and
+``.venv/src/wdnai/src/wdnai/backends/tts.py``.
 
 * **Service** (`app/services/tts_session.py`):
-  - ``TtsSession`` singleton, lazy-imports rkai at first use so a
+  - ``TtsSession`` singleton, lazy-imports wdnai at first use so a
     non-RK dev box still boots (just reports ``state="unavailable"``).
-  - State machine mirrors ``VideoSession``/``RkaiDetector``:
+  - State machine mirrors ``VideoSession``/``WdnaiDetector``:
     ``idle → start() → loading → running → done/error/stopped``.
     The state transitions are broadcast over ``/api/tts/ws``.
   - One daemon worker thread per request. The worker forwards
@@ -880,7 +880,7 @@ are all documented in
   That file ships only with the rknn3 dev tree and is never installed
   on a clean board. To keep the SDK self-contained, both vectors are
   encoded inline as zlib-compressed fp16 blobs in
-  ``_BUNDLED_SPEAKER_EMBEDDINGS_B64`` (``.venv/src/rkai/src/rkai/backends/tts.py:209``)
+  ``_BUNDLED_SPEAKER_EMBEDDINGS_B64`` (``.venv/src/wdnai/src/wdnai/backends/tts.py:209``)
   and decoded by ``_get_bundled_speaker_embeddings()`` on first use.
   ``Qwen3TTSDriver._load_speaker_embeddings()`` (line 635) returns the
   bundled dict directly — there is no runtime walk-up filesystem
@@ -909,7 +909,7 @@ RIFF header by hand.
   - `VideoFileAnalysisService` 单例（`get_service()`）。状态机
     `idle → opening → running → summarizing → done`，`stopped` / `error` 是
     旁支终态。
-  - **独立 `rkv.VideoCapture`** —— 不挂 `VideoSession.add_frame_sink`，避免
+  - **独立 `wdnav.VideoCapture`** —— 不挂 `VideoSession.add_frame_sink`，避免
     抢占音视频描述 / 视频监控的同一源。
   - **LLMSession 必须从 ComputeRegistry 取** —— `get_session("swcap_video_describe")`，
     复用 `qwen3-vl-4b` 实例；找不到 capability 抛 `RuntimeError("功能未启用: ...")`，
@@ -921,7 +921,7 @@ RIFF header by hand.
   - **decode / infer pipeline 反压**：`_decode_loop` 用 `queue.Queue(maxsize=1)`
     + `threading.Event` 做 backpressure —— 采样时等 `_worker_ready`，worker
     拿走样本立即 set；避免新样本覆盖尚未处理的旧样本。
-  - **per-frame SceneFrame schema**：用 rkai `@Generable SceneFrame(LMOutput)`
+  - **per-frame SceneFrame schema**：用 wdnai `@Generable SceneFrame(LMOutput)`
     让模型输出 5 字段结构化 JSON（`text` / `scene` / `actors` / `action` /
     `objects`）；SDK 解析失败时 `_split_scene_frame_result` 五分支兜底
     （dict 归一化 → JSON parse → markdown regex → raw str）。
@@ -938,7 +938,7 @@ RIFF header by hand.
     进度 / 综述 / available / init_error）。
   - `GET  /api/video-file-analysis/events`      — per-frame events + summary。
   - `POST /api/video-file-analysis/open` `{source, prompt, every_n}` —
-    启动一次；400 source/prompt/every_n 校验失败；503 rkai 不可用 / 功能未启用。
+    启动一次；400 source/prompt/every_n 校验失败；503 wdnai 不可用 / 功能未启用。
   - `POST /api/video-file-analysis/stop`        — 用户中途停止（不出综述）。
   - `POST /api/video-file-analysis/close`       — 彻底关闭。
   - `POST /api/video-file-analysis/events/clear` — 清空内存 events + summary。
@@ -950,7 +950,7 @@ RIFF header by hand.
   - `GET  /api/video-file-analysis/runs/{run_id}/query?scene=&actor=&object=&action=&exact=&q=&semantic=&frame_min=&frame_max=&limit=` —
     反查：多维 AND 过滤 + 三种搜索模式（`semantic` > `exact` > `q` 互斥）。
   - `GET  /api/video-file-analysis/runs/{run_id}/frame/{frame_pos}` —
-    从原始视频取指定帧的 JPEG（PyAV v4l2m2m seek + rkv read0 fallback）。
+    从原始视频取指定帧的 JPEG（PyAV v4l2m2m seek + wdnav read0 fallback）。
   - `WS   /api/video-file-analysis/ws`          — server-push `{type:"event"|"summary"|"state"|"hello"}`。
 * **前端** (`app/static/js/app.js` `VFA` 模块 + `#page-video-file-analysis`):
   - 顶部进度条 + 阶段标签（`未启动 / 正在打开 / 分析中 / 生成综述中 / 已完成 /
@@ -970,7 +970,7 @@ RIFF header by hand.
     / 高亮 `<mark>`。点击结果 → **取帧 modal** (`#vfa-frame-modal`)：从原
     视频取对应帧 JPEG + 显示 frame_pos / fps / 该帧时间戳 / 画面描述 / 结构化。
   - 取帧路径：PyAV v4l2m2m `avformat_seek_file` 跳到 keyframe + 顺序 decode 到
-    target（实测比 rkv read0 从头顺序读快 ~150x），失败 fallback 到 rkv。
+    target（实测比 wdnav read0 从头顺序读快 ~150x），失败 fallback 到 wdnav。
 * **DemoGuard 注册**：VFA 是演示页第 4 项，离开时弹 confirm 并 POST `/stop`；
   `active()` 判定 `state ∈ {opening, running, summarizing}`；`stopSync` 走
   `sendBeacon(/stop, POST)` 兜底。`beforeunload` 期间 JS 不能保证送达，最
@@ -979,7 +979,7 @@ RIFF header by hand.
   VFA 分析 200 帧约 200s（every_n=60 × 1s/inference）。长视频（>10 分钟）
   建议 every_n ≥ 60。
 * **依赖**：`requirements.txt` 加 `av>=11.0.0`（PyAV，硬取帧走 `v4l2m2m` 后端
-  + `avformat_seek_file`）；`rkv.VideoCapture` 已在内部 SDK 提供。
+  + `avformat_seek_file`）；`wdnav.VideoCapture` 已在内部 SDK 提供。
 
 ## Video content search (视频内容检索) page
 
@@ -1082,10 +1082,10 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     其它服务风格一致。
   - **LLMSession 必须从 ComputeRegistry 取**（`get_session("swcap_text_chat")`）；
     找不到抛 `RuntimeError("功能未启用: swcap_text_chat")`，HTTP 502 透传。
-  - **rkai 导入懒加载** —— 模块顶层只 import `os / queue / re / threading / asyncio`；
-    `_install_patches()` 在第一次构造实例时才 import `rkai.backends._common`。
+  - **wdnai 导入懒加载** —— 模块顶层只 import `os / queue / re / threading / asyncio`；
+    `_install_patches()` 在第一次构造实例时才 import `wdnai.backends._common`。
   - **流式回调 = monkey-patch**：模块加载时把
-    `rkai.backends._common.make_result_callback` 替换成包装版。包装版
+    `wdnai.backends._common.make_result_callback` 替换成包装版。包装版
     在原 callback 完成后读 `sink.text` 算增量，调用 `register_observer`
     注册的 callable（key = `id(sink)`）。未注册的 sink 走原 callback，
     零开销（其它业务 detector / tts 不受影响）。
@@ -1171,8 +1171,8 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 | `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
 ## Tools (音视频检测页工具)
 
-`app/services/tools/` 装的是给音视频描述页 (`RkaiDetector` 走
-`VLMDoc` schema 时) 用的 rkai ``@Callable`` 工具集合，**不**进入
+`app/services/tools/` 装的是给音视频描述页 (`WdnaiDetector` 走
+`VLMDoc` schema 时) 用的 wdnai ``@Callable`` 工具集合，**不**进入
 视频监控 (16 路) — 那条通路有自己的 surveillance manager，工具
 语义不同，这一轮不动。
 
@@ -1204,12 +1204,12 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - UI：``GET /api/video-detection/tools`` 列表里每条带
     ``available`` / ``reason``；不可用时 checkbox 置灰、显示
     原因。
-  - 后端：``RkaiDetector.start()`` 校验每个 ``enabled_tools``
+  - 后端：``WdnaiDetector.start()`` 校验每个 ``enabled_tools``
     的 capability (``get_registry().get_session(spec.requires_capability)``)，
     未启用抛 503。
 
 * **会话级，不持久化**：用户在检测页勾选的 tools 集合只
-  存在内存里 (``RkaiDetector._enabled_tools``)；重启 / 关闭页
+  存在内存里 (``WdnaiDetector._enabled_tools``)；重启 / 关闭页
   面 / 停止检测都清空，不写 ``config.json``。``tts_alert`` 触发
   的副作用（已播放 / 失败等）只在 ``DetectorEvent`` deque 里活，
   刷新页面 / 重启就丢；不写盘、不另开缓存。
@@ -1217,7 +1217,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 * **单帧多轮工具调用（agent-loop）**：详见上文 detector 段。
   配置入口 ``config.json["compute"]["tool_call_max_iters"``（默认
   5，``0`` = 无限，缺失 / 负值 / 类型错 → 回退默认 5）；任何路径
-  都被 ``RkaiDetector._ABSOLUTE_MAX_ITERS = 200`` 硬上限兜底。
+  都被 ``WdnaiDetector._ABSOLUTE_MAX_ITERS = 200`` 硬上限兜底。
   工具调用 + 返回按 prose 格式写进下一轮 prompt（不是 JSON，避免
   模型复读），由 detector 内部维护。视频目标检测页无工具，循环
   天然只跑一轮就跳出。
@@ -1243,13 +1243,13 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   继承 ``pydantic.BaseModel`` 而非 ``LMOutput``，避免
   ``attachment: List[Attachment]`` 字段污染 ``model_json_schema``。
 
-* **Detector 实例绑定 schema** — ``RkaiDetector.__init__`` 接
+* **Detector 实例绑定 schema** — ``WdnaiDetector.__init__`` 接
   ``generating_cls`` 参数；工厂函数按页面分别绑定：
   - ``get_detector()``         → ``generating_cls`` 留空 → ``VLMDoc``
   - ``get_target_detector()``  → ``generating_cls=_get_target_doc_cls``
     → ``TargetDoc``
 
-* **推理分支** (``RkaiDetector._infer_sync``) — 跑的多轮工具循
+* **推理分支** (``WdnaiDetector._infer_sync``) — 跑的多轮工具循
   环不变，但 ``generating=`` 按实例配置；拿到结果后三路分发：
   1. ``@Callable`` 工具实例 → ``_run_tool_side_effect``
      （当前只有 ``tts_alert``）；
@@ -1259,7 +1259,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
      （音视频描述页走这条）。
 
 * **TargetDoc → DetectorEvent 构造**
-  (``RkaiDetector._build_target_event``)：
+  (``WdnaiDetector._build_target_event``)：
   - 从 ``x1, y1, x2, y2`` 拼 ``bbox: List[float]``；
   - ``desc`` 过 sanitize（防 chatml token / 控制字符 / 半截 JSON
     漏出）→ 复制到事件 ``text`` 字段（沿用历史展示路径）；
@@ -1282,7 +1282,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 * **工具列表已并入算力配置页 RK3588 列**：原 ``#page-tools`` 页面与
   ``GET /api/tools`` 端点都已移除；工具元数据现通过
   ``GET /api/compute`` snapshot 的 ``tools`` 字段返回（懒导入
-  ``app.services.tools``，避免在 compute 模块加载时触发 rkai 装饰器）。
+  ``app.services.tools``，避免在 compute 模块加载时触发 wdnai 装饰器）。
   RK3588 列只读展示：默认全部"已启用"badge，依赖 capability
   未启用时切到"不可用"红色 badge；该列不允许手动 toggle 工具，
   仅作为状态展示。音视频描述页 / 视频目标检测页各自的 per-detector
