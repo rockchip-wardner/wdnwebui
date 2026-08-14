@@ -234,6 +234,35 @@
           </details>
         </section>
 
+        <section class="daemon-section">
+          <header class="section-header">
+            <h3>Daemon（wdndds_daemon）</h3>
+            <span class="badge" id="daemon-badge">--</span>
+            <div class="daemon-actions">
+              <button class="vd-btn" id="daemon-start">启动</button>
+              <button class="vd-btn" id="daemon-stop">停止</button>
+            </div>
+          </header>
+          <div id="daemon-message" class="npu-message hidden"></div>
+          <div class="daemon-table-wrap">
+            <table class="daemon-table">
+              <thead>
+                <tr>
+                  <th>项</th>
+                  <th>值</th>
+                </tr>
+              </thead>
+              <tbody id="daemon-tbody">
+                <tr class="daemon-empty"><td colspan="2">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <details class="raw-output">
+            <summary>完整 JSON</summary>
+            <pre id="daemon-raw"></pre>
+          </details>
+        </section>
+
         <details class="raw-output">
           <summary>完整 JSON</summary>
           <pre class="payload" id="data-system-monitor"></pre>

@@ -422,6 +422,113 @@ function renderSystemMonitor(data) {
     }
   }
   wRaw.textContent = JSON.stringify(w, null, 2);
+
+  // --- wdndds_daemon ----------------------------------------------------
+  // 系统信息页把 daemon 一起露出来：用户不必为了「这板子到底有没有
+  // 拉 daemon」来回切到「注册发现」页。状态由 system-monitor 后端
+  // 聚合（HTTP /status + /peers + pgrep PID），启停按钮走原
+  // /api/discovery/daemon/start|stop。
+  const dm = data.daemon || {};
+  const dBadge = document.getElementById("daemon-badge");
+  const dMsgEl = document.getElementById("daemon-message");
+  const dBody  = document.getElementById("daemon-tbody");
+  const dRaw   = document.getElementById("daemon-raw");
+  const dStart = document.getElementById("daemon-start");
+  const dStop  = document.getElementById("daemon-stop");
+
+  dBadge.classList.remove("ok", "warn", "err");
+  dMsgEl.classList.add("hidden");
+  if (dm.running && dm.available) {
+    dBadge.textContent = "运行中 · " + (dm.snapshot ? dm.snapshot.participant_count : 0) + " 个 peer";
+    dBadge.classList.add("ok");
+  } else if (dm.running && !dm.available) {
+    dBadge.textContent = "进程在跑 · HTTP 不可达";
+    dBadge.classList.add("warn");
+    dMsgEl.classList.remove("hidden");
+    dMsgEl.textContent = dm.reason || "daemon 进程在但 /status 不响应（可能端口被改 / 卡死）";
+  } else {
+    dBadge.textContent = "未运行";
+    dBadge.classList.add("err");
+    dMsgEl.classList.remove("hidden");
+    dMsgEl.textContent = dm.reason || "未检测到 wdndds_daemon 进程";
+  }
+  if (dStart) dStart.disabled = !!dm.running;
+  if (dStop)  dStop.disabled  = !dm.running;
+
+  const dCfg = dm.config || {};
+  const dSnap = dm.snapshot || {};
+  const rows = [
+    ["PID",            dm.pid != null ? dm.pid : "--"],
+    ["状态",           dm.running ? "运行中" : "未运行"],
+    ["UDP 端口",       dCfg.udp_port != null ? dCfg.udp_port : "--"],
+    ["HTTP 端口",      dCfg.http_port != null ? dCfg.http_port : "--"],
+    ["GUID",           dSnap.guid || "--"],
+    ["启动时间",       dSnap.started_at ? new Date(dSnap.started_at * 1000).toLocaleString() : "--"],
+    ["已运行",         dSnap.uptime_sec != null
+                          ? (dSnap.uptime_sec >= 86400
+                              ? Math.floor(dSnap.uptime_sec / 86400) + " 天 " +
+                                Math.floor((dSnap.uptime_sec % 86400) / 3600) + " 时"
+                              : Math.floor(dSnap.uptime_sec / 3600) + " 时 " +
+                                Math.floor((dSnap.uptime_sec % 3600) / 60) + " 分")
+                          : "--"],
+    ["peer 数",        dSnap.participant_count != null ? dSnap.participant_count : "--"],
+    ["discovery_servers", (dCfg.discovery_servers || []).join(", ") || "--"],
+    ["auto_start_daemon", dCfg.auto_start_daemon ? "true" : "false"],
+  ];
+  if (Array.isArray(dm.peers) && dm.peers.length) {
+    rows.push(["peers",
+      dm.peers.map(p => `${p.name || "?"} (${(p.guid || "").slice(0, 8)}…)`).join(" / ")]);
+  } else if (dm.peers && Array.isArray(dm.peers) && dm.peers.length === 0) {
+    rows.push(["peers", "（暂无）"]);
+  }
+  dBody.innerHTML = "";
+  rows.forEach(([k, v]) => {
+    const tr = document.createElement("tr");
+    const tdK = document.createElement("td");
+    tdK.className = "daemon-key";
+    tdK.textContent = k;
+    const tdV = document.createElement("td");
+    tdV.className = "daemon-val";
+    tdV.textContent = v;
+    tdV.title = String(v);
+    tr.appendChild(tdK);
+    tr.appendChild(tdV);
+    dBody.appendChild(tr);
+  });
+  dRaw.textContent = JSON.stringify(dm, null, 2);
+}
+
+async function daemonControl(action) {
+  const r = await fetch(API_PREFIX + "/discovery/daemon/" + action, { method: "POST" });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => "");
+    throw new Error("HTTP " + r.status + " " + detail);
+  }
+  return r.json();
+}
+
+function wireDaemonButtons() {
+  const s = document.getElementById("daemon-start");
+  const t = document.getElementById("daemon-stop");
+  if (!s || !t) return;
+  if (s._wired) return;
+  s._wired = true;
+  s.addEventListener("click", async () => {
+    s.disabled = true;
+    try { await daemonControl("start"); } catch (e) { console.error(e); }
+    try { await refreshSystemMonitor(); } catch (_) {}
+  });
+  t.addEventListener("click", async () => {
+    t.disabled = true;
+    try { await daemonControl("stop"); } catch (e) { console.error(e); }
+    try { await refreshSystemMonitor(); } catch (_) {}
+  });
+}
+
+async function refreshSystemMonitor() {
+  const r = await fetch(API_PREFIX + "/system-monitor", { cache: "no-store" });
+  if (!r.ok) return;
+  renderSystemMonitor(await r.json());
 }
 
 /* ------------------------------------------------------------------ *
@@ -2173,6 +2280,7 @@ async function loadPageData(name) {
   if (name === "system-monitor") {
     const json = document.getElementById("data-system-monitor");
     json.textContent = "加载中…";
+    wireDaemonButtons();
     try {
       const r = await fetch(API_PREFIX + "/" + name);
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -3801,11 +3909,17 @@ const ComputeConfigPage = {
       const rComp = await fetchCompute();
       if (!rComp.ok) throw new Error("compute HTTP " + rComp.status);
       this._snapshot = await rComp.json();
-      if (firstLoad) {
+      this._systemTickCount = (this._systemTickCount || 0) + 1;
+      if (firstLoad || this._systemTickCount % 3 === 0) {
+        // 每 3 个 compute tick（约 3s）刷新一次 system-monitor，
+        // 顶部 3588 内存 + 每张 182x 卡显存 / 温度 / 功耗才能动。
+        // rknn-smi 不扛高频轮询，与 discovery 共用同一节奏。
         try {
           const rSys = await fetchSystem();
           if (rSys.ok) this._system = await rSys.json();
         } catch (_e) { /* 容错：不阻塞主路径 */ }
+      }
+      if (firstLoad) {
         try {
           const rDds = await fetchDiscovery();
           if (rDds.ok) this._discovery = await rDds.json();
@@ -3931,25 +4045,34 @@ const ComputeConfigPage = {
     const cardByIdx = new Map(cards.map(c => [c.npu_index, c]));
 
     const MAX_RK182X_CARDS = CC_MAX_RK182X_CARDS;
-    // enumerate index 就是 NPU 编号，不再 offset —— 第 1 张 182x 是 #0。
-    let rk182xIndices = cards
-      .map(c => c.npu_index)
-      .sort((a, b) => a - b)
-      .slice(0, MAX_RK182X_CARDS);
+    // 按 npu_index 升序固定位置 —— 与 label "RK182x #N" 完全对齐，
+    // 位置 1 ↔ #0、位置 2 ↔ #1，跨刷新稳定。详见 _sortNpuCards。
+    let rk182xCards = this._sortNpuCards(cards).slice(0, MAX_RK182X_CARDS);
 
     // wdnai 完全枚举不到 NPU 时，rknn-smi 兜底一次（host 没有 wdnai
-    // / rknn3 的开发板情况），同样 cap。
-    if (rk182xIndices.length === 0 && devices.length > 0) {
+    // / rknn3 的开发板情况），同样按 name 排序后再 cap。
+    if (rk182xCards.length === 0 && devices.length > 0) {
+      const seen = new Set();
+      const fallback = [];
       for (const d of devices) {
-        if (!rk182xIndices.includes(d.index)) {
-          rk182xIndices.push(d.index);
-          if (rk182xIndices.length >= MAX_RK182X_CARDS) break;
-        }
+        if (seen.has(d.index)) continue;
+        seen.add(d.index);
+        fallback.push({
+          npu_index: d.index,
+          device_id: d.id || null,
+        });
+        if (fallback.length >= MAX_RK182X_CARDS) break;
       }
-      rk182xIndices.sort((a, b) => a - b);
+      rk182xCards = fallback.sort((a, b) => {
+        const idxA = (a.npu_index || 0) - (b.npu_index || 0);
+        if (idxA !== 0) return idxA;
+        const da = (a.device_id || "").toString();
+        const db = (b.device_id || "").toString();
+        return da.localeCompare(db);
+      });
     }
 
-    if (rk182xIndices.length === 0) {
+    if (rk182xCards.length === 0) {
       // 没有 182x —— 给一个 placeholder 占位，避免整行塌陷。
       const ph = document.createElement("div");
       ph.className = "cc-mem-cell is-missing";
@@ -3968,12 +4091,13 @@ const ComputeConfigPage = {
     } else {
       // enumerate index 就是 NPU 编号 —— 第 1 张 182x 是 #0，跟下面
       // 算力卡 "运行在" radio / 系统信息页 NPU #N 完全对齐。
-      for (const idx of rk182xIndices) {
+      // 排序已固定（见上方 _sortNpuCards），每张物理卡始终落在同一格。
+      for (const card of rk182xCards) {
+        const idx = card.npu_index;
         const dev = npuByIdx.get(idx);
-        const card = cardByIdx.get(idx);
         strip.appendChild(this._makeMemCell({
           title: `RK182x #${idx}`,
-          sub:   card ? (card.device_id || `device_id=${idx}`) : `npu #${idx}`,
+          sub:   card.device_id || `npu #${idx}`,
           usedMb:  dev ? dev.mem_used_mb : null,
           totalMb: dev ? dev.mem_total_mb : null,
           pct:     dev && dev.mem_used_mb != null && dev.mem_total_mb
@@ -4437,46 +4561,49 @@ const ComputeConfigPage = {
         targetContainer = newPeerFrame[frameKey]?.grid || peerRoot;
       }
 
-      if (prev && prev.sig === sig && prev.isLocal === isLocal) {
-        // 数据未变 → 复用旧 card，避免 select / toggle 失焦
-        // 但要确保 card 在正确的 container 内（用户可能在 local/peer
-        // 之间切换过视图）。如果之前挂在别的 container，先 remove 再 append。
+      if (prev && prev.card && prev.card.parentNode) {
+        // v0.10: 复用旧 card + 原地 update（不 remove / 不重建）。
+        // 即使 sig 变化也只调 _updateLocalCardState 刷新节点属性 /
+        // class / text —— 卡片始终在 DOM 里，"点启动后卡片消失了一
+        // 下"的视觉抖动彻底消失。radio fieldset 是唯一会结构变化
+        // 的部分，update 内部按 lastRadioSig 检测后 replaceWith。
+        if (isLocal && prev.card._h) {
+          this._updateLocalCardState(prev.card, s, meta, cards);
+        } else {
+          // peer / unavailable，或者 prev 是 peer card 现在要变 local
+          // （_h 不存在）—— 这些 case 涉及 card 类型切换，结构差别
+          // 太大不能 in-place update。重建代价小（peer card 简单 /
+          // local card 切换是罕见的 transition），保留旧的 remove +
+          // recreate 路径。SIG 不变的 hot path 不会进这里。
+          prev.card.parentNode.removeChild(prev.card);
+          prev.card = isLocal
+            ? this._makeLocalCard(s.model_id, meta, s, cards)
+            : this._makePeerCard(s.model_id, meta, s);
+          prev.sig = sig;
+          prev.isLocal = isLocal;
+          newCard[s.model_id] = prev;
+          newOrder.push({model_id: s.model_id, container: targetContainer, card: prev.card});
+          continue;
+        }
+        prev.sig = sig;
+        prev.isLocal = isLocal;
+        // 把 card 移到正确 container / 正确位置（用户可能在 local /
+        // peer 之间切了视图，或 reorder 导致 sibling 变了）。
         if (prev.card.parentNode !== targetContainer) {
           if (prev.card.parentNode) prev.card.remove();
           targetContainer.appendChild(prev.card);
         } else if (prev.card.nextSibling !== prev.nextSibling) {
-          // 顺序变了 —— reorder（不影响 select 焦点，因为 select 内部 focus 状态保留）
+          // 顺序变了 —— reorder（不影响 radio focus，因为是 move 不是 recreate）
           targetContainer.removeChild(prev.card);
           targetContainer.appendChild(prev.card);
-        }
-        // 加载倒计时每 tick 刷新（status 一直是 "loading" 时 sig 不变，
-        // 但 started_at 是同一秒的固定值，elapsed = now - started_at 自然
-        // 每 tick 增 1，文本应每秒减 1）。这里没有走 sig，不会触发 card
-        // 重建，所以必须主动 update 文本。
-        if (prev.card._countdownEl) {
-          if (state === "loading") {
-            const left = this._countdownSec(s, "loading");
-            prev.card._countdownEl.textContent = `初始化中… 约 ${left}s`;
-            prev.card._countdownEl.style.display = "";
-          } else {
-            prev.card._countdownEl.style.display = "none";
-          }
-          prev.card._countdownState = state;
         }
         newCard[s.model_id] = prev;
         newOrder.push({model_id: s.model_id, container: targetContainer, card: prev.card});
         continue;
       }
 
-      // sig 变了 —— 重建 card。**先把旧 card 从 DOM 里 remove**，
-      // 否则下面 appendChild 后同一 model 会有两个 card 叠加（用户
-      // 体验"点启动后多了一个卡"）。这里不能用后面的 cleanup 循环
-      // 处理：cleanup 只删 models 中已不存在的 prev，sig 变了的同
-      // model 不会被清理。
-      if (prev && prev.card && prev.card.parentNode) {
-        prev.card.parentNode.removeChild(prev.card);
-      }
-
+      // 首次渲染（prev.card 不在 DOM 里）—— 调 _makeLocalCard 创建，
+      // 内部 _updateLocalCardState 写入初始状态。
       const card = isLocal
         ? this._makeLocalCard(s.model_id, meta, s, cards)
         : this._makePeerCard(s.model_id, meta, s);
@@ -4540,129 +4667,71 @@ const ComputeConfigPage = {
   // 本机 worker —— spawned（本次启动由 Popen 起的）或 adopted_local
   // （uvicorn reload 留下的 worker）。adopted_local 可用 toggle 启用 /
   // bind，但 重启 按钮灰掉（worker 不在我们 Popen 控制内）。
+  //
+  // v0.10: 整个 card 结构（head/body 内部全部元素）一次性创建，元素
+  // 全部挂到 ``card._h`` 钩子上；状态相关的内容统一交给
+  // ``_updateLocalCardState`` 写入。这样 ``_renderServices`` 在 sig
+  // 变化时只调 update 就能原地刷新卡片，**不会 removeChild / createElement
+  // 整张卡** —— 彻底消除"点启动后卡片消失了一下"的视觉抖动。
+  // radio fieldset 是唯一会结构变化的部分（cards 列表变 / available_targets
+  // 变），通过 ``_h.lastRadioSig`` 检测后用 ``replaceWith`` 原地换掉，
+  // 保留 body / head 不动。
   _makeLocalCard(modelId, meta, svc, cards) {
     const card = document.createElement("article");
     card.className = "cc-service-card";
     card.dataset.model = modelId;
-    card.dataset.source = svc._source || "spawned";
-    if (svc._source === "adopted_local") card.classList.add("is-orphan");
 
-    const state = svc.status || "not_loaded";
-    if (state === "running") card.classList.add("is-running");
-    if (state === "loading") card.classList.add("is-pending");
-    if (state === "error")   card.classList.add("has-error");
-
-    // ---- head: title + caps + (optional) pid + toggle switch
+    // ---- head: title + (optional) pid + headActions(restart / toggle)
     const head = document.createElement("header");
     head.className = "cc-service-head";
-    const title = document.createElement("h3");
-    title.className = "cc-service-title";
-    title.textContent = meta.label;
-    head.appendChild(title);
+    card.appendChild(head);
 
-    // 只在 adopted_local 时显示 PID（spawned 的 PID 跟 toggle 一起隐藏，
-    // 避免重复；用户想看 PID 时可悬停 toggle）
-    if (svc._source === "adopted_local" && svc.pid) {
-      const pid = document.createElement("span");
-      pid.className = "cc-pid";
-      pid.textContent = `PID ${svc.pid}`;
-      pid.title = "uvicorn reload 留下的 worker，registry 没持有 Popen 句柄；要清理请 `kill " + svc.pid + "`";
-      head.appendChild(pid);
-    }
+    const titleEl = document.createElement("h3");
+    titleEl.className = "cc-service-title";
+    head.appendChild(titleEl);
 
-    // v0.8: toggle 替代 "未启用" badge + "启用"/"禁用" 按钮（关 toggle
-    // = 禁用）；跟「重启服务」按钮一起放到 head 末尾的 actions wrapper
-    // 里，靠右对齐。
-    const noCards = !cards || cards.length === 0;
-    const isOrphan = svc._source === "adopted_local";
-    const isUnavail = svc._source === "unavailable";
-    const isOn     = state === "running" || state === "loading";
-    const isLoad   = state === "loading";
-    const isErr    = state === "error";
-    const isMissingDir = state === "missing_model_dir";
+    // PID 永远占位（adopted_local 才显示文字）；hidden via display:none。
+    // 这样 _updateLocalCardState 可以无副作用地切换显示态。
+    const pidEl = document.createElement("span");
+    pidEl.className = "cc-pid";
+    pidEl.style.display = "none";
+    head.appendChild(pidEl);
 
     const headActions = document.createElement("div");
     headActions.className = "cc-head-actions";
+    head.appendChild(headActions);
 
-    // ---- 重启服务按钮：仅 spawned 显示 + enable；
-    // adopted_local (没 Popen 句柄) 和 unavailable (没 worker) 隐藏
+    // 重启按钮：永远挂 DOM 上，hidden via display:none（adopted_local /
+    // unavailable 不显示）；click handler 永远绑定（display:none 期间不会
+    // 被触发，避免 update 时还得重绑 listener）。
     const restartBtn = document.createElement("button");
     restartBtn.className = "cc-btn cc-btn-restart";
     restartBtn.textContent = "重启服务";
-    // 仅 spawned (本机 Popen worker) 可重启；adopted_local / unavailable 隐藏
-    if (isOrphan || isUnavail) {
-      restartBtn.style.display = "none";
-    } else {
-      restartBtn.disabled = state === "loading";
-      restartBtn.title = "Q3 4 步：unload → shutdown → wait/kill → 走 boot 流程（不自动 bind）";
-      restartBtn.addEventListener("click", () => {
-        if (confirm(`确认重启 ${meta.label}？重启后需重新选择 NPU 才能 inference。`)) {
-          this._restartInstance(modelId);
-        }
-      });
-      headActions.appendChild(restartBtn);
-    }
+    restartBtn.title = "Q3 4 步：unload → shutdown → wait/kill → 走 boot 流程（不自动 bind）";
+    restartBtn.addEventListener("click", () => {
+      if (confirm(`确认重启 ${meta.label}？重启后需重新选择 NPU 才能 inference。`)) {
+        this._restartInstance(modelId);
+      }
+    });
+    headActions.appendChild(restartBtn);
 
-    // ---- toggle 开关
+    // toggle：label + hidden input + track + thumb。所有 listener / 属性
+    // 一开始就绑好，后续只更新属性 & class（不重建节点）。
     const toggle = document.createElement("label");
     toggle.className = "cc-toggle";
-    toggle.classList.toggle("is-on", isOn);
-    toggle.classList.toggle("is-load", isLoad);
-    toggle.classList.toggle("is-err", isErr);
-    if (noCards) toggle.classList.add("is-disabled");
-
-    // v0.8: 未选 NPU 时也禁用 toggle（避免"运行在还没选就能启用"）
-    const targetPicked = this._hasTargetPicked(modelId, svc);
-    const needsTarget = !isOn && !isErr && !isMissingDir
-                     && svc._source !== "adopted"
-                     && svc._source !== "unavailable";
-    // unavailable 时，spawn 阶段不必先选 target（后端走默认）—— 但
-    // 后端 ensure_worker_for_model 不需要 npu_index；只有 bind 阶段需要。
-    // 因此 spawned/adopted_local 都强制要 target picked 才允许启用。
-    // missing_model_dir: 不阻塞 toggle —— 用户的下一步是补目录然后
-    // toggle 一下重试 load，target 该选就选。
-    const toggleBlocked = noCards
-                       || isLoad
-                       || isErr
-                       || (needsTarget && !targetPicked);
     const toggleInput = document.createElement("input");
     toggleInput.type = "checkbox";
-    toggleInput.checked = isOn;
-    toggleInput.disabled = toggleBlocked;
-    toggleInput.setAttribute("aria-label",
-      `${meta.label}：${isOn ? "已启用" : "未启用"}，点击切换`);
-    if (noCards) {
-      toggle.title = "无可用 NPU 卡";
-    } else if (isLoad) {
-      toggle.title = "加载中，已锁定";
-    } else if (isMissingDir) {
-      toggle.title = svc.model_dir
-        ? `模型目录 ${svc.model_dir} 不存在；点 toggle 重试 load`
-        : `模型目录不存在；点 toggle 重试 load`;
-    } else if (isErr) {
-      // spawned: 用户主动启的，失败可重试。
-      // adopted_local: 本机孤儿 worker（reload 残留）异常，本机没 Popen
-      // 句柄，"重试"只能发 RPC load；如果 worker 进程已死也救不回来，
-      // 需要 kill PID 重启。重试 tooltip 改成把这两层都说清楚。
-      if (svc._source === "adopted_local") {
-        toggle.title = svc.pid
-          ? `本机孤儿 worker 异常 (PID ${svc.pid})；点 toggle 重发 RPC load，若仍失败请 kill ${svc.pid} 重启`
-          : `本机孤儿 worker 异常；点 toggle 重发 RPC load`;
-      } else {
-        toggle.title = "启动失败，点击重试";
-      }
-    } else if (needsTarget && !targetPicked) {
-      toggle.title = "请先选择运行 NPU";
-    } else {
-      toggle.title = isOn
-        ? `运行中，点击禁用 ${meta.label}`
-        : `点击启用 ${meta.label}`;
-    }
+    toggleInput.setAttribute("aria-label", `${meta.label}：未启用，点击切换`);
     toggleInput.addEventListener("change", () => {
       if (toggleInput.disabled) return;
+      // 用当前 snapshot 里的 svc，避免 update 后闭包 svc 过时。
+      const curSvc = this._findSvcInSnapshot(modelId);
+      const curCards = (this._snapshot && this._snapshot.cards) || [];
       const target = this._selectedTarget[modelId] != null
         ? this._selectedTarget[modelId]
-        : (svc.npu_index >= 0 ? svc.npu_index : this._defaultTargetNpu(cards));
+        : (curSvc && curSvc.npu_index >= 0
+            ? curSvc.npu_index
+            : this._defaultTargetNpu(curCards));
       if (toggleInput.checked) {
         this._enableInstance(target, modelId);
       } else {
@@ -4683,89 +4752,219 @@ const ComputeConfigPage = {
     toggle.appendChild(toggleTrack);
     headActions.appendChild(toggle);
 
-    head.appendChild(headActions);
-    card.appendChild(head);
-
-    // ---- body: model desc + NPU picker (radio) + countdown + (error info)
+    // ---- body: caps + desc + missing-dir-hint + radio + countdown + error-pre
     const body = document.createElement("div");
     body.className = "cc-service-body";
+    card.appendChild(body);
 
-    // ----- 软件能力 chips（swcap_video_describe / swcap_audio_tts / ...），
-    // 放在 description 上面，让用户先看到"它能干啥"再看到"是啥说明"。
+    // SW capability chips（swcap_video_describe / swcap_audio_tts / …）
+    const capsEl = document.createElement("div");
+    capsEl.className = "cc-service-caps";
+    body.appendChild(capsEl);
+
+    // 模型描述
+    const descEl = document.createElement("p");
+    descEl.className = "cc-model-desc";
+    body.appendChild(descEl);
+
+    // missing-dir 提示块：永远占位，hidden via display:none
+    const missingDirEl = document.createElement("div");
+    missingDirEl.className = "cc-missing-dir";
+    missingDirEl.style.display = "none";
+    body.appendChild(missingDirEl);
+
+    // radio fieldset 占位（_updateLocalCardState 第一次调用会替换成真 fieldset）
+    const radioFieldsetEl = document.createElement("fieldset");
+    radioFieldsetEl.className = "cc-target-pick";
+    body.appendChild(radioFieldsetEl);
+
+    // 加载倒计时：永远占位
+    const countdownEl = document.createElement("div");
+    countdownEl.className = "cc-load-countdown";
+    countdownEl.style.display = "none";
+    body.appendChild(countdownEl);
+
+    // error pre：永远占位（state==="error" 时显示 svc.error）
+    const errorEl = document.createElement("pre");
+    errorEl.className = "cc-service-error-pre";
+    errorEl.style.display = "none";
+    body.appendChild(errorEl);
+
+    card._h = {
+      titleEl, pidEl, restartBtn, toggle, toggleInput,
+      body, capsEl, descEl, missingDirEl, radioFieldsetEl,
+      countdownEl, errorEl,
+      // radioSig：上一次 _makeTargetFieldset 的输入签名；
+      // 变化时 replaceWith 替换 fieldset，未变则完全不动 —— 保证用户
+      // 已选 radio / focus 不会丢。
+      lastRadioSig: null,
+    };
+
+    // 一次性写入初始状态（state class / text / toggle / countdown …）。
+    this._updateLocalCardState(card, svc, meta, cards);
+
+    return card;
+  },
+
+  // 原地刷新 local card 的所有状态相关字段。调用时机：
+  //   - 首次创建 _makeLocalCard 时
+  //   - _renderServices 命中 sig 变化 / container 切换时
+  // 不创建/销毁任何节点（除 radio fieldset 在 sig 变化时 replaceWith 替换）。
+  _updateLocalCardState(card, svc, meta, cards) {
+    const h = card._h;
+    if (!h) return;
+    const state = svc.status || "not_loaded";
+    const isOn     = state === "running" || state === "loading";
+    const isLoad   = state === "loading";
+    const isErr    = state === "error";
+    const isMissingDir = state === "missing_model_dir";
+    const noCards  = !cards || cards.length === 0;
+    const isOrphan = svc._source === "adopted_local";
+    const isUnavail = svc._source === "unavailable";
+
+    // ---- card 整体 class
+    card.dataset.source = svc._source || "spawned";
+    card.classList.toggle("is-orphan", isOrphan);
+    card.classList.toggle("is-running", state === "running");
+    card.classList.toggle("is-pending", isLoad);
+    card.classList.toggle("has-error", isErr);
+
+    // ---- title
+    h.titleEl.textContent = meta.label;
+
+    // ---- PID（adopted_local 才显示）
+    if (isOrphan && svc.pid) {
+      h.pidEl.textContent = `PID ${svc.pid}`;
+      h.pidEl.title = "uvicorn reload 留下的 worker，registry 没持有 Popen 句柄；要清理请 `kill " + svc.pid + "`";
+      h.pidEl.style.display = "";
+    } else {
+      h.pidEl.style.display = "none";
+    }
+
+    // ---- 重启按钮：只 spawned 显示；loading 时禁用
+    h.restartBtn.style.display = (isOrphan || isUnavail) ? "none" : "";
+    h.restartBtn.disabled = isLoad;
+
+    // ---- toggle 状态
+    h.toggle.classList.toggle("is-on", isOn);
+    h.toggle.classList.toggle("is-load", isLoad);
+    h.toggle.classList.toggle("is-err", isErr);
+    h.toggle.classList.toggle("is-disabled", noCards);
+
+    const targetPicked = this._hasTargetPicked(card.dataset.model, svc);
+    const needsTarget = !isOn && !isErr && !isMissingDir
+                     && svc._source !== "adopted"
+                     && svc._source !== "unavailable";
+    const toggleBlocked = noCards
+                       || isLoad
+                       || isErr
+                       || (needsTarget && !targetPicked);
+    h.toggleInput.checked = isOn;
+    h.toggleInput.disabled = toggleBlocked;
+    h.toggleInput.setAttribute("aria-label",
+      `${meta.label}：${isOn ? "已启用" : "未启用"}，点击切换`);
+
+    if (noCards) {
+      h.toggle.title = "无可用 NPU 卡";
+    } else if (isLoad) {
+      h.toggle.title = "加载中，已锁定";
+    } else if (isMissingDir) {
+      h.toggle.title = svc.model_dir
+        ? `模型目录 ${svc.model_dir} 不存在；点 toggle 重试 load`
+        : `模型目录不存在；点 toggle 重试 load`;
+    } else if (isErr) {
+      if (svc._source === "adopted_local") {
+        h.toggle.title = svc.pid
+          ? `本机孤儿 worker 异常 (PID ${svc.pid})；点 toggle 重发 RPC load，若仍失败请 kill ${svc.pid} 重启`
+          : `本机孤儿 worker 异常；点 toggle 重发 RPC load`;
+      } else {
+        h.toggle.title = "启动失败，点击重试";
+      }
+    } else if (needsTarget && !targetPicked) {
+      h.toggle.title = "请先选择运行 NPU";
+    } else {
+      h.toggle.title = isOn
+        ? `运行中，点击禁用 ${meta.label}`
+        : `点击启用 ${meta.label}`;
+    }
+
+    // ---- caps（SW capability chips）：内容可能变（少见），每次重渲染
+    h.capsEl.innerHTML = "";
     if (meta.capability_types && meta.capability_types.length) {
-      const caps = document.createElement("div");
-      caps.className = "cc-service-caps";
+      h.capsEl.style.display = "";
       for (const cap of meta.capability_types) {
         const c = document.createElement("span");
         c.className = "cc-service-cap";
         c.textContent = cap;
-        caps.appendChild(c);
+        h.capsEl.appendChild(c);
       }
-      body.appendChild(caps);
+    } else {
+      h.capsEl.style.display = "none";
     }
 
-    // ----- 模型描述（来自后端 MODEL_PRESETS.description），紧贴在 chips 下方
+    // ---- desc
     if (meta.description) {
-      const desc = document.createElement("p");
-      desc.className = "cc-model-desc";
-      desc.textContent = meta.description;
-      body.appendChild(desc);
+      h.descEl.textContent = meta.description;
+      h.descEl.style.display = "";
+    } else {
+      h.descEl.style.display = "none";
     }
 
-    // ----- 资源缺失提示：模型目录不存在 —— 单独一段友好提示，
-    // 不要塞进红色 error pre。这条提示只展示给 spawned /
-    // adopted_local（adopted peer 不会因为本机缺文件就 missing）；
-    // 用户补完目录后 toggle 一下重新 load 即可收敛。
-    if (state === "missing_model_dir") {
-      const hint = document.createElement("div");
-      hint.className = "cc-missing-dir";
+    // ---- missing-dir 提示（state==="missing_model_dir" 时显示）
+    if (isMissingDir) {
+      h.missingDirEl.innerHTML = "";
       const label = document.createElement("span");
       label.className = "cc-missing-dir-label";
       label.textContent = "⚠ 模型目录不存在";
-      hint.appendChild(label);
+      h.missingDirEl.appendChild(label);
       const path = document.createElement("code");
       path.className = "cc-missing-dir-path";
       path.textContent = svc.model_dir || "(未知路径)";
-      hint.appendChild(path);
+      h.missingDirEl.appendChild(path);
       const note = document.createElement("span");
       note.className = "cc-missing-dir-note";
       note.textContent = "补齐目录后点 toggle 重试 load，无需重启 worker";
-      hint.appendChild(note);
-      body.appendChild(hint);
-    }
-
-    // ----- NPU radio（patch 算法下节点复用，radio 没有 dropdown 状态机），
-    // 默认 1828#0，未选时 toggle 不能点启用
-    const selectWrap = this._makeTargetFieldset(modelId, meta, svc, cards);
-    body.appendChild(selectWrap);
-
-    // ----- 加载倒计时（loading 状态显示）
-    const countdown = document.createElement("div");
-    countdown.className = "cc-load-countdown";
-    if (isLoad) {
-      const left = this._countdownSec(svc, "loading");
-      countdown.textContent = `初始化中… 约 ${left}s`;
+      h.missingDirEl.appendChild(note);
+      h.missingDirEl.style.display = "";
     } else {
-      countdown.style.display = "none";
+      h.missingDirEl.style.display = "none";
     }
-    body.appendChild(countdown);
-    // 让 reuse 分支每 tick 都能找到这个 element 刷新文本（_renderServices
-    // 在 status 一直是 "loading" 时 sig 不变，会复用旧 card 不重建 —
-    // 倒计时文本就是在这条路径上永远卡住，所以必须让 patch 知道这个
-    // 元素存在并主动 update，而不是只挂在新 card 上）。
-    card._countdownEl = countdown;
-    card._countdownState = state;
 
-    if (state === "error" && svc.error) {
-      const pre = document.createElement("pre");
-      pre.className = "cc-service-error-pre";
-      pre.textContent = svc.error;
-      body.appendChild(pre);
+    // ---- radio fieldset：cards / available_targets / npu_index 任一变化才换
+    const radioSig = [
+      (cards || []).map(c => `${c.npu_index}:${c.device_id || ""}`).join(","),
+      (meta.available_targets || []).join(","),
+      String(svc.npu_index),
+    ].join("|");
+    if (h.lastRadioSig !== radioSig) {
+      const newFs = this._makeTargetFieldset(card.dataset.model, meta, svc, cards);
+      h.radioFieldsetEl.replaceWith(newFs);
+      h.radioFieldsetEl = newFs;
+      h.lastRadioSig = radioSig;
     }
-    // missing_model_dir 已在上方单独渲染友好提示块，不走 error pre。
 
-    card.appendChild(body);
-    return card;
+    // ---- 倒计时
+    if (isLoad) {
+      h.countdownEl.textContent = `初始化中… 约 ${this._countdownSec(svc, "loading")}s`;
+      h.countdownEl.style.display = "";
+    } else {
+      h.countdownEl.style.display = "none";
+    }
+
+    // ---- error pre
+    if (isErr && svc.error) {
+      h.errorEl.textContent = svc.error;
+      h.errorEl.style.display = "";
+    } else {
+      h.errorEl.style.display = "none";
+    }
+  },
+
+  // 找当前 snapshot 里 modelId 对应的 svc（toggle handler 用，
+  // 避免闭包 svc 过时）。
+  _findSvcInSnapshot(modelId) {
+    const svcs = (this._snapshot && this._snapshot.services) || [];
+    return svcs.find(s => s.model_id === modelId) || null;
   },
 
   // adopted peer / unavailable —— 只读
@@ -5070,9 +5269,8 @@ const ComputeConfigPage = {
     // npu 枚举里）。enumerate index 就是真实的 NPU 编号，
     // "RK182x #N" 的 N 直接等于 enumerate index，不再 offset。
     const MAX_RK182X_OPTIONS = CC_MAX_RK182X_CARDS;
-    const cardsByIdx = new Map(cards.map(c => [c.npu_index, c]));
-    const sorted = Array.from(new Set(cards.map(c => c.npu_index)))
-      .sort((a, b) => a - b);
+    const sorted = this._sortNpuCards(cards);
+    const sortedIndices = sorted.map(c => c.npu_index);
 
     // v0.8: 模型本身只支持某些 target（available_targets，如 ["182x"]）；
     // 不支持的 radio 灰掉 + 不可点。
@@ -5085,17 +5283,17 @@ const ComputeConfigPage = {
     );
 
     // 默认选中：用户已记录 → 那个；否则 instance.npu_index >= 0 → 那个；
-    // 否则 enumerate 顺序里第一个 supported 的 target。
+    // 否则按 npu_index 升序排好后的第一个 supported 的 target。
     let defaultIdx = null;
     if (this._selectedTarget[modelId] != null
-        && sorted.includes(this._selectedTarget[modelId])
+        && sortedIndices.includes(this._selectedTarget[modelId])
         && supported.has("182x")) {
       defaultIdx = this._selectedTarget[modelId];
     } else if (inst && inst.npu_index >= 0
-               && sorted.includes(inst.npu_index)) {
+               && sortedIndices.includes(inst.npu_index)) {
       defaultIdx = inst.npu_index;
     } else {
-      for (const idx of sorted) {
+      for (const idx of sortedIndices) {
         if (supported.has("182x")) { defaultIdx = idx; break; }
       }
     }
@@ -5132,11 +5330,12 @@ const ComputeConfigPage = {
     // enumerate index 本身就是 NPU 编号。3588 走 device_id 路径不在
     // npu 枚举里 —— enumerate 0 就是第一张 182x 协卡，label 写
     // "RK182x #0"，radio value 也是 0（直接给 worker 用）。
-    for (const idx of sorted) {
+    // 排序按 npu_index 升序，与顶部 182x 内存条位置完全对齐。
+    for (const card of sorted) {
       if (rendered >= MAX_RK182X_OPTIONS) break;
-      const c = cardsByIdx.get(idx);
+      const idx = card.npu_index;
       renderOpt(idx, `RK182x #${idx}`,
-                c ? (c.device_id || `npu #${idx}`) : `npu #${idx}`,
+                card.device_id || `npu #${idx}`,
                 "182x", supported.has("182x"));
     }
     if (rendered === 0) {
@@ -5152,8 +5351,32 @@ const ComputeConfigPage = {
 
   _defaultTargetNpu(cards) {
     if (!cards || !cards.length) return 0;     // 兜底：选 enumerate #0
-    const sorted = cards.map(c => c.npu_index).sort((a, b) => a - b);
-    return sorted[0];
+    const sorted = this._sortNpuCards(cards);
+    return sorted.length ? sorted[0].npu_index : 0;
+  },
+
+  // NPU 卡片按 enumerate index (npu_index) 升序，与 label "RK182x #N"
+  // 完全对齐。早期版本按 device_id 字符串排序，会让 Position 1 显示
+  // "RK182x #1" 而 Position 2 显示 "RK182x #0"（label 与位置错位），
+  // 跟系统信息页 / radio 选 #N 实际跑在 #N 上对不上。
+  //
+  // 真相：wdnai 枚举的 npu_index 本身就是 canonical 编号（与系统
+  // 信息页 / rknn-smi 对齐后的 index 同源），按 npu_index 排即按
+  // 物理编号从左到右。每张物理卡始终落在同一格，位置 = label。
+  // ties 时按 device_id 字符串作 tiebreaker 稳定顺序。
+  // 入参可能是 [{npu_index, device_id, ...}, ...]；按 npu_index 去重。
+  _sortNpuCards(cards) {
+    const seen = new Map();
+    for (const c of (cards || [])) {
+      if (c && !seen.has(c.npu_index)) seen.set(c.npu_index, c);
+    }
+    return Array.from(seen.values()).sort((a, b) => {
+      const idxA = (a.npu_index || 0) - (b.npu_index || 0);
+      if (idxA !== 0) return idxA;
+      const da = (a.device_id || "").toString();
+      const db = (b.device_id || "").toString();
+      return da.localeCompare(db);
+    });
   },
 
   // v0.8: 校验"已选 NPU"——用户必须先在 select 里选一个目标，toggle

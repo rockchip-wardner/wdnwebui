@@ -288,6 +288,60 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _drain_worker_stderr(proc, max_bytes: int = 2000) -> str:
+    """Best-effort non-blocking drain of a compute_worker's stderr pipe.
+
+    Used by :meth:`ComputeRegistry.bind_instance` when the RPC ``load``
+    call returns ``ok=False`` (typically ``"timeout"``) or raises — at
+    that point we want to surface the worker's actual failure (NPU
+    abort, native panic, weight load error, FileNotFoundError on a
+    missing .1828.rknn, …) instead of leaving the user with a cryptic
+    one-word error.
+
+    Implementation notes:
+
+    * The pipe is **always** read non-blocking. A blocking read here
+      would defeat the whole point (we're already past the RPC timeout
+      and don't want to wait longer for stderr to arrive).
+    * If the worker is still alive and hasn't written anything yet,
+      returns ``""`` — the probe thread will pick up the next round of
+      stderr on its next pass.
+    * If the worker has exited, ``poll()`` is non-None and read drains
+      whatever is buffered (Linux default pipe buffer is 64 KB; we
+      cap at ``max_bytes`` and let the front get truncated).
+    * Never raises — the caller is in an error path already.
+    """
+    if proc is None or proc.stderr is None:
+        return ""
+    import fcntl
+    fd = -1
+    try:
+        fd = proc.stderr.fileno()
+    except (OSError, ValueError):
+        return ""
+    saved_flags = -1
+    try:
+        # Toggle O_NONBLOCK for the duration of the read; restore the
+        # original flags on exit so other consumers (the probe thread)
+        # aren't surprised by a non-blocking pipe.
+        try:
+            saved_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, saved_flags | os.O_NONBLOCK)
+        except OSError:
+            saved_flags = -1
+        try:
+            chunk = os.read(fd, max_bytes)
+        except (BlockingIOError, OSError):
+            return ""
+        return chunk.decode("utf-8", errors="replace")
+    finally:
+        if saved_flags != -1:
+            try:
+                fcntl.fcntl(fd, fcntl.F_SETFL, saved_flags)
+            except OSError:
+                pass
+
+
 def _terminate_orphan_pids(pids: List[int], grace_sec: int = 5) -> int:
     """SIGTERM the given PIDs, wait up to ``grace_sec`` for graceful
     exit, then SIGKILL the stragglers. Returns the count of PIDs we
@@ -1154,8 +1208,33 @@ class ComputeRegistry:
         """
         with self._lock:
             for inst in self._instances.values():
-                if inst.model_id == model_id:
-                    return inst
+                if inst.model_id != model_id:
+                    continue
+                # spawned workers: 如果 subprocess 死了（probe 还没
+                # 来得及翻 error，或 probe 已 return），不要复用 stale
+                # inst —— 后面的 RPC 会发到死进程，等 120s timeout。
+                # 杀掉 stale inst，重新走 adopt / spawn。
+                if (inst._source == "spawned"
+                        and inst.proc is not None
+                        and inst.proc.poll() is not None):
+                    LOG.warning(
+                        "ensure_worker_for_model: %s inst=%s stale "
+                        "(proc rc=%s); respawning",
+                        model_id, id(inst), inst.proc.returncode)
+                    try:
+                        if inst.rpc_session_proxy is not None:
+                            inst.rpc_session_proxy.close()
+                    except Exception:
+                        pass
+                    try:
+                        if inst.rpc_client is not None:
+                            inst.rpc_client.destroy()
+                    except Exception:
+                        pass
+                    self._instances.pop(inst.key, None)
+                    # fall through to adopt / spawn
+                    break
+                return inst
         adopted = self._adopt_existing_worker(model_id)
         if adopted is not None:
             return adopted
@@ -1209,12 +1288,36 @@ class ComputeRegistry:
                 data = (r or {}).get("data") or {}
                 if not (r or {}).get("ok"):
                     err_msg = (r or {}).get("error") or "RPC failed"
+                    rc = inst.proc.poll() if inst.proc is not None else None
+                    # 如果 worker 已经死了，stderr 留给 _probe_instance 读
+                    # + 写错误（它有完整 worker exit 处理路径，且会 return）。
+                    # 这里只更新状态，避免覆盖 probe 写的 stderr。
+                    stderr_tail = (
+                        "" if rc is not None
+                        else _drain_worker_stderr(inst.proc))
+                    LOG.warning(
+                        "bind %s RPC fail: err=%r rc=%s stderr_len=%d "
+                        "stderr_tail=%r",
+                        model_id, err_msg, rc, len(stderr_tail),
+                        stderr_tail[:200] if stderr_tail else "",
+                    )
                     with self._lock:
                         inst.status = "error"
-                        inst.error = str(err_msg)
                         inst.npu_index = -1
-                    LOG.warning("bind %s load RPC failed: %s",
-                                model_id, err_msg)
+                        if rc is not None:
+                            if not inst.error:
+                                inst.error = f"compute_worker exited rc={rc}"
+                        else:
+                            parts = [str(err_msg)]
+                            if stderr_tail:
+                                parts.append(
+                                    f"worker stderr (last "
+                                    f"{len(stderr_tail)} chars):\n"
+                                    f"{stderr_tail.rstrip()}")
+                            inst.error = "\n".join(parts)
+                    LOG.warning("bind %s load RPC failed: %s%s",
+                                model_id, err_msg,
+                                f" (rc={rc})" if rc is not None else "")
                     return
                 if data.get("status") == "error":
                     err_msg = data.get("init_error", "load worker error")
@@ -1224,6 +1327,33 @@ class ComputeRegistry:
                         inst.npu_index = -1
                     LOG.warning("bind %s load worker error: %s",
                                 model_id, err_msg)
+                    return
+                if data.get("status") == "missing_model_dir":
+                    err_msg = data.get("error", "模型目录不存在")
+                    with self._lock:
+                        inst.status = "missing_model_dir"
+                        inst.error = err_msg
+                        inst.npu_index = -1
+                    LOG.warning("bind %s missing_model_dir: %s",
+                                model_id, err_msg)
+                    return
+                if data.get("status") == "loading":
+                    # Worker 把 LLMSession init 挪到独立线程跑（避免
+                    # cshim Replier pump 线程持 rknn 资源跟 init 死锁），
+                    # RPC 立即返 loading。_probe_instance 1Hz 探测 info
+                    # RPC，看到 worker 的 state["status"] 翻 running /
+                    # error 自动同步到 inst。这里 fire-and-forget 直接
+                    # 退场：probe 接管。
+                    new_key = (npu_index, model_id)
+                    with self._lock:
+                        if inst.key != new_key:
+                            self._instances.pop(inst.key, None)
+                            inst.key = new_key
+                            self._instances[new_key] = inst
+                        # inst.status 已经是 loading（bind_instance 入口
+                        # 乐观设置）；保留不要改 running。
+                    LOG.info("bind %s @ npu=%d: async load started, "
+                             "deferring to probe", model_id, npu_index)
                     return
                 # 翻 running + 更新 key + 加载耗时
                 new_key = (npu_index, model_id)
@@ -1239,11 +1369,32 @@ class ComputeRegistry:
                 LOG.info("bound %s @ npu=%d (load=%.1fs)",
                          model_id, npu_index, inst.load_time_sec or 0.0)
             except Exception as e:  # noqa: BLE001
+                # RPC call itself raised (transport-level error before
+                # we even got a JSON reply). Best-effort drain worker
+                # stderr so the user sees the real reason (NPU abort,
+                # native panic, weight load error) instead of just the
+                # exception name.
+                rc = inst.proc.poll() if inst.proc is not None else None
+                stderr_tail = (
+                    "" if rc is not None
+                    else _drain_worker_stderr(inst.proc))
                 with self._lock:
                     inst.status = "error"
-                    inst.error = f"{type(e).__name__}: {e}"
                     inst.npu_index = -1
-                LOG.exception("bind %s load raised", model_id)
+                    if rc is not None:
+                        if not inst.error:
+                            inst.error = f"compute_worker exited rc={rc}"
+                    else:
+                        parts = [f"{type(e).__name__}: {e}"]
+                        if stderr_tail:
+                            parts.append(
+                                f"worker stderr (last "
+                                f"{len(stderr_tail)} chars):\n"
+                                f"{stderr_tail.rstrip()}")
+                        inst.error = "\n".join(parts)
+                LOG.exception("bind %s load raised%s",
+                              model_id,
+                              f" (rc={rc})" if rc is not None else "")
             finally:
                 inst._bind_inflight = False
 
@@ -1671,6 +1822,16 @@ class ComputeRegistry:
                 if inst.proc is not None:
                     rc = inst.proc.poll()
                     if rc is not None:
+                        # Once the worker has exited, ``proc.stderr.read()``
+                        # drains everything that's still buffered (the pipe
+                        # stays open until the parent closes its fd).
+                        # Coordinate with :meth:`bind_instance._run_load`
+                        # which also drains stderr on the RPC-fail path:
+                        # whichever thread reads first wins, the other
+                        # defers. ``inst.error`` containing ``"stderr"``
+                        # is the marker that someone already populated
+                        # the error field — in that case we only update
+                        # status / finished_at so the message stays.
                         err = ""
                         try:
                             if inst.proc.stderr:
@@ -1680,11 +1841,12 @@ class ComputeRegistry:
                             pass
                         with self._lock:
                             inst.status = "error"
-                            inst.error = (
-                                f"compute_worker exited rc={rc}; "
-                                f"stderr: {err[:1500]}"
-                            )
                             inst.finished_at = time.time()
+                            if "stderr" not in inst.error:
+                                parts = [f"compute_worker exited rc={rc}"]
+                                if err:
+                                    parts.append(f"stderr: {err[:1500]}")
+                                inst.error = "\n".join(parts)
                         LOG.warning(
                             "compute_worker for %s @ npu=%d exited rc=%d; "
                             "stderr (last 800 chars):\n%s",

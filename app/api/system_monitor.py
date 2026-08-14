@@ -8,15 +8,22 @@ interface and ``/sys/class/thermal/`` are readable.
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import os
 import re
 import shutil
+import socket
+import subprocess
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
 from fastapi import APIRouter
+
+from app.services.config import get_config
 
 router = APIRouter(tags=["system-monitor"])
 
@@ -556,11 +563,103 @@ def _collect_workers() -> dict:
     }
 
 
+def _http_get_json(url: str, timeout: float = 1.0):
+    """Tiny helper: GET a URL, parse JSON body, return dict or None.
+
+    Connection refused / timeout / non-200 all collapse to ``None`` —
+    callers treat that as "daemon not running". Anything that survives
+    is forwarded as-is so the UI can render whatever shape the daemon
+    returned (current schema is documented in
+    ``app/services/wdndds_daemon.py::_DaemonHTTPHandler._snapshot``).
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return _json.loads(resp.read())
+    except (urllib.error.URLError, ConnectionRefusedError, TimeoutError,
+            socket.timeout, OSError, ValueError):
+        return None
+
+
+def _pgrep_daemon_pid() -> int | None:
+    """First PID whose cmdline mentions ``wdndds_daemon``.
+
+    Same orphan-detection caveat as ``_collect_workers``: pgrep matches
+    this process too (its argv contains ``app.services.wdndds_daemon``
+    when running via ``-m``), so filter self out.
+    """
+    self_pid = os.getpid()
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "wdndds_daemon"],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    for token in out.split():
+        try:
+            pid = int(token.strip())
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        return pid
+    return None
+
+
+def _collect_daemon() -> dict:
+    """快照 ``wdndds_daemon`` 进程 — 配置端口 + HTTP /status + /peers
+    + pgrep PID 一起读。
+
+    这是「系统信息 → Daemon」段的真相源：daemon 自己只暴露
+    ``running / started_at / uptime_sec / udp_port / guid / participant_count``
+    （见 ``app/services/wdndds_daemon.py::_DaemonHTTPHandler``），算上
+    ``peers`` 列表和宿主 OS 的 PID 就是 UI 渲染要的全集。
+
+    HTTP 拉不到 = daemon 没起；返回 ``available=False`` + ``reason`` 兜
+    底信息。PID 通过 pgrep 兜底，万一 daemon 卡死 / 端口换掉 / 进程名
+    对不上时 UI 还能看到「在跑但 HTTP 不可达」/「进程不在」。
+    """
+    cfg = get_config().get_section("compute") or {}
+    udp_port = int(cfg.get("discovery_server_port", 7411))
+    http_port = int(cfg.get("daemon_http_port", 7412))
+    auto_start = bool(cfg.get("auto_start_daemon", False))
+    discovery_servers = list(cfg.get("discovery_servers") or [])
+
+    snapshot = _http_get_json(f"http://127.0.0.1:{http_port}/status", timeout=1.0)
+    peers_payload = _http_get_json(f"http://127.0.0.1:{http_port}/peers", timeout=1.0)
+    peers = None
+    if isinstance(peers_payload, dict) and isinstance(peers_payload.get("peers"), list):
+        peers = peers_payload["peers"]
+
+    pid = _pgrep_daemon_pid()
+    available = snapshot is not None
+    running = available or pid is not None
+    reason = None if available else (
+        f"127.0.0.1:{http_port}/status unreachable"
+        + (f"（pgrep 发现 PID {pid}，但 HTTP 不可达）" if pid else "")
+    )
+    return {
+        "available": available,
+        "running": running,
+        "config": {
+            "udp_port": udp_port,
+            "http_port": http_port,
+            "auto_start_daemon": auto_start,
+            "discovery_servers": discovery_servers,
+        },
+        "snapshot": snapshot,
+        "peers": peers,
+        "pid": pid,
+        "reason": reason,
+    }
+
+
 @router.get("/system-monitor")
 async def get_system_monitor() -> dict:
     base = await asyncio.to_thread(_sample_cpu_mem)
     base["disk"] = await asyncio.to_thread(_sample_disk)
     base["workers"] = await asyncio.to_thread(_collect_workers)
+    base["daemon"] = await asyncio.to_thread(_collect_daemon)
     base["thermal"] = await asyncio.to_thread(_collect_thermal)
     base["npu"] = await _collect_npu()
     base["placeholder"] = False

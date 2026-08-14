@@ -722,6 +722,48 @@ html, body {
 .worker-table .col-state-disk-sleep { color: #b45309; }
 .worker-table .col-ppid-1 { color: #b91c1c; font-weight: 600; }
 
+/* ---------- daemon section (system-monitor) ---------- */
+.daemon-section { margin-top: 1.5rem; }
+.daemon-actions { display: inline-flex; gap: 0.4rem; margin-left: auto; }
+.daemon-actions .vd-btn { padding: 0.3rem 0.7rem; font-size: 0.8rem; }
+.daemon-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  background: #fff;
+  margin-top: 0.6rem;
+}
+.daemon-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+.daemon-table thead th {
+  text-align: left;
+  background: #f3f4f6;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  font-weight: 600;
+  color: #374151;
+}
+.daemon-table tbody td {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid #f1f5f9;
+  vertical-align: top;
+}
+.daemon-table tbody tr:last-child td { border-bottom: 0; }
+.daemon-table .daemon-key {
+  width: 11rem;
+  color: #4b5563;
+  white-space: nowrap;
+}
+.daemon-table .daemon-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #111827;
+  word-break: break-all;
+}
+
 /* ---------- video-detection page ---------- */
 .vd-toolbar {
   display: flex;

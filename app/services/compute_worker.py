@@ -265,25 +265,74 @@ def load_handler(state: dict, model_id: str,
     state["status"] = "loading"
     state["npu_index"] = npu_index
     state["init_error"] = ""
-    try:
-        t0 = time.time()
-        sess = _build_session(model_id, npu_index)
-        load_sec = round(time.time() - t0, 2)
-    except Exception as e:  # noqa: BLE001
-        state["status"] = "error"
-        state["init_error"] = f"{type(e).__name__}: {e}"
-        return {"status": "error",
-                "npu_index": npu_index,
-                "init_error": state["init_error"]}
-    state["session"] = sess
-    state["status"] = "running"
-    state["load_time_sec"] = load_sec
-    state["loaded_at"] = time.time()
+    state["loaded_at"] = None
+    state["load_time_sec"] = None
+
+    # Init 在**独立 Python 线程**里跑，不在 cshim Replier pump 线程上。
+    #
+    # Why: cshim 的 C++ pump 线程（Replier._on_request_c 触发）跑同步
+    # Python 调用栈 router → load_handler → _build_session。实测 NPU
+    # #1 上 qwen3-vl-4b init 需要 28.6s。在这 28.6s 内 pump 线程持
+    # cshim 内部的 endpoint / payload pool / FastDDS 线程同步资源，
+    # rknn3lite / wdnai C 端的 init 想抢同一组 fd / driver handle →
+    # 死锁，进程卡在 futex_wait_queue 永远不出。stderr 也写不出
+    # "building LLMSession" 那条 log（C 端卡住前 Python logging 还没
+    # flush 到 pipe）。
+    #
+    # Fix: pump 线程立即返回 {"status": "loading"} + npu_index，
+    # 后台线程跑 _build_session；完成时把 state["status"] 翻 running
+    # 或 error（info RPC 会自动看到）。主进程 _probe_instance 1Hz 探测
+    # info RPC，按 loading → running / error 状态机收敛。
+    #
+    # 重新 bind 不同 NPU 时：上一轮 init 线程可能还在跑 —— 用
+    # state["_init_token"] 标记当前轮次，旧线程完成时发现 token 不匹配
+    # 就丢弃结果（session 不写 state），避免覆盖新轮的 state。
+    import threading as _threading
+    token = state.get("_init_token", 0) + 1
+    state["_init_token"] = token
+    state["_init_started_at"] = time.time()
+
+    def _do_init():
+        try:
+            t0 = time.time()
+            LOG.info("building LLMSession(model=%s, npu=%d) ...",
+                     model_id, npu_index)
+            sess = _build_session(model_id, npu_index)
+            load_sec = round(time.time() - t0, 2)
+            # 轮次校验：旧轮的 init 完成后才到，看到 token 不一致
+            # 就丢弃结果（新的 load 已经在用 state 了）。
+            if state.get("_init_token") != token:
+                LOG.info("load %s @ npu=%d init done but token stale "
+                         "(got %s, current %s); discarding",
+                         model_id, npu_index, token, state.get("_init_token"))
+                try:
+                    sess.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            state["session"] = sess
+            state["status"] = "running"
+            state["load_time_sec"] = load_sec
+            state["loaded_at"] = time.time()
+            state["init_error"] = ""
+            LOG.info("LLMSession ready (%.1fs) for %s @ npu=%d",
+                     load_sec, model_id, npu_index)
+        except Exception as e:  # noqa: BLE001
+            err_msg = f"{type(e).__name__}: {e}"
+            if state.get("_init_token") != token:
+                LOG.info("load %s @ npu=%d init failed but token stale; "
+                         "discarding (%s)", model_id, npu_index, err_msg)
+                return
+            state["status"] = "error"
+            state["init_error"] = err_msg
+            LOG.warning("LLMSession init failed for %s @ npu=%d: %s",
+                        model_id, npu_index, err_msg)
+
+    _threading.Thread(target=_do_init, name=f"init-{model_id}",
+                      daemon=True).start()
     return {
-        "status": "running",
+        "status": "loading",
         "npu_index": npu_index,
-        "load_time_sec": load_sec,
-        "loaded_at": state["loaded_at"],
     }
 
 
