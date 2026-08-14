@@ -11,6 +11,7 @@ from starlette.responses import Response
 
 from app import __version__
 from app.api import (
+    audio_analysis,
     compute,
     config,
     coprocessor,
@@ -26,6 +27,7 @@ from app.api import (
     video_target_detection,
     wechat,
 )
+from app.services.audio_analysis import get_service as get_audio_analysis_service
 from app.services.compute_registry import get_registry
 from app.services.config import get_config
 from app.services.detector import get_detector, get_target_detector
@@ -93,6 +95,7 @@ def create_app() -> FastAPI:
     app.include_router(video_content_search.router, prefix="/api")
     app.include_router(wechat.router, prefix="/api")
     app.include_router(text_chat.router, prefix="/api")
+    app.include_router(audio_analysis.router, prefix="/api")
     app.include_router(versions.router, prefix="/api")
 
     # Boot：按 config.compute.services 列表为每条 model 做 probe →
@@ -176,6 +179,15 @@ def create_app() -> FastAPI:
             close_chat()
         except Exception:
             pass
+        # Stop the audio-analysis worker (releases its PyAV container +
+        # joins the decode / infer threads). The underlying LLMSession
+        # is owned by ComputeRegistry and was already closed by
+        # close_all() above.
+        try:
+            get_audio_analysis_service().close()
+        except Exception:
+            pass
+
     return app
 
 

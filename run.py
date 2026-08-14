@@ -62,6 +62,39 @@ def _start_wdndds_daemon() -> None:
               f"{type(e).__name__}: {e}", file=sys.stderr)
 
 
+def _ensure_wdndds_native_path() -> None:
+    """Prepend wdndds native lib dir to LD_LIBRARY_PATH。
+
+    wdndds cshim 链接 libwdndds_cshim.so + libwdndds_idl.so +
+    libfast{cdr,dds}.so，位于 ``.venv/src/wdndds/native/lib``。
+    该目录不在系统 loader 搜索路径里（apt 没包、ldconfig 没注册）；
+    不加上 spawn 出的 compute_worker 子进程会 fork 后 dlopen 失败，
+    进而 ComputeRegistry Hub 起不来。
+
+    这里设的 LD_LIBRARY_PATH 通过继承环境传给子进程，worker 端无需
+    各自配置。当路径已指向可加载库时本函数是 no-op。
+    """
+    repo_root = Path(__file__).resolve().parent
+    native_lib = repo_root / ".venv" / "src" / "wdndds" / "native" / "lib"
+    if not native_lib.is_dir():
+        return
+    marker = native_lib / "libwdndds_cshim.so"
+    if not marker.is_file():
+        return
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [str(native_lib)] + ([p for p in current.split(":") if p] if current else [])
+    seen: set[str] = set()
+    deduped = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    os.environ["LD_LIBRARY_PATH"] = ":".join(deduped)
+
+
+_ensure_wdndds_native_path()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="wdnwebui",

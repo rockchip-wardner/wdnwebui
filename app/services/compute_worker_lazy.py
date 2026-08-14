@@ -84,6 +84,9 @@ def _preset_for(model_id: str) -> Any:
         # Embedding 走 RKNN3Lite 普通模型路径输出 2048 维归一化向量；
         # LLM 推理不走 token 生成。
         return SLM.qwen3_vl_embedding()
+    if model_id == "qwen2.5-omni-3b":
+        # Qwen2.5-Omni-3B（kind="omni"）。单次 run_audio 上限 6s，调用方切片。
+        return SLM.qwen_2_5_omni_3b()
     raise ValueError(f"unknown model_id: {model_id!r}")
 
 

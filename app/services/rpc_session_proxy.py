@@ -116,6 +116,7 @@ class _RpcSessionProxy:
 
     def _sync_call(self, prompt, attachment, generating, tools,
                    perf, overrides) -> Any:
+        # options 白名单含 LLM 采样参数 + audio 通道参数（omni run_audio 需要）。
         payload = {
             "action": "infer",
             "prompt": prompt,
@@ -125,7 +126,8 @@ class _RpcSessionProxy:
             "tools": [t.__name__ for t in (tools or [])],
             "options": {k: v for k, v in overrides.items()
                         if k in {"max_new_tokens", "temperature",
-                                  "top_p", "top_k"}},
+                                  "top_p", "top_k",
+                                  "sample_rate", "n_channels", "sample_width"}},
         }
         reply = self._client.call(payload, timeout_ms=120_000)
         if not reply.get("ok"):
@@ -210,13 +212,9 @@ class _RpcSessionProxy:
             try:
                 from wdnai import Attachment as _WdnaiAttach
                 if isinstance(item, _WdnaiAttach):
-                    # wdnai.Attachment exposes channels by ``kind``:
-                    #   "image" → ``item.images`` (list[BGR ndarray])
-                    #   "video" → ``item.frames`` (list[BGR ndarray])
-                    #   "text"  → ``item.text``    (str)
-                    #   "audio" → ``item.data``    (bytes)
-                    # Each channel is serialized so the worker can
-                    # reconstruct an equivalent Attachment on its side.
+                    # wdnai.Attachment channels: image/video/text/audio
+                    # (按 ``kind`` 字段)。音频用 dict 包成``data_b64+kind``
+                    # 让 worker 端能识别（否则字符串会被当成 text 兜底）。
                     if getattr(item, "images", None):
                         for img in item.images:
                             out.append(_bgr_ndarray_to_b64(img))
@@ -229,7 +227,16 @@ class _RpcSessionProxy:
                         out.append(item.text)
                         continue
                     if getattr(item, "data", None):
-                        out.append(base64.b64encode(bytes(item.data)).decode("ascii"))
+                        kind = getattr(item, "kind", "audio") or "audio"
+                        if kind == "audio":
+                            out.append({
+                                "data_b64": base64.b64encode(
+                                    bytes(item.data)).decode("ascii"),
+                                "kind":     "audio",
+                            })
+                        else:
+                            out.append(base64.b64encode(
+                                bytes(item.data)).decode("ascii"))
                         continue
                     continue
             except ImportError:
@@ -238,7 +245,11 @@ class _RpcSessionProxy:
                 out.append(_bgr_ndarray_to_b64(item))
                 continue
             if isinstance(item, (bytes, bytearray)):
-                out.append(base64.b64encode(bytes(item)).decode("ascii"))
+                # 裸 bytes：默认按音频处理（TTS 常见输出 shape）。
+                out.append({
+                    "data_b64": base64.b64encode(bytes(item)).decode("ascii"),
+                    "kind":     "audio",
+                })
                 continue
             if isinstance(item, str):
                 out.append(item)

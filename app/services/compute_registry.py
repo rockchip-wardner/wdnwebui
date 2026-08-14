@@ -435,6 +435,15 @@ def _qwen3_vl_embedding_2b_spec():
     return SystemLanguageModel.qwen3_vl_embedding()
 
 
+def _qwen_2_5_omni_3b_spec():
+    """Qwen2.5-Omni-3B 音频理解 preset（kind="omni"）。
+
+    单次 ``run_audio`` 输入上限 6.0 秒（omni.py 硬限制），调用方负责切片。
+    """
+    from wdnai import SystemLanguageModel
+    return SystemLanguageModel.qwen_2_5_omni_3b()
+
+
 # 每个 model 的 ``estimated_init_seconds`` 是经验值，用来渲染"加载中"倒计时
 # 的初始起点；loading 段倒计时按 (estimate - (now - started_at)) 实算，estimate
 # 只影响倒计时的**起点**。真机冷启动实测（page cache dropped 之后）：
@@ -505,6 +514,21 @@ MODEL_PRESETS: dict[str, dict] = {
         "description":      "视觉信息编码模型",
         "available_targets": ["182x"],
     },
+    "qwen2.5-omni-3b": {
+        # Qwen2.5-Omni-3B（kind="omni"，wav-in/text-out）。单次推理上限
+        # 6.0 秒（omni.py 硬限制），调用方负责切片。memory_estimate_mb /
+        # estimated_init_seconds 是预估值，真机测后回填。
+        "label":            "Qwen2.5-Omni-3B",
+        "preset_factory":   _qwen_2_5_omni_3b_spec,
+        "model_dir_name":   "Qwen2.5-Omni-3B",
+        "memory_estimate_mb": 2500,
+        "estimated_init_seconds": 50,
+        "capability_types": ["swcap_audio_understand"],
+        "instance_name":    "llm-audio",
+        "worker_name":      "audio-3b",     # comm = "worker:audio-3b" (13 chars)
+        "description":      "音频理解模型",
+        "available_targets": ["182x"],
+    },
 }
 
 
@@ -512,15 +536,16 @@ MODEL_PRESETS: dict[str, dict] = {
 # Legacy capability_type migration (kept for backward compat with old configs) #
 # --------------------------------------------------------------------------- #
 _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
-    "video_input":    "hwcap_video_input",
-    "video_query":    "swcap_video_query",
-    "video_describe": "swcap_video_describe",
-    "audio_input":    "hwcap_audio_input",
-    "audio_output":   "hwcap_audio_output",
-    "hdmi_display":   "hwcap_hdmi_display",
-    "audio_tts":      "swcap_audio_tts",
-    "video_analyse":  "swcap_video_analyse",
-    "text_chat":      "swcap_text_chat",
+    "video_input":     "hwcap_video_input",
+    "video_query":     "swcap_video_query",
+    "video_describe":  "swcap_video_describe",
+    "audio_input":     "hwcap_audio_input",
+    "audio_output":    "hwcap_audio_output",
+    "hdmi_display":    "hwcap_hdmi_display",
+    "audio_tts":       "swcap_audio_tts",
+    "audio_understand":"swcap_audio_understand",
+    "video_analyse":   "swcap_video_analyse",
+    "text_chat":       "swcap_text_chat",
 }
 
 

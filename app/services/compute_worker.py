@@ -182,6 +182,9 @@ def _build_session(model_id: str, npu_index: int):
         # 不做 token 生成，wdnai 内部用 EmbeddingBackend 跑 embed_text /
         # embed_video_chunk；模型文件布局与 Qwen3-VL-4B 同款。
         spec = mod["SystemLanguageModel"].qwen3_vl_embedding()
+    elif model_id == "qwen2.5-omni-3b":
+        # Qwen2.5-Omni-3B（kind="omni"）。单次 run_audio 上限 6s，调用方负责切片。
+        spec = mod["SystemLanguageModel"].qwen_2_5_omni_3b()
     else:
         raise ValueError(f"unknown model_id: {model_id!r}")
     LOG.info("building LLMSession(model=%s, npu=%d) ...", model_id, npu_index)
@@ -454,12 +457,27 @@ def infer_handler(state: dict, payload: dict) -> dict:
         Attachment = mod["Attachment"]
         prompt = payload.get("prompt")
         atts_meta = payload.get("attachment", [])
+        # audio 通道参数（omni run_audio 需要）。未传则用 omni 默认
+        # 契约（16 kHz mono s16le），兜底靠 session.py 内部 default。
+        options = payload.get("options") or {}
+        audio_kwargs: dict = {}
+        if "sample_rate" in options:
+            audio_kwargs["sample_rate"] = options["sample_rate"]
+        if "n_channels" in options:
+            audio_kwargs["n_channels"] = options["n_channels"]
+        if "sample_width" in options:
+            audio_kwargs["sample_width"] = options["sample_width"]
+
         attachments = []
         for item in atts_meta:
             if isinstance(item, dict) and "data_b64" in item:
+                # audio 走 tag dict（``kind=="audio"``）；图片走裸 base64 字符串。
                 import base64 as _b64
-                import numpy as _np
                 raw = _b64.b64decode(item["data_b64"])
+                if item.get("kind") == "audio":
+                    attachments.append(Attachment(raw, kind="audio"))
+                    continue
+                import numpy as _np
                 arr = _np.frombuffer(raw, dtype=_np.uint8)
                 import cv2 as _cv2
                 img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
@@ -505,7 +523,7 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 sess.reset()
             except Exception:
                 pass
-            kwargs = {}
+            kwargs = dict(audio_kwargs)
             if generating_cls is not None:
                 kwargs["generating"] = generating_cls
             return await sess.respond(
@@ -525,6 +543,7 @@ def infer_handler(state: dict, payload: dict) -> dict:
             "crop_b64": getattr(result, "crop_b64", None),
         }
     except Exception as e:  # noqa: BLE001
+        LOG.warning("infer_handler exception: %s", e)
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 

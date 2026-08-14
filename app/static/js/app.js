@@ -544,6 +544,7 @@ const VD = {
   enabledTools: [],
   lastSnap: null,
   detectorSnap: null,
+  audioSnap: null,   // AudioAnalysis 状态快照（{state, progress, ...}）
   init() { return initVideoDetection(); },
 };
 
@@ -552,6 +553,168 @@ const VDDetector = {
   badgeTimer: null,
   refresh() { return refreshVdDetector(); },
 };
+
+// AudioAnalysis — 音频理解前端模块（嵌入音视频描述页）。
+// WS 协议：连接即推 hello（含 snapshot）；每段推理完推 event +
+// progress；state 变化推 state；终态时前端再 hydrate 一次 events 兜底。
+const AudioAnalysis = {
+  ws: null,
+  wsRetry: 0,
+  wsTimer: null,
+  events: [],
+  init() {
+    const startBtn = document.getElementById("vd-audio-start");
+    const stopBtn  = document.getElementById("vd-audio-stop");
+    const clearBtn = document.getElementById("vd-audio-events-clear");
+    if (startBtn) startBtn.onclick = () => AudioAnalysis.onStart();
+    if (stopBtn)  stopBtn.onclick  = () => AudioAnalysis.onStop();
+    if (clearBtn) clearBtn.onclick = () => AudioAnalysis.onClear();
+    this.ensureWs();
+    this.refresh();
+  },
+
+  async refresh() {
+    try {
+      const r = await fetch(API_PREFIX + "/audio-analysis", { cache: "no-store" });
+      if (!r.ok) return;
+      const snap = await r.json();
+      setVdAudioMeta(snap);
+      return snap;
+    } catch (_) { return null; }
+  },
+
+  async hydrateEvents() {
+    try {
+      const r = await fetch(API_PREFIX + "/audio-analysis/events", { cache: "no-store" });
+      if (!r.ok) return;
+      const data = await r.json();
+      this.events = Array.isArray(data.events) ? data.events.slice() : [];
+      this.render();
+    } catch (_) { /* best-effort */ }
+  },
+
+  async onStart() {
+    const sourceEl = document.getElementById("vd-source");
+    const promptEl = document.getElementById("vd-audio-prompt");
+    const source = (sourceEl?.value || "").trim();
+    const prompt = (promptEl?.value || "").trim();
+    if (!source) { alert("请先在上方视频源里打开一个视频文件"); return; }
+    if (!prompt) { alert("请输入音频理解提示词"); return; }
+    this.events = [];
+    this.render();
+    try {
+      const r = await fetch(API_PREFIX + "/audio-analysis/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source, prompt }),
+      });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        alert(`启动音频分析失败: ${e.detail || r.status}`);
+        return;
+      }
+      const snap = await r.json();
+      setVdAudioMeta(snap);
+    } catch (e) {
+      alert("启动音频分析失败: " + e.message);
+    }
+  },
+
+  async onStop() {
+    try {
+      await fetch(API_PREFIX + "/audio-analysis/stop", { method: "POST" });
+    } catch (_) { /* best-effort */ }
+    this.refresh();
+  },
+
+  async onClear() {
+    try {
+      await fetch(API_PREFIX + "/audio-analysis/events/clear", { method: "POST" });
+    } catch (_) { /* best-effort */ }
+    this.events = [];
+    this.render();
+  },
+
+  ensureWs() {
+    if (this.ws && this.ws.readyState <= 1) return;
+    this.wsRetry = Math.min(this.wsRetry + 1, 6);
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}${API_PREFIX}/audio-analysis/ws`;
+    try {
+      this.ws = new WebSocket(url);
+    } catch (_) {
+      this.wsTimer = setTimeout(() => this.ensureWs(),
+        Math.min(1000 * (1 << (this.wsRetry - 1)), 30000));
+      return;
+    }
+    this.ws.onmessage = (ev) => AudioAnalysis.onWsMessage(ev);
+    this.ws.onclose = () => {
+      AudioAnalysis.ws = null;
+      const wait = Math.min(1000 * (1 << (AudioAnalysis.wsRetry - 1)), 30000);
+      AudioAnalysis.wsTimer = setTimeout(() => AudioAnalysis.ensureWs(), wait);
+    };
+    this.ws.onerror = () => { try { this.ws && this.ws.close(); } catch (_) {} };
+  },
+
+  onWsMessage(ev) {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (_) { return; }
+    if (m.type === "hello") {
+      this.hydrateEvents();
+      setVdAudioMeta(m);
+    } else if (m.type === "state") {
+      setVdAudioMeta(m);
+      // 终态再 hydrate 一次避免 WS 漏推
+      if (m.state === "done" || m.state === "error" || m.state === "stopped") {
+        this.hydrateEvents();
+      }
+    } else if (m.type === "progress") {
+      setVdAudioMeta({
+        state: VD.audioSnap ? VD.audioSnap.state : "extracting",
+        progress: [m.done, m.total],
+        source: VD.audioSnap && VD.audioSnap.source,
+        events_count: this.events.length,
+      });
+    } else if (m.type === "event" && m.event) {
+      this.events.push(m.event);
+      this.render();
+      const cntEl = document.getElementById("vd-audio-events-count");
+      if (cntEl) cntEl.textContent = `${this.events.length} 段`;
+    }
+  },
+
+  render() {
+    const ol = document.getElementById("vd-audio-events");
+    if (!ol) return;
+    if (!this.events.length) {
+      ol.innerHTML = '<li class="vd-audio-empty">启动音频分析后，按 6 秒切片逐段推理，结果显示在这里。</li>';
+      return;
+    }
+    ol.innerHTML = "";
+    this.events.forEach((ev) => {
+      const li = document.createElement("li");
+      const errClass = ev.level === "error" ? " vd-audio-ev--err" : "";
+      li.className = "vd-audio-ev" + errClass;
+      const ts = document.createElement("span");
+      ts.className = "vd-audio-ts";
+      ts.textContent = `[${fmtTime(ev.start_s)}–${fmtTime(ev.end_s)}]`;
+      const tx = document.createElement("span");
+      tx.className = "vd-audio-text";
+      tx.textContent = sanitizeEventText(ev.text || "");
+      li.append(ts, tx);
+      ol.appendChild(li);
+    });
+    const cntEl = document.getElementById("vd-audio-events-count");
+    if (cntEl) cntEl.textContent = `${this.events.length} 段`;
+  },
+};
+
+function fmtTime(s) {
+  if (s == null || isNaN(s)) return "--:--";
+  const m = Math.floor(s / 60);
+  const r = Math.round(s % 60);
+  return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
+}
 
 function setVdOverlay(text, isError) {
   const el = document.getElementById("vd-overlay");
@@ -573,7 +736,62 @@ function setVdMeta(snap) {
   el.textContent = parts.join(" · ") || "--";
   VD.lastSnap = snap;
   if (typeof DemoGuard !== "undefined") {
-    DemoGuard.report("video-detection", { session: VD.lastSnap, detector: VD.detectorSnap });
+    DemoGuard.report("video-detection", {
+      session:  VD.lastSnap,
+      detector: VD.detectorSnap,
+      audio:    VD.audioSnap,
+    });
+  }
+}
+
+// 把最新 AudioAnalysis 快照推到 DemoGuard + audio-block UI。
+// 快照形状：{state, error, source, prompt, progress:[done,total],
+// events_count, available} —— 与后端 AudioAnalysisService.snapshot() 对齐。
+function setVdAudioMeta(snap) {
+  VD.audioSnap = snap || null;
+  const srcEl = document.getElementById("vd-audio-source");
+  if (srcEl) {
+    srcEl.textContent = (snap && snap.source)
+      || document.getElementById("vd-source")?.value?.trim()
+      || "—";
+  }
+  const statusEl = document.getElementById("vd-audio-status");
+  const startBtn = document.getElementById("vd-audio-start");
+  const stopBtn  = document.getElementById("vd-audio-stop");
+  if (statusEl) {
+    const s = snap && snap.state;
+    if (s === "extracting") {
+      const [done, total] = (snap.progress || [0, 0]);
+      statusEl.textContent = `分析中 ${done}/${total}`;
+    } else if (s === "done") {
+      statusEl.textContent = `完成 · ${snap.events_count || 0} 段`;
+    } else if (s === "stopped") {
+      statusEl.textContent = "已停止";
+    } else if (s === "error") {
+      statusEl.textContent = "错误: " + (snap.error || "");
+    } else {
+      statusEl.textContent = (snap && snap.available === false)
+        ? "功能未启用"
+        : "未启动";
+    }
+  }
+  if (startBtn) startBtn.disabled = !!(snap && snap.state === "extracting");
+  if (stopBtn)  stopBtn.disabled  = !(snap && snap.state === "extracting");
+  const progEl = document.getElementById("vd-audio-progress");
+  if (progEl) {
+    if (snap && snap.state === "extracting") {
+      const [done, total] = (snap.progress || [0, 0]);
+      progEl.textContent = total > 0 ? `已处理 ${done} / ${total} 段（每段 ≤ 6 秒）` : "";
+    } else {
+      progEl.textContent = "";
+    }
+  }
+  if (typeof DemoGuard !== "undefined") {
+    DemoGuard.report("video-detection", {
+      session:  VD.lastSnap,
+      detector: VD.detectorSnap,
+      audio:    VD.audioSnap,
+    });
   }
 }
 
@@ -990,7 +1208,11 @@ function updateVdDetectorStatus(snap) {
   if (stopBtn)  stopBtn.disabled  = !snap.enabled;
   VD.detectorSnap = snap;
   if (typeof DemoGuard !== "undefined") {
-    DemoGuard.report("video-detection", { session: VD.lastSnap, detector: VD.detectorSnap });
+    DemoGuard.report("video-detection", {
+      session:  VD.lastSnap,
+      detector: VD.detectorSnap,
+      audio:    VD.audioSnap,
+    });
   }
 }
 
@@ -1267,7 +1489,7 @@ function initVideoDetection() {
   // Initial state hydration (when navigating back to the page)
   refreshVdDetector();
   vdLoadTools();
-
+  AudioAnalysis.init();
   if (!VD.ws && !VD.wsTimer) connectVdWs();
 }
 
@@ -2391,6 +2613,21 @@ function showPage(name) {
   if (prev === "text-chat" && name !== "text-chat") {
     TextChat.closeWs();
   }
+  // 离开音视频描述页：关掉 AudioAnalysis WS（DemoGuard 才是 stop 入口）
+  if (prev === "video-detection" && name !== "video-detection") {
+    if (AudioAnalysis.ws) {
+      try { AudioAnalysis.ws.close(); } catch (_) {}
+      AudioAnalysis.ws = null;
+    }
+    if (AudioAnalysis.wsTimer) {
+      clearTimeout(AudioAnalysis.wsTimer);
+      AudioAnalysis.wsTimer = null;
+    }
+  }
+  // 回到音视频描述页：兜底 ensureWs（防止 init 被 window.__vdInit 短路）
+  if (name === "video-detection" && prev !== "video-detection") {
+    AudioAnalysis.ensureWs();
+  }
   document.querySelectorAll(".page").forEach(p => {
     p.classList.toggle("hidden", p.dataset.page !== name);
   });
@@ -2424,12 +2661,14 @@ const DemoGuard = {
       active(snap = {}) {
         const dec = snap.session && this._ACTIVE_STATES.includes(snap.session.state);
         const det = snap.detector && snap.detector.enabled;
-        return !!(dec || det);
+        const aud = snap.audio && snap.audio.state === "extracting";
+        return !!(dec || det || aud);
       },
       async stop() {
         await Promise.allSettled([
           fetch(API_PREFIX + "/video-detection/close",       { method: "POST" }),
           fetch(API_PREFIX + "/video-detection/prompt/stop", { method: "POST" }),
+          fetch(API_PREFIX + "/audio-analysis/stop",         { method: "POST" }),
         ]);
       },
     },
@@ -2504,6 +2743,7 @@ const DemoGuard = {
       "video-detection": [
         [API_PREFIX + "/video-detection/close",       "POST"],
         [API_PREFIX + "/video-detection/prompt/stop", "POST"],
+        [API_PREFIX + "/audio-analysis/stop",         "POST"],
       ],
       "video-target-detection": [
         [API_PREFIX + "/video-target-detection/close",       "POST"],
@@ -2545,7 +2785,7 @@ const DemoGuard = {
   async stopAndClear(page) {
     const reg = this._registry[page];
     if (reg) await reg.stop();
-    this._cache[page] = { session: null, detector: null };
+    this._cache[page] = { session: null, detector: null, audio: null };
   },
 };
 
@@ -4351,11 +4591,17 @@ const ComputeConfigPage = {
 
   // ---------- 两栏 compute service 卡片 (v0.7) ----------
   // 数据源：``/api/compute`` snapshot.services —— 后端从
-  // ``list_with_source`` 拼出来，按 source 分组：spawned / adopted_local
-  // （本机算力栏，平铺）+ adopted（网络算力栏，按 ``(device_name, peer_ip)``
-  // 分组，每个设备一个外框 + 内嵌 4 列网格）；unavailable（daemon 全 LAN
-  // 都没找到 peer）→ 也放网络栏底部一个"未连接"组。
-  // 下栏卡片只读（peer 不可操作；unavailable 是因为没人提供）。
+  // ``list_with_source`` 拼出来，按 source 分组：
+  //   * 本机算力栏（平铺）：spawned / adopted_local / unavailable
+  //     - spawned        ：本机 Popen 起的 worker（持有 proc 句柄）
+  //     - adopted_local  ：uvicorn reload 留下的孤儿 worker（同 hostname，
+  //                         registry 没 Popen 句柄但能 RPC 触达）
+  //     - unavailable    ：``MODEL_PRESETS`` 里声明但本机 + LAN 都没回应
+  //                         —— 仍是**本机** model，UI 显示在本地栏并提供
+  //                         「启用」按钮让用户 spawn 新进程
+  //   * 网络算力栏（按 ``(device_name, peer_ip)`` 分组，每设备一框）：
+  //     - adopted        ：LAN 上另一台机子的 worker 提供的 service
+  // 下栏卡片只读（peer 不可操作）。
   _renderServices() {
     const localRoot = document.getElementById("cc-local-cards");
     const peerRoot  = document.getElementById("cc-peer-cards");
@@ -4395,8 +4641,9 @@ const ComputeConfigPage = {
     const newOrder = [];   // [{model_id, container: localRoot|<frame grid>}]
 
     // ---------- peer 设备框 ----------
-    // 把 adopted 按 (device_name, peer_ip) 分组；unavailable 单独一个
-    // "未连接"组；组内按 CC_PRESET_ORDER 排序保证视觉一致。
+    // 只 adopted 进网络栏，按 (device_name, peer_ip) 分组；组内按
+    // CC_PRESET_ORDER 排序保证视觉一致。unavailable 是本机 preset
+    // model，进本地栏（见 _renderServices 顶部 docstring）。
     const peerFrameOrder = [];          // [{key, name, ip, services: [...]}]
     const peerFrameByKey = new Map();
     for (const s of ordered) {
@@ -4410,18 +4657,6 @@ const ComputeConfigPage = {
           peerFrameOrder.push(group);
         }
         peerFrameByKey.get(key).services.push(s);
-      } else if (s._source === "unavailable") {
-        if (!peerFrameByKey.has("__unavailable__")) {
-          const group = {
-            key: "__unavailable__",
-            name: "未连接",
-            ip: "",
-            services: [],
-          };
-          peerFrameByKey.set("__unavailable__", group);
-          peerFrameOrder.push(group);
-        }
-        peerFrameByKey.get("__unavailable__").services.push(s);
       }
     }
     // 组内按 CC_PRESET_ORDER 排序
@@ -4462,7 +4697,6 @@ const ComputeConfigPage = {
       const frame = document.createElement("section");
       frame.className = "cc-device-frame";
       frame.dataset.deviceKey = group.key;
-      if (group.key === "__unavailable__") frame.classList.add("is-unavailable");
 
       const head = document.createElement("header");
       head.className = "cc-device-head";
@@ -4498,7 +4732,7 @@ const ComputeConfigPage = {
         description:          s.description || cm.description || "",
         available_targets:    s.available_targets || cm.available_targets || ["182x"],
       };
-      const isLocal = s._source !== "adopted" && s._source !== "unavailable";
+      const isLocal = s._source !== "adopted";
 
       // 计算关键字段 hash；任一变化 → 重建 card。
       const sig = [
@@ -4523,12 +4757,11 @@ const ComputeConfigPage = {
       if (isLocal) {
         targetContainer = localRoot;
       } else {
-        // adopted / unavailable — 容器是 peer frame 的 grid。
-        // frame 已先创建好（见上方帧循环），保证引用有效。
+        // adopted — 容器是 peer frame 的 grid。frame 已先创建好
+        // （见上方帧循环），保证引用有效。
         const name = (s._peer_name || "").trim() || "远端";
         const ip = (s._peer_ip || "").trim();
-        const frameKey = s._source === "unavailable"
-          ? "__unavailable__" : `${name}@${ip}`;
+        const frameKey = `${name}@${ip}`;
         targetContainer = newPeerFrame[frameKey]?.grid || peerRoot;
       }
 
@@ -4541,7 +4774,7 @@ const ComputeConfigPage = {
         if (isLocal && prev.card._h) {
           this._updateLocalCardState(prev.card, s, meta, cards);
         } else {
-          // peer / unavailable，或者 prev 是 peer card 现在要变 local
+          // adopted peer card，或者 prev 是 peer card 现在要变 local
           // （_h 不存在）—— 这些 case 涉及 card 类型切换，结构差别
           // 太大不能 in-place update。重建代价小（peer card 简单 /
           // local card 切换是罕见的 transition），保留旧的 remove +
@@ -4938,12 +5171,12 @@ const ComputeConfigPage = {
     return svcs.find(s => s.model_id === modelId) || null;
   },
 
-  // adopted peer / unavailable —— 只读
+  // adopted peer —— 只读
   _makePeerCard(modelId, meta, svc) {
     const card = document.createElement("article");
     card.className = "cc-service-card cc-service-card-peer";
     card.dataset.model = modelId;
-    card.dataset.source = svc._source;  // "adopted" | "unavailable"
+    card.dataset.source = svc._source;  // "adopted"
 
     const state = svc.status || "not_loaded";
     if (state === "running") card.classList.add("is-running");
@@ -4955,26 +5188,20 @@ const ComputeConfigPage = {
     head.className = "cc-service-head";
     const title = document.createElement("h3");
     title.className = "cc-service-title";
-    if (svc._source === "adopted" && svc._peer_name) {
-      // 远端 peer：<model> @ <device_name>（device_name 来自 worker 的
-      // info_handler.device_name 字段；hostname 放 peer-id 行）
-      title.textContent = `${meta.label} @ ${svc._peer_name}`;
-    } else {
-      title.textContent = meta.label;
-    }
+    // 远端 peer：<model> @ <device_name>（device_name 来自 worker 的
+    // info_handler.device_name 字段；hostname 放 peer-id 行）
+    title.textContent = svc._peer_name
+      ? `${meta.label} @ ${svc._peer_name}`
+      : meta.label;
     head.appendChild(title);
 
     const peerId = document.createElement("span");
     peerId.className = "cc-peer-id";
-    if (svc._source === "adopted") {
-      const peerLabel = svc._peer_name || (svc._peer_guid || "").slice(0, 8) || "远端";
-      peerId.textContent = `peer: ${peerLabel}`;
-      if (svc.pid) {
-        peerId.textContent += ` · PID ${svc.pid}`;
-        peerId.title = `远端 worker 真实 PID ${svc.pid}`;
-      }
-    } else {
-      peerId.textContent = "无可用 worker";
+    const peerLabel = svc._peer_name || (svc._peer_guid || "").slice(0, 8) || "远端";
+    peerId.textContent = `peer: ${peerLabel}`;
+    if (svc.pid) {
+      peerId.textContent += ` · PID ${svc.pid}`;
+      peerId.title = `远端 worker 真实 PID ${svc.pid}`;
     }
     head.appendChild(peerId);
 
@@ -4983,7 +5210,6 @@ const ComputeConfigPage = {
     const dot = document.createElement("span");
     dot.className = "cc-state-dot";
     dot.dataset.state = state;
-    if (svc._source === "unavailable") dot.dataset.state = "unavailable";
     head.appendChild(dot);
 
     card.appendChild(head);
@@ -5002,11 +5228,7 @@ const ComputeConfigPage = {
 
     const ro = document.createElement("div");
     ro.className = "cc-readonly";
-    if (svc._source === "unavailable") {
-      ro.textContent = "本机 + LAN 都未发现该 service；点本地栏的「启用」会 spawn 新进程";
-    } else {
-      ro.textContent = "只读 · 本机无权操作 peer service";
-    }
+    ro.textContent = "只读 · 本机无权操作 peer service";
     body.appendChild(ro);
 
     if (state === "error" && svc.error) {

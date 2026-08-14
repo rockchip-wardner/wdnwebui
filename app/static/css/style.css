@@ -5165,3 +5165,86 @@ html, body {
   padding: 0.25rem 0.6rem;
 }
 
+/* 音频理解（嵌入音视频描述页） */
+.vd-audio-block {
+  border-top: 1px dashed var(--border);
+  padding-top: 0.5rem;
+  margin-top: 0.25rem;
+}
+.vd-audio-block h3 small {
+  font-weight: normal;
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-left: 0.35rem;
+}
+.vd-audio-hint {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+.vd-audio-hint code {
+  background: var(--code-bg);
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.78rem;
+}
+.vd-audio-meta {
+  margin-top: 0.35rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  min-height: 1em;
+}
+.vd-audio-section {
+  border-top: 1px solid var(--border);
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+}
+.vd-audio-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.vd-audio-empty {
+  font-size: 0.85rem;
+  color: var(--muted);
+  padding: 0.5rem;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  text-align: center;
+}
+.vd-audio-ev {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card-bg, rgba(255, 255, 255, 0.02));
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+.vd-audio-ev--err {
+  border-color: rgba(220, 80, 80, 0.6);
+  background: rgba(220, 80, 80, 0.08);
+  color: #b91c1c;
+}
+.vd-audio-ts {
+  flex: 0 0 auto;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+  padding-top: 0.1rem;
+}
+.vd-audio-text {
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+

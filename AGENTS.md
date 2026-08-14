@@ -306,6 +306,137 @@ The `#page-video-detection` section is wired to:
 so `app.include_router(...)` in `main.py` actually sees them — without it
 the package object is empty and the routes are silently missing.
 
+## Audio understanding (音频理解) — 嵌入音视频描述页
+
+`#page-video-detection` 在视觉检测区下方新加 `#vd-audio-block` 子区块：
+独立的 `audio prompt` textarea + "分析音频" / "停止" 按钮 + 段落事件列表。
+复用上方视频源（`#vd-source` 的 value），不另起 file picker；与
+`WdnaiDetector` 完全解耦，可与视觉检测同时运行。
+
+### Omni-3B 单次推理上限（必须切片）
+
+`wdnai/backends/omni.py:58-70` 把 audio encoder 的动态 shape 写死两档：
+
+```python
+AUDIO_SHAPES = {
+    0: {"n_frame": 600, "embeds_dim0": 150},   # ≤ 6.0 s
+    1: {"n_frame": 300, "embeds_dim0":  75},   # ≤ 3.0 s
+}
+```
+
+`omni.py:287-291` 的截断逻辑：
+
+```python
+if mel.shape[1] >= n_frame:
+    mel_padded = mel[:, :n_frame].astype(np.float16)   # 直接切到 600 帧
+```
+
+**结论**：超过 6.0 秒的音频被**静默截断**到前 6 秒；`Attachment` 串联
+(`session.py:247` 的 `b"".join(...)`) 也救不了 —— 后端仍按 600 帧切。
+所以 60 秒音频必须先切片。`audio_analysis.CHUNK_SECONDS = 6.0` 是硬上限。
+
+### 切片策略（硬切片 + 时间戳列表）
+
+`app/services/audio_analysis.py`：
+
+* **PyAV 抽音**：从当前视频源 `av.open` → `container.streams.audio[0]` →
+  `av.AudioResampler(format="s16", layout="mono", rate=16000)` →
+  `b"".join(pcm_chunks)`（16 kHz mono s16le bytes）。
+* **硬切片**：每 6 秒一段（`samples_per_chunk = 6.0 * 16000 = 96000`），
+  无重叠；总段数 `n_chunks = ceil(total_samples / samples_per_chunk)`。
+* **逐段推理**：`with get_session_call_lock(): sess.reset() + await sess.respond(prompt, attachment=[Attachment(pcm, kind="audio")], sample_rate=16000, n_channels=1, sample_width=2)`。
+* **失败隔离**：单段 SDK / NPU 异常写 `AudioEvent(level="error")` 继续下一段。
+* **状态机**：`idle → extracting → done / stopped / error`。
+
+### AudioEvent 形状
+
+```python
+@dataclass
+class AudioEvent:
+    id:        int
+    chunk_idx: int       # 0-based 段序号
+    start_s:   float     # 段起点秒
+    end_s:     float     # 段终点秒
+    ts:        float     # 推理完成 wall-clock
+    prompt:    str
+    text:      str       # omni 输出（已经过 sanitize）
+    level:     Optional[str] = None   # "error" 时表示该段失败
+```
+
+前端渲染为 `[00:00–00:06] 描述...` 段落时间线（`fmtTime` 把秒数格式化为
+`MM:SS`）。
+
+### Capability 与 ComputeRegistry 集成
+
+* `MODEL_PRESETS["qwen2.5-omni-3b"]`：memory_estimate_mb=2500 /
+  estimated_init_seconds=50 / capability_types=["swcap_audio_understand"] /
+  worker_name="audio-3b"（comm="worker:audio-3b", 13 字符）。
+* `compute_worker.py:_build_session` / `compute_worker_lazy.py:_preset_for`
+  都加了 `model_id == "qwen2.5-omni-3b"` 分支（`SLM.qwen_2_5_omni_3b()`）。
+* `_LEGACY_CAPABILITY_TYPE_RENAMES` 加 `"audio_understand" → "swcap_audio_understand"`，
+  兼容老 config.json。
+
+### API 端点（`app/api/audio_analysis.py`）
+
+| Method | Path | 用途 |
+|---|---|---|
+| `GET`  | `/api/audio-analysis`               | 快照 `{state, error, source, prompt, progress, events_count, available}` |
+| `GET`  | `/api/audio-analysis/events`        | `{snapshot, events: [AudioEvent...]}` |
+| `POST` | `/api/audio-analysis/start` `{source, prompt}` | 启动一次；404 source 不存在 / 400 prompt 空 / 502 capability 未启用 |
+| `POST` | `/api/audio-analysis/stop`          | 中途停止（不动 session） |
+| `POST` | `/api/audio-analysis/events/clear`  | 清空内存事件 |
+| `WS`   | `/api/audio-analysis/ws`            | server-push `{type:"hello"|"event"|"progress"|"state"}` |
+
+错误码与 detector / VFA 对齐：502 + `RuntimeError("功能未启用: swcap_audio_understand")`。
+
+### 前端模块（`app/static/js/app.js`）
+
+* `AudioAnalysis` 模块（仿 `VDDetector` 写法）：
+  * `init()` 绑定 start / stop / clear；`ensureWs()` 指数退避重连（上限 30s）。
+  * `onStart()` 校验 source ≠ 空（alert）+ prompt ≠ 空。
+  * `onWsMessage()` 分发 hello / state / progress / event 四种帧；
+    state 终态（done/error/stopped）时主动 `hydrateEvents()` 拉全量列表。
+* `setVdAudioMeta(snap)`：把快照写进 `VD.audioSnap`，同时刷新
+  `#vd-audio-status` / `#vd-audio-source` / 按钮 enable 状态 / 进度条。
+* `setVdMeta` / `updateVdDetectorStatus` 同时把 `audio: VD.audioSnap` 推
+  进 `DemoGuard.report("video-detection", ...)`。
+
+### DemoGuard 集成
+
+`video-detection` 已有 DemoGuard。audio 加进去需要：
+
+* `_ACTIVE_STATES` 判定条件追加 `audio.state === "extracting"`。
+* `stop()` + `stopSync()` 追加 `POST /audio-analysis/stop`（sendBeacon
+  兜底）。
+* `stopAndClear` 把 cache 清成 `{session: null, detector: null, audio: null}`。
+
+`beforeunload` / `hashchange` 走已有兜底链路，自动覆盖 audio（sendBeacon
+已发 stop）。
+
+### 资源预算
+
+| 项 | 值 | 备注 |
+|---|---|---|
+| omni 内存 | ~ 2500 MB | audio encoder + llm + embed；按 VL-4B 同档估；真机测后回填 |
+| omni init | ~ 50s | 两个 rknn + embed；倒计时同其它 preset |
+| 60s 音频切片 | 10 段 × ~ 1s | 单线程串行 ≈ 10s 总耗时 |
+| 与 qwen3-vl-4b 共存 | ~ 6 GB | OK；与 qwen3-8b 同时跑超 8 GB |
+| NPU 互斥 | 进程级 `_llm_session_call_lock` 串行 | 与 detector / VFA / text_chat 共享同一把锁 |
+
+`_check_npu_memory_budget()`（`compute_registry.py`）自动纳入 omni preset
+校验；同卡内存超限在 `boot_compute_services` 时被拒绝。
+
+### 已知限制
+
+* **音频源必须含音轨**：PyAV `streams.audio` 为空 → worker 进入 `_STATE_ERROR`，
+  前端 `alert("视频无音轨")`。
+* **极短音频**（< 6s）：整段算一段，shape 1 (n=300) 或 shape 0 (n=600)
+  补零处理（omni 内部行为）。
+* **超时熔断**：单段 SDK 卡死没有 timeout；上层若需要可包一层
+  `asyncio.wait_for(...)`，但当前按 detector / VFA 现有风格不做。
+* **不做二次聚合**：60 秒以上音频不会自动生成"综述"；如未来需要，
+  加一段独立的 LLM 调用（建议复用 `swcap_text_chat` 的 qwen3-8b）。
+
 ## Surveillance page (视频监控)
 
 The `#page-surveillance` section (sits **above** 视频检测 in the sidebar)
