@@ -664,6 +664,59 @@ html, body {
   word-break: break-all;
 }
 
+/* ---------- system-monitor: worker process table ---------- */
+.worker-section { margin-top: 1rem; }
+.worker-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 4px;
+  background: #fff;
+}
+.worker-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+.worker-table thead th {
+  text-align: left;
+  background: #f3f4f6;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  font-weight: 600;
+  color: #374151;
+  white-space: nowrap;
+}
+.worker-table tbody td {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid #f1f5f9;
+  white-space: nowrap;
+}
+.worker-table tbody tr:last-child td { border-bottom: 0; }
+.worker-table tbody tr.worker-orphan { background: #fef2f2; }
+.worker-table tbody tr.worker-orphan td:first-child::before {
+  content: "⚠ ";
+  color: #b91c1c;
+}
+.worker-table tbody tr.worker-empty td {
+  text-align: center;
+  color: var(--muted, #6b7280);
+  padding: 1rem;
+}
+.worker-table .col-cmdline {
+  white-space: normal;
+  word-break: break-all;
+  color: #475569;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  max-width: 480px;
+}
+.worker-table .col-state-running  { color: #15803d; font-weight: 600; }
+.worker-table .col-state-sleeping { color: #1d4ed8; }
+.worker-table .col-state-zombie  { color: #b91c1c; font-weight: 600; }
+.worker-table .col-state-disk-sleep { color: #b45309; }
+.worker-table .col-ppid-1 { color: #b91c1c; font-weight: 600; }
+
 /* ---------- video-detection page ---------- */
 .vd-toolbar {
   display: flex;
@@ -2106,6 +2159,46 @@ html, body {
 .cc-toggle input:checked + .cc-toggle-track { background: var(--accent); }
 .cc-toggle input:checked + .cc-toggle-track::before { transform: translateX(20px); }
 .cc-toggle input:disabled + .cc-toggle-track { opacity: 0.4; cursor: not-allowed; }
+/* v0.8: 状态色调（running 绿 / loading 橙 pulse / error 红） */
+.cc-toggle.is-on     input:checked + .cc-toggle-track { background: #16a34a; }
+.cc-toggle.is-load   input:checked + .cc-toggle-track { background: #f59e0b; animation: cc-pulse 1.2s ease-in-out infinite; }
+.cc-toggle.is-err    input:checked + .cc-toggle-track { background: #ef4444; }
+.cc-toggle.is-disabled { opacity: 0.5; }
+
+/* v0.8: 状态小圆点（_makePeerCard 用，标题旁替代 badge） */
+.cc-state-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #d1d5db; flex-shrink: 0;
+  align-self: center;
+}
+.cc-state-dot[data-state="running"]  { background: #16a34a; }
+.cc-state-dot[data-state="loading"] { background: #f59e0b; animation: cc-pulse 1.2s ease-in-out infinite; }
+.cc-state-dot[data-state="error"]   { background: #ef4444; }
+.cc-state-dot[data-state="unavailable"] { background: #d1d5db; }
+
+/* v0.8 → v0.9: 模型描述 改成纯文本，不带外框 / 背景 / 左边线。
+ * 之前那种 "灰色背景 + 左边线 accent + padding" 看着像在喊"我很重
+ * 要"，其实 description 只是辅助信息。整段去掉框线，title 跟下
+ * 面的 chips 视觉上更像同一组，body 区也不再被色块切碎。
+ * 跟上面的 chips 之间靠 body 的 flex gap（10px）拉开，不再额外
+ * 给 desc 加 top margin，否则 caps→desc 又会鼓成 16-20px。 */
+.cc-model-desc {
+  margin: 0 0 4px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-muted, #6b7280);
+  font-weight: 400;
+}
+
+/* v0.8: NPU picker 不支持的 target（_makeTargetFieldset 灰掉 + 不可点） */
+.cc-target-opt.is-unsupported {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.cc-target-opt.is-unsupported input[type="radio"]:disabled + span {
+  text-decoration: line-through;
+  text-decoration-color: var(--text-muted, #9ca3af);
+}
 .cc-model-meta {
   display: flex;
   flex-direction: column;
@@ -2408,15 +2501,31 @@ html, body {
 }
 
 /* ---------- compute-config: 三 service 卡片 (Qwen3-VL-4B / TTS / 8B) ---------- */
+/* v0.9: 本地算力与网络算力 (设备框内) 都按一行四卡片排版 */
 .cc-services {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px;
   margin-bottom: 12px;
 }
+/* v0.9: 网络算力栏改为按设备分组（外框每设备一行，内部 4 卡片一行），
+   不再直接 grid 平铺。frame 之间靠纵向 flex 排列。 */
 .cc-services.cc-services-peer {
-  grid-template-columns: 1fr;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
+/* v0.9: 网络算力栏无 peer 时显示引导文案 */
+.cc-peer-empty {
+  padding: 24px 18px;
+  color: var(--muted);
+  text-align: center;
+  background: #f9fafb;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+.cc-peer-empty.hidden { display: none; }
 .cc-services-empty {
   padding: 24px 18px;
   color: var(--muted);
@@ -2428,7 +2537,59 @@ html, body {
   grid-column: 1 / -1;
 }
 @media (max-width: 1280px) {
+  .cc-services { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
   .cc-services { grid-template-columns: 1fr; }
+}
+
+/* v0.9: 网络算力 — 每设备一框，<device_name>@<ip> 标题 + 4 列内嵌卡片 */
+.cc-device-frame {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 0;
+  overflow: hidden;
+}
+.cc-device-frame.is-unavailable {
+  border-style: dashed;
+  background: #f9fafb;
+}
+.cc-device-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: #f3f4f6;
+  font-size: 0.9rem;
+}
+.cc-device-frame.is-unavailable .cc-device-head {
+  background: #f3f4f6;
+  color: var(--muted);
+}
+.cc-device-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--info, #2563eb);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+.cc-device-frame.is-unavailable .cc-device-title {
+  color: var(--muted);
+}
+/* 4 列内嵌卡片网格：不足 4 个时靠左对齐、右侧留空 */
+.cc-device-cards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  padding: 12px;
+}
+@media (max-width: 1280px) {
+  .cc-device-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .cc-device-cards { grid-template-columns: 1fr; }
 }
 .cc-service-card {
   background: var(--surface);
@@ -2446,12 +2607,44 @@ html, body {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 14px;
+  padding: 12px 16px 10px;
+  /* head 是卡片标题栏 —— 跟 body 信息区要分层。保留 #f9fafb 浅灰
+   * 底色作 section header 视觉锚点；底部用 border-bottom 跟
+   * body 分隔，圆角跟卡片外框对齐。padding-bottom 收到 10px，
+   * 让下面的 body 顶 padding 接管"head↔caps"之间的呼吸空间，
+   * 不要 head/body 两边各加 padding 叠成厚厚一道。 */
+  background: #f9fafb;
   border-bottom: 1px solid var(--border);
-  background: #f3f4f6;
   border-top-left-radius: 8px;
   border-top-right-radius: 8px;
   flex-wrap: wrap;
+}
+/* v0.8: head 末尾的"重启服务"+ toggle 包装器，靠右对齐 */
+.cc-head-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.cc-btn-restart {
+  font-size: 11px;
+  padding: 4px 10px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.cc-btn-restart:hover:not(:disabled) {
+  background: #f9fafb;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.cc-btn-restart:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 .cc-service-title {
   font-weight: 600;
@@ -2467,6 +2660,13 @@ html, body {
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 1px 8px;
+}
+/* 软件能力 chips 行容器（紧贴 head 下方，跟 title 同属"元信息"段） */
+.cc-service-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 6px;
 }
 .cc-service-badge {
   margin-left: auto;
@@ -2485,10 +2685,14 @@ html, body {
 .cc-service-badge.is-ready-lazy { background: #e0f2fe; color: #075985; }
 
 .cc-service-body {
-  padding: 12px 14px;
+  /* 12px top padding 跟 head 的 border-bottom 一起构成"title ↔
+   * chips"的呼吸空间 —— 视觉上跟 head 是分开的两组，但不至于
+   * 留一道空白把 chips 推到卡片中部。gap 10 + 各自 6px 内的
+   * margin 让 chips / desc / 运行在 之间不挤也不散。 */
+  padding: 12px 16px 14px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   flex: 1 1 auto;
   min-width: 0;
 }
@@ -2549,6 +2753,26 @@ html, body {
   font-family: var(--mono);
   padding: 0 4px;
 }
+/* v0.8: NPU picker 改成下拉框 select；与原 radio 样式共存 */
+.cc-target-label {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.cc-target-select {
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--text);
+  cursor: pointer;
+  min-width: 180px;
+}
+.cc-target-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .cc-target-options {
   display: flex;
   gap: 12px;
@@ -2574,6 +2798,65 @@ html, body {
 .cc-target-opt.is-disabled {
   color: var(--muted);
   cursor: not-allowed;
+}
+
+/* v0.8: 加载倒计时（loading 状态显示在 NPU picker 下方） */
+.cc-load-countdown {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--accent);
+  font-family: var(--mono);
+  animation: cc-pulse 1.5s ease-in-out infinite;
+}
+
+/* v0.9: 模型目录缺失提示块。友好黄底 + ⚠ + 路径 + 提示语，
+ * 跟红色 error pre 区分开 —— 这不是 init 失败。 */
+.cc-missing-dir {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: #fef3c7;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+}
+.cc-missing-dir-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #92400e;
+}
+.cc-missing-dir-path {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: #78350f;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid #fde68a;
+  border-radius: 3px;
+  padding: 2px 6px;
+  word-break: break-all;
+  display: inline-block;
+  align-self: flex-start;
+  max-width: 100%;
+}
+.cc-missing-dir-note {
+  font-size: 11px;
+  color: #92400e;
+  opacity: 0.85;
+}
+
+/* v0.8: 错误 banner 单条右上的 ✕ 按钮 */
+.cc-banner-row-clear {
+  float: right;
+  background: transparent;
+  border: none;
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  line-height: 1;
+}
+.cc-banner-row-clear:hover {
+  font-weight: bold;
 }
 
 /* action button + status line */

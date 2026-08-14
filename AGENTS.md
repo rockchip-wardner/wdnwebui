@@ -714,9 +714,17 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   做 probe → adopt-or-spawn：
    - **probe**：对 `wdndds/rpc/<model_id>` 走短超时 RPC ``info``（~1.5s）
    - **命中**（LAN peer 已响应或上轮孤儿 worker 还在）→ ``_adopt_existing_worker``，
-     `proc=None` + `_source="adopted"`，**不** spawn 新进程
+     `proc=None` + `_source` 根据 probe info 的 ``hostname`` 字段决定：
+     同 hostname → ``"adopted_local"``（本机孤儿 / reload 残留），
+     不同 hostname → ``"adopted"``（真 LAN peer），**不** spawn 新进程
    - **未命中** → ``_spawn_compute_worker`` 拉新子进程
      （`python compute_worker.py --model <id>`，**不传 --npu**）
+
+  **v0.8 dedup**：spawn 之前再扫一次 `/proc/*/cmdline` 找同 model 的现存
+  worker 进程（`_find_orphan_worker_pid`），命中就走 adopt 接管 —— 防
+  reload 后 Popen(start_new_session=True) 的子进程脱离父进程组、reload
+  SIGTERM 杀不掉导致的 NPU 内存累积泄漏。详情见 "Orphan worker 处理"
+  段落。
 
   worker 启动后**只**起 Hub + Service + Replier，不 build LLMSession。
   状态停在 ``not_loaded``；用户在算力配置页选 NPU 后触发
@@ -738,13 +746,76 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   同步到 registry。worker 进程意外退出时 probe 把 inst 翻 ``error``
   并捕获 stderr。Reload 模式下 uvicorn 重启父进程会杀掉 daemon thread；
   production 下靠 `close_all`（但 v0.7 起 `close_all` 不杀 worker）。
-- **Local-only operations**：算力配置页的"启用 / 禁用 / 重启"按钮
-  只对 ``ModelInstance.proc is not None``（本机 spawned）的 service 可见
-  可点；``adopted``（peer 提供的 service，本机无 proc）或
-  ``unavailable``（daemon 全 LAN 没找到 peer）只能查看状态。后端通过
-  ``_require_owned(inst, action)`` 拦 403；前端按钮按
-  ``snapshot.services[]._source`` 渲染可见性。当前网络推理不做（Q2：
-  "网络推理我们后面再设计"）—— LAN peer 的 service 在本机只读 view。
+- **`ModelInstance._source` 4 个取值**（v0.8 起）：
+  - ``"spawned"``        —— 本次 boot 由本机 Popen 起的 worker
+                            （`proc` 句柄在 registry 里，PID 来自 `proc.pid`）。
+  - ``"adopted_local"``  —— uvicorn reload 留下的孤儿 worker：probe 命中
+                            的 responder 跟主进程同 hostname。proc 句柄
+                            **不在** registry 里（被 SIGTERM 干掉的是父
+                            进程而不是 worker），但 worker 进程还在跑、
+                            能响应 RPC。`_peer_pid` 字段填 worker 的真实
+                            PID，让用户能 `kill <pid>` 手动清理。
+  - ``"adopted"``        —— LAN 上另一台机子的 worker 提供的 service。
+                            只有本机 _setup_rpc_client 路径，没有 proc；
+                            bind / 启停 / 重启全部 403。
+  - ``"unavailable"``    —— `MODEL_PRESETS` 里有这个 model，但 daemon
+                            全 LAN 都没回应（既没本地孤儿也没 peer）。
+  UI 渲染：local 列容纳 spawned + adopted_local（按 PID 来源不同在
+  `_makeLocalCard` 区分"自管 PID" 与 "孤儿 PID"，后者 重启/禁用 按钮
+  disable 并提示 `kill <pid>`）；peer 列容纳 adopted + unavailable
+  （`adopted` 卡片标题为 `<model> @ <device_name>`，device_name 来自
+  worker `info_handler` 的 device_name 字段）。
+- **Local-only operations**：算力配置页的 "启用 / 禁用 / 重启" 按钮
+  可见性：
+  - **spawed**：启用 / 重启 / 禁用 三按钮全开
+  - **adopted_local**：只 启用 可点（走 RPC `load` 同 spawned）；重启/
+    禁用 disable 提示 `kill <pid>` 手动清理
+  - **adopted**：三按钮全 disable（远端机子，本机无权操作）
+  - **unavailable**：只有 启用 可点（spawn 新进程）
+  后端 `_require_owned(inst, action)` 对 ``_source == "adopted"`` 拦
+  403，对 spawned / adopted_local 放行。
+- **Orphan worker 处理（v0.8 dedup → v0.9 强化）**：uvicorn reload 路径下
+  `Popen(start_new_session=True)` 起的 worker 脱离原进程组，reload
+  SIGTERM 不会传过来 —— 每次 reload 都会留一个孤儿。`_spawn_compute_worker`
+  在 spawn 前先扫 worker 进程，命中就走 `_adopt_existing_worker` 接管
+  而不 spawn，避免 NPU 内存被无意义地消耗。`_adopt_existing_worker`
+  拿到 info 后对比 `info.hostname == socket.gethostname()` 区分本机
+  孤儿 vs 远端 peer。Worker 端 `info_handler` (v0.8) 返回
+  `pid` / `hostname` / `device_name` 字段供主进程判断。
+
+  v0.9 修了一个老 dedup 的洞：`_find_orphan_worker_pid` 只返**第一个**
+  匹配 PID，剩下的孤儿永远没人收。新实现
+  `_find_workers_by_name(model_id)` 返 `List[int]`，扫出**所有**同 model
+  worker；`_adopt_existing_worker` 接管 1 个后 SIGTERM 其余（5s 宽限 →
+  SIGKILL 兜底）；`boot_compute_services` 末尾再跑一次
+  `_cleanup_unregistered_workers` 兜底扫
+  （同时清掉 config.compute.services 移除后残留的孤儿 + proc 文件
+  异常权限扫不到的边界情况）。
+
+  **Worker 进程命名**：worker 启动后通过 ``prctl(PR_SET_NAME)`` 把
+  自己的 comm（`/proc/<pid>/comm` / `ps -c`）设为 ``worker:<alias>``，
+  alias 来自 ``MODEL_PRESETS[model_id]["worker_name"]``。预设：
+  - qwen3-vl-4b → `worker:vlm-4b`（13 字符）
+  - qwen3-tts → `worker:tts`（10 字符）
+  - qwen3-8b → `worker:llm-8b`（12 字符）
+  - qwen3-vl-embedding-2b → `worker:emb-2b`（12 字符）
+
+  受 TASK_COMM_LEN=16 限制 alias 必须在 8 字符内（15 - len("worker:")）。
+  命名放在 worker 端 main() 里调 —— preexec_fn 里调 prctl 会被紧随的
+  exec() 用新 argv[0] basename 覆盖。`_find_workers_by_name` 同时
+  fallback 扫 cmdline 兼容老 worker（reload 后的第一次清理会识别
+  comm="python" 的历史 worker，全清之后 cmdline 退化为 no-op）。
+- **FastDDS participant_name 命名约定 (v0.8)**：每个 DomainParticipant
+  的名字都带 `config.json["base"]["device_name"]` 后缀，方便 LAN daemon
+  的 `/peers` 端点和 DDS 调试日志一眼区分板子：
+   - 主进程：`pyrkaiweb-main-{device_name}`
+   - discovery Hub（注册发现页）：`pyrkaiweb-discovery-{device_name}`
+   - compute worker：`compute_worker-{device_name}-{model_id}`
+  worker 的 `info_handler` 返回的 `device_name` 字段是上述 participant
+  name 后缀的来源；主进程 probe 后写到 `ModelInstance._peer_name`，
+  算力配置页"网络发现"卡片标题渲染为 `<model> @ <device_name>`。
+  device_name 缺失时 fallback 到 `socket.gethostname()`，保证
+  participant_name 永远非空。
 - **重启 4 步 (Q3)**：`POST /api/compute/restart {model}` →
   ``stop_instance_local(model)`` (unload → RPC shutdown → wait 3s →
   kill -9) → ``ensure_worker_for_model(model)``（probe → adopt /

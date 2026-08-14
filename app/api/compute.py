@@ -116,16 +116,26 @@ class ComputeConfigPayload(BaseModel):
 # 权限 / 状态工具
 # --------------------------------------------------------------------------- #
 def _require_owned(inst, action: str) -> None:
-    """确保 ``inst`` 是本机 spawn 的（proc 非空）；否则抛 403。
+    """确保 ``inst`` 是本机 spawn 或 adopted_local（reload 遗留 worker），
+    即本机拿得到 process handle（spawned）或能通过 RPC 触达（adopted_local）；
+    仅 ``adopted`` (远端 peer) → 403。
 
-    Used by 禁用 / 重启 endpoints。
+    v0.8: 之前用 ``inst.proc is None`` 会把 reload 留下的 adopted_local
+    也拒掉，导致用户在算力配置页点启用后端返 403；现改为按 ``_source``
+    判断：adopted_local 跟 spawned 一样可写。
     """
-    if inst is None or inst.proc is None:
+    if inst is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{action}: model 不在 registry",
+        )
+    if inst._source == "adopted":
+        peer_label = inst._peer_name or (inst._peer_guid or "")[:8] or "peer"
         raise HTTPException(
             status_code=403,
             detail=(
-                f"不能 {action}：该 service 是 {'adopted from peer' if inst else 'unavailable'}，"
-                "请到对端机器操作，或在本机先启动一个本地实例"
+                f"不能 {action}：该 service 由远端 peer ({peer_label}) 提供，"
+                "请到对端机器操作，或先在本机启动一个新实例"
             ),
         )
 
@@ -180,8 +190,8 @@ async def start_instance(req: InstanceRequest) -> dict:
          - daemon 上有 peer → adopt
          - 否则 → spawn 本机新进程
       2. ``bind_instance(model, npu_index)``：RPC ``load{npu_index}`` →
-         worker 调 ``LLMSession(model, npu=N)``。仅 spawned 允许，
-         adopted 抛 RuntimeError → 403。
+         worker 调 ``LLMSession(model, npu=N)``。spawned 与 adopted_local
+         都允许；adopted (远端 peer) → 403。
 
     Raises:
         400: npu_index 越界 / 未知 model。
@@ -192,13 +202,12 @@ async def start_instance(req: InstanceRequest) -> dict:
         inst = reg.ensure_worker_for_model(req.model)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    if inst.proc is None:
-        # adopted from peer — can only view status, not bind.
-        peer_label = inst._peer_name or inst._peer_guid[:8]
+    if inst._source == "adopted":
+        peer_label = inst._peer_name or (inst._peer_guid or "")[:8] or "peer"
         raise HTTPException(
             status_code=403,
             detail=(
-                f"{req.model} 是 peer ({peer_label}) 提供的 service，"
+                f"{req.model} 是远端 peer ({peer_label}) 提供的 service，"
                 "本机无权 bind。请到对端机器上点启用，或先在本机启动"
                 "一个新实例（unavailable → spawned）。"
             ),
@@ -318,6 +327,29 @@ async def put_hardware_capabilities(payload: HardwareCapabilityUpdate) -> dict:
 @router.post("/compute/stop-all")
 async def stop_all_instances() -> dict:
     """全部停止 —— 只停 spawned workers；adopted peers 不动。"""
+
+
+class ClearErrorsRequest(BaseModel):
+    """``POST /compute/clear-errors`` 入参：清空错误状态 + UI banner。
+
+    ``model_id`` 可选 —— 缺省清全部，传入时只清那一条。
+    """
+
+    model_id: Optional[str] = None
+
+
+@router.post("/compute/clear-errors")
+async def clear_errors(payload: ClearErrorsRequest) -> dict:
+    """清空 error banner —— 仅清错误状态（status 翻 not_loaded +
+    ``error`` 字符串置空），不重启 / 卸载 worker。下次用户点 toggle
+    启用会重新走 RPC load。
+
+    用于修复 v0.8 banner "全部清空" 误调 stopAll 的 bug：banner 跟
+    stopAll 是两件事。
+    """
+    reg = get_registry()
+    cleared = reg.clear_error(payload.model_id)
+    return {"ok": True, "cleared": cleared, "snapshot": reg.snapshot()}
     reg = get_registry()
     reg.stop_all_local()
     return {"ok": True, "snapshot": reg.snapshot()}

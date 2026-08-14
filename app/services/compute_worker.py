@@ -30,16 +30,95 @@ Lifecycle (v0.7):
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
 from typing import Any
 
 LOG = logging.getLogger("compute_worker")
+
+
+_PR_SET_NAME = 15
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_libc.prctl.restype = ctypes.c_int
+_libc.prctl.argtypes = [
+    ctypes.c_int,                       # option
+    ctypes.c_char_p,                    # arg2
+    ctypes.c_ulong, ctypes.c_ulong,     # arg3, arg4
+    ctypes.c_ulong,                     # arg5
+]
+
+
+def _set_comm_name(name: str) -> None:
+    """Set this process's comm (visible in ``ps -c`` / ``top`` /
+    ``/proc/<pid>/comm``) via ``prctl(PR_SET_NAME)``.
+
+    The name is truncated to 15 bytes (TASK_COMM_LEN - 1). The main
+    process's :mod:`app.services.compute_registry` dedup walks
+    ``/proc/*/comm`` looking for ``worker:<alias>`` to find us, so
+    setting the name early (before we open DDS endpoints) is what
+    makes "no duplicate workers after reload" actually work.
+
+    Why not preexec_fn? ``prctl(PR_SET_NAME)`` in preexec_fn is
+    immediately overwritten by the subsequent ``execvp()`` (the new
+    argv[0] basename becomes the new comm). Setting it here, after
+    Python has already started, sticks.
+    """
+    name_bytes = name.encode("utf-8")[:15]
+    try:
+        _libc.prctl(_PR_SET_NAME, name_bytes, 0, 0, 0)
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("set comm name to %r failed: %s", name, e)
+
+
+_WORKER_PID: int = os.getpid()
+
+
+def _read_local_ip() -> str:
+    """Best-effort: return the primary outbound IPv4 (for the discovery
+    layer to display alongside device_name). Opens a UDP socket to a
+    public IP without sending any packet, then reads the local endpoint.
+    Returns ``""`` on any failure (no IPv4 default route, etc.) so the
+    field is never the cause of a probe failure."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return ""
+
+
+_WORKER_IP: str = _read_local_ip()
+
+
+def _read_device_name() -> str:
+    """Resolve ``device_name`` from ``config.json["base"]``.
+
+    Used as the FastDDS participant name suffix so LAN peers can
+    identify which board each worker is running on. Falls back to the
+    host's ``socket.gethostname()`` when the field is missing or
+    ``config.json`` is unreachable (workers running before the main
+    process, or in a stripped-down test environment).
+    """
+    try:
+        from app.services.config import get_config
+        base = get_config().get_section("base") or {}
+        v = (base.get("device_name") or "").strip()
+        if v:
+            return v
+    except Exception:  # noqa: BLE001
+        pass
+    return socket.gethostname()
 
 
 def _setup_logging(debug: bool) -> None:
@@ -128,6 +207,19 @@ def info_handler(state: dict, model_id: str,
         "load_time_sec":      state.get("load_time_sec"),
         "init_error":         state.get("init_error", ""),
         "rkai_available":     state.get("rkai_available", False),
+        # v0.8: provenance for the main process's boot probe — used
+        # to distinguish a local-orphan worker (same hostname as the
+        # main process) from a real LAN peer. Hostname is the
+        # authoritative signal; ``device_name`` is the user-facing
+        # label that shows up in the compute-config page's 网络发现
+        # column as ``<model> @ <device_name>``.
+        "pid":                _WORKER_PID,
+        "hostname":           socket.gethostname(),
+        "device_name":        _read_device_name(),
+        # Best-effort outbound IPv4 — shown as ``<device> @ <ip>`` in
+        # the network compute group header. Empty if the host has no
+        # default IPv4 route (offline / init failure).
+        "peer_ip":            _WORKER_IP,
     }
 
 
@@ -140,6 +232,18 @@ def load_handler(state: dict, model_id: str,
         return {
             "status": "error",
             "error": "npu_index 缺失：load action 必须传 npu_index",
+        }
+    # 资源预检：model_dir 不存在就直接报 missing_model_dir，不再去
+    # 撞 rknn（撞了也只是把 FileNotFoundError 当 init_error 报上去，
+    # 误诊为"启动失败"）。恢复路径：用户补完目录后再调一次 load，
+    # 这里的预检会重新走通。
+    model_dir = state.get("model_dir")
+    if model_dir is not None and not os.path.isdir(model_dir):
+        return {
+            "status": "missing_model_dir",
+            "npu_index": npu_index,
+            "model_dir": model_dir,
+            "error": f"模型目录不存在: {model_dir}",
         }
     # If already running on the same NPU, idempotent.
     if (state.get("status") == "running"
@@ -461,6 +565,16 @@ def main() -> int:
     model_id = args.model
     npu_index = args.npu
 
+    # 设置本进程 comm（"worker:<alias>"），让主进程 _find_workers_by_name()
+    # 能通过 /proc/<pid>/comm 找到我们做 dedup。必须在 _setup_logging 后
+    # 调，让 LOG.warning 报错时 comm 已经设上。
+    try:
+        from app.services.compute_registry import _worker_comm_name
+        comm_name = _worker_comm_name(model_id)
+        _set_comm_name(comm_name)
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("could not set comm name for %s: %s", model_id, e)
+
     # Resolve model_dir for the info reply (don't fail if missing).
     model_dir = None
     try:
@@ -501,8 +615,21 @@ def main() -> int:
     # State dict shared with the router callback. Initial status is
     # ``not_loaded`` — worker is alive and reachable, but has not
     # built an LLMSession yet (npu_index deferred to RPC load).
+    #
+    # 特殊状态 ``missing_model_dir``：worker 启动时就发现 model_dir 不
+    # 存在 —— 不是 init 失败，是"压根没料"。load_handler 看到这状态
+    # 直接返回，不会去碰 rknn；UI 那边在算力卡上显示"模型目录不存在"
+    # 而不是"启动失败"。这样把"环境/资源缺失"和"实际启动出错"区分
+    # 干净，banner / 错误归类也对得上。
+    initial_status = "not_loaded"
+    if model_dir is not None and not os.path.isdir(model_dir):
+        initial_status = "missing_model_dir"
+        LOG.warning(
+            "model_dir %s does not exist; worker %s will report "
+            "missing_model_dir instead of attempting init",
+            model_dir, model_id)
     _worker_state: dict = {
-        "status": "not_loaded",
+        "status": initial_status,
         "started_at": time.time(),
         "npu_index": None,
         "load_time_sec": None,
@@ -510,6 +637,7 @@ def main() -> int:
         "init_error": "",
         "session": None,
         "rkai_available": False,
+        "model_dir": model_dir,
     }
 
     # Reset module-level stop event in case main() is re-entered under
@@ -518,8 +646,9 @@ def main() -> int:
     _WORKER_STOP_EVENT = threading.Event()
     stop_event = _WORKER_STOP_EVENT
 
+    device_name = _read_device_name()
     hub = Hub(
-        participant_name=f"compute_worker-{model_id}",
+        participant_name=f"compute_worker-{device_name}-{model_id}",
         domain_id=0,
         services=[f"wdndds/rpc/{model_id}"],
         callback=lambda svc, pl: router(

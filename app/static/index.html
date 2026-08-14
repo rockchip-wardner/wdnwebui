@@ -144,6 +144,15 @@
             <div class="bar"><div class="bar-fill" id="mem-bar"></div></div>
             <div class="metric-sub" id="mem-meta"></div>
           </div>
+
+          <div class="metric-card" id="card-disk">
+            <div class="metric-head">
+              <span class="metric-label">磁盘剩余</span>
+              <span class="metric-value" id="disk-percent">--</span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="disk-bar"></div></div>
+            <div class="metric-sub" id="disk-meta"></div>
+          </div>
         </div>
 
         <section class="thermal-section">
@@ -181,6 +190,36 @@
           </details>
         </section>
 
+        <section class="worker-section">
+          <header class="section-header">
+            <h3>Worker 进程</h3>
+            <span class="badge" id="worker-badge">--</span>
+          </header>
+          <div id="worker-message" class="npu-message hidden"></div>
+          <div class="worker-table-wrap">
+            <table class="worker-table">
+              <thead>
+                <tr>
+                  <th>PID</th>
+                  <th>PPID</th>
+                  <th>comm</th>
+                  <th>model</th>
+                  <th>状态</th>
+                  <th>RSS</th>
+                  <th>启动时间</th>
+                </tr>
+              </thead>
+              <tbody id="worker-tbody">
+                <tr class="worker-empty"><td colspan="7">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <details class="raw-output">
+            <summary>完整 JSON</summary>
+            <pre id="worker-raw"></pre>
+          </details>
+        </section>
+
         <details class="raw-output">
           <summary>完整 JSON</summary>
           <pre class="payload" id="data-system-monitor"></pre>
@@ -199,8 +238,8 @@
         <form class="bc-form" id="base-config-form" autocomplete="off">
           <section class="bc-section">
             <header class="bc-section-head">
-              <h3>设备</h3>
-              <span class="bc-hint">设备标识</span>
+              <h3>设备注册</h3>
+              <span class="bc-hint">本机注册到网络的标识与硬件能力</span>
             </header>
             <div class="bc-field">
               <label class="bc-label" for="bc-device-name">设备名</label>
@@ -212,6 +251,15 @@
                      maxlength="64" />
               <div class="bc-meta">
                 <span class="bc-hint">网络中注册发现的名字</span>
+              </div>
+            </div>
+            <div class="bc-field" id="bc-hw-caps-section">
+              <label class="bc-label">硬件能力 (HW)</label>
+              <div class="bc-hw-caps-list" id="bc-hw-caps-list">
+                <div class="bc-status">加载中…</div>
+              </div>
+              <div class="bc-meta">
+                <span class="bc-hint">本机对外公开的硬件能力；与“注册发现”页同步。取消勾选会从 <code>config.json["compute"]["hardware_capabilities"]</code> 中写入 <code>false</code>；保存后立即生效。</span>
               </div>
             </div>
           </section>
@@ -242,19 +290,6 @@
                 <span class="bc-status" id="bc-resource-dir-status">--</span>
                 <span class="bc-hint">视频检测等页面"浏览设备"将以该目录为根 (绝对路径，以 / 开头)</span>
               </div>
-            </div>
-          </section>
-
-          <section class="bc-section" id="bc-hw-caps-section">
-            <header class="bc-section-head">
-              <h3>硬件能力 (HW)</h3>
-              <span class="bc-hint">本机对外公开的硬件能力；与“注册发现”页同步。</span>
-            </header>
-            <div class="bc-hw-caps-list" id="bc-hw-caps-list">
-              <div class="bc-status">加载中…</div>
-            </div>
-            <div class="bc-meta">
-              <span class="bc-hint">取消勾选会从 <code>config.json["compute"]["hardware_capabilities"]</code> 中写入 <code>false</code>；保存后立即生效。</span>
             </div>
           </section>
 
@@ -298,10 +333,17 @@
           <div class="cc-divider" aria-hidden="true"></div>
           <div class="cc-col cc-col-peer">
             <header class="cc-col-head">
-              <h3>网络发现</h3>
-              <span class="cc-col-hint">从 DDS 发现的 peer worker；只读，不可启用 / 停用 / 重启</span>
+              <h3>网络算力</h3>
+              <span class="cc-col-hint">按远端设备分组（&lt;设备名&gt;@&lt;IP&gt;），每框内 4 张卡片；只读，不可启用 / 停用 / 重启</span>
             </header>
-            <div class="cc-services cc-services-peer" id="cc-peer-cards"></div>
+            <div class="cc-services cc-services-peer" id="cc-peer-cards">
+              <div class="cc-peer-empty" id="cc-peer-empty">
+                <div class="cc-peer-empty-text">
+                  尚未发现 LAN 上的 peer compute worker。<br/>
+                  确认其他设备已启动 compute_worker 进程后等待约 5 秒，或刷新本页。
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1157,11 +1199,11 @@
               <span class="tts-label">播放到</span>
               <div class="tts-playto" role="radiogroup" aria-label="播放目标">
                 <label class="tts-playto-opt">
-                  <input type="radio" name="tts-play-to" value="device" checked />
+                  <input type="radio" name="tts-play-to" value="device" />
                   <span>设备</span>
                 </label>
                 <label class="tts-playto-opt">
-                  <input type="radio" name="tts-play-to" value="browser" />
+                  <input type="radio" name="tts-play-to" value="browser" checked />
                   <span>浏览器</span>
                 </label>
                 <label class="tts-playto-opt">
@@ -1312,6 +1354,6 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js?v=41" defer></script>
+  <script src="/static/js/app.js?v=49" defer></script>
 </body>
 </html>

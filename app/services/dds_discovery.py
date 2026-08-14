@@ -142,8 +142,17 @@ class DdsDiscoveryManager:
             servers = compute_cfg.get("discovery_servers") or []
             if isinstance(servers, str):
                 servers = [s.strip() for s in servers.split(",") if s.strip()]
-            hub = _RpcHub(["_discovery_placeholder"], domain_id=0,
-                           discovery_servers=list(servers))
+            # v0.8: FastDDS participant_name 加 device_name 后缀，跟
+            # compute_worker / main process 的命名约定一致，方便 LAN
+            # daemon 的 /peers 端点调试时一眼认出是哪个板子。
+            base_cfg = get_config().get_section("base") or {}
+            dn = (base_cfg.get("device_name") or "").strip() or "pyrkaiweb"
+            hub = _RpcHub(
+                ["_discovery_placeholder"],
+                domain_id=0,
+                discovery_servers=list(servers),
+                participant_name=f"pyrkaiweb-discovery-{dn}",
+            )
             hub.start()
 
             with self._lock:

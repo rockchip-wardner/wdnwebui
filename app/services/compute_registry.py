@@ -33,15 +33,19 @@ snapshot 字段：
 """
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import logging
 import os
+import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from app.services.config import get_config
 
@@ -123,6 +127,224 @@ LOG = logging.getLogger("compute_registry")
 DEFAULT_ESTIMATED_INIT_SECONDS = 10
 
 
+# adopted peer "失联" 判定阈值：连续失败次数。
+# 失败间隔固定 ``time.sleep(2.0)``（见 _probe_instance），所以
+# ``>= _PEER_LOST_CONSECUTIVE_FAILURES`` 等价于大约
+# ``_PEER_LOST_CONSECUTIVE_FAILURES * 2`` 秒未收到 reply。
+# 当前 5 ≈ 10 秒，足够吃掉 LAN 上偶发的丢包 / participant 重协商，
+# 又能在真断电 / kill 场景下及时把卡片翻成 error。
+_PEER_LOST_CONSECUTIVE_FAILURES = 5
+
+
+def _read_device_name() -> str:
+    """Read ``device_name`` from ``config.json["base"]``.
+
+    Used both for the main process's ``Hub(participant_name=...)`` and
+    to compare against the ``hostname`` field on the worker's ``info``
+    response when deciding whether a probe hit is a local orphan vs
+    a real LAN peer. Falls back to ``socket.gethostname()`` when the
+    field is unset (so the participant_name is never empty).
+    """
+    try:
+        base = get_config().get_section("base") or {}
+        v = (base.get("device_name") or "").strip()
+        if v:
+            return v
+    except Exception:  # noqa: BLE001
+        pass
+    return socket.gethostname()
+
+
+def _find_orphan_worker_pid(model_id: str) -> Optional[int]:
+    """Back-compat shim — returns the first match from
+    :func:`_find_workers_by_name`. New callers should use the list
+    version directly.
+    """
+    pids = _find_workers_by_name(model_id)
+    return pids[0] if pids else None
+
+
+def _worker_comm_name(model_id: str) -> str:
+    """Compute the comm (process name) we set for this model's worker.
+
+    Format: ``worker:<alias>`` where ``<alias>`` is
+    ``MODEL_PRESETS[model_id]["worker_name"]``. The full string must
+    fit in 15 bytes (TASK_COMM_LEN - 1) for ``prctl(PR_SET_NAME)``.
+    The dedup walk reads ``/proc/<pid>/comm`` and matches on this
+    prefix.
+    """
+    preset = MODEL_PRESETS.get(model_id)
+    if preset is None:
+        alias = model_id[:8]
+    else:
+        alias = preset.get("worker_name") or model_id[:8]
+    full = f"worker:{alias}"
+    if len(full.encode("utf-8")) > 15:
+        # 兜底截断：保留 ``worker:`` 前缀 + alias 前缀
+        return full[:15]
+    return full
+
+
+def _set_comm_name_preexec(name: str):
+    """Return a ``preexec_fn`` for ``subprocess.Popen`` that calls
+    ``prctl(PR_SET_NAME, name)`` in the child between fork and exec.
+
+    The name is truncated to 15 bytes (TASK_COMM_LEN - 1) to match the
+    kernel limit. Failure is swallowed: a misnamed worker still works,
+    it just doesn't dedup by name.
+
+    Implementation note: ``subprocess.Popen`` pickles the preexec_fn
+    to send it across the fork boundary, so the inner function must
+    not close over any non-picklable object. A ``ctypes.CDLL`` handle
+    is NOT picklable, so we acquire libc inside the inner function
+    on every call (cheap — it's a no-op after the first mmap, and
+    preexec_fn runs once per spawn).
+    """
+    PR_SET_NAME = 15
+    name_bytes = name.encode("utf-8")[:15]
+
+    def _set():
+        try:
+            libc = ctypes.CDLL(ctypes.util.find_library("c"),
+                               use_errno=True)
+            libc.prctl(PR_SET_NAME, name_bytes, 0, 0, 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _set
+
+
+def _find_workers_by_name(model_id: str) -> List[int]:
+    """Walk ``/proc/*/comm`` looking for processes whose comm equals
+    the canonical name for this model's worker (``worker:<alias>``).
+
+    PR_SET_NAME only writes the comm field (visible in ``ps -c`` /
+    ``top`` / ``/proc/<pid>/comm``); ``/proc/<pid>/cmdline`` is
+    unchanged and still shows the original ``python -u ...`` argv.
+    Walking ``comm`` is both faster and unambiguous: two workers
+    spawned from different sources but serving the same model will
+    both have the same comm, so the dedup will catch them.
+
+    For backward compat with workers spawned by the *old* code path
+    (before the preexec_fn change), we also fall back to a cmdline
+    substring match on
+    ``compute_worker.py\x00--model\x00<model_id>\x00`` —
+    those workers have ``comm="python"`` (the default) and would
+    otherwise slip through the dedup and keep consuming NPU memory.
+    Once every old worker has been replaced by a new one (one
+    reload after deploy), the cmdline branch becomes a no-op.
+
+    Returns all matching PIDs (potentially many — a reload storm can
+    leave several orphans). The caller is expected to adopt one and
+    clean the rest.
+    """
+    own_pid = os.getpid()
+    comm_needle = _worker_comm_name(model_id).encode("utf-8")
+    # cmdline 里 argv 各元素以 \x00 分隔，不是空格：
+    #   b'/.../python\x00-u\x00/.../compute_worker.py\x00--model\x00qwen3-vl-4b\x00'
+    cmdline_needle = (
+        f"compute_worker.py\x00--model\x00{model_id}\x00".encode("utf-8"))
+    pids: List[int] = []
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == own_pid:
+                continue
+            # 先查 comm（新 worker）
+            try:
+                with open(f"/proc/{pid}/comm", "rb") as f:
+                    comm = f.read().rstrip(b"\x00").rstrip()
+            except (OSError, FileNotFoundError):
+                continue
+            if comm == comm_needle:
+                pids.append(pid)
+                continue
+            # fallback：老 worker（comm 没设），靠 cmdline 认
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read()
+            except (OSError, FileNotFoundError):
+                continue
+            if cmdline_needle in cmdline:
+                pids.append(pid)
+    except OSError:
+        pass
+    return pids
+
+
+def _pid_alive(pid: int) -> bool:
+    """``kill(pid, 0)`` returns 0 if the process exists and we have
+    permission, raises ``ProcessLookupError`` if it's gone, or
+    ``PermissionError`` if it exists but isn't ours. Both of the
+    errors mean "not killable by us" — treat as not alive for the
+    purposes of the orphan-cleanup wait loop.
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _terminate_orphan_pids(pids: List[int], grace_sec: int = 5) -> int:
+    """SIGTERM the given PIDs, wait up to ``grace_sec`` for graceful
+    exit, then SIGKILL the stragglers. Returns the count of PIDs we
+    managed to send SIGTERM to.
+
+    PIDs that we lack permission to signal (PermissionError) are
+    skipped silently — that's another process's worker, not ours to
+    reap (e.g. ``adopted`` peer workers, which are the other
+    board's responsibility). The dedup walk in this module only ever
+    looks at local workers so in practice this shouldn't fire, but
+    the defensive check keeps the function safe to call on
+    "what if it's a peer" inputs.
+    """
+    if not pids:
+        return 0
+    sent = 0
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            LOG.info("sent SIGTERM to orphan worker pid=%d", pid)
+            sent += 1
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            LOG.warning("permission denied SIGTERM pid=%d (likely peer-owned)", pid)
+    deadline = time.time() + grace_sec
+    survivors = list(pids)
+    while survivors and time.time() < deadline:
+        time.sleep(0.2)
+        survivors = [p for p in survivors if _pid_alive(p)]
+    for pid in survivors:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            LOG.warning("SIGKILL stubborn orphan worker pid=%d", pid)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            LOG.error("permission denied SIGKILL pid=%d", pid)
+    return sent
+
+
+def _resolve_worker_model_id(comm: str) -> Optional[str]:
+    """Reverse-lookup: given a comm string (e.g. ``worker:llm-8b``),
+    return the ``model_id`` whose ``MODEL_PRESETS[model_id].worker_name``
+    matches the suffix. Returns ``None`` for unknown comms (e.g.
+    ``worker:debug``, future aliases not in the preset table).
+    """
+    prefix = "worker:"
+    if not comm.startswith(prefix):
+        return None
+    alias = comm[len(prefix):]
+    for mid, preset in MODEL_PRESETS.items():
+        if preset.get("worker_name") == alias:
+            return mid
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # preset 映射表                                                              #
 # --------------------------------------------------------------------------- #
@@ -185,6 +407,9 @@ MODEL_PRESETS: dict[str, dict] = {
         "estimated_init_seconds": 60,
         "capability_types": ["swcap_video_describe"],
         "instance_name":    "llm-vl",
+        "worker_name":      "vlm-4b",          # comm = "worker:vlm-4b"（15 chars）
+        "description":      "视频描述模型",
+        "available_targets": ["182x"],   # .1828.rknn 权重 — RK182x 协卡
     },
     "qwen3-tts": {
         "label":            "Qwen3-TTS",
@@ -194,6 +419,9 @@ MODEL_PRESETS: dict[str, dict] = {
         "estimated_init_seconds": 30,
         "capability_types": ["swcap_audio_tts"],
         "instance_name":    "llm-tts",
+        "worker_name":      "tts",             # comm = "worker:tts"（10 chars）
+        "description":      "文字转语音模型",
+        "available_targets": ["182x"],
     },
     "qwen3-8b": {
         "label":            "Qwen3-8B",
@@ -203,15 +431,25 @@ MODEL_PRESETS: dict[str, dict] = {
         "estimated_init_seconds": 60,
         "capability_types": ["swcap_text_chat"],
         "instance_name":    "llm-chat",
+        "worker_name":      "llm-8b",          # comm = "worker:llm-8b"（12 chars）
+        "description":      "文字对话模型",
+        "available_targets": ["182x"],
     },
     "qwen3-vl-embedding-2b": {
-        "label":            "Qwen3-VL-Embedding-2B",
+        # v0.9 第一次缩成 "Qwen3-VL-Embed-2B"（16 字符），还是嫌长。
+        # 再缩成 "Qwen3-VLEmb-2B"（14 字符）—— "VL" + "Emb" 当连续
+        # 缩写，符合 rkai 圈子常见写法（"VLE" / "Emb" 已是行业缩略）。
+        # 文件名 / model_dir_name 不动，只改 UI label。
+        "label":            "Qwen3-VLEmb-2B",
         "preset_factory":   _qwen3_vl_embedding_2b_spec,
         "model_dir_name":   "Qwen3-VL-Embedding-2B",
         "memory_estimate_mb": 2000,        # ~1GB 权重 + 622MB embed 表 + vision
         "estimated_init_seconds": 30,      # 加载两个 rknn + embed 表
         "capability_types": ["swcap_video_retrieval"],
         "instance_name":    "llm-embed",
+        "worker_name":      "emb-2b",          # comm = "worker:emb-2b"（12 chars）
+        "description":      "视觉信息编码模型",
+        "available_targets": ["182x"],
     },
 }
 
@@ -268,18 +506,32 @@ class ModelInstance:
     finished_at: float = 0.0
     load_time_sec: Optional[float] = None
     loaded_at: Optional[float] = None
+    # 模型目录（worker probe 解析出来；missing_model_dir 状态时主进程
+    # 据此决定 UI 怎么显示）。
+    model_dir: str = ""
     # RPC subprocess state
     proc: Optional[subprocess.Popen] = None
     rpc_client: Any = None
     rpc_session_proxy: Any = None
     _probe_thread: Optional[threading.Thread] = None
     # Provenance / discovery
-    _source: str = "spawned"                    # "spawned" | "adopted"
+    _source: str = "spawned"                    # "spawned" | "adopted_local" | "adopted" | "unavailable"
     _peer_guid: str = ""                       # adopted: peer participant GUID
-    _peer_name: str = ""                       # adopted: peer participant name
+    _peer_name: str = ""                       # adopted: peer participant name (or "<device> @ <host>")
+    _peer_ip: str = ""                         # adopted: peer worker's outbound IPv4 (best-effort)
+    _peer_pid: int = 0                          # adopted: responder's PID (for cross-check / kill)
 
     def to_dict(self) -> dict:
-        pid = self.proc.pid if (self.proc is not None) else 0
+        # spawned: PID 来自自己 Popen 的子进程；adopted_local: 来自 probe
+        # info（孤儿 worker 的真实 PID）；adopted: 同上（远端 peer）；
+        # unavailable: 0.
+        if self.proc is not None:
+            pid = self.proc.pid
+        elif self._source in ("adopted_local", "adopted") and self._peer_pid:
+            pid = self._peer_pid
+        else:
+            pid = 0
+        preset = MODEL_PRESETS.get(self.model_id, {})
         return {
             "npu_index":          self.npu_index,
             "model_id":           self.model_id,
@@ -290,17 +542,22 @@ class ModelInstance:
             "stderr_full":        self.stderr_full,
             "capability_types":   list(self.capability_types),
             "memory_estimate_mb": self.memory_estimate_mb,
+            "description":        preset.get("description", ""),
+            "available_targets":  list(preset.get("available_targets", ["182x"])),
+            "model_dir":          self.model_dir,
             "device_id":          self.device_id.decode("utf-8", errors="replace")
                                     if self.device_id else None,
             "queued_at":          self.queued_at,
             "started_at":         self.started_at,
-            "finished_at":        self.finished_at,
+            "finished_at":         self.finished_at,
             "load_time_sec":      self.load_time_sec,
             "loaded_at":          self.loaded_at,
             "pid":                pid,
             "_source":            self._source,
             "_peer_guid":         self._peer_guid,
             "_peer_name":         self._peer_name,
+            "_peer_ip":           self._peer_ip,
+            "_peer_pid":          self._peer_pid,
         }
 
 
@@ -351,16 +608,17 @@ class ComputeRegistry:
             # is empty (SIMPLE discovery, single-host) when no
             # daemon is configured.
             discovery_servers = self._read_discovery_servers()
+            device_name = _read_device_name()
             self._hub = _RpcHub(
-                participant_name="pyrkaiweb-main",
+                participant_name=f"pyrkaiweb-main-{device_name}",
                 domain_id=0,
                 discovery_servers=discovery_servers,
             )
             self._hub.start()
             LOG.info(
                 "ComputeRegistry Hub started: services=%s "
-                "discovery_servers=%s",
-                service_names, discovery_servers)
+                "discovery_servers=%s participant_name=pyrkaiweb-main-%s",
+                service_names, discovery_servers, device_name)
         except Exception as e:  # noqa: BLE001
             LOG.exception("ComputeRegistry Hub bring-up failed")
             self._cards_failed = str(e)
@@ -465,11 +723,39 @@ class ComputeRegistry:
             out.append({
                 "id":                 model_id,
                 "label":              preset["label"],
+                "description":        preset.get("description", ""),
                 "exists":             d.is_dir() if d else None,
                 "memory_estimate_mb": preset["memory_estimate_mb"],
                 "capability_types":   list(preset["capability_types"]),
+                "available_targets":  list(preset.get("available_targets", ["182x"])),
             })
         return out
+
+    # ------------------------------------------------------------------ #
+    # Error state management                                            #
+    # ------------------------------------------------------------------ #
+    def clear_error(self, model_id: Optional[str] = None) -> int:
+        """清空一个（或全部）错误实例的 ``error`` 字段并把状态翻回
+        ``not_loaded``，让 UI 上的红色 banner 消失、用户可以从 toggle
+        重试启用。
+
+        不会重启 / 卸载 worker —— 仅清错误显示 + 允许重试。Worker
+        进程本身仍然在跑（如果还活着），下一次走 RPC load 即可。
+
+        Returns the number of instances cleared.
+        """
+        cleared = 0
+        with self._lock:
+            for inst in self._instances.values():
+                if model_id is not None and inst.model_id != model_id:
+                    continue
+                if inst.status != "error" and not inst.error:
+                    continue
+                inst.error = ""
+                inst.status = "not_loaded"
+                inst.stderr_full = ""
+                cleared += 1
+        return cleared
 
     # ------------------------------------------------------------------ #
     # Snapshot                                                           #
@@ -622,12 +908,33 @@ class ComputeRegistry:
         Service + Replier online and waits in ``not_loaded`` state
         until the main process sends ``{"action":"load","npu_index":N}``.
 
-        Returns the new ``ModelInstance`` keyed ``(-1, model_id)``.
+        v0.8 dedup: before spawning, scan ``/proc`` for any pre-existing
+        ``compute_worker.py --model <id>`` process. If found, refuse to
+        spawn a duplicate and instead adopt the existing one (handles
+        the uvicorn-reload orphan case where a previous main process
+        spawned a worker that survived SIGTERM).
+
+        Returns the new ``ModelInstance`` keyed ``(-1, model_id)``, or
+        the adopted one if dedup kicks in.
         """
         if model_id not in MODEL_PRESETS:
             raise ValueError(f"未知 model: {model_id!r}")
-        if model_id not in MODEL_PRESETS:
-            raise ValueError(f"未知 model: {model_id!r}")
+        # 1. 进程级 dedup：扫 /proc 同 comm 名的 worker（取代旧 cmdline substring 匹配）
+        orphan_pids = _find_workers_by_name(model_id)
+        if orphan_pids:
+            LOG.warning(
+                "spawn skipped: %d existing %s worker(s) found (pids=%s); "
+                "adopting one and cleaning the rest",
+                len(orphan_pids), model_id, orphan_pids)
+            adopted = self._adopt_existing_worker(model_id)
+            if adopted is not None:
+                return adopted
+            # adopt 失败（probe 超时等）降级到 spawn，避免完全阻塞启用流程
+        # 2. 让 ensure_worker_for_model 阶段不重复进入
+        with self._lock:
+            for inst in self._instances.values():
+                if inst.model_id == model_id:
+                    return inst
         preset = MODEL_PRESETS[model_id]
         inst = ModelInstance(
             key=(-1, model_id),
@@ -661,6 +968,11 @@ class ComputeRegistry:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
+                # 注意：进程 comm 是在 worker 端 main() 里
+                # _set_comm_name(...) 调的，不是在 preexec_fn 里
+                # —— preexec_fn 设的 PR_SET_NAME 会被紧随的 exec() 覆盖
+                # （新 argv[0] basename 变成 comm）。所以这里不传
+                # preexec_fn，命名逻辑下沉到 compute_worker.py。
             )
             inst.proc = proc
         except Exception as e:
@@ -702,10 +1014,23 @@ class ComputeRegistry:
     def _adopt_existing_worker(self, model_id: str) -> Optional[ModelInstance]:
         """Probe the LAN daemon for a peer worker providing
         ``wdndds/rpc/<model_id>``. If found, register a ``ModelInstance``
-        pointing at it (proc=None, _source='adopted').
+        pointing at it (proc=None).
 
-        Returns the adopted instance or ``None`` if no peer is
-        responding within ~1.5 s.
+        v0.8 distinguishes two flavours of probed worker:
+
+        * ``_source="adopted_local"`` — the responder's ``hostname``
+          matches ``socket.gethostname()`` of the main process. This
+          is a leftover worker from a previous uvicorn reload (Popen
+          ``start_new_session=True`` workers detach from the parent
+          process group and survive SIGTERM). The UI shows it in the
+          本地算力 column but disables 禁用/重启 (only bind/load
+          operations make sense against a worker we don't own).
+        * ``_source="adopted"`` — the responder is on a different host.
+          Shown in the 网络发现 column as ``<model> @ <device_name>``
+          (read-only, no bind).
+
+        Returns the adopted instance or ``None`` if no peer / orphan
+        responds within ~1.5 s.
         """
         if model_id not in MODEL_PRESETS:
             return None
@@ -714,6 +1039,29 @@ class ComputeRegistry:
             return None
         preset = MODEL_PRESETS[model_id]
         worker_npu = info.get("npu_index")
+        worker_pid = info.get("pid")
+        worker_host = (info.get("hostname") or "").strip()
+        worker_device = (info.get("device_name") or "").strip()
+        local_host = socket.gethostname()
+        is_local = bool(worker_host) and worker_host == local_host
+        if is_local:
+            source = "adopted_local"
+            label_host = worker_device or local_host
+            if isinstance(worker_pid, int):
+                # 本机孤儿：device_name（"本机"标注 + PID 排查用）
+                peer_name = f"{label_host}（本机 pid={worker_pid}）"
+            else:
+                peer_name = f"{label_host}（本机）"
+        else:
+            source = "adopted"
+            # 远端 peer：优先返回 device_name（用户配的易记名），UI 拼接
+            # ``@<device_name>``；hostname 兜底显示在 _makePeerCard 的 peer-id 行
+            if worker_device:
+                peer_name = worker_device
+            elif worker_host:
+                peer_name = worker_host
+            else:
+                peer_name = "远端"
         inst = ModelInstance(
             key=(-1, model_id),
             npu_index=worker_npu if isinstance(worker_npu, int) else -1,
@@ -727,10 +1075,15 @@ class ComputeRegistry:
             finished_at=info.get("loaded_at"),
             load_time_sec=info.get("load_time_sec"),
             loaded_at=info.get("loaded_at"),
-            _source="adopted",
+            _source=source,
             _peer_guid=info.get("_peer_guid", ""),
-            _peer_name=info.get("_peer_name", ""),
+            _peer_name=peer_name,
+            _peer_ip=info.get("peer_ip", ""),
         )
+        # 把远端进程的真实 PID 暴露给 UI，让用户能 cross-check
+        # ps -ef pkill（避免 reload 留下的同 model 孤儿进程被误判）。
+        if isinstance(worker_pid, int):
+            inst._peer_pid = worker_pid
         try:
             self._setup_rpc_client(inst)
         except Exception as e:  # noqa: BLE001
@@ -753,8 +1106,23 @@ class ComputeRegistry:
         )
         inst._probe_thread = probe
         probe.start()
-        LOG.info("adopted peer worker for %s (guid=%s npu=%s status=%s)",
-                 model_id, inst._peer_guid, inst.npu_index, inst.status)
+        LOG.info("adopted %s worker for %s (source=%s name=%s npu=%s status=%s)",
+                 source, model_id, source, inst._peer_name,
+                 inst.npu_index, inst.status)
+
+        # 接管完后清理同一 model 的多余孤儿（同 comm 名但 probe 没接上的 PID）。
+        # 这是修 uvicorn-reload 留下的 NPU 内存泄漏的关键：
+        # 旧实现 _find_orphan_worker_pid 只返第一个 PID，剩下的孤儿无人收；
+        # 现在按 comm 名扫出全部，probe 接走一个，剩下的 SIGTERM → 等 5s → SIGKILL。
+        if isinstance(worker_pid, int):
+            existing_pids = _find_workers_by_name(model_id)
+            extras = [p for p in existing_pids if p != worker_pid]
+            if extras:
+                LOG.warning(
+                    "adopted %s from pid=%d; cleaning %d extra orphan(s): %s",
+                    model_id, worker_pid, len(extras), extras)
+                self._terminate_orphan_pids(extras, grace_sec=5)
+
         return inst
 
     # Legacy single-step entry point kept for back-compat with code
@@ -794,45 +1162,93 @@ class ComputeRegistry:
         return self._spawn_compute_worker(model_id)
 
     def bind_instance(self, model_id: str, npu_index: int) -> ModelInstance:
-        """RPC ``load`` with the chosen npu_index → worker instantiates
-        ``LLMSession``. ``inst.npu_index`` and ``inst.key`` are updated.
+        """v0.8 fire-and-forget：立即把 ``inst.status="loading"`` 返回，
+        让前端 1Hz tick 看到 loading 状态 + 倒计时；后台线程跑 RPC
+        ``load``，完成后翻 status=running / error，失败时 npu_index
+        回退 -1。
 
-        Raises ``RuntimeError`` if the instance is adopted (proc is
-        None) — only locally-spawned workers can be bound from this
-        machine.
+        v0.7 之前是同步阻塞等 RPC load（120s timeout）—— 前端
+        ``await fetch POST`` 卡 60s 才看到状态变化，用户体验
+        "点了就变蓝，不知道什么时候加载完"。fire-and-forget 后
+        用户能看到 is-load 脉动 + 倒计时（"约 30s"），加载完成
+        toggle 切到 running 绿色 + 显示加载耗时。
+
+        Raises ``RuntimeError`` for pre-flight checks (peer source,
+        no RPC client, bad npu_index). The RPC call itself is async
+        — its failures land on ``inst.status = "error"`` + ``inst.error``.
         """
+        import threading
+
         inst = self._find_by_model(model_id)
         if inst is None:
             raise RuntimeError(f"本地无 {model_id} 的 worker")
-        if inst.proc is None:
+        if inst._source == "adopted":
             raise RuntimeError(
                 f"{model_id} 是 peer 提供的 service，本机无权 bind")
         if inst.rpc_client is None:
             raise RuntimeError(f"{model_id} worker RPC client 未就绪")
         if not isinstance(npu_index, int) or npu_index < 0:
             raise RuntimeError(f"npu_index 非法: {npu_index!r}")
-        r = inst.rpc_client.call(
-            {"action": "load", "npu_index": npu_index},
-            timeout_ms=120_000,
-        )
-        if not r.get("ok"):
-            raise RuntimeError(
-                f"{model_id} load RPC failed: {r.get('error')}")
-        data = r.get("data") or {}
-        if data.get("status") == "error":
-            raise RuntimeError(
-                f"{model_id} load worker error: {data.get('init_error', '')}")
-        new_key = (npu_index, model_id)
+
+        # 乐观更新：前端 1Hz tick 立即看到 status="loading" + npu_index。
+        # key 不变 —— 同一个 model 在加载期间应仍是 (-1, model_id)；
+        # 加载成功后异步改成 (npu_index, model_id)。
         with self._lock:
-            self._instances.pop(inst.key, None)
             inst.npu_index = npu_index
-            inst.key = new_key
-            inst.status = data.get("status", "running")
-            inst.load_time_sec = data.get("load_time_sec")
-            inst.loaded_at = data.get("loaded_at")
-            self._instances[new_key] = inst
-        LOG.info("bound %s @ npu=%d (load=%.1fs)",
-                 model_id, npu_index, inst.load_time_sec or 0.0)
+            inst.status = "loading"
+            inst.started_at = time.time()
+            inst.error = ""
+        inst._bind_inflight = True
+
+        def _run_load():
+            try:
+                r = inst.rpc_client.call(
+                    {"action": "load", "npu_index": npu_index},
+                    timeout_ms=120_000,
+                )
+                data = (r or {}).get("data") or {}
+                if not (r or {}).get("ok"):
+                    err_msg = (r or {}).get("error") or "RPC failed"
+                    with self._lock:
+                        inst.status = "error"
+                        inst.error = str(err_msg)
+                        inst.npu_index = -1
+                    LOG.warning("bind %s load RPC failed: %s",
+                                model_id, err_msg)
+                    return
+                if data.get("status") == "error":
+                    err_msg = data.get("init_error", "load worker error")
+                    with self._lock:
+                        inst.status = "error"
+                        inst.error = str(err_msg)
+                        inst.npu_index = -1
+                    LOG.warning("bind %s load worker error: %s",
+                                model_id, err_msg)
+                    return
+                # 翻 running + 更新 key + 加载耗时
+                new_key = (npu_index, model_id)
+                with self._lock:
+                    if inst.key != new_key:
+                        self._instances.pop(inst.key, None)
+                        inst.key = new_key
+                        self._instances[new_key] = inst
+                    inst.status = data.get("status", "running")
+                    inst.load_time_sec = data.get("load_time_sec")
+                    inst.loaded_at = data.get("loaded_at")
+                    inst.finished_at = time.time()
+                LOG.info("bound %s @ npu=%d (load=%.1fs)",
+                         model_id, npu_index, inst.load_time_sec or 0.0)
+            except Exception as e:  # noqa: BLE001
+                with self._lock:
+                    inst.status = "error"
+                    inst.error = f"{type(e).__name__}: {e}"
+                    inst.npu_index = -1
+                LOG.exception("bind %s load raised", model_id)
+            finally:
+                inst._bind_inflight = False
+
+        threading.Thread(target=_run_load, daemon=True,
+                         name=f"compute-bind-{model_id}").start()
         return inst
 
     def unload_instance(self, model_id: str) -> None:
@@ -869,9 +1285,9 @@ class ComputeRegistry:
         inst = self._find_by_model(model_id)
         if inst is None:
             raise RuntimeError(f"{model_id} 不在 registry")
-        if inst.proc is None:
+        if inst._source == "adopted":
             raise RuntimeError(
-                f"{model_id} 是 peer 提供的 service，本机无权停止")
+                f"{model_id} 是远端 peer 提供的 service，本机无权停止")
         try:
             self.unload_instance(model_id)
         except Exception as e:  # noqa: BLE001
@@ -938,6 +1354,40 @@ class ComputeRegistry:
                 self.stop_instance_local(m)
             except Exception:  # noqa: BLE001
                 LOG.exception("stop_all_local: %s failed", m)
+
+    def restart_all_local(self) -> tuple[int, list[str]]:
+        """Restart every spawned worker (unload → shutdown → spawn).
+        Adopted peers untouched — they're owned by other machines.
+
+        Each model goes through the same Q3 4-step flow as a per-card
+        "重启" button click; after this call, every spawned worker is
+        back in ``not_loaded`` state and the user must re-select NPU on
+        the compute-config page to re-bind.
+
+        Returns ``(exit_code, log_lines)``:
+        * ``exit_code = 0`` — all spawned workers restarted OK, OR
+          there were no spawned workers to restart.
+        * ``exit_code = 1`` — at least one worker's restart failed
+          (others may still have succeeded; log lines carry details).
+        """
+        models: list[str] = []
+        with self._lock:
+            for inst in self._instances.values():
+                if inst.proc is not None:
+                    models.append(inst.model_id)
+        if not models:
+            return 0, ["无 spawned worker，跳过"]
+        lines: list[str] = []
+        any_fail = False
+        for m in models:
+            try:
+                self.restart_instance_local(m)
+                lines.append(f"{m}: 重启 OK")
+            except Exception as e:  # noqa: BLE001
+                LOG.exception("restart_all_local: %s failed", m)
+                lines.append(f"{m}: 失败 — {e}")
+                any_fail = True
+        return (1 if any_fail else 0), lines
 
     # ------------------------------------------------------------------ #
     # subprocess-mode spawn (wdndds cshim RPC)                           #
@@ -1032,6 +1482,8 @@ class ComputeRegistry:
                     "instance_name":      preset["instance_name"],
                     "capability_types":   list(preset["capability_types"]),
                     "memory_estimate_mb": preset["memory_estimate_mb"],
+                    "description":        preset.get("description", ""),
+                    "available_targets":  list(preset.get("available_targets", ["182x"])),
                     "status":             "unavailable",
                     "error":              "",
                     "npu_index":          -1,
@@ -1041,6 +1493,7 @@ class ComputeRegistry:
                     "_source":            "unavailable",
                     "_peer_guid":         "",
                     "_peer_name":         "",
+                    "_peer_ip":           "",
                 })
                 continue
             d = inst.to_dict()
@@ -1063,6 +1516,12 @@ class ComputeRegistry:
         Workers are NOT bound to an NPU at boot; they wait in
         ``not_loaded`` until the user clicks 启用 on the compute-config
         page (which triggers ``bind_instance``).
+
+        末尾跑一次 :meth:`_cleanup_unregistered_workers` 兜底扫一遍
+        ``/proc/*/comm``，杀掉 registry 没接管、但 comm 以 ``worker:``
+        开头的进程（理论上 ``_adopt_existing_worker`` 内已经清过一遍，
+        这里只是防 probe 漏掉、或用户在 boot 期间手动启了 worker 的
+        极端情况）。
         """
         try:
             self.list_cards()
@@ -1099,6 +1558,69 @@ class ComputeRegistry:
                 self._spawn_compute_worker(model_id)
             except Exception as e:  # noqa: BLE001
                 LOG.warning("boot spawn %s failed: %s", model_id, e)
+        # boot 末尾总清扫：处理 config 移除某 service 后残留的孤儿、
+        # 以及 _adopt 阶段 probe 漏掉的边界情况。
+        try:
+            self._cleanup_unregistered_workers()
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("boot cleanup sweep failed: %s", e)
+
+    def _cleanup_unregistered_workers(self) -> int:
+        """Boot-time defensive sweep.
+
+        对每个在 ``config.compute.services`` 列出的 model 调
+        :func:`_find_workers_by_name`（先按 comm、再 fallback cmdline
+        兼容老 worker），扫出所有同名进程：
+          * 已经在 registry 里的（spawned 的 proc.pid / adopted_local
+            的 _peer_pid）→ 保留；
+          * 剩下的（不在 registry 但 comm/cmdline 匹配）→ 视为孤儿，
+            SIGTERM → 5s grace → SIGKILL。
+
+        对**不在** config 里的 model_id 的孤儿 worker 也会扫（用
+        ``MODEL_PRESETS`` 全集）—— 用户从 config 删除某个 service
+        后，那个孤儿进程应该被回收，不能继续吃 NPU 内存。
+
+        Returns the count of PIDs killed.
+        """
+        try:
+            configured = set(
+                get_config().get_section("compute", {}).get("services", []))
+        except Exception:
+            configured = set()
+
+        tracked_pids = set()
+        with self._lock:
+            for inst in self._instances.values():
+                if inst.proc is not None and inst.proc.pid:
+                    tracked_pids.add(inst.proc.pid)
+                if inst._source == "adopted_local":
+                    pid = getattr(inst, "_peer_pid", None)
+                    if isinstance(pid, int):
+                        tracked_pids.add(pid)
+
+        # 扫的范围：config 里的 + preset 全集（处理 user 从 config 删
+        # 掉的孤儿）。preset 里没的 model_id 不会被 _find_workers_by_name
+        # 误识（needle 不匹配），所以多扫也安全。
+        scan_targets = set(configured) | set(MODEL_PRESETS.keys())
+        orphans: List[int] = []
+        for model_id in scan_targets:
+            for pid in _find_workers_by_name(model_id):
+                if pid in tracked_pids:
+                    continue
+                orphans.append(pid)
+                if model_id in configured:
+                    LOG.warning(
+                        "cleanup: %s pid=%d not tracked; killing",
+                        model_id, pid)
+                else:
+                    LOG.warning(
+                        "cleanup: %s pid=%d no longer in "
+                        "config.compute.services; killing",
+                        model_id, pid)
+
+        if not orphans:
+            return 0
+        return _terminate_orphan_pids(orphans, grace_sec=5)
 
     def close_all(self) -> None:
         """Web shutdown: close the main process Hub ONLY.
@@ -1133,7 +1655,8 @@ class ComputeRegistry:
           * ``running``  — LLMSession is up; probe no longer needed
           * ``error``    — worker reported init_error / probe gave up
           * spawned worker subprocess exits (proc.poll() != None)
-          * adopted peer disappears (>= 3 consecutive RPC timeouts)
+          * adopted peer disappears (>= 10s of consecutive RPC timeouts,
+            controlled by ``_PEER_LOST_CONSECUTIVE_FAILURES``)
 
         For ``not_loaded`` / ``loading`` we keep polling indefinitely.
         Previously this loop had a 10-min deadline that incorrectly
@@ -1178,18 +1701,20 @@ class ComputeRegistry:
                         consecutive_failures += 1
                         LOG.warning("info call failed for %s (%d): %s",
                                    inst.model_id, consecutive_failures, e)
-                        # For adopted: after several consecutive failures
-                        # we conclude the peer is gone.
-                        if (inst.proc is None
-                                and consecutive_failures >= 3
+                        # For adopted (远端 peer): after several consecutive
+                        # failures we conclude the peer is gone. adopted_local
+                        # 跟 spawned 一样不算（它们是本机孤儿，不存在 "peer
+                        # 失联" 的概念）。
+                        if (inst._source == "adopted"
+                                and consecutive_failures >= _PEER_LOST_CONSECUTIVE_FAILURES
                                 and inst.status != "error"):
                             with self._lock:
                                 inst.status = "error"
                                 inst.error = "peer 已失联"
-                                LOG.warning(
-                                    "adopted peer %s lost (consecutive "
-                                    "RPC failures=%d)",
-                                    inst.model_id, consecutive_failures)
+                            LOG.warning(
+                                "adopted peer %s lost (consecutive "
+                                "RPC failures=%d)",
+                                inst.model_id, consecutive_failures)
                         time.sleep(2.0)
                         continue
                     if not r.get("ok"):
@@ -1199,6 +1724,10 @@ class ComputeRegistry:
                     consecutive_failures = 0
                     data = r.get("data") or {}
                     worker_status = data.get("status", "not_loaded")
+                    # 每轮都把 worker 报告的 model_dir 缓存到实例上——
+                    # missing_model_dir 状态时 UI 直接拿这个字段渲染路径。
+                    if isinstance(data.get("model_dir"), str) and data["model_dir"]:
+                        inst.model_dir = data["model_dir"]
                     if worker_status == "running":
                         with self._lock:
                             inst.status = "running"
@@ -1238,8 +1767,18 @@ class ComputeRegistry:
                     elif worker_status == "not_loaded":
                         with self._lock:
                             if inst.status not in {"not_loaded", "loading",
-                                                    "running", "error"}:
+                                                    "running", "error",
+                                                    "missing_model_dir"}:
                                 inst.status = "not_loaded"
+                    elif worker_status == "missing_model_dir":
+                        # 资源缺失：worker 启动时就发现 model_dir 不存在，
+                        # 或 load 时仍不存在。**不** exit probe —— 用户补
+                        # 完目录后可以再 toggle 重发 RPC load，probe 跑下
+                        # 一轮就能收敛到 running。
+                        with self._lock:
+                            inst.status = "missing_model_dir"
+                            inst.error = ""
+                            inst.finished_at = time.time()
 
                 time.sleep(1.0)
         except Exception as e:
