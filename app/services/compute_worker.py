@@ -539,10 +539,10 @@ def router(service_name: str, payload: Any, state: dict,
 # Main — wdndds cshim Hub as RPC server                                      #
 # --------------------------------------------------------------------------- #
 def _config_path() -> str:
-    """Resolve config.json path from PYRKAIWEB_CONFIG env var, defaulting
+    """Resolve config.json path from WDNWEBUI_CONFIG env var, defaulting
     to the repo root config.json."""
     import os
-    return os.environ.get('PYRKAIWEB_CONFIG') or '/userdata/pyrkaiweb/config.json'
+    return os.environ.get('WDNWEBUI_CONFIG') or '/userdata/wdnwebui/config.json'
 
 
 def main() -> int:

@@ -1,4 +1,4 @@
-# pyrkaiweb
+# wdnwebui
 
 A Python web service that exposes the Rockchip platform SDKs
 ([`wdnav`](https://10.10.10.10/wardner/wdnav) — MPP / RGA2 / V4L2 video,
@@ -24,8 +24,8 @@ target.
 ## 1. Clone
 
 ```bash
-git clone <this-repo-url> pyrkaiweb
-cd pyrkaiweb
+git clone <this-repo-url> wdnwebui
+cd wdnwebui
 ```
 
 ## 2. Create the virtualenv
@@ -148,7 +148,7 @@ edits show up on hard-refresh without restart.
 ## Layout
 
 ```
-pyrkaiweb/
+wdnwebui/
 ├── run.py                  # uvicorn entrypoint
 ├── app/
 │   ├── __init__.py         # __version__ string

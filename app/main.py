@@ -1,6 +1,6 @@
 """FastAPI application factory."""
 import logging
-LOG = logging.getLogger("pyrkaiweb")
+LOG = logging.getLogger("wdnwebui")
 import os
 from pathlib import Path
 
@@ -59,9 +59,9 @@ class NoCacheStaticMiddleware(BaseHTTPMiddleware):
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="pyrkaiweb",
+        title="wdnwebui",
         version=__version__,
-        description="pyrkaiweb service",
+        description="wdnwebui service",
     )
 
     app.add_middleware(NoCacheStaticMiddleware)

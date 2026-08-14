@@ -4,7 +4,7 @@ The web UI never sees a shell — every call goes through the
 ``subprocess`` API with a fixed argv list, so unit / priority filters
 can't break out into command injection. ``systemctl`` itself just
 needs read access to the systemd journal, which we have on the dev
-box (pyrkaiweb runs as root via ``sudo nohup``); on a locked-down
+box (wdnwebui runs as root via ``sudo nohup``); on a locked-down
 deployment we'd plug ``POLKITKIT``/an explicit `machinectl shell`
 in here.
 """

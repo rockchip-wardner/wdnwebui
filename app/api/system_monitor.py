@@ -364,7 +364,7 @@ def _sample_cpu_mem() -> dict:
 def _sample_disk() -> dict:
     """Snapshot 根挂载点的磁盘用量。
 
-    pyrkaiweb 在嵌入式板上模型权重、日志、uploads 全都往根盘或
+    wdnwebui 在嵌入式板上模型权重、日志、uploads 全都往根盘或
     ``/userdata`` 写 —— 满盘会让 rknn 加载失败、demo 写文件失败、
     journald 卡死。系统信息页顶部给一个"磁盘剩余"卡，比事后看
     dmesg 里 "no space left" 强。

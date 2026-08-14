@@ -50,7 +50,7 @@ WS 帧类型
 * ``done`` —— 一轮推理结束，附完整 thinking/answer + 性能数据。
 * ``error`` —— 推理异常或 capability 未启用。
 
-单例：``get_chat_service()``，lazy 构造，与 pyrkaiweb 其它服务风格一致。
+单例：``get_chat_service()``，lazy 构造，与 wdnwebui 其它服务风格一致。
 """
 from __future__ import annotations
 

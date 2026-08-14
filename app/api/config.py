@@ -12,7 +12,7 @@ Per-section (``base`` for now):
 - ``PUT /api/config/base`` — replace the ``base`` section (other
   top-level sections like future ``power`` are untouched)
 
-The runtime path is whatever ``PYRKAIWEB_CONFIG`` resolved to (see
+The runtime path is whatever ``WDNWEBUI_CONFIG`` resolved to (see
 ``run.py --config``); export always serves that exact file.
 """
 from __future__ import annotations

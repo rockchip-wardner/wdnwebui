@@ -5576,7 +5576,7 @@ const DiscoveryDds = {
       switch (snap.state) {
         case "ready":
           summary.textContent =
-            `已注册为「${snap.device_name || "pyrkaiweb"}」 · domain=0 · ` +
+            `已注册为「${snap.device_name || "wdnwebui"}」 · domain=0 · ` +
             `对端 ${snap.discovered_count} 个`;
           break;
         case "starting":

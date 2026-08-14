@@ -12,7 +12,7 @@ Note: in v0.4 the per-model compute_worker subprocesses are
 **NOT** advertised through this Hub — they communicate with the
 main process over the wdndds RPC layer (cshim-based) which is
 separate from discovery. The discovery Hub is reserved for
-inter-device (cross-pyrkaiweb) service discovery in future
+inter-device (cross-wdnwebui) service discovery in future
 multi-board setups.
 """
 
@@ -146,12 +146,12 @@ class DdsDiscoveryManager:
             # compute_worker / main process 的命名约定一致，方便 LAN
             # daemon 的 /peers 端点调试时一眼认出是哪个板子。
             base_cfg = get_config().get_section("base") or {}
-            dn = (base_cfg.get("device_name") or "").strip() or "pyrkaiweb"
+            dn = (base_cfg.get("device_name") or "").strip() or "wdnwebui"
             hub = _RpcHub(
                 ["_discovery_placeholder"],
                 domain_id=0,
                 discovery_servers=list(servers),
-                participant_name=f"pyrkaiweb-discovery-{dn}",
+                participant_name=f"wdnwebui-discovery-{dn}",
             )
             hub.start()
 

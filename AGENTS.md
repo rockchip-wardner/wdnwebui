@@ -4,7 +4,7 @@ Compact guide for OpenCode sessions in this repo.
 
 ## What this repo is
 
-Python web service (`pyrkaiweb`) exposing RK-platform hardware / model SDKs
+Python web service (`wdnwebui`) exposing RK-platform hardware / model SDKs
 (`wdnav`, `wdnai`) over HTTP via FastAPI. Brand-new repo (no commits yet at
 creation); everything below is verified against the current tree.
 
@@ -109,7 +109,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   topic 通路。
 * **多 NPU 跨子组件**：当前 `ModelInstance.npu_index: int` 单值；
   后续 vision@NPU0 + llm@NPU1 这种「一个 model 跨多 NPU」配置要
-  等 wdnai SDK 改 spec + pyrkaiweb 解析 `npu_assignments: dict[str, int]`
+  等 wdnai SDK 改 spec + wdnwebui 解析 `npu_assignments: dict[str, int]`
   —— 当前每个 model 一个实例，所以 service_name = `wdndds/rpc
 `     <model_id>`（**不带 npu 后缀**），单 model 多 npu 也在子进程
   内部决策。
@@ -150,7 +150,7 @@ SDKs aren't published.
 ## Layout
 
 ```
-pyrkaiweb/
+wdnwebui/
 ├── run.py                # entry point — uvicorn.run("app.main:app", ...)
 ├── app/
 │   ├── __init__.py       # __version__ = "0.3.0"
@@ -415,7 +415,7 @@ shared session — see "Resource budget" below.
   ``N * 0.83``, so 16 channels queue ~13 frames deep on average. The
   events timestamp reflects when the inference actually completed,
   not when the frame was captured. If you need faster end-to-end
-  latency, sharding channels across multiple ``pyrkaiweb`` instances
+  latency, sharding channels across multiple ``wdnwebui`` instances
   (each with its own LLMSession) is the answer; the shared-session
   design here makes that a horizontal scaling decision rather than a
   per-channel one.
@@ -426,7 +426,7 @@ The service reads a single JSON-object `config.json` from disk and
 holds it in memory. The file is seeded with a `base` section at
 `{}` + future sections stacked alongside it.
 
-- **Where it lives** — resolved from `PYRKAIWEB_CONFIG` env var when
+- **Where it lives** — resolved from `WDNWEBUI_CONFIG` env var when
   `run.py` starts (set by `--config /path/to/config.json`); if unset,
   defaults to `<repo>/config.json`. Always absolute.
 - **Read-write** — `app/services/config.py` `ConfigStore` is a lazy
@@ -808,8 +808,8 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
 - **FastDDS participant_name 命名约定 (v0.8)**：每个 DomainParticipant
   的名字都带 `config.json["base"]["device_name"]` 后缀，方便 LAN daemon
   的 `/peers` 端点和 DDS 调试日志一眼区分板子：
-   - 主进程：`pyrkaiweb-main-{device_name}`
-   - discovery Hub（注册发现页）：`pyrkaiweb-discovery-{device_name}`
+   - 主进程：`wdnwebui-main-{device_name}`
+   - discovery Hub（注册发现页）：`wdnwebui-discovery-{device_name}`
    - compute worker：`compute_worker-{device_name}-{model_id}`
   worker 的 `info_handler` 返回的 `device_name` 字段是上述 participant
   name 后缀的来源；主进程 probe 后写到 `ModelInstance._peer_name`，
@@ -1078,7 +1078,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 
 * **Service** (`app/services/text_chat.py`):
   - `_TextChatManager` 单例（`get_chat_service()`，lazy）；状态机
-    `idle → loading → running → done/error/stopped`，与 pyrkaiweb
+    `idle → loading → running → done/error/stopped`，与 wdnwebui
     其它服务风格一致。
   - **LLMSession 必须从 ComputeRegistry 取**（`get_session("swcap_text_chat")`）；
     找不到抛 `RuntimeError("功能未启用: swcap_text_chat")`，HTTP 502 透传。
@@ -1399,7 +1399,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 
 * **凭证路径** = `~/.wechatbot/credentials.json`（`wdndds.wechat.DEFAULT_CRED_PATH`），
   也可设 `WDNDDS_WECHAT_CRED_PATH` 环境变量覆盖。这是 SDK 默认路径，
-  多 pyrkaiweb 实例不会冲突。
+  多 wdnwebui 实例不会冲突。
 
 * **资源预算** —— `wdndds.Wechat` 单实例长期驻留一个 daemon thread + 一个
   aiohttp 连接池；未登录时 SDK 不会建任何连接（`bot.login()` 之前
@@ -1425,13 +1425,13 @@ v0.5 在 v0.4 的 per-model-subprocess RPC 之上加了**集中式发现 daemon*
                  │  (UDP 单播：peers 互相发现)
        ┌─────────┼─────────┼─────────┐
        ▼         ▼         ▼         ▼
-   pyrkaiweb  worker   worker   worker     (CLIENT protocol,
+   wdnwebui  worker   worker   worker     (CLIENT protocol,
      main     qwen3   qwen3      qwen8      discovery_servers 指向 daemon)
 ```
 
 * 每个 LAN 跑一个 `wdndds_daemon` 进程。**没有 fallback**（多播 / SIMPLE
   在嵌入式板不可靠；server 故障 = 整个 LAN 不通）。
-* 所有 pyrkaiweb 进程（main / compute_worker / im-bridge / 任意）
+* 所有 wdnwebui 进程（main / compute_worker / im-bridge / 任意）
   通过 `config.json["compute"]["discovery_servers"]` 指向 daemon 的
   `host:port`。
 * daemon 同时服务于「compute RPC 跨机器发现」和「Discovery 页在网注册」
@@ -1439,7 +1439,7 @@ v0.5 在 v0.4 的 per-model-subprocess RPC 之上加了**集中式发现 daemon*
 
 ### wdndds_daemon 启动方式
 
-**1) 主进程随 pyrkaiweb 一起启动（dev / 小部署）**
+**1) 主进程随 wdnwebui 一起启动（dev / 小部署）**
 
 `config.json["compute"]["auto_start_daemon"]: true` 时，`app/main.py`
 `create_app()` 会 `subprocess.Popen` 拉起 daemon（默认端口可改）。
@@ -1457,8 +1457,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/userdata/pyrkaiweb/.venv/bin/python -m app.services.wdndds_daemon     --udp-port 7411 --http-port 7412
-WorkingDirectory=/userdata/pyrkaiweb
+ExecStart=/userdata/wdnwebui/.venv/bin/python -m app.services.wdndds_daemon     --udp-port 7411 --http-port 7412
+WorkingDirectory=/userdata/wdnwebui
 Restart=on-failure
 
 [Install]
@@ -1473,7 +1473,7 @@ GET  /peers    {"peers": [{"guid", "name"}, ...]}   (基于 DomainParticipantLis
 GET  /health   {"ok": true}
 ```
 
-### pyrkaiweb 端配置
+### wdnwebui 端配置
 
 `config.json["compute"]` 字段：
 
@@ -1501,7 +1501,7 @@ GET  /health   {"ok": true}
   请求 ID 在 ComputeRequest/ComputeReply 里匹配（参见
   `wdndds/idl/compute.idl`）。
 * **首次调用 race**：daemon 刚启动时 endpoint 还没匹配，第一次
-  `RpcClient.call()` 会 timeout（约 5s），第二次起成功。pyrkaiweb
+  `RpcClient.call()` 会 timeout（约 5s），第二次起成功。wdnwebui
   probe 自动 retry（每 1s 一次，5s timeout）。
 
 ### 注意事项
@@ -1536,13 +1536,13 @@ v0.5 在 v0.4 的 per-model-subprocess RPC 之上加了**集中式发现 daemon*
                  │  (UDP 单播：peers 互相发现)
        ┌─────────┼─────────┼─────────┐
        ▼         ▼         ▼         ▼
-   pyrkaiweb  worker   worker   worker     (CLIENT protocol,
+   wdnwebui  worker   worker   worker     (CLIENT protocol,
      main     qwen3   qwen3      qwen8      discovery_servers 指向 daemon)
 ```
 
 * 每个 LAN 跑一个 `wdndds_daemon` 进程。**没有 fallback**（多播 / SIMPLE
   在嵌入式板不可靠；server 故障 = 整个 LAN 不通）。
-* 所有 pyrkaiweb 进程（main / compute_worker / im-bridge / 任意）
+* 所有 wdnwebui 进程（main / compute_worker / im-bridge / 任意）
   通过 `config.json["compute"]["discovery_servers"]` 指向 daemon 的
   `host:port`。
 * daemon 同时服务于「compute RPC 跨机器发现」和「Discovery 页在网注册」
@@ -1550,7 +1550,7 @@ v0.5 在 v0.4 的 per-model-subprocess RPC 之上加了**集中式发现 daemon*
 
 ### wdndds_daemon 启动方式
 
-**1) 主进程随 pyrkaiweb 一起启动（dev / 小部署）**
+**1) 主进程随 wdnwebui 一起启动（dev / 小部署）**
 
 `config.json["compute"]["auto_start_daemon"]: true` 时，`app/main.py`
 `create_app()` 会 `subprocess.Popen` 拉起 daemon（默认端口可改）。
@@ -1568,9 +1568,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/userdata/pyrkaiweb/.venv/bin/python -m app.services.wdndds_daemon \
+ExecStart=/userdata/wdnwebui/.venv/bin/python -m app.services.wdndds_daemon \
     --udp-port 7411 --http-port 7412
-WorkingDirectory=/userdata/pyrkaiweb
+WorkingDirectory=/userdata/wdnwebui
 Restart=on-failure
 
 [Install]
@@ -1585,7 +1585,7 @@ GET  /peers    {"peers": [{"guid", "name"}, ...]}   (基于 DomainParticipantLis
 GET  /health   {"ok": true}
 ```
 
-### pyrkaiweb 端配置
+### wdnwebui 端配置
 
 `config.json["compute"]` 字段：
 
@@ -1613,7 +1613,7 @@ GET  /health   {"ok": true}
   请求 ID 在 ComputeRequest/ComputeReply 里匹配（参见
   `wdndds/idl/compute.idl`）。
 * **首次调用 race**：daemon 刚启动时 endpoint 还没匹配，第一次
-  `RpcClient.call()` 会 timeout（约 5s），第二次起成功。pyrkaiweb
+  `RpcClient.call()` 会 timeout（约 5s），第二次起成功。wdnwebui
   probe 自动 retry（每 1s 一次，5s timeout）。
 
 ### 注意事项

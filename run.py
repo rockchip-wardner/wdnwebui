@@ -1,8 +1,8 @@
-"""Entry point for pyrkaiweb service.
+"""Entry point for wdnwebui service.
 
 Usage:
     python run.py
-    python run.py --config /etc/pyrkaiweb/config.json
+    python run.py --config /etc/wdnwebui/config.json
     # or
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
@@ -17,8 +17,8 @@ from app import __version__
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="pyrkaiweb",
-        description=f"pyrkaiweb service v{__version__}",
+        prog="wdnwebui",
+        description=f"wdnwebui service v{__version__}",
     )
     parser.add_argument(
         "--config",
@@ -26,7 +26,7 @@ def main() -> None:
         default=Path(__file__).resolve().parent / "config.json",
         help="Path to the service config.json "
              "(default: <repo>/config.json). Propagated to the app via "
-             "the PYRKAIWEB_CONFIG env var.",
+             "the WDNWEBUI_CONFIG env var.",
     )
     args, _unknown = parser.parse_known_args()
 
@@ -38,7 +38,7 @@ def main() -> None:
 
     # Propagate to the app via env so app.services.config picks it up
     # before any FastAPI route is hit.
-    os.environ["PYRKAIWEB_CONFIG"] = str(config_path)
+    os.environ["WDNWEBUI_CONFIG"] = str(config_path)
 
     uvicorn.run(
         "app.main:app",

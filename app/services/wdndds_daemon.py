@@ -1,13 +1,13 @@
-"""wdndds_daemon — FastDDS Discovery Server daemon for pyrkaiweb.
+"""wdndds_daemon — FastDDS Discovery Server daemon for wdnwebui.
 
-This is the central discovery broker that every pyrkaiweb process on
+This is the central discovery broker that every wdnwebui process on
 the LAN points to. It replaces the unreliable SIMPLE discovery
 (multicast + initialPeers) that proved broken on embedded boards.
 
 What this daemon does:
   - Creates a DomainParticipant in SERVER discovery protocol on the
     configured UDPv4 port.
-  - Listens for ALL participants on the LAN (pyrkaiweb main, compute
+  - Listens for ALL participants on the LAN (wdnwebui main, compute
     workers, im-bridge bot, …) and brokers their discovery metadata
     to each other.
   - Exposes a small HTTP REST API for the UI to query daemon state
@@ -34,7 +34,7 @@ Usage:
   python -m app.services.wdndds_daemon --udp-port 7411 --http-port 7412 \\
       --pidfile /var/run/wdndds-daemon.pid --logfile /var/log/wdndds-daemon.log
 
-  # from pyrkaiweb (auto-started when config.json says so)
+  # from app (auto-started when config.json says so)
   python -c 'from app.services.wdndds_daemon import start_in_subprocess; \\
              start_in_subprocess(port=7411, http_port=7412)'
 """
@@ -182,7 +182,7 @@ def _poll_participants(hub, interval_sec: float = 2.0):
 
 
 # --------------------------------------------------------------------------- #
-# Subprocess launcher (used by pyrkaiweb main.py to auto-start)                #
+# Subprocess launcher (used by wdnwebui main.py to auto-start)                #
 # --------------------------------------------------------------------------- #
 def start_in_subprocess(port: int = DEFAULT_UDP_PORT,
                         http_port: int = DEFAULT_HTTP_PORT,
@@ -190,7 +190,7 @@ def start_in_subprocess(port: int = DEFAULT_UDP_PORT,
     """Launch the daemon in a detached subprocess.
 
     Returns the Popen handle. The caller is responsible for tracking
-    the PID (we write it nowhere by default; pyrkaiweb stashes it in
+    the PID (we write it nowhere by default; wdnwebui stashes it in
     a state dict).
     """
     import subprocess

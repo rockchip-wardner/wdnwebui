@@ -1,4 +1,4 @@
-"""Qwen3-TTS session service for pyrkaiweb.
+"""Qwen3-TTS session service for wdnwebui.
 
 Drives TTS inference through the v2 ``LLMSession.respond`` API; the
 service owns the per-call state machine, history, broadcaster, and

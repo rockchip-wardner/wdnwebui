@@ -57,7 +57,7 @@ from app.services.config import get_config
 # exposes a wdndds cshim RPC service (``wdndds/rpc/<model_id>``). The
 # main process talks to it via ``wdndds.RpcClient``. The subprocess
 # boundary isolates wdnai's uncatchable ``terminate()`` on a broken NPU
-# setup. ``PYRKAIWEB_COMPUTE_MODE=inprocess`` is reserved for the case
+# setup. ``WDNWEBUI_COMPUTE_MODE=inprocess`` is reserved for the case
 # where the cshim DDS layer can't run (e.g. kernel blocklists UDP
 # multicast); the v0.4 inprocess mode is otherwise a no-go on hosts
 # where wdnai RKNN init can call ``terminate()``.
@@ -66,7 +66,7 @@ import contextlib as _contextlib
 
 
 def _resolve_compute_mode() -> str:
-    env = _os.environ.get("PYRKAIWEB_COMPUTE_MODE", "").strip().lower()
+    env = _os.environ.get("WDNWEBUI_COMPUTE_MODE", "").strip().lower()
     if env in ("subprocess", "inprocess"):
         return env
     return "subprocess"
@@ -590,7 +590,7 @@ class ComputeRegistry:
         """Bring up the wdndds Hub that the main process uses to talk
         to all compute_worker subprocesses. The Hub points at the LAN's
         wdndds discovery daemon (one per LAN, configured in
-        config.json["compute"]["discovery_server"]). All pyrkaiweb
+        config.json["compute"]["discovery_server"]). All wdnwebui
         processes on the LAN share this daemon for participant +
         endpoint discovery, replacing the unreliable SIMPLE discovery
         that broke on embedded boards (Raspberry Pi, RK3588)."""
@@ -610,14 +610,14 @@ class ComputeRegistry:
             discovery_servers = self._read_discovery_servers()
             device_name = _read_device_name()
             self._hub = _RpcHub(
-                participant_name=f"pyrkaiweb-main-{device_name}",
+                participant_name=f"wdnwebui-main-{device_name}",
                 domain_id=0,
                 discovery_servers=discovery_servers,
             )
             self._hub.start()
             LOG.info(
                 "ComputeRegistry Hub started: services=%s "
-                "discovery_servers=%s participant_name=pyrkaiweb-main-%s",
+                "discovery_servers=%s participant_name=wdnwebui-main-%s",
                 service_names, discovery_servers, device_name)
         except Exception as e:  # noqa: BLE001
             LOG.exception("ComputeRegistry Hub bring-up failed")

@@ -1,7 +1,7 @@
 """rpc_session_proxy — wdnai.LLMSession drop-in backed by wdndds cshim RPC.
 
 Each compute instance lives in its own compute_worker subprocess; the
-LLMSession is held by that worker. The main pyrkaiweb process holds
+LLMSession is held by that worker. The main wdnwebui process holds
 a wdndds ``RpcClient`` and uses this proxy to forward calls.
 
 Wire: standard Pub-Sub with RELIABLE QoS, two topics per service

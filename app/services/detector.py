@@ -64,14 +64,14 @@ LOG = logging.getLogger("detector")
 # named logger 虽然 propagate 到 root，但 root 不显示 INFO / DEBUG。
 # 这里给 detector 自带一个 StreamHandler（stderr），不依赖 root 的
 # 配置，reload 模式下也不会重复挂载（用 getattr 检测）。
-if not getattr(LOG, "_pyrkaiweb_handler_attached", False):
+if not getattr(LOG, "_wdnwebui_handler_attached", False):
     _handler = logging.StreamHandler()
     _handler.setFormatter(
         logging.Formatter("[detector] %(asctime)s %(levelname)s %(message)s")
     )
     LOG.addHandler(_handler)
     LOG.setLevel(logging.INFO)
-    LOG._pyrkaiweb_handler_attached = True  # type: ignore[attr-defined]
+    LOG._wdnwebui_handler_attached = True  # type: ignore[attr-defined]
     LOG.propagate = False
 
 
@@ -212,7 +212,7 @@ def _build_target_doc_class():
 
     @Generable
     class TargetDoc(_PydBaseModel):
-        """Structured target-detection output for pyrkaiweb's
+        """Structured target-detection output for wdnwebui's
         video-target-detection panel.
 
         模型应给出 0–1000 归一化 ROI 坐标 ``x1, y1, x2, y2``（左上 +

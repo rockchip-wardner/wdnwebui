@@ -218,7 +218,7 @@ def _looks_garbled(text: str) -> bool:
     会产出 CJK/Latin token salad（典型样本：
     ``稽abilidade巡射赴abilidade...``）。SDK 自己的
     ``LLMSession._parse_output`` Path 5 兜底时调同一个函数 bump
-    ``StreamSink.dirty_score``；这里在 pyrkaiweb 端再调用一次做独立
+    ``StreamSink.dirty_score``；这里在 wdnwebui 端再调用一次做独立
     检测，避免 ``_looks_garbled`` 内部 bump 被绕过时还能识别。
 
     **额外规则（针对 SDK 漏判的 subword-level token salad）**：
@@ -642,7 +642,7 @@ def _sanitize_text(raw: str, max_len: int = 500) -> str:
     """清洗模型原始输出：去 think 块 / markdown 头 / 控制字符 / 部分 JSON 残留。
 
     当 VLM 输出不符合 JSON schema 时，wdnai SDK 会把 raw 文本塞进
-    ``LMOutput.text`` 字段（或 pyrkaiweb 的 ``ev.text``）。这个函数把
+    ``LMOutput.text`` 字段（或 wdnwebui 的 ``ev.text``）。这个函数把
     raw 文本整理成干净的自然语言描述，避免前端事件列表里出现：
       - ``<think>...</think>`` 思维链残留（thinking 模型泄漏）
       - ``### 画面描述`` / ``- 项目`` 等 markdown 噪声

@@ -1,6 +1,6 @@
 """Centralized config.json loader / writer.
 
-The path is taken from the ``PYRKAIWEB_CONFIG`` env var (set by
+The path is taken from the ``WDNWEBUI_CONFIG`` env var (set by
 ``run.py --config …``) and falls back to ``<repo>/config.json`` if
 unset. The file is read once at first access and held in memory;
 writes go through :meth:`ConfigStore.replace`, which validates the
@@ -22,7 +22,7 @@ _DEFAULT_CONFIG_PATH = (
 
 
 def _resolve_config_path() -> Path:
-    env = os.environ.get("PYRKAIWEB_CONFIG")
+    env = os.environ.get("WDNWEBUI_CONFIG")
     if env:
         p = Path(env).expanduser()
         try:
@@ -147,7 +147,7 @@ _store: ConfigStore | None = None
 
 def get_config() -> ConfigStore:
     """Lazy singleton accessor. First call resolves the config path from
-    the ``PYRKAIWEB_CONFIG`` env var (or falls back to the repo default)
+    the ``WDNWEBUI_CONFIG`` env var (or falls back to the repo default)
     and reads the file."""
     global _store
     if _store is None:

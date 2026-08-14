@@ -1,4 +1,4 @@
-"""WeChat bot service for pyrkaiweb.
+"""WeChat bot service for wdnwebui.
 
 Thin singleton wrapper around :class:`wdndds.Wechat` that adds:
 

@@ -10,7 +10,7 @@ Worker-side construction differs from main-process:
   - The worker holds exactly ONE LLMSession (no queue, no locking).
   - Each ``infer`` action is a fresh request — we ``reset()`` between
     calls so KV cache state never leaks between requests from
-    different pyrkaiweb threads/processes.
+    different wdnwebui threads/processes.
   - The payload schema mirrors ``app.services.detector._infer_sync``:
     ``{"prompt": str, "attachment": [<b64 image bytes>], ...}``.
     Conversion BGR-ndarray -> base64 happens on the main side
