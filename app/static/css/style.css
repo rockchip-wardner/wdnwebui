@@ -2574,10 +2574,9 @@ html, body {
 }
 
 /* ---------- compute-config: 三 service 卡片 (Qwen3-VL-4B / TTS / 8B) ---------- */
-/* v0.9: 本地算力与网络算力 (设备框内) 都按一行四卡片排版 */
 .cc-services {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
   margin-bottom: 12px;
 }
@@ -2651,10 +2650,10 @@ html, body {
 .cc-device-frame.is-unavailable .cc-device-title {
   color: var(--muted);
 }
-/* 4 列内嵌卡片网格：不足 4 个时靠左对齐、右侧留空 */
+/* 3 列内嵌卡片网格 */
 .cc-device-cards {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   padding: 12px;
 }

@@ -4894,8 +4894,6 @@ const ComputeConfigPage = {
     titleEl.className = "cc-service-title";
     head.appendChild(titleEl);
 
-    // PID 永远占位（adopted_local 才显示文字）；hidden via display:none。
-    // 这样 _updateLocalCardState 可以无副作用地切换显示态。
     const pidEl = document.createElement("span");
     pidEl.className = "cc-pid";
     pidEl.style.display = "none";
@@ -5036,10 +5034,12 @@ const ComputeConfigPage = {
     // ---- title
     h.titleEl.textContent = meta.label;
 
-    // ---- PID（adopted_local 才显示）
-    if (isOrphan && svc.pid) {
+    // ---- PID
+    if (svc.pid && svc._source !== "adopted" && svc._source !== "unavailable") {
       h.pidEl.textContent = `PID ${svc.pid}`;
-      h.pidEl.title = "uvicorn reload 留下的 worker，registry 没持有 Popen 句柄；要清理请 `kill " + svc.pid + "`";
+      h.pidEl.title = isOrphan
+        ? "uvicorn reload 留下的 worker，registry 没持有 Popen 句柄；要清理请 `kill " + svc.pid + "`"
+        : "本机 spawn 的 worker，registry 持有 Popen 句柄；要清理优先用 UI 重启按钮";
       h.pidEl.style.display = "";
     } else {
       h.pidEl.style.display = "none";
