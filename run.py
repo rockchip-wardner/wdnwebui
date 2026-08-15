@@ -92,6 +92,69 @@ def _ensure_wdndds_native_path() -> None:
     os.environ["LD_LIBRARY_PATH"] = ":".join(deduped)
 
 
+def _ensure_wdndds_built() -> None:
+    """Fail fast if wdndds native libs are not built.
+
+    wdndds 的 ``libwdndds_cshim.so`` + ``libwdndds_idl.so`` 不在 wheel
+    里 — 由 ``wdndds._build.py``（setuptools ``build_py`` 子类）在
+    ``pip install`` 时从 ``idl/`` + ``cshim_src/`` 源码编译到
+    ``.venv/src/wdndds/src/wdndds/dds/_native/``。wheel /
+    ``pip install -e`` 都没有自动跑 build hook 时（apt 依赖缺失、
+    fresh clone 跳过 ``build_native.sh`` 等），这两个文件就缺失，
+    后续 ``wdndds_daemon`` 和 ``ComputeRegistry`` 的 ``RpcClient``
+    加载 cshim 时会报
+    ``FileNotFoundError: wdndds: .../libwdndds_cshim.so not found``。
+
+    本函数是 fail-fast 网关：**不在这里自动 build**（apt 需要 sudo、
+    会卡 service 启动），只在缺失时直接 ``SystemExit`` 并指向
+    ``bootstrap_wdndds_native.sh``，让运维显式跑一次完成 apt + 编译。
+    脚本是幂等的：再次执行是 no-op（<1s）。
+
+    Opt-out: 设置 ``WDNWEBUI_SKIP_WDNDDS_BOOTSTRAP=1``（用于生产环境
+    通过其它机制预置 .so 文件的场景，比如 basebox 镜像预装）。
+    """
+    if os.environ.get("WDNWEBUI_SKIP_WDNDDS_BOOTSTRAP") == "1":
+        return
+
+    repo_root = Path(__file__).resolve().parent
+    wdndds_src = repo_root / ".venv" / "src" / "wdndds"
+    cshim = (
+        wdndds_src
+        / "src" / "wdndds" / "dds" / "_native" / "libwdndds_cshim.so"
+    )
+    idl = (
+        wdndds_src
+        / "src" / "wdndds" / "dds" / "_native" / "libwdndds_idl.so"
+    )
+
+    if cshim.is_file() and idl.is_file():
+        return
+
+    bootstrap = repo_root / "bootstrap_wdndds_native.sh"
+    print(
+        f"[run.py] FATAL: wdndds native libraries not built.\n"
+        f"  missing: {cshim}\n"
+        f"           {idl}\n"
+        f"\n"
+        f"Run once on this host:\n"
+        f"  sudo {bootstrap}\n"
+        f"\n"
+        f"The script installs apt build deps (libfoonathan-memory-dev,\n"
+        f"libfoonathan-memory0.7.2, patchelf), patches the partial-native\n"
+        f"cmake stub, and runs pip install to trigger the wdndds build_py\n"
+        f"hook that compiles libwdndds_cshim.so + libwdndds_idl.so.\n"
+        f"It is idempotent — re-running it after a successful bootstrap\n"
+        f"is a no-op.\n"
+        f"\n"
+        f"To bypass this check (production: .so files pre-staged via a\n"
+        f"different mechanism):\n"
+        f"  WDNWEBUI_SKIP_WDNDDS_BOOTSTRAP=1 .venv/bin/python run.py",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+_ensure_wdndds_built()
 _ensure_wdndds_native_path()
 
 
