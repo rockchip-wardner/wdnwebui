@@ -126,14 +126,31 @@ source .venv/bin/activate
 # one-time wdndds native libs (apt + stub + pip) — idempotent, run again is <1s no-op
 sudo ./bootstrap_wdndds_native.sh
 
-# run
-python run.py                  # 0.0.0.0:8000, reload on
+# run (auto-cleans stale uvicorn / compute_workers from previous unclean shutdowns)
+sudo .venv/bin/python run.py             # 0.0.0.0:8000, reload on
+sudo .venv/bin/python run.py --no-kill-stale   # opt out of stale cleanup
 
 # sanity
 curl http://127.0.0.1:8000/health
 ```
 
 Endpoints wired so far: `GET /` (version), `GET /health`.
+
+**Stale-process cleanup on startup.** `run.py` reaps leftover
+processes from a previous unclean shutdown before binding port 8000:
+uvicorn worker holding port 8000 (via `ss -tlnp`), orphan
+`compute_worker.py` subprocesses (ComputeRegistry spawns them with
+`Popen(start_new_session=True)` so they detach from the run.py
+process group and survive it), and the `python run.py` ancestor
+itself. SIGTERM with 3s grace, then SIGKILL. The
+`wdndds_daemon` is intentionally NOT killed (it might be serving
+LAN peers via the FastDDS discovery protocol — `_start_wdndds_daemon`
+adopts any existing one instead of double-spawning). Enabled by
+default; opt out via `--no-kill-stale` CLI flag or
+`WDNWEBUI_KILL_STALE_ON_BOOT=0` env var. Per
+`install_autostart.sh`, the production systemd unit invokes
+`uvicorn` directly (not `run.py`), so the kill-stale behaviour
+never runs under systemd.
 
 ## One-time setup that an agent will get wrong
 

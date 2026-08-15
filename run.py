@@ -8,7 +8,10 @@ Usage:
 """
 import argparse
 import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import uvicorn
@@ -92,6 +95,259 @@ def _ensure_wdndds_native_path() -> None:
     os.environ["LD_LIBRARY_PATH"] = ":".join(deduped)
 
 
+def _pid_listening_on_port(port: int) -> int | None:
+    """Return the PID of the process holding TCP ``port`` in LISTEN, or
+    ``None``. Uses ``ss -tlnp`` (iproute2) which is universal on Linux
+    and avoids shelling to ``lsof`` (not always installed).
+    """
+    try:
+        out = subprocess.run(
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    # Output line ends with ``users:(("python",pid=1234,fd=5))``.
+    import re
+    for line in out.stdout.splitlines():
+        m = re.search(r"pid=(\d+)", line)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _ancestor_pids() -> set[int]:
+    """Walk ``/proc/*/status`` PPid chain back to PID 1. Returns the
+    set of PIDs that are ancestors of (or equal to) ourselves —
+    killing any of these would also kill us, so they MUST be
+    excluded from the kill set.
+    """
+    out = {os.getpid()}
+    pid = os.getpid()
+    for _ in range(64):  # safety cap; realistic chains are < 10
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                ppid = None
+                for line in f:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+            if ppid is None or ppid <= 1:
+                break
+            if ppid in out:
+                break  # cycle / already-seen
+            out.add(ppid)
+            pid = ppid
+        except OSError:
+            break
+    return out
+
+
+def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
+    """Best-effort cleanup of stale wdnwebui resources from a previous
+    unclean shutdown.
+
+    Cleans up:
+      * the uvicorn process holding port 8000 (this is the actual
+        ``[Errno 98] Address already in use`` blocker)
+      * any orphan ``compute_worker.py`` subprocess (orphans because
+        ``ComputeRegistry._spawn_compute_worker`` uses
+        ``Popen(start_new_session=True)`` — they detach from the
+        run.py process group and survive its death)
+
+    Intentionally leaves alone:
+      * ``wdndds_daemon`` — it might be serving LAN peers via the
+        FastDDS discovery protocol, and ``_start_wdndds_daemon``
+        adopts an existing one instead of double-spawning anyway.
+      * our own ancestor chain (would kill us).
+      * anything not matching wdnwebui repo paths (defence in depth).
+
+    Opt-out: pass ``enabled=False`` (driven by ``--no-kill-stale`` /
+    ``WDNWEBUI_KILL_STALE_ON_BOOT=0``).
+
+    Why this is safe to default on for run.py: per
+    ``install_autostart.sh``, the production systemd unit invokes
+    ``uvicorn app.main:app`` directly — run.py is ONLY used for
+    manual CLI dev runs, where killing leftovers is the desired
+    behaviour.
+    """
+    if not enabled:
+        return
+
+    ancestors = _ancestor_pids()
+    my_pid = os.getpid()
+    killed: list[tuple[str, int]] = []
+    survivors: list[tuple[str, int]] = []
+
+    def _collect() -> list[tuple[str, int]]:
+        candidates: list[tuple[str, int]] = []
+
+        # (a) uvicorn holding port 8000 — the actual blocker.
+        holder = _pid_listening_on_port(8000)
+        if holder and holder != my_pid and holder not in ancestors:
+            candidates.append(("uvicorn(port 8000)", holder))
+
+        # (b) compute_workers — find via /proc cmdline walk. We match
+        #     the script path + repo marker so a foreign compute_worker
+        #     (somebody else's dev box) is NOT killed.
+        repo_root = Path(__file__).resolve().parent
+        worker_path = repo_root / "app" / "services" / "compute_worker.py"
+        try:
+            worker_path_str = str(worker_path.resolve())
+        except OSError:
+            worker_path_str = str(worker_path)
+
+        try:
+            pids = sorted(int(p) for p in os.listdir("/proc") if p.isdigit())
+        except OSError:
+            pids = []
+        for pid in pids:
+            if pid == my_pid or pid in ancestors:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            try:
+                cmdline = raw.split(b"\0")
+                cmd_str = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+            except Exception:
+                continue
+
+            # (c) stale ``python run.py`` — the actual uvicorn parent.
+            # The reloader's child process (which ``ss`` reports as the
+            # port 8000 owner) is often a defunct zombie by the time
+            # we look — `kill -9` on a zombie is a no-op, and the real
+            # hold on the LISTEN socket has migrated to the still-
+            # alive run.py ancestor. So we catch ``run.py`` here too
+            # and let the cascade kill the zombie on process exit.
+            #
+            # NOTE: ``/proc/<pid>/cmdline`` is NUL-separated with a
+            # trailing NUL, so ``raw.split(b"\0")`` produces a
+            # trailing empty element. Index from the SECOND-to-last
+            # to get the script arg. We do NOT require ``wdnwebui``
+            # to appear in cmdline (the script arg is just ``run.py``);
+            # instead we validate via ``/proc/<pid>/cwd`` to make sure
+            # we're targeting the same repo, not some foreign
+            # ``run.py`` in another project.
+            argv = [a for a in cmdline if a]  # drop trailing empty
+            if len(argv) >= 2 \
+                    and argv[-1] == b"run.py" \
+                    and (argv[-2].endswith(b"/python")
+                         or argv[-2].endswith(b"/python3")
+                         or argv[-2].endswith(b"python")
+                         or argv[-2].endswith(b"python3")):
+                try:
+                    cwd_target = os.readlink(f"/proc/{pid}/cwd")
+                except OSError:
+                    continue
+                if cwd_target == str(repo_root):
+                    candidates.append(("run.py", pid))
+                    continue
+
+            # (d) uvicorn reloader's multiprocessing children — when
+            # ``uvicorn.run(..., reload=True)`` boots, the reloader
+            # spawns the actual app via ``multiprocessing.spawn`` which
+            # leaves a ``spawn_main`` process tree behind even after
+            # the parent run.py dies. Those children inherit the
+            # LISTEN socket fd, so until they exit, port 8000 stays
+            # held by a process whose cmdline shows nothing related to
+            # wdnwebui / run.py. We match them by the repo marker
+            # (their CWD is the repo because the reloader cd's there
+            # before exec) plus the wdnwebui executable path in
+            # ``/proc/<pid>/exe`` which still resolves to the .venv
+            # python interpreter inside our repo.
+            try:
+                exe_link = os.readlink(f"/proc/{pid}/exe")
+            except OSError:
+                exe_link = ""
+            repo_python_marker = str(repo_root / ".venv" / "bin" / "python")
+            if (b"multiprocessing.spawn" in raw
+                    or b"multiprocessing.resource_tracker" in raw) \
+                    and repo_python_marker in exe_link:
+                candidates.append(("uvicorn-reload-fork", pid))
+                continue
+
+            # Match ``compute_worker.py`` invoked from THIS repo. We
+            # require both pieces: the bare filename (cheap filter)
+            # and the resolved script path on disk (surgical match).
+            if "compute_worker.py" not in cmd_str:
+                continue
+            if worker_path_str not in cmd_str:
+                # Could be a vendored copy at a different path; skip.
+                continue
+            if "wdnwebui" not in cmd_str:
+                continue
+            candidates.append(("compute_worker", pid))
+        return candidates
+
+    candidates = _collect()
+    if not candidates:
+        return
+
+    print(
+        f"[run.py] kill-stale: cleaning up {len(candidates)} stale "
+        f"process(es) from a previous run.py invocation:",
+        file=sys.stderr,
+    )
+    for label, pid in candidates:
+        print(f"  - {label} pid={pid}", file=sys.stderr)
+
+    # SIGTERM with 3s grace.
+    for _, pid in candidates:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.time() + 3.0
+    pending = list(candidates)
+    while pending and time.time() < deadline:
+        time.sleep(0.2)
+        pending = [(lbl, p) for lbl, p in pending
+                   if _pid_alive(p)]
+    survivors = pending
+
+    # SIGKILL anything that didn't honour SIGTERM.
+    if survivors:
+        print(
+            f"[run.py] kill-stale: SIGKILL {len(survivors)} survivor(s) "
+            f"after 3s grace",
+            file=sys.stderr,
+        )
+        for _, pid in survivors:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        # Give the kernel a moment to release sockets.
+        time.sleep(0.5)
+
+    for label, pid in candidates:
+        if not _pid_alive(pid):
+            killed.append((label, pid))
+
+    if killed:
+        print(
+            f"[run.py] kill-stale: {len(killed)} process(es) reaped "
+            f"before binding port 8000",
+            file=sys.stderr,
+        )
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def _ensure_wdndds_built() -> None:
     """Fail fast if wdndds native libs are not built.
 
@@ -171,7 +427,39 @@ def main() -> None:
              "(default: <repo>/config.json). Propagated to the app via "
              "the WDNWEBUI_CONFIG env var.",
     )
+    parser.add_argument(
+        "--kill-stale",
+        action="store_true", default=None,
+        help="Reap stale wdnwebui processes (port 8000 uvicorn + "
+             "compute_workers) from a previous unclean shutdown "
+             "before binding. Default: ON for manual CLI runs. "
+             "Explicit opt-out: --no-kill-stale.",
+    )
+    parser.add_argument(
+        "--no-kill-stale",
+        action="store_true", default=None,
+        help="Skip stale-process cleanup. Inverse of --kill-stale; "
+             "the last flag wins if both are passed.",
+    )
     args, _unknown = parser.parse_known_args()
+
+    # Resolve kill-stale default: env override > CLI > default ON.
+    # Default is ON because run.py is only invoked manually (the
+    # production systemd unit invokes uvicorn directly — see
+    # install_autostart.sh), and manual runs almost always hit
+    # leftovers from a previous unclean shutdown.
+    env_kill = os.environ.get("WDNWEBUI_KILL_STALE_ON_BOOT", "").strip()
+    if env_kill == "0":
+        kill_stale = False
+    elif env_kill == "1":
+        kill_stale = True
+    elif args.no_kill_stale and not args.kill_stale:
+        kill_stale = False
+    elif args.kill_stale and not args.no_kill_stale:
+        kill_stale = True
+    else:
+        # both / neither — default behaviour is ON.
+        kill_stale = True
 
     config_path = args.config.expanduser()
     if not config_path.is_absolute():
@@ -182,6 +470,13 @@ def main() -> None:
     # Propagate to the app via env so app.services.config picks it up
     # before any FastAPI route is hit.
     os.environ["WDNWEBUI_CONFIG"] = str(config_path)
+
+    # Reap stale uvicorn (port 8000) + compute_workers from any
+    # previous unclean shutdown BEFORE we try to bind. Done before
+    # _start_wdndds_daemon() so the daemon sees a clean slate too
+    # (and so we don't kill anything spawned by the daemon we just
+    # brought up).
+    _kill_stale_wdnwebui_processes(kill_stale)
 
     # Bring up the FastDDS discovery daemon before uvicorn binds the
     # web port. _start_wdndds_daemon() is idempotent — it walks
