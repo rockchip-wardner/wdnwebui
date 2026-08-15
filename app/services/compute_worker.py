@@ -40,7 +40,7 @@ import socket
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Optional
 
 LOG = logging.getLogger("compute_worker")
 
@@ -460,13 +460,21 @@ def infer_handler(state: dict, payload: dict) -> dict:
         # audio 通道参数（omni run_audio 需要）。未传则用 omni 默认
         # 契约（16 kHz mono s16le），兜底靠 session.py 内部 default。
         options = payload.get("options") or {}
+        # audio 通道 kwargs（omni run_audio）
         audio_kwargs: dict = {}
-        if "sample_rate" in options:
-            audio_kwargs["sample_rate"] = options["sample_rate"]
-        if "n_channels" in options:
-            audio_kwargs["n_channels"] = options["n_channels"]
-        if "sample_width" in options:
-            audio_kwargs["sample_width"] = options["sample_width"]
+        for k in ("sample_rate", "n_channels", "sample_width"):
+            if k in options:
+                audio_kwargs[k] = options[k]
+        # TTS 通道 kwargs（qwen3-tts TTSBackend.run_text 读这些）。
+        # 不传时 SDK 用默认值：ref_speaker="girl_base", language="auto",
+        # volume=0.5, no_play=False, non_streaming_mode=False — 但用户
+        # 在音视频描述页的 tts_alert 工具传的 ref_speaker/volume
+        # 必须流到这里才会真正生效。
+        tts_kwargs: dict = {}
+        for k in ("language", "speaker", "ref_speaker", "instruct",
+                  "volume", "no_play", "non_streaming_mode"):
+            if k in options:
+                tts_kwargs[k] = options[k]
 
         attachments = []
         for item in atts_meta:
@@ -517,13 +525,28 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 generating_cls = _get_target_doc_cls()
             except Exception as e:  # noqa: BLE001
                 LOG.warning("TargetDoc schema load failed in worker: %s", e)
+        elif gen_name == "TTSResult":
+            # TTS：worker 必须知道 TTSResult schema，否则 SDK 走
+            # ``if generating is None: return raw_text`` 分支，
+            # result.attachment 永远是空 → 主进程收不到 WAV bytes
+            # → 无声。tts_session.py 定义的 TTSResult 继承 LMOutput，
+            # SDK 检测到 bool(attachments_out) AND issubclass(generating,
+            # LMOutput) 时会把 audio bytes 挂到 result.attachment。
+            try:
+                from app.services.tts_session import _get_tts_result_cls
+                generating_cls = _get_tts_result_cls()
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("TTSResult schema load failed in worker: %s", e)
 
         async def _call():
             try:
                 sess.reset()
             except Exception:
                 pass
-            kwargs = dict(audio_kwargs)
+            # 合并 channel kwargs：audio 通道（omni run_audio）+ TTS 通道。
+            # 顺序无关（key 不重叠），但 audio 优先覆盖以防未来 TTS 也
+            # 引入 sample_rate 类参数时单边胜出（当前无重叠）。
+            kwargs = {**audio_kwargs, **tts_kwargs}
             if generating_cls is not None:
                 kwargs["generating"] = generating_cls
             return await sess.respond(
@@ -535,13 +558,31 @@ def infer_handler(state: dict, payload: dict) -> dict:
         result = asyncio.run(_call())
         text = getattr(result, "text", None) or (
             result if isinstance(result, str) else None)
-        return {
+
+        # Serialize ``result.attachment`` as base64 so the wire RPC can
+        # carry binary payloads (TTS WAV bytes, VLM decoded images,
+        # …). Earlier this dict only had text/level/tool_call/bbox/
+        # crop_b64, which meant TTS audio bytes silently disappeared
+        # at the worker boundary.
+        attachment_b64: Optional[str] = None
+        try:
+            atts = list(getattr(result, "attachment", []) or [])
+            if atts and atts[0].data:
+                import base64 as _b64
+                attachment_b64 = _b64.b64encode(bytes(atts[0].data)).decode("ascii")
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("attachment serialize failed: %s", e)
+
+        reply = {
             "text": text,
             "level": getattr(result, "level", None),
             "tool_call": getattr(result, "tool_call", None),
             "bbox": getattr(result, "bbox", None),
             "crop_b64": getattr(result, "crop_b64", None),
         }
+        if attachment_b64 is not None:
+            reply["attachment_b64"] = attachment_b64
+        return reply
     except Exception as e:  # noqa: BLE001
         LOG.warning("infer_handler exception: %s", e)
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}

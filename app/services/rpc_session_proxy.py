@@ -43,17 +43,53 @@ def _bgr_ndarray_to_b64(arr, quality: int = 85) -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
+class _AttachmentProxy:
+    """Adapter carrying the same attribute surface as
+    :class:`wdnai.Attachment` — ``kind`` / ``mime_type`` / ``data``
+    plus the small accessors ``tts_session.py`` reads.
+
+    Kept minimal so we don't have to import the real
+    ``wdnai.Attachment`` (which would pull in RKNN3 native libs
+    eagerly and segfault on a non-RK dev box — see
+    ``WdnaiDetector._load_wdnai`` constraint). The wdnai Attachment
+    is just a dataclass; the only method tts_session uses is
+    ``.data`` / ``.kind`` / ``.mime_type``.
+    """
+
+    __slots__ = ("kind", "mime_type", "data")
+
+    def __init__(self, *, kind: str = "", mime_type: str = "", data=bytes()):
+        self.kind = kind
+        self.mime_type = mime_type
+        self.data = data
+
+    def __repr__(self) -> str:
+        return (
+            f"_AttachmentProxy(kind={self.kind!r}, "
+            f"mime_type={self.mime_type!r}, "
+            f"data=<{len(bytes(self.data))} bytes>)"
+        )
+
+
 class _ProxyResult:
     """Adapter object: detector/tts/vfa code reads ``result.text`` etc.;
-    this mirrors the fields that wdnai returns from ``sess.respond``."""
+    this mirrors the fields that wdnai returns from ``sess.respond``.
+
+    ``attachment`` is a list of ``wdnai.Attachment``-shaped objects
+    (``kind`` / ``mime_type`` / ``data`` attributes) — populated only
+    when the worker's ``infer_handler`` forwarded binary payloads
+    (TTS WAV bytes today; future VLM-decoded images may also flow
+    through this slot).
+    """
 
     def __init__(self, *, text=None, level=None, tool_call=None,
-                 bbox=None, crop_b64=None, raw=None):
+                 bbox=None, crop_b64=None, attachment=None, raw=None):
         self.text = text
         self.level = level
         self.tool_call = tool_call
         self.bbox = bbox
         self.crop_b64 = crop_b64
+        self.attachment = attachment or []
         self._raw = raw or {}
 
     @property
@@ -63,7 +99,8 @@ class _ProxyResult:
     def __repr__(self) -> str:
         return (
             f"_ProxyResult(text={self.text!r}, level={self.level!r}, "
-            f"tool_call={self.tool_call!r})"
+            f"tool_call={self.tool_call!r}, "
+            f"attachment={len(self.attachment)} items)"
         )
 
     def __str__(self) -> str:
@@ -116,7 +153,14 @@ class _RpcSessionProxy:
 
     def _sync_call(self, prompt, attachment, generating, tools,
                    perf, overrides) -> Any:
-        # options 白名单含 LLM 采样参数 + audio 通道参数（omni run_audio 需要）。
+        # options 白名单：
+        #   - LLM 采样参数
+        #   - audio 通道参数（omni run_audio 需要）
+        #   - TTS 通道参数（qwen3-tts TTSBackend.run_text 读这些）。
+        #     没有这些时 SDK 用默认值（ref_speaker="girl_base",
+        #     volume=0.5, no_play=False）能跑出声音，但用户在
+        #     音视频描述页 tts_alert 工具传的 ref_speaker / volume
+        #     必须透传到 worker 才会真正生效。
         payload = {
             "action": "infer",
             "prompt": prompt,
@@ -127,7 +171,12 @@ class _RpcSessionProxy:
             "options": {k: v for k, v in overrides.items()
                         if k in {"max_new_tokens", "temperature",
                                   "top_p", "top_k",
-                                  "sample_rate", "n_channels", "sample_width"}},
+                                  "sample_rate", "n_channels", "sample_width",
+                                  # TTS channel kwargs — see wdnai/backends/tts.py
+                                  # TTSBackend.run_text overrides.get() calls.
+                                  "language", "speaker", "ref_speaker",
+                                  "instruct", "volume", "no_play",
+                                  "non_streaming_mode"}},
         }
         reply = self._client.call(payload, timeout_ms=120_000)
         if not reply.get("ok"):
@@ -135,12 +184,35 @@ class _RpcSessionProxy:
             raise RuntimeError(
                 f"compute_worker[{self._model_id}] infer failed: {err}")
         data = reply.get("data") or {}
+
+        # Decode any attachment bytes the worker serialized. Worker
+        # encodes ``result.attachment[0].data`` as base64 (TTS WAV
+        # bytes, future VLM-decoded images, …) because cshim RPC
+        # only carries JSON-serialisable values. We rehydrate it into
+        # an object with the same attribute surface that wdnai.Attachment
+        # exposes (``kind`` / ``mime_type`` / ``data``) so
+        # tts_session.py can do ``result.attachment[0].data`` and
+        # write the WAV to disk.
+        attachments = []
+        attachment_b64 = data.get("attachment_b64")
+        if attachment_b64:
+            try:
+                raw = base64.b64decode(attachment_b64)
+                attachments.append(_AttachmentProxy(
+                    kind="audio", mime_type="audio/wav", data=raw,
+                ))
+            except Exception:
+                # Bad base64 / oversized — leave attachment empty and
+                # let the caller see an empty wav_bytes path.
+                pass
+
         return _ProxyResult(
             text=data.get("text"),
             level=data.get("level"),
             tool_call=data.get("tool_call"),
             bbox=data.get("bbox"),
             crop_b64=data.get("crop_b64"),
+            attachment=attachments,
             raw=data,
         )
 
