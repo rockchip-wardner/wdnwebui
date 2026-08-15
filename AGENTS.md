@@ -123,6 +123,9 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
 # activate (do NOT use system pip — Debian PEP 668 blocks it)
 source .venv/bin/activate
 
+# one-time wdndds native libs (apt + stub + pip) — idempotent, run again is <1s no-op
+sudo ./bootstrap_wdndds_native.sh
+
 # run
 python run.py                  # 0.0.0.0:8000, reload on
 
@@ -154,45 +157,68 @@ the `wdndds/_build.py` `build_py` hook is supposed to compile
 into `src/wdndds/dds/_native/` at install time. The hook needs a
 FastDDS 3.6 dev install with `libfoonathan_memory.so.0.7.2` reachable.
 
-* Symptom when missing — `run.py` boots with `FileNotFoundError: wdndds:
-  …/native/lib/libwdndds_cshim.so not found.` followed by 4×
-  `RuntimeError: wdndds Hub not available (fastdds init failed)`. The
-  Hub can never come up, so every worker in `boot_compute_services()`
-  fails to register. Quick check:
+`run.py` ships a fail-fast preflight (`_ensure_wdndds_built`) that
+checks for the two `.so` files at module-import time and `SystemExit(1)`
+with a pointer to `bootstrap_wdndds_native.sh` if they're missing —
+the web service refuses to come up rather than silently failing in
+the daemon child process. Bypass with
+`WDNWEBUI_SKIP_WDNDDS_BOOTSTRAP=1` for production images that
+pre-stage the .so files out-of-band.
+
+* Symptom when missing — `run.py` aborts with
+  `wdndds native libraries not built. Run once on this host:
+  sudo ./bootstrap_wdndds_native.sh`. Quick check:
 
   ```bash
   .venv/bin/python -c "from wdndds.dds._cshim import check_runtime; print(check_runtime())"
   # expect (True, None)
   ```
 
+* `bootstrap_wdndds_native.sh` is the recommended one-shot setup
+  (idempotent, ~1s fast-path when already done). It installs the
+  apt build deps (`libfoonathan-memory-dev`, `libfoonathan-memory0.7.2`,
+  `patchelf`), writes a stub for `native/bin/nodesize_dbg` (partial
+  native-install workaround for foonathan's cmake IMPORTED-target
+  existence check), and runs `pip install --force-reinstall --no-deps
+  .venv/src/wdndds` to trigger `_build.py` end-to-end. The script
+  refuses to fall back to `apt install libfastrtps-dev` — that's
+  FastDDS 2.x and incompatible with the v0.5 cshim ABI.
+
 * `native/lib/libfastdds.so.3.6.2.0` + `libfastcdr.so.2.3.6` already
-  vendored (typical partial build) — skip `build_native.sh`, just
-  install foonathan + force-reinstall wdndds to fire the build_py hook:
+  vendored (typical partial build) — the bootstrap script handles
+  this case automatically. Manual equivalent:
 
   ```bash
-  sudo apt install libfoonathan-memory-dev libfoonathan-memory0.7.2
-  .venv/bin/pip install --force-reinstall --no-deps -e .venv/src/wdndds
+  sudo apt install libfoonathan-memory-dev libfoonathan-memory0.7.2 patchelf
+  sudo .venv/bin/pip install --force-reinstall --no-deps .venv/src/wdndds
   ls .venv/src/wdndds/src/wdndds/dds/_native/libwdndds_*.so
   ```
 
+  Note: `pip install -e ...` (editable) silently swallows `_build.py`
+  hook failures on setuptools ≥64 — so always run the bootstrap
+  script (or the manual non-editable `pip install` form) when
+  rebuilding. The `WDNDDS_FASTDDS_PREFIX` env var (read by
+  `_build.py`) is auto-detected from `native/`, no need to set it.
+
 * `native/` empty (fresh clone after `git clean -fd`, or new board) —
-  run `build_native.sh` first (20-30 min, builds FastDDS 3.6 + FastCDR
-  2.3 from source), then the two commands above. **Do NOT** try to fall
-  back to `apt install libfastrtps-dev` — that's FastDDS 2.x and
-  incompatible with the v0.5 cshim ABI.
+  run `bash .venv/src/wdndds/build_native.sh` first (20-30 min,
+  builds FastDDS 3.6 + FastCDR 2.3 from source), then the bootstrap
+  script.
 
 The wdndds-owned `.so` files (`libwdndds_cshim.so`,
 `libwdndds_idl.so`) are **never in git** — gitignored at both
 `native/lib/` and `src/wdndds/dds/_native/`, built fresh per install.
-A `git clean -fd` that wipes `native/lib/` is recoverable; a
-`git clean -fdx` that also wipes `idl/build/` + `cshim_src/build/`
-needs the `pip install --force-reinstall` line above to rebuild them.
+A `git clean -fd` that wipes `native/lib/` is recoverable via the
+bootstrap script; a `git clean -fdx` that also wipes
+`idl/build/` + `cshim_src/build/` needs the full `build_native.sh` +
+bootstrap dance.
 
 ## Layout
 
 ```
 wdnwebui/
-├── run.py                # entry point — uvicorn.run("app.main:app", ...)
+├── run.py                          # entry point — uvicorn.run("app.main:app", ...)
+├── bootstrap_wdndds_native.sh      # one-time wdndds .so build (apt + stub + pip)
 ├── app/
 │   ├── __init__.py       # __version__ = "0.3.0"
 │   ├── main.py           # create_app() factory + module-level `app`
