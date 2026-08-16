@@ -12,6 +12,16 @@
   检查（``get_session("swcap_audio_tts")``），未启用则直接抛
   ``RuntimeError("功能未启用: swcap_audio_tts")``，由 detector
   写入 ``DetectorEvent(level="error")``。
+
+并发：
+
+TTS 服务是单 worker（``TtsSession`` 单例 + 后台线程），单次合成
+需要 2-5 秒。如果模型在 detector 的多轮工具循环里连发 tts_alert
+（每帧 1 次 + max_iters 默认 5），第二个调用会撞上
+``"TTS 正在运行或正在清理，请稍候再试"``。这里**静默跳过**而非
+写入 error 事件——避免在 alert 已经播过一次的循环里刷屏
+``语音提醒失败: ...``。Detector 仍能拿到第一轮成功播的那一次
+事件。
 """
 from __future__ import annotations
 
@@ -19,6 +29,14 @@ from typing import Annotated
 
 from wdnai import Callable as WdnaiCallable
 from wdnai import Field as WdnaiField
+
+
+# tts_alert 默认音量。AGENTS.md 早期约定 standalone TTS page 默认
+# 0.1（"10% on hardware whose mixers default to 100%"），但 tts_alert
+# 是 alert 场景——用户期望听见，不能默默 10%。0.5 在大多数 3.5mm
+# 耳机 / 板载喇叭上已经是清晰可闻的音量，且仍给系统 mixer 留余量。
+# 用户可调系统的 ``amixer`` 控制或后续在 UI 加 slider。
+_ALERT_VOLUME = 0.5
 
 
 @WdnaiCallable
@@ -50,7 +68,22 @@ class TtsAlert:
         except RuntimeError as e:
             raise RuntimeError(str(e)) from e
 
-        from app.services.tts_session import PLAY_DEVICE, TTSRequest, get_session
+        from app.services.tts_session import (
+            PLAY_DEVICE, TTSRequest, get_session,
+        )
+
+        sess = get_session()
+        # Concurrency guard: TTS 单 worker，busy 时不应该再入队
+        # 同一个 alert，而是当作"已经提醒过了"安静返回。``snapshot()``
+        # 的 ``busy`` 字段就是 ``_state in (LOADING, RUNNING)`` 的对外
+        # 表达 —— TtsSession 没有直接暴露 ``state`` 属性。
+        if sess.snapshot().get("busy"):
+            return {
+                "text": text,
+                "played": False,
+                "error": "skipped(tts busy)",
+                "silent": True,
+            }
 
         req = TTSRequest(
             text=text,
@@ -58,15 +91,25 @@ class TtsAlert:
             speaker="",
             ref_speaker=(self.ref_speaker or "girl_base"),
             instruct="",
-            volume=0.1,
+            volume=_ALERT_VOLUME,
             no_play=False,
             play_to=PLAY_DEVICE,
             output="",
             non_streaming_mode=False,
         )
         try:
-            get_session().start(req)
+            sess.start(req)
         except Exception as e:  # noqa: BLE001
             return {"text": text, "played": False, "error": str(e)}
 
-        return {"text": text, "played": True, "error": ""}
+        # tts_alert 是纯 side-effect：模型调用工具即"提醒已播"，
+        # 没有需要 wrap-up 的 follow-up 输出。返回 ``consume_iteration=True``
+        # 让 detector 跳出 multi-iter 循环——不再把"你刚说了
+        # '看到人就提醒'"的 transcript 喂回下一轮，避免模型退化到
+        # 把用户提示词当 VLMDoc 的 text 复读出来。
+        return {
+            "text": text,
+            "played": True,
+            "error": "",
+            "consume_iteration": True,
+        }

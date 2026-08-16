@@ -276,10 +276,16 @@ class DetectorEvent:
     crop_w: Optional[int] = None
     crop_h: Optional[int] = None
     desc: Optional[str] = None
+    # ``True`` when the tool that produced this event is a pure
+    # side-effect (e.g. ``tts_alert`` 播完了就是播完了，不再需要模型
+    # wrap-up). detector 看到 ``tool_ev.consume_iteration`` 时直接跳出
+    # multi-iter 循环，不再把 "你刚说了 X" 的 transcript 喂回下一轮
+    # 避免模型退化到复读用户的提示词。
+    consume_iteration: bool = False
 
     def to_dict(self) -> dict:
         return {
-            "id":               self.id,
+"id":               self.id,
             "frame_pos":        self.frame_pos,
             "ts":               self.ts,
             "prompt":           self.prompt,
@@ -292,6 +298,7 @@ class DetectorEvent:
             "crop_w":           self.crop_w,
             "crop_h":           self.crop_h,
             "desc":             self.desc,
+            "consume_iteration": self.consume_iteration,
         }
 
 
@@ -314,6 +321,8 @@ class DetectorEvent:
 _SANITIZE_CHATML_TOKEN = re.compile(r"<\|[^|]*\|>")
 _SANITIZE_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SANITIZE_BLANK_LINES = re.compile(r"\n{3,}")
+_DEGENERATE_VLM_TEXT = frozenset({"VLMDoc", "TargetDoc", "TTSResult"})
+_TRAILING_PUNCT = re.compile(r"[，。！？!?,.;:：、\s]+$")
 
 
 def _sanitize_event_text(s: Optional[str]) -> Optional[str]:
@@ -332,6 +341,10 @@ def _sanitize_event_text(s: Optional[str]) -> Optional[str]:
     s = s.replace("\ufffd", "")
     s = _SANITIZE_BLANK_LINES.sub("\n\n", s)
     return s.strip()
+
+
+def _strip_trailing_punct(s: str) -> str:
+    return _TRAILING_PUNCT.sub("", s)
 
 
 # --------------------------------------------------------------------------- #
@@ -774,11 +787,20 @@ class WdnaiDetector:
                         is_fatal,
                         tool_ev.level,
                     )
-                    # 工具成功 → 写 transcript 进下一轮 prompt，继续循环；
                     # 工具失败 → 直接跳出（按设计：异常 → error → 不再喂回）。
                     if is_fatal:
                         exit_reason = f"tool_error[{tool_ev.tool_call}]"
                         break
+                    # 纯 side-effect 工具（tts_alert 等）成功后跳出循环：
+                    # 它们的 effect 本身就是目的，不再让模型 wrap-up 一段
+                    # VLMDoc —— 那个 wrap-up 反而会让模型复读自己的工具
+                    # arguments（"你刚说了 X"→下一轮 text="X"→退化）。
+                    if tool_ev.consume_iteration:
+                        exit_reason = (
+                            f"tool_consumed[{tool_ev.tool_call}]"
+                        )
+                        break
+                    # 默认：写 transcript 进下一轮 prompt，继续循环。
                     tool_transcripts.append(
                         self._format_tool_transcript(result, tool_ev)
                     )
@@ -819,7 +841,27 @@ class WdnaiDetector:
                     level=getattr(result, "level", None),
                     attachment_count=att_count,
                 )
-                events.append(final_ev)
+                prompt_stripped = (prompt or "").strip()
+                text_stripped = clean_text.strip()
+                # 提示词的尾部中英文标点（"，。！？!?,;: " 等）经常被
+                # 模型回显时漏掉 / 漏多，用去掉标点的版本做 echo 判定。
+                prompt_norm = _strip_trailing_punct(prompt_stripped)
+                text_norm = _strip_trailing_punct(text_stripped)
+                degenerate = (
+                    (text_norm == prompt_norm and bool(prompt_norm))
+                    or text_stripped in _DEGENERATE_VLM_TEXT
+                    or not text_stripped
+                )
+                if degenerate:
+                    LOG.info(
+                        "frame iter %d: VLMDoc degenerate (text_len=%d "
+                        "text=%r) — drop event",
+                        i + 1,
+                        len(clean_text),
+                        clean_text[:80],
+                    )
+                else:
+                    events.append(final_ev)
                 LOG.info(
                     "frame iter %d: VLMDoc level=%s text_len=%d (sanitized %d)",
                     i + 1,
@@ -981,13 +1023,27 @@ class WdnaiDetector:
                 ), True
             if side.get("played"):
                 text_v = (side.get("text") or "").strip()
+                prompt_norm = _strip_trailing_punct(prompt or "")
+                text_norm = _strip_trailing_punct(text_v)
+                if text_norm and text_norm == prompt_norm:
+                    LOG.info(
+                        "tts_alert prompt-echo (text=%r) — drop event",
+                        text_v[:60],
+                    )
+                    return None, False
                 snippet = text_v if len(text_v) <= 60 else text_v[:57] + "..."
                 return DetectorEvent(
                     id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
                     text=f"语音提醒: {snippet}",
                     level=None, attachment_count=0,
                     tool_call="tts_alert",
+                    consume_iteration=bool(side.get("consume_iteration")),
                 ), False
+            # TTS 在跑（同一帧多轮工具循环里上一次的合成还没结束）——
+            # 静默跳过，不写 error 事件也不打断循环。第一轮成功播的
+            # 那一次 DetectorEvent 已经记录在 events 里了。
+            if side.get("silent"):
+                return None, False
             err = side.get("error") or "unknown"
             return DetectorEvent(
                 id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
