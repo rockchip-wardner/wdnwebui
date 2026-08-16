@@ -185,14 +185,44 @@ class _RpcSessionProxy:
                 f"compute_worker[{self._model_id}] infer failed: {err}")
         data = reply.get("data") or {}
 
-        # Decode any attachment bytes the worker serialized. Worker
-        # encodes ``result.attachment[0].data`` as base64 (TTS WAV
-        # bytes, future VLM-decoded images, …) because cshim RPC
-        # only carries JSON-serialisable values. We rehydrate it into
-        # an object with the same attribute surface that wdnai.Attachment
-        # exposes (``kind`` / ``mime_type`` / ``data``) so
-        # tts_session.py can do ``result.attachment[0].data`` and
-        # write the WAV to disk.
+        # ---- Tool-instance path -------------------------------------------
+        # Worker 端 SDK 的 ``dispatch_tool_call`` 把模型返回的 JSON
+        # 还原成 ``@Callable`` 实例并直接 return。Worker 把这个实例
+        # ``model_dump()`` 后作为 ``tool_call_args`` 发回 RPC，我们
+        # 在这里按 ``tool_call``（class 名）查到对应 class 并
+        # ``cls.model_validate(args)`` 重建——这样 detector 端
+        # ``isinstance(result, TtsAlert)`` 通过、``result(frame_bgr,
+        # ctx)`` 可直接调用。不重建的话 detector 拿到的是
+        # ``_ProxyResult``，永远 instanceof 不上。
+        #
+        # Registry key 是 UI 用的 ``"tts_alert"``，worker 发的是 class
+        # 名 ``"TtsAlert"`` —— 两者不同。按 class 名查 registry。
+        tool_call_name = data.get("tool_call")
+        tool_call_args = data.get("tool_call_args")
+        if tool_call_name and isinstance(tool_call_args, dict):
+            try:
+                from app.services.tools import get_tool_registry
+                cls = None
+                for spec in get_tool_registry().list_specs():
+                    if spec.tool_class.__name__ == tool_call_name:
+                        cls = spec.tool_class
+                        break
+                if cls is None:
+                    raise KeyError(tool_call_name)
+                instance = cls.model_validate(tool_call_args)
+                # Return the actual instance so the caller's
+                # isinstance() check + __call__(frame_bgr, ctx)
+                # both work without a wrapper adapter.
+                return instance
+            except KeyError:
+                LOG.warning("proxy: unknown tool class %r in reply — "
+                            "falling back to _ProxyResult", tool_call_name)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("proxy: tool instance reconstruct failed "
+                            "(%s: %s) — falling back to _ProxyResult",
+                            type(e).__name__, e)
+
+        # ---- Attachment (TTS WAV bytes / future VLM-decoded images) -----
         attachments = []
         attachment_b64 = data.get("attachment_b64")
         if attachment_b64:

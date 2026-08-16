@@ -164,6 +164,48 @@ def _load_wdnai() -> dict:
     return _WDNAI
 
 
+# RPC only carries ``@Callable`` class NAMES (the class objects can't be
+# pickled across the wdndds cshim boundary). Each worker holds this
+# lookup table so it can resolve the name back to the actual class
+# before passing ``tools=[…]`` to the SDK. Add new entries here when a
+# new ``@Callable`` tool is registered.
+_TOOL_TABLE = {
+    "TtsAlert": "app.services.tools.tts_alert.TtsAlert",
+}
+
+
+def _resolve_tool_classes(names):
+    """Map ``@Callable`` class names (strings) to actual class objects.
+
+    Lazy imports keep the worker boot path clean: a model that's
+    never invoked with ``tools=[...]`` never imports
+    ``app.services.tools.*``. Unknown names are silently skipped (and
+    logged) so the SDK doesn't error out — the model simply can't
+    call a tool it never sees a schema for.
+    """
+    if not names:
+        return []
+    out = []
+    for n in names:
+        mod_path = _TOOL_TABLE.get(n)
+        if not mod_path:
+            LOG.warning("infer_handler: unknown tool name %r — skipping", n)
+            continue
+        try:
+            mod_name, cls_name = mod_path.rsplit(".", 1)
+            mod = __import__(mod_name, fromlist=[cls_name])
+            cls = getattr(mod, cls_name, None)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("infer_handler: tool import failed for %r: %s", n, e)
+            continue
+        if cls is None:
+            LOG.warning("infer_handler: tool class %r not found at %s",
+                        n, mod_path)
+            continue
+        out.append(cls)
+    return out
+
+
 def _build_session(model_id: str, npu_index: int):
     """Construct an LLMSession. May raise (or call terminate())."""
     mod = _load_wdnai()
@@ -549,6 +591,15 @@ def infer_handler(state: dict, payload: dict) -> dict:
             kwargs = {**audio_kwargs, **tts_kwargs}
             if generating_cls is not None:
                 kwargs["generating"] = generating_cls
+            # ``tools`` 是 wdnai 的 ``@Callable`` 类列表。RPC 只透传
+            # class name 字符串（类对象不可 pickle），worker 端按名查
+            # 表拿到真实 class 再传给 SDK。当前唯一已注册的工具是
+            # 音视频描述页的 ``tts_alert``；后续加新工具时扩 ``_TOOL_TABLE``
+            # 即可。
+            tool_names = payload.get("tools") or []
+            tool_classes = _resolve_tool_classes(tool_names)
+            if tool_classes:
+                kwargs["tools"] = tool_classes
             return await sess.respond(
                 prompt=prompt,
                 attachment=attachments if attachments else None,
@@ -558,6 +609,27 @@ def infer_handler(state: dict, payload: dict) -> dict:
         result = asyncio.run(_call())
         text = getattr(result, "text", None) or (
             result if isinstance(result, str) else None)
+
+        # Detect tool instance. SDK 在 worker 内 ``dispatch_tool_call``
+        # 把模型返回的 JSON 还原成 ``@Callable`` 实例并直接 return
+        # ``sess.respond()``——也就是说 ``result`` 可能是 ``TtsAlert``
+        # 等实例，不是 ``VLMDoc`` / ``TargetDoc`` 结构化输出。detector
+        # 端的 ``isinstance(result, TtsAlert)`` 分支需要拿到真正的实例
+        # 才能 ``result(frame_bgr, ctx)``；下面把实例 ``model_dump``
+        # 出来供 proxy 端 ``cls.model_validate(args)`` 重建。
+        tool_call_name = type(result).__name__ if not isinstance(result, str) else None
+        is_tool_instance = (
+            tool_call_name is not None
+            and tool_call_name not in {"str", "TTSResult", "VLMDoc", "TargetDoc"}
+            and hasattr(result, "model_dump")
+            and not isinstance(result, (str, bytes))
+        )
+        tool_call_args: Optional[dict] = None
+        if is_tool_instance:
+            try:
+                tool_call_args = result.model_dump()
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("tool instance dump failed: %s", e)
 
         # Serialize ``result.attachment`` as base64 so the wire RPC can
         # carry binary payloads (TTS WAV bytes, VLM decoded images,
@@ -576,12 +648,14 @@ def infer_handler(state: dict, payload: dict) -> dict:
         reply = {
             "text": text,
             "level": getattr(result, "level", None),
-            "tool_call": getattr(result, "tool_call", None),
+            "tool_call": tool_call_name if is_tool_instance else getattr(result, "tool_call", None),
             "bbox": getattr(result, "bbox", None),
             "crop_b64": getattr(result, "crop_b64", None),
         }
         if attachment_b64 is not None:
             reply["attachment_b64"] = attachment_b64
+        if is_tool_instance and tool_call_args is not None:
+            reply["tool_call_args"] = tool_call_args
         return reply
     except Exception as e:  # noqa: BLE001
         LOG.warning("infer_handler exception: %s", e)
