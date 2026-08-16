@@ -35,6 +35,7 @@ class ToolSpec:
     description: str
     requires_capability: Optional[str]
     tool_class: Type
+    icon: str = ""
     fields: Tuple[Tuple[str, str], ...] = ()   # (name, description)
 
 
@@ -62,12 +63,14 @@ class ToolRegistry:
         description: str,
         requires_capability: Optional[str],
         tool_class: Type,
+        icon: str = "",
     ) -> None:
         spec = ToolSpec(
             key=key,
             name=name,
             description=description,
             requires_capability=requires_capability,
+            icon=icon,
             tool_class=tool_class,
             fields=self._extract_fields(tool_class),
         )
@@ -137,6 +140,7 @@ def get_tool_registry() -> ToolRegistry:
                 ),
                 requires_capability="swcap_audio_tts",
                 tool_class=TtsAlert,
+                icon="🔊",
             )
             _registry = reg
         return _registry

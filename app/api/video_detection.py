@@ -316,6 +316,7 @@ async def list_tools() -> dict:
         out.append({
             "key":                 spec.key,
             "name":                spec.name,
+            "icon":                spec.icon,
             "description":         spec.description,
             "requires_capability": spec.requires_capability,
             "available":           available,

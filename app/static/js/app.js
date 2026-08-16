@@ -1304,12 +1304,17 @@ function renderVdTools() {
   tools.forEach((t) => {
     const card = document.createElement("label");
     card.className = "vd-tool-card" + (t.available ? "" : " is-disabled");
+    if (VD.enabledTools.includes(t.key)) card.classList.add("is-selected");
     const check = document.createElement("input");
     check.type = "checkbox";
     check.dataset.toolKey = t.key;
-    check.disabled = !t.available;
+    // 始终可勾选 —— capability 未就绪时也允许预选，让用户能提前
+    // 配置好工具，等 bind 了 qwen3-tts 后再启动检测。capability
+    // 缺失由 detector.start() 的 tool-capability 校验兜底（HTTP 503）。
+    check.disabled = false;
     if (VD.enabledTools.includes(t.key)) check.checked = true;
     check.addEventListener("change", () => {
+      card.classList.toggle("is-selected", check.checked);
       if (check.checked) {
         if (!VD.enabledTools.includes(t.key)) VD.enabledTools.push(t.key);
       } else {
@@ -1321,12 +1326,16 @@ function renderVdTools() {
     body.className = "vd-tool-card-body";
     const title = document.createElement("div");
     title.className = "vd-tool-card-title";
+    const icon = document.createElement("span");
+    icon.className = "vd-tool-card-icon";
+    icon.textContent = t.icon || "🛠";
     const name = document.createElement("span");
     name.className = "vd-tool-card-name";
     name.textContent = t.name;
     const key = document.createElement("span");
     key.className = "vd-tool-card-key";
     key.textContent = t.key;
+    title.appendChild(icon);
     title.appendChild(name);
     title.appendChild(key);
     const desc = document.createElement("div");
