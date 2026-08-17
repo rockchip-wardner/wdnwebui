@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from app.services.wechat import get_wechat
+from app.services.wechat_bot import Wechat
 
 
 _LOG = logging.getLogger("wechat_api")
@@ -60,9 +61,7 @@ async def get_wechat_users() -> dict:
 
 @router.get("/wechat/runtime")
 async def get_wechat_runtime() -> dict:
-    import wdndds
-
-    info = wdndds.Wechat.check_runtime()
+    info = Wechat.check_runtime()
     info["wechat_loaded"] = info.get("available", False)
     return info
 
