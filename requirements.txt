@@ -7,12 +7,14 @@ python-multipart>=0.0.9
 av>=11.0.0
 rknn3-toolkit-lite>=1.0.0
 gguf>=0.10.0
-# wdndds / wechatbot-sdk：im-bridge 页的微信 iLink 机器人依赖。
-#   - wdndds（私有包，配套 wdnav/wdnai 一起放在 .venv/src/，需要
-#     `pip install -e .venv/src/wdndds` editable 安装；带 vendor 的
-#     _fastdds_python.so + _wdndds_string.so 二进制 + wechatbot-sdk 依赖）
-#   - wechatbot-sdk（PyPI 包，wdndds 依赖会自动装）
+wechatbot-sdk>=0.3.0,<1.0
+# wdndds（私有包，配套 wdnav/wdnai 一起放在 .venv/src/，需要
+# `pip install -e .venv/src/wdndds` editable 安装）— 仅 DDS/RPC，
+# 不再含 Wechat 模块。wechatbot-sdk 由 wdnwebui 直接依赖。
 # wdnav / wdnai are internal SDKs (behind SSH on git@10.10.10.10) and are
 # installed separately — see README §4.
 # gguf is imported by wdnai.gguf_tokenizer to load the *.tokenizer.gguf
 # files that ship with RKNN models; wdnai's own pyproject doesn't pin it.
+# wechatbot-sdk powers the im-bridge (微信 iLink) page — its Wechat
+# wrapper lives in app/services/wechat_bot.py (inlined from the old
+# wdndds.Wechat in 0.5+).
