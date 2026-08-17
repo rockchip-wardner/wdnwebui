@@ -52,6 +52,9 @@ python-multipart, **`rknn3-toolkit-lite`**, and **`gguf`**.
   `*.tokenizer.gguf` files that ship with each RKNN model. The
   `wdnai` SDK imports it but doesn't declare it as a dependency, so
   we pin it here.
+- `wechatbot-sdk` — async client for the 微信 iLink bot; the synchronous
+  wrapper that drives the im-bridge page lives in
+  `app/services/wechat_bot.py` (inlined from `wdndds.Wechat` in 0.5+).
 
 > ⚠️  `rknn3-toolkit-lite` only ships the **Python** half of the
 > runtime. The kernel-mode driver (`/dev/rknn3`), the userspace libs
