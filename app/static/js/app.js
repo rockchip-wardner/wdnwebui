@@ -2858,7 +2858,7 @@ const DemoGuard = {
   },
 
   async confirmLeave(fromPage) {
-    if (!this.isActive(fromPage)) return true;
+    if (!this.isActive(fromPage)) return "stop";
     const labels = {
       "video-detection":        "音视频描述",
       "video-target-detection": "视频目标检测",
@@ -2866,10 +2866,31 @@ const DemoGuard = {
       "video-file-analysis":    "视频文件分析",
       "tts":                    "语音生成",
     };
-    const msg =
-      `【${labels[fromPage] || fromPage}】后台正在运行。\n\n` +
-      `离开此页面将自动停止当前任务并释放算力。\n确定继续吗？`;
-    return window.confirm(msg);
+    const name = labels[fromPage] || fromPage;
+    return new Promise((resolve) => {
+      const modal = document.getElementById("dg-modal");
+      const msgEl = document.getElementById("dg-modal-msg");
+      const btnStop = document.getElementById("dg-btn-stop");
+      const btnKeep = document.getElementById("dg-btn-keep");
+      const btnCancel = document.getElementById("dg-btn-cancel");
+      msgEl.textContent = `【${name}】后台正在运行。离开此页面将自动停止当前任务并释放算力。`;
+      modal.classList.remove("hidden");
+      function cleanup() {
+        modal.classList.add("hidden");
+        btnStop.removeEventListener("click", onStop);
+        btnKeep.removeEventListener("click", onKeep);
+        btnCancel.removeEventListener("click", onCancel);
+        modal.removeEventListener("click", onBg);
+      }
+      function onStop()  { cleanup(); resolve("stop"); }
+      function onKeep()  { cleanup(); resolve("keep"); }
+      function onCancel(){ cleanup(); resolve("cancel"); }
+      function onBg(e)   { if (e.target === modal) onCancel(); }
+      btnStop.addEventListener("click", onStop);
+      btnKeep.addEventListener("click", onKeep);
+      btnCancel.addEventListener("click", onCancel);
+      modal.addEventListener("click", onBg);
+    });
   },
 
   // stop 后清理缓存，避免兜底 hashchange 监听把同一组 POST 再发一遍
@@ -2886,12 +2907,15 @@ document.querySelectorAll(".nav-item").forEach(a => {
     const cur = currentPage();
     if (!target || target === cur) return;
     if (!DemoGuard.isActive(cur)) return;
-    if (!await DemoGuard.confirmLeave(cur)) {
+    const decision = await DemoGuard.confirmLeave(cur);
+    if (decision === "cancel") {
       e.preventDefault();
       return;
     }
     e.preventDefault();
-    await DemoGuard.stopAndClear(cur);
+    if (decision === "stop") {
+      await DemoGuard.stopAndClear(cur);
+    }
     location.hash = "#" + target;
   });
 });

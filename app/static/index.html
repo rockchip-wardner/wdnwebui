@@ -1406,6 +1406,23 @@
       </main>
   </div>
 
-  <script src="/static/js/app.js?v=49" defer></script>
+  <!-- DemoGuard: 演示页离开确认 modal（三按钮） -->
+  <div id="dg-modal" class="dg-modal hidden" role="dialog" aria-modal="true" aria-label="离开确认">
+    <div class="dg-modal-card">
+      <div class="dg-modal-head">
+        <span class="dg-modal-title" id="dg-modal-title">后台任务运行中</span>
+      </div>
+      <div class="dg-modal-body">
+        <p id="dg-modal-msg"></p>
+      </div>
+      <div class="dg-modal-foot">
+        <button class="vd-btn" id="dg-btn-cancel">取消</button>
+        <button class="vd-btn dg-btn-keep" id="dg-btn-keep">保持后台运行</button>
+        <button class="vd-btn vd-btn-primary" id="dg-btn-stop">停止并离开</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js?v=50" defer></script>
 </body>
 </html>
