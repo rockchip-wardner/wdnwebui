@@ -176,6 +176,7 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
     if not enabled:
         return
 
+    repo_root = Path(__file__).resolve().parent
     ancestors = _ancestor_pids()
     my_pid = os.getpid()
     killed: list[tuple[str, int]] = []
@@ -192,7 +193,6 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
         # (b) compute_workers — find via /proc cmdline walk. We match
         #     the script path + repo marker so a foreign compute_worker
         #     (somebody else's dev box) is NOT killed.
-        repo_root = Path(__file__).resolve().parent
         worker_path = repo_root / "app" / "services" / "compute_worker.py"
         try:
             worker_path_str = str(worker_path.resolve())
@@ -229,19 +229,20 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
             #
             # NOTE: ``/proc/<pid>/cmdline`` is NUL-separated with a
             # trailing NUL, so ``raw.split(b"\0")`` produces a
-            # trailing empty element. Index from the SECOND-to-last
-            # to get the script arg. We do NOT require ``wdnwebui``
-            # to appear in cmdline (the script arg is just ``run.py``);
-            # instead we validate via ``/proc/<pid>/cwd`` to make sure
-            # we're targeting the same repo, not some foreign
-            # ``run.py`` in another project.
+            # trailing empty element. We DON'T require ``run.py`` to
+            # be the last arg — the previous run may have had flags
+            # after it (``--no-kill-stale`` etc.) that shift ``run.py``
+            # to the middle. We DO require the python interpreter to
+            # be repo-internal (``.venv/bin/python``) and CWD to be the
+            # repo root, so we never touch a foreign ``run.py`` from
+            # another project.
             argv = [a for a in cmdline if a]  # drop trailing empty
-            if len(argv) >= 2 \
-                    and argv[-1] == b"run.py" \
-                    and (argv[-2].endswith(b"/python")
-                         or argv[-2].endswith(b"/python3")
-                         or argv[-2].endswith(b"python")
-                         or argv[-2].endswith(b"python3")):
+            has_run_py = any(a.endswith(b"run.py") for a in argv)
+            has_repo_python = any(
+                a.endswith(b"/python") or a.endswith(b"/python3")
+                for a in argv
+            )
+            if len(argv) >= 2 and has_run_py and has_repo_python:
                 try:
                     cwd_target = os.readlink(f"/proc/{pid}/cwd")
                 except OSError:
@@ -298,15 +299,30 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
     for label, pid in candidates:
         print(f"  - {label} pid={pid}", file=sys.stderr)
 
-    # SIGTERM with 3s grace.
-    for _, pid in candidates:
+    # SIGTERM with 3s grace. For "run.py" candidates we also walk
+    # children (deepest first) and signal each descendant — covers
+    # uvicorn's reload child + the actual worker + compute_workers
+    # spawned via Popen with start_new_session, all without touching
+    # unrelated processes in the same process group (the shell that
+    # launched us via nohup shares the pgrp).
+    def _signal_pid(pid: int, sig: int) -> None:
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
             pass
 
+    # Expand "run.py" candidates into their full descendant tree.
+    expanded: list[tuple[str, int]] = list(candidates)
+    for label, pid in candidates:
+        if label == "run.py":
+            for child in _descendant_pids(pid):
+                expanded.append((f"{label}.child", child))
+
+    for label, pid in expanded:
+        _signal_pid(pid, signal.SIGTERM)
+
     deadline = time.time() + 3.0
-    pending = list(candidates)
+    pending = list(expanded)
     while pending and time.time() < deadline:
         time.sleep(0.2)
         pending = [(lbl, p) for lbl, p in pending
@@ -320,13 +336,46 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
             f"after 3s grace",
             file=sys.stderr,
         )
-        for _, pid in survivors:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        for label, pid in survivors:
+            _signal_pid(pid, signal.SIGKILL)
         # Give the kernel a moment to release sockets.
         time.sleep(0.5)
+
+    # Post-kill verification: if port 8000 is STILL occupied, the
+    # original sweep missed something (common when the previous run
+    # was launched under a wrapper like ``nohup`` that stripped the
+    # argv path or the holder's cmdline is unreadable). Walk the
+    # parent's PPid chain until we find a wdnwebui-flavored ancestor
+    # and kill its process group as a last resort. If even that
+    # can't release the port, leave a loud hint and let ``uvicorn.run``
+    # raise the [Errno 98] — caller can then ``kill -9`` by hand.
+    new_holder = _pid_listening_on_port(8000)
+    if new_holder and new_holder != my_pid and new_holder not in ancestors:
+        ancestor = _find_wdnwebui_ancestor(new_holder, repo_root, ancestors)
+        if ancestor and ancestor not in {p for _, p in expanded}:
+            print(
+                f"[run.py] kill-stale: port 8000 still held by pid={new_holder}; "
+                f"killing wdnwebui ancestor pid={ancestor} (+ descendants)",
+                file=sys.stderr,
+            )
+            for child in _descendant_pids(ancestor):
+                _signal_pid(child, signal.SIGKILL)
+            _signal_pid(ancestor, signal.SIGKILL)
+            time.sleep(0.5)
+            # If STILL busy (foreign process holding 8000), surface it
+            # so the user knows what to kill manually.
+            leftover = _pid_listening_on_port(8000)
+            if leftover and leftover != my_pid and leftover not in ancestors:
+                try:
+                    with open(f"/proc/{leftover}/cmdline", "rb") as f:
+                        cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+                except OSError:
+                    cmd = "(unreadable)"
+                print(
+                    f"[run.py] kill-stale: WARNING port 8000 STILL held by "
+                    f"pid={leftover} cmd='{cmd}' — kill -9 manually",
+                    file=sys.stderr,
+                )
 
     for label, pid in candidates:
         if not _pid_alive(pid):
@@ -338,6 +387,88 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
             f"before binding port 8000",
             file=sys.stderr,
         )
+
+
+def _find_wdnwebui_ancestor(
+    pid: int, repo_root: Path, exclude: set[int]
+) -> int | None:
+    """Walk ``pid``'s PPid chain looking for a process whose CWD is
+    ``repo_root`` AND whose cmdline contains ``run.py`` AND whose
+    interpreter is the repo's ``.venv/bin/python``. Returns the topmost
+    such ancestor, or ``None`` if the chain breaks / no match.
+
+    Used by the post-kill verification path: when the original
+    ``_kill_stale_wdnwebui_processes`` sweep missed the port 8000
+    holder (e.g. it was launched under ``nohup`` and the wrapper
+    proc owns the LISTEN socket), we walk up from the holder to find
+    a wdnwebui process we can safely kill the whole group of.
+    """
+    seen: set[int] = set()
+    cur = pid
+    result: int | None = None
+    for _ in range(64):
+        if cur in seen or cur in exclude or cur <= 1:
+            break
+        seen.add(cur)
+        try:
+            with open(f"/proc/{cur}/status") as f:
+                ppid = None
+                for line in f:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+            if ppid is None:
+                break
+        except OSError:
+            break
+        try:
+            with open(f"/proc/{cur}/cmdline", "rb") as f:
+                raw = f.read()
+            cwd = os.readlink(f"/proc/{cur}/cwd")
+        except OSError:
+            if ppid <= 1:
+                break
+            cur = ppid
+            continue
+        argv = [a for a in raw.split(b"\0") if a]
+        if (
+            cwd == str(repo_root)
+            and any(a.endswith(b"run.py") for a in argv)
+            and any(a.endswith(b"/python") or a.endswith(b"/python3") for a in argv)
+        ):
+            result = cur
+        if ppid <= 1:
+            break
+        cur = ppid
+    return result
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    """Return all descendant PIDs of ``pid`` (children, grand-children, …)
+    in post-order (deepest first). Reads
+    ``/proc/<pid>/task/<pid>/children`` which the kernel maintains
+    automatically — no need to walk /proc on each candidate. Excludes
+    ``pid`` itself; caller signals the root separately.
+    """
+    out: list[int] = []
+    stack = [pid]
+    while stack:
+        cur = stack.pop()
+        try:
+            with open(f"/proc/{cur}/task/{cur}/children") as f:
+                raw = f.read().strip()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        for tok in raw.split():
+            try:
+                child = int(tok)
+            except ValueError:
+                continue
+            stack.append(child)
+            out.append(child)
+    return out
 
 
 def _pid_alive(pid: int) -> bool:
