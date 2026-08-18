@@ -71,17 +71,23 @@ async def stop_extract() -> dict:
 
 @router.post("/video-content-search/query")
 async def query_video(payload: dict) -> dict:
-    """文本检索。Body: ``{text, sim_threshold, top_k}``。"""
+    """文本检索。Body: ``{text, sim_threshold, top_k, min_results?, debug?}``。
+
+    ``sim_threshold`` 严格过滤相似度：返回的每条 hit 都满足
+    ``similarity >= sim_threshold``。当 **没有任何** hit 达到阈值，
+    默认返回空列表；调用方如果想看"最佳猜测"（即使低于阈值），
+    显式传 ``min_results=N`` 启用 fallback 模式。
+    """
     payload = payload or {}
     text = (payload.get("text") or "").strip()
     debug = bool(payload.get("debug", False))
     try:
-        # Default threshold 0.5 + min_results 3: only strong matches pass,
-        # but the user always gets the best top-3 with their actual
-        # sim scores for self-diagnosis.
         sim_threshold = float(payload.get("sim_threshold", 0.5))
         top_k = int(payload.get("top_k", 10))
-        min_results = int(payload.get("min_results", 3))
+        # 默认 0 = 严格模式，没有达到阈值的片段就返回空。
+        # 设为 N>0 时启用 fallback：阈值过滤完后无命中时，
+        # 补回 top-N（无视阈值），用于自检 / 调阈值。
+        min_results = int(payload.get("min_results", 0))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="阈值/上限必须为数值")
     # embed_text 是同步 NPU 推理：挪到线程池执行（不阻塞 event loop），

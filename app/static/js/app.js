@@ -7008,9 +7008,25 @@ function vcsRenderHits(hits, query) {
   const count = vcsEl("vcs-results-count");
   if (!list) return;
   if (!hits.length) {
-    list.innerHTML = '<li class="vcs-results-empty">' +
-      (query ? "没有达到阈值或上限的结果。" : "完成提取后输入问题检索，命中片段显示在这里。") +
-      "</li>";
+    let msg;
+    if (!query) {
+      msg = "完成提取后输入问题检索，命中片段显示在这里。";
+    } else {
+      // 区分"完全没结果"vs"问题已查询过但没达阈值"。
+      // query_meta.above_threshold_count 用于精确提示：若索引里有
+      // 数据但全低于阈值，引导用户降低阈值 / 开宽松匹配。
+      const meta = (VCS.snap && VCS.snap.query_meta) || {};
+      const above = meta.above_threshold_count;
+      const below = meta.below_threshold_count;
+      if (typeof above === "number" && above === 0 && below > 0) {
+        msg = "没有片段达到阈值；可降低阈值或勾选「宽松匹配」查看最佳猜测"
+              + "（索引 " + meta.index_size + " 条，最高分 " +
+              (meta.top_score != null ? Number(meta.top_score).toFixed(2) : "--") + "）。";
+      } else {
+        msg = "没有达到阈值或上限的结果。";
+      }
+    }
+    list.innerHTML = '<li class="vcs-results-empty">' + vcsEsc(msg) + "</li>";
     if (count) count.textContent = "0 条";
     return;
   }
@@ -7020,13 +7036,19 @@ function vcsRenderHits(hits, query) {
     const t = vcsFormatTime(h.start_time) + " – " + vcsFormatTime(h.end_time);
     const sim = (h.similarity != null) ? Number(h.similarity).toFixed(2) : "--";
     const t0 = (h.start_time != null) ? Number(h.start_time) : 0;
+    // above_threshold=false 来自 fallback：阈值过滤完后无命中时
+    // 补回的 top-N（"宽松匹配"模式），标红 badge 提示用户。
+    const aboveTh = h.above_threshold !== false;
+    const badgeCls = aboveTh ? "vcs-badge vcs-badge-ok" : "vcs-badge vcs-badge-low";
+    const badgeTxt = aboveTh ? "达标" : "低于阈值";
     return (
-      '<li class="vcs-card" data-i="' + i + '" role="button" tabindex="0">' +
+      '<li class="vcs-card' + (aboveTh ? "" : " vcs-card-low") + '" data-i="' + i + '" role="button" tabindex="0">' +
         '<div class="vcs-thumb" data-thumb-t="' + t0 + '">缩略图</div>' +
         '<div class="vcs-card-info">' +
           '<span class="vcs-card-time">' + vcsEsc(t) + "</span>" +
           '<span class="vcs-card-score">相似度 <b>' + sim + "</b></span>" +
-        "</div>" +
+        '</div>' +
+        '<span class="' + badgeCls + '">' + badgeTxt + "</span>" +
         '<span class="vcs-card-play">▶</span>' +
       "</li>"
     );
@@ -7382,14 +7404,16 @@ async function vcsQuery() {
   if (btn) { btn.disabled = true; btn.textContent = "检索中"; }
   if (meta) meta.textContent = "检索中…";
   try {
+    const lenient = !!vcsEl("vcs-lenient")?.checked;
+    const body = { text, sim_threshold: threshold, top_k: topK };
+    // 严格模式（默认）：阈值过滤后无命中就返回空。
+    // 勾选"宽松匹配" → min_results=topK，启用 fallback：
+    //   阈值过滤完后无命中时补回 top-N（无视阈值，标"低于阈值"）。
+    if (lenient) body.min_results = topK;
     const r = await fetch(API_PREFIX + "/video-content-search/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // min_results: when threshold filters out everything, server falls
-      // back to top-N best-effort matches instead of returning empty.
-      body: JSON.stringify({
-        text, sim_threshold: threshold, top_k: topK, min_results: topK,
-      }),
+      body: JSON.stringify(body),
       signal: vcsQueryAbort.signal,
     });
     const data = await r.json();
@@ -7465,6 +7489,15 @@ function initVideoContentSearch() {
       c.classList.toggle("over", n >= 50);
     }
   });
+
+  const topKEl = vcsEl("vcs-top-k");
+  const lenKEl = vcsEl("vcs-lenient-k");
+  const syncLenientK = () => {
+    const k = Number(topKEl?.value || 10);
+    if (lenKEl) lenKEl.textContent = String(k);
+  };
+  topKEl?.addEventListener("input", syncLenientK);
+  syncLenientK();
 
   // 播放器按钮
   vcsEl("vcs-play").addEventListener("click", () => {

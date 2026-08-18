@@ -899,6 +899,10 @@
                             placeholder="例如：有人在搬箱子 / 货车驶入 / 穿红色衣服的人"></textarea>
                   <span class="vcs-ta-count" id="vcs-ta-count">0 / 50</span>
                 </div>
+                <label class="vcs-lenient-row">
+                  <input type="checkbox" id="vcs-lenient" />
+                  <span>宽松匹配（阈值过滤后无命中时补回 top-<span id="vcs-lenient-k">10</span>，无视阈值，标"低于阈值"）</span>
+                </label>
                 <div class="vd-actions-row">
                   <button type="button" class="vd-btn vd-btn-primary" id="vcs-query" disabled>检索</button>
                   <span class="vd-meta" id="vcs-query-meta"></span>

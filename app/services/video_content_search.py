@@ -440,7 +440,7 @@ class VideoContentSearchService:
         return self.snapshot()
 
     def query(self, text: str, sim_threshold: float, top_k: int,
-             min_results: int = 3, debug: bool = False) -> dict:
+             min_results: int = 0, debug: bool = False) -> dict:
         text = (text or "").strip()
         if not text:
             raise ValueError("检索问题不能为空")
@@ -507,17 +507,18 @@ class VideoContentSearchService:
                      sim_threshold, len(hits),
                      hits[0][0] if hits else 0.0)
 
-        above_count = sum(1 for s in all_sims if s >= sim_threshold)
-        below_count = len(all_sims) - above_count
-        top_score = max(all_sims) if all_sims else None
-
         result_hits = [{
             "video_path": entry["video_path"],
             "start_time": entry["start_time"],
             "end_time": entry["end_time"],
             "chunk_idx": entry["chunk_idx"],
             "similarity": round(float(sim), 4),
+            "above_threshold": bool(sim >= sim_threshold),
         } for sim, entry in hits]
+
+        above_count = sum(1 for s in all_sims if s >= sim_threshold)
+        below_count = len(all_sims) - above_count
+        top_score = max(all_sims) if all_sims else None
 
         snap = None
         with self._lock:
