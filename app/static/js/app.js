@@ -7385,7 +7385,11 @@ async function vcsQuery() {
     const r = await fetch(API_PREFIX + "/video-content-search/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, sim_threshold: threshold, top_k: topK }),
+      // min_results: when threshold filters out everything, server falls
+      // back to top-N best-effort matches instead of returning empty.
+      body: JSON.stringify({
+        text, sim_threshold: threshold, top_k: topK, min_results: topK,
+      }),
       signal: vcsQueryAbort.signal,
     });
     const data = await r.json();

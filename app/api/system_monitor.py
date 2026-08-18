@@ -15,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import time
+from typing import Optional
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -204,19 +205,32 @@ def _wdnai_canonical_device_index(bus_id: str | None) -> int | None:
     physical card with the same ``#K``. Returns ``None`` when wdnai is
     unavailable (non-RK dev box) or ``bus_id`` is missing/unmatched —
     callers fall back to the rknn-smi native idx in that case.
+
+    Caches the ``RKNN3Lite`` probe and the resolved lookup map at
+    module scope. ``/api/system-monitor`` calls this once per
+    rknn-smi device per poll; without the cache each call instantiates
+    a new ``RKNN3Lite`` (which opens ``/dev/rknn3`` and contends with
+    the worker's inference on RK3588).
     """
     if not bus_id:
         return None
-    try:
-        from rknn3lite.api import RKNN3Lite
-        ids = RKNN3Lite().get_devices_id()
-    except Exception:
-        return None
-    for i, x in enumerate(ids):
+    global _wdnai_dev_ids
+    if _wdnai_dev_ids is None:
+        try:
+            from rknn3lite.api import RKNN3Lite
+            _wdnai_probe = RKNN3Lite()
+            _wdnai_dev_ids = _wdnai_probe.get_devices_id()
+        except Exception:
+            return None
+    for i, x in enumerate(_wdnai_dev_ids):
         raw = x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8")
         if raw.decode("utf-8", errors="replace") == bus_id:
             return i
     return None
+
+
+_wdnai_probe = None
+_wdnai_dev_ids: Optional[list] = None
 
 
 def _align_npu_indices(devices: list[dict]) -> list[dict]:

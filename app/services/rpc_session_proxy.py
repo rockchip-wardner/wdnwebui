@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -111,16 +112,68 @@ class _RpcSessionProxy:
     """Drop-in for ``wdnai.LLMSession`` that talks to a compute_worker
     subprocess via wdndds cshim RPC.
 
-    Construct via :func:`make_rpc_session_proxy(rpc_client, model_id)`.
+    Construct via :func:`make_rpc_session_proxy(rpc_client, model_id, _svc)`.
     """
 
-    def __init__(self, rpc_client, model_id: str):
+    def __init__(self, rpc_client, model_id: str, _svc=None):
         self._client = rpc_client
         self._model_id = model_id
+        # wdndds cshim requester 一次性：timeout / send-failed 后 channel
+        # 永久 wedged。传 service 引用以便 destroy + create_requester 自愈。
+        self._svc = _svc
+        self._client_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=f"rpc-proxy-{model_id}",
         )
+
+    def _recreate_client(self) -> None:
+        """Destroy wedged cshim client + spin up a fresh requester."""
+        if self._svc is None:
+            LOG.warning("rpc-proxy[%s]: no _svc ref, can't recreate", self._model_id)
+            return
+        with self._client_lock:
+            old = self._client
+            try:
+                old.destroy()
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("rpc-proxy[%s]: destroy old client raised %s",
+                          self._model_id, e)
+            try:
+                self._client = self._svc.create_requester(timeout_ms=10_000)
+                LOG.info("rpc-proxy[%s]: cshim client recreated (was wedged)",
+                         self._model_id)
+            except Exception as e:  # noqa: BLE001
+                LOG.error("rpc-proxy[%s]: recreate failed: %s", self._model_id, e)
+
+    def _call_with_recreate(self, payload: dict, timeout_ms: int) -> dict:
+        """call + auto-recreate on first wedge.
+
+        wdndds cshim deadlock path:
+          1. first call → reply topic discovery race → timeout
+          2. next call → "send failed" (RC=-1, requester wedged)
+        Either symptom triggers destroy + recreate_requester + retry.
+        After recreate, new SEDP/SPDP endpoints match within ~1s on
+        localhost, so the retry almost always succeeds.
+        """
+        reply = self._client.call(payload, timeout_ms=timeout_ms)
+        if reply.get("ok") or not reply.get("error"):
+            return reply
+        err = str(reply.get("error", "")).lower()
+        wedged = ("timeout" in err or "send failed" in err
+                  or "no data" in err)
+        if not wedged:
+            return reply
+        LOG.warning("rpc-proxy[%s]: cshim wedged (%s); recreating client",
+                    self._model_id, err)
+        self._recreate_client()
+        # probe warm-up so retry doesn't re-hit the same discovery race
+        try:
+            self._client.call({"action": "info"}, timeout_ms=10_000)
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("rpc-proxy[%s]: post-recreate warmup raised %s",
+                      self._model_id, e)
+        return self._client.call(payload, timeout_ms=timeout_ms)
 
     @property
     def model_id(self) -> str:
@@ -268,7 +321,7 @@ class _RpcSessionProxy:
         Returns a numpy ``float32`` array on the calling thread. Synchronous
         version of the wdnai LLMSession.embed_text API.
         """
-        reply = self._client.call(
+        reply = self._call_with_recreate(
             {"action": "embed_text", "text": text},
             timeout_ms=60_000,
         )
@@ -281,29 +334,49 @@ class _RpcSessionProxy:
         import numpy as _np
         return _np.asarray(vec, dtype=_np.float32).reshape(-1)
 
-    def embed_video(self, frames, prompt: str = "") -> "np.ndarray":
-        """Embedding one video chunk (list of BGR ndarrays) → 2048-dim vector.
+    def embed_video(self, frames_or_paths, prompt: str = "") -> "np.ndarray":
+        """Embedding one video chunk → 2048-dim vector.
 
-        Frames are JPEG-encoded + base64'd here; the worker decodes them
-        back to BGR ndarrays via cv2.imdecode. We don't bypass this
-        encoding (which would require sharing DMA-BUFs across the cshim
-        boundary) because the per-call payload already fits in one DDS
-        message for typical 16-frame chunks at JPEG q=85.
+        Accepts either:
+          - ``List[np.ndarray]`` (BGR frames) — encoded to JPEG+base64
+            and shipped inline. This is the legacy path; works for
+            small payloads only.
+          - ``List[str]`` (absolute paths to JPEG files, e.g. on
+            ``/dev/shm``) — the worker reads each file with
+            ``cv2.imread()``. This is the **preferred** path: the DDS
+            payload is only ~50 bytes (a list of paths) instead of
+            ~500 KiB (base64-encoded JPEG frames), which keeps the
+            message well under the 64 KiB UDP / SHM transport limit
+            that otherwise wedges ``write()`` indefinitely on FastDDS 3.6.2.
+        Auto-detects: if the first element is a string, treats the
+        whole list as paths; otherwise falls back to base64 encoding.
         """
         import base64 as _b64
-        encoded = []
-        for fr in frames:
-            if hasattr(fr, "shape") and hasattr(fr, "dtype"):
-                encoded.append(_bgr_ndarray_to_b64(fr))
-            elif isinstance(fr, (bytes, bytearray)):
-                encoded.append(_b64.b64encode(bytes(fr)).decode("ascii"))
-            else:
-                raise TypeError(
-                    f"frame must be BGR ndarray or bytes, got {type(fr).__name__}")
-        reply = self._client.call(
-            {"action": "embed_video", "frames": encoded, "prompt": prompt or ""},
-            timeout_ms=120_000,
-        )
+        # Prefer the /dev/shm path-list contract — one path per frame
+        # is ~50 bytes per chunk vs ~500 KiB inline base64.
+        if (frames_or_paths and isinstance(frames_or_paths[0], str)):
+            paths = list(frames_or_paths)
+            reply = self._call_with_recreate(
+                {"action": "embed_video", "frame_paths": paths,
+                 "prompt": prompt or ""},
+                timeout_ms=300_000,
+            )
+        else:
+            # Legacy fallback: keep the old base64 path working for
+            # any other caller that bypasses the VCS service.
+            encoded = []
+            for fr in frames_or_paths:
+                if hasattr(fr, "shape") and hasattr(fr, "dtype"):
+                    encoded.append(_bgr_ndarray_to_b64(fr, quality=60))
+                elif isinstance(fr, (bytes, bytearray)):
+                    encoded.append(_b64.b64encode(bytes(fr)).decode("ascii"))
+                else:
+                    raise TypeError(
+                        f"frame must be BGR ndarray, bytes, or str path; got {type(fr).__name__}")
+            reply = self._call_with_recreate(
+                {"action": "embed_video", "frames": encoded, "prompt": prompt or ""},
+                timeout_ms=300_000,
+            )
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
             raise RuntimeError(
@@ -369,8 +442,8 @@ class _RpcSessionProxy:
         return out
 
 
-def make_rpc_session_proxy(rpc_client, model_id: str) -> _RpcSessionProxy:
-    return _RpcSessionProxy(rpc_client, model_id)
+def make_rpc_session_proxy(rpc_client, model_id: str, _svc=None) -> _RpcSessionProxy:
+    return _RpcSessionProxy(rpc_client, model_id, _svc=_svc)
 
 
 # Public alias

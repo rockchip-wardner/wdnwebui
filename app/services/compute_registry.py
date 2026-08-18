@@ -135,6 +135,8 @@ DEFAULT_ESTIMATED_INIT_SECONDS = 10
 # 又能在真断电 / kill 场景下及时把卡片翻成 error。
 _PEER_LOST_CONSECUTIVE_FAILURES = 5
 
+_RKNN_PROBE_TIMEOUT = 5.0
+
 
 def _read_device_name() -> str:
     """Read ``device_name`` from ``config.json["base"]``.
@@ -622,6 +624,7 @@ class ModelInstance:
     rpc_client: Any = None
     rpc_session_proxy: Any = None
     _probe_thread: Optional[threading.Thread] = None
+    _logged_running: bool = False
     # Provenance / discovery
     _source: str = "spawned"                    # "spawned" | "adopted_local" | "adopted" | "unavailable"
     _peer_guid: str = ""                       # adopted: peer participant GUID
@@ -687,6 +690,9 @@ class ComputeRegistry:
         self._instances: dict[Tuple[int, str], ModelInstance] = {}
         self._cards: list[dict] = []            # not used by RPC path
         self._cards_failed: str = ""
+        # Cache for list_cards() — see that method for the full rationale.
+        self._rknn_probe = None
+        self._rknn_device_ids: Optional[list] = None
         self._hub: Any = None                   # wdndds Hub for client side
         self._hub_lock = threading.Lock()
         self._mode: str = _resolve_compute_mode()
@@ -794,20 +800,63 @@ class ComputeRegistry:
     # 元数据查询                                                          #
     # ------------------------------------------------------------------ #
     def list_cards(self, force_refresh: bool = False) -> list[dict]:
-        """NPU enumeration (wdnai path still needed for non-RPC metadata)."""
+        """NPU enumeration (wdnai path still needed for non-RK metadata).
+
+        Caches the ``RKNN3Lite`` probe handle and the raw
+        ``get_devices_id()`` result so polling endpoints (``/api/compute``)
+        don't re-open ``/dev/rknn3`` on every request. The UI typically
+        polls this 1×/s while the worker is running inference; without
+        the cache, every poll logs ``rknn3-toolkit-lite version: 1.0.4``
+        and contends with the worker on the RKNN driver — which has
+        been observed to wedge ``embed_video`` mid-extract on RK3588.
+
+        First call (no cache) runs ``RKNN3Lite()`` + ``get_devices_id()``
+        in a worker thread bounded by ``_RKNN_PROBE_TIMEOUT`` so a
+        contended ``/dev/rknn3`` can't hang the entire snapshot call
+        (which would block the 1Hz UI poll forever). On timeout we
+        return ``[]`` + set ``cards_failed`` so the UI can surface the
+        driver busy state without taking the API offline.
+        """
         with self._lock:
             if self._cards and not force_refresh:
                 return list(self._cards)
-        try:
-            from rknn3lite.api import RKNN3Lite  # lazy
-            ids = RKNN3Lite().get_devices_id()
-        except Exception as e:
-            with self._lock:
-                self._cards = []
-                self._cards_failed = str(e)
-            return []
+
+        if self._rknn_probe is None or force_refresh:
+            import threading
+            holder: dict = {}
+
+            def _probe():
+                try:
+                    from rknn3lite.api import RKNN3Lite
+                    probe = RKNN3Lite()
+                    holder["probe"] = probe
+                    holder["device_ids"] = probe.get_devices_id()
+                except BaseException as e:  # noqa: BLE001
+                    holder["error"] = e
+
+            t = threading.Thread(target=_probe, daemon=True)
+            t.start()
+            t.join(timeout=_RKNN_PROBE_TIMEOUT)
+            if t.is_alive():
+                with self._lock:
+                    self._cards_failed = (
+                        f"RKNN probe timeout after {_RKNN_PROBE_TIMEOUT:.1f}s "
+                        f"(/dev/rknn3 contended with worker)"
+                    )
+                LOG.warning("list_cards: %s", self._cards_failed)
+                return []
+            if "error" in holder:
+                with self._lock:
+                    self._cards = []
+                    self._cards_failed = str(holder["error"])
+                    self._rknn_probe = None
+                    self._rknn_device_ids = None
+                return []
+            self._rknn_probe = holder["probe"]
+            self._rknn_device_ids = holder["device_ids"]
+
         cards = []
-        for i, x in enumerate(ids):
+        for i, x in enumerate(self._rknn_device_ids):
             raw = x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8")
             cards.append({
                 "npu_index": i,
@@ -1675,7 +1724,7 @@ class ComputeRegistry:
         try:
             from app.services.rpc_session_proxy import make_rpc_session_proxy
             inst.rpc_session_proxy = make_rpc_session_proxy(
-                rpc_client, inst.model_id)
+                rpc_client, inst.model_id, _svc=svc)
             inst.llm_session = inst.rpc_session_proxy
         except Exception as e:  # noqa: BLE001
             LOG.warning("RpcSessionProxy create failed for %s: %s",
@@ -1814,6 +1863,15 @@ class ComputeRegistry:
             with self._lock:
                 if any(i.model_id == model_id for i in self._instances.values()):
                     continue
+            # config.compute.services 是用户显式意图 → 优先本地 spawn，
+            # LAN peer 不可控（挂掉 / 资源占满 / 版本不匹配）。
+            try:
+                self._spawn_compute_worker(model_id)
+                LOG.info("boot: spawned local %s (per config.services)", model_id)
+                continue
+            except Exception as spawn_err:  # noqa: BLE001
+                LOG.warning("boot spawn %s failed (%s); falling back to peer adopt",
+                            model_id, spawn_err)
             adopted = None
             try:
                 adopted = self._adopt_existing_worker(model_id)
@@ -1822,11 +1880,6 @@ class ComputeRegistry:
             if adopted is not None:
                 LOG.info("boot: adopted %s (peer guid=%s status=%s)",
                          model_id, adopted._peer_guid, adopted.status)
-                continue
-            try:
-                self._spawn_compute_worker(model_id)
-            except Exception as e:  # noqa: BLE001
-                LOG.warning("boot spawn %s failed: %s", model_id, e)
         # boot 末尾总清扫：处理 config 移除某 service 后残留的孤儿、
         # 以及 _adopt 阶段 probe 漏掉的边界情况。
         try:
@@ -2035,11 +2088,14 @@ class ComputeRegistry:
                             inst.load_time_sec = data.get("load_time_sec", 0.0)
                             inst.loaded_at = inst.finished_at
                             inst.error = ""
-                        LOG.info(
-                            "instance %s @ npu=%d → running (load=%.1fs)",
-                            inst.model_id, inst.npu_index,
-                            inst.load_time_sec)
-                        return
+                            if not inst._logged_running:
+                                inst._logged_running = True
+                                LOG.info(
+                                    "instance %s @ npu=%d → running (load=%.1fs)",
+                                    inst.model_id, inst.npu_index,
+                                    inst.load_time_sec)
+                        # 不 return — 继续 poll + drain stderr，保留对 running
+                        # worker 的可见性（embed_video 错误/NPU 卡死不会显示）
                     if worker_status == "error":
                         with self._lock:
                             inst.status = "error"
@@ -2071,6 +2127,12 @@ class ComputeRegistry:
                             inst.error = ""
                             inst.finished_at = time.time()
 
+                tail = _drain_worker_stderr(inst.proc)
+                if tail:
+                    for line in tail.splitlines():
+                        if line.strip():
+                            LOG.info("compute_worker[%s]: %s",
+                                     inst.model_id, line)
                 time.sleep(1.0)
         except Exception as e:
             LOG.exception("probe_instance crashed")
@@ -2124,14 +2186,16 @@ def get_registry() -> ComputeRegistry:
 # Backward-compat: legacy ``get_session_call_lock()`` API.                       #
 # In the v0.4 per-subprocess RPC refactor the call lock is no longer needed     #
 # in the main process (server-side lock in compute_worker serializes per       #
-# instance). We keep this function returning a no-op context manager so        #
-# existing call sites (video_file_analysis.py) keep working.                  #
+# instance). This module-level lock is kept so existing call sites             #
+# (video_file_analysis.py, video_content_search.py, audio_analysis.py) keep    #
+# compiling. It is a no-op in practice because nothing else in the main        #
+# process ever acquires it.                                                    #
 # --------------------------------------------------------------------------- #
-import contextlib
+_call_lock = threading.Lock()
 
 
-@contextlib.contextmanager
-def get_session_call_lock():
-    """Legacy no-op call lock. Kept for backward compat with code
-    written before the per-subprocess RPC refactor."""
-    yield
+def get_session_call_lock() -> threading.Lock:
+    """Legacy no-op call lock. Returns a reusable ``threading.Lock``
+    so call sites can use it in multiple ``with`` blocks (e.g. inside
+    a loop) without draining a single-use ``@contextmanager``."""
+    return _call_lock

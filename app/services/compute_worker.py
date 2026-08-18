@@ -45,6 +45,10 @@ from typing import Any, Optional
 LOG = logging.getLogger("compute_worker")
 
 
+_EMBED_TEXT_TIMEOUT = 30.0
+_EMBED_VIDEO_TIMEOUT = 60.0
+
+
 _PR_SET_NAME = 15
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 _libc.prctl.restype = ctypes.c_int
@@ -449,7 +453,13 @@ def embed_text_handler(state: dict, payload: dict) -> dict:
     Payload: ``{"text": str}``
     Reply:   ``{"vec": List[float], "dim": int}`` — already-normalized
              2048-dim vector for cosine-similarity ranking.
+
+    Like ``embed_video_handler`` this runs in a separate thread with
+    a Python-level timeout so a wedged RKNN session can't pin the
+    wdndds cshim pump thread.
     """
+    import time as _time
+    import threading as _threading
     sess = state.get("session")
     if sess is None:
         return {"status": "error",
@@ -457,70 +467,190 @@ def embed_text_handler(state: dict, payload: dict) -> dict:
     text = payload.get("text") or ""
     if not isinstance(text, str) or not text:
         return {"status": "error", "error": "text 必须是非空字符串"}
-    try:
-        vec = sess.embed_text(text)
-    except Exception as e:  # noqa: BLE001
+    LOG.info("embed_text: starting (text_len=%d)", len(text))
+    t0 = _time.time()
+    holder: list = []
+
+    def _run():
+        try:
+            holder.append(sess.embed_text(text))
+        except BaseException as e:  # noqa: BLE001
+            holder.append(e)
+
+    th = _threading.Thread(target=_run, name="embed_text_run", daemon=True)
+    th.start()
+    th.join(timeout=_EMBED_TEXT_TIMEOUT)
+
+    if th.is_alive():
+        LOG.warning("embed_text: timed out after %.1fs — calling session_stop()",
+                    _EMBED_TEXT_TIMEOUT)
+        try:
+            backend = getattr(sess, "_backend", None)
+            if backend is not None and hasattr(backend, "rknn_llm"):
+                backend.rknn_llm.session_stop()
+        except Exception:  # noqa: BLE001
+            pass
+        th.join(timeout=3.0)
         return {"status": "error",
-                "error": f"{type(e).__name__}: {e}"}
+                "error": f"embed_text timeout after {_EMBED_TEXT_TIMEOUT:.0f}s "
+                        f"(NPU may be wedged; restart the instance)"}
+
+    if not holder:
+        return {"status": "error",
+                "error": "embed_text returned no result"}
+
+    result = holder[0]
+    if isinstance(result, BaseException):
+        LOG.warning("embed_text: failed after %.2fs: %s",
+                    _time.time() - t0, result)
+        return {"status": "error",
+                "error": f"{type(result).__name__}: {result}"}
+    vec = result
     # numpy array → JSON-friendly list. C extension returns either
     # np.ndarray or sequence-like; normalize via numpy when available.
     try:
         import numpy as _np
         arr = _np.asarray(vec, dtype=_np.float32).reshape(-1)
+        LOG.info("embed_text: done in %.2fs, dim=%d",
+                 _time.time() - t0, arr.size)
         return {"vec": arr.tolist(), "dim": int(arr.size)}
     except Exception:
         flat = list(vec) if hasattr(vec, "__iter__") else [float(x) for x in vec]
+        LOG.info("embed_text: done in %.2fs, dim=%d (fallback)",
+                 _time.time() - t0, len(flat))
         return {"vec": flat, "dim": len(flat)}
 
 
 def embed_video_handler(state: dict, payload: dict) -> dict:
     """Embedding video chunk (Qwen3-VL-Embedding-2B only).
 
-    Payload: ``{"frames": [bgr-ndarray, ...], "prompt": str (optional)}``
-    Reply:   ``{"vec": List[float], "dim": int, "n_frames": int}``
+    Payload (two equivalent forms):
+      - ``{"frame_paths": ["/dev/shm/xxx_c0000_f00.jpg", ...], "prompt": str}``
+      - ``{"frames": [b64-jpeg-str, ...], "prompt": str}`` (legacy)
 
-    Frames are encoded as base64-encoded JPEG bytes (decoded to BGR
-    here). Wire size matters: a typical 16-frame chunk at JPEG q=85
-    fits comfortably; we don't compress further server-side.
+    The path-list form is the **preferred** contract: the VCS service
+    writes each chunk's JPEG frames to ``/dev/shm`` (tmpfs, RAM-backed)
+    and ships a list of *paths* (~50 bytes per chunk). The base64
+    form is kept for any other caller (e.g. ad-hoc scripts) that
+    doesn't have /dev/shm access.
+
+    Wire-size note: a 4-frame chunk at JPEG q=85 is ~500 KiB base64 —
+    well above FastDDS 3.6.2's effective per-message limit on the SHM
+    transport, so the path-list form is what makes the cshim RPC
+    actually work for the VCS page.
+
+    Runs the underlying ``sess.embed_video()`` in a **separate
+    thread** with a Python-level timeout. The wdndds cshim pump
+    thread that calls this handler is single-threaded; if the C
+    library's ``rknn_session.run()`` blocks indefinitely (e.g. RKNN
+    driver wedged from a previous overload), the pump thread is
+    pinned and every subsequent RPC (load / info / embed_text) queues
+    up behind it. A normal chunk takes ~3 s on RK3588, so 60 s is a
+    generous ceiling. On timeout, ``session_stop()`` is invoked
+    asynchronously — if the C library honours the stop, the worker
+    thread exits within a few hundred ms.
     """
+    import time as _time
+    import threading as _threading
     sess = state.get("session")
     if sess is None:
         return {"status": "error",
                 "error": "session not loaded; send action='load' first"}
-    import base64 as _b64
     import numpy as _np
     import cv2 as _cv2
-    frames_meta = payload.get("frames", [])
-    if not isinstance(frames_meta, list) or not frames_meta:
-        return {"status": "error", "error": "frames 必须是非空 list"}
+
     frames: list = []
-    for item in frames_meta:
-        if isinstance(item, dict) and "data_b64" in item:
-            data_b64 = item["data_b64"]
-        elif isinstance(item, str):
-            data_b64 = item
-        else:
-            return {"status": "error",
-                    "error": f"frame 项必须是 b64 string 或 {{data_b64}} dict: {type(item).__name__}"}
-        raw = _b64.b64decode(data_b64)
-        arr = _np.frombuffer(raw, dtype=_np.uint8)
-        img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
-        if img is None:
-            return {"status": "error", "error": "cv2.imdecode returned None"}
-        frames.append(img)
+    if "frame_paths" in payload:
+        paths = payload["frame_paths"]
+        if not isinstance(paths, list) or not paths:
+            return {"status": "error", "error": "frame_paths 必须是非空 list"}
+        LOG.info("embed_video: starting (n_paths=%d, /dev/shm path-list form)",
+                 len(paths))
+        t0 = _time.time()
+        for p in paths:
+            img = _cv2.imread(p, _cv2.IMREAD_COLOR)
+            if img is None:
+                return {"status": "error",
+                        "error": f"cv2.imread returned None for {p}"}
+            frames.append(img)
+    else:
+        # Legacy base64 form
+        import base64 as _b64
+        frames_meta = payload.get("frames", [])
+        if not isinstance(frames_meta, list) or not frames_meta:
+            return {"status": "error", "error": "frames 必须是非空 list"}
+        LOG.info("embed_video: starting (n_frames=%d, legacy base64 form)",
+                 len(frames_meta))
+        for item in frames_meta:
+            if isinstance(item, dict) and "data_b64" in item:
+                data_b64 = item["data_b64"]
+            elif isinstance(item, str):
+                data_b64 = item
+            else:
+                return {"status": "error",
+                        "error": f"frame 项必须是 b64 string 或 {{data_b64}} dict: {type(item).__name__}"}
+            raw = _b64.b64decode(data_b64)
+            arr = _np.frombuffer(raw, dtype=_np.uint8)
+            img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
+            if img is None:
+                return {"status": "error", "error": "cv2.imdecode returned None"}
+            frames.append(img)
     prompt = payload.get("prompt", "")
-    try:
-        vec = sess.embed_video(frames, prompt=prompt or "")
-    except Exception as e:  # noqa: BLE001
+    holder: list = []
+
+    def _run():
+        try:
+            holder.append(sess.embed_video(frames, prompt=prompt or ""))
+        except BaseException as e:  # noqa: BLE001
+            holder.append(e)
+
+    th = _threading.Thread(target=_run, name="embed_video_run", daemon=True)
+    th.start()
+    th.join(timeout=_EMBED_VIDEO_TIMEOUT)
+
+    if th.is_alive():
+        LOG.warning("embed_video: timed out after %.1fs (n_frames=%d) — "
+                    "calling session_stop() to interrupt RKNN inference",
+                    _EMBED_VIDEO_TIMEOUT, len(frames))
+        try:
+            backend = getattr(sess, "_backend", None)
+            if backend is not None and hasattr(backend, "rknn_llm"):
+                backend.rknn_llm.session_stop()
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("session_stop() raised (continuing): %s", e)
+        th.join(timeout=3.0)
+        if th.is_alive():
+            LOG.error("embed_video: thread still alive 3s after stop — "
+                      "RKNN driver likely wedged; recommend POST "
+                      "/api/compute/restart for model_id=%r",
+                      state.get("model_id", "?"))
         return {"status": "error",
-                "error": f"{type(e).__name__}: {e}"}
+                "error": f"embed_video timeout after {_EMBED_VIDEO_TIMEOUT:.0f}s "
+                        f"(NPU may be wedged; restart the instance)"}
+
+    if not holder:
+        return {"status": "error",
+                "error": "embed_video returned no result (thread exited without output)"}
+
+    result = holder[0]
+    if isinstance(result, BaseException):
+        LOG.warning("embed_video: failed after %.2fs (n_frames=%d): %s",
+                    _time.time() - t0, len(frames), result)
+        return {"status": "error",
+                "error": f"{type(result).__name__}: {result}"}
+    vec = result
+    elapsed = _time.time() - t0
     try:
         arr = _np.asarray(vec, dtype=_np.float32).reshape(-1)
+        LOG.info("embed_video: done in %.2fs (n_frames=%d, dim=%d)",
+                 elapsed, len(frames), arr.size)
         return {"vec": arr.tolist(),
                 "dim": int(arr.size),
                 "n_frames": len(frames)}
     except Exception:
         flat = list(vec) if hasattr(vec, "__iter__") else [float(x) for x in vec]
+        LOG.info("embed_video: done in %.2fs (n_frames=%d, dim=%d, fallback)",
+                 elapsed, len(frames), len(flat))
         return {"vec": flat, "dim": len(flat), "n_frames": len(frames)}
 
 
@@ -660,7 +790,13 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 **kwargs,
             )
 
+        LOG.info("infer: starting (prompt_len=%d, attachments=%d)",
+                 len(prompt or ""), len(attachments))
+        import time as _time_inf
+        t0_inf = _time_inf.time()
         result = asyncio.run(_call())
+        LOG.info("infer: done in %.2fs (result_type=%s)",
+                 _time_inf.time() - t0_inf, type(result).__name__)
         text = getattr(result, "text", None) or (
             result if isinstance(result, str) else None)
 
@@ -875,6 +1011,7 @@ def main() -> int:
         "session": None,
         "wdnai_available": False,
         "model_dir": model_dir,
+        "model_id": model_id,
     }
 
     # Reset module-level stop event in case main() is re-entered under

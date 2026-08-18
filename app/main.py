@@ -1,6 +1,20 @@
 """FastAPI application factory."""
+import logging
 import os
 from pathlib import Path
+
+# uvicorn's default ``LOGGING_CONFIG`` does not configure the root
+# logger — only its own ``uvicorn`` / ``uvicorn.error`` / ``uvicorn.access``
+# channels. Without this, every ``LOG.info(...)`` from app.services.*
+# / app.api.* is silently swallowed (Python's default root level is
+# WARNING with no handlers). Symptom: clicking "开始提取" produced
+# no log output at all. Keep this near the top of the module so it
+# runs for both ``run.py`` and direct ``uvicorn app.main:app``.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse

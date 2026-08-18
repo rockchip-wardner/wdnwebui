@@ -47,6 +47,7 @@ async def start_extract(payload: dict) -> dict:
     chunk_prompt?: str}``。参数值域以**前端档位**为准：
     chunk_seconds ∈ {3,4,5,6}，chunk_overlap_seconds ∈ {1,2}。
     """
+    LOG.info("vcs API: POST /extract payload=%s", payload)
     payload = payload or {}
     try:
         chunk_seconds = int(payload.get("chunk_seconds", 4))
@@ -73,9 +74,14 @@ async def query_video(payload: dict) -> dict:
     """文本检索。Body: ``{text, sim_threshold, top_k}``。"""
     payload = payload or {}
     text = (payload.get("text") or "").strip()
+    debug = bool(payload.get("debug", False))
     try:
+        # Default threshold 0.5 + min_results 3: only strong matches pass,
+        # but the user always gets the best top-3 with their actual
+        # sim scores for self-diagnosis.
         sim_threshold = float(payload.get("sim_threshold", 0.5))
         top_k = int(payload.get("top_k", 10))
+        min_results = int(payload.get("min_results", 3))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="阈值/上限必须为数值")
     # embed_text 是同步 NPU 推理：挪到线程池执行（不阻塞 event loop），
@@ -83,7 +89,9 @@ async def query_video(payload: dict) -> dict:
     loop = asyncio.get_event_loop()
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(None, get_service().query, text, sim_threshold, top_k),
+            loop.run_in_executor(
+                None, get_service().query,
+                text, sim_threshold, top_k, min_results, debug),
             timeout=35.0,
         )
     except asyncio.TimeoutError:

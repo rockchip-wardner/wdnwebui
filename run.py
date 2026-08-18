@@ -486,11 +486,16 @@ def main() -> None:
     # without double-spawn.
     _start_wdndds_daemon()
 
+    # VCS extract over a long source runs 50-75s; uvicorn's default 20s WS
+    # ping often times the connection out mid-extract so the progress bar
+    # only resyncs on reconnect (visible as a single 0% → 100% jump).
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=8000,
         reload=True,
+        ws_ping_interval=5.0,
+        ws_ping_timeout=60.0,
     )
 
 

@@ -25,6 +25,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from typing import Callable, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -52,7 +53,12 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _probe_video_meta(source: str) -> Optional[dict]:
-    """用 PyAV 探测 fps / 总帧数 / 时长。失败返回 None。"""
+    """用 PyAV 探测 fps / 总帧数 / 时长。失败返回 None。
+
+    多数 MP4 不在 moov 头写 ``stream.duration`` / ``stream.frames``，导致
+    metadata 返回 0；此时回退到 ``container.decode(video=0)`` 顺序解全片
+    拿真实 last_pts + 帧数（慢但对任何 PyAV 可解码的视频都准）。
+    """
     if not source or not os.path.isfile(source):
         return None
     try:
@@ -62,6 +68,28 @@ def _probe_video_meta(source: str) -> Optional[dict]:
             fps = float(stream.average_rate) if stream.average_rate else 0.0
             total_frames = int(stream.frames) if stream.frames else 0
             duration_s = float(stream.duration * stream.time_base) if stream.duration else 0.0
+
+            if (duration_s <= 0 or total_frames <= 0) and fps > 0:
+                LOG.info("vcs: probe metadata 不全 (duration=%.1fs, frames=%d) — "
+                         "fall back to full decode for %s",
+                         duration_s, total_frames, source)
+                last_pts = 0.0
+                count = 0
+                tb = float(stream.time_base) if stream.time_base > 0 else 0.0
+                for frame in container.decode(video=0):
+                    if frame.pts is not None and tb > 0:
+                        last_pts = float(frame.pts) * tb
+                    count += 1
+                if count > 0:
+                    if total_frames <= 0:
+                        total_frames = count
+                    if duration_s <= 0 and last_pts > 0:
+                        duration_s = last_pts
+                    elif duration_s <= 0:
+                        duration_s = count / fps
+                    LOG.info("vcs: probe fallback got frames=%d duration=%.1fs",
+                             count, duration_s)
+
             return {
                 "fps": fps,
                 "total_frames": total_frames,
@@ -82,6 +110,10 @@ def _read_chunk_frames(source: str, start_s: float, chunk_seconds: int,
     - 每帧缩放到 576×576（embedding 模型 vision 输入）。
     """
     import av
+    LOG.info("vcs: PyAV opening %s for chunk @%.2fs (chunk_seconds=%d)",
+             source, start_s, chunk_seconds)
+    import time as _time
+    t0 = _time.time()
 
     target_frames = chunk_seconds if max_frames is None else min(chunk_seconds, max_frames)
     container = av.open(source, timeout=(2.0, 5.0))
@@ -132,6 +164,8 @@ def _read_chunk_frames(source: str, start_s: float, chunk_seconds: int,
                 bgr = cv2.resize(bgr, (_VISION_SIZE, _VISION_SIZE),
                                  interpolation=cv2.INTER_LINEAR)
             frames.append(bgr)
+        LOG.info("vcs: PyAV done in %.2fs — %d/%d frames decoded",
+                 _time.time() - t0, len(frames), len(frame_numbers))
         return frames
     finally:
         container.close()
@@ -205,6 +239,45 @@ def iter_segment_jpeg(source: str, start_s: float, end_s: float,
                 yield bytes(buf)
     finally:
         container.close()
+
+
+def _write_frames_to_shm(frames: List[np.ndarray], shm_session_id: str,
+                        chunk_idx: int) -> List[str]:
+    """Encode frames as JPEG and write to /dev/shm (tmpfs, RAM-backed).
+
+    Returns a list of *absolute* paths the worker can ``cv2.imread()``.
+    Filenames are deterministic from (session_id, chunk_idx, frame_idx) so
+    a re-run of the same chunk overwrites cleanly. JPEG q=85 is fine
+    because the per-frame file is ~50 KiB and the *list of paths* sent
+    over cshim is only ~50 bytes total — well under the 64 KiB UDP /
+    SHM transport limit that blocks the original inline base64 payload.
+    """
+    import cv2 as _cv2
+    out_dir = "/dev/shm"
+    paths: List[str] = []
+    for fi, fr in enumerate(frames):
+        p = f"{out_dir}/wdndds_vcs_{shm_session_id}_c{chunk_idx:04d}_f{fi:02d}.jpg"
+        ok, buf = _cv2.imencode(".jpg", fr, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            raise RuntimeError(f"cv2.imencode failed for chunk {chunk_idx} frame {fi}")
+        with open(p, "wb") as f:
+            f.write(buf.tobytes())
+        paths.append(p)
+    return paths
+
+
+def _cleanup_shm_session(shm_session_id: str) -> int:
+    """Delete all /dev/shm/wdndds_vcs_<session_id>_* files. Returns count."""
+    import glob as _glob
+    pattern = f"/dev/shm/wdndds_vcs_{shm_session_id}_*"
+    n = 0
+    for p in _glob.glob(pattern):
+        try:
+            os.unlink(p)
+            n += 1
+        except OSError:
+            pass
+    return n
 
 
 class VideoContentSearchService:
@@ -307,6 +380,13 @@ class VideoContentSearchService:
             self._index = []
             self._fps = 0.0
             self._duration_s = 0.0
+            # 新开一次 video 时给帧的 /dev/shm 临时文件分配新 session id。
+            # 旧的 session 文件被 _cleanup_shm_session 清掉（保险起见——
+            # 正常路径每个 chunk 结束或 close() 都会清各自的 frame 文件）。
+            old_sid = getattr(self, "_shm_session_id", None)
+            if old_sid:
+                _cleanup_shm_session(old_sid)
+            self._shm_session_id = uuid.uuid4().hex[:12]
         self._broadcast({"type": "state", **self.snapshot()})
         return self.snapshot()
 
@@ -314,6 +394,8 @@ class VideoContentSearchService:
         # 预检：实例未启用时立即抛 RuntimeError，由 API 层转 503，
         # 避免用户点"开始提取"后还要等 worker 探测元数据才报错。
         # worker 里仍保留二次 _ensure_session 兜底（幂等）。
+        LOG.info("vcs: start_extract requested (chunk=%ds, overlap=%ds, source=%s)",
+                 chunk_seconds, chunk_overlap_seconds, self._source)
         self._ensure_session()
         with self._lock:
             if self._state == _STATE_EXTRACTING:
@@ -357,7 +439,8 @@ class VideoContentSearchService:
         self._broadcast({"type": "state", **self.snapshot()})
         return self.snapshot()
 
-    def query(self, text: str, sim_threshold: float, top_k: int) -> dict:
+    def query(self, text: str, sim_threshold: float, top_k: int,
+             min_results: int = 3, debug: bool = False) -> dict:
         text = (text or "").strip()
         if not text:
             raise ValueError("检索问题不能为空")
@@ -367,14 +450,28 @@ class VideoContentSearchService:
             raise ValueError("阈值必须在 0–1.0 之间")
         if not 1 <= top_k <= 10:
             raise ValueError("上限必须在 1–10 之间")
+        if min_results < 0:
+            min_results = 0
+        LOG.info("vcs: query text=%r threshold=%.2f top_k=%d min_results=%d "
+                 "debug=%s (index_size=%d)",
+                 text, sim_threshold, top_k, min_results, debug,
+                 len(self._index) if hasattr(self, "_index") else 0)
         with self._lock:
             if self._state not in (_STATE_READY, _STATE_IDLE):
                 raise ValueError("请先完成视频切片提取")
             if not self._index:
                 self._query = {"text": text, "sim_threshold": sim_threshold, "top_k": top_k}
                 self._hits = []
-                self._broadcast({"type": "state", **self.snapshot()})
-                return self.snapshot()
+                snap = self.snapshot()
+                snap["query_meta"] = {
+                    "index_size": 0,
+                    "top_score": None,
+                    "above_threshold_count": 0,
+                    "below_threshold_count": 0,
+                    "fallback_used": False,
+                }
+                self._broadcast({"type": "state", **snap})
+                return snap
 
         session = self._ensure_session()
         lock = get_session_call_lock()
@@ -390,25 +487,58 @@ class VideoContentSearchService:
             scored.append((sim, entry))
 
         scored.sort(key=lambda t: -t[0])
-        hits = []
+        all_sims = [s for s, _ in scored]
+        hits: list = []
+        fallback: list = []
         for sim, entry in scored:
             if sim < sim_threshold:
+                if len(fallback) < min_results:
+                    fallback.append((sim, entry))
                 continue
+            hits.append((sim, entry))
             if len(hits) >= top_k:
                 break
-            hits.append({
-                "video_path": entry["video_path"],
-                "start_time": entry["start_time"],
-                "end_time": entry["end_time"],
-                "chunk_idx": entry["chunk_idx"],
-                "similarity": round(float(sim), 4),
-            })
+        fallback_used = False
+        if not hits and fallback:
+            hits = fallback[:top_k]
+            fallback_used = True
+            LOG.info("vcs: query threshold %.2f filtered all hits — "
+                     "falling back to top-%d (best sim=%.3f)",
+                     sim_threshold, len(hits),
+                     hits[0][0] if hits else 0.0)
 
+        above_count = sum(1 for s in all_sims if s >= sim_threshold)
+        below_count = len(all_sims) - above_count
+        top_score = max(all_sims) if all_sims else None
+
+        result_hits = [{
+            "video_path": entry["video_path"],
+            "start_time": entry["start_time"],
+            "end_time": entry["end_time"],
+            "chunk_idx": entry["chunk_idx"],
+            "similarity": round(float(sim), 4),
+        } for sim, entry in hits]
+
+        snap = None
         with self._lock:
             self._query = {"text": text, "sim_threshold": sim_threshold, "top_k": top_k}
-            self._hits = hits
-        self._broadcast({"type": "state", **self.snapshot()})
-        return self.snapshot()
+            self._hits = result_hits
+            snap = self.snapshot()
+            snap["query_meta"] = {
+                "index_size": len(index),
+                "top_score": round(float(top_score), 4) if top_score is not None else None,
+                "above_threshold_count": above_count,
+                "below_threshold_count": below_count,
+                "fallback_used": fallback_used,
+            }
+            if debug:
+                snap["query_debug"] = {
+                    "all_similarities": [round(float(s), 4) for s in all_sims],
+                    "qvec_norm": round(float(np.linalg.norm(qvec)), 4),
+                    "qvec_l2_unit": abs(round(float(np.linalg.norm(qvec)), 4) - 1.0) < 0.01,
+                }
+        self._broadcast({"type": "state", **snap})
+        return snap
 
     def _ensure_session(self):
         """从 ComputeRegistry 拿 embedding session。未启用抛 RuntimeError。"""
@@ -430,6 +560,13 @@ class VideoContentSearchService:
             self._query = None
             self._hits = []
             self._index = []
+            # 清理 /dev/shm 临时帧文件（正常路径 _worker_loop 在
+            # 每个 chunk 结束都会 unlink，但 crash/timeout 可能遗漏）
+            sid = getattr(self, "_shm_session_id", None)
+            if sid:
+                n = _cleanup_shm_session(sid)
+                if n:
+                    LOG.info("vcs: close() cleaned %d stale shm files for session %s", n, sid)
 
     # ------------------------------------------------------------------ #
     # 后台 worker：切片 + embedding
@@ -476,6 +613,15 @@ class VideoContentSearchService:
                 self._fps = fps
                 self._duration_s = duration_s
                 self._slices_total = self._compute_slices(fps, duration_s)
+                if self._slices_total <= 0:
+                    self._state = _STATE_ERROR
+                    self._error = (
+                        f"无法计算切片数（fps={fps:.2f}, "
+                        f"duration={duration_s:.1f}s, total_frames={int(duration_s * fps)}）。"
+                        "请检查视频文件是否完整或换一个文件重试。"
+                    )
+                    self._broadcast({"type": "state", **self.snapshot()})
+                    return
                 self._broadcast({"type": "state", **self.snapshot()})
 
             session = self._ensure_session()
@@ -483,19 +629,48 @@ class VideoContentSearchService:
             chunk_idx = 0
             start = 0.0
             lock = get_session_call_lock()
+        except Exception as e:  # pragma: no cover - defensive
+            LOG.exception("vcs extract worker error: %s", e)
+            self._set_state(_STATE_ERROR, str(e))
+            return
 
-            while start < duration_s:
-                if self._stop_worker.is_set():
-                    return
-                frames = _read_chunk_frames(
-                    self._source, start, self._chunk_seconds, fps)
-                if not frames:
-                    break
-                # 帧采样间隔 1 秒/帧（demo 语义），所以实际覆盖秒数 = 帧数；
-                # 短尾片截断时 end_time 按实际帧数计
-                end_time = start + len(frames)
-                with lock:
-                    vec = session.embed_video(frames, prompt="")
+        while start < duration_s:
+            if self._stop_worker.is_set():
+                return
+            frames = _read_chunk_frames(
+                self._source, start, self._chunk_seconds, fps)
+            if not frames:
+                break
+            # 帧采样间隔 1 秒/帧（demo 语义），所以实际覆盖秒数 = 帧数；
+            # 短尾片截断时 end_time 按实际帧数计
+            end_time = start + len(frames)
+            LOG.debug("vcs: chunk %d/%d [%.2fs-%.2fs, %d frames] — writing to /dev/shm",
+                      chunk_idx, self._slices_total, start, end_time, len(frames))
+            # FastDDS 3.6.2 SHM transport 的 cshim write() 在 >500 KiB 的
+            # payload（base64 帧数组）上 hang 死。把帧先写到 /dev/shm
+            # tmpfs（RAM-backed，速度 = SHM），RPC payload 只传文件路径
+            # 列表（~50 字节）。Worker 端 cv2.imread() 读图。
+            # 每个 extract session 生成一个唯一 ID，所有 chunk 的临时
+            # 文件在同一 ID 命名空间下，extract 结束统一清理。
+            frame_paths = _write_frames_to_shm(frames, self._shm_session_id, chunk_idx)
+            try:
+                LOG.debug("vcs: chunk %d — calling embed_video (frame_paths)",
+                          chunk_idx)
+                import time as _time
+                t_chunk = _time.time()
+                vec = None
+                # FastDDS 首次调用 reply topic discovery race → client 端
+                # timeout. 已匹配后不会再 race，所以 timeout 后立即重试即可。
+                for _attempt in range(2):
+                    try:
+                        with lock:
+                            vec = session.embed_video(frame_paths, prompt="")
+                        break
+                    except RuntimeError as rpc_err:
+                        if "timeout" not in str(rpc_err).lower() or _attempt == 1:
+                            raise
+                        LOG.warning("vcs: chunk %d embed_video timeout "
+                                    "(reply discovery race), retrying", chunk_idx)
                 vec = np.asarray(vec, dtype=np.float32)
                 norm = float(np.linalg.norm(vec))
                 if norm > 1e-6:
@@ -515,21 +690,42 @@ class VideoContentSearchService:
                             "embedded": self._slices_embedded,
                             "total": self._slices_total,
                         })
-                chunk_idx += 1
-                start += step
-                if end_time >= duration_s:
-                    break
+                LOG.debug("vcs: chunk %d done in %.2fs (slices_embedded=%d/%d)",
+                          chunk_idx, _time.time() - t_chunk,
+                          self._slices_embedded, self._slices_total)
+            except Exception as chunk_err:  # noqa: BLE001
+                LOG.warning(
+                    "vcs: chunk %d [%.2fs-%.2fs] embedding failed after %.2fs: %s — skipping",
+                    chunk_idx, start, end_time, _time.time() - t_chunk, chunk_err)
+            finally:
+                # 即便 embed_video 失败也要清理 /dev/shm 临时文件
+                for _p in frame_paths:
+                    try:
+                        os.unlink(_p)
+                    except OSError:
+                        pass
+            chunk_idx += 1
+            start += step
+            if end_time >= duration_s:
+                break
 
-            if self._stop_worker.is_set():
-                return
-            with self._lock:
-                if self._state == _STATE_EXTRACTING:
+        if self._stop_worker.is_set():
+            return
+        with self._lock:
+            if self._state == _STATE_EXTRACTING:
+                if self._slices_total > 0 and self._slices_embedded == 0:
+                    self._state = _STATE_ERROR
+                    self._error = (
+                        f"提取完成但 0/{self._slices_total} 切片成功 embedding — "
+                        "所有切片解码或推理失败，请查看后端日志或换文件重试。"
+                    )
+                else:
                     self._state = _STATE_READY
                     self._error = ""
-            self._broadcast({"type": "state", **self.snapshot()})
-        except Exception as e:  # pragma: no cover - defensive
-            LOG.exception("vcs extract worker error: %s", e)
-            self._set_state(_STATE_ERROR, str(e))
+        LOG.info("vcs: extract done — %d/%d slices embedded in %.1fs wall",
+                 self._slices_embedded, self._slices_total,
+                 time.time() - self._started_at)
+        self._broadcast({"type": "state", **self.snapshot()})
 
 
 _service: Optional[VideoContentSearchService] = None
