@@ -1194,8 +1194,11 @@ function updateVdDetectorStatus(snap) {
   } else if (snap.enabled && snap.session_ready) {
     const toolsCount = (snap.enabled_tools || []).length;
     const toolsHint = toolsCount ? ` · ${toolsCount} 个工具` : "";
+    const sizeHint = (typeof snap.image_size === "number")
+      ? ` · 尺寸 ${snap.image_size}`
+      : "";
     statusEl.textContent =
-      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size}${toolsHint}`;
+      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size}${toolsHint}${sizeHint}`;
   } else if (snap.enabled) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
@@ -1229,6 +1232,13 @@ async function refreshVdDetector() {
       VDDetector.events = data.events.slice();
       renderVdEventList();
     }
+    // Vision sizes may not have been ready on first page open
+    // (worker still loading). Re-poll on every detector refresh until
+    // the dropdown is enabled at least once.
+    const sizeEl = document.getElementById("vd-detect-size");
+    if (sizeEl && sizeEl.disabled) {
+      vdLoadVisionSizes();
+    }
     return data;
   } catch (_) { return null; }
 }
@@ -1236,10 +1246,21 @@ async function refreshVdDetector() {
 async function vdDetectorStart() {
   const promptEl  = document.getElementById("vd-prompt");
   const everyEl   = document.getElementById("vd-every-n");
+  const sizeEl    = document.getElementById("vd-detect-size");
   const prompt = (promptEl?.value || "").trim();
   const every_n = parseInt(everyEl?.value || "30", 10);
   if (!prompt) {
     setVdOverlay("请先填写检测提示词", true);
+    return;
+  }
+  // image_size：用户从 ``#vd-detect-size`` 选的尺寸。``null``/空
+  // /disabled 时表示"按帧自动选最近变体"，让 backend 走 legacy
+  // auto-pick；服务端校验合法性（必须是 worker 已加载的某个变体
+  // 尺寸，否则 400）。
+  const sizeVal = sizeEl && !sizeEl.disabled ? sizeEl.value : "";
+  const image_size = sizeVal ? parseInt(sizeVal, 10) : null;
+  if (sizeVal && !Number.isFinite(image_size)) {
+    setVdOverlay("检测尺寸值非法: " + sizeVal, true);
     return;
   }
   const enabled_tools = vdCollectEnabledTools();
@@ -1247,7 +1268,10 @@ async function vdDetectorStart() {
     const r = await fetch(API_PREFIX + "/video-detection/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, every_n, enabled_tools }),
+      body: JSON.stringify({
+        prompt, every_n, enabled_tools,
+        image_size: Number.isFinite(image_size) ? image_size : null,
+      }),
     });
     if (!r.ok) {
       const detail = await r.text().catch(() => "");
@@ -1259,6 +1283,59 @@ async function vdDetectorStart() {
     setVdOverlay("", false);
   } catch (e) {
     setVdOverlay("启动检测失败: " + e.message, true);
+  }
+}
+
+/**
+ * Populate the ``#vd-detect-size`` dropdown from the worker's
+ * currently-loaded vision variants.
+ *
+ * Data flow:
+ *   - GET /api/video-detection/available-vision-sizes returns
+ *     ``{"sizes": [...], "default": N}`` from the running qwen3-vl-4b
+ *     compute instance (queried via ComputeRegistry → worker info
+ *     RPC, never hardcoded on the client).
+ *   - Empty list → dropdown disabled + "无可用变体" hint.
+ *   - One entry → single option, marked default.
+ *   - Multiple entries → all options; first one selected (= smallest
+ *     = matches the prior hardcoded 384×384 default).
+ */
+async function vdLoadVisionSizes() {
+  const sel  = document.getElementById("vd-detect-size");
+  const hint = document.getElementById("vd-detect-size-hint");
+  if (!sel) return;
+  let data = { sizes: [], default: null };
+  try {
+    const r = await fetch(API_PREFIX + "/video-detection/available-vision-sizes",
+                         { cache: "no-store" });
+    if (r.ok) data = await r.json();
+  } catch (_) { /* best-effort: leave dropdown disabled */ }
+  const sizes = Array.isArray(data.sizes) ? data.sizes.slice().sort((a, b) => a - b) : [];
+  sel.innerHTML = "";
+  if (!sizes.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "— 模型未加载 —";
+    sel.appendChild(opt);
+    sel.disabled = true;
+    if (hint) hint.textContent = "无可用变体（等待 qwen3-vl-4b 加载）";
+    return;
+  }
+  for (const s of sizes) {
+    const opt = document.createElement("option");
+    opt.value = String(s);
+    opt.textContent = `${s}×${s}`;
+    sel.appendChild(opt);
+  }
+  const def = (typeof data.default === "number" && sizes.includes(data.default))
+    ? String(data.default)
+    : String(sizes[0]);
+  sel.value = def;
+  sel.disabled = false;
+  if (hint) {
+    hint.textContent = sizes.length > 1
+      ? `${sizes.join(" / ")} — 选定后端到对应 vision 变体`
+      : `仅 ${sizes[0]}×${sizes[0]}（单变体部署）`;
   }
 }
 
@@ -1394,6 +1471,11 @@ async function vdEventsClear() {
 function initVideoDetection() {
   if (window.__vdInit) return;
   window.__vdInit = true;
+
+  // 数据驱动填充 ``#vd-detect-size`` 下拉框 —— 永远不要在
+  // 客户端硬编码 384/768 列表；大小由 qwen3-vl-4b 实例的 worker
+  // info RPC 动态返回。
+  vdLoadVisionSizes();
 
   const sourceEl = document.getElementById("vd-source");
   const loopEl   = document.getElementById("vd-loop");

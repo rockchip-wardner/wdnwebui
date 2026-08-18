@@ -454,6 +454,13 @@ class WdnaiDetector:
         self._frame_count = 0
         self._model_name = "qwen3-vl-4b"
         self._generating_cls = generating_cls
+        # 视觉模型目标尺寸 —— 用户从 ``#vd-detect-size`` 下拉框选
+        # 的值。``None`` 表示"按图像分辨率自动选最近的变体"（leg‐
+        # acy 行为）。在 ``start()`` 里校验后写入；``_infer_sync`` 透
+        # 传给 ``sess.respond(image_size=...)``，backend 的
+        # ``_pick_variant(image_size=...)`` 据此选择对应的 vision
+        # 变体。
+        self._image_size: Optional[int] = None
         # 缓存本实例对应的 schema 类，避免每次推理都重读缓存字典。
         # start() 里再赋值一次（要拿到已 build 好的类 ——
         # ``_get_vlm_doc_cls`` / ``_get_target_doc_cls`` 仅在首次
@@ -479,33 +486,104 @@ class WdnaiDetector:
 
     def snapshot(self) -> dict:
         from app.services.compute_registry import get_registry
+        registry = get_registry()
         try:
-            sess = get_registry().get_session("swcap_video_describe")
+            sess = registry.get_session("swcap_video_describe")
             session_ready = sess is not None
             session_error = ""
         except RuntimeError as e:
+            sess = None
             session_ready = False
             session_error = str(e)
+        # Query the running qwen3-vl-4b instance for its loaded
+        # vision-model native sizes — never hardcode [384, 768] on
+        # the client. Empty list when the worker hasn't reported yet
+        # (model not loaded, network probe failure, missing capability).
+        available_sizes: List[int] = []
+        if sess is not None:
+            try:
+                for inst in registry.list_with_source():
+                    if inst.get("model_id") == "qwen3-vl-4b":
+                        raw = inst.get("available_image_sizes") or []
+                        if isinstance(raw, list):
+                            cleaned = []
+                            for s in raw:
+                                if isinstance(s, bool):
+                                    continue
+                                try:
+                                    cleaned.append(int(s))
+                                except (TypeError, ValueError):
+                                    continue
+                            available_sizes = sorted(set(cleaned))
+                        break
+            except Exception:  # noqa: BLE001
+                pass
         with self._lock:
             return {
-                "available":      self.available,
-                "init_error":     session_error or self._init_error,
-                "enabled":        self._enabled,
-                "prompt":         self._prompt,
-                "every_n":        self._every_n,
-                "model":          self._model_name,
-                "session_ready":  session_ready,
-                "worker_alive":   self._worker is not None and self._worker.is_alive(),
-                "queue_size":     self._item_q.qsize(),
-                "enabled_tools":  list(self._enabled_tools),
+                "available":              self.available,
+                "init_error":             session_error or self._init_error,
+                "enabled":                self._enabled,
+                "prompt":                 self._prompt,
+                "every_n":                self._every_n,
+                "model":                  self._model_name,
+                "session_ready":          session_ready,
+                "worker_alive":           self._worker is not None and self._worker.is_alive(),
+                "queue_size":             self._item_q.qsize(),
+                "enabled_tools":          list(self._enabled_tools),
+                # 数据驱动：UI ``#vd-detect-size`` 下拉框从这里读。
+                # Empty list when qwen3-vl-4b instance isn't running
+                # yet or hasn't reported its loaded variants — UI
+                # should grey out / disable the dropdown in that case.
+                "available_image_sizes":  available_sizes,
+                # 当前 session 实际选定的变体（来自最近一次 ``start``
+                # 调用的 ``image_size``）。None 表示 auto-pick by
+                # image resolution（legacy behaviour preserved）。
+                "image_size":             self._image_size,
             }
 
     # ------------------------------------------------------------------ #
-    def start(self, prompt: str, every_n: int = 30, enabled_tools: Optional[List[str]] = None) -> dict:
+    def start(self, prompt: str, every_n: int = 30,
+              enabled_tools: Optional[List[str]] = None,
+              image_size: Optional[int] = None) -> dict:
         if not self.available:
             raise RuntimeError("wdnai 不可用")
         if not (prompt or "").strip():
             raise ValueError("prompt 不能为空")
+        # image_size 校验：必须是 qwen3-vl-4b 实例实际加载的某个
+        # vision 变体尺寸。``None`` 表示"按图自动选"（legacy 行
+        # 为）。Backend 的 ``_pick_variant(image_size=...)`` 在不匹
+        # 配时也会兜底取 nearest 并 warn —— 但前端下拉框只暴露合
+        # 法值，所以这里严格匹配更友好。
+        if image_size is not None:
+            if not isinstance(image_size, int) or isinstance(image_size, bool):
+                raise ValueError(
+                    f"image_size 必须是整数或 None: {image_size!r}"
+                )
+            if image_size <= 0:
+                raise ValueError(
+                    f"image_size 必须 > 0: {image_size}"
+                )
+            from app.services.compute_registry import get_registry
+            registry = get_registry()
+            available_sizes: List[int] = []
+            try:
+                for inst in registry.list_with_source():
+                    if inst.get("model_id") == "qwen3-vl-4b":
+                        raw = inst.get("available_image_sizes") or []
+                        if isinstance(raw, list):
+                            for s in raw:
+                                try:
+                                    available_sizes.append(int(s))
+                                except (TypeError, ValueError):
+                                    continue
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            if available_sizes and image_size not in available_sizes:
+                raise ValueError(
+                    f"image_size={image_size} 不在模型已加载的视觉变体列表 "
+                    f"{available_sizes} 中；可选值：{available_sizes}"
+                )
         # 工具名校验放在最前面：未知 key → 400（与 capability
         # 区分开）。这一步独立于 VLM 是否可用，纯字符串 / 注册表
         # 校验。
@@ -560,6 +638,7 @@ class WdnaiDetector:
             self._prompt = prompt
             self._every_n = max(1, int(every_n))
             self._enabled_tools = tool_keys
+            self._image_size = image_size  # None → backend auto-pick
             self._frame_count = 0
         if self._worker is None or not self._worker.is_alive():
             self._stop_event.clear()
@@ -695,6 +774,10 @@ class WdnaiDetector:
             # 本实例的 generating schema；start() 已经解析过
             # （None 时回退到 ``VLMDoc``）。
             generating_cls = self._generating_cls
+            # 用户在 ``#vd-detect-size`` 选的尺寸；``None`` → backend
+            # 走 legacy auto-pick（按图最大边最近匹配）。start() 已校
+            # 验过合法性，这里只读不写。
+            image_size = self._image_size
 
         try:
             ok, Attachment, *_ = _load_wdnai()
@@ -771,6 +854,11 @@ class WdnaiDetector:
                     attachment=attachments,
                     generating=generating_cls,
                     tools=tool_classes,
+                    # 用户在 ``#vd-detect-size`` 选定的视觉模型
+                    # 目标尺寸；backend 端 ``VLMBackend.run_images`` 会
+                    # 透传给 ``_pick_variant(image_size=...)`` 强制选
+                    # 那个变体。``None`` 时保留 auto-pick。
+                    image_size=image_size,
                 )
                 result = asyncio.run(coro)
 

@@ -260,9 +260,13 @@ async def get_prompt() -> dict:
 async def set_prompt(payload: dict) -> dict:
     """Start (or update) VLM detection.
 
-    Body: ``{prompt: str, every_n: int, enabled_tools: list[str]}``
+    Body: ``{prompt: str, every_n: int, enabled_tools: list[str],
+            image_size: int | None}``
     — ``prompt`` 必填；``enabled_tools`` 可选，默认 ``[]``，每一项
-    必须是 ``/api/video-detection/tools`` 返回的合法 ``key``。
+    必须是 ``/api/video-detection/tools`` 返回的合法 ``key``；
+    ``image_size`` 可选，指定视觉模型目标尺寸（必须由
+    ``/api/video-detection/available-vision-sizes`` 返回的合法值之
+    一；缺省 / ``None`` = 按帧自动选最近的变体，保留 legacy 行为）。
     """
     payload = payload or {}
     prompt = (payload.get("prompt") or "").strip()
@@ -280,12 +284,70 @@ async def set_prompt(payload: dict) -> dict:
     # 后端兜底：仅允许白名单内的工具，丢弃其他项。前端 UI 已经按
     # ``ALLOWED_TOOLS`` 过滤；这里再卡一层避免直接 curl 越权。
     enabled_tools = [k for k in enabled_tools if k in ALLOWED_TOOLS]
+    # image_size 解析：可选字段，缺省 / ``None`` → auto-pick；非法
+    # 类型 / 不在合法列表 → 400（detector ``start()`` 内部也校验，
+    # 这里提前到 HTTP 层是为了返回更具体的错误消息）。
+    raw_image_size = payload.get("image_size", None)
+    image_size: int | None
+    if raw_image_size is None:
+        image_size = None
+    elif isinstance(raw_image_size, bool) or not isinstance(raw_image_size, int):
+        raise HTTPException(
+            status_code=400,
+            detail=f"image_size 必须是整数或 null: {raw_image_size!r}",
+        )
+    else:
+        image_size = raw_image_size
     try:
-        return get_detector().start(prompt, every_n=every_n, enabled_tools=enabled_tools)
+        return get_detector().start(
+            prompt, every_n=every_n, enabled_tools=enabled_tools,
+            image_size=image_size,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.get("/video-detection/available-vision-sizes")
+async def available_vision_sizes() -> dict:
+    """List the vision-model native sizes currently loaded into the
+    qwen3-vl-4b compute instance.
+
+    Returned shape: ``{"sizes": [384, 768], "default": 384}`` where
+    ``sizes`` is the data-driven enumeration reported by the worker's
+    info RPC (single-element ``[384]`` on legacy single-resolution
+    installs; ``[384, 768]`` on full multi-resolution installs;
+    empty when the instance isn't running yet). ``default`` is the
+    smallest reported size — matches the prior hardcoded behaviour
+    of the 384x384 default.
+
+    The 音视频描述 page's ``#vd-detect-size`` dropdown is populated
+    from this endpoint on page open. **No** 384/768 list is baked
+    into the client.
+    """
+    from app.services.compute_registry import get_registry
+    registry = get_registry()
+    sizes: list[int] = []
+    for inst in registry.list_with_source():
+        if inst.get("model_id") != "qwen3-vl-4b":
+            continue
+        raw = inst.get("available_image_sizes") or []
+        if not isinstance(raw, list):
+            continue
+        for s in raw:
+            if isinstance(s, bool):
+                continue
+            try:
+                sizes.append(int(s))
+            except (TypeError, ValueError):
+                continue
+        sizes = sorted(set(sizes))
+        break
+    return {
+        "sizes":   sizes,
+        "default": sizes[0] if sizes else None,
+    }
 
 
 @router.get("/video-detection/tools")

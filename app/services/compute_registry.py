@@ -552,6 +552,27 @@ _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
 # --------------------------------------------------------------------------- #
 # ModelInstance                                                             #
 # --------------------------------------------------------------------------- #
+def _coerce_image_sizes(raw) -> list:
+    """Normalise a worker ``available_image_sizes`` payload into a
+    sorted list of ints; drop anything that doesn't parse.
+
+    Used both by ``_adopt_existing_worker`` (one-shot, from the
+    probe's info dict) and by ``_probe_instance`` (every info tick)
+    so a future worker upgrade that adds new resolutions surfaces
+    them automatically without a registry restart.
+    """
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for s in raw:
+        try:
+            out.append(int(s))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
+
+
+# --------------------------------------------------------------------------- #
 @dataclass
 class ModelInstance:
     """One compute service instance, either local (spawned) or remote (adopted).
@@ -588,6 +609,14 @@ class ModelInstance:
     # 模型目录（worker probe 解析出来；missing_model_dir 状态时主进程
     # 据此决定 UI 怎么显示）。
     model_dir: str = ""
+    # Vision-model native image sizes (e.g. ``[384]`` 或 ``[384, 768]``)
+    # loaded into the worker's session — populated from worker's info
+    # ``available_image_sizes`` field by ``_probe_instance`` after the
+    # session reaches ``running``. Empty until then, and empty
+    # permanently for non-vision backends (TTS / text-only). UI
+    # dropdowns (e.g. 音视频描述页 ``#vd-detect-size``) query this
+    # list — it is **never** hardcoded on the client side.
+    available_image_sizes: list = field(default_factory=list)
     # RPC subprocess state
     proc: Optional[subprocess.Popen] = None
     rpc_client: Any = None
@@ -628,10 +657,17 @@ class ModelInstance:
                                     if self.device_id else None,
             "queued_at":          self.queued_at,
             "started_at":         self.started_at,
-            "finished_at":         self.finished_at,
+            "finished_at":        self.finished_at,
             "load_time_sec":      self.load_time_sec,
             "loaded_at":          self.loaded_at,
             "pid":                pid,
+            # Vision-model native sizes loaded into this instance.
+            # Empty for non-vision backends; vision backends report at
+            # least ``[384]`` (legacy single-resolution) or
+            # ``[384, 768]`` (full multi-resolution install). Surfaced
+            # to the 音视频描述 page's ``#vd-detect-size`` dropdown
+            # via ``GET /api/video-detection/available-vision-sizes``.
+            "available_image_sizes": list(self.available_image_sizes),
             "_source":            self._source,
             "_peer_guid":         self._peer_guid,
             "_peer_name":         self._peer_name,
@@ -1181,6 +1217,13 @@ class ComputeRegistry:
             finished_at=info.get("loaded_at"),
             load_time_sec=info.get("load_time_sec"),
             loaded_at=info.get("loaded_at"),
+            # Adopted workers also carry ``available_image_sizes`` if
+            # they report it (their info RPC goes through the same
+            # ``info_handler`` we just extended). Empty list when the
+            # info didn't include it (older peer worker that hasn't
+            # been updated yet) or when the model isn't vision-bearing.
+            available_image_sizes=_coerce_image_sizes(
+                info.get("available_image_sizes")),
             _source=source,
             _peer_guid=info.get("_peer_guid", ""),
             _peer_name=peer_name,
@@ -1713,6 +1756,9 @@ class ComputeRegistry:
                     "pid":                0,
                     "load_time_sec":      None,
                     "loaded_at":          None,
+                    # Not available → empty list (UI dropdown shows
+                    # "loading" / disabled until a worker comes up).
+                    "available_image_sizes": [],
                     "_source":            "unavailable",
                     "_peer_guid":         "",
                     "_peer_name":         "",
@@ -1962,6 +2008,17 @@ class ComputeRegistry:
                     # missing_model_dir 状态时 UI 直接拿这个字段渲染路径。
                     if isinstance(data.get("model_dir"), str) and data["model_dir"]:
                         inst.model_dir = data["model_dir"]
+                    # Worker 报告的 vision-model native sizes 也缓存到
+                    # 实例上 —— 音视频描述页通过这个字段动态填充
+                    # ``#vd-detect-size`` 下拉框，不在客户端硬编码
+                    # 384/768。Empty list for non-vision backends
+                    # (text / TTS); non-empty for VLM / embedding
+                    # once the session reaches ``running``.
+                    cleaned_sizes = _coerce_image_sizes(
+                        data.get("available_image_sizes"))
+                    if cleaned_sizes != inst.available_image_sizes:
+                        with self._lock:
+                            inst.available_image_sizes = cleaned_sizes
                     if worker_status == "running":
                         with self._lock:
                             inst.status = "running"

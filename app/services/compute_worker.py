@@ -236,6 +236,41 @@ def _build_session(model_id: str, npu_index: int):
     return sess
 
 
+def _resolve_available_image_sizes(sess) -> list:
+    """Read vision-model native resolutions from the loaded session.
+
+    Returns a sorted list of integers (square pixel sizes like
+    ``[384]`` or ``[384, 768]``). Empty list when the model isn't
+    vision-bearing (text-only / TTS) or when the session has no
+    backend yet.
+
+    The main process's probe thread calls this on every info tick so
+    that wdnwebui's 音视频描述 page can populate its ``#vd-detect-size``
+    dropdown dynamically — never hardcoded.
+    """
+    if sess is None:
+        return []
+    backend = getattr(sess, "_backend", None)
+    if backend is None:
+        return []
+    fn = getattr(backend, "available_image_sizes", None)
+    if not callable(fn):
+        return []
+    try:
+        sizes = fn()
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("available_image_sizes probe failed: %s", e)
+        return []
+    out: list = []
+    src = sizes if isinstance(sizes, (list, tuple)) else []
+    for s in src:
+        try:
+            out.append(int(s))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
+
+
 # --------------------------------------------------------------------------- #
 # Per-call handlers                                                          #
 # --------------------------------------------------------------------------- #
@@ -252,6 +287,17 @@ def info_handler(state: dict, model_id: str,
         "load_time_sec":      state.get("load_time_sec"),
         "init_error":         state.get("init_error", ""),
         "wdnai_available":     state.get("wdnai_available", False),
+        # Native vision-model resolutions loaded into the session.
+        # Empty until the worker reaches ``running`` for a vision
+        # model (text-only / TTS models report ``[]``). The main
+        # process caches this per ``ModelInstance`` and surfaces it
+        # via ``GET /api/video-detection/available-vision-sizes`` so
+        # the 音视频描述 page dropdown is data-driven, not
+        # hardcoded. See ``_resolve_available_image_sizes`` for the
+        # resolution rules (single-element for legacy single-file
+        # installs; ``[384, 768]`` when both variants are present).
+        "available_image_sizes": _resolve_available_image_sizes(
+            state.get("session")),
         # v0.8: provenance for the main process's boot probe — used
         # to distinguish a local-orphan worker (same hostname as the
         # main process) from a real LAN peer. Hostname is the
@@ -600,6 +646,14 @@ def infer_handler(state: dict, payload: dict) -> dict:
             tool_classes = _resolve_tool_classes(tool_names)
             if tool_classes:
                 kwargs["tools"] = tool_classes
+            # 视觉模型目标尺寸（音视频描述页 ``#vd-detect-size``）——
+            # 主进程 detector 透传到 RPC payload，worker 直接转发给
+            # ``sess.respond(image_size=...)``，backend ``run_images``
+            # 据此选择对应的 vision 变体；``None``（缺省）→ 走 legacy
+            # auto-pick（按帧最长边最近匹配）。
+            image_size = payload.get("image_size")
+            if isinstance(image_size, int) and not isinstance(image_size, bool):
+                kwargs["image_size"] = image_size
             return await sess.respond(
                 prompt=prompt,
                 attachment=attachments if attachments else None,

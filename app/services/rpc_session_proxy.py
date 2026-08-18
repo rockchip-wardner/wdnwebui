@@ -178,6 +178,15 @@ class _RpcSessionProxy:
                                   "instruct", "volume", "no_play",
                                   "non_streaming_mode"}},
         }
+        # 视觉模型目标尺寸（音视频描述页 ``#vd-detect-size``）——
+        # 顶层字段而非 ``options``，因为这是 vision backend 特有的
+        # channel 控制，不是 sampling 参数；也不进白名单，避免
+        # 误把它当成采样配置采样化。worker ``infer_handler`` 直接读
+        # ``payload["image_size"]``，透传给 ``sess.respond(image_size=
+        # ...)``。``None`` / 缺省 → backend 走 auto-pick。
+        _image_size = overrides.get("image_size")
+        if isinstance(_image_size, int) and not isinstance(_image_size, bool):
+            payload["image_size"] = _image_size
         reply = self._client.call(payload, timeout_ms=120_000)
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
