@@ -2818,6 +2818,8 @@ const DemoGuard = {
 
   // 各页模块主动 push 最新快照
   _cache: {},
+  // 用户在导航弹窗里选了"保持后台运行"的页面 —— hashchange 兜底不要把它们 stop
+  _keptPages: new Set(),
   report(page, snap) {
     this._cache[page] = snap || {};
   },
@@ -2915,6 +2917,8 @@ document.querySelectorAll(".nav-item").forEach(a => {
     e.preventDefault();
     if (decision === "stop") {
       await DemoGuard.stopAndClear(cur);
+    } else if (decision === "keep") {
+      DemoGuard._keptPages.add(cur);
     }
     location.hash = "#" + target;
   });
@@ -2923,10 +2927,16 @@ document.querySelectorAll(".nav-item").forEach(a => {
 window.addEventListener("beforeunload", (e) => {
   const cur = currentPage();
   if (!DemoGuard.isActive(cur)) return;
-  DemoGuard.stopSync(cur);
+  // 只弹原生对话框；真正的 stop 在 pagehide 里 —— 用户点"否/留下"就不会触发
   e.preventDefault();
   e.returnValue = "后台任务正在运行；离开将自动停止并释放算力。";
   return e.returnValue;
+});
+
+window.addEventListener("pagehide", () => {
+  // pagehide 在 beforeunload 确认放行之后才触发；用户取消则不触发
+  const cur = currentPage();
+  if (DemoGuard.isActive(cur)) DemoGuard.stopSync(cur);
 });
 
 // 浏览器前进/后退（hash 变化但不经过 .nav-item click）：静默 stopOnLeave 兜底
@@ -2938,6 +2948,7 @@ window.addEventListener("hashchange", () => {
   if (DemoGuard._registry[cur]) return;     // 当前是已注册页，不动
   // 切到非演示页（system-monitor / base-config / ...）：遍历注册表兜底
   for (const page of Object.keys(DemoGuard._registry)) {
+    if (DemoGuard._keptPages.has(page)) continue;   // 用户已选"保持后台运行"
     if (DemoGuard.isActive(page)) DemoGuard.stopSync(page);
   }
 });
