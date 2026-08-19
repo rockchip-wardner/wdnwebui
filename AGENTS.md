@@ -84,11 +84,33 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   —— 主进程侧 `RpcSessionProxy.respond` 内部 1 个 ThreadPoolExecutor
   串行化同一 instance 的并发请求。
 * **`boot_compute_services` 在 boot 默认开启**。`app/main.py`
-  `create_app` 调用一次，遍历 `config.compute.services`
-  （典型 `["qwen3-vl-4b", "qwen3-tts", "qwen3-8b"]`）逐条做
-  probe → adopt-or-spawn。worker 起来后**只**注册 DDS endpoint，
-  不 build LLMSession；npu_index 由用户在算力配置页选 NPU 后通过
-  RPC `{"action":"load","npu_index":N}` 传入。
+  `create_app` 把整个调用挪到 daemon thread
+  (``threading.Thread(target=..., name="compute-boot", daemon=True).start()``)，
+  防止冷启动时 ``_probe_service`` 的 3 × 5s race-recovery timeout
+  把 ``create_app()`` 阻塞几十秒、uvicorn bind 8000 等不到 —— 浏览器
+  GET / 立即出，probe/adopt/spawn 在后台慢慢跑（前端 1Hz 轮询
+  ``/api/compute`` 自动反映）。函数本体在 v0.10 重写：以
+  **DDS RPC `info` 探测 + `/proc` 先行** 为真源，对
+  ``MODEL_PRESETS`` 全集做四步走——
+  1. **`_find_workers_by_name(model_id)`** 先扫 ``/proc/*/comm``
+     看本机有没有 ``worker:<alias>`` comm 的进程；
+     **未命中 → 跳过 probe**（避免冷启动 5 × 17s ≈ 85s 的纯
+     timeout 等待），按 config 走 spawn / skip；
+     **命中 → 走 probe + adopt**（拿 hostname / npu / status）。
+  2. 探测 + adopt：``_adopt_existing_worker`` 内部走
+     ``_probe_service`` 的 3 × 5s race-recovery 路径，只对真的有
+     活 worker 的 model 才会被探测到。
+  3. 本机无 worker + config 里有 → ``_spawn_compute_worker``；
+     本机无 worker + config 里没 → skip（UI ``unavailable``）。
+  4. 本机有 worker + probe 失败 + config 里有 → fall through
+     ``_spawn_compute_worker``，它的 dedup 拒绝 spawn sibling 并
+     登 errored inst（避免 NPU 显存吃双份）。
+  **LAN peer 不在 `/proc` 里** —— boot 不主动探测远端 worker；
+  兜底走运行时首次请求 ``_ensure_worker_for_model`` → probe → 若
+  peer 响应则 adopt；否则本机 spawn。单板部署无影响，多板 LAN 的
+  peer boot-time discover 退化到 runtime discover。worker 起来后
+  只注册 DDS endpoint，不 build LLMSession；npu_index 由用户在算力
+  配置页选 NPU 后通过 RPC `{"action":"load","npu_index":N}` 传入。
   `_probe_instance` daemon 线程周期性 RPC `info` 同步 worker
   状态（`not_loaded` / `loading` / `running` / `error`）。
 * **`get_session_call_lock()` 留作 no-op 兼容旧调用点**
@@ -137,20 +159,32 @@ curl http://127.0.0.1:8000/health
 Endpoints wired so far: `GET /` (version), `GET /health`.
 
 **Stale-process cleanup on startup.** `run.py` reaps leftover
-processes from a previous unclean shutdown before binding port 8000:
-uvicorn worker holding port 8000 (via `ss -tlnp`), orphan
-`compute_worker.py` subprocesses (ComputeRegistry spawns them with
+**MAIN** processes from a previous unclean shutdown before binding
+port 8000: uvicorn worker holding port 8000 (via `ss -tlnp`), the
+`python run.py` ancestor itself, and uvicorn-reloader's
+`multiprocessing.spawn` / `resource_tracker` children (defunct
+zombies that inherited the LISTEN socket). SIGTERM with 3s grace,
+then SIGKILL.
+
+**Orphan `compute_worker.py` subprocesses are intentionally NOT
+killed** — ComputeRegistry spawns them with
 `Popen(start_new_session=True)` so they detach from the run.py
-process group and survive it), and the `python run.py` ancestor
-itself. SIGTERM with 3s grace, then SIGKILL. The
-`wdndds_daemon` is intentionally NOT killed (it might be serving
-LAN peers via the FastDDS discovery protocol — `_start_wdndds_daemon`
-adopts any existing one instead of double-spawning). Enabled by
-default; opt out via `--no-kill-stale` CLI flag or
-`WDNWEBUI_KILL_STALE_ON_BOOT=0` env var. Per
-`install_autostart.sh`, the production systemd unit invokes
-`uvicorn` directly (not `run.py`), so the kill-stale behaviour
-never runs under systemd.
+process group and survive it, and the new main process adopts them
+on the next boot via `boot_compute_services()` →
+`_adopt_existing_worker()` (DDS RPC `info` probe). Killing them
+would force a 60s+ model reload on every restart. Detected orphans
+are reported on stderr ("detected N orphan compute_worker
+process(es) — preserved, will be adopted") so the user has
+visibility. Treated identically to `wdndds_daemon` below (which is
+also not killed because `_start_wdndds_daemon` adopts existing
+ones).
+
+Enabled by default; opt out via `--no-kill-stale` CLI flag or
+`WDNWEBUI_KILL_STALE_ON_BOOT=0` env var. When disabled, both the
+MAIN-process kill and the orphan-worker log are skipped (single
+gate). Per `install_autostart.sh`, the production systemd unit
+invokes `uvicorn` directly (not `run.py`), so the kill-stale
+behaviour never runs under systemd.
 
 ## One-time setup that an agent will get wrong
 
@@ -823,27 +857,37 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   doesn't expose a `set(1, frame_pos)` API; plumbing one in means
   touching `self._container` internals. The progress bar is currently
   read-only and animates only for live sources.
-- **`ComputeRegistry` 启动顺序 (v0.7)**：`app.main.create_app()` 必须先
-  `include_router(compute.router)`，**再**调
-  `get_registry().boot_compute_services()`，**再**注册 detector 的
-  frame sink。
+- **`ComputeRegistry` 启动顺序 (v0.7→v0.10)**：`app.main.create_app()` 必须先
+  `include_router(compute.router)`，**再**fire ``compute-boot`` daemon
+  thread 调 `get_registry().boot_compute_services()`，**再**注册 detector 的
+  frame sink。daemon-thread 化（v0.10）是为了让 ``create_app()`` 同步返回 →
+  uvicorn 立即 bind 8000；probe / adopt / spawn 的耗时挪到后台。
 
-  **`boot_compute_services()`**：遍历 `config.compute.services`
-  列表（典型：``["qwen3-vl-4b", "qwen3-tts", "qwen3-8b"]``），逐条
-  做 probe → adopt-or-spawn：
-   - **probe**：对 `wdndds/rpc/<model_id>` 走短超时 RPC ``info``（~1.5s）
-   - **命中**（LAN peer 已响应或上轮孤儿 worker 还在）→ ``_adopt_existing_worker``，
-     `proc=None` + `_source` 根据 probe info 的 ``hostname`` 字段决定：
-     同 hostname → ``"adopted_local"``（本机孤儿 / reload 残留），
-     不同 hostname → ``"adopted"``（真 LAN peer），**不** spawn 新进程
-   - **未命中** → ``_spawn_compute_worker`` 拉新子进程
-     （`python compute_worker.py --model <id>`，**不传 --npu**）
+  **`boot_compute_services()` (v0.10 /proc 先行)**：遍历
+  ``MODEL_PRESETS`` 全集，逐条先扫 ``/proc/*/comm``：
+   - **`_find_workers_by_name(model_id)` 命中**（本机有 worker comm）
+     → 走 RPC ``info`` probe（``_probe_service`` 3 × 5s race-recovery）+ 
+     ``_adopt_existing_worker``。probe 命中 → ``_source`` 按 info
+     ``hostname`` 决定：同 hostname → ``"adopted_local"``（本机孤儿 /
+     reload 残留），不同 hostname → ``"adopted"``（真 LAN peer）；
+     probe 失败 + config 里有 → fall through ``_spawn_compute_worker``
+     让它的 dedup 拒 spawn sibling 登 errored inst；probe 失败 + config
+     里没 → log warning + skip。
+   - **`_find_workers_by_name(model_id)` 未命中**（冷启动 / 全新板）
+     → **跳过 probe**（避免冷启动 5 × 17s ≈ 85s 纯 timeout 阻塞），
+     config 里有 → ``_spawn_compute_worker`` 拉新子进程（``python
+     compute_worker.py --model <id>``，**不传 --npu**），config 里没
+     → skip（UI ``unavailable``）。
+
+  **为什么 `/proc` 先行**：v0.10 之前的 boot 对每个 preset 都跑一遍
+  probe；冷启动无 worker 时 5 × 17s timeout 浪费且阻塞 create_app。
+  ``/proc`` 先行后冷启动 probe 数 = 0，后台总耗时 < 100ms。
 
   **v0.8 dedup**：spawn 之前再扫一次 `/proc/*/cmdline` 找同 model 的现存
-  worker 进程（`_find_orphan_worker_pid`），命中就走 adopt 接管 —— 防
-  reload 后 Popen(start_new_session=True) 的子进程脱离父进程组、reload
-  SIGTERM 杀不掉导致的 NPU 内存累积泄漏。详情见 "Orphan worker 处理"
-  段落。
+   worker 进程（`_find_orphan_worker_pid`），命中就走 adopt 接管 —— 防
+   reload 后 Popen(start_new_session=True) 的子进程脱离父进程组、reload
+   SIGTERM 杀不掉导致的 NPU 内存累积泄漏。详情见 "Orphan worker 处理"
+   段落。
 
   worker 启动后**只**起 Hub + Service + Replier，不 build LLMSession。
   状态停在 ``not_loaded``；用户在算力配置页选 NPU 后触发
