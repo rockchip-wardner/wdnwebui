@@ -25,6 +25,7 @@ import asyncio
 import base64
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -192,6 +193,75 @@ class _RpcSessionProxy:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
+
+    def chat_run(self, history, text, *, context_limit=None,
+                 max_new_tokens=2048, on_delta=None, stop_event=None,
+                 poll_interval_ms=150, timeout_ms=300000) -> dict:
+        """Run one text-chat turn against the worker.
+
+        Synchronous (call it from a plain thread). The worker runs the
+        inference on a background thread and appends token deltas to its
+        chat state; this method polls ``chat_poll`` until the run
+        finishes, invoking ``on_delta(text)`` for each delta chunk.
+
+        Returns the worker's ``result`` dict on ``done`` (text /
+        elapsed_sec / prompt_tokens / answer_tokens). Raises
+        ``RuntimeError`` on worker errors / timeout.
+        """
+        payload = {
+            "action": "chat_run",
+            "history": history,
+            "text": text,
+            "context_limit": int(context_limit or 0),
+            "max_new_tokens": int(max_new_tokens or 2048),
+        }
+        reply = self._client.call(payload, timeout_ms=10_000)
+        if not reply.get("ok"):
+            err = reply.get("error", "unknown error")
+            raise RuntimeError(
+                f"compute_worker[{self._model_id}] chat_run failed: {err}")
+        data = reply.get("data") or {}
+        if data.get("status") != "chat_started":
+            raise RuntimeError(
+                f"compute_worker[{self._model_id}] chat_run: "
+                f"{data.get('error') or data.get('status') or 'unknown'}")
+
+        offset = 0
+        deadline = time.monotonic() + (timeout_ms / 1000.0)
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                self.chat_stop()
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"compute_worker[{self._model_id}] chat_run timed out")
+            poll = self._client.call(
+                {"action": "chat_poll", "offset": offset}, timeout_ms=5_000)
+            if not poll.get("ok"):
+                raise RuntimeError(
+                    f"compute_worker[{self._model_id}] chat_poll failed: "
+                    f"{poll.get('error', 'unknown error')}")
+            data = poll.get("data") or {}
+            status = data.get("status")
+            if on_delta is not None:
+                for d in data.get("deltas") or []:
+                    if d:
+                        on_delta(d)
+            offset = int(data.get("offset") or offset)
+            if status == "done":
+                result = data.get("result") or {}
+                result.setdefault("status", "done")
+                return result
+            if status == "error":
+                raise RuntimeError(data.get("error") or "chat error")
+            if status == "idle":
+                raise RuntimeError("chat went idle unexpectedly")
+            time.sleep(poll_interval_ms / 1000.0)
+
+    def chat_stop(self) -> None:
+        try:
+            self._client.call({"action": "chat_stop"}, timeout_ms=5_000)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("chat_stop on %s raised: %s", self._model_id, e)
 
     async def respond(self, prompt=None, attachment=None,
                       generating=None, tools=None, perf=False,

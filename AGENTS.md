@@ -1282,8 +1282,15 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 ## Text chat (文本对话) page
 
 `#page-text-chat` 暴露 Qwen3-8B 纯文本对话（`swcap_text_chat` capability），
-流式逐字渲染 `<think>...</think>` 与正式回答，单页实例串行推理，
-多轮上下文由 app 端消息 deque + ChatML 拼接维持。
+流式逐字渲染 ` thinking... response` 与正式回答，单页实例串行推理，
+多轮上下文由 worker 端滚动裁剪 + ChatML 拼接维持。
+
+**推理走 compute_worker 子进程（RPC）**。`get_session("swcap_text_chat")`
+返回 `RpcSessionProxy`，`session.chat_run(...)` 通过 wdndds RPC 把
+`{history, text, context_limit, max_new_tokens}` 发给 worker；worker 后台
+线程用真实 tokenizer 精确裁剪历史、拼 ChatML、跑 `_backend.run`，边跑边把
+`sink.text` 增量收进 chat state。主进程 `chat_poll` 轮询拉增量（~150ms
+粒度），`on_delta` 喂给 `_ThinkingRouter` 流式切分 thinking / answer。
 
 * **Backend** (`app/api/text_chat.py`):
   - `GET /api/text-chat` — snapshot：state / busy / error / history_count /
@@ -1292,8 +1299,9 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - `POST /api/text-chat/send` `{text}` — 发起一轮推理；返回
     `{request_id, snapshot}`。400 text 为空 / 409 还在生成中 /
     502 capability 未启用。
-  - `POST /api/text-chat/stop` — 立即调 `session._backend.rknn.session_stop()`
-    中断 C 端正在跑的推理；当前轮丢弃，不写历史。
+  - `POST /api/text-chat/stop` — 置 `_worker_stop_event`；proxy 的
+    `chat_run` 轮询循环感知后调 `chat_stop` RPC（软停：worker 跑完返回
+    stopped，主进程丢弃本轮，不写历史）。
   - `POST /api/text-chat/reset` — 清空 history + history_tokens，回到 idle。
   - `WS /api/text-chat/ws` — server-push 流式 token + 状态变更；连接后立即
     推 `{type:"snapshot", snapshot:...}` hydrate。
@@ -1304,34 +1312,70 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     其它服务风格一致。
   - **LLMSession 必须从 ComputeRegistry 取**（`get_session("swcap_text_chat")`）；
     找不到抛 `RuntimeError("功能未启用: swcap_text_chat")`，HTTP 502 透传。
-  - **wdnai 导入懒加载** —— 模块顶层只 import `os / queue / re / threading / asyncio`；
-    `_install_patches()` 在第一次构造实例时才 import `wdnai.backends._common`。
-  - **流式回调 = monkey-patch**：模块加载时把
-    `wdnai.backends._common.make_result_callback` 替换成包装版。包装版
-    在原 callback 完成后读 `sink.text` 算增量，调用 `register_observer`
-    注册的 callable（key = `id(sink)`）。未注册的 sink 走原 callback，
-    零开销（其它业务 detector / tts 不受影响）。
-  - **`_ThinkingRouter`**：observer 每次拿到 delta 增量时按 `</think>` 切频道
-    推到 `thinking` / `answer` 两条流；`done` 时再正则
-    `<think>(.*?)</think>` 兜底切一次，处理 token 边界切碎等极端情况。
+    拿到的是 `RpcSessionProxy` —— 本模块**不再访问 `session._backend`**，
+    wdnai 的 monkey-patch（`make_result_callback` 包装）已整体移除。
+  - **`_ThinkingRouter`**：`chat_run` 的 `on_delta` 每次拿到增量时按
+    ` response` 切频道推到 `thinking` / `answer` 两条流；`done` 时再用
+    `chat_runner.split_thinking` 兜底切一次（处理 token 边界切碎等极端情况）。
   - 单 daemon worker thread（`text-chat-worker`）串行消费 `request_queue`；
-    `session_run` 是同步阻塞，worker 在 `loop.get(timeout=1.0)` 期间
-    监听 `_worker_stop_event`，stop 事件置位即调
-    `session._backend.rknn.session_stop()`。
-  - **32K token 限制**：每收到 `done` 用 `tokenizer.encode(content)` 累加
-    `history_tokens`；超过 `context_limit - max_new_tokens` 时拒绝发新
-    请求（HTTP 400 + 中文提示）。预留输出 = `max_new_tokens = 2048`，
-    spec `max_context_len = 32768`。
-  - **多轮上下文**：app 端消息 deque，每轮 `session.reset()` 清 C 端 KV，
-    再用 ChatML（`<|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...`
-    系列）拼整段 prompt 喂进 `session._backend.run(prompt, keep_history=0)`。
+    `chat_run` 同步阻塞在 RPC 轮询里，每轮检查 `_worker_stop_event`。
+  - **上下文管理在 worker 端**（`app/services/chat_runner.py`）：
+    `trim_history` 用真实 tokenizer 从最新往回累计每条消息 token，超
+    `context_limit - reserve` 就裁掉更早的（滚动窗口）；reserve =
+    `min(max_new_tokens, context_limit // 8)`（自适应输出预留，小 context
+    测试如 2048 不会误伤）。仅单条用户消息超限才报"单条消息过长"。
+  - **多轮上下文**：app 端消息 deque 全量发给 worker；worker 每轮
+    `sess.reset()` 清 C 端 KV 后 `_backend.run(prompt, keep_history=0)`。
     **历史中只写 `content:answer`，不写 thinking** —— 下轮 prompt 看不到
-    thinking，保证模型下一轮从干净的对话记忆开始。spec.options 的
-    `keep_history=1` 是 init runtime 默认值（按用户要求保留），但
-    per-call override 设为 0，所以 KV 不跨 run 续接。
+    thinking，保证模型下一轮从干净的对话记忆开始。
+  - **history_tokens 语义**：每次 done 后覆盖为 worker 返回的
+    `prompt_tokens`（最近一次实际喂给模型的 prompt token 数），前端据此
+    显示上下文占用。
+  - **context_limit 可配置**：`config.json["compute"]["text_chat"]["context_limit"]`，
+    默认 32768；每次推理前热读（`_resolve_context_limit`）。测试多轮裁剪
+    可设 2048。
   - WS broadcaster pattern：worker 线程 push 到 `asyncio.Queue` 列表，
     WS handler 在主 event loop 里 `await queue.get()` drain；observer
     也走同一条路径，避免第二条 channel。
+
+* **Worker 端 chat 通道**（`app/services/compute_worker.py`）：
+  - `chat_run` action：校验 session loaded + 无并发 chat；把 history/text/
+    context_limit/max_new_tokens 存进 `state["chat"]`，起后台线程
+    `_chat_run_loop`，pump 线程立即返回 `{"status":"chat_started"}`（对齐
+    `load_handler` 的后台线程模式，避免长推理占住 cshim pump 线程）。
+  - `_chat_run_loop`：`chat_runner.trim_history` 精确裁剪 → 拼 ChatML →
+    `sess.reset()` → **注册 C 回调 observer**（`app/services/chat_stream.py`，
+    见下）把 `sink.text` 增量 append 到 `state["chat"]["deltas"]` →
+    `_backend.run(prompt, keep_history=0, enable_thinking=True)` → done
+    （text / elapsed_sec / prompt_tokens / answer_tokens）。
+  - `chat_poll` action：按 offset 返回新 delta + status（running / done /
+    error / idle），done 时附 result。
+  - `chat_stop` action：置 `state["chat"]["stop"]`（软停标志）。
+  - `_build_session` 已支持 qwen3-8b（`max_context_len=32768` +
+    `with_options(max_new_tokens=2048, keep_history=1, enable_thinking=True)`）。
+
+* **流式采集 = C 回调注入**（`app/services/chat_stream.py`）：
+  - **不能靠独立线程轮询 `sink.text`** —— `_backend.run` 的 `session_run`
+    是同步阻塞的 C 调用，解码回调持有 GIL 逐批执行，并行轮询线程抢不到
+    GIL，`deltas` 恒为空（真机实测：状态走到 done 但前端无任何回复）。
+  - `install_patch()`：幂等包装 `wdnai.backends._common.make_result_callback`，
+    在原 callback 之后按 `id(sink)` 查全局 observer，算 `sink.text` 增量并
+    调用它；回调本身在 C 层持有 GIL 时执行，采集可靠。**必须显式
+    `return ret`**（`LLMResultCallback` 是 CFUNCTYPE(c_int)，漏 return 会
+    被 ctypes 吞掉并导致原 callback 副作用失效）。
+  - 在 `compute_worker._load_wdnai()` 里安装（早于任何 `_build_session`
+    构造 LLMSession，patch 才能绑进 `init_runtime`）。未注册 observer 的
+    sink（detector / vlm / tts）走原 callback 零开销。
+  - `register_observer(sink, cb)` / `unregister_observer(sink)`：全局 dict
+    key=`id(sink)`，`_chat_run_loop` 在 run 前后注册/注销。
+
+* **Proxy**（`app/services/rpc_session_proxy.py`）：
+  - `chat_run(history, text, *, context_limit, max_new_tokens, on_delta,
+    stop_event, poll_interval_ms=150, timeout_ms=300000)` — 同步阻塞，发
+    `chat_run` 后循环 `chat_poll` 拉增量调 `on_delta`；`stop_event` 置位即
+    调 `chat_stop`；done 返回 result dict；error 抛 `RuntimeError`；超时抛
+    `TimeoutError`。
+  - `chat_stop()` — RPC `chat_stop`。
 
 * **ComputeRegistry** preset（`app/services/compute_registry.py:136-164`）：
   - 新增 `MODEL_PRESETS["qwen3-8b"]`：`capability_types=["swcap_text_chat"]`，
@@ -1359,7 +1403,8 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     - `_onWsMessage(msg)` 分发 `snapshot` / `state` / `user_echo` /
       `thinking` / `answer` / `done` / `stopped` / `error` 八种帧；
     - `pending: Map<request_id, ...>` 维护每轮推理的"用户气泡 →
-      assistant 气泡"三段渲染状态；
+      assistant 气泡"三段渲染状态；`_finalizeBubble` 优先用 done 帧的完整
+      thinking/answer 覆盖流式 buffer（一次性结果也能完整渲染）；
     - `_scrollToBottom()` 仅在用户靠近底部时自动滚动（避免抢焦点）。
   - `loadPageData("text-chat")` 调 `TextChat.init() + refresh() + ensureWs()`；
     `showPage()` 离开时调 `TextChat.closeWs()`。
@@ -1370,16 +1415,16 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   串行；如需横向扩展，在算力配置页加第 2 个 Qwen3-8B 实例（多卡环境）。
 
 * **限制 / 已知问题**：
-  - 32K 上下文硬上限写死；改需同步 `spec.max_context_len` + 服务端
-    `CONTEXT_LIMIT` 常量 + 前端 token 计数器。
+  - stop 为**软停**：`chat_stop` 只置 worker 标志，`_backend.run` 同步阻塞
+    跑完才返回，主进程丢弃本轮。跨线程 `session_stop()` 硬中断（C 库
+    FINISH state=3）尚未打通，真机验证后再加。
+  - `history` 全量每次 RPC 传输（deque 200 条上限）：同机 SHM 无碍；跨机
+    UDP 传输受 FastDDS 单包大小限制，长对话跨机场景需评估。
   - thinking 不写历史 —— 用户"接着问"时下一轮 prompt 看不到上轮思考；
     想要延续 thinking 行为需把 `thinking` 也 push 到 history 的 assistant
     content 字段，但代价是污染 KV 且长对话下 token 增长更快。
   - 重生成按钮首版不做（plan §十三已确认）。
   - 真机首次初始化 ~90s（按经验值，需真机 page-cache-dropped 实测校准）。
-  - 取消正在跑的轮次靠 `rknn3lite.session_stop()`；C 库收到 stop 信号后
-    回调走 FINISH state=3，`session_run` 返回。当前 `sink.text` 丢弃，
-    不写历史。
 
 ## When you change things, also update
 

@@ -204,6 +204,8 @@ def _load_wdnai() -> dict:
         )
     except ImportError as e:
         raise RuntimeError(f"wdnai import failed: {e}")
+    from app.services.chat_stream import install_patch as _install_chat_stream_patch
+    _install_chat_stream_patch()
     _WDNAI = {
         "Attachment": Attachment,
         "LLMSession": LLMSession,
@@ -726,6 +728,125 @@ def reset_handler(state: dict) -> dict:
         return {"status": "error", "error": f"reset failed: {e}"}
 
 
+def chat_run_handler(state: dict, payload: dict) -> dict:
+    sess = state.get("session")
+    if sess is None:
+        return {"status": "error", "error": "session not loaded; send action='load' first"}
+    chat = state.get("chat") or {}
+    if chat.get("status") == "running":
+        return {"status": "error", "error": "another chat run is already in progress"}
+    history = payload.get("history")
+    text = payload.get("text")
+    if not isinstance(history, list):
+        return {"status": "error", "error": "history 必须是 list"}
+    if not isinstance(text, str) or not text.strip():
+        return {"status": "error", "error": "text 必须是非空字符串"}
+    try:
+        context_limit = int(payload.get("context_limit") or 0)
+        max_new_tokens = int(payload.get("max_new_tokens") or 2048)
+    except Exception:
+        context_limit, max_new_tokens = 0, 2048
+    chat.update({
+        "status": "running",
+        "deltas": [],
+        "offset": 0,
+        "stop": False,
+        "history": history,
+        "text": text,
+        "context_limit": context_limit,
+        "max_new_tokens": max_new_tokens,
+        "result": None,
+        "error": "",
+    })
+    state["chat"] = chat
+    threading.Thread(target=_chat_run_loop, args=(state,),
+                     daemon=True, name="chat-run").start()
+    return {"status": "chat_started"}
+
+
+def _chat_run_loop(state: dict) -> None:
+    sess = state.get("session")
+    chat = state.get("chat") or {}
+    try:
+        from app.services.chat_runner import build_chatml_prompt, count_tokens, trim_history
+        backend = getattr(sess, "_backend", None)
+        if backend is None:
+            raise RuntimeError("session._backend missing")
+        tokenizer = getattr(backend, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("session._backend.tokenizer missing")
+        history = chat.get("history") or []
+        text = chat.get("text") or ""
+        context_limit = int(chat.get("context_limit") or 0)
+        max_new_tokens = int(chat.get("max_new_tokens") or 2048)
+        selected, err = trim_history(
+            history, text, tokenizer, context_limit, max_new_tokens)
+        if err:
+            chat["status"] = "error"
+            chat["error"] = err
+            return
+        prompt = build_chatml_prompt(selected, text)
+        chat["prompt_tokens"] = count_tokens(tokenizer, prompt)
+
+        sink = getattr(backend, "sink", None)
+        if sink is None:
+            raise RuntimeError("session._backend.sink missing")
+
+        from app.services.chat_stream import register_observer, unregister_observer
+
+        def _on_delta(d: str) -> None:
+            if d:
+                chat["deltas"].append(d)
+
+        sess.reset()
+        register_observer(sink, _on_delta)
+        t0 = time.time()
+        try:
+            full_text = backend.run(
+                prompt, keep_history=0, enable_thinking=True)
+        finally:
+            unregister_observer(sink)
+        elapsed = round(time.time() - t0, 2)
+        chat["status"] = "done"
+        chat["result"] = {
+            "text": full_text,
+            "elapsed_sec": elapsed,
+            "prompt_tokens": chat.get("prompt_tokens", 0),
+            "answer_tokens": count_tokens(tokenizer, full_text),
+        }
+    except Exception as e:  # noqa: BLE001
+        chat["status"] = "error"
+        chat["error"] = f"{type(e).__name__}: {e}"
+
+
+def chat_poll_handler(state: dict, payload: dict) -> dict:
+    chat = state.get("chat")
+    if not chat:
+        return {"status": "idle", "deltas": [], "offset": 0}
+    try:
+        offset = max(0, int(payload.get("offset", 0)))
+    except Exception:
+        offset = 0
+    deltas = chat.get("deltas") or []
+    reply = {
+        "status": chat.get("status", "idle"),
+        "deltas": deltas[offset:],
+        "offset": len(deltas),
+    }
+    if chat.get("result"):
+        reply["result"] = chat["result"]
+    if chat.get("error"):
+        reply["error"] = chat["error"]
+    return reply
+
+
+def chat_stop_handler(state: dict) -> dict:
+    chat = state.get("chat")
+    if chat:
+        chat["stop"] = True
+    return {"status": "stopped"}
+
+
 def infer_handler(state: dict, payload: dict) -> dict:
     sess = state.get("session")
     if sess is None:
@@ -1004,6 +1125,12 @@ def router(service_name: str, payload: Any, state: dict,
         return infer_handler(state, payload)
     if action == "reset":
         return reset_handler(state)
+    if action == "chat_run":
+        return chat_run_handler(state, payload)
+    if action == "chat_poll":
+        return chat_poll_handler(state, payload)
+    if action == "chat_stop":
+        return chat_stop_handler(state)
     if action == "unload":
         return unload_handler(state)
     if action == "embed_text":

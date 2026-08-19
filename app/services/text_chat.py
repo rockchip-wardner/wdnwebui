@@ -1,45 +1,30 @@
-"""Qwen3-8B 文本对话服务：单例 + worker。
+"""Qwen3-8B 文本对话服务：单例 + worker + RPC 流式拉取。
 
 设计要点
 ========
 
-* **LLMSession 必须从 ComputeRegistry 取**（``get_session("swcap_text_chat")``，
-  返回 ``_RpcSessionProxy``）。Proxy 只暴露 ``reset()`` / ``respond()`` /
-  ``embed_text()`` / ``embed_video()`` —— 这层抽象把 wdnai.LLMSession +
-  RKNN3 runtime 隔在 compute_worker 子进程里，主进程**绝对不能**碰
-  ``session._backend.sink / .tokenizer / .rknn / .run(...)`` 等私有属性
-  （v0.4 之前的老代码会过；当前架构直接 ``AttributeError``）。
-* **wdnai 导入懒加载**：模块顶部不 import wdnai。tokenizer 仅用于精确
-  token 计数 —— 但 v0.4 之后主进程拿不到 tokenizer，token 预算改用
-  ``len(text) // 3`` 粗估（中英混合场景 ±30% 误差，对 32K 上限留 6K
-  buffer 够用）。
-* **批模式推理（非流式）**：compute_worker 的 ``infer_handler`` 把
-  ``sess.respond(prompt=...)`` 跑完后**一次性**把 ``result.text`` 整段
-  通过 RPC reply 返回（见 ``app/services/compute_worker.py:infer_handler``）。
-  主进程拿到完整文本后用 ``_split_thinking`` 正则切成
-  ``thinking`` / ``answer`` 两段，再各推一个 single-frame delta 给前端。
-  真正的 token 级流式得 cshim 加 streaming RPC 通路（v0.10 未实现）。
-* **thinking 与 answer 分离**：主进程 ``_split_thinking`` 一刀切；前端
-  ``TextChat._appendThinkingDelta`` / ``_appendAnswerDelta`` 接收
-  ``delta`` 字段做累加，单次 delta = 整段，所以前端是一次性填满而不是
-  字符级打字机效果。layout 不变。
-* **多轮上下文**：app 端消息 deque + 每轮 ``session.reset()`` 清 C 端 KV，
-  再用 ChatML 拼整段 prompt 喂进 ``await sess.respond(prompt=...)``。
-  历史中**只写 ``content:answer``**，不写 thinking，下一轮看不到。
-* **32K token 限制**：每轮用粗估 ``len(text)//3`` 算 ``history_tokens``；
-  超过 ``context_limit - max_new_tokens`` 拒绝发新请求。
-* **停止 = 状态翻转（best-effort）**：worker 侧 ``sess.respond`` 是阻塞
-  + 不可中断的，主进程没有 cancel RPC 通路（v0.10 未实现）。``stop()``
-  仅把状态翻到 ``stopped`` 并把 ``_worker_stop_event`` 置位，worker 跑完
-  后看到 ``stopped`` 就丢弃本轮结果不写历史；用户体感是 "UI 立即停，
-  worker 静默跑完"。下一轮 ``session.reset()`` 仍可用 —— proxy 内部
-  ThreadPoolExecutor(max_workers=1) 串行，新请求会排队等 worker 空闲。
+* **LLMSession 必须从 ComputeRegistry 取**（``get_session("swcap_text_chat")``）；
+  拿到的是 ``RpcSessionProxy``，找不到抛
+  ``RuntimeError("功能未启用: swcap_text_chat")``，调用方决定如何上报。
+* **推理在 compute_worker 子进程里跑**：``session.chat_run(...)`` 通过 wdndds
+  RPC 把 ``{history, text, context_limit, max_new_tokens}`` 发给 worker；
+  worker 后台线程用 tokenizer 精确裁剪历史、拼 ChatML、跑
+  ``_backend.run``，边跑边把 ``sink.text`` 增量收进 chat state。
+  主进程 ``chat_poll`` 轮询拉增量，``on_delta`` 喂给 ``_ThinkingRouter``
+  流式切分 thinking / answer。
+* **thinking 与 answer 分离**：每个 delta 增量先过一道 ``_ThinkingRouter``
+  状态机，按 `` thinking`` / `` response`` 推到对应频道；``done`` 时再
+  用 ``split_thinking`` 兜底切一次（处理 token 边界切碎等极端情况）。
+* **多轮上下文**：app 端消息 deque 全量发给 worker；worker 用真实 tokenizer
+  从最旧历史滚动裁剪（超 ``context_limit - max_new_tokens`` 就丢更早的），
+  拼 ChatML 后 ``keep_history=0`` 跑 —— 历史只写 ``content:answer``，
+  不写 thinking，下一轮看不到。
+* **context_limit 可配置**：``config.json["compute"]["text_chat"]["context_limit"]``，
+  默认 32768；每次推理前热读。超限自动裁剪最旧历史，仅单条消息超限才报错。
+* **停止 = 软停**：``stop()`` 置 ``_worker_stop_event``；proxy 的 ``chat_run``
+  轮询循环感知后调 ``chat_stop`` RPC，worker 跑完返回 stopped，主进程丢本轮。
 * **broadcast pattern**：worker 线程 push 到 ``asyncio.Queue`` 列表；
   WS handler 在主 event loop 里 ``drain``。
-* **进程级串行**：通过 ``ComputeRegistry.get_session_call_lock()`` 串行化
-  主进程侧 ``session.reset() + respond()``。这与 detector / VFA 共用同一
-  qwen3-vl-4b 时锁的是同一把 —— 但 text_chat 走 qwen3-8b，不冲突；这里
-  锁为防御性兜底（理论上单 instance 也只有 chat 这一个 consumer）。
 
 状态机
 ======
@@ -58,8 +43,8 @@ WS 帧类型
 * ``snapshot`` —— 连接建立后立即推一次（与 wechat 一致）。
 * ``state`` —— 状态字段 diff。
 * ``user_echo`` —— 用户消息 echo 回前端（前端用它来立即渲染 user 气泡）。
-* ``thinking`` —— ``<think>...</think>`` 段增量。
-* ``answer`` —— ``</think>`` 之后的回答增量。
+* ``thinking`` —— `` thinking... response`` 段增量。
+* ``answer`` —— `` response`` 之后的回答增量。
 * ``stopped`` —— 用户中途停止。
 * ``done`` —— 一轮推理结束，附完整 thinking/answer + 性能数据。
 * ``error`` —— 推理异常或 capability 未启用。
@@ -71,12 +56,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue as _queue
-import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, List, Optional
+from typing import Callable, Deque, List, Optional
+
+from app.services.chat_runner import split_thinking
+from app.services.config import get_config
 
 
 _LOG = logging.getLogger("text_chat")
@@ -87,25 +74,6 @@ _SUB_QUEUE_MAX = 500
 
 
 # --------------------------------------------------------------------------- #
-# thinking 切分（worker 返回的 result.text 仍可能含 <think>...</think> 标签；
-# 在主进程侧用正则一次性切开）
-# --------------------------------------------------------------------------- #
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-
-
-def _split_thinking(text: str) -> tuple[str, str]:
-    """一次性切分完整回复（done 时兜底切）。
-
-    返回 ``(thinking, answer)``；若没找到 ``<think>``，thinking 为空。
-    """
-    m = _THINK_RE.search(text)
-    if not m:
-        return "", text.strip()
-    thinking = m.group(1).strip()
-    answer = (text[:m.start()] + text[m.end():]).strip()
-    return thinking, answer
-
-
 # --------------------------------------------------------------------------- #
 # Request dataclass
 # --------------------------------------------------------------------------- #
@@ -202,7 +170,7 @@ class _TextChatManager:
                 "error":             self._error,
                 "history_count":     len(self._history),
                 "history_tokens":    self._history_tokens,
-                "context_limit":     self.CONTEXT_LIMIT,
+                "context_limit":     self._resolve_context_limit(),
                 "max_new_tokens":    self.MAX_NEW_TOKENS,
                 "current_request_id": self._current_request_id,
                 "last_result":       self._last_result,
@@ -309,66 +277,33 @@ class _TextChatManager:
             self._broadcast({"type": "state", "state": self.snapshot()})
             return
 
-        # 2. 拼 ChatML（仅含 user + assistant(answer)，不含 thinking）
         with self._lock:
             history_snapshot = list(self._history)
-        full_prompt = self._build_chatml_prompt(history_snapshot, req.text)
+        context_limit = self._resolve_context_limit()
 
-        # 3. token 粗估 + 上下文检查（中英混合 ~3 char/token，留 ~6144 buffer）
-        prompt_tokens = self._est_tokens(full_prompt)
-        if prompt_tokens + self.MAX_NEW_TOKENS > self.CONTEXT_LIMIT:
-            detail = (
-                f"对话过长（prompt≈{prompt_tokens} tokens + 预留 "
-                f"{self.MAX_NEW_TOKENS} > {self.CONTEXT_LIMIT}），"
-                f"请清空对话或缩短上下文"
-            )
-            with self._lock:
-                self._set_state(self.STATE_ERROR, error=detail)
-            self._broadcast({
-                "type": "error",
-                "request_id": req.id,
-                "detail": detail,
-            })
-            self._broadcast({"type": "state", "state": self.snapshot()})
-            return
+        router = _ThinkingRouter(
+            emit_fn=lambda payload: self._broadcast(payload),
+            request_id=req.id,
+        )
 
-        # 4. state → running
+        # 5. state → running
         with self._lock:
             self._set_state(self.STATE_RUNNING)
         self._broadcast({"type": "state", "state": self.snapshot()})
 
-        # 5. session.reset() + await sess.respond() —— 串行锁与 detector / VFA 共享
-        #    （text_chat 走 qwen3-8b，理论上不冲突；锁为防御性兜底）
+        # 6. RPC 推理（worker 端裁剪 + 跑；主进程轮询拉增量）
         t0 = time.perf_counter()
         try:
-            with get_session_call_lock():
-                try:
-                    session.reset()
-                except Exception as e:  # noqa: BLE001
-                    _LOG.warning("session.reset() raised: %s (非致命)", e)
-                coro = session.respond(
-                    prompt=full_prompt,
-                    max_new_tokens=self.MAX_NEW_TOKENS,
-                )
-                # proxy.respond() 是 async，内部 run_in_executor → 同步阻塞跑完
-                result = asyncio.run(coro)
+            result = session.chat_run(
+                history=history_snapshot,
+                text=req.text,
+                context_limit=context_limit,
+                max_new_tokens=self.MAX_NEW_TOKENS,
+                on_delta=lambda d: router.push(d),
+                stop_event=self._worker_stop_event,
+            )
             elapsed = time.perf_counter() - t0
-
-            # 6. 抽 result.text → 切 thinking/answer
-            full_text = getattr(result, "text", None) or ""
-            if not full_text and isinstance(result, str):
-                full_text = result
-            _LOG.info(
-                "[text-chat] req=%d raw_len=%d raw_head=%r",
-                req.id, len(full_text), full_text[:200],
-            )
-            thinking, answer = _split_thinking(full_text)
-            _LOG.info(
-                "[text-chat] req=%d split: thinking=%d chars, answer=%d chars",
-                req.id, len(thinking), len(answer),
-            )
         except Exception as e:  # noqa: BLE001
-            elapsed = time.perf_counter() - t0
             with self._lock:
                 self._set_state(self.STATE_ERROR, error=str(e))
             self._broadcast({
@@ -379,22 +314,12 @@ class _TextChatManager:
             self._broadcast({"type": "state", "state": self.snapshot()})
             return
 
-        # 推 WS thinking/answer（单次 delta = 整段，前端累加 = 一次性填满）
-        if thinking:
-            self._broadcast({
-                "type": "thinking",
-                "request_id": req.id,
-                "delta": thinking,
-            })
-        if answer:
-            self._broadcast({
-                "type": "answer",
-                "request_id": req.id,
-                "delta": answer,
-            })
-
-        # cshim 没 cancel RPC，worker 实际跑完了；被 stop 时丢本轮不写历史
+        # 7. 检查是否被 stop 中断 —— 丢弃本轮
         stopped = self._worker_stop_event.is_set()
+
+        # 8. 切 thinking / answer（兜底正则）
+        full_text = result.get("text") or ""
+        thinking, answer = split_thinking(full_text)
 
         if stopped:
             with self._lock:
@@ -409,18 +334,16 @@ class _TextChatManager:
             self._broadcast({"type": "state", "state": self.snapshot()})
             return
 
-        # 9. 写回 history（仅 answer，不含 thinking —— 下轮 prompt 看不到 thinking）
-        user_tokens = self._est_tokens(req.text)
-        answer_tokens = self._est_tokens(answer) if answer else 0
+        # 9. 写回 history（仅 answer，不含 thinking）
+        prompt_tokens = int(result.get("prompt_tokens") or 0)
         with self._lock:
-            self._history.append({"role": "user",      "content": req.text, "ts": req.ts})
-            self._history_tokens += user_tokens
+            self._history.append({"role": "user", "content": req.text, "ts": req.ts})
+            self._history_tokens = prompt_tokens
             if answer:
                 self._history.append({
                     "role": "assistant", "content": answer,
                     "thinking": thinking, "ts": time.time(),
                 })
-                self._history_tokens += answer_tokens
             self._last_result = {
                 "thinking":   thinking,
                 "answer":     answer,
@@ -439,35 +362,76 @@ class _TextChatManager:
         })
         self._broadcast({"type": "state", "state": self.snapshot()})
 
-    # -------------------------------------------------------------- helpers
-    @staticmethod
-    def _build_chatml_prompt(history: List[dict], user_text: str) -> str:
-        """构造喂给 SDK 的裸 prompt；LLMSession.respond 不参与，
-        所以直接拼 ``<|im_start|>`` 系列 ChatML 模板（与 Qwen3 训练一致）。
+    def _resolve_context_limit(self) -> int:
+        """读 ``config.json["compute"]["text_chat"]["context_limit"]``。
 
-        历史只含 ``role:user`` + ``role:assistant``，不含 thinking。
+        默认 32768；缺失 / 类型错 / <1 → 回退默认。每次推理前重读，配置热生效。
         """
-        parts = ["<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"]
-        for msg in history:
-            if msg["role"] == "user":
-                parts.append(f"<|im_start|>user\n{msg['content']}<|im_end|>\n")
-            elif msg["role"] == "assistant":
-                parts.append(f"<|im_start|>assistant\n{msg['content']}<|im_end|>\n")
-        parts.append(f"<|im_start|>user\n{user_text}<|im_end|>\n")
-        parts.append("<|im_start|>assistant\n")
-        return "".join(parts)
+        try:
+            cfg = get_config().get_section("compute", {})
+            if not isinstance(cfg, dict):
+                return self.CONTEXT_LIMIT
+            tc = cfg.get("text_chat")
+            if not isinstance(tc, dict):
+                return self.CONTEXT_LIMIT
+            v = int(tc.get("context_limit") or self.CONTEXT_LIMIT)
+            if v < 1:
+                return self.CONTEXT_LIMIT
+            return v
+        except Exception:  # noqa: BLE001
+            return self.CONTEXT_LIMIT
 
-    @staticmethod
-    def _est_tokens(text: str) -> int:
-        """粗估 token 数：中英混合 ~3 char/token（含 ChatML 标签 + 空格）。
 
-        v0.4 主进程拿不到 tokenizer（tokenizer 只在 compute_worker 子进程里）；
-        v0.5 之前是 ``tokenizer.encode(text)`` 精确数。3 char/token 对中英
-        混合文本误差 ±30%，32K 上限预留 6K buffer 够用。返回 0 防除零。
-        """
-        if not text:
-            return 0
-        return max(1, len(text) // 3)
+# --------------------------------------------------------------------------- #
+# ThinkingRouter：observer 每次 delta 进来调用，按  thinking 边界切频道
+# --------------------------------------------------------------------------- #
+class _ThinkingRouter:
+    """增量状态机：维护一个游标决定下一段 delta 推 thinking 还是 answer。
+
+    进入点固定假设模型先输出 thinking（用户已确认 Qwen3-8B 走 enable_thinking
+    必输出 ``<think>...</think>``）；首次见到 ``</think>`` 后切到 answer。
+    """
+
+    def __init__(self, emit_fn: Callable[[dict], None], request_id: int) -> None:
+        self._emit = emit_fn
+        self._request_id = request_id
+        self._mode = "thinking"          # thinking / answer
+        self._sent_start_marker = False
+
+    def push(self, delta: str) -> None:
+        if not delta:
+            return
+        if self._mode == "thinking":
+            end_idx = delta.find("</think>")
+            if end_idx >= 0:
+                head = delta[:end_idx]
+                if head:
+                    self._emit({
+                        "type": "thinking",
+                        "request_id": self._request_id,
+                        "delta": head,
+                    })
+                self._mode = "answer"
+                rest = delta[end_idx + len("</think>"):]
+                if rest:
+                    self._emit({
+                        "type": "answer",
+                        "request_id": self._request_id,
+                        "delta": rest,
+                    })
+            else:
+                # 整个 delta 还在 thinking 段
+                self._emit({
+                    "type": "thinking",
+                    "request_id": self._request_id,
+                    "delta": delta,
+                })
+        else:
+            self._emit({
+                "type": "answer",
+                "request_id": self._request_id,
+                "delta": delta,
+            })
 
 
 # --------------------------------------------------------------------------- #

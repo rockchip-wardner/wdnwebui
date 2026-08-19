@@ -6884,7 +6884,14 @@ const TextChat = {
   },
 
   _finalizeBubble(reqId, info) {
-    const p = this.pending.get(reqId);
+    let p = this.pending.get(reqId);
+    if (!p) {
+      // No streaming delta ever arrived (e.g. worker produced no live
+      // tokens); create the bubble now so the done/stopped frame can
+      // still render the full reply instead of being dropped.
+      this._ensureAssistantBubble(reqId);
+      p = this.pending.get(reqId);
+    }
     if (!p || !p.assistantLi) return;
 
     // remove cursor
@@ -6894,6 +6901,11 @@ const TextChat = {
     if (typeof info.thinking === "string") {
       p.thinkingBuf = info.thinking;
       if (p.thinkingEl) p.thinkingEl.textContent = info.thinking;
+      const details = p.assistantLi.querySelector(".text-chat-thinking");
+      if (details) {
+        if (info.thinking) details.setAttribute("open", "");
+        else details.hidden = true;
+      }
     }
     if (typeof info.answer === "string") {
       p.answerBuf = info.answer;
