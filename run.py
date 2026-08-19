@@ -146,18 +146,29 @@ def _ancestor_pids() -> set[int]:
 
 
 def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
-    """Best-effort cleanup of stale wdnwebui resources from a previous
-    unclean shutdown.
+    """Best-effort cleanup of stale wdnwebui MAIN process resources
+    from a previous unclean shutdown.
 
     Cleans up:
       * the uvicorn process holding port 8000 (this is the actual
         ``[Errno 98] Address already in use`` blocker)
-      * any orphan ``compute_worker.py`` subprocess (orphans because
-        ``ComputeRegistry._spawn_compute_worker`` uses
-        ``Popen(start_new_session=True)`` — they detach from the
-        run.py process group and survive its death)
+      * the previous ``run.py`` (uvicorn reloader parent; otherwise
+        the reloader-spawned zombie holds port 8000 indefinitely)
+      * uvicorn-reloader's ``multiprocessing.spawn`` /
+        ``resource_tracker`` children (defunct zombies that inherited
+        the LISTEN socket)
 
     Intentionally leaves alone:
+      * ``compute_worker.py`` subprocesses — they're independently-
+        managed processes with their own DDS endpoint. The new
+        ``ComputeRegistry.boot_compute_services()`` adopts live
+        workers via DDS RPC ``info`` probe (``_adopt_existing_worker``
+        in ``app/services/compute_registry.py``); killing them here
+        would defeat the orphan-adoption design and force a 60s+
+        model reload. Treated identically to ``wdndds_daemon`` below.
+        Detected orphans are reported on stderr for visibility —
+        see the "detected N orphan compute_worker process(es)" log
+        emitted below.
       * ``wdndds_daemon`` — it might be serving LAN peers via the
         FastDDS discovery protocol, and ``_start_wdndds_daemon``
         adopts an existing one instead of double-spawning anyway.
@@ -165,7 +176,8 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
       * anything not matching wdnwebui repo paths (defence in depth).
 
     Opt-out: pass ``enabled=False`` (driven by ``--no-kill-stale`` /
-    ``WDNWEBUI_KILL_STALE_ON_BOOT=0``).
+    ``WDNWEBUI_KILL_STALE_ON_BOOT=0``). When disabled the entire
+    /proc scan is skipped, including the orphan-worker log.
 
     Why this is safe to default on for run.py: per
     ``install_autostart.sh``, the production systemd unit invokes
@@ -182,17 +194,31 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
     killed: list[tuple[str, int]] = []
     survivors: list[tuple[str, int]] = []
 
-    def _collect() -> list[tuple[str, int]]:
+    def _collect() -> tuple[list[tuple[str, int]], list[int]]:
+        """Walk ``/proc`` once; return ``(kill_candidates,
+        orphan_worker_pids)``.
+
+        ``orphan_worker_pids`` are intentionally NOT added to the kill
+        list — they're detected here purely for visibility, the
+        actual adoption happens later in
+        :meth:`ComputeRegistry.boot_compute_services` via
+        :meth:`ComputeRegistry._adopt_existing_worker` (DDS RPC info
+        probe). Putting the detection in the same scan avoids a
+        second ``/proc`` walk.
+        """
         candidates: list[tuple[str, int]] = []
+        orphan_workers: list[int] = []
 
         # (a) uvicorn holding port 8000 — the actual blocker.
         holder = _pid_listening_on_port(8000)
         if holder and holder != my_pid and holder not in ancestors:
             candidates.append(("uvicorn(port 8000)", holder))
 
-        # (b) compute_workers — find via /proc cmdline walk. We match
-        #     the script path + repo marker so a foreign compute_worker
-        #     (somebody else's dev box) is NOT killed.
+        # (b) find ``compute_worker.py`` via /proc cmdline walk —
+        #     DETECTED but added to ``orphan_workers`` (NOT killed).
+        #     See ``(d) orphan compute_worker`` branch below for the
+        #     rationale and the triple filter (script path + repo
+        #     marker) that excludes foreign compute_workers.
         worker_path = repo_root / "app" / "services" / "compute_worker.py"
         try:
             worker_path_str = str(worker_path.resolve())
@@ -219,7 +245,7 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
             except Exception:
                 continue
 
-            # (c) stale ``python run.py`` — the actual uvicorn parent.
+            # (b) stale ``python run.py`` — the actual uvicorn parent.
             # The reloader's child process (which ``ss`` reports as the
             # port 8000 owner) is often a defunct zombie by the time
             # we look — `kill -9` on a zombie is a no-op, and the real
@@ -251,7 +277,7 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
                     candidates.append(("run.py", pid))
                     continue
 
-            # (d) uvicorn reloader's multiprocessing children — when
+            # (c) uvicorn reloader's multiprocessing children — when
             # ``uvicorn.run(..., reload=True)`` boots, the reloader
             # spawns the actual app via ``multiprocessing.spawn`` which
             # leaves a ``spawn_main`` process tree behind even after
@@ -274,20 +300,35 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
                 candidates.append(("uvicorn-reload-fork", pid))
                 continue
 
-            # Match ``compute_worker.py`` invoked from THIS repo. We
-            # require both pieces: the bare filename (cheap filter)
-            # and the resolved script path on disk (surgical match).
-            if "compute_worker.py" not in cmd_str:
-                continue
-            if worker_path_str not in cmd_str:
-                # Could be a vendored copy at a different path; skip.
-                continue
-            if "wdnwebui" not in cmd_str:
-                continue
-            candidates.append(("compute_worker", pid))
-        return candidates
+            # (d) orphan ``compute_worker.py`` invoked from THIS repo.
+            # DETECTED but NOT killed — see this function's docstring
+            # (compute_workers are independently-managed and adopted
+            # by the new ComputeRegistry.boot_compute_services()).
+            # We still run the same bare-filename + resolved-path +
+            # repo-name triple filter so a foreign compute_worker
+            # (somebody else's dev box) is NOT flagged here either.
+            if ("compute_worker.py" in cmd_str
+                    and worker_path_str in cmd_str
+                    and "wdnwebui" in cmd_str):
+                orphan_workers.append(pid)
+        return candidates, orphan_workers
 
-    candidates = _collect()
+    candidates, orphan_workers = _collect()
+
+    # Orphan-worker visibility — emit BEFORE the kill report so a
+    # user reading the boot log sees "X workers survived, will be
+    # adopted" even when there are no main-process leftovers to reap.
+    if orphan_workers:
+        print(
+            f"[run.py] detected {len(orphan_workers)} orphan "
+            f"compute_worker process(es) — preserved, will be "
+            f"adopted by ComputeRegistry.boot_compute_services() "
+            f"via DDS RPC info probe (NOT killed):",
+            file=sys.stderr,
+        )
+        for pid in orphan_workers:
+            print(f"  - pid={pid}", file=sys.stderr)
+
     if not candidates:
         return
 
@@ -561,16 +602,21 @@ def main() -> None:
     parser.add_argument(
         "--kill-stale",
         action="store_true", default=None,
-        help="Reap stale wdnwebui processes (port 8000 uvicorn + "
-             "compute_workers) from a previous unclean shutdown "
-             "before binding. Default: ON for manual CLI runs. "
-             "Explicit opt-out: --no-kill-stale.",
+        help="Reap stale wdnwebui MAIN processes (port 8000 uvicorn + "
+             "uvicorn-reloader fork + prior run.py) from a previous "
+             "unclean shutdown before binding. Orphan compute_worker "
+             "processes are intentionally NOT killed — they're "
+             "independently managed and adopted by "
+             "ComputeRegistry.boot_compute_services() on the new boot. "
+             "Default: ON for manual CLI runs. Explicit opt-out: "
+             "--no-kill-stale.",
     )
     parser.add_argument(
         "--no-kill-stale",
         action="store_true", default=None,
-        help="Skip stale-process cleanup. Inverse of --kill-stale; "
-             "the last flag wins if both are passed.",
+        help="Skip stale MAIN-process cleanup. Inverse of --kill-stale; "
+             "the last flag wins if both are passed. compute_workers "
+             "are never killed by run.py regardless of this flag.",
     )
     args, _unknown = parser.parse_known_args()
 
