@@ -60,8 +60,17 @@ async def _run_rknn_smi_info() -> tuple[str, str, int]:
             proc.communicate(), timeout=_RKNNSMI_TIMEOUT_S
         )
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        # subprocess 可能在 wait_for 取消过程中已经退出 / 被 asyncio 关闭，
+        # 直接 kill() / wait() 会抛 ProcessLookupError。需要 try/except 兜住
+        # 否则 500 错误泄漏到 /api/system-monitor 整个 endpoint。
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
         return "", f"timeout after {_RKNNSMI_TIMEOUT_S}s", -1
     return (
         stdout.decode(errors="replace"),

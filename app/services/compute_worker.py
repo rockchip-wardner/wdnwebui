@@ -842,6 +842,23 @@ def infer_handler(state: dict, payload: dict) -> dict:
             "bbox": getattr(result, "bbox", None),
             "crop_b64": getattr(result, "crop_b64", None),
         }
+        # v0.10 修复：当 ``generating=SceneFrame`` / TargetDoc 等 pydantic
+        # 类被 SDK 成功解析时，result 是 BaseModel 实例，但其字段（scene /
+        # actors / action / objects / text / note 等）并不在 ``reply`` 里
+        # —— 历史 reply 只搬 text/level/tool_call/bbox/crop_b64，把结构化
+        # 字段全部丢在 worker 边界。主进程 ``_ProxyResult._raw`` 收到这份
+        # 精简 reply，导致 VFA 的 ``_split_scene_frame_result`` 看到空
+        # structured。这里 model_dump 把结构化字段塞进 reply["structured"]，
+        # 主进程 ``rpc_session_proxy`` 那边解析后填进 ``_ProxyResult._raw``，
+        # VFA Path 2 就能拿到完整字段。
+        if not is_tool_instance and not isinstance(result, (str, bytes, dict)):
+            try:
+                if hasattr(result, "model_dump") and callable(getattr(result, "model_dump", None)):
+                    _dump = result.model_dump()
+                    if isinstance(_dump, dict) and _dump:
+                        reply["structured"] = _dump
+            except Exception as _dump_ex:
+                LOG.warning("model_dump failed: %s", _dump_ex)
         if attachment_b64 is not None:
             reply["attachment_b64"] = attachment_b64
         if is_tool_instance and tool_call_args is not None:

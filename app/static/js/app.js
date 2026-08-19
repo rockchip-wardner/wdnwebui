@@ -7863,8 +7863,14 @@ const _VFA_PHASE_LABEL = {
  *                 ..., floor(total_frames/every_n)*every_n），所以样本数
  *                 是 floor 而不是 ceil。之前用 ceil 导致 totalFrames 不是
  *                 every_n 整数倍时进度条永远停在 (N-1)/N。
- *   analyzed     = VFA.events.length（每条 event 对应一帧推理）
- *   progress     = analyzed / expected
+ *   analyzed     = 优先用 ``snap.analyzed``（state API 的权威计数），
+ *                 没有 snap 时退到 ``VFA.events.length``。
+ *                 **不要直接用 events.length**：events API 与 state API 是
+ *                 两次请求，在 done 状态切换瞬间 events 端可能延迟一拍，
+ *                 导致用户多次刷新看到 ratio 在 70%→86%→100% 之间
+ *                 跳变（bar 一会儿不满格一会儿满格）。用 snap.analyzed
+ *                 与 state 同源，永远不会出现这种 flicker。
+ *   progress     = analyzed / expected（done 状态下强制 ratio=1）
  */
 function vfaUpdateProgress(snap) {
   const root      = document.getElementById("vfa-progress");
@@ -7927,7 +7933,14 @@ function vfaUpdateProgress(snap) {
   // summarizing 阶段：把进度比换成 chunk 完成度（[done, total]）。
   const totalFrames = VFA.meta.total_frames;
   const everyN      = VFA.meta.every_n;
-  const analyzed    = VFA.events.length;
+  // 优先用 snap.analyzed（state API 的权威计数）。没有 snap 时退到 events.length。
+  // 关键：events API 与 state API 是两次独立 HTTP 请求，在 done 状态切换瞬间
+  // events 端可能延迟 1-2 帧，导致 ratio 在 70%→86%→100% 跳变（用户多次刷新
+  // 看到进度条一会儿不满格一会儿满格）。用 snap.analyzed 与 state 同源 → 一次
+  // state 推送期间 analyzed 值稳定，进度条就不会 flicker。
+  const analyzed    = (snap && Number.isFinite(snap.analyzed))
+    ? Number(snap.analyzed)
+    : VFA.events.length;
 
   let expected = 0;
   let ratio = null;
@@ -7935,7 +7948,7 @@ function vfaUpdateProgress(snap) {
   // 进度条只在"真正在干活或刚干完"的状态下显示数字：
   //   running / opening  → 实跑帧数（analyzed / expected）
   //   summarizing       → chunk 完成度
-  //   done              → 100% 满格
+  //   done              → 100% 满格（强制 ratio=1，与 events.length 解耦）
   // idle / stopped / error 一律不显示帧数（哪怕 VFA.meta 残留上次运行的值
   // —— 此时 ratio=null → indeterminate 滑动 / 0%，避免用户以为"还在跑"）。
   const showNumbers = state === "running" || state === "opening" ||
@@ -7949,13 +7962,21 @@ function vfaUpdateProgress(snap) {
     expected = snap.summary_progress[1];
     ratio = Math.min(1, snap.summary_progress[0] / expected);
     progressLabel = "综述 chunk " + snap.summary_progress[0] + "/" + expected;
+  } else if (state === "done") {
+    // **done 状态下强制 ratio=1**，且 **expected = analyzed** 让数字显示
+    // "30 / 30" / "5 / 5" 而不是 "30 / 40" / "5 / 10" 这种看上去很怪
+    // 的"已完成但只填到 75%"。原因：
+    // 1) events API 可能比 state 慢 1-2 帧（events 端没追上）
+    // 2) analyzed 本身可能因 dirty / timeout 大于实际成功 event 数
+    // 3) floor(totalFrames/everyN) **是上限估计不是真实需求**——
+    //    视频最后一帧可能不整除、也可能有 B 帧 / 关键帧让后端
+    //    实际只采了 7 帧（10 帧的 70%），这 7 帧是"我们能采的
+    //    全部"不是"7/10 必须采满"，已完成就显示 7/7。
+    expected = analyzed;
+    ratio = 1;
   } else if (totalFrames > 0 && everyN > 0) {
     expected = Math.max(1, Math.floor(totalFrames / everyN));
     ratio = Math.min(1, analyzed / expected);
-  } else if (state === "done") {
-    // 不知道总数但已完成 → 用实际数量填到 100%
-    expected = analyzed;
-    ratio = 1;
   }
 
   if (progressLabel) {

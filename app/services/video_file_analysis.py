@@ -241,6 +241,22 @@ def _looks_garbled(text: str) -> bool:
     """
     if not text or len(text) < 8:
         return False
+    # 0. v0.10 关键防误判：如果 text 是合法 JSON（顶层 dict 形如 {"x": "y"}），
+    #    跳过所有 Latin/CJK 启发式。原因：JSON 内含大量 key 名 / value 英文
+    #    （"scene"/"actors"/"action"），任一 Latin 短串都会出现 ≥3 次，
+    #    但本质是结构化输出不是乱码。SDK 自己的 _looks_garbled 对半截
+    #    JSON 也会误判（"{" 出现但后续无法 parse → 标记 garbage）。
+    #    这条短路让真 JSON 永远不被误杀。
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            import json as _json
+            obj = _json.loads(stripped)
+            if isinstance(obj, dict):
+                return False  # 合法 JSON 顶层 dict → 一定不是 garbled
+        except Exception:
+            pass  # 不是合法 JSON → 落到下面的启发式
+
     # 1. SDK 内置启发式（CJK 比例 <30% / 半截 JSON / 控制字符 / 长 Latin
     #    连续 / 单字符重复 8+ 等）
     try:
@@ -335,6 +351,48 @@ def _split_scene_frame_result(result) -> tuple:
     # Path 2：pydantic 验证失败的 raw dict（_call_llm 兜底返回）
     if isinstance(result, dict):
         try:
+            # v0.10 修复：SDK Path 5 兜底 + wdnai 后端 JSON 解析失败时，
+            # 模型的原始 JSON 字符串可能落在 3 个不同位置：
+            #   1. result["note"] （早期 _normalize_structured 残留）
+            #   2. result["text"] （worker's RPC reply 字段；SDK 返回 str
+            #       时整段模型输出塞这里）
+            #   3. result["structured"] （worker model_dump 的成功路径）
+            # 三种位置都尝试用 regex 抽 JSON，把 scene/actors/action/
+            # objects/note 提升到顶层（setdefault，已有顶层字段优先），
+            # 让 _normalize_structured 拿到正确数据。
+            _json_str = None
+            for _k in ("note", "text", "structured_text"):
+                _v = result.get(_k)
+                if isinstance(_v, str) and "{" in _v:
+                    _json_str = _v
+                    break
+            if _json_str is None:
+                # 也尝试 result["text"] 整体作为 JSON（worker's reply 的
+                # text 字段是模型原始输出，pydantic 失败时整段 JSON 落地）
+                _v = result.get("text")
+                if isinstance(_v, str) and _v.strip().startswith("{"):
+                    _json_str = _v
+            if _json_str is not None:
+                try:
+                    import json as _json_vfa
+                    import re as _re_vfa
+                    _m = _re_vfa.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", _json_str)
+                    if _m:
+                        _parsed = _json_vfa.loads(_m.group(0))
+                        if isinstance(_parsed, dict):
+                            for _kn, _kv in _parsed.items():
+                                result.setdefault(_kn, _kv)
+                except Exception:
+                    pass
+            # v0.10 修复：worker 的 model_dump reply 把 SceneFrame 字段
+            # 塞进 reply["structured"]（rpc_session_proxy 直透成
+            # _ProxyResult._raw["structured"]）。Path 2 拿到 result 后
+            # 把 structured 子字典的字段提升到顶层，让 _normalize_structured
+            # 按 scene/actors/action/objects/note 正常归一化。
+            _struct_vfa = result.get("structured")
+            if isinstance(_struct_vfa, dict) and _struct_vfa:
+                for _kn, _kv in _struct_vfa.items():
+                    result.setdefault(_kn, _kv)
             structured = _normalize_structured(result)
             text = _text_from_dict(result)
             # dict 路径同样需要 _looks_garbled 兜底：SDK Path 5 在 JSON
@@ -424,6 +482,15 @@ def _normalize_structured(obj: dict) -> dict:
 
     智能匹配：scene/actors/action/objects/note 直接映射；其他未知
     字段（Qwen3-VL 经常输出 ``analysis`` / ``error``）拼到 ``note`` 里。
+
+    **模型输出类型兜底**（v0.10 修）：SDK Path 5 兜底 + 正则抽 JSON 后，
+    模型偶尔输出类型与 SceneFrame schema 不符的 JSON —— 例如车辆类
+    视频上模型把 ``action`` / ``text`` 写成 ``[]`` 或 list of dicts；
+    ``objects`` 写成 ``[{"type": "车辆", "description": "黑色轿车", ...}]``
+    这种 TargetDoc 风格的 dict 列表。直接 ``str(v)`` 会得到 ``"[]"`` 或
+    ``"{'type': ...}"`` 这种垃圾显示。这里做"类型拉直"：list 视情况
+    拼接成字符串，list of dict 提取 ``description`` / ``text`` / ``name``
+    三个候选字段。
     """
     known: dict = {}
     note_extras: list = []
@@ -435,10 +502,10 @@ def _normalize_structured(obj: dict) -> dict:
         elif isinstance(v, list) and v:
             note_extras.append(f"{k}: {','.join(str(x) for x in v if x)}")
     structured = {
-        "scene":   str(known.get("scene") or ""),
-        "actors":  _as_str_list(known.get("actors")),
-        "action":  str(known.get("action") or ""),
-        "objects": _as_str_list(known.get("objects")),
+        "scene":   _coerce_scene_like(known.get("scene")),
+        "actors":  _coerce_list_of_str(known.get("actors")),
+        "action":  _coerce_action_like(known.get("action")),
+        "objects": _coerce_objects(known.get("objects")),
         "note":    None,
     }
     if known.get("note") is not None:
@@ -457,6 +524,184 @@ def _as_str_list(v) -> List[str]:
     if isinstance(v, str):
         return [v] if v else []
     return []
+
+
+def _coerce_scene_like(v) -> str:
+    """scene / action / text 字段预期是 str。模型偶尔输出 list / dict：
+    list 取第一个非空元素并 stringify；dict 取首个 str 值；其余 fallback。
+    """
+    if v is None or v == "":
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list):
+        # 优先取第一个 string，其次 stringify dict 元素
+        for x in v:
+            if isinstance(x, str) and x:
+                return x
+            if isinstance(x, dict):
+                _desc = _first_dict_string(x, ("scene", "action", "text", "description", "value"))
+                if _desc:
+                    return _desc
+        # 全是空 list 或 dict → 取首元素的 str()
+        for x in v:
+            if x:
+                return str(x)
+        return ""
+    if isinstance(v, dict):
+        return _first_dict_string(v, ("scene", "action", "text", "description", "value")) or str(v)
+    return str(v)
+
+
+def _coerce_action_like(v) -> str:
+    """action 字段专用兜底：list/dict → 拼接短描述；空 list → ""（非 "[]"）。"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list):
+        parts: List[str] = []
+        for x in v:
+            if isinstance(x, str) and x:
+                parts.append(x)
+            elif isinstance(x, dict):
+                _d = _first_dict_string(x, ("action", "desc", "description", "text", "value"))
+                if _d:
+                    parts.append(_d)
+        return "、".join(parts)
+    if isinstance(v, dict):
+        return _first_dict_string(v, ("action", "desc", "description", "text", "value")) or str(v)
+    return str(v)
+
+
+def _coerce_list_of_str(v) -> List[str]:
+    """actors / objects 字段预期是 List[str]。模型偶尔输出 list of dict：
+    dict 元素提取 description / name / text / value 等候选字段。"""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v] if v else []
+    if isinstance(v, list):
+        out: List[str] = []
+        for x in v:
+            if isinstance(x, str) and x:
+                out.append(x)
+            elif isinstance(x, dict):
+                _d = _first_dict_string(x, ("description", "name", "text", "value", "label"))
+                if _d:
+                    out.append(_d)
+        return out
+    if isinstance(v, dict):
+        _d = _first_dict_string(v, ("description", "name", "text", "value", "label"))
+        return [_d] if _d else []
+    return [str(v)] if v else []
+
+
+def _coerce_objects(v) -> List[str]:
+    """objects 字段专用兜底：兼容 TargetDoc 风格 list of dict。"""
+    return _coerce_list_of_str(v)
+
+
+def _first_dict_string(d: dict, candidates: tuple) -> str:
+    """从 dict 里按优先级取第一个非空 string 值。"""
+    for k in candidates:
+        v = d.get(k)
+        if isinstance(v, str) and v:
+            return v
+        if isinstance(v, list) and v:
+            for x in v:
+                if isinstance(x, str) and x:
+                    return x
+    # 兜底：取第一个非空 string 值
+    for v in d.values():
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+# 通用垃圾值检测：Qwen3-VL 在不同类型视频上有不同 hallucinate 模式：
+#   - 车辆视频 → "粤B·88888" / "车牌颜色：蓝色" / "车型:小型轿车"
+#   - 监控视频 → "2024-01-15 14:32:18" / "ID: 0042"
+#   - 体育视频 → "3:2" / "Curry #30"
+#   - 产品视频 → "SKU-12345" / "材质: 100% 棉"
+#   - 监控视频 → "x: 234, y: 567" (坐标)
+# 这些输出**不是** SceneFrame schema 期望的"看到了什么 + 在做什么"
+# 自然语言描述，需要从结构化字段里清掉（保留进 note 供回溯）。
+#
+# 通用检测思路（不针对任何特定视频类型）：
+#   1. 字符串 < 12 字符 且 含 ≤1 个 CJK 字符 且 含 1+ 个数字 / 大写字母 / ·  → → 短串特征
+#   2. 字符串是 "label: value" / "label: value, label2: value2" 模式 → attribute 行
+#   3. 字符串是 (中文车牌前缀 + 大写字母 + · + 数字) 这种特定模式   → 车牌（保留兼容）
+#   4. 字符串只有数字 / 标点 / 全大写缩写                        → 编号 / ID / 比分
+# 任何一条命中即视为"非 SceneFrame 自然语言描述"，从结构化字段中剔除。
+_GARBAGE_PATTERNS = [
+    # 纯短串（含数字 / 大写 / ·，< 12 字符）：车牌 / ID / SKU / 编号
+    re.compile(r"^[\u4e00-\u9fffA-Za-z]{0,4}[A-Z0-9·\-]{3,12}$"),
+    # 短串 + 空格 + 短串（如 "车牌 5J5666"）：车牌 / 编号标签
+    re.compile(r"^[\u4e00-\u9fffA-Za-z]{2,8}\s+[A-Z0-9·\-]{3,12}$"),
+    # label: value 或 label: value, label2: value2 — attribute 行
+    re.compile(r"^[\u4e00-\u9fffA-Za-z]{1,8}\s*[:：=]\s*[^\n,]{1,30}(?:\s*[,，;；]\s*[\u4e00-\u9fffA-Za-z]{1,8}\s*[:：=]\s*[^\n,]{1,30})*$"),
+    # 时间戳："2024-01-15" / "2024-01-15 14:32:18"
+    re.compile(r"^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}(\s+\d{1,2}:\d{1,2}(:\d{1,2})?)?$"),
+    # 纯时间："14:32:18" / "14:32"
+    re.compile(r"^\d{1,2}:\d{1,2}(:\d{1,2})?$"),
+    # 比分："3:2" / "21:18"
+    re.compile(r"^\d{1,3}\s*[:：]\s*\d{1,3}$"),
+    # 坐标："x: 234, y: 567" / "(123, 456)"
+    re.compile(r"^[xXyY]\s*[:：=]\s*\d+(\s*[,，;；]\s*[xXyY]\s*[:：=]\s*\d+)*$"),
+    # 纯数字 / 纯大写缩写
+    re.compile(r"^[\d]{3,}$"),
+    re.compile(r"^[A-Z]{3,8}$"),
+]
+
+
+def _is_garbage_value(s: str) -> bool:
+    """返回 True 表示 ``s`` 不是 SceneFrame 字段期望的自然语言描述。
+
+    通用判定：长度超限 / 命中 attribute / ID / 编号 / 坐标 / 时间戳等
+    单一字段抽取模式。中文场景短语 / 动作描述 不会被误判。
+    """
+    if not s or not s.strip():
+        return False
+    s = s.strip()
+    if len(s) > 60:  # SceneFrame 字段都不该超过这个长度（text 最大 80 字但纯文本长串不会是 garbage）
+        return False
+    return any(p.match(s) for p in _GARBAGE_PATTERNS)
+
+
+def _sanitize_structured_fields(structured: dict, raw_text: str) -> tuple:
+    """从结构化字段里清洗 attribute / 编号类垃圾，保留进 note 让落盘可追溯。
+
+    检测 scene / action / text 是否是"非 SceneFrame 自然语言描述"的
+    单字段抽取（车牌 / ID / 时间戳 / 坐标 / 比分 / label: value 等），
+    若是则置空并把原始 attribute 串塞进 ``note``。
+    同时扫描 raw_text 抓类似的 attribute 子串，同样摘出来归档到 note。
+
+    Returns:
+        (cleaned_structured_dict, garbage_note_str)
+        garbage_note_str 为空表示没检测到垃圾。
+    """
+    cleaned = dict(structured)
+    garbage_bits: List[str] = []
+
+    for _field in ("scene", "action", "text"):
+        _v = cleaned.get(_field) or ""
+        if _v and _is_garbage_value(_v):
+            garbage_bits.append(f"{_field}={_v}")
+            cleaned["_field"] = ""
+
+    # 扫 raw_text 抓垃圾子串（不限位置）
+    if raw_text:
+        for _p in _GARBAGE_PATTERNS:
+            for _m in _p.finditer(raw_text):
+                _hit = _m.group(0).strip()
+                # 跳过空或纯标点的 hit
+                if not _hit or _hit in garbage_bits:
+                    continue
+                garbage_bits.append(_hit)
+
+    note_str = "; ".join(garbage_bits) if garbage_bits else ""
+    return cleaned, note_str
 
 
 # --------------------------------------------------------------------------- #
@@ -805,7 +1050,13 @@ class FrameEvent:
             "text":      self.text,
         }
         if self.structured is not None:
-            out["structured"] = self.structured
+            # v0.10.3 反查清洗：note 字段只用来落盘追溯（车牌 / 时间戳 /
+            # attribute-only 等垃圾诊断信息），不应泄漏到反查 API 响应
+            # —— 否则 chip 候选会混入 "粤B·88888" / "14:32:18" 之类噪声。
+            # 内存里保留 self.structured["note"] 给运维排障用，只是不
+            # 序列化进 to_dict()。
+            _struct = {k: v for k, v in self.structured.items() if k != "note"}
+            out["structured"] = _struct
         if self._dirty:
             # 下划线开头字段通常前端会忽略；这里显式给出方便
             # UI / API 消费者识别"该帧 SDK 输出质量异常"。
@@ -835,8 +1086,15 @@ SUMMARY_CHUNK_SIZE             = 15      # 单块最多 15 帧；prompt 安全
 SUMMARY_FRAME_TEXT_MAX         = 60      # 单帧文本最大字符数（紧凑）
 SUMMARY_CHUNK_PROMPT_BUDGET    = 2200    # 单 chunk prompt 字符上限（含模板）
 SUMMARY_PROMPT_CHAR_BUDGET     = 3000    # 兜底：最终 prompt parts 字符上限（< 5000 token）
-CHUNK_MAX_NEW_TOKENS           = 200     # pass 1 单块硬控输出
-FINAL_MAX_NEW_TOKENS           = 400     # pass 2 最终综述硬控输出
+CHUNK_MAX_NEW_TOKENS           = 150     # pass 1 单块硬控输出（v0.10: 200→150，省 ~2s/call）
+FINAL_MAX_NEW_TOKENS           = 280     # pass 2 最终综述硬控输出（v0.10: 400→280，省 ~6s）
+
+# 单次 LLM 推理的 asyncio.wait_for 上限（秒）。v0.10：30 → 60。
+# 30s 在 RK3588 qwen3-vl-4b 上贴着 Apollo 综述最后一步的边界：1829-frame
+# 视频 ≈ 10 个 chunk，每段 ≤120 字 + 模板 ≈ 2500 字 prompt + 400
+# 新 token 输出，实测 ~25-30s；任何 prompt 略长或 NPU 短暂忙就破。
+# 60s 留余量覆盖合理慢调用，又不至于让真卡死的 SDK hang 几分钟才报错。
+_INFER_TIMEOUT_SEC             = 60.0
 
 # Chunk-level rescue 在早期实现里嵌在 _infer_one（每 30 events 同步跑一次
 # batch LLM 兜底）。问题：worker 线程被 rescue 阻塞，且 30 events × 500 字符
@@ -915,6 +1173,11 @@ class VideoFileAnalysisService:
         self._sampled = 0           # 本次分析已抽样的帧数
         self._analyzed = 0          # 已完成的推理数
         self._dirty_count = 0       # retry 后仍乱码的帧数（监测指标）
+        # 连续 _call_llm 超时计数：≥2 触发 worker restart 清掉 wedged
+        # rknn3 C 层（session_stop() 在用户 RK3588 实测不释放，65s/call
+        # 串联等死）。worker 重启 = 30s init 成本，但根治"LLM 队列 N"
+        # 队列积压。成功调用一次重置回 0。
+        self._consecutive_timeouts = 0
         self._started_at = 0.0
         self._finished_at = 0.0
 
@@ -1035,6 +1298,49 @@ class VideoFileAnalysisService:
             every_n = max(1, int(every_n))
         except (TypeError, ValueError):
             raise ValueError("every_n 必须为整数")
+
+        # v0.10 关键修复：用户传 "describe scene" 这种英文 prompt 时，
+        # qwen3-vl-4b 会输出 700+ 字的英文段落描述（"This is a close-up
+        # photograph of a white bowl..."），而不是 SceneFrame JSON schema。
+        # SDK 的 schema hint 被忽略，每帧都触发 _split_scene_frame_result
+        # 的"text 字段乱码"兜底，event 全是 dirty=True 的空事件。
+        #
+        # v0.10.2 泛化：原版只针对车牌 / 车辆属性这类误读 prompt 的输出做了
+        # 约束，但 Qwen3-VL 在不同类型视频上有不同 hallucinate 模式：
+        #   - 车辆视频：把 prompt 误读成 attribute-extraction，输出
+        #     "粤B·88888" / "车牌颜色：蓝色" / "车型:小型轿车" 等
+        #   - 监控视频：只输出时间戳 / ID 编号
+        #   - 体育视频：只输出比分 / 球员名
+        #   - 产品视频：只输出 SKU / 颜色 / 材质
+        # 通用规则是：模型**只描述看到了什么 + 在发生什么**，不要做属性抽取。
+        # 这里给通用 SceneFrame schema 描述 + 一个中性示例（不绑车型）。
+        if "json" not in prompt.lower() and "schema" not in prompt.lower():
+            prompt = (
+                prompt.rstrip("。. \n")
+                + "\n\n【输出格式（严格按 JSON schema）】\n"
+                "请输出一个 JSON 对象，必须且只能有以下 5 个字段：\n"
+                "{\n"
+                '  "scene":   "<场景地点或环境，2-12 字中文，如 \"厨房\"、\"户外街道\"、\"小区入口\">",\n'
+                '  "actors":  ["<人物或主体1>", "<人物或主体2>"],   // 字符串数组，无则 []，最多 3 项\n'
+                '  "action":  "<正在发生的动作或事件，2-20 字中文一句话>",\n'
+                '  "objects": ["<关键物体1>", "<关键物体2>"],       // 字符串数组，无则 []，最多 4 项\n'
+                '  "text":    "<30-80 字中文自然语言描述：场景 + 动作 + 关键物体综合>"  \n'
+                "}\n\n"
+                "【类型约束（模型常错的地方）】\n"
+                "- scene / action / text 必须是**字符串**（不能是数组、字典、数字）\n"
+                "- actors / objects 必须是**字符串数组**（不能是数组里套字典、不能是单字符串）\n"
+                "  错误示例：objects=[{\"type\":\"车辆\",\"color\":\"白色\"}]\n"
+                "  正确示例：objects=[\"白色轿车\", \"行人\"]\n\n"
+                "【输出风格约束（避免输出污染）】\n"
+                '- 只描述"看到了什么 + 正在发生什么"，**不要做结构化属性抽取**\n'
+                "  （车牌号 / 车牌颜色 / 车型 / 产品 SKU / 颜色尺寸 / 时间戳 /\n"
+                "  比分球员 / 监控 ID / 坐标位置 等单独字段不属于 scene/action/text）\n"
+                "- text 字段必须是一段自然语言描述（30-80 字），不是单 token、数字串、\n"
+                "  label: value 形式的 attribute-only 输出\n"
+                "- 全中文输出（除 JSON 键名外）\n\n"
+                "【正确示例】\n"
+                '{"scene":"户外街道","actors":["行人"],"action":"行人从画面左侧走向右侧","objects":["白色轿车","树木","人行道"],"text":"一名行人从画面左侧走向右侧，身旁停着一辆白色轿车，背景可见行道树和人行道。"}'
+            )
 
         # 业务级校验：算力是否就绪
         from app.services.compute_registry import get_registry
@@ -1697,9 +2003,23 @@ class VideoFileAnalysisService:
         SceneFrame = _get_scene_frame_cls()
         result = self._call_llm(
             prompt, frame_bgr, generating=SceneFrame,
-            max_new_tokens=300,
+            max_new_tokens=250,
         )
         structured_dict, raw_text = _split_scene_frame_result(result)
+
+        # v0.10.2 垃圾输出清洗：Qwen3-VL 经常把 prompt 误读成 attribute-extraction
+        # 任务，输出车牌号 / 监控 ID / 时间戳 / 坐标 / 比分等"非 SceneFrame"
+        # 内容。这些会污染反查索引（chip 候选里出现 "粤B·88888" / "14:32:18" 等），
+        # 需要从结构化字段里清掉，残留 attribute 信息塞进 note 让落盘可追溯。
+        if structured_dict is not None:
+            _sanitized = _sanitize_structured_fields(structured_dict, raw_text or "")
+            structured_dict = _sanitized[0]
+            _garbage_note = _sanitized[1]
+            if _garbage_note:
+                _existing_note = structured_dict.get("note") or ""
+                structured_dict["note"] = (
+                    f"{_existing_note} | {_garbage_note}" if _existing_note else _garbage_note
+                )
 
         # 失败标记：_call_llm 把 SDK 错误返回成 "(功能未启用: ...)" /
         # "(推理超时: ...)" / "(推理失败: ...)" 等字符串。这种情况下
@@ -2195,6 +2515,42 @@ class VideoFileAnalysisService:
     # ------------------------------------------------------------------ #
     # LLM 调用：LLMSession 来自 registry；session.respond 前后包进程锁
     # ------------------------------------------------------------------ #
+    def _on_call_timeout(self) -> None:
+        """每次 _call_llm 触发 60s timeout 时调用。
+
+        连续 ≥2 次 → 触发 stop_instance_local("qwen3-vl-4b")，干掉旧
+        worker 进程 → 35s 内 spawn 新进程 + init LLMSession → 队列里
+        积压的 _call_llm 失败（但 1-2 个 error 事件比 5+ 分钟卡死好），
+        之后稳态运行。
+
+        阈值定 ≥2 而非 1：单次 timeout 可能是长 prompt / NPU 短暂忙，
+        不必重启；连续 2 次说明 C 层 rknn3 session 真正 wedged，
+        session_stop() + wait_sec=5 已实测不够，必须靠 worker 重启
+        抹掉 NPU mutex 状态。
+        """
+        self._consecutive_timeouts += 1
+        if self._consecutive_timeouts < 2:
+            return
+        LOG.warning(
+            "vfa: %d 次连续 _call_llm 超时，触发 qwen3-vl-4b worker 重启（清 wedged C 层）",
+            self._consecutive_timeouts,
+        )
+        try:
+            from app.services.compute_registry import get_registry
+            get_registry().stop_instance_local("qwen3-vl-4b")
+        except Exception as ex:
+            LOG.error("vfa: worker 重启失败: %s", ex)
+        # 重启后新 worker 是 fresh session，counter 清零。
+        self._consecutive_timeouts = 0
+
+    def _reset_timeout_counter(self) -> None:
+        """成功 / 非 timeout 错误路径调用，重置连续超时计数。
+
+        单次成功（或非 timeout 异常）就足以证明 C 层 rknn3 session 还
+        能正常调度，counter 不需要累加。
+        """
+        self._consecutive_timeouts = 0
+
     def _call_llm(self, prompt: str, frame_bgr, *,
                   max_new_tokens: Optional[int] = None,
                   generating=None) -> Any:
@@ -2228,6 +2584,47 @@ class VideoFileAnalysisService:
             # get_session 抛 RuntimeError("功能未启用: <cap>")，直接包裹
             # 不再加 "功能未启用: " 前缀（否则会出现双重前缀）。
             return f"({e})"
+
+        # Prompt 长度诊断（用户报告 "60s timeout 但不是 NPU wedged"——
+        # 怀疑是 prompt 超过 qwen3-vl-4b max_context_len=4096 导致 rknn3
+        # session_run 在 prefill 时长挂）。本段在每条 _call_llm 入口 log
+        # 输入 token 总数，逼近 4096 时 WARNING、超过 ERROR（让用户立刻
+        # 看到是 prompt 而不是 C-level 引起的 stall）。
+        try:
+            tokenizer = getattr(getattr(sess, "_backend", None), "tokenizer", None)
+            spec = getattr(getattr(sess, "_backend", None), "spec", None)
+            if tokenizer is not None and spec is not None:
+                user_t = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+                img_size = getattr(spec, "image_size", 384) or 384
+                img_tokens = (img_size // 14) ** 2 + 6  # patches + start/end/pad
+                # 估算 SDK wrapping：system + chatml overhead + JSON schema hint
+                overhead = 12 + 80 + 150
+                total_in = user_t + img_tokens + overhead
+                budget = getattr(spec, "max_context_len", 4096)
+                gen_out = max_new_tokens or 300
+                total = total_in + gen_out
+                if total_in > budget:
+                    LOG.error(
+                        "vfa: _call_llm INPUT 超过 model context：%d tokens > %d "
+                        "（user=%d + image=%d + overhead=%d；image_size=%d, "
+                        "max_new_tokens=%d）→ 必然触发 rknn3 prefill 阶段长挂",
+                        total_in, budget, user_t, img_tokens, overhead,
+                        img_size, gen_out,
+                    )
+                elif total_in > budget * 0.8:
+                    LOG.warning(
+                        "vfa: _call_llm INPUT 逼近 context 上限：%d / %d tokens "
+                        "（user=%d + image=%d + overhead=%d；image_size=%d）",
+                        total_in, budget, user_t, img_tokens, overhead, img_size,
+                    )
+                else:
+                    LOG.debug(
+                        "vfa: _call_llm tokens: in=%d (%d user + %d image + %d overhead) "
+                        "+ out=%d = total %d / %d",
+                        total_in, user_t, img_tokens, overhead, gen_out, total, budget,
+                    )
+        except Exception as diag_ex:
+            LOG.debug("vfa: prompt token 诊断失败（忽略）: %s", diag_ex)
 
         ok, Attachment, wdnai_err = _load_wdnai()
         if not ok:
@@ -2274,8 +2671,14 @@ class VideoFileAnalysisService:
                 # 重要：在线程隔离的新 event loop 里跑 SDK coroutine。
                 # 用 `asyncio.run` 在 worker thread 里偶发死锁（与 main loop
                 # 共享 thread 池资源），改用独立 Thread + new_event_loop。
-                # 加 30s timeout 防 SDK 永久 hang（rknn3lite 偶发 bug
-                # 或 NPU 满载时会等无穷）。
+                # 加 _INFER_TIMEOUT_SEC timeout 防 SDK 永久 hang（rknn3lite
+                # 偶发 bug 或 NPU 满载时会等无穷）。
+                #
+                # v0.10：30s → 60s。Apollo 三段式综述最后一步（final summary）
+                # 把所有 chunk 小结拼起来再调一次 LLM：1829-frame 视频通常 10
+                # 个 chunk，每段 ≤120 字 + 模板 ≈ 2500 字 prompt + 400
+                # 新 token 输出。RK3588 qwen3-vl-4b 实测这一调用 ~25-30s，
+                # 30s 阈值被贴着边缘，任何 prompt 略长或 NPU 短暂忙就破。
                 result_holder = [None]
                 error_holder = [None]
                 finished = [False]
@@ -2284,7 +2687,7 @@ class VideoFileAnalysisService:
                     loop = asyncio.new_event_loop()
                     try:
                         result_holder[0] = loop.run_until_complete(
-                            asyncio.wait_for(coro, timeout=30.0)
+                            asyncio.wait_for(coro, timeout=_INFER_TIMEOUT_SEC)
                         )
                     except asyncio.TimeoutError:
                         error_holder[0] = "timeout"
@@ -2299,26 +2702,47 @@ class VideoFileAnalysisService:
 
                 t = threading.Thread(target=_runner, daemon=True)
                 t.start()
-                t.join(timeout=35.0)
+                # join 留 5s 余量覆盖 asyncio.wait_for 拆 + runner 收尾
+                t.join(timeout=_INFER_TIMEOUT_SEC + 5.0)
 
                 # 防呆：超时/异常路径返回安全的 error string 而非 None
                 # （下游 text.startswith("(") 会 NoneType 崩溃）
                 if not finished[0]:
-                    LOG.warning("vfa: _call_llm thread 35s 内未完成（可能 SDK 卡死）")
-                    return f"(推理失败：超时 35s SDK 未响应)"
+                    LOG.warning("vfa: _call_llm thread %.0fs 内未完成（SDK 卡死）",
+                                _INFER_TIMEOUT_SEC + 5.0)
+                    _interrupt_rknn_session(sess, wait_sec=5.0)
+                    self._on_call_timeout()
+                    return f"(推理失败：超时 {_INFER_TIMEOUT_SEC:.0f}s SDK 未响应)"
                 if error_holder[0] == "timeout":
-                    LOG.warning("vfa: LLM 推理超时（30s），可能 NPU 满载或 prompt 过长")
-                    return f"(推理超时：30s 内 LLM 未响应)"
+                    LOG.warning("vfa: LLM 推理超时（%.0fs），可能 NPU 满载或 prompt 过长",
+                                _INFER_TIMEOUT_SEC)
+                    # 关键：asyncio.wait_for 只取消 Python 协程，C 层
+                    # rknn3.session_run() 还在 NPU 上跑（无人在等它返回）。
+                    # 不显式 session_stop() + 等待，下次 sess.reset() → clear_kvcache()
+                    # 会阻塞等 C 层跑完（RK3588 实测 5-30s），连锁卡死后续每个
+                    # chunk。计算 worker 已用同款模式（compute_worker.py
+                    # embed_video handler:611-619）。
+                    #
+                    # session_stop() 是 async signal，C 层在 kernel 间
+                    # 协作点检查 → 实际释放可能花数秒（长 prompt prefill /
+                    # generation 跑到一半）。这里 sync 等待最多 5s 让 C 层
+                    # 处理 stop 信号并实际让出 NPU mutex，下次 reset() 不阻塞。
+                    _interrupt_rknn_session(sess, wait_sec=5.0)
+                    self._on_call_timeout()
+                    return f"(推理超时：{_INFER_TIMEOUT_SEC:.0f}s 内 LLM 未响应)"
                 if error_holder[0] is not None:
                     # 关键：不要 raise！否则 _run_summary 异常退出，
                     # state 卡在 STATE_RUNNING，前端永远显"分析中"。
                     # 改成返回 error string，_run_summary 会进入 fallback
                     # 路径（startswith("(")），下游 graceful 处理。
                     LOG.warning("vfa: _call_llm 异常: %s", error_holder[0])
+                    self._reset_timeout_counter()
                     return f"(推理失败：{error_holder[0]})"
                 if result_holder[0] is None:
+                    self._reset_timeout_counter()
                     return f"(推理失败：返回为空)"
                 result = result_holder[0]
+                self._reset_timeout_counter()
         except Exception as e:
             # pydantic.ValidationError：SDK 拿到了 JSON 但字段对不上
             # SceneFrame（如模型输出 {"analysis":"..."} 缺 scene/actors 等字段）。
@@ -2349,7 +2773,86 @@ class VideoFileAnalysisService:
                 "vfa: LLM 期望 SceneFrame 但拿到 str（JSON 解析失败？），前 80 字符: %s",
                 sample,
             )
+
+        # 兼容 RpcSessionProxy 包装：worker 把推理结果序列化成 dict，
+        # 主进程 ``_RpcSessionProxy.respond`` 统一包成 ``_ProxyResult``
+        # （rpc_session_proxy.py:301-309）。_ProxyResult 不是 str/dict，
+        # 但 ``.text`` 字段等同 ``sess.respond()`` 的 str 返回、
+        # ``._raw`` 字段是 worker 发回的完整 JSON dict（含 scene /
+        # actors / action / objects / text 等 SceneFrame 字段）。
+        #
+        # 不归一化的话，``_run_summary`` 拿 ``text.startswith("(")``
+        # / ``_rescue_structured_batch`` 拿 ``raw.startswith("(")`` 都
+        # 会 AttributeError；``_infer_one`` → ``_split_scene_frame_result``
+        # 走 Path 5 兜底返回 ``(None, _ProxyResult)``，上游同样崩。
+        # ``audio_analysis.py:385-395`` 已用同款模式。
+        if generating is None:
+            if not isinstance(result, str):
+                text_attr = getattr(result, "text", None)
+                if isinstance(text_attr, str):
+                    result = text_attr
+                else:
+                    result = str(result)
+        else:
+            if not isinstance(result, (dict, str)):
+                raw = getattr(result, "_raw", None)
+                if isinstance(raw, dict) and raw:
+                    result = raw
+                else:
+                    # _raw 缺失（老 worker / fallback 路径）—— 用顶层字段
+                    # 拼个最小 dict，让 _split_scene_frame_result Path 2
+                    # 接管；缺 scene/actors 等字段时由 _normalize_structured
+                    # 走智能归一化兜底。
+                    text_attr = getattr(result, "text", None)
+                    if isinstance(text_attr, str):
+                        result = {"text": text_attr}
         return result
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _interrupt_rknn_session(sess, *, wait_sec: float = 2.0) -> None:
+    """向 rknn3 发送 session_stop() 中断当前阻塞的 session_run 并等待 C 层实际释放。
+
+    asyncio.wait_for / t.join 超时只取消 Python 协程，**不**中断 C 层
+    rknn3.session_run()；NPU 满载或 SDK 卡死时，C 层会在后台持续占用
+    RKNN session，导致下一次 ``sess.reset()`` 调 ``clear_kvcache()`` 时
+    阻塞等 C 层跑完（数十秒～数分钟），连锁卡死后续每个 chunk。
+
+    这里主动 session_stop() 让 C 层几百 ms 内主动退出，session 进入
+    可用态。LLMSession + VLM/Text/TTS backend 都有 ``_backend.rknn_llm``
+    句柄可调 session_stop()；TTS backend 略有不同（``_backend.talker``）
+    —— 当前 VFA 路径只用 VLM/text backend，这一处覆盖足够。
+
+    **v0.10 新增 wait_sec**：session_stop() 是 async signal（不是
+    force-kill），C 层只在 kernel 边界检查 stop 标志。RK3588 qwen3-vl-4b
+    实测：长 prompt prefill 跑到一半时收到 stop，要等当前 kernel 跑完、
+    下一个协作点才发现 flag → 实际释放花 1-5s。如果不等待直接 return，
+    下次 ``sess.reset()`` 在 C 层 mutex 未释放时调 clear_kvcache() 就会
+    阻塞 → 用户看到"卡住"现象（这是用户报告的 §v0.10 残留 bug）。
+    实测最大 5s 已覆盖大部分边界，更长说明 C 层真正 wedged，需要
+    worker 重启（已超出本函数能力）。
+
+    调用方需仍在 ``with lock`` 内，避免下一轮 ``sess.reset()`` 在
+    C 层 abort 完成前抢跑。
+    """
+    backend = getattr(sess, "_backend", None)
+    if backend is None:
+        return
+    rknn_llm = getattr(backend, "rknn_llm", None)
+    if rknn_llm is None:
+        return
+    try:
+        rknn_llm.session_stop()
+    except Exception as ex:
+        # session_stop() 内部可能因 driver 状态异常抛错；不影响主路径
+        LOG.warning("vfa: session_stop() 异常（继续）: %s", ex)
+    if wait_sec > 0:
+        # 同步等待：C 层在 kernel 间检查 stop flag 并让出 NPU mutex。
+        # Python 端 sleep（C 线程不阻塞），sleep 期间主线程可以处理
+        # 其他事件；上限 wait_sec 防止极端 wedged 情况无限等。
+        time.sleep(wait_sec)
 
 
 # --------------------------------------------------------------------------- #
