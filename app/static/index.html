@@ -521,6 +521,14 @@
             </header>
 
             <div class="imb-card-body imb-card-body--chat">
+              <div class="imb-bridge-row">
+                <label class="imb-bridge-label" for="imb-llm-bridge">
+                  <input type="checkbox" id="imb-llm-bridge" />
+                  对接文字对话模型
+                </label>
+                <span class="imb-bridge-hint" id="imb-llm-bridge-hint"></span>
+              </div>
+
               <div class="imb-conv">
                 <div class="imb-conv-title" id="imb-conv-title">消息记录</div>
                 <div class="imb-conv-list" id="imb-conv-list">
@@ -539,6 +547,7 @@
                 <div class="imb-composer-actions">
                   <button class="vd-btn" id="imb-send-btn"  type="button" disabled>发送</button>
                   <button class="vd-btn" id="imb-clear-btn" type="button">清屏</button>
+                  <button class="vd-btn" id="imb-history-btn" type="button">历史</button>
                   <span class="imb-status-inline" id="imb-chat-status"></span>
                 </div>
               </div>

@@ -47,6 +47,10 @@ class _WechatManager:
         # Subscribe to inbound messages so we can push them to WS clients.
         self._wechat.register_message_handler(self._handle_incoming)
 
+        # 微信 → 文本对话模型 桥接（开关关闭时零开销）
+        from app.services.wechat_llm import get_llm_bridge
+        self._llm_bridge = get_llm_bridge()
+
         self._subs_lock = threading.Lock()
         self._subs: list[asyncio.Queue] = []
 
@@ -118,6 +122,7 @@ class _WechatManager:
             "error": ls["error"],
             "known_users": self._wechat.known_users(),
             "recent_messages": self._wechat.recent_messages(limit=50),
+            "llm_bridge": self._llm_bridge.snapshot(),
         }
 
     def known_users(self) -> list[str]:
@@ -150,9 +155,20 @@ class _WechatManager:
         self._wechat.send_text(user_id, text)
         self._push_state_diff()
 
+    def set_llm_bridge(self, enabled: bool) -> dict:
+        """开/关微信文字对话桥接。未启用 LLM 时开启抛 RuntimeError。"""
+        snap = self._llm_bridge.set_enabled(enabled)
+        self._push_state_diff()
+        return snap
+
     # ------------------------------------------------------------- events
     def _handle_incoming(self, msg: Any) -> None:
         """Called from the wechat-bot loop thread for each user message."""
+        # 若开关开启，先把文字消息转给 LLM 桥接（自动回复）。
+        try:
+            self._llm_bridge.handle_incoming(msg)
+        except Exception as exc:  # noqa: BLE001
+            _wechat_log(f"llm bridge handle_incoming failed: {exc!r}")
         # ``recent_messages`` is now one item longer; the diff logic in
         # ``_push_state_diff`` will detect that and forward the tail to
         # subscribers. We still call it directly so the user sees the
@@ -224,6 +240,10 @@ class _WechatManager:
             self._poller_thread.join(timeout=2.0)
         with self._subs_lock:
             self._subs.clear()
+        try:
+            self._llm_bridge.close()
+        except Exception as exc:  # noqa: BLE001
+            _wechat_log(f"llm bridge close error: {exc!r}")
         try:
             self._wechat.close()
         except Exception as exc:  # noqa: BLE001

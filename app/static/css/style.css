@@ -3728,7 +3728,13 @@ html, body {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
   display: flex;
   flex-direction: column;
+  height: calc(100vh - 220px);
   min-height: 480px;
+}
+
+/* 登录卡内容固定（凭证 + 二维码 + 按钮），不随 grid 拉伸而变高 */
+.imb-card--login {
+  height: calc(100vh - 220px);
 }
 
 .imb-card-head {
@@ -3875,10 +3881,11 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  /* Push the composer to the bottom of the card and let the message
-   * list absorb whatever vertical space is left. */
-  min-height: 540px;
-  max-height: calc(100vh - 220px);
+  /* Fill the card below the head; flex chain lets the message list
+   * absorb remaining space and scroll instead of stretching the card. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
 }
 .imb-label {
   font-size: 12px;
@@ -3912,6 +3919,42 @@ html, body {
   color: var(--muted);
 }
 
+/* ---------- LLM bridge toggle row (top of the chat card) ---------- */
+.imb-bridge-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 2px 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.imb-bridge-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  color: #111827;
+}
+.imb-bridge-label input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+.imb-bridge-label input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.imb-bridge-hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+.imb-bridge-hint.danger {
+  color: #b91c1c;
+}
+
 /* ---------- conversation list (top half of the chat card) ---------- */
 .imb-conv {
   display: flex;
@@ -3930,12 +3973,12 @@ html, body {
 }
 .imb-conv-list {
   flex: 1 1 auto;
+  min-height: 320px; /* reasonable floor; normally flex fills remaining card space */
   overflow-y: auto;
   background: #f9fafb;
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 8px;
-  min-height: 240px;
 }
 .imb-conv-ul {
   list-style: none;

@@ -176,6 +176,35 @@ class _RpcSessionProxy:
                       self._model_id, e)
         return self._client.call(payload, timeout_ms=timeout_ms)
 
+    # Max consecutive chat_poll timeouts before we give up. A single
+    # timeout is usually transient (worker pump starved of the GIL while
+    # _chat_run_loop holds it during backend.run), so we retry a few
+    # times before surfacing an error.
+    _POLL_RETRY = 3
+    _POLL_RETRY_SLEEP = 0.5
+
+    def _call_poll_with_retry(self, offset: int) -> dict:
+        """chat_poll with bounded retry on transient timeout + self-heal.
+
+        Each attempt goes through ``_call_with_recreate`` so a wedged
+        cshim requester is destroyed + recreated instead of failing
+        forever. Only repeated consecutive timeouts are surfaced as an
+        error; real worker errors (``ok:false`` non-timeout) return
+        immediately.
+        """
+        last = {"ok": False, "error": "unknown"}
+        for _ in range(self._POLL_RETRY):
+            poll = self._call_with_recreate(
+                {"action": "chat_poll", "offset": offset}, timeout_ms=5_000)
+            if poll.get("ok"):
+                return poll
+            err = str(poll.get("error", "")).lower()
+            if "timeout" not in err and "no data" not in err and "send failed" not in err:
+                return poll
+            last = poll
+            time.sleep(self._POLL_RETRY_SLEEP)
+        return last
+
     @property
     def model_id(self) -> str:
         return self._model_id
@@ -215,7 +244,7 @@ class _RpcSessionProxy:
             "context_limit": int(context_limit or 0),
             "max_new_tokens": int(max_new_tokens or 2048),
         }
-        reply = self._client.call(payload, timeout_ms=10_000)
+        reply = self._call_with_recreate(payload, timeout_ms=10_000)
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
             raise RuntimeError(
@@ -234,8 +263,11 @@ class _RpcSessionProxy:
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"compute_worker[{self._model_id}] chat_run timed out")
-            poll = self._client.call(
-                {"action": "chat_poll", "offset": offset}, timeout_ms=5_000)
+            # chat_poll 走 _call_with_recreate（requester wedged 时自动
+            # destroy+recreate+warmup+retry），并对瞬时 timeout 做有限重试。
+            # worker 端 _chat_run_loop 的 backend.run 推理会持 GIL，阻塞 pump
+            # 线程响应 chat_poll；GIL 阻塞是瞬时的，重试几次通常能恢复。
+            poll = self._call_poll_with_retry(offset)
             if not poll.get("ok"):
                 raise RuntimeError(
                     f"compute_worker[{self._model_id}] chat_poll failed: "

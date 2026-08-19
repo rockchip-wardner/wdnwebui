@@ -45,6 +45,11 @@ class SendPayload(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
 
 
+class LlmBridgePayload(BaseModel):
+    model_config = {"extra": "ignore"}
+    enabled: bool = False
+
+
 # --------------------------------------------------------------------- #
 # REST
 # --------------------------------------------------------------------- #
@@ -90,6 +95,12 @@ async def post_wechat_send(payload: SendPayload) -> dict:
     text = payload.text
     if not user_id or not text:
         raise HTTPException(status_code=400, detail="user_id / text 不能为空")
+    # 开关开启时禁止手动"插话"，避免手动消息未进模型上下文造成上下文错乱。
+    if get_wechat()._llm_bridge.enabled():
+        raise HTTPException(
+            status_code=409,
+            detail="对接文字对话模型已开启，手动发送已禁用",
+        )
     try:
         get_wechat().send_text(user_id, text)
     except Exception as exc:  # noqa: BLE001
@@ -107,6 +118,21 @@ async def post_wechat_send(payload: SendPayload) -> dict:
             ) from exc
         raise HTTPException(status_code=502, detail=f"send failed: {exc}") from exc
     return {"ok": True}
+
+
+@router.post("/wechat/llm-bridge")
+async def post_wechat_llm_bridge(payload: LlmBridgePayload) -> dict:
+    """开/关微信文字对话模型桥接。
+
+    开启时 qwen3-8b 必须已加载（``available``）；否则 409。开启后手动
+    发送会被 ``/wechat/send`` 拒绝。开关不持久化（内存态，重启即关）。
+    """
+    mgr = get_wechat()
+    try:
+        bridge_snap = mgr.set_llm_bridge(payload.enabled)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"ok": True, "snapshot": mgr.snapshot(), "llm_bridge": bridge_snap}
 
 
 # --------------------------------------------------------------------- #

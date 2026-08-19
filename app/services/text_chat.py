@@ -294,14 +294,16 @@ class _TextChatManager:
         # 6. RPC 推理（worker 端裁剪 + 跑；主进程轮询拉增量）
         t0 = time.perf_counter()
         try:
-            result = session.chat_run(
-                history=history_snapshot,
-                text=req.text,
-                context_limit=context_limit,
-                max_new_tokens=self.MAX_NEW_TOKENS,
-                on_delta=lambda d: router.push(d),
-                stop_event=self._worker_stop_event,
-            )
+            from app.services.chat_serial import get_chat_run_lock
+            with get_chat_run_lock():
+                result = session.chat_run(
+                    history=history_snapshot,
+                    text=req.text,
+                    context_limit=context_limit,
+                    max_new_tokens=self.MAX_NEW_TOKENS,
+                    on_delta=lambda d: router.push(d),
+                    stop_event=self._worker_stop_event,
+                )
             elapsed = time.perf_counter() - t0
         except Exception as e:  # noqa: BLE001
             with self._lock:

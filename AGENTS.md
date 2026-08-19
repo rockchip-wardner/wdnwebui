@@ -1685,6 +1685,57 @@ asyncio loop），不是直接 `await` SDK。`wechatbot-sdk` 是 wdnwebui
   内部走 `MAX_QR_REFRESH_COUNT=3` 轮后抛 `AuthError`，wrapper 把
   `login_state` 切到 `error`，UI 看到红色徽章 + 点 登录 重试。
 
+## 微信对接文字对话模型（LLM Bridge）
+
+im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模型」开关。开启后
+微信用户发来的**文字**消息自动进入桥接队列 → 调 `swcap_text_chat`
+（qwen3-8b）推理 → 把回答（只回 answer，不含 thinking）通过
+`Wechat.send_text` 发回给该微信用户，实现微信上的多轮文本对话。
+
+* **Service** (`app/services/wechat_llm.py`)：
+  - `_LlmBridge` 单例（`get_llm_bridge()`），由 `_WechatManager` 持有并
+    在 `_handle_incoming` 里转发 `handle_incoming(msg)`。
+  - **开关内存态**：`_enabled` 不落盘（重启即关）。`available()` 通过
+    `get_registry().get_session("swcap_text_chat")` 判断 qwen3-8b 是否
+    已加载；未加载时 `set_enabled(True)` 抛 `RuntimeError`（前端置灰 +
+    后端 409 双层防护）。
+  - **per-user 上下文隔离**：`histories: dict[user_id, deque(maxlen=200)]`
+    各自独立，与 web 文本对话的全局历史完全无关；服务重启即清空。
+  - **串行保证**：桥接 worker 线程串行消费 `queue.Queue`；`chat_run` 用
+    `chat_serial.get_chat_run_lock()`（进程级 `RLock`）与 text_chat worker
+    互斥 —— 同一时刻只有一个 `chat_run` 发往 worker，避免并发轮询/停止
+    冲突。`text_chat._run_one` 的 `chat_run` 同样包这把锁。
+  - **裁剪在 worker 端**：主进程只透传 `history`，`compute_worker`
+    `_chat_run_loop` 用真实 tokenizer 裁剪 + 拼 ChatML；主进程拿回完整
+    `text` 后用 `chat_runner.split_thinking` 切掉思考段再发微信。
+  - **发送复用 `wechat_bot`**：回复走 `Wechat.send_text`，自动出现在
+    "调试收发"消息列表（out 方向），与手动发送共用同一发送通道、线程安全。
+
+* **与调试收发的关系**：两者数据流正交、可共存。用户消息（in）和 LLM
+  自动回复（out）都显示在调试收发列表。**开关开启时手动发送被禁止**：
+  - 前端：`imb-send-btn` 固定置灰（输入框仍可输入）；
+  - 后端：`POST /api/wechat/send` 在 `llm_bridge.enabled == true` 时返回
+    409「对接文字对话模型已开启，手动发送已禁用」。
+  语义：开启时消息流完全交给「用户微信消息 → LLM → 自动回复」闭环，避免
+  手动消息未进模型上下文造成上下文错乱。
+
+* **API**（`app/api/wechat.py`）：
+  - `POST /api/wechat/llm-bridge` `{enabled}` —— 开/关桥接；未加载 LLM 时
+    开启 → 409；返回 `{ok, snapshot, llm_bridge}`。
+  - `GET /api/wechat` snapshot 增加 `llm_bridge: {enabled, available,
+    busy, active_sessions}`（`available` 供前端置灰）。
+
+* **前端**（`app/static/index.html` + `app.js` `ImBridge`）：
+  - 调试收发卡片顶部一行：checkbox + 提示。`available=false` → checkbox
+    disabled + 红字提示「文本对话模型未启用，请在算力配置页加载 qwen3-8b」；
+    `enabled` + `busy` → 「已对接，生成中…」。
+  - `_toggleLlmBridge` 调 `POST /api/wechat/llm-bridge`；409 时 revert +
+    提示。`send()` 顶部也兜底拦截（按钮已置灰，防 Cmd+Enter 绕过）。
+
+* **限制**：LLM 单实例串行，多人同时发需排队（每条推理约 40-60s）；只发
+  answer 不发 thinking；非文字消息（图/音/文件）回复「当前仅支持文字对话」。
+
+
 
 
 ## FastDDS discovery — SIMPLE multicast (v0.6+)

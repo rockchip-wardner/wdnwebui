@@ -6127,6 +6127,7 @@ const ImBridge = {
   wsTimer: null,
   snapshot: null,
   messages: [],          // most recent first (in + out mixed)
+  chatCleared: false,    // true after 清屏: don't re-fill from backend on page re-entry
 
   init() {
     const $ = (id) => document.getElementById(id);
@@ -6135,6 +6136,10 @@ const ImBridge = {
     $("imb-logout-btn")?.addEventListener("click", () => this.logout());
     $("imb-send-btn")?.addEventListener("click", () => this.send());
     $("imb-clear-btn")?.addEventListener("click", () => this.clearChat());
+    $("imb-history-btn")?.addEventListener("click", () => this.showHistory());
+    $("imb-llm-bridge")?.addEventListener("change", (e) => {
+      this._toggleLlmBridge(e.target.checked);
+    });
     $("imb-text-input")?.addEventListener("keydown", (e) => {
       // Cmd/Ctrl + Enter sends; plain Enter inserts a newline.
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -6240,6 +6245,7 @@ const ImBridge = {
       this._renderState();
       this._renderButtons();
       this._renderQr();
+      this._renderLlmBridge();
       return;
     }
     if (msg.type === "message") {
@@ -6253,12 +6259,18 @@ const ImBridge = {
   _applySnapshot(snap) {
     if (!snap) return;
     this.snapshot = snap;
-    this.messages = Array.isArray(snap.recent_messages) ? snap.recent_messages.slice() : [];
+    // Only (re)fill from the backend's recent_messages if the user hasn't
+    // cleared the view. After 清屏, keep the cleared state across page
+    // switches (until re-login); new incoming messages still append.
+    if (!this.chatCleared) {
+      this.messages = Array.isArray(snap.recent_messages) ? snap.recent_messages.slice() : [];
+    }
     this._renderState();
     this._renderButtons();
     this._renderQr();
     this._renderKnown();
     this._renderChat();
+    this._renderLlmBridge();
   },
 
   _renderState() {
@@ -6316,8 +6328,63 @@ const ImBridge = {
     if (loginBtn) loginBtn.disabled = loggedIn || active;
     if (cancelBtn) cancelBtn.disabled = !active;
     if (logoutBtn) logoutBtn.disabled = !loggedIn && state !== "error";
-    if (sendBtn) sendBtn.disabled = !loggedIn;
+    const bridge = (s.llm_bridge && s.llm_bridge.enabled) || false;
+    if (sendBtn) sendBtn.disabled = !loggedIn || bridge;
     if (textInput) textInput.disabled = !loggedIn;
+  },
+
+  _renderLlmBridge() {
+    const s = this.snapshot || {};
+    const b = (s.llm_bridge) || {};
+    const cb = document.getElementById("imb-llm-bridge");
+    const hint = document.getElementById("imb-llm-bridge-hint");
+    if (!cb) return;
+
+    const enabled = !!b.enabled;
+    const available = b.available !== false;
+
+    cb.checked = enabled;
+    cb.disabled = !available;
+
+    if (hint) {
+      if (!available) {
+        hint.textContent = "文本对话模型未启用，请在算力配置页加载 qwen3-8b";
+        hint.className = "imb-bridge-hint danger";
+      } else if (enabled) {
+        hint.textContent = b.busy ? "已对接，生成中…" : "已对接，微信消息将自动回复";
+        hint.className = "imb-bridge-hint";
+      } else {
+        hint.textContent = "";
+        hint.className = "imb-bridge-hint";
+      }
+    }
+  },
+
+  async _toggleLlmBridge(checked) {
+    const cb = document.getElementById("imb-llm-bridge");
+    const hint = document.getElementById("imb-llm-bridge-hint");
+    if (cb) cb.disabled = true;
+    if (hint) hint.textContent = "处理中…";
+    try {
+      const r = await fetch(API_PREFIX + "/wechat/llm-bridge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: checked }),
+      });
+      if (!r.ok) {
+        let detail = "HTTP " + r.status;
+        try { detail = (await r.json()).detail || detail; } catch (_) {}
+        throw new Error(detail);
+      }
+      const data = await r.json();
+      if (data.snapshot) this._applySnapshot(data.snapshot);
+      else this._renderLlmBridge();
+      this._setChatStatus(checked ? "已开启文字对话模型对接" : "已关闭文字对话模型对接");
+    } catch (err) {
+      if (cb) cb.checked = !checked;   // revert
+      this._renderLlmBridge();
+      this._setChatStatus("操作失败: " + err.message, true);
+    }
   },
 
   _renderQr() {
@@ -6437,7 +6504,9 @@ const ImBridge = {
     // Show all messages (any user) — the sender is locked to the bot's
     // own user_id, so almost everything will be to/from that account;
     // a real user messaging the bot will still surface here.
-    const rows = this.messages.map((m) => {
+    // ``this.messages`` is newest-first (``_recordMessage`` unshifts),
+    // so reverse to render oldest-at-top / newest-at-bottom (chat flow).
+    const rows = this.messages.slice().reverse().map((m) => {
       const dir = m.direction === "out" ? "out" : "in";
       const errTag = m.error ? `<span class="imb-msg-error">[${this._esc(m.error)}]</span>` : "";
       const time = m.ts ? this._fmtTime(m.ts_ms) : "";
@@ -6453,7 +6522,28 @@ const ImBridge = {
       return self ? `消息记录（发送目标：${this._esc(self)}）` : "消息记录";
     })();
     title.textContent = header;
+    // Capture scroll position before rebuilding (innerHTML reset resets it);
+    // pass it so the smart-follow can restore it when not near the bottom.
+    const prevScrollTop = list.scrollTop;
     list.innerHTML = `<ul class="imb-conv-ul">${rows.join("")}</ul>`;
+    this._scrollChatToBottomIfNear(list, prevScrollTop);
+  },
+
+  // Threshold (px) below the bottom: if the user is scrolled within this
+  // distance of the bottom, keep auto-following new messages down. If they
+  // scrolled up to read history, don't yank the view back down.
+  _CHAT_BOTTOM_TOLERANCE: 40,
+
+  _scrollChatToBottomIfNear(list, prevScrollTop) {
+    if (!list) return;
+    const nearBottom =
+      list.scrollHeight - list.scrollTop - list.clientHeight <=
+      this._CHAT_BOTTOM_TOLERANCE;
+    if (nearBottom) {
+      list.scrollTop = list.scrollHeight;
+    } else if (typeof prevScrollTop === "number") {
+      list.scrollTop = prevScrollTop;
+    }
   },
 
   refreshChat() {
@@ -6462,7 +6552,27 @@ const ImBridge = {
 
   clearChat() {
     this.messages = [];
+    this.chatCleared = true;
     this._renderChat();
+  },
+
+  showHistory() {
+    // Restore the full recent history. chatCleared=false so the backend
+    // snapshot (freshly fetched) fills this.messages again.
+    this.chatCleared = false;
+    this._refreshHistory();
+  },
+
+  async _refreshHistory() {
+    try {
+      const r = await fetch(API_PREFIX + "/wechat");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const snap = await r.json();
+      // chatCleared is now false, so _applySnapshot fills from backend.
+      this._applySnapshot(snap);
+    } catch (err) {
+      this._setChatStatus("加载历史失败: " + err.message, true);
+    }
   },
 
   _setChatStatus(text, danger) {
@@ -6484,7 +6594,11 @@ const ImBridge = {
       });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const data = await r.json();
-      if (data.snapshot) this._applySnapshot(data.snapshot);
+      // Re-login: reset the cleared-view flag so the new session shows history.
+      if (data.snapshot) {
+        this.chatCleared = false;
+        this._applySnapshot(data.snapshot);
+      }
       this._setChatStatus("");
     } catch (err) {
       this._setChatStatus("登录失败: " + err.message, true);
@@ -6511,6 +6625,8 @@ const ImBridge = {
       const r = await fetch(API_PREFIX + "/wechat/logout", { method: "POST" });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const data = await r.json();
+      // Logout resets the cleared-view flag; a fresh login will re-show history.
+      this.chatCleared = false;
       if (data.snapshot) this._applySnapshot(data.snapshot);
       else await this.load();
       this._setChatStatus("已退出登录");
@@ -6522,6 +6638,11 @@ const ImBridge = {
   async send() {
     const textEl = document.getElementById("imb-text-input");
     if (!textEl) return;
+    // 开关开启时禁止手动"插话"（与后端一致；按钮已置灰，此处兜底键盘触发）
+    if (this.snapshot && this.snapshot.llm_bridge && this.snapshot.llm_bridge.enabled) {
+      this._setChatStatus("对接文字对话模型已开启，手动发送已禁用", true);
+      return;
+    }
     // The receiver is locked to the bot's own user_id — the dialog
     // exists to verify the SDK's round-trip, not to message arbitrary
     // users. We accept whatever the backend has for ``user_id``; the
