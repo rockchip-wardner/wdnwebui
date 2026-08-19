@@ -1104,6 +1104,7 @@ class ComputeRegistry:
         """
         if model_id not in MODEL_PRESETS:
             raise ValueError(f"未知 model: {model_id!r}")
+        preset = MODEL_PRESETS[model_id]
         # 1. 进程级 dedup：扫 /proc 同 comm 名的 worker（取代旧 cmdline substring 匹配）
         orphan_pids = _find_workers_by_name(model_id)
         if orphan_pids:
@@ -1114,7 +1115,31 @@ class ComputeRegistry:
             adopted = self._adopt_existing_worker(model_id)
             if adopted is not None:
                 return adopted
-            # adopt 失败（probe 超时等）降级到 spawn，避免完全阻塞启用流程
+            # adopt 失败 —— 但孤儿 PID 还在 /proc 里活着，绝对不能
+            # 再 spawn 一个 sibling 把 NPU 显存吃双份（旧版 fall-through
+            # 这个 bug 至少在 v0.8 就有，参见 _probe_service 注释）。
+            # 返回 errored inst 让 UI 走红色 banner 路径，用户可以选
+            # 重启服务（会先 SIGTERM 孤儿再 spawn）或手动 ``kill <pid>``。
+            err_inst = ModelInstance(
+                key=(-1, model_id),
+                npu_index=-1,
+                model_id=model_id,
+                capability_types=list(preset["capability_types"]),
+                instance_name=preset["instance_name"],
+                label=preset["label"],
+                memory_estimate_mb=preset["memory_estimate_mb"],
+                status="error",
+                started_at=time.time(),
+                _source="spawned",
+            )
+            err_inst.error = (
+                f"发现 {len(orphan_pids)} 个现存的 {model_id} worker "
+                f"(pid={orphan_pids}) 但 dds rpc 全部探测失败 —— "
+                f"无法接管。请刷新页面或重启服务（前者会 SIGTERM 孤儿 + spawn，"
+                f"后者手动 kill {orphan_pids[0]} 后再启用）"
+            )
+            self._register_errored_instance(err_inst)
+            return err_inst
         # 2. 让 ensure_worker_for_model 阶段不重复进入
         with self._lock:
             for inst in self._instances.values():
@@ -1733,34 +1758,76 @@ class ComputeRegistry:
     def _probe_service(self, model_id: str) -> Optional[dict]:
         """Short-timeout RPC ``info`` probe on ``wdndds/rpc/<model_id>``.
 
-        Returns the worker's info dict if a worker responds within
-        ~1.5s, else ``None``. Used by ``_adopt_existing_worker`` to
+        Returns the worker's info dict on success, ``None`` after all
+        attempts are exhausted. Used by ``_adopt_existing_worker`` to
         avoid spawning duplicate processes when a peer (or a stale
-        orphan from a previous boot) is already providing the
-        service on the LAN.
+        orphan from a previous boot) is already providing the service
+        on the LAN.
+
+        **首次调用 race 兜底**：cshim client 在 daemon 刚握手 / endpoint
+        还没匹配时，第一次 ``RpcClient.call()`` 会 timeout（约 5s），
+        第二次就成功。所以这里走 3 次尝试 × 5s timeout + 1s 间隔：
+        第 1 次内若 endpoint 已匹配就直接返；不匹配就睡 1s 再试，
+        覆盖 daemon 重启 + cshim 重新握手这条链路。
+
+        旧版单次 1500ms timeout 的实现在 web 进程 reload 场景下会因
+        race 全 timeout，触发后续 fallback ``_spawn_compute_worker``，
+        在已经加载好模型的 NPU 上又 spawn 一个 worker 吃双份显存。
+        3 次 × 5s 上限 ~16s 总耗时，boot 阶段可接受。
+
+        Returns:
+            dict  on success (the worker's ``info_handler`` payload);
+            ``None`` when all retries are exhausted (worker is dead
+            OR hub unavailable OR RPC channel truly broken).
         """
         if self._hub is None:
             return None
-        try:
-            svc = self._hub.create_service(f"wdndds/rpc/{model_id}")
-            rpc = svc.create_requester(timeout_ms=1500)
-        except Exception as e:  # noqa: BLE001
-            LOG.debug("probe: create requester failed for %s: %s",
-                      model_id, e)
-            return None
-        try:
-            r = rpc.call({"action": "info"}, timeout_ms=1500)
-        except Exception as e:  # noqa: BLE001
-            LOG.debug("probe: call failed for %s: %s", model_id, e)
-            return None
-        finally:
+        attempts = 3
+        timeout_ms = 5000
+        sleep_between = 1.0
+        for attempt in range(1, attempts + 1):
             try:
-                rpc.destroy()
-            except Exception:
-                pass
-        if not r or not r.get("ok"):
-            return None
-        return r.get("data") or {}
+                svc = self._hub.create_service(f"wdndds/rpc/{model_id}")
+                rpc = svc.create_requester(timeout_ms=timeout_ms)
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("probe: create requester failed for %s "
+                          "(attempt %d/%d): %s",
+                          model_id, attempt, attempts, e)
+                if attempt < attempts:
+                    time.sleep(sleep_between)
+                    continue
+                return None
+            try:
+                r = rpc.call({"action": "info"}, timeout_ms=timeout_ms)
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("probe: call failed for %s (attempt %d/%d): %s",
+                          model_id, attempt, attempts, e)
+                if attempt < attempts:
+                    time.sleep(sleep_between)
+                    continue
+                return None
+            finally:
+                try:
+                    rpc.destroy()
+                except Exception:
+                    pass
+            if r and r.get("ok") and r.get("data"):
+                if attempt > 1:
+                    LOG.info("probe: %s responded on attempt %d/%d "
+                             "(race recovery)",
+                             model_id, attempt, attempts)
+                return r.get("data") or {}
+            # 空响应（ok 但 data 为空 / 不存在）—— 也是 race 未结束。
+            # 不 sleep 一下立刻重试代价太高会刷爆 cshim；sleep 1s 走下次。
+            LOG.debug("probe: %s returned empty/ok=False "
+                      "(attempt %d/%d)",
+                      model_id, attempt, attempts)
+            if attempt < attempts:
+                time.sleep(sleep_between)
+        LOG.warning("probe: %s unreachable after %d attempts; "
+                    "giving up",
+                    model_id, attempts)
+        return None
 
     def _find_by_model(self, model_id: str) -> Optional[ModelInstance]:
         """Look up a registered instance by model_id (key changes after
@@ -1828,12 +1895,23 @@ class ComputeRegistry:
 
         For each model_id in the list:
           1. if we already have a record, skip
-          2. probe the LAN daemon — adopt if a peer responds
-          3. otherwise spawn a fresh local subprocess
+          2. spawn a fresh local subprocess (config is user intent —
+             LAN peer is untrusted: may be down / resource-stuffed /
+             version-mismatched)
+          3. if local spawn fails, fall back to adopting a LAN peer
 
         Workers are NOT bound to an NPU at boot; they wait in
         ``not_loaded`` until the user clicks 启用 on the compute-config
         page (which triggers ``bind_instance``).
+
+        ``_probe_service`` runs a 3 × 5s race-recovery retry inside
+        ``_adopt_existing_worker`` to absorb the cshim daemon
+        endpoint-matching race. The whole call is also wrapped in a
+        daemon thread by :func:`app.main.create_app` so neither the
+        probe timeouts nor the spawn startup time blocks uvicorn
+        from binding port 8000 — the browser sees the page immediately
+        while boot runs in the background; the 1Hz ``/api/compute``
+        poll reflects each model's state as it lands.
 
         末尾跑一次 :meth:`_cleanup_unregistered_workers` 兜底扫一遍
         ``/proc/*/comm``，杀掉 registry 没接管、但 comm 以 ``worker:``
@@ -1861,7 +1939,8 @@ class ComputeRegistry:
                             model_id)
                 continue
             with self._lock:
-                if any(i.model_id == model_id for i in self._instances.values()):
+                if any(i.model_id == model_id
+                       for i in self._instances.values()):
                     continue
             # config.compute.services 是用户显式意图 → 优先本地 spawn，
             # LAN peer 不可控（挂掉 / 资源占满 / 版本不匹配）。

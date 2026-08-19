@@ -1,6 +1,7 @@
 """FastAPI application factory."""
 import logging
 import os
+import threading
 from pathlib import Path
 
 # uvicorn's default ``LOGGING_CONFIG`` does not configure the root
@@ -112,11 +113,21 @@ def create_app() -> FastAPI:
     app.include_router(audio_analysis.router, prefix="/api")
     app.include_router(versions.router, prefix="/api")
 
-    # Boot：按 config.compute.services 列表为每条 model 做 probe →
-    # adopt-or-spawn。worker 起来后只注册 DDS endpoint，不 build
+    # Boot：按 config.compute.services 列表为每条 model 做 spawn →
+    # 失败 fallback peer adopt。worker 起来后只注册 DDS endpoint，不 build
     # LLMSession；用户随后在算力配置页选 NPU 触发 RPC load 完成绑定。
-    # boot 自身不阻塞 UI（_spawn_compute_worker 立即返回，spawn 异步）。
-    get_registry().boot_compute_services()
+    #
+    # **必须在 daemon thread 里跑** —— 同步调用会阻塞 ``create_app()``
+    # 返回 → uvicorn 无法 bind 8000 → 浏览器 GET / hang 直到整个 boot
+    # 跑完（冷启动无 worker 时 ``_probe_service`` 的 3 × 5s race-recovery
+    # 重试 + spawn 子进程冷启都能吃几十秒）。挪到后台后：页面立即出，
+    # boot 在后台慢慢跑，前端 1Hz 轮询 /api/compute 自动反映每个
+    # model 的真实状态。
+    threading.Thread(
+        target=get_registry().boot_compute_services,
+        name="compute-boot",
+        daemon=True,
+    ).start()
 
     # Wire the detector as a frame sink on the video session so each
     # decoded BGR frame is offered to it (it picks the Nth one).
