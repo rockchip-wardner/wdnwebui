@@ -741,14 +741,12 @@
               <section class="surv-form-section">
                 <header class="surv-form-head">
                   <h3>检测尺寸</h3>
-                  <span class="surv-hint">VLM 推理帧大小（UI 占位）</span>
+                  <span class="surv-hint" id="vtd-detect-size-hint">从模型加载中…</span>
                 </header>
                 <div class="surv-field">
                   <label class="surv-input-split">
                     <span>尺寸</span>
-                    <select id="vtd-detect-size" class="surv-input">
-                      <option value="384" selected>384×384（默认）</option>
-                      <option value="768">768×768</option>
+                    <select id="vtd-detect-size" class="surv-input" disabled>
                     </select>
                   </label>
                 </div>

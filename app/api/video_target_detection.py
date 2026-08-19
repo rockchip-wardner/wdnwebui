@@ -69,7 +69,11 @@ async def get_prompt() -> dict:
 async def set_prompt(payload: dict) -> dict:
     """Start (or update) target-detection.
 
-    Body: ``{prompt: str, every_n: int}``
+    Body: ``{prompt: str, every_n: int, image_size: int | None}``
+    — ``prompt`` 必填；``image_size`` 可选，指定视觉模型目标尺寸
+    （必须由 ``/api/video-detection/available-vision-sizes`` 返回的
+    合法值之一；缺省 / ``None`` = 按帧自动选最近的变体，保留 legacy
+    行为）。
 
     旧版 ``enabled_tools`` 字段不再生效 —— 该页只走 ``TargetDoc``
     结构化输出，不再挂任何 ``@Callable`` 工具。仍接受该字段以便
@@ -85,9 +89,26 @@ async def set_prompt(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail="every_n 必须为整数")
     if every_n < 1:
         raise HTTPException(status_code=400, detail="every_n 必须 >= 1")
+    # image_size 解析：可选字段，缺省 / ``None`` → auto-pick；非法
+    # 类型 → 400（detector ``start()`` 内部也校验实际合法性，这里提前
+    # 到 HTTP 层只是为了返回更具体的错误消息）。
+    raw_image_size = payload.get("image_size", None)
+    image_size: int | None
+    if raw_image_size is None:
+        image_size = None
+    elif isinstance(raw_image_size, bool) or not isinstance(raw_image_size, int):
+        raise HTTPException(
+            status_code=400,
+            detail=f"image_size 必须是整数或 null: {raw_image_size!r}",
+        )
+    else:
+        image_size = raw_image_size
     try:
         # enabled_tools 显式置 [] — 该页不再挂工具。
-        return get_target_detector().start(prompt, every_n=every_n, enabled_tools=[])
+        return get_target_detector().start(
+            prompt, every_n=every_n, enabled_tools=[],
+            image_size=image_size,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
