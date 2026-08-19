@@ -298,6 +298,28 @@ class _RpcSessionProxy:
                 # let the caller see an empty wav_bytes path.
                 pass
 
+        # ---- Schema-instance reconstruction ---------------------------------
+        # Worker forwards ``result_data = result.model_dump()`` for schema
+        # returns (TargetDoc / VLMDoc / TTSResult). Reconstruct the actual
+        # class so detector's ``isinstance(result, TargetDoc)`` succeeds.
+        # Without this the proxy returns ``_ProxyResult`` whose only
+        # ``text / level / bbox / crop_b64`` slots are all ``None`` for
+        # TargetDoc — every event then falls through to the VLMDoc
+        # branch with empty text and gets silently dropped as degenerate.
+        gen_name = payload.get("generating")
+        result_data = data.get("result_data")
+        if gen_name == "TargetDoc" and isinstance(result_data, dict):
+            try:
+                from app.services.detector import _get_target_doc_cls
+                TargetDoc = _get_target_doc_cls()
+                return TargetDoc.model_validate(result_data)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning(
+                    "proxy: TargetDoc reconstruct failed (%s: %s) — "
+                    "falling back to _ProxyResult",
+                    type(e).__name__, e,
+                )
+
         return _ProxyResult(
             text=data.get("text"),
             level=data.get("level"),

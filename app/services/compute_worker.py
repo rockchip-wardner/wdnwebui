@@ -846,6 +846,24 @@ def infer_handler(state: dict, payload: dict) -> dict:
             reply["attachment_b64"] = attachment_b64
         if is_tool_instance and tool_call_args is not None:
             reply["tool_call_args"] = tool_call_args
+        # Schema instances (TargetDoc / VLMDoc / TTSResult) — forward the
+        # full ``model_dump()`` so the proxy can reconstruct the actual
+        # class. The ``text / level / bbox / crop_b64`` slots above only
+        # cover VLMDoc's surface; for TargetDoc (``x1 / y1 / x2 / y2 /
+        # desc``) every structured field would otherwise be lost at the
+        # worker boundary and the detector's ``isinstance(result,
+        # TargetDoc)`` branch never matches on the main side. Mirrors the
+        # ``tool_call_args`` pattern for ``@Callable`` reconstruction
+        # (see ``_run_tool_side_effect`` docstring).
+        if (not is_tool_instance
+                and type(result).__name__ in {"VLMDoc", "TargetDoc", "TTSResult"}):
+            try:
+                reply["result_data"] = result.model_dump()
+            except Exception as e:
+                LOG.warning(
+                    "schema instance dump failed (%s): %s",
+                    type(result).__name__, e,
+                )
         return reply
     except Exception as e:  # noqa: BLE001
         LOG.warning("infer_handler exception: %s", e)
