@@ -17,52 +17,7 @@ from pathlib import Path
 import uvicorn
 
 from app import __version__
-from app.services import wdndds_daemon
 from app.services.config import get_config
-
-
-def _start_wdndds_daemon() -> None:
-    """Auto-start ``wdndds_daemon`` before uvicorn boots.
-
-    The daemon process renames its comm to ``"wdndds-daemon"`` via
-    ``prctl(PR_SET_NAME)`` immediately after import (see
-    :func:`app.services.wdndds_daemon._set_comm_name`). We walk
-    ``/proc/*/comm`` via
-    :func:`app.services.wdndds_daemon.find_daemon_pids` first; any
-    match — including daemons started by systemd, manually, or by a
-    previous ``run.py`` invocation — short-circuits Popen so reload
-    loops and double-launches are impossible.
-
-    Ports are read from ``config.json["compute"]`` so a board
-    configured with non-default ``discovery_server_port`` /
-    ``daemon_http_port`` still comes up correctly. Falls back to the
-    daemon's CLI defaults (7411 / 7412) when the keys are missing.
-
-    All failures are logged to stderr and swallowed — a daemon crash
-    must not block the web service from coming up. The user can
-    restart manually or fix the config and retry.
-    """
-    existing = wdndds_daemon.find_daemon_pids()
-    if existing:
-        print(f"[run.py] wdndds_daemon already running (pids={existing}), "
-              f"skip auto-start", file=sys.stderr)
-        return
-
-    compute_cfg = get_config().get_section("compute") or {}
-    udp_port = int(compute_cfg.get("discovery_server_port",
-                                  wdndds_daemon.DEFAULT_UDP_PORT))
-    http_port = int(compute_cfg.get("daemon_http_port",
-                                    wdndds_daemon.DEFAULT_HTTP_PORT))
-    logfile = compute_cfg.get("daemon_logfile")
-
-    try:
-        proc = wdndds_daemon.start_in_subprocess(
-            port=udp_port, http_port=http_port, logfile=logfile)
-        print(f"[run.py] wdndds_daemon auto-started pid={proc.pid} "
-              f"udp={udp_port} http={http_port}", file=sys.stderr)
-    except Exception as e:  # noqa: BLE001
-        print(f"[run.py] wdndds_daemon auto-start failed: "
-              f"{type(e).__name__}: {e}", file=sys.stderr)
 
 
 def _ensure_wdndds_native_path() -> None:
@@ -146,26 +101,33 @@ def _ancestor_pids() -> set[int]:
 
 
 def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
-    """Best-effort cleanup of stale wdnwebui processes from a previous
-    unclean shutdown. Kills **every** wdnwebui-flavored process — the
-    previous uvicorn (port 8000), the prior ``run.py`` + uvicorn-reloader
-    spawn/resource_tracker children, **all orphan ``compute_worker.py``
-    subprocesses**, and the **wdndds_daemon** if one is already running
-    — so the new boot starts from a clean slate with no BrokenPipe
-    pollution from dead parents and no stale NPU model sessions.
+    """Best-effort cleanup of stale wdnwebui MAIN process resources
+    from a previous unclean shutdown.
 
-    Trade-off vs. the old preserve-and-adopt design: each restart now
-    pays the cost of rebuilding the daemon's FastDDS endpoints (peers
-    re-register on next announce) and re-instantiating every model's
-    ``LLMSession`` (~55s per model on RK3588). For dev / single-host
-    runs this is the right trade — the previous "preserve" design
-    surfaced BrokenPipeError pollution and 60s+ reload crossover bugs
-    whenever the old main process died ungracefully. Production hosts
-    that genuinely want adoption semantics should invoke ``uvicorn
-    app.main:app`` directly (the systemd unit installed by
-    ``install_autostart.sh`` does this) and skip ``run.py`` entirely.
+    Cleans up:
+      * the uvicorn process holding port 8000 (this is the actual
+        ``[Errno 98] Address already in use`` blocker)
+      * the previous ``run.py`` (uvicorn reloader parent; otherwise
+        the reloader-spawned zombie holds port 8000 indefinitely)
+      * uvicorn-reloader's ``multiprocessing.spawn`` /
+        ``resource_tracker`` children (defunct zombies that inherited
+        the LISTEN socket)
 
-    Opt-out: pass ``enabled=False`` (``--no-kill-stale`` /
+    Intentionally leaves alone:
+      * ``compute_worker.py`` subprocesses — they're independently-
+        managed processes with their own DDS endpoint. The new
+        ``ComputeRegistry.boot_compute_services()`` adopts live
+        workers via DDS RPC ``info`` probe (``_adopt_existing_worker``
+        in ``app/services/compute_registry.py``); killing them here
+        would defeat the orphan-adoption design and force a 60s+
+        model reload. Detected orphans are reported on stderr for
+        visibility — see the "detected N orphan compute_worker
+        process(es)" log emitted below.
+      * our own ancestor chain (would kill us).
+      * anything not matching wdnwebui repo paths (defence in depth).
+
+    Opt-out: pass ``enabled=False`` (driven by ``--no-kill-stale`` /
+>>>>>>> feat(discovery): switch FastDDS discovery from SERVER/CLIENT to SIMPLE multicast (v0.8)
     ``WDNWEBUI_KILL_STALE_ON_BOOT=0``). When disabled the entire
     /proc scan is skipped.
 
@@ -191,7 +153,8 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
           (c) uvicorn-reloader's ``multiprocessing.spawn`` /
               ``resource_tracker`` children
           (d) any ``compute_worker.py`` subprocess (orphan or not)
-          (e) ``wdndds_daemon`` matched via comm-set detection
+              — DETECTED but NOT killed; ``boot_compute_services``
+              adopts via DDS RPC ``info`` probe instead.
         """
         candidates: list[tuple[str, int]] = []
 
@@ -265,21 +228,19 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
                 candidates.append(("compute_worker.py", pid))
                 continue
 
-            # (e) wdndds_daemon via cmdline catches those that haven't
-            # had prctl renamed them yet.
-            if (b"wdndds_daemon" in raw
-                    and repo_python_marker in exe_link):
-                candidates.append(("wdndds_daemon", pid))
-                continue
+            # (d) orphan ``compute_worker.py`` invoked from THIS repo.
+            # DETECTED but NOT killed — see this function's docstring
+            # (compute_workers are independently-managed and adopted
+            # by the new ComputeRegistry.boot_compute_services()).
+            # We still run the same bare-filename + resolved-path +
+            # repo-name triple filter so a foreign compute_worker
+            # (somebody else's dev box) is NOT flagged here either.
 
-        # (e') comm-based daemon detection via /proc/PID/comm; the
-        # prctl-set name is not visible in cmdline.
-        try:
-            for pid in wdndds_daemon.find_daemon_pids(exclude_self=True):
-                if pid != my_pid and pid not in ancestors:
-                    candidates.append(("wdndds_daemon", pid))
-        except Exception:
-            pass
+            if ("compute_worker.py" in cmd_str
+                    and worker_path_str in cmd_str
+                    and "wdnwebui" in cmd_str):
+                candidates.append(("compute_worker.py", pid))
+                continue
 
         return candidates
 
@@ -485,8 +446,7 @@ def _ensure_wdndds_built() -> None:
     ``.venv/src/wdndds/src/wdndds/dds/_native/``。wheel /
     ``pip install -e`` 都没有自动跑 build hook 时（apt 依赖缺失、
     fresh clone 跳过 ``build_native.sh`` 等），这两个文件就缺失，
-    后续 ``wdndds_daemon`` 和 ``ComputeRegistry`` 的 ``RpcClient``
-    加载 cshim 时会报
+    后续 ``ComputeRegistry`` 的 ``RpcClient`` 加载 cshim 时会报
     ``FileNotFoundError: wdndds: .../libwdndds_cshim.so not found``。
 
     本函数是 fail-fast 网关：**不在这里自动 build**（apt 需要 sudo、
@@ -605,19 +565,11 @@ def main() -> None:
     os.environ["WDNWEBUI_CONFIG"] = str(config_path)
 
     # Reap stale uvicorn (port 8000) + compute_workers from any
-    # previous unclean shutdown BEFORE we try to bind. Done before
-    # _start_wdndds_daemon() so the daemon sees a clean slate too
-    # (and so we don't kill anything spawned by the daemon we just
-    # brought up).
+    # previous unclean shutdown BEFORE we try to bind.
     _kill_stale_wdnwebui_processes(kill_stale)
 
-    # Bring up the FastDDS discovery daemon before uvicorn binds the
-    # web port. _start_wdndds_daemon() is idempotent — it walks
-    # /proc/*/comm for the daemon's prctl-set name ("wdndds-daemon")
-    # and skips Popen when one is already running, so re-invoking
-    # run.py, uvicorn reloads, or systemd-started daemons all coexist
-    # without double-spawn.
-    _start_wdndds_daemon()
+    # v0.6: no daemon bootstrap — ComputeRegistry's Hub uses FastDDS
+    # SIMPLE discovery (multicast 239.255.0.1:7400).
 
     # VCS extract over a long source runs 50-75s; uvicorn's default 20s WS
     # ping often times the connection out mid-extract so the progress bar

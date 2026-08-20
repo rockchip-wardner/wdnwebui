@@ -423,106 +423,90 @@ function renderSystemMonitor(data) {
   }
   wRaw.textContent = JSON.stringify(w, null, 2);
 
-  // --- wdndds_daemon ----------------------------------------------------
-  // 系统信息页把 daemon 一起露出来：用户不必为了「这板子到底有没有
-  // 拉 daemon」来回切到其它页。状态由 system-monitor 后端
-  // 聚合（HTTP /status + /peers + pgrep PID），启停按钮走
-  // /api/system-monitor/daemon/start|stop。
-  const dm = data.daemon || {};
-  const dBadge = document.getElementById("daemon-badge");
-  const dMsgEl = document.getElementById("daemon-message");
-  const dBody  = document.getElementById("daemon-tbody");
-  const dRaw   = document.getElementById("daemon-raw");
-  const dStart = document.getElementById("daemon-start");
-  const dStop  = document.getElementById("daemon-stop");
+  // SIMPLE 在网设备 — peer 列表直接拉主进程 Hub;组播不通时设
+  // WDNDDS_INITIAL_PEERS 走单播 fallback。
+  const dc = data.discovery || {};
+  const dBadge = document.getElementById("discovery-badge");
+  const dMsgEl = document.getElementById("discovery-message");
+  const dBody  = document.getElementById("discovery-tbody");
+  const dPeersBody = document.getElementById("discovery-peers-tbody");
+  const dRaw   = document.getElementById("discovery-raw");
 
+  const peerCount = dc.peer_count || 0;
   dBadge.classList.remove("ok", "warn", "err");
   dMsgEl.classList.add("hidden");
-  if (dm.running && dm.available) {
-    dBadge.textContent = "运行中 · " + (dm.snapshot ? dm.snapshot.participant_count : 0) + " 个 peer";
+  if (dc.protocol === "SIMPLE" && dc.own_guid) {
+    dBadge.textContent = `SIMPLE · ${peerCount} 个 peer`;
     dBadge.classList.add("ok");
-  } else if (dm.running && !dm.available) {
-    dBadge.textContent = "进程在跑 · HTTP 不可达";
+    if (peerCount === 0) {
+      dMsgEl.classList.remove("hidden");
+      const ip = (dc.wdndds_initial_peers || []).join(", ") || "<未设置>";
+      dMsgEl.textContent =
+        `组播 ${dc.multicast_group} 上尚未看到任何 peer —— ` +
+        `若 LAN 组播被防火墙 / AP 隔离阻断，可在本机设环境变量 ` +
+        `WDNDDS_INITIAL_PEERS="${ip}" 后重启 web 服务，走单播 fallback。`;
+    }
+  } else if (dc.protocol === "SIMPLE") {
+    dBadge.textContent = "Hub 未就绪";
     dBadge.classList.add("warn");
     dMsgEl.classList.remove("hidden");
-    dMsgEl.textContent = dm.reason || "daemon 进程在但 /status 不响应（可能端口被改 / 卡死）";
+    dMsgEl.textContent = dc.reason || "ComputeRegistry Hub 未启动";
   } else {
-    dBadge.textContent = "未运行";
-    dBadge.classList.add("err");
-    dMsgEl.classList.remove("hidden");
-    dMsgEl.textContent = dm.reason || "未检测到 wdndds_daemon 进程";
+    dBadge.textContent = dc.protocol || "未知";
+    dBadge.classList.add("warn");
   }
-  if (dStart) dStart.disabled = !!dm.running;
-  if (dStop)  dStop.disabled  = !dm.running;
 
-  const dCfg = dm.config || {};
-  const dSnap = dm.snapshot || {};
-  const rows = [
-    ["PID",            dm.pid != null ? dm.pid : "--"],
-    ["状态",           dm.running ? "运行中" : "未运行"],
-    ["UDP 端口",       dCfg.udp_port != null ? dCfg.udp_port : "--"],
-    ["HTTP 端口",      dCfg.http_port != null ? dCfg.http_port : "--"],
-    ["GUID",           dSnap.guid || "--"],
-    ["启动时间",       dSnap.started_at ? new Date(dSnap.started_at * 1000).toLocaleString() : "--"],
-    ["已运行",         dSnap.uptime_sec != null
-                          ? (dSnap.uptime_sec >= 86400
-                              ? Math.floor(dSnap.uptime_sec / 86400) + " 天 " +
-                                Math.floor((dSnap.uptime_sec % 86400) / 3600) + " 时"
-                              : Math.floor(dSnap.uptime_sec / 3600) + " 时 " +
-                                Math.floor((dSnap.uptime_sec % 3600) / 60) + " 分")
-                          : "--"],
-    ["peer 数",        dSnap.participant_count != null ? dSnap.participant_count : "--"],
-    ["discovery_servers", (dCfg.discovery_servers || []).join(", ") || "--"],
-    ["auto_start_daemon", dCfg.auto_start_daemon ? "true" : "false"],
+  const baseRows = [
+    ["协议",         dc.protocol || "--"],
+    ["组播地址",     dc.multicast_group || "--"],
+    ["本机 GUID",    dc.own_guid ? dc.own_guid.slice(0, 24) + "…" : "--"],
+    ["peer 数量",    peerCount],
+    ["WDNDDS_INITIAL_PEERS",
+      (dc.wdndds_initial_peers || []).join(", ") || "<未设置>"],
   ];
-  if (Array.isArray(dm.peers) && dm.peers.length) {
-    rows.push(["peers",
-      dm.peers.map(p => `${p.name || "?"} (${(p.guid || "").slice(0, 8)}…)`).join(" / ")]);
-  } else if (dm.peers && Array.isArray(dm.peers) && dm.peers.length === 0) {
-    rows.push(["peers", "（暂无）"]);
-  }
   dBody.innerHTML = "";
-  rows.forEach(([k, v]) => {
+  baseRows.forEach(([k, v]) => {
     const tr = document.createElement("tr");
-    const tdK = document.createElement("td");
-    tdK.className = "daemon-key";
-    tdK.textContent = k;
-    const tdV = document.createElement("td");
-    tdV.className = "daemon-val";
-    tdV.textContent = v;
+    const tdK = document.createElement("td"); tdK.className = "daemon-key"; tdK.textContent = k;
+    const tdV = document.createElement("td"); tdV.className = "daemon-val"; tdV.textContent = String(v);
     tdV.title = String(v);
-    tr.appendChild(tdK);
-    tr.appendChild(tdV);
+    tr.appendChild(tdK); tr.appendChild(tdV);
     dBody.appendChild(tr);
   });
-  dRaw.textContent = JSON.stringify(dm, null, 2);
-}
 
-async function daemonControl(action) {
-  const r = await fetch(API_PREFIX + "/system-monitor/daemon/" + action, { method: "POST" });
-  if (!r.ok) {
-    const detail = await r.text().catch(() => "");
-    throw new Error("HTTP " + r.status + " " + detail);
+  dPeersBody.innerHTML = "";
+  const peers = dc.peers || [];
+  if (peers.length === 0) {
+    const tr = document.createElement("tr");
+    tr.className = "daemon-empty";
+    const td = document.createElement("td");
+    td.colSpan = 4;
+    td.textContent = peerCount === 0 ? "暂无 peer" : "加载中…";
+    tr.appendChild(td);
+    dPeersBody.appendChild(tr);
+  } else {
+    peers.forEach(p => {
+      const tr = document.createElement("tr");
+      const tdG = document.createElement("td");
+      tdG.className = "daemon-val";
+      tdG.textContent = (p.guid || "").slice(0, 24) + (p.guid && p.guid.length > 24 ? "…" : "");
+      tdG.title = p.guid || "";
+      const tdN = document.createElement("td");
+      tdN.className = "daemon-val";
+      tdN.textContent = p.name || "(未命名)";
+      const tdI = document.createElement("td");
+      tdI.className = "daemon-val";
+      tdI.textContent = p.ip || "--";
+      const tdT = document.createElement("td");
+      tdT.className = "daemon-val";
+      tdT.textContent = p.discovered_at
+        ? new Date(p.discovered_at * 1000).toLocaleTimeString()
+        : "--";
+      tr.appendChild(tdG); tr.appendChild(tdN); tr.appendChild(tdI); tr.appendChild(tdT);
+      dPeersBody.appendChild(tr);
+    });
   }
-  return r.json();
-}
-
-function wireDaemonButtons() {
-  const s = document.getElementById("daemon-start");
-  const t = document.getElementById("daemon-stop");
-  if (!s || !t) return;
-  if (s._wired) return;
-  s._wired = true;
-  s.addEventListener("click", async () => {
-    s.disabled = true;
-    try { await daemonControl("start"); } catch (e) { console.error(e); }
-    try { await refreshSystemMonitor(); } catch (_) {}
-  });
-  t.addEventListener("click", async () => {
-    t.disabled = true;
-    try { await daemonControl("stop"); } catch (e) { console.error(e); }
-    try { await refreshSystemMonitor(); } catch (_) {}
-  });
+  dRaw.textContent = JSON.stringify(dc, null, 2);
 }
 
 async function refreshSystemMonitor() {
@@ -2762,7 +2746,6 @@ async function loadPageData(name) {
   if (name === "system-monitor") {
     const json = document.getElementById("data-system-monitor");
     json.textContent = "加载中…";
-    wireDaemonButtons();
     try {
       const r = await fetch(API_PREFIX + "/" + name);
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -4906,7 +4889,17 @@ const ComputeConfigPage = {
     // 数据不变直接复用旧节点。
     const snap = this._snapshot || {};
     const cards = snap.cards || [];
-    const services = snap.services || [];
+    const rawServices = snap.services || [];
+
+// 网络栏过滤:adopted + (not_loaded | error) 都隐藏 —— peer 没在正常
+// 服务状态,UI 显出来误导用户。
+    const services = rawServices.filter(s => {
+      if (s._source === "adopted"
+          && (s.status === "not_loaded" || s.status === "error")) {
+        return false;
+      }
+      return true;
+    });
 
     if (!services.length) {
       const empty = document.createElement("div");
@@ -4917,14 +4910,20 @@ const ComputeConfigPage = {
     }
 
     // 按 CC_PRESET_ORDER 排序，保证 UI 默认视觉顺序稳定。
+    // 同 model 可以出现多条(例如 adopted 一条 + unavailable 一条),
+    // dedup 用 (model_id, _source) 复合 key 让两张卡都进 ordered。
     const ordered = [];
     const seen = new Set();
+    const seenKey = (s) => `${s.model_id}__${s._source || ""}`;
     for (const id of CC_PRESET_ORDER) {
-      const s = services.find(x => x.model_id === id);
-      if (s) { ordered.push(s); seen.add(s.model_id); }
+      for (const s of services.filter(x => x.model_id === id)) {
+        const k = seenKey(s);
+        if (!seen.has(k)) { ordered.push(s); seen.add(k); }
+      }
     }
     for (const s of services) {
-      if (!seen.has(s.model_id)) ordered.push(s);
+      const k = seenKey(s);
+      if (!seen.has(k)) { ordered.push(s); seen.add(k); }
     }
 
     // v0.8: 1Hz tick 时整张卡片重建会让 `<select>` 失去焦点
@@ -5047,7 +5046,7 @@ const ComputeConfigPage = {
         this._selectedTarget[s.model_id] != null
           ? String(this._selectedTarget[s.model_id]) : "_",
       ].join("|");
-      const prev = prevCard[s.model_id];
+      const prev = prevCard[seenKey(s)];
       let targetContainer;
       if (isLocal) {
         targetContainer = localRoot;
@@ -5080,7 +5079,7 @@ const ComputeConfigPage = {
             : this._makePeerCard(s.model_id, meta, s);
           prev.sig = sig;
           prev.isLocal = isLocal;
-          newCard[s.model_id] = prev;
+          newCard[seenKey(s)] = prev;
           newOrder.push({model_id: s.model_id, container: targetContainer, card: prev.card});
           continue;
         }
@@ -5096,7 +5095,7 @@ const ComputeConfigPage = {
           targetContainer.removeChild(prev.card);
           targetContainer.appendChild(prev.card);
         }
-        newCard[s.model_id] = prev;
+        newCard[seenKey(s)] = prev;
         newOrder.push({model_id: s.model_id, container: targetContainer, card: prev.card});
         continue;
       }
@@ -5106,7 +5105,7 @@ const ComputeConfigPage = {
       const card = isLocal
         ? this._makeLocalCard(s.model_id, meta, s, cards)
         : this._makePeerCard(s.model_id, meta, s);
-      newCard[s.model_id] = { card, sig, isLocal };
+      newCard[seenKey(s)] = { card, sig, isLocal };
       newOrder.push({model_id: s.model_id, container: targetContainer, card});
     }
 

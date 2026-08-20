@@ -599,10 +599,10 @@ async def get_app_prompts() -> dict:
 async def put_app_prompts(payload: AppPromptsConfig) -> dict:
     """Deep-merge ``payload`` into ``config.json["compute"]["app_prompts"]``
     and persist the updated ``compute`` section. Other compute
-    subsections (``instances``, ``discovery_servers``,
-    ``tool_call_max_iters``, ...) are preserved; sibling apps in
-    ``app_prompts`` are preserved too — a PUT that only mentions
-    ``video_detection`` never wipes ``video_target_detection``.
+    subsections (``instances``, ``tool_call_max_iters``, ...) are
+    preserved; sibling apps in ``app_prompts`` are preserved too — a
+    PUT that only mentions ``video_detection`` never wipes
+    ``video_target_detection``.
 
     Validation:
 
@@ -667,8 +667,8 @@ async def delete_app_prompts() -> dict:
 
     Removes ``compute.app_prompts`` from ``config.json`` so the GET
     endpoint falls back to the detector-side defaults. Other compute
-    subsections (``instances``, ``discovery_servers``,
-    ``tool_call_max_iters``, …) are preserved.
+    subsections (``instances``, ``tool_call_max_iters``, …) are
+    preserved.
 
     The response shape mirrors :func:`put_app_prompts` (same
     effective-section helper) so the UI can re-render the form without

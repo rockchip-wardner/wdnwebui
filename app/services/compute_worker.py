@@ -1079,23 +1079,6 @@ def main() -> int:
     # background pump thread that calls our ``router`` for each
     # inbound request.
     from wdndds.dds._rpc import Hub
-    # Discovery: point at the LAN's wdndds_daemon (one per LAN). If
-    # config.json doesn't list any discovery_servers, the worker
-    # falls back to SIMPLE discovery (single-host, multicast).
-    discovery_servers = []
-    try:
-        import json as _json
-        with open(_config_path()) as f:
-            cfg = _json.load(f).get("compute", {})
-        servers = cfg.get("discovery_servers") or []
-        if isinstance(servers, str):
-            servers = [s.strip() for s in servers.split(",") if s.strip()]
-        discovery_servers = [s for s in servers if s]
-    except (OSError, ValueError):
-        pass
-
-    LOG.info("compute_worker discovery_servers=%r (config=%s)",
-             discovery_servers, _config_path())
 
     # State dict shared with the router callback. Initial status is
     # ``not_loaded`` — worker is alive and reachable, but has not
@@ -1139,7 +1122,7 @@ def main() -> int:
         services=[f"wdndds/rpc/{model_id}"],
         callback=lambda svc, pl: router(
             svc, pl, _worker_state, model_id, npu_index, model_dir),
-        discovery_servers=discovery_servers,
+        discovery_servers=[],
     )
     hub.start()
 

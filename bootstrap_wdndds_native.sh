@@ -5,7 +5,7 @@
 # libwdndds_idl.so — they are source-compiled at pip install time by
 # wdndds._build.py (a setuptools build_py subclass). On a fresh box
 # after `pip install -e .venv/src/wdndds`, those .so files are missing
-# and wdndds_daemon / ComputeRegistry's RpcClient cannot come up
+# and ComputeRegistry's RpcClient cannot come up
 # (`FileNotFoundError: wdndds: .../libwdndds_cshim.so not found`).
 #
 # This script does the missing piece in three idempotent steps:

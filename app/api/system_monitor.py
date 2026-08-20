@@ -8,16 +8,11 @@ interface and ``/sys/class/thermal/`` are readable.
 from __future__ import annotations
 
 import asyncio
-import json as _json
 import os
 import re
 import shutil
-import socket
-import subprocess
 import time
 from typing import Optional
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -586,94 +581,42 @@ def _collect_workers() -> dict:
     }
 
 
-def _http_get_json(url: str, timeout: float = 1.0):
-    """Tiny helper: GET a URL, parse JSON body, return dict or None.
+def _collect_discovery() -> dict:
+    """Snapshot the FastDDS SIMPLE discovery state of the main process's
+    Hub. Source of truth for the 「系统信息 → 在网设备」section.
 
-    Connection refused / timeout / non-200 all collapse to ``None`` —
-    callers treat that as "daemon not running". Anything that survives
-    is forwarded as-is so the UI can render whatever shape the daemon
-    returned (current schema is documented in
-    ``app/services/wdndds_daemon.py::_DaemonHTTPHandler._snapshot``).
+    Returns ``{protocol, multicast_group, own_guid, peer_count,
+    peers:[{guid, name, ip, discovered_at}], wdndds_initial_peers}``.
+    ``ip`` is the first UDPv4 unicast locator the peer announced
+    (from FastDDS ParticipantBuiltinTopicData); empty string when
+    the peer didn't advertise one (e.g. SHM-only).
     """
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return _json.loads(resp.read())
-    except (urllib.error.URLError, ConnectionRefusedError, TimeoutError,
-            socket.timeout, OSError, ValueError):
-        return None
-
-
-def _pgrep_daemon_pid() -> int | None:
-    """First PID whose cmdline mentions ``wdndds_daemon``.
-
-    Same orphan-detection caveat as ``_collect_workers``: pgrep matches
-    this process too (its argv contains ``app.services.wdndds_daemon``
-    when running via ``-m``), so filter self out.
-    """
-    self_pid = os.getpid()
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "wdndds_daemon"],
-            stderr=subprocess.DEVNULL,
-        ).decode()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-        return None
-    for token in out.split():
-        try:
-            pid = int(token.strip())
-        except ValueError:
-            continue
-        if pid == self_pid:
-            continue
-        return pid
-    return None
-
-
-def _collect_daemon() -> dict:
-    """快照 ``wdndds_daemon`` 进程 — 配置端口 + HTTP /status + /peers
-    + pgrep PID 一起读。
-
-    这是「系统信息 → Daemon」段的真相源：daemon 自己只暴露
-    ``running / started_at / uptime_sec / udp_port / guid / participant_count``
-    （见 ``app/services/wdndds_daemon.py::_DaemonHTTPHandler``），算上
-    ``peers`` 列表和宿主 OS 的 PID 就是 UI 渲染要的全集。
-
-    HTTP 拉不到 = daemon 没起；返回 ``available=False`` + ``reason`` 兜
-    底信息。PID 通过 pgrep 兜底，万一 daemon 卡死 / 端口换掉 / 进程名
-    对不上时 UI 还能看到「在跑但 HTTP 不可达」/「进程不在」。
-    """
-    cfg = get_config().get_section("compute") or {}
-    udp_port = int(cfg.get("discovery_server_port", 7411))
-    http_port = int(cfg.get("daemon_http_port", 7412))
-    auto_start = bool(cfg.get("auto_start_daemon", False))
-    discovery_servers = list(cfg.get("discovery_servers") or [])
-
-    snapshot = _http_get_json(f"http://127.0.0.1:{http_port}/status", timeout=1.0)
-    peers_payload = _http_get_json(f"http://127.0.0.1:{http_port}/peers", timeout=1.0)
-    peers = None
-    if isinstance(peers_payload, dict) and isinstance(peers_payload.get("peers"), list):
-        peers = peers_payload["peers"]
-
-    pid = _pgrep_daemon_pid()
-    available = snapshot is not None
-    running = available or pid is not None
-    reason = None if available else (
-        f"127.0.0.1:{http_port}/status unreachable"
-        + (f"（pgrep 发现 PID {pid}，但 HTTP 不可达）" if pid else "")
-    )
+        from app.services.compute_registry import get_registry
+        reg = get_registry()
+        peers = reg.list_peers()
+        own_guid = reg.own_guid()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "protocol": "SIMPLE",
+            "multicast_group": "239.255.0.1:7400",
+            "own_guid": "",
+            "peer_count": 0,
+            "peers": [],
+            "reason": f"registry unavailable: {type(e).__name__}: {e}",
+        }
+    initial_peers = [
+        p.strip() for p in
+        (os.environ.get("WDNDDS_INITIAL_PEERS", "") or "").split(",")
+        if p.strip()
+    ]
     return {
-        "available": available,
-        "running": running,
-        "config": {
-            "udp_port": udp_port,
-            "http_port": http_port,
-            "auto_start_daemon": auto_start,
-            "discovery_servers": discovery_servers,
-        },
-        "snapshot": snapshot,
-        "peers": peers,
-        "pid": pid,
-        "reason": reason,
+        "protocol": "SIMPLE",
+        "multicast_group": "239.255.0.1:7400",
+        "own_guid": own_guid,
+        "peer_count": len(peers),
+        "peers": sorted(peers, key=lambda p: p.get("name") or ""),
+        "wdndds_initial_peers": initial_peers,
     }
 
 
@@ -682,77 +625,11 @@ async def get_system_monitor() -> dict:
     base = await asyncio.to_thread(_sample_cpu_mem)
     base["disk"] = await asyncio.to_thread(_sample_disk)
     base["workers"] = await asyncio.to_thread(_collect_workers)
-    base["daemon"] = await asyncio.to_thread(_collect_daemon)
+    base["discovery"] = await asyncio.to_thread(_collect_discovery)
     base["thermal"] = await asyncio.to_thread(_collect_thermal)
     base["npu"] = await _collect_npu()
     base["placeholder"] = False
     base["section"] = "system-monitor"
     base["collected_at"] = datetime.now(timezone.utc).isoformat()
     return base
-
-
-# --------------------------------------------------------------------------- #
-# wdndds_daemon 控制（启停）                                                  #
-# --------------------------------------------------------------------------- #
-# 这些端点原本挂在 ``/api/discovery/daemon/*`` 下，属于 Discovery 页 DDS
-# 子面板的一部分。Discovery 页 DDS 子面板 v0.10 整体下线（开关只起空
-# Hub、不广播能力、对端列表永远为空，详见设计变更记录）；daemon 启停按
-# 钮真正被消费的地方是「系统信息 → Daemon」section，所以端点挪到这里，
-# URL 同步改成 ``/api/system-monitor/daemon/*``。
-@router.get("/system-monitor/daemon")
-async def get_daemon_status() -> dict:
-    """``GET /api/discovery/daemon`` 的迁移版本 —— 同 payload。"""
-    import urllib.request
-    import urllib.error
-    compute_cfg = get_config().get_section("compute") or {}
-    http_port = int(compute_cfg.get("daemon_http_port", 7412))
-    try:
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{http_port}/status", timeout=1) as resp:
-            return _json.loads(resp.read())
-    except (urllib.error.URLError, ConnectionRefusedError, TimeoutError, OSError) as e:
-        return {"running": False, "error": str(e)}
-
-
-@router.post("/system-monitor/daemon/start")
-async def post_daemon_start() -> dict:
-    """以 detached subprocess 拉起 ``wdndds_daemon``。幂等。"""
-    from app.services import wdndds_daemon
-    compute_cfg = get_config().get_section("compute") or {}
-    udp_port = int(compute_cfg.get("discovery_server_port", 7411))
-    http_port = int(compute_cfg.get("daemon_http_port", 7412))
-    logfile = compute_cfg.get("daemon_logfile")
-    try:
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{http_port}/status", timeout=0.5) as resp:
-            return _json.loads(resp.read())
-    except Exception:
-        pass
-    p = wdndds_daemon.start_in_subprocess(
-        port=udp_port, http_port=http_port, logfile=logfile)
-    return {"running": True, "pid": p.pid, "udp_port": udp_port,
-            "http_port": http_port}
-
-
-@router.post("/system-monitor/daemon/stop")
-async def post_daemon_stop() -> dict:
-    """TERM 子进程停掉 ``wdndds_daemon``。幂等。"""
-    http_port = int(
-        (get_config().get_section("compute") or {}).get(
-            "daemon_http_port", 7412))
-    try:
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{http_port}/status",
-                timeout=0.5) as resp:
-            resp.read()
-    except Exception:
-        return {"running": False, "stopped": False,
-                "note": "daemon was not running"}
-    try:
-        out = subprocess.check_output(["pgrep", "-f", "wdndds_daemon"]).decode()
-    except subprocess.CalledProcessError:
-        return {"running": False, "stopped": False,
-                "note": "no daemon process found"}
-    for pid in out.split():
-        subprocess.run(["kill", "-TERM", pid.strip()])
     return {"running": False, "stopped": True}

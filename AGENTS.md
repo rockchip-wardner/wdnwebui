@@ -175,9 +175,7 @@ on the next boot via `boot_compute_services()` →
 would force a 60s+ model reload on every restart. Detected orphans
 are reported on stderr ("detected N orphan compute_worker
 process(es) — preserved, will be adopted") so the user has
-visibility. Treated identically to `wdndds_daemon` below (which is
-also not killed because `_start_wdndds_daemon` adopts existing
-ones).
+visibility.
 
 Enabled by default; opt out via `--no-kill-stale` CLI flag or
 `WDNWEBUI_KILL_STALE_ON_BOOT=0` env var. When disabled, both the
@@ -763,10 +761,9 @@ holds it in memory. The file is seeded with a `base` section at
   才 instantiate（55-90s）。UI 通过 `GET /api/compute` 每秒轮询状态，
   loading 实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL`）。
   Capability 概念作为内部 key 使用（`get_session("swcap_video_describe")` /
-  `"swcap_audio_tts"`）；当前 v0.10 不再广播到 LAN DDS，capability 路由
-  仅走同进程 `ComputeRegistry` —— 跨机器发现完全靠
-  `wdndds_daemon`（SERVER 协议）+ `ComputeRegistry` 的 `Hub` 服务名
-  `wdndds/rpc/<model_id>` 暴露给 peer。
+  `"swcap_audio_tts"`）；capability 路由仅走同进程 `ComputeRegistry`，
+  跨机器发现走 FastDDS SIMPLE multicast（v0.6+），`ComputeRegistry`
+  的 `Hub` 服务名 `wdndds/rpc/<model_id>` 自动暴露给 peer。
 
 ## App 提示词模板 (compute.app_prompts)
 
@@ -838,10 +835,8 @@ holds it in memory. The file is seeded with a `base` section at
 **v0.10 起下线**：原"在网注册 (DDS)"子面板（含开关 + FastDDS 能力广播 +
 对端列表）整个删除 —— `DdsDiscoveryManager` 之前只起一个 placeholder
 `RpcHub`，既不广播 capability、也不订阅对端列表（`_discovered` 永远为
-0），toggle 是个空壳。跨机器发现改由 `wdndds_daemon`（SERVER 协议，见
-`app/services/wdndds_daemon.py`）承担。daemon 启停按钮搬到「系统信息
-→ Daemon」section（端点从 `/api/discovery/daemon/*` 迁到
-`/api/system-monitor/daemon/*`，前端调用点同步更新）。
+0），toggle 是个空壳。跨机器发现改由 FastDDS SIMPLE multicast（v0.6+）
+承担，「系统信息 → 在网设备」section 展示主进程 Hub 的真实 peer 列表。
 
 ## System logs page
 
@@ -1646,225 +1641,84 @@ asyncio loop），不是直接 `await` SDK。`wechatbot-sdk` 是 wdnwebui
   `login_state` 切到 `error`，UI 看到红色徽章 + 点 登录 重试。
 
 
-## wdndds_daemon — FastDDS Discovery Server (v0.5)
 
-v0.5 在 v0.4 的 per-model-subprocess RPC 之上加了**集中式发现 daemon**，
-绕开 FastDDS 2.9 在本机的 SPDP multicast 发现 bug（**改用 SERVER/CLIENT
-协议 + UDP 单播**）。
+## FastDDS discovery — SIMPLE multicast (v0.6+)
 
-### 架构
-
-```
-       ┌───────────────────────┐
-       │   wdndds_daemon       │   唯一一个进程
-       │   (FastDDS SERVER     │   默认端口：UDP 7411 / HTTP 7412
-       │    discovery protocol)│   (可在 config.json 里改)
-       └───────────────────────┘
-                 │  (UDP 单播：peers 互相发现)
-       ┌─────────┼─────────┼─────────┐
-       ▼         ▼         ▼         ▼
-   wdnwebui  worker   worker   worker     (CLIENT protocol,
-     main     qwen3   qwen3      qwen8      discovery_servers 指向 daemon)
-```
-
-* 每个 LAN 跑一个 `wdndds_daemon` 进程。**没有 fallback**（多播 / SIMPLE
-  在嵌入式板不可靠；server 故障 = 整个 LAN 不通）。
-* 所有 wdnwebui 进程（main / compute_worker / im-bridge / 任意）
-  通过 `config.json["compute"]["discovery_servers"]` 指向 daemon 的
-  `host:port`。
-* daemon 同时服务于「compute RPC 跨机器发现」和「Discovery 页在网注册」
-  —— **同一个 daemon，两个用途**。
-
-### wdndds_daemon 启动方式
-
-**1) 主进程随 wdnwebui 一起启动（dev / 小部署）**
-
-`config.json["compute"]["auto_start_daemon"]: true` 时，`app/main.py`
-`create_app()` 会 `subprocess.Popen` 拉起 daemon（默认端口可改）。
-
-**2) 手动启动（生产 / systemd）**
-
-```bash
-# 前台
-.venv/bin/python -m app.services.wdndds_daemon --udp-port 7411 --http-port 7412
-
-# 通过 systemd unit（生产推荐）
-[Unit]
-Description=wdndds discovery daemon
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/userdata/wdnwebui/.venv/bin/python -m app.services.wdndds_daemon     --udp-port 7411 --http-port 7412
-WorkingDirectory=/userdata/wdnwebui
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**3) HTTP API（前端 / 调试用）**
-
-```
-GET  /status   {"running", "started_at", "uptime_sec", "udp_port", "guid", "participant_count"}
-GET  /peers    {"peers": [{"guid", "name"}, ...]}   (基于 DomainParticipantListener)
-GET  /health   {"ok": true}
-```
-
-### wdnwebui 端配置
-
-`config.json["compute"]` 字段：
-
-```json
-{
-  "instances": [{"npu_index": 0, "model": "qwen3-vl-4b"}],
-  "discovery_servers": ["127.0.0.1:7411"],   // 主进程 / worker 都读这个
-  "discovery_server_port": 7411,            // 仅 auto_start_daemon 用
-  "daemon_http_port": 7412,                 // 同上
-  "auto_start_daemon": false                // 默认 false（生产用 systemd）
-}
-```
-
-`compute_registry._persist()` **保留** `discovery_servers` / `ports` /
-`auto_start_daemon` 字段（v0.5.1 修复：之前会覆盖整个 compute section）。
-
-### 跨进程 RPC：发现 + 数据平面
-
-* **发现**：daemon 跑 SERVER 协议，所有 client 跑 CLIENT 协议 →
-  daemon 监听 UDP 7411 → 每个 client 把自己的 participant + endpoint
-  注册到 daemon → daemon 把 endpoint 信息分发给所有 client。
-* **数据平面**：compute_worker 用 `SHM + UDPv4 + TCPv4` 三种 transport；
-  SHM 走同机零拷贝，UDPv4 走同 LAN，TCPv4 走跨子网。
-* **共享 reply topic**：request / reply 两个 topic 复用 shared reply。
-  请求 ID 在 ComputeRequest/ComputeReply 里匹配（参见
-  `wdndds/idl/compute.idl`）。
-* **首次调用 race**：daemon 刚启动时 endpoint 还没匹配，第一次
-  `RpcClient.call()` 会 timeout（约 5s），第二次起成功。wdnwebui
-  probe 自动 retry（每 1s 一次，5s timeout）。
-
-### 注意事项
-
-* **本机 FastDDS 3.6.2 编译 + 源码安装**（参见
-  `.venv/src/wdndds/build_native.sh`）：libfastdds / libfastcdr /
-  libwdndds_idl / libwdndds_cshim 全部安装到 `wdndds/native/`，不依赖
-  系统 apt 包。
-* **FastDDS 3.6 的 rrpc API 还是 stub 状态**：DomainParticipant::create_service
-  等返回 `RETCODE_UNSUPPORTED`（参见 Fast-DDS `DomainParticipantImpl.cpp`）。
-  wdndds_cshim 直接用 raw `DataReader` / `DataWriter` 模拟 Request/Reply
-  —— 等 FastDDS 真实现 rrpc 后可以简化。
-* **disable_builtin_multicast=true** + **avoid_builtin_multicast=true**：
-  cshim 在 SERVER/CLIENT 模式下禁用 multicast，单纯走 UDP 单播。
-  这是 FastDDS 3.6 的官方推荐（embedded board 不保证有 multicast 路由）。
-
-
-## wdndds_daemon — FastDDS Discovery Server (v0.5)
-
-v0.5 在 v0.4 的 per-model-subprocess RPC 之上加了**集中式发现 daemon**，
-绕开 FastDDS 2.9 在本机的 SPDP multicast 发现 bug（**改用 SERVER/CLIENT
-协议 + UDP 单播**）。
+v0.5 引入了 wdndds_daemon 走 SERVER/CLIENT 协议绕开 FastDDS 2.9 SPDP
+multicast bug。v0.6 改成 **FastDDS SIMPLE discovery** 直接走组播
+239.255.0.1:7400 —— 既然 wdnwebui 现已自带源码编译的 FastDDS 3.6.2
+(v0.5 时代的 bug 不存在),daemon 这一层就成了纯运维负担,没有功能收益。
 
 ### 架构
 
 ```
-       ┌───────────────────────┐
-       │   wdndds_daemon       │   唯一一个进程
-       │   (FastDDS SERVER     │   默认端口：UDP 7411 / HTTP 7412
-       │    discovery protocol)│   (可在 config.json 里改)
-       └───────────────────────┘
-                 │  (UDP 单播：peers 互相发现)
-       ┌─────────┼─────────┼─────────┐
-       ▼         ▼         ▼         ▼
-   wdnwebui  worker   worker   worker     (CLIENT protocol,
-     main     qwen3   qwen3      qwen8      discovery_servers 指向 daemon)
+        ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+        │  main    │  │ worker   │  │ worker   │  │ worker   │  (FastDDS
+        │ (wdnwebui│  │ qwen3-vl │  │ qwen3-tts│  │ qwen3-8b │   SIMPLE)
+        │  main)   │  │  -4b     │  │          │  │          │
+        └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
+             │              │             │             │
+             └──────────────┴──── UDP multicast 239.255.0.1:7400 ───────
+                                          │
+                            (LAN: 任意 L2 节点互通)
 ```
 
-* 每个 LAN 跑一个 `wdndds_daemon` 进程。**没有 fallback**（多播 / SIMPLE
-  在嵌入式板不可靠；server 故障 = 整个 LAN 不通）。
-* 所有 wdnwebui 进程（main / compute_worker / im-bridge / 任意）
-  通过 `config.json["compute"]["discovery_servers"]` 指向 daemon 的
-  `host:port`。
-* daemon 同时服务于「compute RPC 跨机器发现」和「Discovery 页在网注册」
-  —— **同一个 daemon，两个用途**。
+* **零配置**：每台板子启 `wdnwebui` 即自动被同网段其它板子看到；
+  不需要配 daemon 地址、不需要 systemd 单元、不需要端口管理。
+* **数据平面不变**：仍走 cshim 的 SHM（同机）+ UDPv4（LAN）+ TCPv4（跨子网）
+  builtin transports。
+* **请求 / 回复主题**：`wdndds/rpc/req/<model_id>` +
+  `wdndds/rpc/rep/<model_id>`，IDL 见 `wdndds/idl/compute.idl`。
+* **participant 命名约定**：主进程 = `wdnwebui-main-<device_name>`，
+  worker = `compute_worker-<device_name>-<model_id>`，
+  comm = `worker:<alias>`（见 `MODEL_PRESETS[model_id]["worker_name"]`）。
+  v0.8 起 `device_name` 缺省 fallback 到 `socket.gethostname()`，
+  participant_name 永远非空。
 
-### wdndds_daemon 启动方式
+### 跨子网 / 组播被屏蔽时的 fallback
 
-**1) 主进程随 wdnwebui 一起启动（dev / 小部署）**
-
-`config.json["compute"]["auto_start_daemon"]: true` 时，`app/main.py`
-`create_app()` 会 `subprocess.Popen` 拉起 daemon（默认端口可改）。
-
-**2) 手动启动（生产 / systemd）**
+消费级 WiFi（AP 隔离、访客网络）、Docker bridge、严格 VLAN 经常丢组播。
+每个 wdnwebui 进程读 `WDNDDS_INITIAL_PEERS` 环境变量（逗号分隔的 IP
+列表），由 cshim 的 `_install_default_dds_profile()` 写入
+FastDDS XML profile 的 `initialPeersList`，作为 unicast fallback：
 
 ```bash
-# 前台
-.venv/bin/python -m app.services.wdndds_daemon --udp-port 7411 --http-port 7412
-
-# 通过 systemd unit（生产推荐）
-[Unit]
-Description=wdndds discovery daemon
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/userdata/wdnwebui/.venv/bin/python -m app.services.wdndds_daemon \
-    --udp-port 7411 --http-port 7412
-WorkingDirectory=/userdata/wdnwebui
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
+# 在每台板子设上对端 IP（v0.6 新增，无需 daemon）
+WDNDDS_INITIAL_PEERS="192.168.1.10,192.168.1.11,192.168.1.12" \
+    .venv/bin/python run.py
 ```
 
-**3) HTTP API（前端 / 调试用）**
+XML profile 路径：`$XDG_RUNTIME_DIR/wdndds_default_profile.xml`
+（找不到时 fallback 到 `/tmp/`）。除 `initialPeersList` 外,profile 还
+显式设了:
+* `<discoveryProtocol>SIMPLE</discoveryProtocol>`
+* `<initialAnnouncements><count>10</count><period>100ms</period></initialAnnouncements>`
+  — 比 FastDDS 默认（5×100ms）更激进,冷启动发现更早收敛。
+* `<leaseDuration_announcementperiod><sec>1</sec>…</leaseDuration_announcementperiod>`
+  — 比 FastDDS 默认（3s）更短,周期发现滞后更小。
+* 默认 `initialPeersList` 永远含 `127.0.0.1:7410` loopback,同机进程
+  即使 multicast 坏掉也能互相发现。
 
-```
-GET  /status   {"running", "started_at", "uptime_sec", "udp_port", "guid", "participant_count"}
-GET  /peers    {"peers": [{"guid", "name"}, ...]}   (基于 DomainParticipantListener)
-GET  /health   {"ok": true}
-```
+### 调试 / 监控
 
-### wdnwebui 端配置
+* **「系统信息 → 在网设备」**：前端拉 `GET /api/system-monitor` 中的
+  `discovery` 字段（`{protocol, multicast_group, own_guid, peer_count,
+  peers:[{guid, name, discovered_at}], wdndds_initial_peers}`）。
+  数据源是 `ComputeRegistry.list_peers()`,由 `_ensure_hub()` 启动时
+  给 Hub 装的 `set_peer_listener()` 实时回调维护。
+* **verify 脚本** (`scripts/verify_simple_discovery.py`)：
+  跨机 / 同机纯 SIMPLE 端到端检查,带退出码（0=peer+RPC OK,
+  1=peer OK 但 RPC 失败, 2=无 peer, 3=cshim 不可用）。
+* **无 daemon HTTP API**：v0.5 时代 daemon 的 `/status` / `/peers`
+  /start /stop 端点全部下线。
 
-`config.json["compute"]` 字段：
+### 已知限制
 
-```json
-{
-  "instances": [{"npu_index": 0, "model": "qwen3-vl-4b"}],
-  "discovery_servers": ["127.0.0.1:7411"],   // 主进程 / worker 都读这个
-  "discovery_server_port": 7411,            // 仅 auto_start_daemon 用
-  "daemon_http_port": 7412,                 // 同上
-  "auto_start_daemon": false                // 默认 false（生产用 systemd）
-}
-```
-
-`compute_registry._persist()` **保留** `discovery_servers` / `ports` /
-`auto_start_daemon` 字段（v0.5.1 修复：之前会覆盖整个 compute section）。
-
-### 跨进程 RPC：发现 + 数据平面
-
-* **发现**：daemon 跑 SERVER 协议，所有 client 跑 CLIENT 协议 →
-  daemon 监听 UDP 7411 → 每个 client 把自己的 participant + endpoint
-  注册到 daemon → daemon 把 endpoint 信息分发给所有 client。
-* **数据平面**：compute_worker 用 `SHM + UDPv4 + TCPv4` 三种 transport；
-  SHM 走同机零拷贝，UDPv4 走同 LAN，TCPv4 走跨子网。
-* **共享 reply topic**：request / reply 两个 topic 复用 shared reply。
-  请求 ID 在 ComputeRequest/ComputeReply 里匹配（参见
-  `wdndds/idl/compute.idl`）。
-* **首次调用 race**：daemon 刚启动时 endpoint 还没匹配，第一次
-  `RpcClient.call()` 会 timeout（约 5s），第二次起成功。wdnwebui
-  probe 自动 retry（每 1s 一次，5s timeout）。
-
-### 注意事项
-
-* **本机 FastDDS 3.6.2 编译 + 源码安装**（参见
-  `.venv/src/wdndds/build_native.sh`）：libfastdds / libfastcdr /
-  libwdndds_idl / libwdndds_cshim 全部安装到 `wdndds/native/`，不依赖
-  系统 apt 包。
-* **FastDDS 3.6 的 rrpc API 还是 stub 状态**：DomainParticipant::create_service
-  等返回 `RETCODE_UNSUPPORTED`（参见 Fast-DDS `DomainParticipantImpl.cpp`）。
-  wdndds_cshim 直接用 raw `DataReader` / `DataWriter` 模拟 Request/Reply
-  —— 等 FastDDS 真实现 rrpc 后可以简化。
-* **disable_builtin_multicast=true** + **avoid_builtin_multicast=true**：
-  cshim 在 SERVER/CLIENT 模式下禁用 multicast，单纯走 UDP 单播。
-  这是 FastDDS 3.6 的官方推荐（embedded board 不保证有 multicast 路由）。
-
+* 跨机 cold-start 时延：从 SPDP 首次通告到 peer 可见 < 1s（实测本机
+  0.20s / 同 LAN 跨机 0.20s）。lease announcement period = 1s 意味着
+  peer 失联最迟 ~3s（lease 20s 之内）后被探测到。
+* FastDDS 3.6 rrpc API 仍 stub（参见 Fast-DDS `DomainParticipantImpl.cpp`）：
+  wdndds_cshim 仍走 raw `DataReader` / `DataWriter` 模拟 Request/Reply。
+* wdndds_daemon 完全删除；旧版 systemd unit
+  `wdndds-daemon.service` 会因 unit 文件不存在报 `Unit not found`，
+  `install_autostart.sh --uninstall` 会一并清掉。

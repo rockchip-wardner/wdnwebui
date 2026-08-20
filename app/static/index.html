@@ -236,14 +236,10 @@
 
         <section class="daemon-section">
           <header class="section-header">
-            <h3>Daemon（wdndds_daemon）</h3>
-            <span class="badge" id="daemon-badge">--</span>
-            <div class="daemon-actions">
-              <button class="vd-btn" id="daemon-start">启动</button>
-              <button class="vd-btn" id="daemon-stop">停止</button>
-            </div>
+            <h3>在网设备（FastDDS SIMPLE discovery）</h3>
+            <span class="badge" id="discovery-badge">--</span>
           </header>
-          <div id="daemon-message" class="npu-message hidden"></div>
+          <div id="discovery-message" class="npu-message hidden"></div>
           <div class="daemon-table-wrap">
             <table class="daemon-table">
               <thead>
@@ -252,14 +248,30 @@
                   <th>值</th>
                 </tr>
               </thead>
-              <tbody id="daemon-tbody">
+              <tbody id="discovery-tbody">
                 <tr class="daemon-empty"><td colspan="2">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <h4 style="margin-top:1rem;font-size:0.95rem;">已发现 peer</h4>
+          <div class="daemon-table-wrap">
+            <table class="daemon-table">
+              <thead>
+                <tr>
+                  <th>GUID</th>
+                  <th>名称</th>
+                  <th>IP</th>
+                  <th>发现时间</th>
+                </tr>
+              </thead>
+              <tbody id="discovery-peers-tbody">
+                <tr class="daemon-empty"><td colspan="4">暂无 peer</td></tr>
               </tbody>
             </table>
           </div>
           <details class="raw-output">
             <summary>完整 JSON</summary>
-            <pre id="daemon-raw"></pre>
+            <pre id="discovery-raw"></pre>
           </details>
         </section>
 

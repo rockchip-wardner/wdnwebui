@@ -157,6 +157,22 @@ def _read_device_name() -> str:
     return socket.gethostname()
 
 
+def _get_local_ip() -> str:
+    """Outbound LAN IP via UDP-connect trick (no actual send). Used to
+    tell local orphan from true LAN peer — clone-image boxes share
+    the same hostname but have different IPs, so hostname() alone
+    is ambiguous."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))   # public IP, no actual send
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return ""
+
+
 def _find_orphan_worker_pid(model_id: str) -> Optional[int]:
     """Back-compat shim — returns the first match from
     :func:`_find_workers_by_name`. New callers should use the list
@@ -695,6 +711,8 @@ class ComputeRegistry:
         self._rknn_device_ids: Optional[list] = None
         self._hub: Any = None                   # wdndds Hub for client side
         self._hub_lock = threading.Lock()
+        self._peers: dict[str, dict] = {}       # guid → {name, discovered_at}
+        self._peers_lock = threading.Lock()
         self._mode: str = _resolve_compute_mode()
         self._migrate_legacy_capability_types()
         if self._mode == "subprocess":
@@ -704,17 +722,15 @@ class ComputeRegistry:
     def compute_mode(self) -> str:
         return self._mode
 
-    # ------------------------------------------------------------------ #
-    # Hub bring-up (client side)                                         #
+# ------------------------------------------------------------------ #
+    # Hub bring-up (SIMPLE discovery)                                    #
     # ------------------------------------------------------------------ #
     def _ensure_hub(self) -> None:
-        """Bring up the wdndds Hub that the main process uses to talk
-        to all compute_worker subprocesses. The Hub points at the LAN's
-        wdndds discovery daemon (one per LAN, configured in
-        config.json["compute"]["discovery_server"]). All wdnwebui
-        processes on the LAN share this daemon for participant +
-        endpoint discovery, replacing the unreliable SIMPLE discovery
-        that broke on embedded boards (Raspberry Pi, RK3588)."""
+        """Bring up the wdndds Hub the main process uses to talk to
+        compute_worker subprocesses. v0.6+ uses FastDDS SIMPLE
+        discovery (multicast 239.255.0.1:7400); set
+        ``WDNDDS_INITIAL_PEERS`` for unicast fallback when LAN
+        multicast is blocked."""
         with self._hub_lock:
             if self._hub is not None:
                 return
@@ -725,38 +741,60 @@ class ComputeRegistry:
             service_names = [
                 f"wdndds/rpc/{mid}" for mid in MODEL_PRESETS.keys()
             ]
-            # Read the discovery server list from config; default
-            # is empty (SIMPLE discovery, single-host) when no
-            # daemon is configured.
-            discovery_servers = self._read_discovery_servers()
             device_name = _read_device_name()
             self._hub = _RpcHub(
                 participant_name=f"wdnwebui-main-{device_name}",
                 domain_id=0,
-                discovery_servers=discovery_servers,
+                discovery_servers=[],
             )
             self._hub.start()
+            def _on_peer(guid: str, name: str, ip: str, discovered: bool) -> None:
+                with self._peers_lock:
+                    if discovered:
+                        self._peers[guid] = {
+                            "name": name,
+                            "ip": ip,
+                            "discovered_at": time.time(),
+                        }
+                    else:
+                        self._peers.pop(guid, None)
+            self._hub.set_peer_listener(_on_peer)
             LOG.info(
-                "ComputeRegistry Hub started: services=%s "
-                "discovery_servers=%s participant_name=wdnwebui-main-%s",
-                service_names, discovery_servers, device_name)
+                "ComputeRegistry Hub started (SIMPLE discovery): "
+                "services=%s participant_name=wdnwebui-main-%s "
+                "WDNDDS_INITIAL_PEERS=%s",
+                service_names, device_name,
+                os.environ.get("WDNDDS_INITIAL_PEERS", "<unset>"))
         except Exception as e:  # noqa: BLE001
             LOG.exception("ComputeRegistry Hub bring-up failed")
             self._cards_failed = str(e)
             self._hub = None
 
-    def _read_discovery_servers(self) -> list[str]:
-        """Read the discovery server list from config.json.
-
-        Returns ["host:port", ...] or [] for default SIMPLE discovery.
+    def list_peers(self) -> list[dict]:
+        """Return the currently visible FastDDS SIMPLE peers as
+        ``[{guid, name, discovered_at}, ...]``. ``name`` may be empty
+        if the peer hasn't sent its participant name yet (FastDDS
+        announces name in a later submessage). Empty list when the
+        Hub isn't up yet.
         """
-        cfg = get_config().get_section("compute")
-        if not cfg:
-            return []
-        servers = cfg.get("discovery_servers") or []
-        if isinstance(servers, str):
-            servers = [s.strip() for s in servers.split(",") if s.strip()]
-        return [s for s in servers if s]
+        with self._peers_lock:
+            return [
+                {"guid": g, **info}
+                for g, info in self._peers.items()
+            ]
+
+    def own_guid(self) -> str:
+        """Return this participant's own GUID, or ``""`` when the
+        Hub isn't up. Useful for the system-monitor UI to distinguish
+        ``self`` from peers.
+        """
+        hub = self._hub
+        if hub is None:
+            return ""
+        try:
+            return hub.guid()
+        except Exception:
+            return ""
 
     def _hub_or_raise(self):
         if self._hub is None:
@@ -1250,16 +1288,35 @@ class ComputeRegistry:
         """
         if model_id not in MODEL_PRESETS:
             return None
-        info = self._probe_service(model_id)
-        if not info:
+        # DDS 选 endpoint 是 best-effort 的,可能反复命中坏 peer。多探
+        # 几次:每次 create_requester 拿到新 client,cshim 可能重选 endpoint。
+        # 全 error 则拒绝采纳(避免脏数据进 network 栏)。
+        info = None
+        for probe_try in range(3):
+            info = self._probe_service(model_id)
+            if info is None:
+                break
+            if info.get("status") != "error":
+                break
+            time.sleep(2.0)
+        if info is None:
+            return None
+        if info.get("status") == "error":
+            LOG.warning("adopt: %s: probes returned error, skipping", model_id)
             return None
         preset = MODEL_PRESETS[model_id]
         worker_npu = info.get("npu_index")
         worker_pid = info.get("pid")
         worker_host = (info.get("hostname") or "").strip()
+        worker_ip = (info.get("peer_ip") or "").strip()
         worker_device = (info.get("device_name") or "").strip()
         local_host = socket.gethostname()
-        is_local = bool(worker_host) and worker_host == local_host
+        local_ip = _get_local_ip()
+        # 优先 IP 比对 —— 克隆镜像板 hostname 撞车;peer_ip 缺失时退到 hostname。
+        if worker_ip and local_ip:
+            is_local = worker_ip == local_ip
+        else:
+            is_local = bool(worker_host) and worker_host == local_host
         if is_local:
             source = "adopted_local"
             label_host = worker_device or local_host
@@ -1855,69 +1912,54 @@ class ComputeRegistry:
             by_model: dict[str, ModelInstance] = {
                 inst.model_id: inst for inst in self._instances.values()
             }
+
+        def _unavailable_entry(model_id: str) -> dict:
+            preset = MODEL_PRESETS[model_id]
+            return {
+                "model_id":           model_id,
+                "label":              preset["label"],
+                "instance_name":      preset["instance_name"],
+                "capability_types":   list(preset["capability_types"]),
+                "memory_estimate_mb": preset["memory_estimate_mb"],
+                "description":        preset.get("description", ""),
+                "available_targets":  list(preset.get("available_targets", ["182x"])),
+                "status":             "unavailable",
+                "error":              "",
+                "npu_index":          -1,
+                "pid":                0,
+                "load_time_sec":      None,
+                "loaded_at":          None,
+                "available_image_sizes": [],
+                "_source":            "unavailable",
+                "_peer_guid":         "",
+                "_peer_name":         "",
+                "_peer_ip":           "",
+            }
+
         for model_id, preset in MODEL_PRESETS.items():
             inst = by_model.get(model_id)
             if inst is None:
-                out.append({
-                    "model_id":           model_id,
-                    "label":              preset["label"],
-                    "instance_name":      preset["instance_name"],
-                    "capability_types":   list(preset["capability_types"]),
-                    "memory_estimate_mb": preset["memory_estimate_mb"],
-                    "description":        preset.get("description", ""),
-                    "available_targets":  list(preset.get("available_targets", ["182x"])),
-                    "status":             "unavailable",
-                    "error":              "",
-                    "npu_index":          -1,
-                    "pid":                0,
-                    "load_time_sec":      None,
-                    "loaded_at":          None,
-                    # Not available → empty list (UI dropdown shows
-                    # "loading" / disabled until a worker comes up).
-                    "available_image_sizes": [],
-                    "_source":            "unavailable",
-                    "_peer_guid":         "",
-                    "_peer_name":         "",
-                    "_peer_ip":           "",
-                })
+                out.append(_unavailable_entry(model_id))
                 continue
-            d = inst.to_dict()
-            out.append(d)
-        # Stable ordering: spawned → adopted → unavailable.
-        order = {"spawned": 0, "adopted": 1, "unavailable": 2}
+            out.append(inst.to_dict())
+            # adopted/adopted_local 时本地还没 spawn —— 补一条 unavailable
+            # 让本地栏依然有「启用」卡(用户想用本机 NPU 可覆盖)。
+            if inst._source in ("adopted", "adopted_local"):
+                out.append(_unavailable_entry(model_id))
+        # Stable ordering: spawned → adopted_local → adopted → unavailable.
+        order = {"spawned": 0, "adopted_local": 1, "adopted": 2, "unavailable": 3}
         out.sort(key=lambda x: (order.get(x.get("_source", ""), 9),
                                 x.get("model_id", "")))
         return out
 
     def boot_compute_services(self) -> None:
-        """App boot: ensure every model in ``config.compute.services``
-        has *some* live worker reachable on the LAN.
-
-        For each model_id in the list:
-          1. if we already have a record, skip
-          2. spawn a fresh local subprocess (config is user intent —
-             LAN peer is untrusted: may be down / resource-stuffed /
-             version-mismatched)
-          3. if local spawn fails, fall back to adopting a LAN peer
-
-        Workers are NOT bound to an NPU at boot; they wait in
-        ``not_loaded`` until the user clicks 启用 on the compute-config
-        page (which triggers ``bind_instance``).
-
-        ``_probe_service`` runs a 3 × 5s race-recovery retry inside
-        ``_adopt_existing_worker`` to absorb the cshim daemon
-        endpoint-matching race. The whole call is also wrapped in a
-        daemon thread by :func:`app.main.create_app` so neither the
-        probe timeouts nor the spawn startup time blocks uvicorn
-        from binding port 8000 — the browser sees the page immediately
-        while boot runs in the background; the 1Hz ``/api/compute``
-        poll reflects each model's state as it lands.
-
-        末尾跑一次 :meth:`_cleanup_unregistered_workers` 兜底扫一遍
-        ``/proc/*/comm``，杀掉 registry 没接管、但 comm 以 ``worker:``
-        开头的进程（理论上 ``_adopt_existing_worker`` 内已经清过一遍，
-        这里只是防 probe 漏掉、或用户在 boot 期间手动启了 worker 的
-        极端情况）。
+        """App boot: for each model in ``config.compute.services`` try
+        to adopt a LAN peer that already runs it. Local workers are
+        not auto-spawned here — they only come up when the user
+        clicks 启用 on the 算力配置 page. See
+        :func:`app.main.create_app` for the daemon-thread wrapper
+        and :meth:`_cleanup_unregistered_workers` for the orphan
+        sweep.
         """
         try:
             self.list_cards()
@@ -1929,7 +1971,7 @@ class ComputeRegistry:
             stored = {}
         services = stored.get("services") if isinstance(stored, dict) else None
         if not isinstance(services, list):
-            return
+            services = []
         for entry in services:
             if not isinstance(entry, str):
                 continue
@@ -1942,25 +1984,14 @@ class ComputeRegistry:
                 if any(i.model_id == model_id
                        for i in self._instances.values()):
                     continue
-            # config.compute.services 是用户显式意图 → 优先本地 spawn，
-            # LAN peer 不可控（挂掉 / 资源占满 / 版本不匹配）。
-            try:
-                self._spawn_compute_worker(model_id)
-                LOG.info("boot: spawned local %s (per config.services)", model_id)
-                continue
-            except Exception as spawn_err:  # noqa: BLE001
-                LOG.warning("boot spawn %s failed (%s); falling back to peer adopt",
-                            model_id, spawn_err)
             adopted = None
             try:
                 adopted = self._adopt_existing_worker(model_id)
             except Exception as e:  # noqa: BLE001
-                LOG.warning("boot probe failed for %s: %s", model_id, e)
+                LOG.warning("boot peer-adopt failed for %s: %s", model_id, e)
             if adopted is not None:
                 LOG.info("boot: adopted %s (peer guid=%s status=%s)",
                          model_id, adopted._peer_guid, adopted.status)
-        # boot 末尾总清扫：处理 config 移除某 service 后残留的孤儿、
-        # 以及 _adopt 阶段 probe 漏掉的边界情况。
         try:
             self._cleanup_unregistered_workers()
         except Exception as e:  # noqa: BLE001
@@ -2113,6 +2144,21 @@ class ComputeRegistry:
                         consecutive_failures += 1
                         LOG.warning("info call failed for %s (%d): %s",
                                    inst.model_id, consecutive_failures, e)
+                        # BrokenPipe 后 cshim 端 endpoint 已坏;重建 RpcClient
+                        # 让 cshim 重新走 endpoint 发现,可能命中别的健康 peer。
+                        try:
+                            inst.rpc_client.destroy()
+                        except Exception:
+                            pass
+                        try:
+                            self._setup_rpc_client(inst)
+                            LOG.info("rebuilt rpc_client for %s after "
+                                     "%d consecutive failures",
+                                     inst.model_id, consecutive_failures)
+                        except Exception as setup_e:
+                            LOG.warning("rpc_client rebuild failed for "
+                                        "%s: %s",
+                                        inst.model_id, setup_e)
                         # For adopted (远端 peer): after several consecutive
                         # failures we conclude the peer is gone. adopted_local
                         # 跟 spawned 一样不算（它们是本机孤儿，不存在 "peer

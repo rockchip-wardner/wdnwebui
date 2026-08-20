@@ -107,8 +107,8 @@ class RestartRequest(BaseModel):
 class ComputeConfigPayload(BaseModel):
     """``PUT /api/compute/config`` 入参。
 
-    其它字段（discovery_servers / ports / auto_start_daemon /
-    hardware_capabilities 等）按现有语义落盘；``instances`` 若存在被
+    其它字段（hardware_capabilities / app_prompts /
+    tool_call_max_iters 等）按现有语义落盘；``instances`` 若存在被
     ``extra="ignore"`` 丢弃（实例选择不在 config 持久化）。
     """
 
