@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import tempfile
 from pathlib import Path
 from threading import RLock
@@ -18,6 +19,14 @@ from typing import Any
 
 _DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config.json"
+)
+
+
+_DEVICE_NAME_LENGTH = 8
+_DEVICE_NAME_ALPHABET = (
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
 )
 
 
@@ -30,6 +39,14 @@ def _resolve_config_path() -> Path:
         except OSError:
             return p
     return _DEFAULT_CONFIG_PATH
+
+
+def _random_device_name() -> str:
+    """8-char alphanumeric identifier (mixed case + digits)."""
+    return "".join(
+        secrets.choice(_DEVICE_NAME_ALPHABET)
+        for _ in range(_DEVICE_NAME_LENGTH)
+    )
 
 
 class ConfigStore:
@@ -46,12 +63,19 @@ class ConfigStore:
         return self._path
 
     def reload(self) -> dict[str, Any]:
-        """Re-read the file from disk. Missing / unreadable / non-object
-        payloads all collapse to ``{}`` so the rest of the app can treat
-        the config as a JSON object unconditionally."""
+        """Re-read the file from disk.
+
+        Missing file → write the first-run template (random
+        ``device_name`` + every model from ``MODEL_PRESETS`` registered
+        as ``compute.services``) so a fresh deployment boots with
+        ``boot_compute_services`` actually able to spawn workers. An
+        existing-but-empty / corrupted / non-object payload still
+        collapses to ``{}`` — we only auto-seed when the file is
+        genuinely missing, never overwrite a user-wiped one.
+        """
         with self._lock:
             if not self._path.exists():
-                self._data = {}
+                self._seed_defaults()
                 return self._data
             try:
                 with self._path.open("r", encoding="utf-8") as f:
@@ -64,6 +88,74 @@ class ConfigStore:
                 return self._data
             self._data = raw
             return self._data
+
+    def _seed_defaults(self) -> None:
+        """Write the first-run template to disk.
+
+        Acquires ``self._lock`` itself so it's safe to call from any
+        context (including the recursive re-entry from
+        :py:meth:`reload` while the lock is already held; ``RLock``
+        handles that).
+
+        The template mirrors the current shipping config.json:
+
+        * ``base`` — default paths + a freshly randomized
+          ``device_name``
+        * ``compute.services`` — every model from
+          :data:`app.services.compute_registry.MODEL_PRESETS`, so
+          ``boot_compute_services`` has work to do
+        * ``compute.hardware_capabilities`` — every entry in
+          :data:`app.services.compute_registry.HARDWARE_CAPABILITIES`
+          enabled (``True``), matching the on-device reality of a
+          full-featured board
+        * ``compute.app_prompts`` — the three configurable schema
+          fields (VLMDoc.text / .level, TargetDoc.desc) seeded with
+          the SDK's :mod:`app.services.detector` ``DEFAULT_*_DESC``
+          constants, so the system lands in a known-good prompt state
+          on first boot
+
+        All three sibling modules are imported lazily to avoid
+        ``config → compute_registry → config`` and
+        ``config → detector → config`` circular imports; by the time
+        ``_seed_defaults`` actually fires (file missing at startup)
+        both ``compute_registry`` and ``detector`` are already loaded
+        by the app import graph.
+        """
+        from app.services.compute_registry import (
+            MODEL_PRESETS,
+            _hardware_capability_default_state,
+        )
+        from app.services.detector import (
+            DEFAULT_TARGET_DOC_DESC_DESC,
+            DEFAULT_VLM_DOC_LEVEL_DESC,
+            DEFAULT_VLM_DOC_TEXT_DESC,
+        )
+        with self._lock:
+            self._data = {
+                "base": {
+                    "device_name": _random_device_name(),
+                    "model_path": "/userdata/models/",
+                    "resource_dir": "/userdata",
+                },
+                "compute": {
+                    "services": list(MODEL_PRESETS.keys()),
+                    "hardware_capabilities": _hardware_capability_default_state(),
+                    "app_prompts": {
+                        "video_detection": {
+                            "VLMDoc": {
+                                "text": DEFAULT_VLM_DOC_TEXT_DESC,
+                                "level": DEFAULT_VLM_DOC_LEVEL_DESC,
+                            },
+                        },
+                        "video_target_detection": {
+                            "TargetDoc": {
+                                "desc": DEFAULT_TARGET_DOC_DESC_DESC,
+                            },
+                        },
+                    },
+                },
+            }
+            self._persist()
 
     def snapshot(self) -> dict[str, Any]:
         """Return a deep copy so callers can't mutate the cached state."""
