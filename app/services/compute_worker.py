@@ -45,6 +45,50 @@ from typing import Any, Optional
 LOG = logging.getLogger("compute_worker")
 
 
+# Orphan-worker SIGPIPE pre-arm. compute_worker is spawned with
+# stdout/stderr=PIPE so the main process can tail + forward logs via
+# _drain_worker_stderr; when the original parent dies (uvicorn reload,
+# kill-stale reaping, unclean shutdown) the kernel closes the parent's
+# read-end of the pipes but our write-end stays open — every subsequent
+# stderr write then raises BrokenPipeError on the Python side AND
+# triggers the default SIGPIPE termination on the C side. Either one
+# flips state to {"status":"error","init_error":"BrokenPipeError: ..."},
+# which the new run.py's adoption probe then surfaces as a warning.
+# Two pieces of pre-arming so we stay cleanly adoptable across restarts.
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+except (AttributeError, ValueError):
+    pass
+
+
+class _BrokenPipeSafeStderr:
+    """Forward to the real sys.stderr but swallow BrokenPipeError on write/flush."""
+
+    __slots__ = ("_real",)
+
+    def __init__(self, real):
+        self._real = real
+
+    def write(self, data):
+        try:
+            return self._real.write(data)
+        except BrokenPipeError:
+            return len(data) if data else 0
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except BrokenPipeError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+if not isinstance(sys.stderr, _BrokenPipeSafeStderr):
+    sys.stderr = _BrokenPipeSafeStderr(sys.stderr)
+
+
 _EMBED_TEXT_TIMEOUT = 30.0
 _EMBED_VIDEO_TIMEOUT = 60.0
 
@@ -282,6 +326,23 @@ def info_handler(state: dict, model_id: str,
                  startup_npu_index: int | None,
                  model_dir: str | None) -> dict:
     npu_index = state.get("npu_index")
+
+    # Resource self-heal: recheck model_dir on every RPC. The
+    # startup check at line 1076 only fires once; if the user
+    # populates the directory later (or deletes it out from under
+    # us) we want the next probe to converge without a worker
+    # restart. Skip ``running`` / ``loading`` / ``error`` —
+    # those are owned by the load path.
+    cur_model_dir = state.get("model_dir")
+    if cur_model_dir is not None:
+        cur_status = state.get("status", "not_loaded")
+        if os.path.isdir(cur_model_dir):
+            if cur_status == "missing_model_dir":
+                state["status"] = "not_loaded"
+        else:
+            if cur_status == "not_loaded":
+                state["status"] = "missing_model_dir"
+
     return {
         "status":             state.get("status", "not_loaded"),
         "model":              model_id,
@@ -851,12 +912,24 @@ def infer_handler(state: dict, payload: dict) -> dict:
         # structured。这里 model_dump 把结构化字段塞进 reply["structured"]，
         # 主进程 ``rpc_session_proxy`` 那边解析后填进 ``_ProxyResult._raw``，
         # VFA Path 2 就能拿到完整字段。
+        #
+        # 弹掉 ``attachment``：LMOutput 的 attachment 字段是
+        # ``List[Attachment]``，Attachment 是 plain class（不是
+        # pydantic model）— model_dump 要么把 Attachment 实例原样塞进
+        # dict，要么直接抛 PydanticUserError，两种情况都会让 reply
+        # 无法 JSON 序列化（cshim 在 worker 边界 json.dumps 整个
+        # reply）。audio bytes 已经走 ``attachment_b64`` 单独走线，主进程
+        # proxy 从那里重建 ``_AttachmentProxy``（rpc_session_proxy.py:
+        # 287-299）— pop 掉 result_data.attachment 对 TTS / VLM
+        # 重构无影响。
         if not is_tool_instance and not isinstance(result, (str, bytes, dict)):
             try:
                 if hasattr(result, "model_dump") and callable(getattr(result, "model_dump", None)):
                     _dump = result.model_dump()
                     if isinstance(_dump, dict) and _dump:
-                        reply["structured"] = _dump
+                        _dump.pop("attachment", None)
+                        if _dump:
+                            reply["structured"] = _dump
             except Exception as _dump_ex:
                 LOG.warning("model_dump failed: %s", _dump_ex)
         if attachment_b64 is not None:
@@ -871,11 +944,15 @@ def infer_handler(state: dict, payload: dict) -> dict:
         # worker boundary and the detector's ``isinstance(result,
         # TargetDoc)`` branch never matches on the main side. Mirrors the
         # ``tool_call_args`` pattern for ``@Callable`` reconstruction
-        # (see ``_run_tool_side_effect`` docstring).
+        # (see ``_run_tool_side_effect`` docstring). 同上 strip
+        # ``attachment`` 让 reply 可 JSON 序列化。
         if (not is_tool_instance
                 and type(result).__name__ in {"VLMDoc", "TargetDoc", "TTSResult"}):
             try:
-                reply["result_data"] = result.model_dump()
+                _dump = result.model_dump()
+                if isinstance(_dump, dict):
+                    _dump.pop("attachment", None)
+                    reply["result_data"] = _dump
             except Exception as e:
                 LOG.warning(
                     "schema instance dump failed (%s): %s",

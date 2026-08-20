@@ -2192,9 +2192,14 @@ class ComputeRegistry:
                                           inst.model_id, inst.npu_index)
                     elif worker_status == "not_loaded":
                         with self._lock:
+                            # ``missing_model_dir`` deliberately absent
+                            # from the sticky set: the worker's info_handler
+                            # self-heals back to ``not_loaded`` once the
+                            # directory reappears, so we want the next
+                            # probe to converge. Other terminal states
+                            # (running / loading / error) stay untouched.
                             if inst.status not in {"not_loaded", "loading",
-                                                    "running", "error",
-                                                    "missing_model_dir"}:
+                                                    "error"}:
                                 inst.status = "not_loaded"
                     elif worker_status == "missing_model_dir":
                         # 资源缺失：worker 启动时就发现 model_dir 不存在，
