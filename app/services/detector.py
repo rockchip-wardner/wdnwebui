@@ -51,6 +51,13 @@ import numpy as np
 from app.services.config import get_config
 
 
+# 历史默认（不再使用，简化版见 DEFAULT_*_DESC）：见 _build_vlm_doc_class / _build_target_doc_class 函数体内 inline 字符串
+# App 提示词默认值（简化中文一句）；用户可在「系统配置 → App 提示词模板」覆盖。
+DEFAULT_VLM_DOC_TEXT_DESC = "用中文一句话描述画面中的场景、主体（人/物）、动作和环境。"
+DEFAULT_VLM_DOC_LEVEL_DESC = "严重程度标签：正常 / 警告 / 危险。"
+DEFAULT_TARGET_DOC_DESC_DESC = "对目标框内内容的一句话中文描述。"
+
+
 _WDNAI_IMPORT_ERROR = ""
 # wdnai is imported LAZILY (at start() time, not at module load) — RKNN native
 # libraries can race with wdnav's mpp init or fork-unsafe state if loaded too
@@ -129,12 +136,16 @@ def _load_wdnai():
 # ``attachment`` automatically when a future backend produces binary
 # outputs. Currently empty for VLM (text-only path).
 # --------------------------------------------------------------------------- #
-def _build_vlm_doc_class():
+def _build_vlm_doc_class(text_desc: str, level_desc: str):
     """Build the ``VLMDoc`` schema lazily, once wdnai is importable.
 
     The class is created with ``@Generable`` + ``LMOutput`` as the base so
     the SDK can attach the parsed fields into an instance that also
     carries the standard ``attachment`` slot.
+
+    ``text_desc`` / ``level_desc`` —— 用户在「系统配置 → App 提示词模板」
+    覆盖的 ``Field(description=...)`` 文本；缺失时回退到
+    ``DEFAULT_VLM_DOC_TEXT_DESC`` / ``DEFAULT_VLM_DOC_LEVEL_DESC``。
     """
     # ``from typing import Optional`` *inside* this function so the name
     # shows up in the function's locals — ``pydantic`` resolves forward
@@ -160,33 +171,57 @@ def _build_vlm_doc_class():
 
     @Generable
     class VLMDoc(_PydBaseModel):
-        text: str = Field(
-            description=(
-                "Natural-language description of what is happening in the "
-                "frame: scene, main subjects (people/objects), their actions "
-                "and the surrounding environment. Reply in the same language "
-                "as the user's request. Ignore on-screen overlays such as "
-                "timestamps, watermarks, subtitles or captions — they are "
-                "not part of the actual scene."
-            ),
-        )
-        level: Optional[str] = Field(
-            default=None,
-            description="Optional severity tag (e.g. 'normal' / 'warning' / 'danger').",
-        )
+        text: str = Field(description=text_desc)
+        level: Optional[str] = Field(default=None, description=level_desc)
 
     return VLMDoc
 
 
-# Cached after first build.
-_VLM_DOC_CLS = None
+# --------------------------------------------------------------------------- #
+# Schema cache keyed by (schema_name, tuple(sorted(field_descs))). The key
+# includes the description strings so any PUT to compute.app_prompts that
+# changes one of the user-configurable Field descriptions yields a different
+# key and triggers a rebuild. Schema rebuilds only happen on key miss —
+# typically at most once per "保存" click in the 系统配置 page, not per
+# inference. TargetDoc's x1/y1/x2/y2 descriptions are hardcoded literals
+# inside ``_build_target_doc_class`` and do NOT participate in the cache key
+# (per spec: only ``desc`` is user-configurable for TargetDoc).
+# --------------------------------------------------------------------------- #
+_SCHEMA_CACHE: dict[tuple, type] = {}
+
+
+def _load_app_prompts(app_key: str, schema_cls: str) -> dict[str, str]:
+    """从 config.json["compute"]["app_prompts"][app_key][schema_cls] 读 schema 提示词覆盖。
+    缺字段 / 空值 → fallback 到 DEFAULT_*_DESC（不写盘）。
+    """
+    cfg = get_config().get_section("compute", {}) or {}
+    app_prompts = cfg.get("app_prompts") or {}
+    app_block = app_prompts.get(app_key) or {}
+    schema_block = app_block.get(schema_cls) or {}
+    result: dict[str, str] = {}
+    # 映射表：每个 schema 类的可配字段名 → 默认常量
+    defaults = {
+        ("video_detection", "VLMDoc"): {"text": DEFAULT_VLM_DOC_TEXT_DESC, "level": DEFAULT_VLM_DOC_LEVEL_DESC},
+        ("video_target_detection", "TargetDoc"): {"desc": DEFAULT_TARGET_DOC_DESC_DESC},
+    }
+    for field, default_desc in defaults.get((app_key, schema_cls), {}).items():
+        user_val = schema_block.get(field)
+        if isinstance(user_val, str) and user_val.strip():
+            result[field] = user_val.strip()
+        else:
+            result[field] = default_desc
+    return result
 
 
 def _get_vlm_doc_cls():
-    global _VLM_DOC_CLS
-    if _VLM_DOC_CLS is None:
-        _VLM_DOC_CLS = _build_vlm_doc_class()
-    return _VLM_DOC_CLS
+    descs = _load_app_prompts("video_detection", "VLMDoc")
+    cache_key = ("VLMDoc", tuple(sorted(descs.items())))
+    cached = _SCHEMA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    cls = _build_vlm_doc_class(descs["text"], descs["level"])
+    _SCHEMA_CACHE[cache_key] = cls
+    return cls
 
 
 # --------------------------------------------------------------------------- #
@@ -197,12 +232,18 @@ def _get_vlm_doc_cls():
 # 述文本），detector 在 worker 线程里按 bbox 裁原帧、JPEG 编码、base64
 # 内嵌进事件 JSON（``crop_b64`` / ``crop_w`` / ``crop_h``），``desc``
 # 复制到 ``text`` 字段，事件历史列表沿用现有展示路径。
-def _build_target_doc_class():
+def _build_target_doc_class(desc_desc: str):
     """Build the ``TargetDoc`` schema lazily, once wdnai is importable.
 
     与 ``VLMDoc`` 一样继承 ``BaseModel`` 而非 ``LMOutput`` —— 避免
     ``attachment: List[Attachment]`` 字段污染 ``model_json_schema``，
     否则 SDK 的 ``_safe_schema`` 会返回空串，模型看不到字段含义。
+
+    ``desc_desc`` —— 用户在「系统配置 → App 提示词模板」覆盖的
+    ``desc`` 字段 ``Field(description=...)`` 文本；缺失时回退到
+    ``DEFAULT_TARGET_DOC_DESC_DESC``。4 个坐标字段 ``x1/y1/x2/y2``
+    的描述是协议级格式规约（"0–1000 归一化"），不属于自然语言提示
+    词，按用户决策保持 hardcoded 不开放给配置。
     """
     from typing import Optional  # noqa: F401  (kept for parity w/ VLMDoc)
 
@@ -224,20 +265,24 @@ def _build_target_doc_class():
         y1: float = Field(description="ROI 左上角 y，0–1000 归一化。")
         x2: float = Field(description="ROI 右下角 x，0–1000 归一化。")
         y2: float = Field(description="ROI 右下角 y，0–1000 归一化。")
-        desc: str = Field(description="对 ROI 框出区域内容的描述文本。")
+        desc: str = Field(description=desc_desc)
 
     return TargetDoc
 
 
-# Cached after first build.
-_TARGET_DOC_CLS = None
+# Cached after first build. (cache unified into _SCHEMA_CACHE above — see
+# ``_get_vlm_doc_cls`` for the key construction.)
 
 
 def _get_target_doc_cls():
-    global _TARGET_DOC_CLS
-    if _TARGET_DOC_CLS is None:
-        _TARGET_DOC_CLS = _build_target_doc_class()
-    return _TARGET_DOC_CLS
+    descs = _load_app_prompts("video_target_detection", "TargetDoc")
+    cache_key = ("TargetDoc", tuple(sorted(descs.items())))
+    cached = _SCHEMA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    cls = _build_target_doc_class(descs["desc"])
+    _SCHEMA_CACHE[cache_key] = cls
+    return cls
 
 
 @dataclass
