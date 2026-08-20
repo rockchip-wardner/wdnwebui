@@ -21,7 +21,7 @@ import json
 import secrets
 import string
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -118,6 +118,183 @@ class BaseConfig(BaseModel):
         if not v.startswith("/"):
             raise ValueError("resource_dir 必须是绝对路径 (以 / 开头)")
         return v
+
+
+# --- app-prompts section schema -------------------------------------------
+#
+# Per-app Pydantic schema field descriptions (the natural-language hints
+# baked into ``Field(description=...)``) are user-editable from the
+# 系统配置 page. Defaults live in ``app/services/detector.py``
+# (``DEFAULT_*_DESC``). Three-layer nesting on disk:
+#
+#     config.json["compute"]["app_prompts"][<app_key>][<schema_cls>][<field>]
+#
+# Adding a new app's prompts:
+#   1. Define a new ``<Schema>Prompts`` class with ``field_validator``
+#      enforcing ≤ 4096 chars per non-empty string field (empty strings
+#      are allowed and mean "use the detector-side default").
+#   2. Register the sub-shape check in
+#      ``AppPromptsConfig._check_*`` so PUT enforces it (422 on bad input).
+#   3. In ``app/services/detector.py`` add a ``DEFAULT_<...>_DESC``
+#      constant + thread the user value through ``_build_*_class``.
+#
+# ``TargetDoc`` coordinate descriptions (x1 / y1 / x2 / y2) are
+# deliberately NOT exposed — they are protocol-level format specs
+# (0–1000 normalized ROI bounds), not natural language, so they
+# remain hardcoded inside ``detector._build_target_doc_class()``.
+
+# Upper bound for a single field description (chosen to comfortably
+# exceed any reasonable one-liner but bound memory / UI render cost).
+_PROMPT_DESC_MAX_LEN = 4096
+
+
+def _check_prompt_desc(v: str, field_label: str) -> str:
+    """Shared validator body for prompt-description string fields.
+    Strips whitespace; allows empty strings (interpreted as "use the
+    detector-side default" by :func:`get_app_prompts` /
+    :func:`put_app_prompts`); rejects oversized non-empty values
+    (raises ``ValueError`` so Pydantic surfaces a 422)."""
+    v = v.strip()
+    if v and len(v) > _PROMPT_DESC_MAX_LEN:
+        raise ValueError(
+            f"{field_label} 描述不能超过 {_PROMPT_DESC_MAX_LEN} 字符"
+        )
+    return v
+
+
+class VLMDocPrompts(BaseModel):
+    """Field descriptions for the ``VLMDoc`` schema used by the
+    音视频描述 (video-detection) page.
+
+    Both fields correspond 1:1 to the ``text`` / ``level`` attributes
+    on ``VLMDoc``. The detector rebuilds the schema class on
+    ``start()`` when these values change, so saving here is picked
+    up on the next detection launch (no hot-reload inside a running
+    worker)."""
+
+    model_config = {"extra": "ignore", "validate_default": True}
+
+    text: str = Field(
+        default="",
+        description="VLMDoc.text 字段的自然语言描述（指导模型如何描述画面）",
+    )
+    level: str = Field(
+        default="",
+        description="VLMDoc.level 字段的自然语言描述（事件严重等级）",
+    )
+
+    @field_validator("text", "level")
+    @classmethod
+    def _bounded(cls, v: str) -> str:
+        # field_label is the same for both — keep the error generic
+        # so the UI doesn't have to special-case each field.
+        return _check_prompt_desc(v, "VLMDoc 字段")
+
+
+class TargetDocPrompts(BaseModel):
+    """Field descriptions for the ``TargetDoc`` schema used by the
+    视频目标检测 (video-target-detection) page.
+
+    Only the ``desc`` description is user-editable. The 4 coordinate
+    descriptions (``x1`` / ``y1`` / ``x2`` / ``y2``) are protocol-
+    level format specs (0–1000 normalized ROI bounds) and are
+    intentionally hardcoded inside
+    ``detector._build_target_doc_class()`` — adding them here would
+    expose implementation details that should never change per
+    device."""
+
+    model_config = {"extra": "ignore", "validate_default": True}
+
+    desc: str = Field(
+        default="",
+        description=(
+            "TargetDoc.desc 字段的自然语言描述"
+            "（对目标 ROI 框出区域的内容描述）"
+        ),
+    )
+
+    @field_validator("desc")
+    @classmethod
+    def _bounded(cls, v: str) -> str:
+        return _check_prompt_desc(v, "TargetDoc 字段")
+
+
+class AppPromptsConfig(BaseModel):
+    """Top-level container for per-app Pydantic schema field
+    descriptions. Each app section is a loose ``Dict[str, Any]`` so
+    new schema-class entries (e.g. an audio-understanding schema) can
+    be added without bumping this model. Known sub-shapes
+    (``VLMDoc`` under ``video_detection`` and ``TargetDoc`` under
+    ``video_target_detection``) are still validated against
+    :class:`VLMDocPrompts` / :class:`TargetDocPrompts` so a malformed
+    field surfaces as 422 at the API boundary instead of leaking
+    bad data into the detector cache.
+
+    Empty-string leaf fields are accepted (interpreted as "use the
+    detector-side default") but get pruned from the persisted
+    payload in :func:`put_app_prompts` via
+    :func:`_strip_empty_strings` so they never overwrite an existing
+    user value nor appear as ``""`` in ``config.json``."""
+
+    model_config = {"extra": "ignore", "validate_default": True}
+
+    video_detection: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "音视频描述页 schema 字段描述，"
+            "key 为 schema 类名（如 VLMDoc），value 为字段名→描述"
+        ),
+    )
+    video_target_detection: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "视频目标检测页 schema 字段描述，"
+            "key 为 schema 类名（如 TargetDoc），value 为字段名→描述"
+        ),
+    )
+
+    @field_validator("video_detection")
+    @classmethod
+    def _check_video_detection(
+        cls, v: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("video_detection 必须是 dict")
+        # Validate the well-known VLMDoc sub-shape against
+        # VLMDocPrompts (422 on bad leaf fields) and replace it with
+        # the cleaned dump so extras (e.g. junk the user pasted in)
+        # don't leak into the persisted config — Pydantic's
+        # ``extra="ignore"`` only applies inside the sub-model, not
+        # to the outer ``Dict[str, Any]``. Unknown top-level keys
+        # (e.g. a future schema class) are preserved so this
+        # endpoint stays schema-flexible.
+        cleaned: dict[str, Any] = dict(v)
+        if "VLMDoc" in cleaned and isinstance(cleaned["VLMDoc"], dict):
+            cleaned["VLMDoc"] = VLMDocPrompts(**cleaned["VLMDoc"]).model_dump()
+        return cleaned
+
+    @field_validator("video_target_detection")
+    @classmethod
+    def _check_video_target_detection(
+        cls, v: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("video_target_detection 必须是 dict")
+        # Same pattern as ``_check_video_detection`` — validate the
+        # TargetDoc sub-shape and replace it with the cleaned dump so
+        # coordinate fields (x1 / y1 / x2 / y2) the user might paste
+        # in by mistake never get persisted (TargetDocPrompts has
+        # ``extra="ignore"`` but the outer Dict does not).
+        cleaned: dict[str, Any] = dict(v)
+        if "TargetDoc" in cleaned and isinstance(cleaned["TargetDoc"], dict):
+            cleaned["TargetDoc"] = TargetDocPrompts(
+                **cleaned["TargetDoc"]
+            ).model_dump()
+        return cleaned
 
 
 def _generate_missing_defaults(stored: dict[str, Any]) -> dict[str, Any]:
@@ -252,5 +429,287 @@ async def put_base_config(payload: BaseConfig) -> dict:
         "section": section,
         "model_path_exists": bool(model_path) and Path(model_path).exists(),
         "resource_dir_exists": bool(resource_dir) and Path(resource_dir).exists(),
+        "data": snap,
+    }
+
+
+def _app_prompts_leaf(
+    app_prompts: dict[str, Any], app_key: str, schema_cls: str, field: str
+) -> str:
+    """Read a single leaf string from ``compute.app_prompts``.
+
+    Walks ``app_prompts → app_key → schema_cls → field`` defensively
+    (every layer can be absent / wrong-typed if the config was hand-
+    edited or carried over from a prior schema). Returns ``""`` for
+    any missing or non-string node so the GET response always has a
+    fully-populated leaf string."""
+    cur: Any = app_prompts
+    for key in (app_key, schema_cls, field):
+        if not isinstance(cur, dict):
+            return ""
+        cur = cur.get(key)
+    if not isinstance(cur, str):
+        return ""
+    return cur.strip()
+
+
+def _deep_merge_dict(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Return a new dict with ``overlay`` deep-merged into ``base``.
+
+    Dict-on-dict recurses so sibling keys at every layer are preserved
+    (a PUT that only updates ``video_detection.VLMDoc.text`` must not
+    wipe ``video_detection.VLMDoc.level`` or
+    ``video_target_detection``). Non-dict values are replaced wholesale
+    (no list-element merge). ``base`` is deep-copied so the caller's
+    object is untouched.
+    """
+    out: dict[str, Any] = json.loads(json.dumps(base))
+    for k, v in overlay.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _strip_empty_strings(d: dict[str, Any]) -> dict[str, Any]:
+    """Return a new dict with empty-string leaf values removed.
+
+    Walks ``d`` recursively and prunes any leaf whose value is
+    ``""`` (after the upstream Pydantic validator strips it). Dict
+    subtrees are recursed into and replaced with their pruned form;
+    non-dict non-string values are kept as-is. The empty-string
+    sentinel in the PUT payload means "use the detector-side
+    default" (see :func:`put_app_prompts`), so dropping it from the
+    payload prevents both (a) overwriting an existing user value
+    with ``""`` during deep-merge and (b) leaving a literal ``""
+    key behind in ``config.json``.
+
+    Example:
+        ``{"text": "X", "level": ""}`` → ``{"text": "X"}``
+    """
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out[k] = _strip_empty_strings(v)
+        elif v == "":
+            continue
+        else:
+            out[k] = v
+    return out
+
+
+def _effective_app_prompts_section(
+    app_prompts: dict[str, Any],
+    default_text: str,
+    default_level: str,
+    default_desc: str,
+) -> dict[str, Any]:
+    """Return the GET/PUT response shape with defaults filled in for
+    every empty / missing leaf.
+
+    Reads via :func:`_app_prompts_leaf` (which returns ``""`` for any
+    missing node) and substitutes each leaf's detector-side default
+    when the read value strips to empty, so the API always surfaces
+    the "effective" value the model will use. Shared by
+    :func:`get_app_prompts` and :func:`put_app_prompts` so the two
+    endpoints can't drift apart."""
+    text_val = _app_prompts_leaf(
+        app_prompts, "video_detection", "VLMDoc", "text"
+    )
+    level_val = _app_prompts_leaf(
+        app_prompts, "video_detection", "VLMDoc", "level"
+    )
+    desc_val = _app_prompts_leaf(
+        app_prompts, "video_target_detection", "TargetDoc", "desc"
+    )
+    return {
+        "video_detection": {
+            "VLMDoc": {
+                "text": text_val if text_val.strip() else default_text,
+                "level": level_val if level_val.strip() else default_level,
+            },
+        },
+        "video_target_detection": {
+            "TargetDoc": {
+                "desc": desc_val if desc_val.strip() else default_desc,
+            },
+        },
+    }
+
+
+@router.get("/config/app-prompts")
+async def get_app_prompts() -> dict:
+    """Return the ``compute.app_prompts`` section as a fully-populated
+    object — every known leaf is always present, and missing or empty
+    leaves are filled with the detector-side defaults from
+    :mod:`app.services.detector` so the page always sees the
+    "effective" values the model will actually use.
+
+    Shape:
+
+        {
+          "section": {
+            "video_detection":         {"VLMDoc":   {"text": str, "level": str}},
+            "video_target_detection":  {"TargetDoc": {"desc": str}},
+          }
+        }
+
+    Defaults:
+
+      * ``video_detection.VLMDoc.text``  ← ``DEFAULT_VLM_DOC_TEXT_DESC``
+      * ``video_detection.VLMDoc.level`` ← ``DEFAULT_VLM_DOC_LEVEL_DESC``
+      * ``video_target_detection.TargetDoc.desc`` ← ``DEFAULT_TARGET_DOC_DESC_DESC``
+
+    Implementation note: the default constants are imported lazily
+    inside this function body to break the
+    ``app.api.config ↔ app.services.detector`` import cycle
+    (``detector`` already imports :func:`get_config` from
+    ``app.services.config``). Lazy imports keep both sides of the
+    cycle loadable."""
+
+    # Lazy import to break the app.api.config ↔ app.services.detector
+    # cycle — see implementation note above.
+    from app.services.detector import (
+        DEFAULT_TARGET_DOC_DESC_DESC,
+        DEFAULT_VLM_DOC_LEVEL_DESC,
+        DEFAULT_VLM_DOC_TEXT_DESC,
+    )
+
+    store = get_config()
+    compute_section = store.get_section("compute", {})
+    if not isinstance(compute_section, dict):
+        compute_section = {}
+    app_prompts_raw = compute_section.get("app_prompts", {})
+    app_prompts: dict[str, Any] = (
+        app_prompts_raw if isinstance(app_prompts_raw, dict) else {}
+    )
+
+    return {
+        "section": _effective_app_prompts_section(
+            app_prompts,
+            DEFAULT_VLM_DOC_TEXT_DESC,
+            DEFAULT_VLM_DOC_LEVEL_DESC,
+            DEFAULT_TARGET_DOC_DESC_DESC,
+        ),
+    }
+
+
+@router.put("/config/app-prompts")
+async def put_app_prompts(payload: AppPromptsConfig) -> dict:
+    """Deep-merge ``payload`` into ``config.json["compute"]["app_prompts"]``
+    and persist the updated ``compute`` section. Other compute
+    subsections (``instances``, ``discovery_servers``,
+    ``tool_call_max_iters``, ...) are preserved; sibling apps in
+    ``app_prompts`` are preserved too — a PUT that only mentions
+    ``video_detection`` never wipes ``video_target_detection``.
+
+    Validation:
+
+      * ``AppPromptsConfig`` field_validators enforce ≤ 4096 chars per
+        non-empty leaf string and reject malformed ``VLMDoc`` /
+        ``TargetDoc`` sub-shapes — bad input surfaces as HTTP 422.
+        Empty strings are accepted and mean "use the detector-side
+        default" (see :func:`get_app_prompts`).
+      * Empty / missing app_keys are dropped via
+        ``model_dump(exclude_none=True)`` so they neither overwrite
+        existing data nor get persisted as ``None``.
+      * Empty-string leaf fields are recursively pruned via
+        :func:`_strip_empty_strings` so a PUT like
+        ``{"text": "X", "level": ""}`` only persists ``"text": "X"``
+        (no ``"level"`` key) — the existing ``level`` value (if any)
+        is preserved by the deep-merge.
+
+    Returns the same shape as :func:`get_app_prompts` (with the same
+    effective-value substitution so PUT and GET can't drift) plus
+    ``data=<full snapshot>`` (matches ``put_base_config``)."""
+    # Lazy import to break the app.api.config ↔ app.services.detector
+    # cycle — same as :func:`get_app_prompts`.
+    from app.services.detector import (
+        DEFAULT_TARGET_DOC_DESC_DESC,
+        DEFAULT_VLM_DOC_LEVEL_DESC,
+        DEFAULT_VLM_DOC_TEXT_DESC,
+    )
+
+    store = get_config()
+    compute_section = store.get_section("compute", {})
+    if not isinstance(compute_section, dict):
+        compute_section = {}
+    existing_app_prompts_raw = compute_section.get("app_prompts", {})
+    existing_app_prompts: dict[str, Any] = (
+        existing_app_prompts_raw
+        if isinstance(existing_app_prompts_raw, dict)
+        else {}
+    )
+
+    incoming = _strip_empty_strings(payload.model_dump(exclude_none=True))
+    merged_app_prompts = _deep_merge_dict(existing_app_prompts, incoming)
+
+    new_compute = dict(compute_section)
+    new_compute["app_prompts"] = merged_app_prompts
+    snap = store.set_section("compute", new_compute)
+
+    return {
+        "ok": True,
+        "section": _effective_app_prompts_section(
+            merged_app_prompts,
+            DEFAULT_VLM_DOC_TEXT_DESC,
+            DEFAULT_VLM_DOC_LEVEL_DESC,
+            DEFAULT_TARGET_DOC_DESC_DESC,
+        ),
+        "data": snap,
+    }
+
+
+@router.delete("/config/app-prompts")
+async def delete_app_prompts() -> dict:
+    """Clear all per-app prompt overrides from config.
+
+    Removes ``compute.app_prompts`` from ``config.json`` so the GET
+    endpoint falls back to the detector-side defaults. Other compute
+    subsections (``instances``, ``discovery_servers``,
+    ``tool_call_max_iters``, …) are preserved.
+
+    The response shape mirrors :func:`put_app_prompts` (same
+    effective-section helper) so the UI can re-render the form without
+    a second round-trip; on the already-clean path the helper is
+    invoked against an empty dict, which yields exactly the
+    detector-side defaults.
+    """
+    # Lazy import to break the app.api.config ↔ app.services.detector
+    # cycle — same as :func:`get_app_prompts` / :func:`put_app_prompts`.
+    from app.services.detector import (
+        DEFAULT_TARGET_DOC_DESC_DESC,
+        DEFAULT_VLM_DOC_LEVEL_DESC,
+        DEFAULT_VLM_DOC_TEXT_DESC,
+    )
+
+    store = get_config()
+    compute_section = store.get_section("compute", {})
+    if not isinstance(compute_section, dict):
+        compute_section = {}
+    if "app_prompts" not in compute_section:
+        # Already clean — skip the disk write and just return the
+        # effective (default) section.
+        return {
+            "ok": True,
+            "section": _effective_app_prompts_section(
+                {},
+                DEFAULT_VLM_DOC_TEXT_DESC,
+                DEFAULT_VLM_DOC_LEVEL_DESC,
+                DEFAULT_TARGET_DOC_DESC_DESC,
+            ),
+        }
+    new_compute = dict(compute_section)
+    new_compute.pop("app_prompts", None)
+    snap = store.set_section("compute", new_compute)
+    return {
+        "ok": True,
+        "section": _effective_app_prompts_section(
+            {},
+            DEFAULT_VLM_DOC_TEXT_DESC,
+            DEFAULT_VLM_DOC_LEVEL_DESC,
+            DEFAULT_TARGET_DOC_DESC_DESC,
+        ),
         "data": snap,
     }
