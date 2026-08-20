@@ -336,6 +336,33 @@
             </div>
           </section>
 
+          <section class="bc-section" id="bc-section-app-prompts">
+            <header class="bc-section-head">
+              <h3>App 提示词模板</h3>
+              <span class="bc-hint" id="bc-prompts-hint">随系统配置一起保存；点击「还原默认」可清除当前自定义并显示默认值；重启检测后生效</span>
+            </header>
+            <h4>音视频描述 (VLMDoc)</h4>
+            <div class="bc-fields-row">
+              <div class="bc-field">
+                <label class="bc-label" for="bc-prompts-vd-text">text 描述</label>
+                <textarea id="bc-prompts-vd-text" class="bc-input bc-textarea" rows="2" maxlength="4096"></textarea>
+              </div>
+              <div class="bc-field">
+                <label class="bc-label" for="bc-prompts-vd-level">level 描述</label>
+                <textarea id="bc-prompts-vd-level" class="bc-input bc-textarea" rows="2" maxlength="4096"></textarea>
+              </div>
+            </div>
+            <h4>视频目标检测 (TargetDoc)</h4>
+            <div class="bc-field">
+              <label class="bc-label" for="bc-prompts-vtd-desc">desc 描述</label>
+              <textarea id="bc-prompts-vtd-desc" class="bc-input bc-textarea" rows="3" maxlength="4096"></textarea>
+            </div>
+            <div class="bc-prompts-actions">
+              <span class="vd-spacer"></span>
+              <button type="button" class="vd-btn" id="bc-prompts-reset">还原默认</button>
+            </div>
+          </section>
+
           <div class="bc-actions">
             <span class="vd-spacer"></span>
             <button type="button" class="vd-btn" id="bc-reload">放弃修改</button>

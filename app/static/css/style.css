@@ -1626,6 +1626,28 @@ html, body {
   border-color: var(--accent);
   background: #fff;
 }
+.bc-textarea {
+  min-height: 60px;
+  line-height: 1.5;
+  resize: vertical;
+  font-family: inherit;
+}
+
+.bc-fields-row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.bc-fields-row > .bc-field {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 600px) {
+  .bc-fields-row {
+    flex-direction: column;
+  }
+}
 
 .bc-meta {
   display: flex;

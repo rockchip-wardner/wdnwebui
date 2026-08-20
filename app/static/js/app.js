@@ -2413,6 +2413,9 @@ const Base = {
         this.save();
       });
     }
+
+    const promptsResetBtn = document.getElementById("bc-prompts-reset");
+    if (promptsResetBtn) promptsResetBtn.addEventListener("click", () => this.resetPrompts());
   },
 
   async load() {
@@ -2436,6 +2439,7 @@ const Base = {
     } catch (e2) {
       this.renderHwCapsError("加载失败: " + e2.message);
     }
+    this.loadPrompts();
   },
 
   render(data) {
@@ -2638,6 +2642,39 @@ const Base = {
         }
       }
 
+      try {
+        const textVal = (document.getElementById("bc-prompts-vd-text")?.value || "").trim();
+        const levelVal = (document.getElementById("bc-prompts-vd-level")?.value || "").trim();
+        const descVal = (document.getElementById("bc-prompts-vtd-desc")?.value || "").trim();
+        const r3 = await fetch(API_PREFIX + "/config/app-prompts", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            video_detection: { VLMDoc: { text: textVal, level: levelVal } },
+            video_target_detection: { TargetDoc: { desc: descVal } },
+          }),
+        });
+        if (r3.ok) {
+          parts.push("提示词已保存");
+        } else {
+          let msg = "HTTP " + r3.status;
+          try {
+            const respText = await r3.text();
+            const body3 = JSON.parse(respText);
+            if (Array.isArray(body3.detail)) {
+              msg = body3.detail
+                .map((d) => (d && d.msg) ? d.msg : JSON.stringify(d))
+                .join("; ");
+            } else if (typeof body3.detail === "string") {
+              msg = body3.detail;
+            }
+          } catch { /* keep HTTP status as fallback */ }
+          parts.push("⚠ 提示词保存失败: " + msg);
+        }
+      } catch (e3) {
+        parts.push("⚠ 提示词保存失败: " + e3.message);
+      }
+
       this.setFoot("已保存（" + parts.join(" · ") + "）", "ok");
     } catch (e) {
       this.setFoot("保存失败: " + e.message, "danger");
@@ -2656,6 +2693,56 @@ const Base = {
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => { if (d && d.path) el.textContent = "存储于 " + d.path; })
       .catch(() => { /* leave prior value in place */ });
+  },
+
+  async loadPrompts() {
+    try {
+      const r = await fetch(API_PREFIX + "/config/app-prompts");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      const section = (data && data.section) || {};
+      const vd = section.video_detection && section.video_detection.VLMDoc;
+      const vtd = section.video_target_detection && section.video_target_detection.TargetDoc;
+      const textEl = document.getElementById("bc-prompts-vd-text");
+      if (textEl) textEl.value = (vd && vd.text) || "";
+      const levelEl = document.getElementById("bc-prompts-vd-level");
+      if (levelEl) levelEl.value = (vd && vd.level) || "";
+      const descEl = document.getElementById("bc-prompts-vtd-desc");
+      if (descEl) descEl.value = (vtd && vtd.desc) || "";
+    } catch (e) {
+      console.error("loadPrompts failed:", e);
+      this.setFoot("加载提示词失败: " + e.message, "danger");
+    }
+  },
+
+  async resetPrompts() {
+    if (!confirm("确认还原为默认提示词？此操作会清除已保存的自定义内容。")) return;
+    this.setFoot("正在还原…", "warn");
+    try {
+      const r = await fetch(API_PREFIX + "/config/app-prompts", {
+        method: "DELETE",
+      });
+      if (r.ok) {
+        await this.loadPrompts();
+        this.setFoot("已还原为默认提示词", "ok");
+      } else {
+        let msg = "HTTP " + r.status;
+        try {
+          const respText = await r.text();
+          const body = JSON.parse(respText);
+          if (Array.isArray(body.detail)) {
+            msg = body.detail
+              .map((d) => (d && d.msg) ? d.msg : JSON.stringify(d))
+              .join("; ");
+          } else if (typeof body.detail === "string") {
+            msg = body.detail;
+          }
+        } catch { /* keep HTTP status as fallback */ }
+        this.setFoot("还原失败: " + msg, "danger");
+      }
+    } catch (e) {
+      this.setFoot("还原失败: " + e.message, "danger");
+    }
   },
 
   setFoot(text, level) {
