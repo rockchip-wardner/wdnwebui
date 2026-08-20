@@ -768,6 +768,64 @@ holds it in memory. The file is seeded with a `base` section at
   `wdndds_daemon`（SERVER 协议）+ `ComputeRegistry` 的 `Hub` 服务名
   `wdndds/rpc/<model_id>` 暴露给 peer。
 
+## App 提示词模板 (compute.app_prompts)
+
+`config.json["compute"]["app_prompts"]` 是一个 3 层 schema 驱动的提示词模板
+配置 —— 给 wdnai 的 `@Generable` schema class (`VLMDoc` / `TargetDoc`)
+的每个 `Field(description=...)` 提供用户可编辑的中文说明。模型根据
+`description` 推断字段语义，描述越具体，返回字段越稳。
+
+* **路径** — `compute.app_prompts.<app_key>.<schema_cls>.<field>`，
+  三段都是字面 key。例如 `compute.app_prompts.video_detection.VLMDoc.text`
+  写到 `text: str` 这一个 field 的 description 上。
+* **当前可配字段 (3 项)**：
+  - `video_detection.VLMDoc.text` — 音视频描述页 `text` 字段描述。
+  - `video_detection.VLMDoc.level` — 严重程度标签字段描述。
+  - `video_target_detection.TargetDoc.desc` — 视频目标检测页
+    `desc` 字段描述。
+* **`TargetDoc.x1/y1/x2/y2` 刻意不做配置** —— 4 个 bbox 坐标字段的
+  description 写死在 `_build_target_doc_class()` (`app/services/detector.py`)
+  函数体里，是协议层 0–1000 归一化坐标格式说明，与模型对「画哪里」
+  的理解无关，开 UI 编辑只会让用户误改协议格式。`_SCHEMA_CACHE`
+  的 cache key 也只覆盖可配字段 (`desc`) 的 description，硬编码坐标
+  字面量不进 cache（也不在 `_load_app_prompts` 返回值里）。
+* **默认值在 `app/services/detector.py` 模块顶层常量**
+  (`DEFAULT_VLM_DOC_TEXT_DESC` / `DEFAULT_VLM_DOC_LEVEL_DESC` /
+  `DEFAULT_TARGET_DOC_DESC_DESC`)，简体中文一句话。
+* **空值兜底** —— 配置里字段缺失或空字符串 fallback 到默认常量，
+  不写盘空值；`PUT /api/config/app-prompts` 由
+  `AppPromptsConfig.field_validator` 兜底拒绝空字段 (422)。
+* **修改提示词后重启检测后生效** —— detector 实例的 schema class 在
+  `start()` 时 build 一次，cached 在模块级 `_SCHEMA_CACHE`
+  (`app/services/detector.py`)；UI 上方有 hint `#bc-prompts-hint`
+  提示用户保存后必须停止 + 重新启动检测循环。
+* **API** (`app/api/config.py`)：
+  - `GET  /api/config/app-prompts` — 返回当前生效值（缺字段用默认补）。
+  - `PUT  /api/config/app-prompts` — 全量替换；`AppPromptsConfig`
+    校验每个字段非空 + strip 后落盘。
+* **UI 入口** —— 系统配置页 (`#base-config`) 下新增
+  `#bc-section-app-prompts` 子区块（`app/static/index.html`）：
+  音视频描述 (VLMDoc) 两条 textarea + 视频目标检测 (TargetDoc) 一条
+  textarea + 保存/放弃修改按钮。`Base` 模块 (`app/static/js/app.js`)
+  的 `loadPrompts()` / `savePrompts()` / `resetPrompts()` 负责
+  GET/PUT 三件套。
+* **添加新 app 的提示词步骤**：
+  1. `app/api/config.py` 里定义 `<Schema>Prompts(BaseModel)`，加 field
+     description；`AppPromptsConfig` 加同名嵌套字段并配
+     `field_validator`。
+  2. `app/services/detector.py` `_load_app_prompts()` 的 `defaults`
+     映射表追加 `(<app_key>, <schema_cls>)` 条目 + 默认常量。
+  3. `app/static/index.html` 的 `#bc-section-app-prompts` 内追加
+     一组 `<h4>` + `<textarea>` 控件。
+  4. `app/static/js/app.js` `Base.loadPrompts()` /
+     `savePrompts()` 里追加对应字段读写 + `addEventListener`
+     绑定。
+* **Schema cache 行为** — `_SCHEMA_CACHE: dict[tuple, type] = {}`
+  以 `(schema_name, tuple(sorted(field_descs)))` 为 key：
+  description 变了 → 新 key → rebuild；description 没变 → 命中旧
+  key → 复用。一般用户每次点"保存"最多触发 1 次重建，不在每次
+  inference 重建。
+
 ## Discovery page (注册发现)
 
 `#page-discovery` 内部按从上到下两个 pane 排布：
@@ -1338,6 +1396,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 | Anything that needs a new endpoint    | Add a route inside `create_app()` in `app/main.py`        |
 | Added/removed a model preset          | `MODEL_PRESETS` in `app/services/compute_registry.py` + `register` the new capability in the same table; update `app/static/index.html` and `app/static/js/app.js` only if the UI needs new model cards |
 | `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
+| Schema hint prompts (`VLMDoc.text`/`level`, `TargetDoc.desc`) | `compute.app_prompts.<app_key>.<schema_cls>.<field>` in `config.json`; UI under 系统配置 → App 提示词模板 section. `TargetDoc.x1/y1/x2/y2` stay hardcoded in `_build_target_doc_class` (`app/services/detector.py`) — protocol-level 0–1000 归一化坐标格式说明，刻意不开 UI 编辑 |
 ## Tools (音视频检测页工具)
 
 `app/services/tools/` 装的是给音视频描述页 (`WdnaiDetector` 走
