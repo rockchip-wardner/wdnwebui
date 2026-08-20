@@ -225,7 +225,8 @@ class _RpcSessionProxy:
 
     def chat_run(self, history, text, *, context_limit=None,
                  max_new_tokens=2048, on_delta=None, stop_event=None,
-                 poll_interval_ms=150, timeout_ms=300000) -> dict:
+                 poll_interval_ms=150, timeout_ms=300000,
+                 tool_names: Optional[list] = None) -> dict:
         """Run one text-chat turn against the worker.
 
         Synchronous (call it from a plain thread). The worker runs the
@@ -233,8 +234,18 @@ class _RpcSessionProxy:
         chat state; this method polls ``chat_poll`` until the run
         finishes, invoking ``on_delta(text)`` for each delta chunk.
 
+        ``tool_names`` lists the ``@Callable`` class names (e.g.
+        ``"TtsAlert"``) the worker should expose to the LLM for tool
+        calling. Worker injects the tool schema into the prompt and
+        parses ``<tool_call>{...}</tool_call>`` output; if the model
+        emits a tool call, ``result["tool_call"]`` carries the class
+        name and ``result["tool_call_args"]`` the validated arguments
+        (dict). Stage 1: caller decides what to do — agent-loop is
+        planned for stage 2.
+
         Returns the worker's ``result`` dict on ``done`` (text /
-        elapsed_sec / prompt_tokens / answer_tokens). Raises
+        thinking / answer / elapsed_sec / prompt_tokens /
+        answer_tokens / tool_call / tool_call_args). Raises
         ``RuntimeError`` on worker errors / timeout.
         """
         payload = {
@@ -243,6 +254,7 @@ class _RpcSessionProxy:
             "text": text,
             "context_limit": int(context_limit or 0),
             "max_new_tokens": int(max_new_tokens or 2048),
+            "tools": list(tool_names or []),
         }
         reply = self._call_with_recreate(payload, timeout_ms=10_000)
         if not reply.get("ok"):

@@ -35,12 +35,13 @@ import ctypes.util
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import sys
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 LOG = logging.getLogger("compute_worker")
 
@@ -254,6 +255,136 @@ def _resolve_tool_classes(names):
             continue
         out.append(cls)
     return out
+
+
+# qwen3-8b 输出工具调用时使用 ``<tool_call>{...}</tool_call>`` XML
+# 标签包裹的 JSON 格式（与 wdnai ``try_parse_tool_call`` 期望的裸 JSON
+# / markdown 围栏不同）。先按标签定位再剥离出 JSON。
+_TOOL_CALL_TAG_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+
+def _find_json_objects(text: str) -> list:
+    """扫描 text 中所有顶层 JSON 对象。
+
+    处理嵌套 ``{}`` 与字符串内的引号（状态机维护 ``in_str`` / 转义
+    ``esc``）。每个候选独立 ``json.loads``，失败的跳过。结果按文本中
+    出现顺序排列。
+    """
+    out: list = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        end_j = -1
+        for j in range(i, n):
+            ch = text[j]
+            if esc:
+                esc = False
+                continue
+            if in_str:
+                if ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end_j = j
+                    break
+        if end_j < 0:
+            # 未闭合的 ``{``（LLM 输出截断 / 编码错误）—— 强制推进游标
+            # 避免外层 while 死循环。
+            i += 1
+            break
+        try:
+            data = json.loads(text[i:end_j + 1])
+            if isinstance(data, dict):
+                out.append(data)
+        except json.JSONDecodeError:
+            pass
+        i = end_j + 1
+    return out
+
+
+def _extract_name_args(data: dict):
+    """从 JSON 字典提取 (name, arguments) 元组。
+
+    name 取 ``name`` / ``tool`` / ``function`` 任一别名；
+    arguments 取 ``arguments`` / ``args`` / ``parameters`` 任一别名。
+    返回 ``(None, None)`` 表示该 dict 不像 tool_call 候选。
+    """
+    name = data.get("name") or data.get("tool") or data.get("function")
+    if not isinstance(name, str):
+        return None, None
+    args = (data.get("arguments") or data.get("args")
+            or data.get("parameters") or {})
+    return name, args
+
+
+def _parse_qwen_tool_call(
+    answer_text: str, tool_classes: list,
+) -> Optional[Tuple[str, Any]]:
+    """从模型 answer 部分解析 tool_call 并做参数校验。
+
+    策略（双重保险）：
+    1. ``<tool_call>...</tool_call>`` 标签定位（qwen3-8b 在 System 强调
+       "exactly one JSON" 后通常用此格式；标签天然给出唯一边界）。
+    2. fallback：扫描 answer 中所有顶层 JSON 对象，**倒序**尝试
+       ``dispatch_tool_call``，最后一个 dispatch 成功的为准。
+
+       倒序依据：LLM 在 answer 段经常先写"描述 / 示例 JSON"（如
+       解释工具 schema），再写真 tool_call —— 最后一个 JSON 通常是
+       最终决策。**与 prompt 强化指令（chat_runner._TOOL_CALL_INSTRUCTION）
+       互为冗余**：c 让模型少输出多 JSON，b 兜底模型不守规矩。
+
+    返回 ``(name, validated_args_dict)``，**args 已通过
+    ``cls.model_validate`` 校验**（即下游主进程可直接用 args 重建
+    ``@Callable`` 实例）。阶段1：调用方只透传到前端，不执行；阶段2
+    改造时改用 ``args`` 重建 + 执行。
+    """
+    from wdnai.utils import extract_json
+    from wdnai._callable import dispatch_tool_call
+
+    # 路径 1：标签定位
+    m = _TOOL_CALL_TAG_RE.search(answer_text)
+    if m:
+        payload = m.group(1).strip()
+        data = extract_json(payload)
+        if isinstance(data, dict):
+            name, args = _extract_name_args(data)
+            if name:
+                try:
+                    inst = dispatch_tool_call(tool_classes, name, args)
+                    if inst is not None:
+                        return name, inst.model_dump()
+                except Exception:
+                    pass  # 路径 1 校验失败，回退到路径 2
+
+    # 路径 2：扫描所有顶层 JSON，倒序尝试 dispatch
+    candidates = _find_json_objects(answer_text)
+    for data in reversed(candidates):
+        name, args = _extract_name_args(data)
+        if not name:
+            continue
+        try:
+            inst = dispatch_tool_call(tool_classes, name, args)
+            if inst is not None:
+                return name, inst.model_dump()
+        except Exception:
+            # pydantic ValidationError 等 —— 跳过此候选
+            continue
+    return None
 
 
 def _build_session(model_id: str, npu_index: int):
@@ -746,6 +877,11 @@ def chat_run_handler(state: dict, payload: dict) -> dict:
         max_new_tokens = int(payload.get("max_new_tokens") or 2048)
     except Exception:
         context_limit, max_new_tokens = 0, 2048
+    # RPC 仅透传 class name 字符串（与 infer 路径对齐）；worker 端按名
+    # 查 _TOOL_TABLE 拿真实 class 注入到 prompt schema，并解析模型输出。
+    tool_names = payload.get("tools") or []
+    if not isinstance(tool_names, list):
+        tool_names = []
     chat.update({
         "status": "running",
         "deltas": [],
@@ -755,6 +891,7 @@ def chat_run_handler(state: dict, payload: dict) -> dict:
         "text": text,
         "context_limit": context_limit,
         "max_new_tokens": max_new_tokens,
+        "tool_names": tool_names,
         "result": None,
         "error": "",
     })
@@ -768,7 +905,9 @@ def _chat_run_loop(state: dict) -> None:
     sess = state.get("session")
     chat = state.get("chat") or {}
     try:
-        from app.services.chat_runner import build_chatml_prompt, count_tokens, trim_history
+        from app.services.chat_runner import (
+            build_chatml_prompt, count_tokens, split_thinking, trim_history,
+        )
         backend = getattr(sess, "_backend", None)
         if backend is None:
             raise RuntimeError("session._backend missing")
@@ -785,7 +924,19 @@ def _chat_run_loop(state: dict) -> None:
             chat["status"] = "error"
             chat["error"] = err
             return
-        prompt = build_chatml_prompt(selected, text)
+
+        # ---- 工具 schema 注入（chat_run ↔ @Callable 链路）----
+        # 解析 tool_names → class → get_tool_specs → render_tools_block。
+        # _resolve_tool_classes 内部按 _TOOL_TABLE 查 class 名（lazy import），
+        # 找不到的 name 会打 warning 跳过，不会让 SDK 报错。
+        tool_names = chat.get("tool_names") or []
+        tool_classes = _resolve_tool_classes(tool_names)
+        tool_specs = None
+        if tool_classes:
+            from wdnai._callable import get_tool_specs
+            tool_specs = get_tool_specs(tool_classes)
+
+        prompt = build_chatml_prompt(selected, text, tool_specs=tool_specs)
         chat["prompt_tokens"] = count_tokens(tokenizer, prompt)
 
         sink = getattr(backend, "sink", None)
@@ -807,12 +958,33 @@ def _chat_run_loop(state: dict) -> None:
         finally:
             unregister_observer(sink)
         elapsed = round(time.time() - t0, 2)
+
+        # ---- 切 thinking / answer + 解析 tool_call（仅 answer 段）----
+        # 先切 thinking：避免模型思考过程中输出 ``{"name":...}`` 等 JSON
+        # 被误识别为 tool_call。thinking 段里也可能出现 JSON，因此 tool
+        # call 解析只对 answer 部分执行。
+        #
+        # _parse_qwen_tool_call 内部已完成 ``dispatch_tool_call`` 校验 +
+        # ``model_dump``（args 已 validated），外层不再二次 dispatch —
+        # 直接取 ``args`` 作为 ``tool_call_args``。
+        thinking, answer_text = split_thinking(full_text)
+        tool_call_name = None
+        tool_call_args = None
+        if tool_classes:
+            parsed = _parse_qwen_tool_call(answer_text, tool_classes)
+            if parsed is not None:
+                tool_call_name, tool_call_args = parsed
+
         chat["status"] = "done"
         chat["result"] = {
             "text": full_text,
+            "thinking": thinking,
+            "answer": answer_text,
             "elapsed_sec": elapsed,
             "prompt_tokens": chat.get("prompt_tokens", 0),
-            "answer_tokens": count_tokens(tokenizer, full_text),
+            "answer_tokens": count_tokens(tokenizer, answer_text),
+            "tool_call": tool_call_name,
+            "tool_call_args": tool_call_args,
         }
     except Exception as e:  # noqa: BLE001
         chat["status"] = "error"

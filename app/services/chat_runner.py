@@ -5,7 +5,14 @@ from typing import Any, List, Optional, Tuple
 
 MAX_NEW_TOKENS = 2048
 
-_THINK_RE = re.compile(r" thinking(.*?) response", re.DOTALL)
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+_TOOL_CALL_INSTRUCTION = (
+    "When you decide to call a tool, output **exactly one** JSON object "
+    "matching the format above. Do not output multiple JSON objects, "
+    "placeholder/example JSONs, or any text before/after the JSON."
+)
 
 
 def split_thinking(text: str) -> Tuple[str, str]:
@@ -26,15 +33,36 @@ def count_tokens(tokenizer: Any, text: str) -> int:
         return len(text) // 2
 
 
-def build_chatml_prompt(history: List[dict], user_text: str) -> str:
-    parts = ["<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"]
+def build_chatml_prompt(history: List[dict], user_text: str,
+                        tool_specs: Optional[List[dict]] = None) -> str:
+    """拼 ChatML 文本 prompt。
+
+    ``tool_specs``（可选，``get_tool_specs(tools)`` 返回值）非空时，
+    渲染 wdnai 的 ``render_tools_block`` 并以独立段形式追加到 system
+    段之后、对话历史之前（与 wdnai 默认追加到末尾不同——chat_run 走
+    独立段，结构清晰）。模型只需看到工具描述，无需被历史 / 用户问题
+    注意力分散。
+
+    同时追加 ``_TOOL_CALL_INSTRUCTION`` 强化指令（chat_run ↔ @Callable
+    链路 双重保险之一），让 LLM 在 answer 段只输出**单个** tool_call
+    JSON，避免"先示例后真实"的多 JSON 场景。解析层
+    ``compute_worker._parse_qwen_tool_call`` 路径 2 提供兜底。
+    """
+    parts = ["system\nYou are a helpful assistant.\n"]
+    if tool_specs:
+        from wdnai._callable import render_tools_block
+        parts.append("\n")
+        parts.append(render_tools_block(tool_specs))
+        parts.append("\n\n")
+        parts.append(_TOOL_CALL_INSTRUCTION)
+        parts.append("\n\n---\n\n")
     for msg in history:
         if msg.get("role") == "user":
-            parts.append(f"<|im_start|>user\n{msg.get('content') or ''}<|im_end|>\n")
+            parts.append(f"user\n{msg.get('content') or ''}\n")
         elif msg.get("role") == "assistant":
-            parts.append(f"<|im_start|>assistant\n{msg.get('content') or ''}<|im_end|>\n")
-    parts.append(f"<|im_start|>user\n{user_text}<|im_end|>\n")
-    parts.append("<|im_start|>assistant\n")
+            parts.append(f"assistant\n{msg.get('content') or ''}\n")
+    parts.append(f"user\n{user_text}\n")
+    parts.append("assistant\n")
     return "".join(parts)
 
 
