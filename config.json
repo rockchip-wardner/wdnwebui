@@ -12,6 +12,10 @@
       "qwen3-vl-embedding-2b",
       "qwen2.5-omni-3b"
     ],
+    "discovery_servers": ["127.0.0.1:7411"],
+    "discovery_server_port": 7411,
+    "daemon_http_port": 7412,
+    "auto_start_daemon": true,
     "hardware_capabilities": {
       "hwcap_video_input": true,
       "hwcap_audio_input": true,
