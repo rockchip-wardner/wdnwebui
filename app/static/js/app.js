@@ -4335,7 +4335,7 @@ VdFsModal.pickCurrentDir = function () {
  */
 const CC_PRESET_META = {
   "qwen3-vl-4b": {
-    label: "Qwen3-VL-4B",
+    label: "[VL]视频描述模型",
     capability_types: ["swcap_video_describe"],
     instance_name: "llm-vl",
     memory_estimate_mb: 3500,
@@ -4344,7 +4344,7 @@ const CC_PRESET_META = {
     available_targets: ["182x"],
   },
   "qwen3-tts": {
-    label: "Qwen3-TTS",
+    label: "[TTS]文字转语音模型",
     capability_types: ["swcap_audio_tts"],
     instance_name: "llm-tts",
     memory_estimate_mb: 1900,
@@ -4353,7 +4353,7 @@ const CC_PRESET_META = {
     available_targets: ["182x"],
   },
   "qwen3-8b": {
-    label: "Qwen3-8B",
+    label: "[LLM]文字对话模型",
     capability_types: ["swcap_text_chat"],
     instance_name: "llm-chat",
     memory_estimate_mb: 4950,
@@ -4362,7 +4362,7 @@ const CC_PRESET_META = {
     available_targets: ["182x"],
   },
   "qwen3-vl-embedding-2b": {
-    label: "Qwen3-VL-Embedding-2B",
+    label: "[VLEmb]视觉信息编码模型",
     capability_types: ["swcap_video_retrieval"],
     instance_name: "llm-embed",
     memory_estimate_mb: 2000,
@@ -4370,8 +4370,17 @@ const CC_PRESET_META = {
     description: "视觉信息编码模型",
     available_targets: ["182x"],
   },
+  "qwen2.5-omni-3b": {
+    label: "[Omni]多感知描述模型",
+    capability_types: ["swcap_audio_understand"],
+    instance_name: "llm-audio",
+    memory_estimate_mb: 2500,
+    estimated_init_seconds: 50,
+    description: "多感知描述模型",
+    available_targets: ["182x"],
+  },
 };
-const CC_PRESET_ORDER = ["qwen3-vl-4b", "qwen3-tts", "qwen3-8b", "qwen3-vl-embedding-2b"];
+const CC_PRESET_ORDER = ["qwen3-vl-4b", "qwen3-tts", "qwen3-8b", "qwen3-vl-embedding-2b", "qwen2.5-omni-3b"];
 
 // 系统拓扑：1× RK3588 主控（不占"算力卡"位置） + N× RK182x 协卡。
 // wdnai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡多
@@ -5248,7 +5257,7 @@ const ComputeConfigPage = {
     toggle.appendChild(toggleTrack);
     headActions.appendChild(toggle);
 
-    // ---- body: caps + desc + missing-dir-hint + radio + countdown + error-pre
+    // ---- body: caps + missing-dir-hint + radio + countdown + error-pre
     const body = document.createElement("div");
     body.className = "cc-service-body";
     card.appendChild(body);
@@ -5257,11 +5266,6 @@ const ComputeConfigPage = {
     const capsEl = document.createElement("div");
     capsEl.className = "cc-service-caps";
     body.appendChild(capsEl);
-
-    // 模型描述
-    const descEl = document.createElement("p");
-    descEl.className = "cc-model-desc";
-    body.appendChild(descEl);
 
     // missing-dir 提示块：永远占位，hidden via display:none
     const missingDirEl = document.createElement("div");
@@ -5288,7 +5292,7 @@ const ComputeConfigPage = {
 
     card._h = {
       titleEl, pidEl, restartBtn, toggle, toggleInput,
-      body, capsEl, descEl, missingDirEl, radioFieldsetEl,
+      body, capsEl, missingDirEl, radioFieldsetEl,
       countdownEl, errorEl,
       // radioSig：上一次 _makeTargetFieldset 的输入签名；
       // 变化时 replaceWith 替换 fieldset，未变则完全不动 —— 保证用户
@@ -5400,14 +5404,6 @@ const ComputeConfigPage = {
       h.capsEl.style.display = "none";
     }
 
-    // ---- desc
-    if (meta.description) {
-      h.descEl.textContent = meta.description;
-      h.descEl.style.display = "";
-    } else {
-      h.descEl.style.display = "none";
-    }
-
     // ---- missing-dir 提示（state==="missing_model_dir" 时显示）
     if (isMissingDir) {
       h.missingDirEl.innerHTML = "";
@@ -5510,15 +5506,6 @@ const ComputeConfigPage = {
 
     const body = document.createElement("div");
     body.className = "cc-service-body";
-
-    // v0.8: 不再有冗余的 status line（运行中·NPU#1 之类）。模型描述
-    // 直接放这里。
-    if (meta.description) {
-      const desc = document.createElement("p");
-      desc.className = "cc-model-desc";
-      desc.textContent = meta.description;
-      body.appendChild(desc);
-    }
 
     const ro = document.createElement("div");
     ro.className = "cc-readonly";

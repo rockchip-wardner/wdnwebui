@@ -481,7 +481,7 @@ def _qwen_2_5_omni_3b_spec():
 # 保证倒计时结束时实际加载大概率已就绪，避免 UI 卡很久才更新。
 MODEL_PRESETS: dict[str, dict] = {
     "qwen3-vl-4b": {
-        "label":            "Qwen3-VL-4B",
+        "label":            "[VL]视频描述模型",
         "preset_factory":   _qwen3_vl_4b_spec,
         "model_dir_name":   "Qwen3-VL-4B",
         "memory_estimate_mb": 3500,
@@ -493,7 +493,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "available_targets": ["182x"],   # .1828.rknn 权重 — RK182x 协卡
     },
     "qwen3-tts": {
-        "label":            "Qwen3-TTS",
+        "label":            "[TTS]文字转语音模型",
         "preset_factory":   _qwen3_tts_spec,
         "model_dir_name":   "Qwen3-TTS",
         "memory_estimate_mb": 1900,
@@ -505,7 +505,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "available_targets": ["182x"],
     },
     "qwen3-8b": {
-        "label":            "Qwen3-8B",
+        "label":            "[LLM]文字对话模型",
         "preset_factory":   _qwen3_8b_spec,
         "model_dir_name":   "Qwen3-8B",
         "memory_estimate_mb": 4950,
@@ -517,11 +517,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "available_targets": ["182x"],
     },
     "qwen3-vl-embedding-2b": {
-        # v0.9 第一次缩成 "Qwen3-VL-Embed-2B"（16 字符），还是嫌长。
-        # 再缩成 "Qwen3-VLEmb-2B"（14 字符）—— "VL" + "Emb" 当连续
-        # 缩写，符合 wdnai 圈子常见写法（"VLE" / "Emb" 已是行业缩略）。
-        # 文件名 / model_dir_name 不动，只改 UI label。
-        "label":            "Qwen3-VLEmb-2B",
+        "label":            "[VLEmb]视觉信息编码模型",
         "preset_factory":   _qwen3_vl_embedding_2b_spec,
         "model_dir_name":   "Qwen3-VL-Embedding-2B",
         "memory_estimate_mb": 2000,        # ~1GB 权重 + 622MB embed 表 + vision
@@ -536,7 +532,7 @@ MODEL_PRESETS: dict[str, dict] = {
         # Qwen2.5-Omni-3B（kind="omni"，wav-in/text-out）。单次推理上限
         # 6.0 秒（omni.py 硬限制），调用方负责切片。memory_estimate_mb /
         # estimated_init_seconds 是预估值，真机测后回填。
-        "label":            "Qwen2.5-Omni-3B",
+        "label":            "[Omni]多感知描述模型",
         "preset_factory":   _qwen_2_5_omni_3b_spec,
         "model_dir_name":   "Qwen2.5-Omni-3B",
         "memory_estimate_mb": 2500,
@@ -544,7 +540,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "capability_types": ["swcap_audio_understand"],
         "instance_name":    "llm-audio",
         "worker_name":      "audio-3b",     # comm = "worker:audio-3b" (13 chars)
-        "description":      "音频理解模型",
+        "description":      "多感知描述模型",
         "available_targets": ["182x"],
     },
 }
