@@ -1169,8 +1169,8 @@ RIFF header by hand.
   - `DELETE /api/video-file-analysis/runs/{run_id}` — 删盘上 JSON。
   - `GET  /api/video-file-analysis/runs/{run_id}/facets` — scene/actor/object/action
     去重集合（前端反查 chip 候选）。
-  - `GET  /api/video-file-analysis/runs/{run_id}/query?scene=&actor=&object=&action=&exact=&q=&semantic=&frame_min=&frame_max=&limit=` —
-    反查：多维 AND 过滤 + 三种搜索模式（`semantic` > `exact` > `q` 互斥）。
+  - `GET  /api/video-file-analysis/runs/{run_id}/query?scene=&actor=&object=&action=&exact=&q=&frame_min=&frame_max=&limit=` —
+    反查：多维 AND 过滤 + 两种搜索模式（`exact` > `q` 互斥）。
   - `GET  /api/video-file-analysis/runs/{run_id}/frame/{frame_pos}` —
     从原始视频取指定帧的 JPEG（PyAV v4l2m2m seek + wdnav read0 fallback）。
   - `WS   /api/video-file-analysis/ws`          — server-push `{type:"event"|"summary"|"state"|"hello"}`。
@@ -1187,7 +1187,7 @@ RIFF header by hand.
   - 下方 `<details open>` 逐帧分析列表（默认折叠，新事件抵达时只 push、
     不自动滚动；run 终态自动折叠腾出空间给综述）。
   - **反查 modal** (`#vfa-query`)：场景下拉 + 人物/物体/动作 chip 多选 +
-    精准匹配 / 模糊搜索 / 语义搜索 三选一 + 时间范围 `HH:MM:SS`（on-blur 校验，
+    精准匹配 / 模糊搜索 二选一 + 时间范围 `HH:MM:SS`（on-blur 校验，
     超总时长自动截断 + 提示）。结果 list 显示 frame_pos / 时间戳 / 结构化 tag
     / 高亮 `<mark>`。点击结果 → **取帧 modal** (`#vfa-frame-modal`)：从原
     视频取对应帧 JPEG + 显示 frame_pos / fps / 该帧时间戳 / 画面描述 / 结构化。
