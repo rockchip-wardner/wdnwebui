@@ -8445,7 +8445,6 @@ function vfaQueryOpen(runId, sourceLabel, totalFrames, fps) {
   document.getElementById("vfa-query-time-max").value = "";
   document.getElementById("vfa-query-exact").value = "";
   document.getElementById("vfa-query-q").value = "";
-  document.getElementById("vfa-query-semantic").value = "";
   document.getElementById("vfa-query-list").innerHTML = "";
   document.getElementById("vfa-query-summary").textContent = "加载候选中…";
   vfaQueryLoadFacets();
@@ -8736,9 +8735,6 @@ function vfaQueryBuildQuery() {
   // 模糊搜索（n-gram 跨字段匹配）—— "雨天穿红衣" 拆 2-gram 命中
   const q = document.getElementById("vfa-query-q").value.trim();
   if (q) params.set("q", q);
-  // 语义搜索（LLM 打分排序，1 次 LLM 调用）—— 自然语言理解
-  const semantic = document.getElementById("vfa-query-semantic").value.trim();
-  if (semantic) params.set("semantic", semantic);
   // 时间范围：用户按 HH:MM:SS 输入（严格格式），前端解析成秒数再 × fps 转
   // 成 frame 传给后端。后端参数名仍叫 frame_min/max（不要后端改）。
   // fps=0 时跳过（无法转换）。
@@ -8804,9 +8800,8 @@ function vfaQueryBuildQuery() {
 
 function vfaQueryClear() {
   document.getElementById("vfa-query-scene").value = "";
-  document.getElementById("vfa-query-exact").value = "";
+document.getElementById("vfa-query-exact").value = "";
   document.getElementById("vfa-query-q").value = "";
-  document.getElementById("vfa-query-semantic").value = "";
   document.getElementById("vfa-query-time-min").value = "";
   document.getElementById("vfa-query-time-max").value = "";
   // 清空时也清掉红框 + 截断提示
@@ -8825,11 +8820,7 @@ function vfaQueryClear() {
   document.querySelectorAll(".vfa-query-chip.is-on").forEach((c) => c.classList.remove("is-on"));
 }
 
-// 语义搜索（多批 LLM）可能 10-30 秒，AbortController 让用户能取消
-let _vfaAbort = null;
-let _vfaTimeoutId = null;
-let _vfaElapseId = null;
-
+// 精准匹配 / 模糊搜索 + 字段过滤都是纯 Python，毫秒级返回。
 async function vfaQueryRun() {
   const runId = VFAQuery.runId;
   if (!runId) return;
@@ -8839,76 +8830,20 @@ async function vfaQueryRun() {
   // 收集当前所有筛选条件作为高亮 terms
   VFAQuery._terms = collectQueryTerms();
 
-  // 语义搜索：后端先做字符重叠预过滤（毫秒级），候选 ≤ 15 个走快路径
-  // （直接返回，不调 LLM）；候选 > 15 个才调 LLM，最多 2 批 × 30s ≈ 60s。
-  // 精准匹配 / 模糊搜索 + 字段过滤都是纯 Python，毫秒级返回。
-  // 60s hard timeout 留给"events 多 + 语义匹配少"的边缘 case，提示用户
-  // 可缩小范围（时间范围 / 字段过滤 / limit）。
-  const isSemantic = qs.includes("semantic=");
-  const TIMEOUT_MS = 60_000;
-  const runBtn = document.getElementById("vfa-query-run");
-
-  _vfaAbort = new AbortController();
-  if (isSemantic) {
-    summaryEl.textContent = "语义搜索中…";
-    runBtn.disabled = true;
-    runBtn.textContent = "取消";
-  } else {
-    summaryEl.textContent = "查询中…";
-  }
+  summaryEl.textContent = "查询中…";
   listEl.innerHTML = "";
-
-  let timedOut = false;
-  _vfaTimeoutId = setTimeout(() => {
-    if (_vfaAbort && !_vfaAbort.signal.aborted) {
-      timedOut = true;
-      _vfaAbort.abort();
-    }
-  }, TIMEOUT_MS);
-
-  let elapsed = 0;
-  _vfaElapseId = setInterval(() => {
-    elapsed += 1;
-    if (isSemantic && _vfaAbort && !_vfaAbort.signal.aborted) {
-      summaryEl.textContent = `语义搜索中… ${elapsed}s`;
-    }
-  }, 1000);
 
   try {
     const r = await fetch(
       API_PREFIX + "/video-file-analysis/runs/" + encodeURIComponent(runId) +
         "/query?" + qs,
-      { cache: "no-store", signal: _vfaAbort.signal }
+      { cache: "no-store" }
     );
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
     renderQueryResults(data);
   } catch (e) {
-    if (e.name === "AbortError") {
-      if (timedOut) {
-        summaryEl.textContent =
-          `语义搜索超时（>${TIMEOUT_MS/1000}s）。可缩小范围：在「时间范围」里限定起止时间（如 0:30 ~ 1:00），或改用「精准匹配 / 模糊搜索」按字面匹配。`;
-      } else {
-        summaryEl.textContent = "已取消查询。";
-      }
-    } else {
-      summaryEl.textContent = "查询失败：" + e.message;
-    }
-  } finally {
-    clearTimeout(_vfaTimeoutId);
-    clearInterval(_vfaElapseId);
-    _vfaAbort = null;
-    if (runBtn) {
-      runBtn.disabled = false;
-      runBtn.textContent = "反查";
-    }
-  }
-}
-
-// 用户点"取消"按钮时中断查询
-async function vfaQueryCancel() {
-  if (_vfaAbort) {
-    _vfaAbort.abort();
+    summaryEl.textContent = "查询失败：" + e.message;
   }
 }
 
@@ -8931,8 +8866,6 @@ function collectQueryTerms() {
       terms.add(q.slice(i, i + 2));
     }
   }
-  const semEl = document.getElementById("vfa-query-semantic");
-  if (semEl && semEl.value.trim()) terms.add(semEl.value.trim());
   return [...terms].filter((t) => t.length >= 1);
 }
 
@@ -8940,19 +8873,7 @@ function renderQueryResults(data) {
   const summaryEl = document.getElementById("vfa-query-summary");
   const listEl = document.getElementById("vfa-query-list");
   const events = data.events || [];
-  // 语义搜索结果带 rank 标记
-  const isRanked = !!data.ranked;
-  const isFastPath = !!data.fast_path;
-  const isSampled = !!data.sampled;
-  // 区分三种语义搜索路径：快路径（字符重叠）/ LLM 评分 / 采样
-  let sampledNote = "";
-  if (isFastPath) {
-    sampledNote = "（快路径：字符重叠匹配，未调 LLM）";
-  } else if (isSampled && data.total_events) {
-    sampledNote = `（从 ${data.total_events} 个 events 中筛 ${data.prefiltered || data.scored_count || 0} 候选，LLM 分 ${data.batches || 1} 批）`;
-  }
-  const queryLabel = data.query ? ` · 查询"${data.query.slice(0, 20)}${data.query.length > 20 ? "…" : ""}"` : "";
-  summaryEl.textContent = `匹配 ${data.matched} 条${isRanked ? "（语义排序）" : ""}${sampledNote}${data.matched >= data.limit ? "（已截断）" : ""} · limit=${data.limit}${queryLabel}`;
+  summaryEl.textContent = `匹配 ${data.matched} 条${data.matched >= data.limit ? "（已截断）" : ""} · limit=${data.limit}`;
   if (!events.length) {
     listEl.innerHTML = '<li class="vd-event-empty" style="padding:0.6rem;text-align:center;">没有匹配的事件。</li>';
     return;
@@ -8974,23 +8895,9 @@ listEl.innerHTML = "";
     frame.textContent = "帧 " + ev.frame_pos;
     const ts = document.createElement("span");
     ts.textContent = new Date((ev.ts || 0) * 1000).toLocaleTimeString();
-    // 语义搜索 score 显示
-    if (typeof ev._score === "number") {
-      const score = document.createElement("span");
-      score.className = "vfa-query-result-score";
-      score.textContent = "相关度 " + Math.round(ev._score * 100) + "%";
-      head.appendChild(score);
-    }
     head.appendChild(frame);
     head.appendChild(ts);
     li.appendChild(head);
-    // 语义搜索 reason 显示
-    if (ev._reason) {
-      const reason = document.createElement("div");
-      reason.className = "vfa-query-result-reason";
-      reason.textContent = "📌 " + ev._reason;
-      li.appendChild(reason);
-    }
     const tags = document.createElement("div");
     tags.className = "vfa-query-result-tags";
     if (s.scene)   tags.appendChild(makeTag(s.scene, "scene"));
@@ -9083,14 +8990,7 @@ function initVideoFileAnalysis() {
   // 反查 modal
   document.getElementById("vfa-query-close")?.addEventListener("click", vfaQueryClose);
   const runBtn = document.getElementById("vfa-query-run");
-  runBtn?.addEventListener("click", () => {
-    if (_vfaAbort) {
-      // 已有查询在跑，按钮变成"取消"
-      _vfaAbort.abort();
-    } else {
-      vfaQueryRun();
-    }
-  });
+  runBtn?.addEventListener("click", vfaQueryRun);
   document.getElementById("vfa-query-clear")?.addEventListener("click", vfaQueryClear);
   // "时间范围"输入 on-blur 触发格式校验（非 on-input —— 用户输入到一半
   // 如 "0" 是合法中间态，on-input 会闪红框，太烦）。
