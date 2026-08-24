@@ -1521,11 +1521,15 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
     输入"请一句话向用户确认"）生成自然语言确认语 → 出口；
     wrap-up RPC 失败回退固定文案。
   - 结果型（无该标志）→ 结果 JSON 转 prose transcript 作为下一轮
-    `current_text` 继续推理，可链式再次 tool_call；正常出口后由
-    `chat_agent` 补齐 history 尾部的 assistant 回答条目。
-  - 抛错（校验失败 / 执行异常）→ 立即终止，用户收到
-    "抱歉，工具 X 执行失败：<原因>"；不重试（对齐 detector 的
-    is_fatal break）。失败明细写入 steps[].error。
+    `current_text` 继续推理，可链式再次 tool_call。
+  - 执行失败 / 抛错 → **失败 transcript 回喂**（与结果型同构）：
+    `[系统] 工具 X 调用失败：<原因>。请勿提及技术细节，自然语言告知
+    用户暂时无法完成` → 模型生成解释后出口；连续失败由 max_iters
+    兜底收敛。无特殊分支、无固定文案出口。失败明细写入 steps[].error。
+* **capability 前置校验**：``_build_instance`` 对 ``requires_
+  capability`` 未加载的工具直接抛 ``ToolExecutionError`` —— 保证
+  "已注册但不可用的工具被调用必然返回错误"，未来新工具无需各自在
+  ``__call__`` 里重复检查（tts_alert 内部仍保留自己的检查）。
 * **history 写回**：调用方只写首条 user 条目，然后 extend agent 返回的
   `history_append` —— 含语义化 assistant 占位
   （content="[已调用工具 X(...)]"，修掉阶段1 空 content 占位导致下轮
@@ -1537,9 +1541,11 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
   （`tools/registry.py`）——``requires_capability`` 对应模型未加载的
   工具直接从 schema 排除，模型看不到就调不到。text_chat /
   wechat_llm 的 `_resolve_tool_names` 均委托它。
-* **B1 兜底**：微信发送前经 ``chat_runner.strip_tool_call_tags()``
-  清洗 answer 残留（`<tool_call>` 标签 / markdown json 围栏 / 裸
-  tool-call JSON 三类）；正常路径下工具轮不走此文案（wrap-up 覆盖）。
+* **worker 端解析与注入解耦**：schema 注入按 capability 过滤后的
+  `tool_names`；tool_call 解析则**始终按 registry 全量** —— 工具模型
+  卸载后 prompt 无该 schema，但模型凭历史记忆自发输出的调用仍被
+  识别并返回主进程执行（capability 校验必然抛错 → 失败回喂自然告知）。
+  完全编造的工具名 dispatch 校验失败，当纯文本。
 * **新增一个工具的三步流程（零框架改动）**：
   1. ``app/services/tools/<tool>.py`` 定义 ``@WdnaiCallable`` 类 +
      ``__call__(self, frame_bgr, ctx)``（纯文本场景 frame 传 None）；
@@ -1552,6 +1558,12 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
   consume_iteration）→ 会走结果型回喂分支，模型将向用户转述
   "因繁忙未播"；语义上更理想是静默终止 + wrap-up，真机接入 TTS
   后按体验决定是否调整（`_execute_tool` 后加 silent 判定约 3 行）。
+* **工具模型卸载后的"历史诱导调用"**：工具调用成功会在 history 留下
+  `[已调用工具 X(...)]` 语义化占位；对应模型（如 qwen3-tts）被卸载后，
+  新一轮 prompt 无该 schema —— **绝不会误执行**（capability 前置
+  校验必然抛错）；模型可能凭历史记忆继续发起调用，走标准失败回喂
+  路径：`[系统] 工具 X 调用失败：功能未启用…` → 模型自然语言告知用户，
+  与其它运行时失败同构，无特殊分支。
 
 ## TargetDoc 结构化输出 (视频目标检测页)
 
@@ -1770,9 +1782,8 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     冲突。`text_chat._run_one` 的 `chat_run` 同样包这把锁。
   - **裁剪在 worker 端**：主进程只透传 `history`，`compute_worker`
     `_chat_run_loop` 用真实 tokenizer 裁剪 + 拼 ChatML；主进程侧
-    `run_chat_with_tools()` 完成工具执行与回喂循环后，把最终 answer
-    经 `chat_runner.strip_tool_call_tags()` 清洗（剥离工具调用残留）
-    再发微信。
+    `run_chat_with_tools()` 完成工具执行与回喂循环（成功 wrap-up /
+    失败回喂自然告知）后，把最终 answer 直接发微信。
   - **发送复用 `wechat_bot`**：回复走 `Wechat.send_text`，自动出现在
     "调试收发"消息列表（out 方向），与手动发送共用同一发送通道、线程安全。
 

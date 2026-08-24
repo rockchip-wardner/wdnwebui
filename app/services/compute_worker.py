@@ -959,16 +959,27 @@ def _chat_run_loop(state: dict) -> None:
             _chat_shm_publish(state)
             return
 
-        # ---- 工具 schema 注入（chat_run ↔ @Callable 链路）----
-        # 解析 tool_names → class → get_tool_specs → render_tools_block。
-        # _resolve_tool_classes 内部按工具 registry 查 class 名（lazy import），
-        # 找不到的 name 会打 warning 跳过，不会让 SDK 报错。
-        tool_names = chat.get("tool_names") or []
-        tool_classes = _resolve_tool_classes(tool_names)
+        # ---- 工具 schema 注入 + tool_call 解析 ----
+        # 注入按 capability 过滤后的 tool_names 渲染 schema；解析则
+        # **始终按 registry 全量**进行（两者解耦）：工具模型卸载后新
+        # prompt 无该 schema，但模型凭历史记忆自发输出的 tool_call 仍
+        # 能被识别并返回主进程 —— 主进程执行时 capability 前置校验必然
+        # 抛错，错误 transcript 回喂让模型自然语言告知用户。完全编造的
+        # 工具名 dispatch 校验失败，当纯文本处理。
+        inject_classes = _resolve_tool_classes(chat.get("tool_names") or [])
         tool_specs = None
-        if tool_classes:
+        if inject_classes:
             from wdnai._callable import get_tool_specs
-            tool_specs = get_tool_specs(tool_classes)
+            tool_specs = get_tool_specs(inject_classes)
+
+        parse_classes: list = []
+        try:
+            from app.services.tools import get_tool_registry
+            parse_classes = [
+                spec.tool_class
+                for spec in get_tool_registry().list_specs()]
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("infer_handler: tool registry listing failed: %s", e)
 
         prompt = build_chatml_prompt(selected, text, tool_specs=tool_specs)
         chat["prompt_tokens"] = count_tokens(tokenizer, prompt)
@@ -1005,8 +1016,8 @@ def _chat_run_loop(state: dict) -> None:
         thinking, answer_text = split_thinking(full_text)
         tool_call_name = None
         tool_call_args = None
-        if tool_classes:
-            parsed = _parse_qwen_tool_call(answer_text, tool_classes)
+        if parse_classes:
+            parsed = _parse_qwen_tool_call(answer_text, parse_classes)
             if parsed is not None:
                 tool_call_name, tool_call_args = parsed
 

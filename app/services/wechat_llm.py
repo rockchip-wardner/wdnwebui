@@ -14,8 +14,8 @@
   ``chat_runner.trim_history``。
 * **串行保证**：桥接 worker 线程串行消费队列；``chat_run`` 用
   ``chat_serial.get_chat_run_lock()`` 与 text_chat worker 互斥。
-* **只回 answer 不回 thinking**：最终轮输出经 ``strip_tool_call_tags``
-  清洗后发微信。
+* **只回 answer 不回 thinking**：最终轮输出已是面向用户的自然语言
+  （正常回答 / wrap-up 确认语 / 失败回喂后的解释），直接发微信。
 * **发送复用 wechat_bot**：回复走 ``Wechat.send_text``，自动出现在"调试
   收发"消息列表（out 方向），与手动发送共用同一发送通道、线程安全。
 """
@@ -143,7 +143,6 @@ class _LlmBridge:
 
     def _process(self, user_id: str, text: str) -> None:
         from app.services.chat_agent import run_chat_with_tools
-        from app.services.chat_runner import strip_tool_call_tags
         from app.services.chat_serial import get_chat_run_lock
         from app.services.compute_registry import get_registry
 
@@ -161,7 +160,7 @@ class _LlmBridge:
         context_limit = self._resolve_context_limit()
 
         # 裁剪 / ChatML 拼接由 worker 端 _chat_run_loop 完成（真实 tokenizer）；
-        # 工具执行与 wrap-up / 回喂循环由主进程侧 chat_agent 完成。
+        # 工具执行与 wrap-up / 回喂 / 失败告知循环由主进程侧 chat_agent 完成。
         try:
             with get_chat_run_lock():
                 agent = run_chat_with_tools(
@@ -180,11 +179,9 @@ class _LlmBridge:
         if agent.get("interrupted"):
             return
 
-        # 最终轮输出（正常回答 / wrap-up 确认语 / 失败文案）。发送前
-        # 统一剥离工具调用残留 —— 解析失败的半截 JSON、<tool_call>
-        # 标签等不能漏给微信用户。
+        # 最终轮输出：正常回答 / wrap-up 确认语 / 失败回喂后的自然语言
+        # 解释 —— 三种路径都已是面向用户的文本，直接发送。
         answer = (agent.get("answer") or "").strip()
-        answer = strip_tool_call_tags(answer)
         answer = answer or "（模型未输出有效内容）"
 
         steps = agent.get("steps") or []

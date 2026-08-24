@@ -9,10 +9,13 @@ agent-loop：
                     │
                     └─ 有 tool_call ─▶ 主进程实例化并执行 @Callable
                                           │
-                       consume_iteration ├─ True  ─▶ wrap-up 轮(tools=[]) 生成
-                       （side-effect 型）│             自然语言确认 → 出口
-                                         └─ False ─▶ 结果转 transcript 作为
-                       （结果型）                       新一轮输入继续 loop
+                        consume_iteration ├─ True  ─▶ wrap-up 轮(tools=[]) 生成
+                        （side-effect 型）│             自然语言确认 → 出口
+                                          ├─ False ─▶ 结果转 transcript 作为
+                        （结果型）         │             新一轮输入继续 loop
+                                          │
+                        执行失败 / 抛错    └─▶ 失败 transcript 回喂，让模型
+                                            自然语言告知用户后出口
 
 **工具输出契约**（新增工具只需遵守，无需改动本模块）：
 
@@ -21,7 +24,9 @@ agent-loop：
 * 结果型：返回业务数据 dict、不带 ``consume_iteration`` ——结果会被
   序列化为 transcript 回喂模型，模型基于结果继续回答（可再次发起
   tool_call 形成链式调用）。
-* 抛异常：视为该次调用失败，立即以失败文案出口（不再回喂）。
+* 抛异常（含 capability 未加载的前置校验失败）：错误转 transcript
+  回喂，模型用自然语言向用户解释失败 —— 与结果型同构，无特殊分支；
+  连续失败由 max_iters 兜底收敛。
 
 并发约束：调用方必须持有 ``chat_serial.get_chat_run_lock()``（与现有
 text_chat / wechat_llm 相同），保证同一时刻只有一个 chat_run 在飞。
@@ -64,25 +69,38 @@ def _resolve_max_iters() -> int:
     return _DEFAULT_MAX_ITERS
 
 
-def _lookup_tool_class(name: str):
+def _lookup_spec(name: str):
     from app.services.tools import get_tool_registry
     for spec in get_tool_registry().list_specs():
         if spec.tool_class.__name__ == name:
-            return spec.tool_class
+            return spec
     return None
 
 
 def _build_instance(name: str, args: Optional[dict]):
     """按 class 名从 registry 重建 @Callable 实例并校验参数。
 
+    两道校验保证"已注册但不可用的工具被调用必然抛错"：
+
+    1. capability 前置校验 —— ``requires_capability`` 对应模型未加载
+       时立即抛 ``ToolExecutionError``。统一兜底，未来新工具无需各自
+       在 ``__call__`` 里重复检查（tts_alert 内部仍保留自己的检查）；
+    2. pydantic 参数校验。
+
     worker 端已经 dispatch 校验过一次；这里重建是因为实例无法跨进程
     传输——主进程拿到的是 (name, args dict)。
     """
-    cls = _lookup_tool_class(name)
-    if cls is None:
+    spec = _lookup_spec(name)
+    if spec is None:
         raise ToolExecutionError(name, RuntimeError("未注册的工具"))
+    if spec.requires_capability:
+        try:
+            from app.services.compute_registry import get_registry
+            get_registry().get_session(spec.requires_capability)
+        except Exception as exc:  # noqa: BLE001
+            raise ToolExecutionError(name, exc) from exc
     try:
-        return cls.model_validate(args or {})
+        return spec.tool_class.model_validate(args or {})
     except Exception as exc:  # noqa: BLE001
         raise ToolExecutionError(name, exc) from exc
 
@@ -103,6 +121,20 @@ def _transcript_for_result(name: str, outcome: dict) -> str:
     return (
         f"[系统] 工具 {name} 已执行，返回结果：{payload}。"
         f"请基于该结果用自然语言回答用户的问题；如信息不足可直接说明。"
+    )
+
+
+def _transcript_for_failure(name: str, err: str) -> str:
+    """工具执行失败 → 失败 transcript 回喂，让模型自然语言告知用户。
+
+    与结果型回喂同构 —— 卸载工具模型后历史占位诱导的自发调用也走
+    这条路：capability 前置校验必然抛错 → 模型向用户解释"功能暂时
+    不可用"，无需任何特殊分支。
+    """
+    return (
+        f"[系统] 工具 {name} 调用失败：{err}。"
+        f"请不要提及工具名、JSON 或技术细节，用一句简短自然的中文告知"
+        f"用户该请求暂时无法完成。"
     )
 
 
@@ -144,8 +176,8 @@ def run_chat_with_tools(
             "tool_call", "tool_call_args",   # 最后一次工具调用（兼容旧帧）
             "elapsed_sec", "ts", "prompt_tokens",
             "interrupted": bool,        # stop_event 触发中断
-            "error": "",                # 非 fatal 出口为空；工具异常时有值
-        }
+            "error": "",                # 仅 RPC 层推理失败时有值；工具
+        }                               # 执行失败走回喂，不算 error
     """
     t0 = time.perf_counter()
     iters = max_iters if max_iters and max_iters > 0 else _resolve_max_iters()
@@ -204,11 +236,31 @@ def run_chat_with_tools(
             inst = _build_instance(tool_name, last_tool_args)
             outcome = _execute_tool(inst, current_text)
         except Exception as exc:  # noqa: BLE001
+            # 失败不终止：错误转 transcript 回喂，让模型自然语言告知用户。
+            # 卸载工具模型后的历史诱导调用（capability 校验抛错）与未来
+            # 工具的运行时异常都走这条统一路径，由 max_iters 兜底收敛。
             step["error"] = str(exc)
             steps.append(step)
-            error_msg = f"工具 {tool_name} 执行失败：{exc}"
-            _LOG.warning("tool %s failed: %s", tool_name, exc)
-            break
+            _LOG.warning("tool %s failed (feed back): %s", tool_name, exc)
+            history_append.append({
+                "role": "assistant",
+                "content": (
+                    f"[已调用工具 {tool_name}，参数 "
+                    f"{json.dumps(last_tool_args or {}, ensure_ascii=False)}"
+                    f"，调用失败]"),
+                "thinking": final_thinking,
+                "ts": time.time(),
+                "tool_call": tool_name,
+                "_placeholder": True,
+            })
+            work_history.extend(history_append[-1:])
+            next_input = _transcript_for_failure(tool_name, str(exc))
+            history_append.append({
+                "role": "user", "content": next_input, "ts": time.time(),
+                "_system_note": True,
+            })
+            current_text = next_input
+            continue
 
         consume = bool(outcome.get("consume_iteration"))
         step["outcome"] = {k: v for k, v in outcome.items()
