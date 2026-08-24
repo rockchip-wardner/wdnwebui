@@ -64,7 +64,6 @@ from typing import Callable, Deque, List, Optional
 
 from app.services.chat_runner import split_thinking
 from app.services.config import get_config
-from app.services.tools import get_tool_registry
 
 
 _LOG = logging.getLogger("text_chat")
@@ -292,19 +291,24 @@ class _TextChatManager:
             self._set_state(self.STATE_RUNNING)
         self._broadcast({"type": "state", "state": self.snapshot()})
 
-        # 6. RPC 推理（worker 端裁剪 + 跑；主进程轮询拉增量）
+        # 6. RPC 推理（worker 端裁剪 + 跑；主进程轮询拉增量）。
+        # chat_agent 承担工具执行与多轮回喂：模型发起 tool_call 时在
+        # 主进程实例化 @Callable 并执行副作用，wrap-up / transcript
+        # 回喂继续推理，直到给出自然语言回答或达到循环上限。
         t0 = time.perf_counter()
         try:
+            from app.services.chat_agent import run_chat_with_tools
             from app.services.chat_serial import get_chat_run_lock
             with get_chat_run_lock():
-                result = session.chat_run(
-                    history=history_snapshot,
-                    text=req.text,
+                agent = run_chat_with_tools(
+                    session,
+                    history_snapshot,
+                    req.text,
                     context_limit=context_limit,
                     max_new_tokens=self.MAX_NEW_TOKENS,
+                    tool_names=self._resolve_tool_names(),
                     on_delta=lambda d: router.push(d),
                     stop_event=self._worker_stop_event,
-                    tool_names=self._resolve_tool_names(),
                 )
             elapsed = time.perf_counter() - t0
         except Exception as e:  # noqa: BLE001
@@ -319,18 +323,20 @@ class _TextChatManager:
             return
 
         # 7. 检查是否被 stop 中断 —— 丢弃本轮
-        stopped = self._worker_stop_event.is_set()
+        stopped = (
+            self._worker_stop_event.is_set() or agent.get("interrupted"))
 
-        # 8. thinking / answer：worker 端已用 split_thinking 切好 + 仅对
-        # answer 段解析 tool_call；result 同时保留 text（含 thinking）供
-        # 本地兜底正则（处理 worker 未拆分等极端情况）。
-        thinking = result.get("thinking") or ""
-        answer = result.get("answer") or ""
+        # 8. thinking / answer：agent 返回最终轮输出（正常回答、
+        # wrap-up 确认语或失败文案）。worker 已 split_thinking；
+        # result.text 本地兜底仅在两者皆空时使用。
+        thinking = agent.get("thinking") or ""
+        answer = agent.get("answer") or ""
         if not thinking and not answer:
-            full_text = result.get("text") or ""
+            full_text = ""
             thinking, answer = split_thinking(full_text)
-        tool_call_name = result.get("tool_call")
-        tool_call_args = result.get("tool_call_args")
+        tool_call_name = agent.get("tool_call")
+        tool_call_args = agent.get("tool_call_args")
+        steps = agent.get("steps") or []
 
         if stopped:
             with self._lock:
@@ -345,26 +351,18 @@ class _TextChatManager:
             self._broadcast({"type": "state", "state": self.snapshot()})
             return
 
-        # 9. 写回 history（仅 answer，不含 thinking；tool_call 不写）
-        # 阶段1 不执行 tool_call —— JSON 字面量（answer 里）若写入 history
-        # 会污染下轮 prompt。占位条目保证 history 轮次节奏（user + assistant
-        # 一一对应），但 content 留空避免 LLM 复读 / 乱解释。阶段2 引入
-        # agent-loop + 结构化 history（tool_calls / tool role）后整个写入
-        # 策略会被替换。
-        prompt_tokens = int(result.get("prompt_tokens") or 0)
+        # 9. 写回 history。无工具轮：仅 answer 条目；工具轮：extend
+        # chat_agent 返回的 history_append —— 含语义化 assistant 占位
+        # （模型能看到自己调用过什么）、user 系统指令条目和最终回答，
+        # 保证下轮 prompt 轮次节奏完整。
+        prompt_tokens = int(agent.get("prompt_tokens") or 0)
         with self._lock:
             self._history.append({"role": "user", "content": req.text, "ts": req.ts})
             self._history_tokens = prompt_tokens
-            if tool_call_name is not None:
-                self._history.append({
-                    "role": "assistant",
-                    "content": "",
-                    "thinking": thinking,
-                    "ts": time.time(),
-                    "tool_call": tool_call_name,
-                    "_placeholder": True,
-                })
-            elif answer:
+            appended = agent.get("history_append") or []
+            for item in appended:
+                self._history.append(dict(item))
+            if not appended and answer:
                 self._history.append({
                     "role": "assistant", "content": answer,
                     "thinking": thinking, "ts": time.time(),
@@ -374,10 +372,12 @@ class _TextChatManager:
                 "answer":     answer,
                 "elapsed_sec": elapsed,
                 "ts":         time.time(),
-                # tool_call 阶段1：仅做透传，不写入 history（避免污染
-                # 下一轮 prompt）；agent-loop + 写回历史留阶段2。
+                # tool_call：最后一次工具调用记录（None = 纯文本轮）；
+                # steps 是每次执行的明细（args/outcome/error），前端
+                # 工具徽章与调试用。
                 "tool_call":     tool_call_name,
                 "tool_call_args": tool_call_args,
+                "steps":         steps,
             }
             self._set_state(self.STATE_DONE)
 
@@ -390,6 +390,7 @@ class _TextChatManager:
             "history_tokens": self._history_tokens,
             "tool_call":     tool_call_name,
             "tool_call_args": tool_call_args,
+            "steps":         steps,
         })
         self._broadcast({"type": "state", "state": self.snapshot()})
 
@@ -413,18 +414,14 @@ class _TextChatManager:
             return self.CONTEXT_LIMIT
 
     def _resolve_tool_names(self) -> List[str]:
-        """列出来自 ``get_tool_registry()`` 的 ``@Callable`` class 名。
+        """列出**当前可用**的 ``@Callable`` class 名（capability 过滤）。
 
-        阶段1：传所有已注册工具的 class 名给 worker（与 web 文本对话、
-        微信桥接共用同一 qwen3-8b 实例，工具集与音视频描述页保持一致
-        让 LLM 看到完整 schema）。阶段2 加白名单（per-user / per-page
-        过滤），参见 commit history。
+        委托 ``resolve_available_tool_names()``：requires_capability
+        对应模型未加载的工具直接从 schema 中排除，模型看不到就调不到。
         """
         try:
-            return [
-                spec.tool_class.__name__
-                for spec in get_tool_registry().list_specs()
-            ]
+            from app.services.tools import resolve_available_tool_names
+            return resolve_available_tool_names()
         except Exception as e:  # noqa: BLE001
             _LOG.warning("resolve_tool_names failed: %s", e)
             return []

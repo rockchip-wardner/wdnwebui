@@ -1,4 +1,4 @@
-"""工具注册中心：单例 + 元数据查询。
+"""工具注册中心：单例 + 元数据查询 + 可用性过滤。
 
 每个工具以 ``@Callable`` 子类的形式出现，工具在模块加载时通过
 ``register(...)`` 注入到本注册表；key 与 Callable 类一一对应。
@@ -13,9 +13,30 @@ import Callable, Field``，注册过程不引入任何 lazy 间接层，
 视频目标检测页直接用 ``session.respond(generating=TargetDoc)``
 结构化输出，不再走 @Callable 工具链路。当前唯一保留的工具是
 ``tts_alert``（音视频描述页使用）。
+
+新增一个工具的完整步骤（零框架改动）：
+
+1. 在本包内新增 ``<tool>.py``：定义 ``@WdnaiCallable`` 类，
+   实现 ``__call__(self, frame_bgr, ctx)``；
+2. 在 :func:`get_tool_registry` 里 ``reg.register(...)`` 一行，
+   需要模型算力的工具标注 ``requires_capability``（纯软件工具
+   传 None）；
+3. 完成 —— schema 注入、worker 端解析、capability 过滤、
+   chat_agent 的 agent-loop 全部自动生效。
+
+**__call__ 返回值契约**（chat_agent 依赖此契约分流，见
+``app/services/chat_agent.py``）：
+
+* side-effect 型：返回 dict 带 ``consume_iteration: True``
+  （如 tts_alert）——执行本身即目的；chat_agent 成功后走
+  wrap-up 轮生成自然语言确认。
+* 结果型：返回业务数据 dict、不带该标志——结果被序列化为
+  transcript 回喂模型继续推理（可链式再次 tool_call）。
+* 抛异常：chat_agent 视为该次调用失败，以失败文案出口。
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
@@ -144,3 +165,31 @@ def get_tool_registry() -> ToolRegistry:
             )
             _registry = reg
         return _registry
+
+
+def resolve_available_tool_names() -> List[str]:
+    """列出**当前可用**工具的 ``@Callable`` class 名（供 chat_run）。
+
+    capability 门控：``requires_capability`` 非 None 的工具要求对应
+    模型实例已加载（``get_registry().get_session(cap)`` 成功），否则
+    从返回列表中排除 —— 模型根本看不到不可用工具的 schema，从源头
+    避免调用必败工具。纯软件工具（None）始终可用。
+
+    任何单条失败都不影响其余工具；整体异常回退空列表。
+    """
+    out: List[str] = []
+    try:
+        specs = get_tool_registry().list_specs()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("tools").warning("resolve_available_tool_names: %r", exc)
+        return out
+    for spec in specs:
+        cap = spec.requires_capability
+        if cap:
+            try:
+                from app.services.compute_registry import get_registry
+                get_registry().get_session(cap)
+            except Exception:  # noqa: BLE001
+                continue
+        out.append(spec.tool_class.__name__)
+    return out

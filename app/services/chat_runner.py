@@ -14,6 +14,36 @@ _TOOL_CALL_INSTRUCTION = (
     "placeholder/example JSONs, or any text before/after the JSON."
 )
 
+_TOOL_CALL_TAG_RE = re.compile(r"</?tool_call>", re.IGNORECASE)
+_MD_JSON_FENCE_RE = re.compile(
+    r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def strip_tool_call_tags(text: str) -> str:
+    """从 answer 文本中剥离工具调用残留（B1 兜底）。
+
+    模型发起工具调用时 answer 可能是 ``<tool_call>{...}</tool_call>``、
+    裸 JSON 或 markdown ```json 围栏。chat_agent 正常路径下工具轮
+    不会直接把 answer 发给用户（走 wrap-up / 回喂），但解析失败、
+    半截输出等极端情况下仍可能有残留 —— 发送给用户前统一清洗。
+    """
+    if not text:
+        return ""
+    out = _TOOL_CALL_TAG_RE.sub("", text)
+    out = _MD_JSON_FENCE_RE.sub("", out)
+    # 剥离"整个字符串就是一个 JSON 对象"的情况（裸 JSON 兜底）
+    s = out.strip()
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            import json as _json
+            obj = _json.loads(s)
+            if isinstance(obj, dict) and (
+                    "name" in obj or "arguments" in obj or "tool_call" in obj):
+                return ""
+        except Exception:  # noqa: BLE001
+            pass
+    return out.strip()
+
 
 def split_thinking(text: str) -> Tuple[str, str]:
     m = _THINK_RE.search(text)

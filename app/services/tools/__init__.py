@@ -22,6 +22,7 @@ from .registry import (
     ToolRegistry,
     ToolSpec,
     get_tool_registry,
+    resolve_available_tool_names,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "ToolRegistry",
     "ToolSpec",
     "get_tool_registry",
+    "resolve_available_tool_names",
 ]

@@ -14,7 +14,8 @@
   ``chat_runner.trim_history``。
 * **串行保证**：桥接 worker 线程串行消费队列；``chat_run`` 用
   ``chat_serial.get_chat_run_lock()`` 与 text_chat worker 互斥。
-* **只回 answer 不回 thinking**：``split_thinking`` 去掉思考段再发微信。
+* **只回 answer 不回 thinking**：最终轮输出经 ``strip_tool_call_tags``
+  清洗后发微信。
 * **发送复用 wechat_bot**：回复走 ``Wechat.send_text``，自动出现在"调试
   收发"消息列表（out 方向），与手动发送共用同一发送通道、线程安全。
 """
@@ -27,8 +28,7 @@ import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional
 
-from app.services.chat_runner import split_thinking
-from app.services.tools import get_tool_registry
+from app.services.tools import resolve_available_tool_names
 
 _LOG = logging.getLogger("wechat_llm")
 
@@ -142,6 +142,8 @@ class _LlmBridge:
                     self._active_sessions -= 1
 
     def _process(self, user_id: str, text: str) -> None:
+        from app.services.chat_agent import run_chat_with_tools
+        from app.services.chat_runner import strip_tool_call_tags
         from app.services.chat_serial import get_chat_run_lock
         from app.services.compute_registry import get_registry
 
@@ -159,15 +161,15 @@ class _LlmBridge:
         context_limit = self._resolve_context_limit()
 
         # 裁剪 / ChatML 拼接由 worker 端 _chat_run_loop 完成（真实 tokenizer）；
-        # 主进程只透传 history，拿到完整文本后再切 thinking / answer。
+        # 工具执行与 wrap-up / 回喂循环由主进程侧 chat_agent 完成。
         try:
             with get_chat_run_lock():
-                result = session.chat_run(
-                    history=history_snapshot,
-                    text=text,
+                agent = run_chat_with_tools(
+                    session,
+                    history_snapshot,
+                    text,
                     context_limit=context_limit,
                     max_new_tokens=self.MAX_NEW_TOKENS,
-                    on_delta=None,
                     tool_names=self._resolve_tool_names(),
                 )
         except Exception as exc:  # noqa: BLE001
@@ -175,40 +177,35 @@ class _LlmBridge:
             self._reply_no_context(user_id, f"推理失败：{exc}")
             return
 
-        # worker 端已用 split_thinking 切好 + 仅对 answer 段解析 tool_call；
-        # 兜底走本地 split（处理 worker 未拆分等极端情况）。
-        full = result.get("text") or ""
-        answer = (result.get("answer") or "").strip()
-        if not answer:
-            _, answer = split_thinking(full)
-            answer = (answer or "").strip()
+        if agent.get("interrupted"):
+            return
+
+        # 最终轮输出（正常回答 / wrap-up 确认语 / 失败文案）。发送前
+        # 统一剥离工具调用残留 —— 解析失败的半截 JSON、<tool_call>
+        # 标签等不能漏给微信用户。
+        answer = (agent.get("answer") or "").strip()
+        answer = strip_tool_call_tags(answer)
         answer = answer or "（模型未输出有效内容）"
 
-        # 阶段1：tool_call 透传但**不执行 instance()**（避免 TTS 误播、
-        # agent-loop 副作用未实现）。仅记日志提示该轮触发了工具调用。
-        tool_call_name = result.get("tool_call")
-        tool_call_args = result.get("tool_call_args")
-        if tool_call_name:
-            _llm_log(f"tool_call emitted (not executed, stage1): "
-                     f"{tool_call_name} args={tool_call_args}")
+        steps = agent.get("steps") or []
+        if steps:
+            executed = "；".join(
+                f"{s.get('tool_call')}({'成功' if not s.get('error') else '失败'})"
+                for s in steps)
+            _llm_log(f"agent-loop for {user_id}: {executed}")
 
         with self._lock:
-            self.histories.setdefault(user_id, deque(maxlen=_HISTORY_MAX)).append(
-                {"role": "user", "content": text, "ts": time.time()})
-            if tool_call_name is not None:
-                # 阶段1 不执行 tool_call —— 不写 JSON 字面量到 history 避免
-                # 下轮 prompt 污染；用空 content + ``tool_call`` 标记占位。
-                # 阶段2 引入 agent-loop + 结构化 history 后整体替换。
-                self.histories[user_id].append({
-                    "role": "assistant",
-                    "content": "",
+            hist = self.histories.setdefault(user_id, deque(maxlen=_HISTORY_MAX))
+            hist.append({"role": "user", "content": text, "ts": time.time()})
+            appended = agent.get("history_append") or []
+            for item in appended:
+                hist.append(dict(item))
+            if not appended and answer != "（模型未输出有效内容）":
+                hist.append({
+                    "role": "assistant", "content": answer,
+                    "thinking": agent.get("thinking") or "",
                     "ts": time.time(),
-                    "tool_call": tool_call_name,
-                    "_placeholder": True,
                 })
-            else:
-                self.histories[user_id].append(
-                    {"role": "assistant", "content": answer, "ts": time.time()})
 
         self._reply_no_context(user_id, answer)
 
@@ -227,18 +224,15 @@ class _LlmBridge:
         return 32768
 
     def _resolve_tool_names(self) -> list:
-        """列出来自 ``get_tool_registry()`` 的 ``@Callable`` class 名。
+        """列出**当前可用**的 ``@Callable`` class 名（capability 过滤）。
 
-        阶段1：传所有已注册工具给 worker。微信用户当前主要场景是文字
-        对话，但模型看到 ``tts_alert`` schema 后可能调它（参见
-        text_chat._resolve_tool_names 注释）；阶段1 不执行 instance()，
-        仅日志记录。阶段2 加白名单。
+        委托 ``resolve_available_tool_names()``：qwen3-tts 未加载时
+        tts_alert 直接从 schema 排除，模型看不到就调不到，避免必败
+        调用。新工具在 tools 包内 register 一行即自动纳入。
         """
         try:
-            return [
-                spec.tool_class.__name__
-                for spec in get_tool_registry().list_specs()
-            ]
+            from app.services.tools import resolve_available_tool_names
+            return resolve_available_tool_names()
         except Exception as exc:  # noqa: BLE001
             _llm_log(f"resolve_tool_names failed: {exc!r}")
             return []

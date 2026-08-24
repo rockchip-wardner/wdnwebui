@@ -220,38 +220,34 @@ def _load_wdnai() -> dict:
 # lookup table so it can resolve the name back to the actual class
 # before passing ``tools=[…]`` to the SDK. Add new entries here when a
 # new ``@Callable`` tool is registered.
-_TOOL_TABLE = {
-    "TtsAlert": "app.services.tools.tts_alert.TtsAlert",
-}
-
-
 def _resolve_tool_classes(names):
     """Map ``@Callable`` class names (strings) to actual class objects.
 
+    真源是主进程与 worker 共享的 ``app.services.tools`` registry ——
+    新增工具只需在该包内 register 一行，无需再维护手工映射表。
+    Unknown names are silently skipped (and logged) so the SDK
+    doesn't error out — the model simply can't call a tool it never
+    sees a schema for.
+
     Lazy imports keep the worker boot path clean: a model that's
     never invoked with ``tools=[...]`` never imports
-    ``app.services.tools.*``. Unknown names are silently skipped (and
-    logged) so the SDK doesn't error out — the model simply can't
-    call a tool it never sees a schema for.
+    ``app.services.tools.*``.
     """
     if not names:
         return []
     out = []
     for n in names:
-        mod_path = _TOOL_TABLE.get(n)
-        if not mod_path:
-            LOG.warning("infer_handler: unknown tool name %r — skipping", n)
-            continue
+        cls = None
         try:
-            mod_name, cls_name = mod_path.rsplit(".", 1)
-            mod = __import__(mod_name, fromlist=[cls_name])
-            cls = getattr(mod, cls_name, None)
+            from app.services.tools import get_tool_registry
+            for spec in get_tool_registry().list_specs():
+                if spec.tool_class.__name__ == n:
+                    cls = spec.tool_class
+                    break
         except Exception as e:  # noqa: BLE001
-            LOG.warning("infer_handler: tool import failed for %r: %s", n, e)
-            continue
+            LOG.warning("infer_handler: tool registry lookup failed: %s", e)
         if cls is None:
-            LOG.warning("infer_handler: tool class %r not found at %s",
-                        n, mod_path)
+            LOG.warning("infer_handler: unknown tool name %r — skipping", n)
             continue
         out.append(cls)
     return out
@@ -913,7 +909,7 @@ def chat_run_handler(state: dict, payload: dict) -> dict:
     except Exception:
         context_limit, max_new_tokens = 0, 2048
     # RPC 仅透传 class name 字符串（与 infer 路径对齐）；worker 端按名
-    # 查 _TOOL_TABLE 拿真实 class 注入到 prompt schema，并解析模型输出。
+    # 查工具 registry 拿真实 class 注入到 prompt schema，并解析模型输出。
     tool_names = payload.get("tools") or []
     if not isinstance(tool_names, list):
         tool_names = []
@@ -965,7 +961,7 @@ def _chat_run_loop(state: dict) -> None:
 
         # ---- 工具 schema 注入（chat_run ↔ @Callable 链路）----
         # 解析 tool_names → class → get_tool_specs → render_tools_block。
-        # _resolve_tool_classes 内部按 _TOOL_TABLE 查 class 名（lazy import），
+        # _resolve_tool_classes 内部按工具 registry 查 class 名（lazy import），
         # 找不到的 name 会打 warning 跳过，不会让 SDK 报错。
         tool_names = chat.get("tool_names") or []
         tool_classes = _resolve_tool_classes(tool_names)
@@ -1165,7 +1161,8 @@ def infer_handler(state: dict, payload: dict) -> dict:
             # ``tools`` 是 wdnai 的 ``@Callable`` 类列表。RPC 只透传
             # class name 字符串（类对象不可 pickle），worker 端按名查
             # 表拿到真实 class 再传给 SDK。当前唯一已注册的工具是
-            # 音视频描述页的 ``tts_alert``；后续加新工具时扩 ``_TOOL_TABLE``
+            # 音视频描述页的 ``tts_alert``；后续加新工具时在
+            # ``app.services/tools/`` 内 register 一行即可，无需改此处。
             # 即可。
             tool_names = payload.get("tools") or []
             tool_classes = _resolve_tool_classes(tool_names)

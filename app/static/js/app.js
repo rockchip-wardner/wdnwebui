@@ -6827,6 +6827,7 @@ const TextChat = {
         answer: msg.answer || "",
         status: "done",
         elapsed_sec: msg.elapsed_sec,
+        tool_call: msg.tool_call,
       });
       this._recordMessage("user",      msg.answer ? "" : "", 0);   // user 已 echo
       if (msg.answer) {
@@ -7041,6 +7042,19 @@ const TextChat = {
         const span = document.createElement("span");
         span.className = "text-chat-stopped";
         span.textContent = "（已停止）";
+        meta.appendChild(span);
+      }
+    }
+
+    // tool-call badge: the agent executed at least one @Callable during
+    // this turn (e.g. tts_alert / BeepTool). Show which one ran.
+    if (info.tool_call) {
+      const meta = p.assistantLi.querySelector(".imb-msg-meta");
+      if (meta) {
+        const span = document.createElement("span");
+        span.className = "text-chat-tool-badge";
+        span.textContent = `🔧 已调用 ${info.tool_call}`;
+        span.title = "本轮对话通过工具调用完成";
         meta.appendChild(span);
       }
     }
