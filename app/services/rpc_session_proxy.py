@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import threading
 import time
@@ -116,12 +117,16 @@ class _RpcSessionProxy:
     Construct via :func:`make_rpc_session_proxy(rpc_client, model_id, _svc)`.
     """
 
-    def __init__(self, rpc_client, model_id: str, _svc=None):
+    def __init__(self, rpc_client, model_id: str, _svc=None,
+                 on_client_recreated=None):
         self._client = rpc_client
         self._model_id = model_id
         # wdndds cshim requester 一次性：timeout / send-failed 后 channel
         # 永久 wedged。传 service 引用以便 destroy + create_requester 自愈。
         self._svc = _svc
+        # recreate 成功后回调（registry 用来同步替换 inst.rpc_client，
+        # 避免其它持有者继续引用已销毁的 requester）。
+        self._on_client_recreated = on_client_recreated
         self._client_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=1,
@@ -129,23 +134,42 @@ class _RpcSessionProxy:
         )
 
     def _recreate_client(self) -> None:
-        """Destroy wedged cshim client + spin up a fresh requester."""
+        """Destroy wedged cshim client + spin up a fresh requester.
+
+        destroy 必须在旧 requester 的 ``Requester._lock`` 内执行：
+        ``wdndds_requester_destroy`` 与正在进行的 ``wdndds_requester_call``
+        并发是 C 层 use-after-free（probe 线程 / 管理操作可能正拿着同一
+        requester 在 call），实测会产出损坏 reply 甚至直接 SIGSEGV。
+        recreate 完成后通过 ``_on_client_recreated`` 回调通知 registry
+        同步替换 ``inst.rpc_client``，消除悬挂引用。
+        """
         if self._svc is None:
             LOG.warning("rpc-proxy[%s]: no _svc ref, can't recreate", self._model_id)
             return
         with self._client_lock:
             old = self._client
             try:
-                old.destroy()
+                with old._lock:
+                    old.destroy()
             except Exception as e:  # noqa: BLE001
                 LOG.debug("rpc-proxy[%s]: destroy old client raised %s",
                           self._model_id, e)
             try:
-                self._client = self._svc.create_requester(timeout_ms=10_000)
-                LOG.info("rpc-proxy[%s]: cshim client recreated (was wedged)",
-                         self._model_id)
+                new_client = self._svc.create_requester(timeout_ms=10_000)
             except Exception as e:  # noqa: BLE001
-                LOG.error("rpc-proxy[%s]: recreate failed: %s", self._model_id, e)
+                LOG.error("rpc-proxy[%s]: recreate failed: %s",
+                          self._model_id, e)
+                return
+            self._client = new_client
+            LOG.info("rpc-proxy[%s]: cshim client recreated (was wedged)",
+                     self._model_id)
+        cb = self._on_client_recreated
+        if cb is not None:
+            try:
+                cb(self._client)
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("rpc-proxy[%s]: on_client_recreated callback "
+                          "raised %s", self._model_id, e)
 
     def _call_with_recreate(self, payload: dict, timeout_ms: int) -> dict:
         """call + auto-recreate on first wedge.
@@ -153,16 +177,23 @@ class _RpcSessionProxy:
         wdndds cshim deadlock path:
           1. first call → reply topic discovery race → timeout
           2. next call → "send failed" (RC=-1, requester wedged)
-        Either symptom triggers destroy + recreate_requester + retry.
-        After recreate, new SEDP/SPDP endpoints match within ~1s on
-        localhost, so the retry almost always succeeds.
+
+        **只有「结构性故障」才 recreate**：send failed / no data /
+        write rc / discovery_pending —— 这些说明 requester 或 endpoint
+        匹配真的坏了，destroy + recreate + warmup 能自愈。
+
+        **纯 timeout 不 recreate**：worker 端 rknn3lite C 扩展推理期间
+        不释放 GIL，cshim pump 线程存在实测 ~35s 无法应答任何 RPC 的
+        「聋哑窗口」——这是 worker 忙，不是通道坏。此时销毁 requester
+        不仅无益，还会把 reply 一起丢掉并引发 destroy/call 并发竞态。
+        timeout 交给上层 ``_call_poll_with_retry`` 的有限重试消化。
         """
         reply = self._client.call(payload, timeout_ms=timeout_ms)
         if reply.get("ok") or not reply.get("error"):
             return reply
         err = str(reply.get("error", "")).lower()
-        wedged = ("timeout" in err or "send failed" in err
-                  or "no data" in err)
+        wedged = ("send failed" in err or "no data" in err
+                  or "write rc" in err or "discovery_pending" in err)
         if not wedged:
             return reply
         LOG.warning("rpc-proxy[%s]: cshim wedged (%s); recreating client",
@@ -176,34 +207,67 @@ class _RpcSessionProxy:
                       self._model_id, e)
         return self._client.call(payload, timeout_ms=timeout_ms)
 
-    # Max consecutive chat_poll timeouts before we give up. A single
-    # timeout is usually transient (worker pump starved of the GIL while
-    # _chat_run_loop holds it during backend.run), so we retry a few
-    # times before surfacing an error.
-    _POLL_RETRY = 3
+    # chat_poll resilience budget.
+    #
+    # worker 推理期间独立 participant 的 info 响应仅
+    # ~10ms，而主进程长期使用的 requester 会出现 35-60s 的通道级 wedge
+    # （cshim requester 一次性：进入坏状态后该 handle 永久超时，新建
+    # requester 立即恢复）。因此策略分两层：
+    #   * soft：前 _POLL_SOFT_RETRIES 次纯重试，覆盖瞬时抖动；
+    #   * hard：之后每次失败先安全 recreate（probe 已隔离 + destroy
+    #     持锁 + registry 回调同步）再重试。实测 recreate 后首次调用
+    #     即恢复。
+    # 最坏预算 ≈ soft 2×5.5s + hard 6×6.5s ≈ 50s，仍在 chat_run 300s
+    # deadline 内；典型断流窗口在第一次 recreate 后即结束（~17s）。
+    _POLL_SOFT_RETRIES = 2
+    _POLL_HARD_RETRIES = 8
     _POLL_RETRY_SLEEP = 0.5
+    _POLL_TIMEOUT_MS = 5_000
 
-    def _call_poll_with_retry(self, offset: int) -> dict:
-        """chat_poll with bounded retry on transient timeout + self-heal.
+    def _call_resilient(self, payload: dict, timeout_ms: int, *,
+                        soft_retries: Optional[int] = None,
+                        hard_retries: Optional[int] = None) -> dict:
+        """Transient-failure retry with safe recreate escalation.
 
-        Each attempt goes through ``_call_with_recreate`` so a wedged
-        cshim requester is destroyed + recreated instead of failing
-        forever. Only repeated consecutive timeouts are surfaced as an
-        error; real worker errors (``ok:false`` non-timeout) return
-        immediately.
+        前 ``soft_retries`` 次失败只做纯重试；超过后每次先 destroy +
+        recreate cshim client（安全版：持锁销毁、probe 线程已隔离、
+        registry 通过回调同步新 handle）再 warmup + 重试。非瞬时错误
+        （业务 error / malformed 等）原样返回交由调用方处理。
         """
+        if soft_retries is None:
+            soft_retries = self._POLL_SOFT_RETRIES
+        if hard_retries is None:
+            hard_retries = self._POLL_HARD_RETRIES
         last = {"ok": False, "error": "unknown"}
-        for _ in range(self._POLL_RETRY):
-            poll = self._call_with_recreate(
-                {"action": "chat_poll", "offset": offset}, timeout_ms=5_000)
-            if poll.get("ok"):
-                return poll
-            err = str(poll.get("error", "")).lower()
-            if "timeout" not in err and "no data" not in err and "send failed" not in err:
-                return poll
-            last = poll
+        for attempt in range(hard_retries):
+            if attempt > soft_retries:
+                LOG.warning(
+                    "rpc-proxy[%s]: %d consecutive transient failures — "
+                    "recreating cshim client", self._model_id, attempt)
+                self._recreate_client()
+                # warm-up 加速新 requester 的 SEDP 匹配；失败无碍
+                try:
+                    self._client.call({"action": "info"},
+                                      timeout_ms=timeout_ms)
+                except Exception as e:  # noqa: BLE001
+                    LOG.debug("rpc-proxy[%s]: post-recreate warmup raised "
+                              "%s", self._model_id, e)
+            r = self._client.call(payload, timeout_ms=timeout_ms)
+            if r.get("ok") or not r.get("error"):
+                return r
+            err = str(r.get("error", "")).lower()
+            last = r
+            if not any(k in err for k in ("timeout", "no data",
+                                          "send failed")):
+                return r
             time.sleep(self._POLL_RETRY_SLEEP)
         return last
+
+    def _call_poll_with_retry(self, offset: int) -> dict:
+        """chat_poll with bounded retry + safe recreate escalation."""
+        return self._call_resilient(
+            {"action": "chat_poll", "offset": offset},
+            timeout_ms=self._POLL_TIMEOUT_MS)
 
     @property
     def model_id(self) -> str:
@@ -256,7 +320,10 @@ class _RpcSessionProxy:
             "max_new_tokens": int(max_new_tokens or 2048),
             "tools": list(tool_names or []),
         }
-        reply = self._call_with_recreate(payload, timeout_ms=10_000)
+        # 首次 call 也走弹性路径：通道若已 wedge，soft 重试 + recreate
+        # 自愈后再发起；否则用户会直接看到 chat_run failed。
+        reply = self._call_resilient(payload, timeout_ms=10_000,
+                                     soft_retries=1, hard_retries=4)
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
             raise RuntimeError(
@@ -268,36 +335,77 @@ class _RpcSessionProxy:
                 f"{data.get('error') or data.get('status') or 'unknown'}")
 
         offset = 0
+        t_send = time.time()
         deadline = time.monotonic() + (timeout_ms / 1000.0)
+        shm_path = f"/dev/shm/wdnwebui_chat_{self._model_id}.json"
         while True:
             if stop_event is not None and stop_event.is_set():
                 self.chat_stop()
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"compute_worker[{self._model_id}] chat_run timed out")
-            # chat_poll 走 _call_with_recreate（requester wedged 时自动
-            # destroy+recreate+warmup+retry），并对瞬时 timeout 做有限重试。
-            # worker 端 _chat_run_loop 的 backend.run 推理会持 GIL，阻塞 pump
-            # 线程响应 chat_poll；GIL 阻塞是瞬时的，重试几次通常能恢复。
-            poll = self._call_poll_with_retry(offset)
-            if not poll.get("ok"):
-                raise RuntimeError(
-                    f"compute_worker[{self._model_id}] chat_poll failed: "
-                    f"{poll.get('error', 'unknown error')}")
-            data = poll.get("data") or {}
+
+            # 数据面双通道：
+            #   1) 同机 worker 会把 chat 状态原子发布到 /dev/shm —— 直接
+            #      读文件，完全绕开 DDS（实测 DDS RELIABLE 交付存在数十秒
+            #      级抖动，是流式中断的根因）。start_ts 校验防止读到上一
+            #      轮残留快照。
+            #   2) 文件缺失/过期（跨机 peer、worker 老版本）→ 回退
+            #      chat_poll RPC。
+            data: Optional[dict] = None
+            try:
+                with open(shm_path, "r") as f:
+                    snap = json.load(f)
+                if (isinstance(snap, dict)
+                        and isinstance(snap.get("start_ts"), (int, float))
+                        and snap["start_ts"] >= t_send - 1.0):
+                    data = snap
+                elif isinstance(snap, dict):
+                    LOG.warning(
+                        "rpc-proxy[%s]: shm snapshot REJECTED "
+                        "start_ts=%s t_send=%s status=%s",
+                        self._model_id, snap.get("start_ts"), t_send,
+                        snap.get("status"))
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("rpc-proxy[%s]: shm read failed: %s: %s",
+                            self._model_id, type(e).__name__, e)
+                data = None
+
+            via_shm = data is not None
+            if not via_shm:
+                # chat_poll 走 _call_resilient：前 2 次纯重试覆盖瞬时抖动，
+                # 之后每次失败安全 recreate cshim client。
+                poll = self._call_poll_with_retry(offset)
+                if not poll.get("ok"):
+                    raise RuntimeError(
+                        f"compute_worker[{self._model_id}] chat_poll failed: "
+                        f"{poll.get('error', 'unknown error')}")
+                data = poll.get("data") or {}
+
             status = data.get("status")
             if on_delta is not None:
-                for d in data.get("deltas") or []:
+                if via_shm:
+                    all_deltas = data.get("deltas") or []
+                    new_deltas = all_deltas[offset:]
+                    offset = len(all_deltas)
+                else:
+                    new_deltas = data.get("deltas") or []
+                    offset = int(data.get("offset") or offset)
+                for d in new_deltas:
                     if d:
                         on_delta(d)
-            offset = int(data.get("offset") or offset)
+            elif via_shm:
+                offset = len(data.get("deltas") or [])
+            else:
+                offset = int(data.get("offset") or offset)
+
             if status == "done":
-                result = data.get("result") or {}
+                result = dict(data.get("result") or {})
                 result.setdefault("status", "done")
                 return result
             if status == "error":
                 raise RuntimeError(data.get("error") or "chat error")
-            if status == "idle":
+            if status == "idle" and not via_shm:
                 raise RuntimeError("chat went idle unexpectedly")
             time.sleep(poll_interval_ms / 1000.0)
 
@@ -578,8 +686,17 @@ class _RpcSessionProxy:
         return out
 
 
-def make_rpc_session_proxy(rpc_client, model_id: str, _svc=None) -> _RpcSessionProxy:
-    return _RpcSessionProxy(rpc_client, model_id, _svc=_svc)
+def make_rpc_session_proxy(rpc_client, model_id: str, _svc=None,
+                           on_client_recreated=None) -> _RpcSessionProxy:
+    """Build a proxy.
+
+    ``on_client_recreated(new_requester)`` — optional callback invoked
+    after a wedged client was destroyed + recreated. The registry uses
+    it to keep ``inst.rpc_client`` pointing at the live requester so
+    probe threads and admin operations never touch a destroyed handle.
+    """
+    return _RpcSessionProxy(rpc_client, model_id, _svc=_svc,
+                            on_client_recreated=on_client_recreated)
 
 
 # Public alias

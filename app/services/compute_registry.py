@@ -634,6 +634,11 @@ class ModelInstance:
     # RPC subprocess state
     proc: Optional[subprocess.Popen] = None
     rpc_client: Any = None
+    # probe 线程专用 requester —— 与业务通道（rpc_session_proxy 内部持有
+    # 并可能 destroy+recreate 的那个）生命周期解耦。proxy recreate 后
+    # rpc_client 会被回调替换，而 probe_rpc_client 永远指向自己独立的
+    # handle，probe 循环不会踩到已销毁的 requester（use-after-free）。
+    probe_rpc_client: Any = None
     rpc_session_proxy: Any = None
     _probe_thread: Optional[threading.Thread] = None
     _logged_running: bool = False
@@ -1798,7 +1803,8 @@ class ComputeRegistry:
                         pass
                     try:
                         if inst.rpc_client is not None:
-                            inst.rpc_client.destroy()
+                            with inst.rpc_client._lock:
+                                inst.rpc_client.destroy()
                     except Exception:
                         pass
                     self._instances.pop(inst.key, None)
@@ -2045,7 +2051,8 @@ class ComputeRegistry:
             pass
         try:
             if inst.rpc_client is not None:
-                inst.rpc_client.destroy()
+                with inst.rpc_client._lock:
+                    inst.rpc_client.destroy()
         except Exception:
             pass
         with self._lock:
@@ -2171,10 +2178,27 @@ class ComputeRegistry:
         svc = hub.create_service(service_name)
         rpc_client = svc.create_requester(timeout_ms=10_000)
         inst.rpc_client = rpc_client
+        # probe 线程用独立 requester：业务 proxy 在 wedged 自愈时会
+        # destroy + recreate 它内部持有的 client，若 probe 与其共享同一
+        # handle，destroy 会与 probe 正在进行的 C 调用并发（UAF）。
+        try:
+            inst.probe_rpc_client = svc.create_requester(timeout_ms=10_000)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("probe requester create failed for %s: %s "
+                        "(falling back to shared client)", inst.model_id, e)
+            inst.probe_rpc_client = rpc_client
         try:
             from app.services.rpc_session_proxy import make_rpc_session_proxy
+
+            def _on_client_recreated(new_client, _inst=inst):
+                # proxy recreate 后同步替换 inst.rpc_client，让管理操作
+                # （bind / unload / restart）永远拿活的 handle。
+                with self._lock:
+                    _inst.rpc_client = new_client
+
             inst.rpc_session_proxy = make_rpc_session_proxy(
-                rpc_client, inst.model_id, _svc=svc)
+                rpc_client, inst.model_id, _svc=svc,
+                on_client_recreated=_on_client_recreated)
             inst.llm_session = inst.rpc_session_proxy
         except Exception as e:  # noqa: BLE001
             LOG.warning("RpcSessionProxy create failed for %s: %s",
@@ -2635,10 +2659,13 @@ class ComputeRegistry:
                         )
                         return
 
-                # Probe worker.
-                if inst.rpc_client is not None:
+                # Probe worker. Uses the dedicated probe requester —
+                # never the business client (rpc_session_proxy may
+                # destroy + recreate that one mid-flight).
+                probe_client = inst.probe_rpc_client or inst.rpc_client
+                if probe_client is not None:
                     try:
-                        r = inst.rpc_client.call(
+                        r = probe_client.call(
                             {"action": "info"}, timeout_ms=5000)
                     except Exception as e:
                         consecutive_failures += 1
