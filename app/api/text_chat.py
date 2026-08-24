@@ -38,6 +38,7 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.services.text_chat import get_chat_service
@@ -72,10 +73,15 @@ async def post_text_chat_send(payload: SendPayload) -> dict:
         rid = svc.send(payload.text)
     except ValueError as e:
         msg = str(e)
+        if "上一条" in msg:
+            # 409 附带服务端最新 snapshot：前端（或另一标签页）本地状态
+            # 滞后时据此立即纠正 busy/按钮态，而不是显示误导性报错。
+            return JSONResponse(
+                status_code=409,
+                content={"detail": msg, "snapshot": svc.snapshot()},
+            )
         if "text" in msg:
             raise HTTPException(status_code=400, detail=msg) from e
-        if "上一条" in msg:
-            raise HTTPException(status_code=409, detail=msg) from e
         raise HTTPException(status_code=400, detail=msg) from e
     return {"ok": True, "request_id": rid, "snapshot": svc.snapshot()}
 

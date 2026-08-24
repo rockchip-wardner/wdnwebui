@@ -6716,6 +6716,7 @@ const TextChat = {
   wsRetry: 0,
   wsTimer: null,
   snapshot: null,
+  _sending: false,          // in-flight 防抖：fetch 完成前忽略重复 send()
   pending: new Map(),       // request_id -> {userLi, assistantLi, thinkingEl, answerEl, errorEl, cursorEl}
   messages: [],             // local history mirror: [{role:"user"|"assistant", content, ts}]
 
@@ -7094,10 +7095,12 @@ const TextChat = {
     const input = document.getElementById("text-chat-input");
     const text = (input?.value || "").trim();
     if (!text) return;
+    if (this._sending) return;   // 双击 / Cmd+Enter+按钮 同时触发的防抖
     if (this.snapshot && this.snapshot.busy) {
       this._setHint("上一条还在生成中…", true);
       return;
     }
+    this._sending = true;
     try {
       const r = await fetch(API_PREFIX + "/text-chat/send", {
         method: "POST",
@@ -7106,17 +7109,27 @@ const TextChat = {
       });
       if (!r.ok) {
         let detail = "HTTP " + r.status;
+        let body = null;
         try {
-          const errBody = await r.json();
-          if (errBody && errBody.detail) detail = errBody.detail;
+          body = await r.json();
+          if (body && body.detail) {
+            detail = typeof body.detail === "string"
+              ? body.detail : JSON.stringify(body.detail);
+          }
         } catch (_) { /* ignore */ }
-        throw new Error(detail);
+        // 409 等场景：服务端附带最新 snapshot，用它纠正本地 busy/按钮态
+        throw Object.assign(new Error(detail), { respBody: body });
       }
       if (input) input.value = "";
       this._setHint("已发送，等待模型响应…", false);
       // snapshot is updated by WS state frame
     } catch (err) {
       this._setHint("发送失败: " + err.message, true);
+      if (err.respBody && err.respBody.snapshot) {
+        this._applySnapshot(err.respBody.snapshot);
+      }
+    } finally {
+      this._sending = false;
     }
   },
 
