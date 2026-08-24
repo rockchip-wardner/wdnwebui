@@ -1348,6 +1348,14 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     见下）把 `sink.text` 增量 append 到 `state["chat"]["deltas"]` →
     `_backend.run(prompt, keep_history=0, enable_thinking=True)` → done
     （text / elapsed_sec / prompt_tokens / answer_tokens）。
+  - **工具 schema 注入与解析（worker 端只解析不执行）**：payload 带
+    `tools`（class 名列表）时，`_resolve_tool_classes` 从工具 registry
+    枚举真实 class（无手工映射表），`render_tools_block` +
+    `_TOOL_CALL_INSTRUCTION` 注入 prompt；done 后仅对 answer 段跑
+    `_parse_qwen_tool_call`（`<tool_call>` 标签优先 + 倒序 JSON 扫描
+    兜底——真机主力路径是 markdown ```json 围栏）。result 附
+    `tool_call` / `tool_call_args`。副作用执行在主进程侧，见
+    "Chat 工具调用 (chat-agent)" 章节。
   - `chat_poll` action：按 offset 返回新 delta + status（running / done /
     error / idle），done 时附 result。
   - `chat_stop` action：置 `state["chat"]["stop"]`（软停标志）。
@@ -1371,9 +1379,11 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 
 * **Proxy**（`app/services/rpc_session_proxy.py`）：
   - `chat_run(history, text, *, context_limit, max_new_tokens, on_delta,
-    stop_event, poll_interval_ms=150, timeout_ms=300000)` — 同步阻塞，发
+    stop_event, poll_interval_ms=150, timeout_ms=300000,
+    tool_names=None)` — 同步阻塞，发
     `chat_run` 后循环 `chat_poll` 拉增量调 `on_delta`；`stop_event` 置位即
-    调 `chat_stop`；done 返回 result dict；error 抛 `RuntimeError`；超时抛
+    调 `chat_stop`；done 返回 result dict（含 thinking / answer /
+    tool_call / tool_call_args）；error 抛 `RuntimeError`；超时抛
     `TimeoutError`。
   - `chat_stop()` — RPC `chat_stop`。
 
@@ -1452,9 +1462,10 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   ``get_tool_registry()`` 启动时只挂载 ``tts_alert`` 一条。
 
 * **页面归属**：
-  - ``tts_alert`` 只在 **音视频描述页** 暴露
-    （``ALLOWED_TOOLS = ("tts_alert",)`` 在
-    ``app/api/video_detection.py``）。
+  - ``tts_alert`` 暴露面：**音视频描述页**（``ALLOWED_TOOLS =
+    ("tts_alert",)`` 在 ``app/api/video_detection.py``）+ **chat 链路**
+    （web 文本对话 / 微信桥接，经 capability 过滤后自动纳入，
+    见下方 "Chat 工具调用 (chat-agent)" 章节）。
   - 算力配置页 RK3588 列只读展示全部工具的状态（当前只有
     ``tts_alert`` 一条）。
 
@@ -1489,6 +1500,58 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   工具调用 + 返回按 prose 格式写进下一轮 prompt（不是 JSON，避免
   模型复读），由 detector 内部维护。视频目标检测页无工具，循环
   天然只跑一轮就跳出。
+
+## Chat 工具调用 (chat-agent)
+
+web 文本对话与微信桥接共用 ``run_chat_with_tools()`
+（``app/services/chat_agent.py``）：模型发起 tool_call 后在**主进程**
+实例化并执行 @Callable，wrap-up / 回喂继续推理，直到给出自然语言
+回答或达到循环上限。done 帧带最终 ``tool_call`` / ``tool_call_args``
++ ``steps[]``（每次执行的 args/outcome/error 明细）；
+``TextChat`` 前端在气泡 meta 渲染 ``🔧 已调用 <工具名>`` 徽章
+（`.text-chat-tool-badge`）。
+
+* **为什么循环放主进程**：工具副作用依赖主进程资源（TtsSession /
+  registry / 未来设备控制等）；compute_worker 是独立子进程，只能做
+  schema 注入与输出解析（见 Text chat 章节 worker 端描述），执行
+  必须回到主进程。
+* **循环分流**：
+  - side-effect 型（``__call__`` 返回 dict 带 ``consume_iteration:
+    True``，如 tts_alert）→ 成功后跑一轮 wrap-up（``tools=[]``，
+    输入"请一句话向用户确认"）生成自然语言确认语 → 出口；
+    wrap-up RPC 失败回退固定文案。
+  - 结果型（无该标志）→ 结果 JSON 转 prose transcript 作为下一轮
+    `current_text` 继续推理，可链式再次 tool_call；正常出口后由
+    `chat_agent` 补齐 history 尾部的 assistant 回答条目。
+  - 抛错（校验失败 / 执行异常）→ 立即终止，用户收到
+    "抱歉，工具 X 执行失败：<原因>"；不重试（对齐 detector 的
+    is_fatal break）。失败明细写入 steps[].error。
+* **history 写回**：调用方只写首条 user 条目，然后 extend agent 返回的
+  `history_append` —— 含语义化 assistant 占位
+  （content="[已调用工具 X(...)]"，修掉阶段1 空 content 占位导致下轮
+  prompt 出现空 assistant 回合的问题）、user 系统指令条目、最终
+  assistant 回答。
+* **max_iters**：复用 ``compute.tool_call_max_iters``，chat 场景默认
+  3（detector 默认 5），0 = 无限、200 硬上限兜底。
+* **capability 过滤**：``resolve_available_tool_names()``
+  （`tools/registry.py`）——``requires_capability`` 对应模型未加载的
+  工具直接从 schema 排除，模型看不到就调不到。text_chat /
+  wechat_llm 的 `_resolve_tool_names` 均委托它。
+* **B1 兜底**：微信发送前经 ``chat_runner.strip_tool_call_tags()``
+  清洗 answer 残留（`<tool_call>` 标签 / markdown json 围栏 / 裸
+  tool-call JSON 三类）；正常路径下工具轮不走此文案（wrap-up 覆盖）。
+* **新增一个工具的三步流程（零框架改动）**：
+  1. ``app/services/tools/<tool>.py`` 定义 ``@WdnaiCallable`` 类 +
+     ``__call__(self, frame_bgr, ctx)``（纯文本场景 frame 传 None）；
+  2. ``get_tool_registry()`` 里 ``register(...)`` 一行（需 NPU 算力的
+     标注 ``requires_capability``）;
+  3. 完成 —— schema 注入 / 解析 / capability 过滤 / chat-agent 循环 /
+     detector 页勾选列表全部自动生效。worker 端无需任何改动
+     （`_TOOL_TABLE` 手工映射表已删除，改枚举 registry）。
+* **已知边界**：TtsAlert busy 时返回 silent skip dict（不带
+  consume_iteration）→ 会走结果型回喂分支，模型将向用户转述
+  "因繁忙未播"；语义上更理想是静默终止 + wrap-up，真机接入 TTS
+  后按体验决定是否调整（`_execute_tool` 后加 silent 判定约 3 行）。
 
 ## TargetDoc 结构化输出 (视频目标检测页)
 
@@ -1706,8 +1769,10 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     互斥 —— 同一时刻只有一个 `chat_run` 发往 worker，避免并发轮询/停止
     冲突。`text_chat._run_one` 的 `chat_run` 同样包这把锁。
   - **裁剪在 worker 端**：主进程只透传 `history`，`compute_worker`
-    `_chat_run_loop` 用真实 tokenizer 裁剪 + 拼 ChatML；主进程拿回完整
-    `text` 后用 `chat_runner.split_thinking` 切掉思考段再发微信。
+    `_chat_run_loop` 用真实 tokenizer 裁剪 + 拼 ChatML；主进程侧
+    `run_chat_with_tools()` 完成工具执行与回喂循环后，把最终 answer
+    经 `chat_runner.strip_tool_call_tags()` 清洗（剥离工具调用残留）
+    再发微信。
   - **发送复用 `wechat_bot`**：回复走 `Wechat.send_text`，自动出现在
     "调试收发"消息列表（out 方向），与手动发送共用同一发送通道、线程安全。
 
@@ -1734,6 +1799,8 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
 
 * **限制**：LLM 单实例串行，多人同时发需排队（每条推理约 40-60s）；只发
   answer 不发 thinking；非文字消息（图/音/文件）回复「当前仅支持文字对话」。
+  工具调用经 chat-agent 循环（见 "Chat 工具调用 (chat-agent)" 章节），
+  微信用户同样可用。
 
 
 
