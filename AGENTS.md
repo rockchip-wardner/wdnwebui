@@ -1531,10 +1531,15 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
   "已注册但不可用的工具被调用必然返回错误"，未来新工具无需各自在
   ``__call__`` 里重复检查（tts_alert 内部仍保留自己的检查）。
 * **history 写回**：调用方只写首条 user 条目，然后 extend agent 返回的
-  `history_append` —— 含语义化 assistant 占位
-  （content="[已调用工具 X(...)]"，修掉阶段1 空 content 占位导致下轮
-  prompt 出现空 assistant 回合的问题）、user 系统指令条目、最终
-  assistant 回答。
+  `history_append` —— 含**自然语言** assistant 占位
+  （如"（我已通过语音提醒完成操作：「请喝水」。）"，取 registry 的
+  `spec.name` 中文名/英文名 + 结果摘要；语言按本轮用户输入 CJK 占比
+  自适应中英）、user 系统指令条目、最终 assistant 回答。占位刻意不
+  带 class 名 / JSON 参数等机器痕迹 —— 卸载工具模型后模型凭历史记忆
+  复述出的也是无害人话，而非 `[已调用工具 X(参数)]` 机器腔。
+  dict 上仍保留 `tool_call` / `tool_call_args` 字段供程序追溯。
+  wrap-up / 失败回喂指令统一用展示名且要求模型"语言与用户当前对话
+  保持一致"（英文用户场景不再强制中文回复）。
 * **max_iters**：复用 ``compute.tool_call_max_iters``，chat 场景默认
   3（detector 默认 5），0 = 无限、200 硬上限兜底。
 * **capability 过滤**：``resolve_available_tool_names()``

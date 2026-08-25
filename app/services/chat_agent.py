@@ -77,6 +77,12 @@ def _lookup_spec(name: str):
     return None
 
 
+def _display_name(name: str) -> str:
+    """工具的中文展示名（registry spec.name），fallback 到 class 名。"""
+    spec = _lookup_spec(name)
+    return (spec.name or name) if spec is not None else name
+
+
 def _build_instance(name: str, args: Optional[dict]):
     """按 class 名从 registry 重建 @Callable 实例并校验参数。
 
@@ -120,7 +126,8 @@ def _transcript_for_result(name: str, outcome: dict) -> str:
     payload = json.dumps(outcome, ensure_ascii=False, default=str)
     return (
         f"[系统] 工具 {name} 已执行，返回结果：{payload}。"
-        f"请基于该结果用自然语言回答用户的问题；如信息不足可直接说明。"
+        f"请基于该结果、用与用户当前对话一致的自然语言回答用户的问题；"
+        f"如信息不足可直接说明。"
     )
 
 
@@ -129,22 +136,74 @@ def _transcript_for_failure(name: str, err: str) -> str:
 
     与结果型回喂同构 —— 卸载工具模型后历史占位诱导的自发调用也走
     这条路：capability 前置校验必然抛错 → 模型向用户解释"功能暂时
-    不可用"，无需任何特殊分支。
+    不可用"，无需任何特殊分支。回复语言跟随用户对话语言。
     """
     return (
-        f"[系统] 工具 {name} 调用失败：{err}。"
-        f"请不要提及工具名、JSON 或技术细节，用一句简短自然的中文告知"
-        f"用户该请求暂时无法完成。"
+        f"[系统] 工具 {_display_name(name)} 调用失败：{err}。"
+        f"请不要提及工具名、JSON 或技术细节，用一句简短自然的、"
+        f"与用户当前对话一致的语言告知用户该请求暂时无法完成。"
     )
+
+
+def _clip(text: str, limit: int = 50) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _prefer_english(text: str) -> bool:
+    """粗略语言启发式：本轮用户输入的前 200 字符里 CJK 占比过低则
+    视为英文语境 —— 占位 / 指令随之切英文，避免中英混杂被模型模仿。"""
+    if not text:
+        return False
+    sample = text[:200]
+    cjk = sum(1 for ch in sample if "\u4e00" <= ch <= "\u9fff")
+    return cjk < max(1, len(sample) // 10)
+
+
+def _placeholder_for_success(
+    name: str, outcome: dict, consume: bool, english: bool = False,
+) -> str:
+    """成功轮的 history 占位 —— **自然语言**，刻意不带工具 class 名 /
+    JSON 参数等机器痕迹：模型模仿的对象若是流畅人话，卸载后凭历史
+    记忆复述出的也是无害的人话（而非 `[已调用工具 X(参数)]` 机器腔）。
+    语言跟随本轮用户输入（工具名 spec.name 中英皆可嵌入）。"""
+    display = _display_name(name)
+    detail = ""
+    for key in ("text", "detail", "message", "value"):
+        if outcome.get(key):
+            detail = _clip(str(outcome[key]))
+            break
+    if english:
+        if consume:
+            return (
+                f"(I have completed the action via {display}"
+                + (f': "{detail}"' if detail else "")
+                + ".)")
+        return (
+            f"(I obtained the result via {display}"
+            + (f": {detail}" if detail else "")
+            + ".)")
+    if consume:
+        return (
+            f"（我已通过{display}完成操作"
+            + (f"：「{detail}」" if detail else "")
+            + "。）")
+    return f"（我通过{display}获得了结果{('：' + detail) if detail else ''}。）"
+
+
+def _placeholder_for_failure(name: str, english: bool = False) -> str:
+    if english:
+        return f"(I tried to use {name}, but it did not succeed.)"
+    return f"（我尝试使用{_display_name(name)}，但没有成功。）"
 
 
 def _wrapup_instruction(name: str, outcome: dict, user_text: str) -> str:
     detail = outcome.get("text") or outcome.get("detail") or ""
     base = (
-        f"[系统] 工具 {name} 已成功执行"
+        f"[系统] 工具 {_display_name(name)} 已成功执行"
         + (f"（{detail}）" if detail else "")
-        + "。请用一句简短自然的中文向用户确认操作已完成，不要提及工具名、"
-          "JSON 或任何技术细节。"
+        + "。请用一句简短自然的话向用户确认操作已完成，语言与用户当前"
+          "对话保持一致，不要提及工具名、JSON 或任何技术细节。"
     )
     if user_text.strip():
         base += f"用户最初的请求是：「{user_text.strip()}」"
@@ -244,10 +303,8 @@ def run_chat_with_tools(
             _LOG.warning("tool %s failed (feed back): %s", tool_name, exc)
             history_append.append({
                 "role": "assistant",
-                "content": (
-                    f"[已调用工具 {tool_name}，参数 "
-                    f"{json.dumps(last_tool_args or {}, ensure_ascii=False)}"
-                    f"，调用失败]"),
+                "content": _placeholder_for_failure(
+                    tool_name, _prefer_english(first_user_text)),
                 "thinking": final_thinking,
                 "ts": time.time(),
                 "tool_call": tool_name,
@@ -268,12 +325,12 @@ def run_chat_with_tools(
         steps.append(step)
         _LOG.info("agent iter %d executed %s consume=%s", i, tool_name, consume)
 
-        # assistant 占位：语义化 content，让下一轮 prompt 里模型能看到
-        # 自己"已调用过什么、结果如何"，避免空回合诱导复读（修 B3）。
-        placeholder_content = (
-            f"[已调用工具 {tool_name}，参数 "
-            f"{json.dumps(last_tool_args or {}, ensure_ascii=False)}]"
-        )
+        # assistant 占位：自然语言描述（含工具中文名 + 结果摘要），让
+        # 下轮 prompt 知道发生过什么，同时不给模型留下可模仿的机器格式
+        # （JSON 参数 / class 名）—— 卸载后凭历史复述出的也是无害人话。
+        placeholder_content = _placeholder_for_success(
+            tool_name, outcome, consume,
+            _prefer_english(first_user_text))
         history_append.append({
             "role": "assistant",
             "content": placeholder_content,
