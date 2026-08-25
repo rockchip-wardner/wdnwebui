@@ -155,6 +155,15 @@ class _WechatManager:
         self._wechat.send_text(user_id, text)
         self._push_state_diff()
 
+    def download_message(self, msg: Any):
+        """同步透传 SDK 媒体下载（CDN 大文件，调用方放后台线程执行）。
+
+        供微信视频管理器拉取用户发来的视频/文件媒体；返回 SDK 的
+        ``DownloadedMedia``（含 ``data`` bytes / ``file_name`` /
+        ``format``），无可下载媒体时为 ``None``。
+        """
+        return self._wechat.download_message(msg)
+
     def set_llm_bridge(self, enabled: bool) -> dict:
         """开/关微信文字对话桥接。未启用 LLM 时开启抛 RuntimeError。"""
         snap = self._llm_bridge.set_enabled(enabled)

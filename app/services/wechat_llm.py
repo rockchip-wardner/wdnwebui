@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue as _queue
 import threading
 import time
@@ -33,6 +34,14 @@ from app.services.tools import resolve_available_tool_names
 _LOG = logging.getLogger("wechat_llm")
 
 _HISTORY_MAX = 200
+
+# 视频格式白名单（与视频监控页目录扫描清单同源）：微信"文件"形态发送
+# 的 mp4/mov 等同样分流到视频分析管线，只有真正的文档类文件才拒绝。
+_VIDEO_FILE_EXTS = {
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".ts", ".m4v", ".3gp",
+    ".wmv", ".flv", ".mpg", ".mpeg", ".rmvb", ".h264", ".h265", ".hevc",
+    ".m2ts", ".mts",
+}
 
 
 def _llm_log(msg: str) -> None:
@@ -115,16 +124,78 @@ class _LlmBridge:
             # 视频消息 → 微信视频管理器确定性分流：落盘 + 自动后台提取。
             # 不走 LLM 工具链路（提取是确定性事件无需智能决策，且不能
             # 让 CDN 下载阻塞消息回调线程 —— enqueue 纯内存入队毫秒级）。
-            from app.services.wechat_video_manager import (
-                get_wechat_video_manager,
-            )
-            try:
-                get_wechat_video_manager().enqueue_video(user_id, msg)
-            except Exception as exc:  # noqa: BLE001
-                _LOG.exception("wechat video enqueue failed for %s", user_id)
-                self._reply_no_context(user_id, f"视频接收失败：{exc}")
+            self._dispatch_to_video_manager(user_id, msg)
+        elif kind == "file" and msg.files:
+            # 以"文件"形式发送的视频（mp4/mov/...）同样进分析管线 ——
+            # SDK download() 对 file 类型完全支持（返回原始 file_name）。
+            fname = getattr(msg.files[0], "file_name", "") or ""
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in _VIDEO_FILE_EXTS:
+                self._dispatch_to_video_manager(user_id, msg)
+            else:
+                self._reply_no_context(
+                    user_id,
+                    f"暂不支持「{fname}」这类文件；请发送文字、视频消息，"
+                    f"或视频格式的文件（如 mp4 / mov / mkv）。")
         else:
             self._reply_no_context(user_id, "当前仅支持文字与视频消息（图片 / 语音暂不支持）。")
+
+    def _dispatch_to_video_manager(self, user_id: str, msg: Any) -> None:
+        """video 消息与 file 形态的共用分流：入队提取 + 注入系统通知。
+
+        通知必须两个分支都注入 —— 否则模型不知道换了新视频，会沿用
+        history 里上一轮的检索结果作答（真机实测复现的缺陷）。
+        """
+        from app.services.wechat_video_manager import (
+            get_wechat_video_manager,
+        )
+        try:
+            info = get_wechat_video_manager().enqueue_video(user_id, msg)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.exception("wechat video enqueue failed for %s", user_id)
+            self._reply_no_context(user_id, f"视频接收失败：{exc}")
+            return
+        try:
+            self._push_video_notice(user_id, info.get("filename") or "")
+        except Exception as exc:  # noqa: BLE001
+            _LOG.exception(
+                "wechat video notice injection failed for %s", user_id)
+
+    def _push_video_notice(self, user_id: str, filename: str) -> None:
+        """新视频到达 → 注入系统通知条目，宣告旧视频/旧检索结果失效。
+
+        若不注入，模型看到 history 里上一轮的检索结果会跳过工具调用
+        直接复用旧答案（真机实测复现：换新视频后回答仍基于旧素材）。
+        语言按该用户最近的输入自适应中英，与 chat_agent 的占位/回喂
+        策略一致；条目随对话滚动被 trim 淘汰属可接受折中。
+        """
+        from app.services.chat_agent import _prefer_english
+        with self._lock:
+            hist = self.histories.setdefault(
+                user_id, deque(maxlen=_HISTORY_MAX))
+            last_user = ""
+            for m in reversed(hist):
+                if m.get("role") == "user" and not m.get("_system_note"):
+                    last_user = m.get("content") or ""
+                    break
+            if _prefer_english(last_user):
+                notice = (
+                    f"[System] The user just sent a NEW video \"{filename}\"; "
+                    f"it will be analyzed automatically in the background. "
+                    f"The previous video and its retrieval results are now "
+                    f"INVALID — for any video-related question, you MUST "
+                    f"call the VideoSearch tool again instead of reusing "
+                    f"old results from this conversation.")
+            else:
+                notice = (
+                    f"[系统] 用户刚刚发送了一个新视频「{filename}」，系统将"
+                    f"自动后台分析。此前的视频及其检索结果均已失效 —— 之后"
+                    f"所有与视频内容相关的问题，必须重新调用 VideoSearch "
+                    f"工具获取最新结果，不要沿用历史中的旧检索结果。")
+            hist.append({"role": "user", "content": notice,
+                         "ts": time.time(), "_system_note": True})
+        _LOG.info("wechat-llm: injected new-video notice for %s (%s)",
+                  user_id, filename)
 
     def _reply_no_context(self, user_id: str, text: str) -> None:
         try:

@@ -51,6 +51,8 @@ _CHUNK_OVERLAP_SECONDS = 1
 _SIM_THRESHOLD = 0.5
 _FALLBACK_MIN_RESULTS = 3
 _SEARCH_TOP_K = 5
+_DOWNLOAD_RETRIES = 3
+_RETRY_BACKOFF_SECONDS = (2, 4, 8)
 
 _STATE_DOWNLOADING = "downloading"
 _STATE_EXTRACTING = "extracting"
@@ -219,15 +221,50 @@ class WechatVideoManager:
             return entry
 
     def _download_video(self, user_id: str, entry: VideoEntry, msg: Any) -> str:
-        """CDN 下载并落盘，返回本地路径。测试可子类覆盖以注入假视频。"""
-        from app.services.wechat_bot import get_wechat
-        data_obj = get_wechat().download_message(msg)
+        """CDN 下载并落盘，返回本地路径。瞬时网络故障自动重试。
+
+        CDN 传输偶发中断（ContentLength 不满足 / SSL bad_record_mac 等，
+        真机实测复现），SDK 的 ``resp.read()`` 无重试 —— 这里按指数退避
+        重发同一条 msg 的下载请求（CDN 凭证为静态参数，秒级窗口内复用
+        无碍）；每次重试前推送节点通知保持过程可见。SDK 返回 None
+        （无可下载媒体，确定性结果）不重试，直接失败。
+        """
+        from app.services.wechat import get_wechat
+
+        data_obj = None
+        last_err: Optional[Exception] = None
+        for attempt in range(1, _DOWNLOAD_RETRIES + 1):
+            try:
+                data_obj = get_wechat().download_message(msg)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                if attempt >= _DOWNLOAD_RETRIES:
+                    raise RuntimeError(
+                        f"视频下载在 {_DOWNLOAD_RETRIES} 次尝试后仍失败："
+                        f"{type(exc).__name__}: {exc}") from exc
+                wait = _RETRY_BACKOFF_SECONDS[
+                    min(attempt - 1, len(_RETRY_BACKOFF_SECONDS) - 1)]
+                self._notify(
+                    user_id,
+                    f"⚠️ 视频 {entry.filename} 下载中断"
+                    f"（{type(exc).__name__}），{wait} 秒后自动重试"
+                    f"（第 {attempt} 次重试，共 {_DOWNLOAD_RETRIES - 1} 次）…")
+                time.sleep(wait)
         if data_obj is None or not getattr(data_obj, "data", None):
             raise RuntimeError("微信未返回可下载的视频内容")
         out_dir = _UPLOAD_ROOT / user_id
         out_dir.mkdir(parents=True, exist_ok=True)
-        ext = (getattr(data_obj, "format", "") or "mp4").lstrip(".").lower()
-        path = out_dir / f"{entry.filename}.{ext or 'mp4'}"
+        # 扩展名优先级：SDK format → 原始上传文件名后缀（"文件"形态发送
+        # 时 SDK 不填 format）→ 默认 mp4
+        orig_name = ""
+        for f in getattr(msg, "files", []) or []:
+            orig_name = getattr(f, "file_name", "") or ""
+            break
+        ext = ((getattr(data_obj, "format", "") or "")
+               or os.path.splitext(orig_name)[1].lstrip(".")
+               or "mp4").lstrip(".").lower() or "mp4"
+        path = out_dir / f"{entry.filename}.{ext}"
         path.write_bytes(bytes(data_obj.data))
         _LOG.info("wechat video: downloaded %s (%.1f KiB) for %s",
                   path.name, len(data_obj.data) / 1024, user_id)
