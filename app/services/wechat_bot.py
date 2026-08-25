@@ -547,6 +547,21 @@ class Wechat:
             raise
         self._record_outbound(user_id, "video", caption or "")
 
+    def download_message(self, msg: IncomingMessage) -> Optional[Any]:
+        """Download media (image / file / video / voice) from ``msg``.
+
+        同步透传 SDK 的 ``client.download()``（私有 asyncio loop 调度）。
+        CDN 大文件下载可能耗时数十秒，调用方应放在后台线程执行；
+        timeout 120s 为上限兜底。返回 ``None`` 表示该消息无可下载媒体
+        （SDK 语义），成功时为含 ``data`` bytes / ``file_name`` /
+        ``format`` 的对象。
+        """
+        self._require_started()
+        coro = self._bot.download(msg)  # type: ignore[union-attr]
+        return asyncio.run_coroutine_threadsafe(
+            coro, self._loop,
+        ).result(timeout=120.0)
+
     def _require_started(self) -> None:
         if self._bot is None or self._loop is None:
             raise RuntimeError("wechat bot not initialised")

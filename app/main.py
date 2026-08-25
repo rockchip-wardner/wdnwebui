@@ -197,6 +197,14 @@ def create_app() -> FastAPI:
             close_wechat()
         except Exception:
             pass
+        # Stop the wechat video manager (extraction worker thread).
+        try:
+            from app.services.wechat_video_manager import (
+                close_wechat_video_manager,
+            )
+            close_wechat_video_manager()
+        except Exception:
+            pass
         # Stop the text-chat service worker thread (singleton lives in
         # app.services.text_chat; the underlying LLMSession is owned by
         # the ComputeRegistry and was already closed by close_all()).

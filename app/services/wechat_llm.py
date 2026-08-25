@@ -111,8 +111,20 @@ class _LlmBridge:
         if kind == "text" and text:
             self._queue.put((user_id, text, time.time()))
             self._wake.set()
+        elif kind == "video":
+            # 视频消息 → 微信视频管理器确定性分流：落盘 + 自动后台提取。
+            # 不走 LLM 工具链路（提取是确定性事件无需智能决策，且不能
+            # 让 CDN 下载阻塞消息回调线程 —— enqueue 纯内存入队毫秒级）。
+            from app.services.wechat_video_manager import (
+                get_wechat_video_manager,
+            )
+            try:
+                get_wechat_video_manager().enqueue_video(user_id, msg)
+            except Exception as exc:  # noqa: BLE001
+                _LOG.exception("wechat video enqueue failed for %s", user_id)
+                self._reply_no_context(user_id, f"视频接收失败：{exc}")
         else:
-            self._reply_no_context(user_id, "当前仅支持文字对话（图片 / 语音 / 文件暂不支持）。")
+            self._reply_no_context(user_id, "当前仅支持文字与视频消息（图片 / 语音暂不支持）。")
 
     def _reply_no_context(self, user_id: str, text: str) -> None:
         try:
@@ -170,6 +182,8 @@ class _LlmBridge:
                     context_limit=context_limit,
                     max_new_tokens=self.MAX_NEW_TOKENS,
                     tool_names=self._resolve_tool_names(),
+                    user_id=user_id,
+                    channel="wechat",
                 )
         except Exception as exc:  # noqa: BLE001
             _LOG.exception("chat_run failed for %s", user_id)
