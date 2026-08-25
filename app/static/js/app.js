@@ -5089,14 +5089,12 @@ const ComputeConfigPage = {
         }
         prev.sig = sig;
         prev.isLocal = isLocal;
-        // 把 card 移到正确 container / 正确位置（用户可能在 local /
-        // peer 之间切了视图，或 reorder 导致 sibling 变了）。
+        // 容器错了才 detach + appendChild；ordering 交由末尾 newOrder
+        // loop 用 insertBefore 完成 —— 不要在这里做 reorder，否则 omni
+        // （CC_PRESET_ORDER 末位）在循环中途会被推到位置 0，浏览器若
+        // 中途 commit 就会先看到 omni 再看到真正点击的目标。
         if (prev.card.parentNode !== targetContainer) {
           if (prev.card.parentNode) prev.card.remove();
-          targetContainer.appendChild(prev.card);
-        } else if (prev.card.nextSibling !== prev.nextSibling) {
-          // 顺序变了 —— reorder（不影响 radio focus，因为是 move 不是 recreate）
-          targetContainer.removeChild(prev.card);
           targetContainer.appendChild(prev.card);
         }
         newCard[seenKey(s)] = prev;
@@ -5140,13 +5138,22 @@ const ComputeConfigPage = {
       }
     }
 
-    // 按 ordered 顺序把卡片 append 到对应 container（不 detach 已存在的）
-    for (const item of newOrder) {
-      // appendChild 如果已挂在正确位置则不动；否则 append（自动从
-      // 旧位置 move 到新位置，select 焦点保留 —— 因为是 move 节点，
-      // 浏览器认得是同一节点）。
+    // 按 ordered 顺序把卡片放到对应 container 的正确位置（不 detach
+    // 已存在的）。用 insertBefore + nextSibling 比较保证：1) 已经
+    // 在正确位置就不动（focus / select dropdown 保留），2) 需要移
+    // 动时只移一次，不会出现主循环里的"反复推尾"导致 omni 等末位
+    // 卡片被中途推到位置 0 的视觉闪烁。
+    //
+    // 必须**从尾往头**迭代 —— 正向迭代会破坏后继链（A 在 B 前、B
+    // 在 C 前）使 insertBefore 把早处理的卡片推到未处理卡片之前；
+    // 反向迭代先固定后继，前面只需就地放好即可。
+    for (let i = newOrder.length - 1; i >= 0; i--) {
+      const item = newOrder[i];
+      const desiredNext = i + 1 < newOrder.length ? newOrder[i + 1].card : null;
       if (item.card.parentNode !== item.container) {
-        item.container.appendChild(item.card);
+        item.container.insertBefore(item.card, desiredNext);
+      } else if (item.card.nextSibling !== desiredNext) {
+        item.container.insertBefore(item.card, desiredNext);
       }
     }
 
