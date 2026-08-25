@@ -4900,15 +4900,10 @@ const ComputeConfigPage = {
     const cards = snap.cards || [];
     const rawServices = snap.services || [];
 
-// 网络栏过滤:adopted + (not_loaded | error) 都隐藏 —— peer 没在正常
-// 服务状态,UI 显出来误导用户。
-    const services = rawServices.filter(s => {
-      if (s._source === "adopted"
-          && (s.status === "not_loaded" || s.status === "error")) {
-        return false;
-      }
-      return true;
-    });
+    // v0.8.1: 不再过滤 adopted peer —— 用户需要看到对端算力存在与否,
+    // 即使 not_loaded / error 也显示 (peer 不可操作,但 visibility 重要
+    // ——「在网设备」有 peer,「网络算力」看不到会让人困惑)。
+    const services = rawServices;
 
     if (!services.length) {
       const empty = document.createElement("div");

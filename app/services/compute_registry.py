@@ -603,7 +603,7 @@ class ModelInstance:
       4. ``stop_instance_local(model)`` is spawned-only: RPC unload →
          RPC shutdown → wait → kill. Adopted peers are not affected.
     """
-    key: Tuple[int, str]                        # (-1, model_id) → (npu, model_id)
+    key: Tuple[int, str, str]                    # (npu, model_id, source) — source tag 防 spawned/adopted dict key 互撞
     npu_index: int                             # -1 until bound
     model_id: str
     device_id: Optional[bytes] = None
@@ -709,10 +709,19 @@ class ComputeRegistry:
         self._hub_lock = threading.Lock()
         self._peers: dict[str, dict] = {}       # guid → {name, discovered_at}
         self._peers_lock = threading.Lock()
+        # 防 peer listener 重入 adopt:同 model_id SPDP lease 重发时,
+        # 第一次触发 adopt 在跑 (16s probe 上限),后续事件直接跳过。
+        self._adopt_inflight: set[str] = set()
         self._mode: str = _resolve_compute_mode()
         self._migrate_legacy_capability_types()
         if self._mode == "subprocess":
             self._ensure_hub()
+
+    # peer listener 触发 adopt 后,失败按 2/4/8/16/32s exponential backoff
+    # 重试(累计 62s 上限),覆盖 SIMPLE discovery / cshim endpoint 启动期
+    # race window。v0.8.3 之前只跑一次就退出,FastDDS SPDP 不会重发
+    # discovered=True,导致重启 race 失败的 model 永久 lost。
+    _ADOPT_RETRY_DELAYS_SEC: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 32.0)
 
     @property
     def compute_mode(self) -> str:
@@ -738,6 +747,25 @@ class ComputeRegistry:
                 f"wdndds/rpc/{mid}" for mid in MODEL_PRESETS.keys()
             ]
             device_name = _read_device_name()
+            from wdndds.dds import _cshim
+            # 等等 NIC ready,避免 boot 时 SPDP 走错 interface → NETWORK 空。
+            # wdndds 0.2/0.4 有 wait_for_network_ready,0.5+ 删了 → socket fallback。
+            try:
+                _cshim.wait_for_network_ready(timeout_sec=30.0)
+            except AttributeError:
+                import socket as _sock
+                _deadline = time.monotonic() + 30.0
+                while time.monotonic() < _deadline:
+                    try:
+                        _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                        _s.settimeout(0.5)
+                        _s.connect(("8.8.8.8", 80))  # 不真发包,只触发 kernel 选源接口
+                        _s.close()
+                        break
+                    except OSError:
+                        time.sleep(0.5)
+                else:
+                    LOG.warning("no IPv4 NIC ready after 30s; Hub may end up on lo")
             self._hub = _RpcHub(
                 participant_name=f"wdnwebui-main-{device_name}",
                 domain_id=0,
@@ -754,6 +782,19 @@ class ComputeRegistry:
                         }
                     else:
                         self._peers.pop(guid, None)
+                # discovered: peer listener 触发异步 adopt,让对端提供的
+                # service 进 ``self._instances``,网络算力栏 / capability
+                # 路由才看得到。
+                #
+                # v0.8.2: 不再用 peer_name 解析 model_id —— FastDDS SIMPLE
+                # 第一次 announce 时 participant_name 可能为空 (submessage
+                # 后续才带 name;listener 不会再触发 discovered=True),
+                # ``compute_worker-test-box-qwen3-tts`` 这种名字可能在
+                # probe 这一刻还是空字符串。改用 RPC probe 反向验证:
+                # 对每个 MODEL_PRESETS 探一次 ``wdndds/rpc/<model_id>``,
+                # 能拿到 info 的就是该 peer 提供的服务。
+                if discovered:
+                    self._maybe_adopt_from_peer()
             self._hub.set_peer_listener(_on_peer)
             LOG.info(
                 "ComputeRegistry Hub started (SIMPLE discovery): "
@@ -765,6 +806,61 @@ class ComputeRegistry:
             LOG.exception("ComputeRegistry Hub bring-up failed")
             self._cards_failed = str(e)
             self._hub = None
+
+    def _maybe_adopt_from_peer(self) -> None:
+        """peer listener 触发:对每个 model_id 没 adopted 时起 daemon adopt。
+
+        防重入:_adopt_inflight 集合防止 SPDP lease 重发期间重复启动。
+        只 skip 已 adopted(peer),不 skip adopted_local——本机 orphan 跟
+        LAN peer 是两台机器,NETWORK 卡要各自显示。
+        """
+        for model_id in MODEL_PRESETS:
+            with self._lock:
+                if any(inst.model_id == model_id
+                       and inst._source == "adopted"
+                       for inst in self._instances.values()):
+                    continue
+                if model_id in self._adopt_inflight:
+                    continue
+                self._adopt_inflight.add(model_id)
+            threading.Thread(
+                target=self._safe_adopt_for_peer,
+                args=(model_id,),
+                name=f"compute-adopt-{model_id}",
+                daemon=True,
+            ).start()
+
+    def _safe_adopt_for_peer(self, model_id: str) -> None:
+        """daemon 线程:跑 adopt,失败按 exponential backoff 重试(累计 62s)。
+
+        peer listener 只在 participant 加入/消失时触发,lease 重发不重触;
+        重启期 race window 一次 probe 5s timeout 失败 → 不重试就永久 lost。
+        """
+        attempts = len(self._ADOPT_RETRY_DELAYS_SEC) + 1   # 第 1 次 + N 次 retry
+        try:
+            for attempt in range(attempts):
+                if attempt > 0:
+                    delay = self._ADOPT_RETRY_DELAYS_SEC[attempt - 1]
+                    LOG.info(
+                        "auto-adopt peer %s: retry %d/%d in %.1fs "
+                        "(waiting for SIMPLE discovery / cshim endpoint)",
+                        model_id, attempt, len(self._ADOPT_RETRY_DELAYS_SEC),
+                        delay)
+                    time.sleep(delay)
+                inst = self._adopt_existing_worker(model_id)
+                if inst is not None:
+                    return
+            LOG.warning(
+                "auto-adopt peer %s: giving up after %d attempts "
+                "(total waited %.0fs); peer may not be providing this "
+                "service, or endpoint unreachable",
+                model_id, attempts,
+                sum(self._ADOPT_RETRY_DELAYS_SEC))
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("auto-adopt peer %s raised: %s", model_id, e)
+        finally:
+            with self._lock:
+                self._adopt_inflight.discard(model_id)
 
     def list_peers(self) -> list[dict]:
         """Return the currently visible FastDDS SIMPLE peers as
@@ -1113,14 +1209,15 @@ class ComputeRegistry:
         """
         with self._lock:
             old_key = inst.key
-            inst.key = (-1, inst.model_id)
+            inst.key = (-1, inst.model_id, "spawned")
             if old_key != inst.key:
                 self._instances.pop(old_key, None)
             self._instances[inst.key] = inst
         LOG.info("registered errored instance: %s status=error err=%r",
                  inst.model_id, inst.error[:200])
 
-    def _spawn_compute_worker(self, model_id: str) -> ModelInstance:
+    def _spawn_compute_worker(self, model_id: str,
+                            allow_adopt: bool = True) -> ModelInstance:
         """Spawn a fresh ``compute_worker.py --model <id>`` subprocess.
 
         The worker boots up with no ``--npu``: it brings its Hub +
@@ -1133,15 +1230,36 @@ class ComputeRegistry:
         the uvicorn-reload orphan case where a previous main process
         spawned a worker that survived SIGTERM).
 
+        ``allow_adopt`` propagates from ``ensure_worker_for_model`` —
+        the LOCAL "启用" API path passes False to skip both the
+        ``/proc`` orphan-adopt and the inner ``_instances`` dedup so a
+        fresh local worker is always spawned even when a peer adopted
+        entry already exists.
+
         Returns the new ``ModelInstance`` keyed ``(-1, model_id)``, or
         the adopted one if dedup kicks in.
         """
         if model_id not in MODEL_PRESETS:
             raise ValueError(f"未知 model: {model_id!r}")
         preset = MODEL_PRESETS[model_id]
-        # 1. 进程级 dedup：扫 /proc 同 comm 名的 worker（取代旧 cmdline substring 匹配）
+        # v0.8.22 dedup pass 1: LOCAL 启用 (allow_adopt=False) → 主动 drop
+        # 任何现有 adopted/adopted_local,避免 spawn 新本地 worker 后留下
+        # NETWORK adopted 卡,造成 LOCAL + NETWORK 重复(板B 03:36 那次的 bug)。
+        # Boot 路径 (allow_adopt=True) 不动 — 让下面的 orphan / dedup 自己处理。
+        if not allow_adopt:
+            with self._lock:
+                drop_keys = [k for k, inst in self._instances.items()
+                             if inst.model_id == model_id
+                             and inst._source in ("adopted", "adopted_local")]
+                for k in drop_keys:
+                    old = self._instances.pop(k)
+                    LOG.info(
+                        "spawn (allow_adopt=False): dropping existing %s "
+                        "instance for %s (peer_pid=%s) to make room for local",
+                        old._source, model_id, getattr(old, "_peer_pid", None))
+        # 1. 进程级 dedup:扫 /proc 同 comm 名的 worker
         orphan_pids = _find_workers_by_name(model_id)
-        if orphan_pids:
+        if allow_adopt and orphan_pids:
             LOG.warning(
                 "spawn skipped: %d existing %s worker(s) found (pids=%s); "
                 "adopting one and cleaning the rest",
@@ -1149,13 +1267,8 @@ class ComputeRegistry:
             adopted = self._adopt_existing_worker(model_id)
             if adopted is not None:
                 return adopted
-            # adopt 失败 —— 但孤儿 PID 还在 /proc 里活着，绝对不能
-            # 再 spawn 一个 sibling 把 NPU 显存吃双份（旧版 fall-through
-            # 这个 bug 至少在 v0.8 就有，参见 _probe_service 注释）。
-            # 返回 errored inst 让 UI 走红色 banner 路径，用户可以选
-            # 重启服务（会先 SIGTERM 孤儿再 spawn）或手动 ``kill <pid>``。
             err_inst = ModelInstance(
-                key=(-1, model_id),
+                key=(-1, model_id, "spawned"),
                 npu_index=-1,
                 model_id=model_id,
                 capability_types=list(preset["capability_types"]),
@@ -1174,14 +1287,72 @@ class ComputeRegistry:
             )
             self._register_errored_instance(err_inst)
             return err_inst
+        if not allow_adopt and orphan_pids:
+            # v0.8.22: LOCAL 启用 + /proc orphan → 直接注册 adopted_local,
+            # 不走 _adopt_existing_worker 的 DDS probe(避免 grab 错 peer
+            # worker 把 NETWORK 卡弄回来;orphan 是我们自己的,直接用 /proc)。
+            orphan_pid = orphan_pids[0]
+            LOG.info(
+                "spawn (allow_adopt=False): reusing local /proc orphan "
+                "pid=%d for %s as adopted_local", orphan_pid, model_id)
+            device_name = (get_config().get_section("base", {}).get(
+                "device_name", "") or socket.gethostname())
+            inst = ModelInstance(
+                key=(-1, model_id, "adopted_local"),
+                npu_index=-1,
+                model_id=model_id,
+                capability_types=list(preset["capability_types"]),
+                instance_name=preset["instance_name"],
+                label=preset["label"],
+                memory_estimate_mb=preset["memory_estimate_mb"],
+                status="not_loaded",
+                started_at=time.time(),
+                _source="adopted_local",
+            )
+            inst._peer_pid = orphan_pid
+            inst._peer_name = f"{device_name}（本机 pid={orphan_pid}）"
+            with self._lock:
+                # v0.8.27: 已有 spawned 指向同一 pid 时 drop 它。
+                # 同一 worker 进程被两个 key 注册会出双 LOCAL 卡
+                # (spawned + adopted_local 指向同一 pid),冗余且误导。
+                # adopted_local 是更准的描述(/proc 真实存在)。
+                for _k in list(self._instances.keys()):
+                    _ex = self._instances[_k]
+                    if (_ex.model_id == model_id
+                            and _ex._source == "spawned"
+                            and _ex.proc is not None
+                            and _ex.proc.pid == orphan_pid):
+                        LOG.info(
+                            "local-orphan path: dropping duplicate spawned "
+                            "entry for %s pid=%d", model_id, orphan_pid)
+                        del self._instances[_k]
+                        break
+                self._instances[inst.key] = inst
+            try:
+                self._setup_rpc_client(inst)
+            except Exception:  # noqa: BLE001
+                LOG.warning("local-orphan RpcClient setup failed: %s",
+                            model_id, exc_info=True)
+            probe = threading.Thread(
+                target=self._probe_instance,
+                args=(inst,),
+                name=f"compute-probe-local-orphan-{model_id}",
+                daemon=True,
+            )
+            inst._probe_thread = probe
+            probe.start()
+            return inst
         # 2. 让 ensure_worker_for_model 阶段不重复进入
         with self._lock:
             for inst in self._instances.values():
-                if inst.model_id == model_id:
-                    return inst
+                if inst.model_id != model_id:
+                    continue
+                if not allow_adopt and inst._source == "adopted":
+                    continue
+                return inst
         preset = MODEL_PRESETS[model_id]
         inst = ModelInstance(
-            key=(-1, model_id),
+            key=(-1, model_id, "spawned"),
             npu_index=-1,
             model_id=model_id,
             capability_types=list(preset["capability_types"]),
@@ -1204,13 +1375,34 @@ class ComputeRegistry:
             sys.executable, "-u",
             str(Path(__file__).resolve().parent / "compute_worker.py"),
             "--model", model_id,
+            # v0.8.15: 主进程 spawn 本机 worker 时传 --local-only,让 worker
+            # 只注册 per-PID service,不注册 standard。避免本机 spawned worker
+            # 与 LAN peer 共用 standard topic 让 adopted (NETWORK) RpcClient
+            # 路由到本机,造成 NETWORK 卡 status 翻转。
+            "--local-only",
             # 不传 --npu：npu_index 由用户在算力配置页选 NPU 后通过 RPC 传入
         ]
         try:
+            # v0.8.6 改:worker stdout/stderr 写独立 log file,而不是 PIPE。
+            # 原因:PIPE 在 parent(uwsgi worker / uvicorn)死掉时 read 端
+            # 关闭,worker 写 stderr 收到 SIGPIPE → 默认行为是 terminate
+            # → 孤儿 worker 全部死亡,网络算力栏空。
+            # 每个 worker 一个 log file 在 /tmp/wdnwebui-worker/ 下,
+            # logrotation 由用户管理(目前不需要,文件小)。
+            log_dir = Path("/tmp/wdnwebui-worker")
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                log_dir = None
+            if log_dir is not None:
+                log_path = log_dir / f"{model_id}.log"
+                log_fp = open(log_path, "ab", buffering=0)
+            else:
+                log_fp = open(os.devnull, "ab")
             proc = subprocess.Popen(
                 cmd, env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=log_fp,
+                stderr=log_fp,
                 start_new_session=True,
                 # 注意：进程 comm 是在 worker 端 main() 里
                 # _set_comm_name(...) 调的，不是在 preexec_fn 里
@@ -1219,6 +1411,7 @@ class ComputeRegistry:
                 # preexec_fn，命名逻辑下沉到 compute_worker.py。
             )
             inst.proc = proc
+            inst._log_path = str(log_path)
         except Exception as e:
             inst.status = "error"
             inst.error = f"spawn failed: {e}"
@@ -1260,6 +1453,55 @@ class ComputeRegistry:
         LOG.info("spawned compute_worker for %s (pid=%d)",
                  model_id, proc.pid)
         return inst
+
+    def _find_inst_by_worker_pid(self, model_id: str, worker_pid) -> Optional[ModelInstance]:
+        """v0.8.28: 找 _instances 里 model_id + worker_pid 匹配的已有 entry。
+        
+        用于 _adopt_existing_worker / inline-peer retry / _discover_additional_peers
+        在 insert 之前 dedup 同 worker。防止同 worker 因 npu_index
+        在不同时间点变化(key=(npu, model_id, source) 不同)被 register 多次,
+        进而导致双 LOCAL 卡 + NETWORK stale status(黄灯)。
+        """
+        if not isinstance(worker_pid, int):
+            return None
+        for inst in self._instances.values():
+            if inst.model_id != model_id:
+                continue
+            if inst.proc is not None and inst.proc.pid == worker_pid:
+                return inst
+            if getattr(inst, "_peer_pid", None) == worker_pid:
+                return inst
+        return None
+
+    def _upsert_adopted_inst(self, existing, info: dict, model_id: str,
+                              peer_name: str, worker_ip: str, worker_npu) -> None:
+        """v0.8.28: in-place update existing inst + drop 旧 key + re-insert。
+        
+        key 包含 npu_index — npu 从 -1 → 0 时 key 必须更新。直接
+        删所有指向此 inst 的旧 key 再 re-insert 是最干净的写法,
+        避免 dict 留死残留 + stale status。
+        """
+        with self._lock:
+            for k in [k for k, v in list(self._instances.items()) if v is existing]:
+                del self._instances[k]
+            if isinstance(worker_npu, int):
+                existing.npu_index = worker_npu
+            existing.status = info.get("status", existing.status)
+            existing.loaded_at = info.get("loaded_at")
+            existing.load_time_sec = info.get("load_time_sec")
+            existing.finished_at = info.get("loaded_at")
+            existing._peer_name = peer_name
+            existing._peer_ip = worker_ip
+            existing.available_image_sizes = _coerce_image_sizes(
+                info.get("available_image_sizes"))
+            if isinstance(existing.npu_index, int) and existing.npu_index >= 0:
+                existing.key = (existing.npu_index, model_id, existing._source)
+            else:
+                existing.key = (-1, model_id, existing._source)
+            self._instances[existing.key] = existing
+        LOG.info("v0.8.28: in-place updated %s for %s (pid=%d npu=%s status=%s)",
+                 existing._source, model_id, getattr(existing, "_peer_pid", 0),
+                 existing.npu_index, existing.status)
 
     def _adopt_existing_worker(self, model_id: str) -> Optional[ModelInstance]:
         """Probe the LAN daemon for a peer worker providing
@@ -1332,7 +1574,7 @@ class ComputeRegistry:
             else:
                 peer_name = "远端"
         inst = ModelInstance(
-            key=(-1, model_id),
+            key=(-1, model_id, source),
             npu_index=worker_npu if isinstance(worker_npu, int) else -1,
             model_id=model_id,
             capability_types=list(preset["capability_types"]),
@@ -1366,14 +1608,44 @@ class ComputeRegistry:
             LOG.warning("adopt: rpc setup failed for %s: %s",
                         model_id, e)
             return None
+        # v0.8.28: 同 worker pid dedup → in-place update 旧 entry(避免
+        # 同一 worker 因 npu_index 变化在不同时间点被 register 多次)。
+        existing_pid = self._find_inst_by_worker_pid(model_id, worker_pid)
+        if existing_pid is not None:
+            self._upsert_adopted_inst(existing_pid, info, model_id, peer_name,
+                                      worker_ip, worker_npu)
+            return existing_pid
         with self._lock:
+            # v0.8.5 改:只 dedup 同 source。spawned / adopted / adopted_local
+            # 三种 source 可共存 —— 本机 spawned 不应阻止 LAN adopted。
             existing = next((v for v in self._instances.values()
-                             if v.model_id == model_id), None)
+                             if v.model_id == model_id
+                             and v._source == source), None)
             if existing is not None:
                 return existing
+            # v0.8.12:本机已有 spawned entry 时跳过 adopt。用户在算力配置页
+            # 点 LOCAL 启用的结果是 spawned(真相);boot probe / peer listener
+            # 看到本地 worker 也是 DDS participant 会探到它,这时不应该再创建
+            # adopted / adopted_local 跟 spawned 撞同一个 dict key (npu,
+            # model_id) 把用户 spawn 的 entry 覆盖掉。
+            if source in ("adopted", "adopted_local"):
+                # v0.8.23: 不再因本地 spawned 跳过 adopt。设计意图是
+                # LOCAL = 本机 worker(spawned 或 adopted_local),
+                # NETWORK = peer worker(adopted,不论本机是否有同 model)。
+                # 两张卡可同 model 共存,各指向不同板子的实例。
+                # 之前 skip 让板B 在 04:27:05 看到 board A 的 qwen2.5-omni-3b
+                # probe 成功但被拦下,NETWORK 永远不显示 peer 的同 model 卡。
+                pass
             if inst.npu_index >= 0:
-                inst.key = (inst.npu_index, model_id)
-            self._instances[inst.key] = inst
+                inst.key = (inst.npu_index, model_id, source)
+            else:
+                inst.key = (-1, model_id, source)
+            with self._lock:
+                # v0.8.22: 必须在 lock 下插,避免 peer_listener 线程插入
+                # adopted 卡与 _spawn_compute_worker 顶部 dedup 之间的
+                # 可见性 race(板B 03:36 那次 spawn 看到空 _instances 然后
+                # 又被这条 insert 写入,导致 LOCAL + NETWORK 双卡)。
+                self._instances[inst.key] = inst
         probe = threading.Thread(
             target=self._probe_instance,
             args=(inst,),
@@ -1386,18 +1658,84 @@ class ComputeRegistry:
                  source, model_id, source, inst._peer_name,
                  inst.npu_index, inst.status)
 
+        # v0.8.25: 如果首个 probe 拿到本机(/proc orphan 之类),cshim
+        # Requester routing 非确定 — boot 之前看到的可能一直是本机,
+        # 漏了 LAN peer。inline 再 retry 一次,跳过本机响应,找非本机
+        # peer 加成单独的 NETWORK 卡。设计上 LOCAL + NETWORK 可同 model
+        # 共存:一张指本机、一张指 LAN peer,各跑各的。
+        if source == "adopted_local":
+            for peer_retry in range(3):
+                try:
+                    peer_info = self._probe_service(model_id)
+                except Exception:  # noqa: BLE001
+                    peer_info = None
+                if peer_info is None or peer_info.get("status") == "error":
+                    time.sleep(2.0)
+                    continue
+                peer_ip = (peer_info.get("peer_ip") or "").strip()
+                if peer_ip and peer_ip == local_ip:
+                    time.sleep(1.0)
+                    continue
+                # 找到 LAN peer — 注册成独立 adopted entry(key 不同,
+                # 不会覆盖 adopted_local 卡)。
+                try:
+                    peer_inst = self._build_adopted_from_probe(
+                        peer_info, model_id)
+                    # v0.8.28: 同 worker dedup — 防止 peer_retry 多次命中
+                    # 同一 peer worker 时 insert 两次。
+                    existing_peer = self._find_inst_by_worker_pid(
+                        model_id, peer_inst._peer_pid)
+                    if existing_peer is not None:
+                        self._upsert_adopted_inst(
+                            existing_peer, peer_info, model_id,
+                            peer_inst._peer_name, peer_info.get("peer_ip", ""),
+                            peer_inst.npu_index)
+                    else:
+                        with self._lock:
+                            # 防御性 dedup:多线程并发下避免重复 insert
+                            if peer_inst.key not in self._instances:
+                                self._instances[peer_inst.key] = peer_inst
+                            peer_t = threading.Thread(
+                                target=self._probe_instance,
+                                args=(peer_inst,),
+                                name=f"compute-probe-peer-{model_id}",
+                                daemon=True,
+                            )
+                            peer_inst._probe_thread = peer_t
+                            peer_t.start()
+                            LOG.info(
+                                "v0.8.25 inline-peer: found LAN peer for %s "
+                                "alongside local orphan (peer_ip=%s pid=%s)",
+                                model_id, peer_ip,
+                                peer_info.get("pid"))
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning("inline-peer register failed for %s: %s",
+                                model_id, e)
+                break
+
         # 接管完后清理同一 model 的多余孤儿（同 comm 名但 probe 没接上的 PID）。
         # 这是修 uvicorn-reload 留下的 NPU 内存泄漏的关键：
         # 旧实现 _find_orphan_worker_pid 只返第一个 PID，剩下的孤儿无人收；
         # 现在按 comm 名扫出全部，probe 接走一个，剩下的 SIGTERM → 等 5s → SIGKILL。
-        if isinstance(worker_pid, int):
+        if isinstance(worker_pid, int) and source == "adopted_local":
+            # v0.8.26: 只在 probe 命中本机时清理 extras。boot 拿到 peer
+            # (source=adopted) 时,extras 实际是**本机**自己的 /proc worker
+            # (v0.8.25 的 inline-peer 把 peer 加进 NETWORK 后,/proc 还能
+            # 扫到我们的本地 worker,这时不能误杀)。这是修板B 在 04:43:35
+            # boot probe 命中 board A pid=5509 后,cleanup 把本机 pid=4510
+            # 当成 orphan SIGTERM 掉的 bug。
             existing_pids = _find_workers_by_name(model_id)
             extras = [p for p in existing_pids if p != worker_pid]
             if extras:
                 LOG.warning(
-                    "adopted %s from pid=%d; cleaning %d extra orphan(s): %s",
+                    "adopted %s from local pid=%d; cleaning %d extra orphan(s): %s",
                     model_id, worker_pid, len(extras), extras)
-                self._terminate_orphan_pids(extras, grace_sec=5)
+                _terminate_orphan_pids(extras, grace_sec=5)
+        elif isinstance(worker_pid, int):
+            LOG.info(
+                "adopted %s from peer pid=%d (peer_ip=%s); skipping "
+                "orphan cleanup — /proc extras are local workers, not orphans",
+                model_id, worker_pid, worker_ip)
 
         return inst
 
@@ -1414,15 +1752,23 @@ class ComputeRegistry:
         if inst._source != "spawned":
             raise RuntimeError(
                 f"{model_id} 是 peer 提供的 service，本机无权 spawn")
-        return self.bind_instance(model_id, npu_index)
+        return self.bind_instance(inst, npu_index)
 
-    def ensure_worker_for_model(self, model_id: str) -> ModelInstance:
+    def ensure_worker_for_model(self, model_id: str,
+                               allow_adopt: bool = True) -> ModelInstance:
         """User-facing: ensure *some* worker exists for this model.
 
         Order:
-          1. already in ``_instances``? return it
-          2. probe the LAN daemon — if a peer responds, adopt
+          1. already in ``_instances``? return it (any source)
+          2. if ``allow_adopt``: probe the LAN daemon — if a peer
+             responds, adopt
           3. otherwise spawn a fresh local subprocess
+
+        ``allow_adopt`` is True for boot probe / peer listener (zero-
+        config fast path — adopt peer if any), False for the API
+        ``start_instance`` endpoint where the user clicked the LOCAL
+        "启用" card and explicitly wants a fresh local worker on the
+        chosen NPU regardless of peer presence.
 
         Status returned may be ``not_loaded`` if the worker is up but
         the user has not yet bound an NPU (call ``bind_instance`` for
@@ -1431,6 +1777,8 @@ class ComputeRegistry:
         with self._lock:
             for inst in self._instances.values():
                 if inst.model_id != model_id:
+                    continue
+                if not allow_adopt and inst._source == "adopted":
                     continue
                 # spawned workers: 如果 subprocess 死了（probe 还没
                 # 来得及翻 error，或 probe 已 return），不要复用 stale
@@ -1457,12 +1805,14 @@ class ComputeRegistry:
                     # fall through to adopt / spawn
                     break
                 return inst
-        adopted = self._adopt_existing_worker(model_id)
-        if adopted is not None:
-            return adopted
-        return self._spawn_compute_worker(model_id)
+        if allow_adopt:
+            adopted = self._adopt_existing_worker(model_id)
+            if adopted is not None:
+                return adopted
+        spawned = self._spawn_compute_worker(model_id, allow_adopt=allow_adopt)
+        return spawned
 
-    def bind_instance(self, model_id: str, npu_index: int) -> ModelInstance:
+    def bind_instance(self, inst: ModelInstance, npu_index: int) -> ModelInstance:
         """v0.8 fire-and-forget：立即把 ``inst.status="loading"`` 返回，
         让前端 1Hz tick 看到 loading 状态 + 倒计时；后台线程跑 RPC
         ``load``，完成后翻 status=running / error，失败时 npu_index
@@ -1474,20 +1824,25 @@ class ComputeRegistry:
         用户能看到 is-load 脉动 + 倒计时（"约 30s"），加载完成
         toggle 切到 running 绿色 + 显示加载耗时。
 
+        v0.8.11:caller 必须传 inst(从 ``ensure_worker_for_model``
+        返回的那个),而不是再传 model_id 让我们重查 _instances。
+        之前按 model_id 查会撞到多个同 model 不同 source 的 inst
+        (e.g. adopted + spawned) 时返回 boot probe 先加的那个
+        adopted,导致 spawn 完了却 bind 到 adopted → 403。
+
         Raises ``RuntimeError`` for pre-flight checks (peer source,
         no RPC client, bad npu_index). The RPC call itself is async
         — its failures land on ``inst.status = "error"`` + ``inst.error``.
         """
         import threading
 
-        inst = self._find_by_model(model_id)
         if inst is None:
-            raise RuntimeError(f"本地无 {model_id} 的 worker")
+            raise RuntimeError("bind_instance: inst 不能为空")
         if inst._source == "adopted":
             raise RuntimeError(
-                f"{model_id} 是 peer 提供的 service，本机无权 bind")
+                f"{inst.model_id} 是 peer 提供的 service，本机无权 bind")
         if inst.rpc_client is None:
-            raise RuntimeError(f"{model_id} worker RPC client 未就绪")
+            raise RuntimeError(f"{inst.model_id} worker RPC client 未就绪")
         if not isinstance(npu_index, int) or npu_index < 0:
             raise RuntimeError(f"npu_index 非法: {npu_index!r}")
 
@@ -1520,7 +1875,7 @@ class ComputeRegistry:
                     LOG.warning(
                         "bind %s RPC fail: err=%r rc=%s stderr_len=%d "
                         "stderr_tail=%r",
-                        model_id, err_msg, rc, len(stderr_tail),
+                        inst.model_id, err_msg, rc, len(stderr_tail),
                         stderr_tail[:200] if stderr_tail else "",
                     )
                     with self._lock:
@@ -1538,7 +1893,7 @@ class ComputeRegistry:
                                     f"{stderr_tail.rstrip()}")
                             inst.error = "\n".join(parts)
                     LOG.warning("bind %s load RPC failed: %s%s",
-                                model_id, err_msg,
+                                inst.model_id, err_msg,
                                 f" (rc={rc})" if rc is not None else "")
                     return
                 if data.get("status") == "error":
@@ -1548,7 +1903,7 @@ class ComputeRegistry:
                         inst.error = str(err_msg)
                         inst.npu_index = -1
                     LOG.warning("bind %s load worker error: %s",
-                                model_id, err_msg)
+                                inst.model_id, err_msg)
                     return
                 if data.get("status") == "missing_model_dir":
                     err_msg = data.get("error", "模型目录不存在")
@@ -1557,7 +1912,7 @@ class ComputeRegistry:
                         inst.error = err_msg
                         inst.npu_index = -1
                     LOG.warning("bind %s missing_model_dir: %s",
-                                model_id, err_msg)
+                                inst.model_id, err_msg)
                     return
                 if data.get("status") == "loading":
                     # Worker 把 LLMSession init 挪到独立线程跑（避免
@@ -1566,7 +1921,9 @@ class ComputeRegistry:
                     # RPC，看到 worker 的 state["status"] 翻 running /
                     # error 自动同步到 inst。这里 fire-and-forget 直接
                     # 退场：probe 接管。
-                    new_key = (npu_index, model_id)
+                    # v0.8.13:key 用 inst._source 不硬编码 —— bind 也能调到
+                    # adopted_local (orphan dedup 返回的 inst)。
+                    new_key = (npu_index, inst.model_id, inst._source)
                     with self._lock:
                         if inst.key != new_key:
                             self._instances.pop(inst.key, None)
@@ -1575,10 +1932,10 @@ class ComputeRegistry:
                         # inst.status 已经是 loading（bind_instance 入口
                         # 乐观设置）；保留不要改 running。
                     LOG.info("bind %s @ npu=%d: async load started, "
-                             "deferring to probe", model_id, npu_index)
+                             "deferring to probe", inst.model_id, npu_index)
                     return
                 # 翻 running + 更新 key + 加载耗时
-                new_key = (npu_index, model_id)
+                new_key = (npu_index, inst.model_id, inst._source)
                 with self._lock:
                     if inst.key != new_key:
                         self._instances.pop(inst.key, None)
@@ -1589,7 +1946,7 @@ class ComputeRegistry:
                     inst.loaded_at = data.get("loaded_at")
                     inst.finished_at = time.time()
                 LOG.info("bound %s @ npu=%d (load=%.1fs)",
-                         model_id, npu_index, inst.load_time_sec or 0.0)
+                         inst.model_id, npu_index, inst.load_time_sec or 0.0)
             except Exception as e:  # noqa: BLE001
                 # RPC call itself raised (transport-level error before
                 # we even got a JSON reply). Best-effort drain worker
@@ -1615,13 +1972,13 @@ class ComputeRegistry:
                                 f"{stderr_tail.rstrip()}")
                         inst.error = "\n".join(parts)
                 LOG.exception("bind %s load raised%s",
-                              model_id,
+                              inst.model_id,
                               f" (rc={rc})" if rc is not None else "")
             finally:
                 inst._bind_inflight = False
 
         threading.Thread(target=_run_load, daemon=True,
-                         name=f"compute-bind-{model_id}").start()
+                         name=f"compute-bind-{inst.model_id}").start()
         return inst
 
     def unload_instance(self, model_id: str) -> None:
@@ -1642,7 +1999,7 @@ class ComputeRegistry:
         with self._lock:
             old_key = inst.key
             inst.npu_index = -1
-            inst.key = (-1, model_id)
+            inst.key = (-1, model_id, inst._source)
             inst.status = "not_loaded"
             inst.load_time_sec = None
             inst.loaded_at = None
@@ -1790,13 +2147,28 @@ class ComputeRegistry:
 
         Used by both ``_start_one_subprocess`` (fresh spawn) and
         ``_adopt_existing_worker`` (boot-time adoption of an already
-        responding peer). Both paths go through the same wdndds
-        service name ``wdndds/rpc/<model_id>`` so FastDDS discovery
-        routes calls to whichever process is actually hosting the
-        service — local subprocess OR a peer on the LAN.
+        responding peer).
+
+        v0.8.14: for **local** workers (spawned / adopted_local) we bind
+        to the per-worker service ``wdndds/rpc/<model_id>/worker-<pid>``
+        so FastDDS routing is deterministic — the standard
+        ``wdndds/rpc/<model_id>`` topic is shared with any LAN peer
+        also providing the same model, and a non-deterministic load RPC
+        would land on the peer instead of the local worker, leaving the
+        local worker permanently unloaded. For **adopted (LAN peer)**
+        insts we keep the standard service name — there is no per-worker
+        PID for a remote peer.
         """
         hub = self._hub_or_raise()
-        svc = hub.create_service(f"wdndds/rpc/{inst.model_id}")
+        if inst._source == "spawned" and inst.proc is not None and inst.proc.pid:
+            service_name = (
+                f"wdndds/rpc/{inst.model_id}/worker-{inst.proc.pid}")
+        elif inst._source == "adopted_local" and inst._peer_pid:
+            service_name = (
+                f"wdndds/rpc/{inst.model_id}/worker-{inst._peer_pid}")
+        else:
+            service_name = f"wdndds/rpc/{inst.model_id}"
+        svc = hub.create_service(service_name)
         rpc_client = svc.create_requester(timeout_ms=10_000)
         inst.rpc_client = rpc_client
         try:
@@ -1905,9 +2277,13 @@ class ComputeRegistry:
         """
         out: list[dict] = []
         with self._lock:
-            by_model: dict[str, ModelInstance] = {
-                inst.model_id: inst for inst in self._instances.values()
-            }
+            # v0.8.13:by_model 改成 list of insts per model_id,而不是只留
+            # 最后一个。之前 dict comprehension inst.model_id -> inst 会让
+            # 多个同 model 不同 source 的 inst(spawned + adopted 共存)
+            # 被互相挤掉,UI 列表只看到其中一个。
+            by_model: dict[str, list[ModelInstance]] = {}
+            for inst in self._instances.values():
+                by_model.setdefault(inst.model_id, []).append(inst)
 
         def _unavailable_entry(model_id: str) -> dict:
             preset = MODEL_PRESETS[model_id]
@@ -1933,14 +2309,24 @@ class ComputeRegistry:
             }
 
         for model_id, preset in MODEL_PRESETS.items():
-            inst = by_model.get(model_id)
-            if inst is None:
+            insts = by_model.get(model_id, [])
+            if not insts:
                 out.append(_unavailable_entry(model_id))
                 continue
-            out.append(inst.to_dict())
-            # adopted/adopted_local 时本地还没 spawn —— 补一条 unavailable
-            # 让本地栏依然有「启用」卡(用户想用本机 NPU 可覆盖)。
-            if inst._source in ("adopted", "adopted_local"):
+            for inst in insts:
+                out.append(inst.to_dict())
+            # v0.8.7:只对 **远端 adopted** 补 unavailable 占位卡(让用户
+            # 能用本机 NPU 覆盖)。adopted_local 已经是本机孤儿 worker 在跑,
+            # 再补一条会让本地栏出现 2 个同名 model,用户困惑哪个是真的。
+            # spawned 本来就是本机在跑,补一条也没意义。只有远端 adopted
+            # 没本地 spawn / orphan 时才需要补占位卡提示"可以启用本机覆盖"。
+            # v0.8.18:原版只检查 adopted,漏了 spawned/adopted_local 共存
+            # (LOCAL 启用后 LOCAL 栏出现 2 个同名 model 的 bug)。改判
+            # `adopted AND not has_local`。
+            has_local = any(i._source in ("spawned", "adopted_local")
+                            for i in insts)
+            if (any(i._source == "adopted" for i in insts)
+                    and not has_local):
                 out.append(_unavailable_entry(model_id))
         # Stable ordering: spawned → adopted_local → adopted → unavailable.
         order = {"spawned": 0, "adopted_local": 1, "adopted": 2, "unavailable": 3}
@@ -1992,6 +2378,124 @@ class ComputeRegistry:
             self._cleanup_unregistered_workers()
         except Exception as e:  # noqa: BLE001
             LOG.warning("boot cleanup sweep failed: %s", e)
+
+        # v0.8.24: 后台 daemon 再扫一次 peer。boot probe 接受首个 responder,
+        # 如果本机已有 /proc orphan(cshim 路由非确定),LAN peer 可能漏掉。
+        threading.Thread(
+            target=self._discover_additional_peers,
+            name="compute-peer-discovery",
+            daemon=True,
+        ).start()
+
+    def _discover_additional_peers(self) -> None:
+        """v0.8.24: 后台扫 LAN peer,补 boot probe 漏掉的 NETWORK 卡。
+
+        设计意图:NETWORK 卡显示"我能不能从 LAN 调到这台 model",LOCAL
+        卡显示"这台 model 在我本机跑没跑"。两个独立维度 — 即使本机在跑,
+        LAN 上其他板子也跑同一 model 的话,NETWORK 卡也应该显示那个 peer
+        (只读、不能 bind,仅作可见性 + 状态参考)。
+        """
+        # 让 FastDDS SEDP 收敛 + boot probe 跑完。
+        time.sleep(8.0)
+        local_ip = _get_local_ip()
+        if not local_ip:
+            return
+        for model_id in MODEL_PRESETS.keys():
+            with self._lock:
+                # v0.8.27: 跟 _maybe_adopt_from_peer 同——只 skip 已 adopted
+                # (远端),adopted_local(/proc orphan)不应阻止。
+                if any(i.model_id == model_id and i._source == "adopted"
+                       for i in self._instances.values()):
+                    continue
+            peer_info = None
+            for retry in range(5):
+                try:
+                    info = self._probe_service(model_id)
+                except Exception:
+                    info = None
+                if info is None or info.get("status") == "error":
+                    time.sleep(2.0)
+                    continue
+                info_ip = (info.get("peer_ip") or "").strip()
+                if info_ip and info_ip == local_ip:
+                    time.sleep(1.0)
+                    continue
+                peer_info = info
+                break
+            if peer_info is None:
+                continue
+            try:
+                inst = self._build_adopted_from_probe(peer_info, model_id)
+                # v0.8.28: 同 worker dedup — peer-discovery daemon 反复跑
+                # 时防止 insert 多次。
+                existing_d = self._find_inst_by_worker_pid(
+                    model_id, inst._peer_pid)
+                if existing_d is not None:
+                    self._upsert_adopted_inst(
+                        existing_d, peer_info, model_id,
+                        inst._peer_name, peer_info.get("peer_ip", ""),
+                        inst.npu_index)
+                else:
+                    with self._lock:
+                        self._instances[inst.key] = inst
+                    probe_t = threading.Thread(
+                        target=self._probe_instance,
+                        args=(inst,),
+                        name=f"compute-probe-peer-discovery-{model_id}",
+                        daemon=True,
+                    )
+                    inst._probe_thread = probe_t
+                    probe_t.start()
+                LOG.info("v0.8.24 peer-discovery: found LAN peer for %s "
+                         "(peer_ip=%s status=%s)", model_id,
+                         peer_info.get("peer_ip"),
+                         peer_info.get("status"))
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("v0.8.24 peer-discovery register failed for %s: %s",
+                            model_id, e)
+
+    def _build_adopted_from_probe(self, info: dict,
+                                  model_id: str) -> "ModelInstance":
+        """v0.8.24: 把 probe 返回的 dict 包装成 ModelInstance (source=adopted)。
+
+        与 :meth:`_adopt_existing_worker` 共用字段抽取 + IP/hostname 比较
+        分类的逻辑,但永远强制 source="adopted" — 调用方已经确认是 LAN peer
+        (跳过了本机响应),不重复做 IP 比较。
+        """
+        preset = MODEL_PRESETS[model_id]
+        worker_npu = info.get("npu_index")
+        worker_pid = info.get("pid")
+        worker_host = (info.get("hostname") or "").strip()
+        worker_device = (info.get("device_name") or "").strip()
+        if worker_device:
+            peer_name = worker_device
+        elif worker_host:
+            peer_name = worker_host
+        else:
+            peer_name = "远端"
+        inst = ModelInstance(
+            key=(-1, model_id, "adopted"),
+            npu_index=worker_npu if isinstance(worker_npu, int) else -1,
+            model_id=model_id,
+            capability_types=list(preset["capability_types"]),
+            instance_name=preset["instance_name"],
+            label=preset["label"],
+            memory_estimate_mb=preset["memory_estimate_mb"],
+            status=info.get("status", "not_loaded"),
+            started_at=time.time(),
+            finished_at=info.get("loaded_at"),
+            load_time_sec=info.get("load_time_sec"),
+            loaded_at=info.get("loaded_at"),
+            available_image_sizes=_coerce_image_sizes(
+                info.get("available_image_sizes")),
+            _source="adopted",
+            _peer_guid=info.get("_peer_guid", ""),
+            _peer_name=peer_name,
+            _peer_ip=info.get("peer_ip", ""),
+        )
+        if isinstance(worker_pid, int):
+            inst._peer_pid = worker_pid
+        return inst
 
     def _cleanup_unregistered_workers(self) -> int:
         """Boot-time defensive sweep.
@@ -2202,7 +2706,7 @@ class ComputeRegistry:
                                     and inst.npu_index != worker_npu):
                                 self._instances.pop(inst.key, None)
                                 inst.npu_index = worker_npu
-                                inst.key = (worker_npu, inst.model_id)
+                                inst.key = (worker_npu, inst.model_id, inst._source)
                                 self._instances[inst.key] = inst
                             inst.finished_at = data.get(
                                 "loaded_at", time.time())

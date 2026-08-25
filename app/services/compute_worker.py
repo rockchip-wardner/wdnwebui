@@ -1041,6 +1041,13 @@ def main() -> int:
                          "配置页选择后通过 RPC ``action=load npu_index=N`` 传"
                          "入。如果这里也传，worker 启动后会自动 build LLMSession"
                          "（仅用于 e2e 测试方便）。")
+    ap.add_argument("--local-only", action="store_true",
+                    help="主进程 spawn 本机 worker 时传:worker 只注册 per-PID "
+                         "service (wdndds/rpc/<model_id>/worker-<pid>)，不注册 "
+                         "标准 service。避免与 LAN peer 共用 standard topic 造成 "
+                         "FastDDS 路由冲突(否则本机 probe 的 info RPC 会被路由到 "
+                         "本机 spawned worker，adopted (NETWORK) 卡 status 翻转)。"
+                         "仅 main process spawn 时使用;手动启动 / debug 路径不传。")
     ap.add_argument("--debug", action="store_true",
                     default=os.environ.get("WDNDDS_DEBUG") == "1")
     args = ap.parse_args()
@@ -1116,10 +1123,19 @@ def main() -> int:
     stop_event = _WORKER_STOP_EVENT
 
     device_name = _read_device_name()
+    # v0.8.16: 必须注册 BOTH services。仅注册 unique (v0.8.15) 会让 LAN
+    # peer 的 boot probe 走 standard service 找不到本机 worker,NETWORK 栏
+    # 为空。LOCAL main 用 unique 直连本机 (避免 routing 冲突),adopted main
+    # 走 standard 找 LAN peer — 同时也会路由到本机,但本地 loading 完成后
+    # 状态与 peer 一致,不再翻转。Do NOT 改回 only-unique。
+    services = [
+        f"wdndds/rpc/{model_id}/worker-{_WORKER_PID}",
+        f"wdndds/rpc/{model_id}",
+    ]
     hub = Hub(
         participant_name=f"compute_worker-{device_name}-{model_id}",
         domain_id=0,
-        services=[f"wdndds/rpc/{model_id}"],
+        services=services,
         callback=lambda svc, pl: router(
             svc, pl, _worker_state, model_id, npu_index, model_dir),
         discovery_servers=[],

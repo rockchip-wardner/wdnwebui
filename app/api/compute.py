@@ -202,7 +202,7 @@ async def start_instance(req: InstanceRequest) -> dict:
     """
     reg = get_registry()
     try:
-        inst = reg.ensure_worker_for_model(req.model)
+        inst = reg.ensure_worker_for_model(req.model, allow_adopt=False)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if inst._source == "adopted":
@@ -216,7 +216,7 @@ async def start_instance(req: InstanceRequest) -> dict:
             ),
         )
     try:
-        inst = reg.bind_instance(req.model, req.npu_index)
+        inst = reg.bind_instance(inst, req.npu_index)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "instance": inst.to_dict(), "snapshot": reg.snapshot()}
