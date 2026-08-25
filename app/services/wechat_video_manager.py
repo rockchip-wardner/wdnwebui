@@ -350,6 +350,15 @@ class WechatVideoManager:
         if reject:
             raise RuntimeError(reject)
 
+        # ---- 0.5 embedding 会话最终防线：handle_incoming 已做 capability
+        # 预检，这里再取一次防 TOCTOU 窗口（预检通过后、下载期间被卸载）。
+        # 放在下载之前 —— 未启用时连流量都不浪费。
+        from app.services.compute_registry import (
+            get_registry, get_session_call_lock,
+        )
+        session = get_registry().get_session("swcap_video_retrieval")
+        lock = get_session_call_lock()
+
         # ---- 1. 固定文案确认（A 组合播报节点）----
         self._notify(
             user_id,
@@ -396,12 +405,8 @@ class WechatVideoManager:
         self._notify(user_id, f"⏳ 开始分析 {entry.filename}"
                               f"（{duration_s:.0f} 秒，共 {total} 段）…")
 
-        # ---- 4. 切片 embedding（复用 VCS 底层函数 + SHM 帧传递）----
-        from app.services.compute_registry import (
-            get_registry, get_session_call_lock,
-        )
-        session = get_registry().get_session("swcap_video_retrieval")
-        lock = get_session_call_lock()
+        # ---- 4. 切片 embedding（复用 VCS 底层函数 + SHM 帧传递；
+        #         session/lock 已在步骤 0.5 获取）----
         shm_session_id = f"wxv{seq:x}"
         chunk_idx = 0
         start = 0.0

@@ -141,11 +141,28 @@ class _LlmBridge:
             self._reply_no_context(user_id, "当前仅支持文字与视频消息（图片 / 语音暂不支持）。")
 
     def _dispatch_to_video_manager(self, user_id: str, msg: Any) -> None:
-        """video 消息与 file 形态的共用分流：入队提取 + 注入系统通知。
+        """video 消息与 file 形态的共用分流：capability 预检 → 入队提取
+        → 注入系统通知。
 
-        通知必须两个分支都注入 —— 否则模型不知道换了新视频，会沿用
-        history 里上一轮的检索结果作答（真机实测复现的缺陷）。
-        """
+        预检失败（emb-2b 未加载）时整体不可用 —— 不入队（加载后需重发），
+        回固定文案并注入系统通知，让 LLM 对话中能准确解释原因而非含糊
+        其辞。"""
+        try:
+            from app.services.compute_registry import get_registry
+            get_registry().get_session("swcap_video_retrieval")
+        except Exception as exc:  # noqa: BLE001
+            _LOG.info("wechat video skipped for %s (model disabled): %s",
+                      user_id, exc)
+            self._reply_no_context(
+                user_id,
+                "视频检索模型功能未被启用，需在算力配置页中加载启用后重新发送")
+            try:
+                self._push_model_disabled_notice(user_id)
+            except Exception as exc2:  # noqa: BLE001
+                _LOG.exception(
+                    "wechat model-disabled notice failed for %s: %r",
+                    user_id, exc2)
+            return
         from app.services.wechat_video_manager import (
             get_wechat_video_manager,
         )
@@ -160,6 +177,44 @@ class _LlmBridge:
         except Exception as exc:  # noqa: BLE001
             _LOG.exception(
                 "wechat video notice injection failed for %s", user_id)
+
+    def _push_model_disabled_notice(self, user_id: str) -> None:
+        """检索模型未启用时的对话历史通知。
+
+        此场景下 VideoSearch 不在工具 schema 中（capability 过滤），
+        模型没有可调用的工具 —— 若不注入本条目，它只能对用户的视频
+        相关提问给出含糊的通用回答。注入后 LLM 能准确说明"功能当前
+        不可用、如何启用"。语言随该用户最近输入自适应中英。
+        """
+        from app.services.chat_agent import _prefer_english
+        with self._lock:
+            hist = self.histories.setdefault(
+                user_id, deque(maxlen=_HISTORY_MAX))
+            last_user = ""
+            for m in reversed(hist):
+                if m.get("role") == "user" and not m.get("_system_note"):
+                    last_user = m.get("content") or ""
+                    break
+            if _prefer_english(last_user):
+                notice = (
+                    "[System] The user just tried to send a video for "
+                    "content search, but the retrieval model is currently "
+                    "NOT enabled on this device, so the video cannot be "
+                    "analyzed. If the user asks about video content, tell "
+                    "them the feature is unavailable and they should have "
+                    "an administrator load it on the compute-config page, "
+                    "then re-send the video.")
+            else:
+                notice = (
+                    "[系统] 用户刚刚尝试发送一个视频进行内容检索，但视频检索"
+                    "模型（Qwen3-VL-Embedding）当前未被启用，视频无法被分析。"
+                    "之后用户询问与视频内容相关的问题时，请说明该功能当前"
+                    "不可用，建议用户联系管理员在设备的算力配置页中加载启用"
+                    "后再重新发送视频。")
+            hist.append({"role": "user", "content": notice,
+                         "ts": time.time(), "_system_note": True})
+        _LOG.info("wechat-llm: injected model-disabled notice for %s",
+                  user_id)
 
     def _push_video_notice(self, user_id: str, filename: str) -> None:
         """新视频到达 → 注入系统通知条目，宣告旧视频/旧检索结果失效。
