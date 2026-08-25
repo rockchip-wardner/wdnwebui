@@ -62,10 +62,17 @@ class ToolSpec:
 
 @dataclass
 class ToolContext:
-    """执行工具时的上下文，``__call__(frame_bgr, ctx)`` 第二个参数。"""
+    """执行工具时的上下文，``__call__(frame_bgr, ctx)`` 第二个参数。
+
+    ``user_id`` / ``channel`` 标识对话来源（wechat 场景由
+    ``chat_agent.run_chat_with_tools`` 从桥接层透传；web 场景
+    ``channel="web"`` 且 ``user_id=None``），供渠道感知型工具使用。
+    """
     width: int
     height: int
     prompt: str
+    user_id: str = ""
+    channel: str = ""
 
 
 class ToolRegistry:
@@ -150,6 +157,7 @@ def get_tool_registry() -> ToolRegistry:
     with _registry_lock:
         if _registry is None:
             from .tts_alert import TtsAlert
+            from .video_search import VideoSearch
 
             reg = ToolRegistry()
             reg.register(
@@ -162,6 +170,18 @@ def get_tool_registry() -> ToolRegistry:
                 requires_capability="swcap_audio_tts",
                 tool_class=TtsAlert,
                 icon="🔊",
+            )
+            reg.register(
+                key="video_search",
+                name="视频内容检索",
+                description=(
+                    "在用户最新发送的视频中按文字描述检索相关片段，"
+                    "返回命中时间段与相似度；依赖视频已完成后台分析"
+                    "（收到视频后自动进行）。"
+                ),
+                requires_capability="swcap_video_retrieval",
+                tool_class=VideoSearch,
+                icon="🎬",
             )
             _registry = reg
         return _registry

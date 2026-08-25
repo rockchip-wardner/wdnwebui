@@ -111,10 +111,13 @@ def _build_instance(name: str, args: Optional[dict]):
         raise ToolExecutionError(name, exc) from exc
 
 
-def _execute_tool(inst: Any, prompt: str) -> dict:
+def _execute_tool(
+    inst: Any, prompt: str, *, user_id: str = "", channel: str = "",
+) -> dict:
     """统一执行入口。返回归一化后的 dict outcome。"""
     from app.services.tools.registry import ToolContext
-    ctx = ToolContext(width=0, height=0, prompt=prompt)
+    ctx = ToolContext(width=0, height=0, prompt=prompt,
+                      user_id=user_id, channel=channel)
     out = inst(None, ctx)
     if isinstance(out, dict):
         return out
@@ -221,8 +224,14 @@ def run_chat_with_tools(
     on_delta: Optional[TypingCallable[[str], None]] = None,
     stop_event=None,
     max_iters: Optional[int] = None,
+    user_id: str = "",
+    channel: str = "",
 ) -> dict:
     """带工具循环的一轮对话。
+
+    ``user_id`` / ``channel`` 标识对话来源（wechat 桥接传真实值，
+    web 侧 channel="web"），经 ``ToolContext`` 透传给工具 —— 渠道
+    感知型工具（如 VideoSearch 按 user_id 取视频素材）依赖此字段。
 
     参数与 ``RpcSessionProxy.chat_run`` 对齐，额外承担工具执行与
     多轮回喂。返回 dict::
@@ -293,7 +302,8 @@ def run_chat_with_tools(
         }
         try:
             inst = _build_instance(tool_name, last_tool_args)
-            outcome = _execute_tool(inst, current_text)
+            outcome = _execute_tool(
+                inst, current_text, user_id=user_id, channel=channel)
         except Exception as exc:  # noqa: BLE001
             # 失败不终止：错误转 transcript 回喂，让模型自然语言告知用户。
             # 卸载工具模型后的历史诱导调用（capability 校验抛错）与未来

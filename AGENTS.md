@@ -1466,8 +1466,10 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     ("tts_alert",)`` 在 ``app/api/video_detection.py``）+ **chat 链路**
     （web 文本对话 / 微信桥接，经 capability 过滤后自动纳入，
     见下方 "Chat 工具调用 (chat-agent)" 章节）。
-  - 算力配置页 RK3588 列只读展示全部工具的状态（当前只有
-    ``tts_alert`` 一条）。
+  - ``video_search`` 暴露面：仅 **chat 链路**（微信视频检索场景，
+    见 "微信视频检索" 章节）；音视频描述页不使用。
+  - 算力配置页 RK3588 列只读展示全部工具的状态（当前有
+    ``tts_alert`` / ``video_search`` 两条）。
 
 * **历史下线 — ``target_detection`` 工具**：原本是给 **视频目标
   检测页** 用的 ``@Callable``，模型给出 0–1000 归一化 bbox + ROI
@@ -1816,9 +1818,49 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
 * **限制**：LLM 单实例串行，多人同时发需排队（每条推理约 40-60s）；只发
   answer 不发 thinking；非文字消息（图/音/文件）回复「当前仅支持文字对话」。
   工具调用经 chat-agent 循环（见 "Chat 工具调用 (chat-agent)" 章节），
-  微信用户同样可用。
+  微信用户同样可用。视频消息是例外 —— 分流到微信视频管理器（见下节）。
 
 
+## 微信视频检索（wechat-video-manager + VideoSearch）
+
+用户通过微信发送视频并提问（如"视频里有消费员吗"），LLM 调用
+``VideoSearch`` 工具对该视频做语义检索并结合命中时间段回答。
+
+* **架构分层**：提取不走 LLM 工具链路 —— "收到视频 → 提取"是确定性
+  协议行为。``wechat_llm.handle_incoming`` 对 video 消息毫秒级分流到
+  ``wechat_video_manager.enqueue_video()``（纯内存入队，CDN 下载在
+  后台线程，不阻塞回调）；LLM 只暴露同步查询型工具。
+* **管理器**（`app/services/wechat_video_manager.py` 单例）：
+  - **单槽注册表** `{user_id: VideoEntry}` —— 每用户仅保留最新 1 个
+    视频，新视频到达即覆盖旧的（删落盘文件 + 释放旧索引）；串行队列
+    中被覆盖的任务按 seq 判定自动跳过。
+  - 管线：SDK CDN 下载（`Wechat.download_message()` 同步透传，120s
+    上限）→ 落盘 `uploads/wechat_videos/<uid>/` → PyAV 探测 → 逐片
+    **6s 片 / 1s 重叠** embedding（复用 VCS 底层函数 `_probe_video_meta`
+    / `_read_chunk_frames` / `_write_frames_to_shm` / `_cosine_similarity`
+    + `get_session("swcap_video_retrieval")`，SHM 帧传递 + timeout 重试
+    与 UI 页同款）→ ready。
+  - **进度感知 A+C**：推送侧节点播报固定文案（📥 收到 / ⏳ 开始分析
+    N 段 / ✅ 完成 / ⚠️ 失败）；拉取侧工具返回实时 progress。不做周期
+    百分比消息（个人号高频发消息有风控风险，且协议无编辑消息能力、
+    无法做原地刷新的进度条）。
+  - shutdown hook `close_wechat_video_manager()` 在 main.py 注册。
+* **VideoSearch 工具**（`app/services/tools/video_search.py`，
+  `requires_capability="swcap_video_retrieval"`）：**无调用时机限制**
+  的四态结果型返回 —— `ok`（命中片段）/ `extracting`（附实时进度）/
+  `downloading` / `no_video`，状态即合法业务结果而非错误，模型自由
+  组织回复。真正的执行失败（会话缺失等）抛错走失败回喂。
+  检索参数：query 内部截断 50 字；top_k=5（模型可调 1-10）；
+  sim_threshold 固定 0.5 **不暴露给模型**，`min_results=3` 兜底启用
+  —— 全低于阈值时返回最接近片段 + `all_below_threshold` / `hint`
+  质量信号，由模型谨慎表述"未找到高度匹配的内容"。阈值不暴露的
+  原因：模型对余弦分数无语义感知（盲调），且兜底已保证非空。
+* **来源透传**：`ToolContext` 新增 `user_id` / `channel` 字段，
+  `run_chat_with_tools()` 对应形参由 wechat_llm 传真实值（web 侧
+  channel="web"、user_id 空 → 工具返回 no_video 引导走微信渠道）。
+* **已知边界**：UI 页"视频内容检索"的单例服务与本管理器完全独立
+  （互不复用索引）；真机 SDK CDN 下载稳定性需实际微信验证；
+  提取串行执行，连续发多个视频时后续排队（单槽覆盖下旧任务作废）。
 
 
 ## FastDDS discovery — SIMPLE multicast (v0.6+)

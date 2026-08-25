@@ -309,6 +309,7 @@ class _TextChatManager:
                     tool_names=self._resolve_tool_names(),
                     on_delta=lambda d: router.push(d),
                     stop_event=self._worker_stop_event,
+                    channel="web",
                 )
             elapsed = time.perf_counter() - t0
         except Exception as e:  # noqa: BLE001
