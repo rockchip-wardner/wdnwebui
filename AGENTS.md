@@ -1858,6 +1858,12 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
 * **来源透传**：`ToolContext` 新增 `user_id` / `channel` 字段，
   `run_chat_with_tools()` 对应形参由 wechat_llm 传真实值（web 侧
   channel="web"、user_id 空 → 工具返回 no_video 引导走微信渠道）。
+* **资源上限（可配置）**：`config.json["compute"]["wechat_video"]`
+  的 `max_size_mb`（默认 200）与 `max_duration_min`（默认 10），热读
+  即时生效、非法值回退默认。三道校验：下载前按 SDK 元数据预检
+  （video 形态 duration_ms / file 形态 size，互补覆盖）；落盘后大小
+  复核；PyAV probe 后时长复核 —— 统一 raise → error 态 + ⚠️ 微信
+  通知，超限文件不残留。
 * **已知边界**：UI 页"视频内容检索"的单例服务与本管理器完全独立
   （互不复用索引）；真机 SDK CDN 下载稳定性需实际微信验证；
   提取串行执行，连续发多个视频时后续排队（单槽覆盖下旧任务作废）。

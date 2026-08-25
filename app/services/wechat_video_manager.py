@@ -53,6 +53,8 @@ _FALLBACK_MIN_RESULTS = 3
 _SEARCH_TOP_K = 5
 _DOWNLOAD_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = (2, 4, 8)
+_DEFAULT_MAX_SIZE_MB = 200
+_DEFAULT_MAX_DURATION_MIN = 10
 
 _STATE_DOWNLOADING = "downloading"
 _STATE_EXTRACTING = "extracting"
@@ -291,10 +293,62 @@ class WechatVideoManager:
             _LOG.warning("wechat video notify to %s failed: %r", user_id, exc)
 
     # ------------------------------------------------------------ 提取管线
+    def _resolve_limits(self) -> "tuple[int, float]":
+        """热读 ``config.compute.wechat_video`` 大小/时长上限。
+
+        缺失 / 非法 / ≤0 回退默认（200 MB / 10 分钟）；每次管线执行时
+        读取 —— 改配置即时生效无需重启。
+        """
+        max_size_mb, max_duration_min = _DEFAULT_MAX_SIZE_MB, \
+            _DEFAULT_MAX_DURATION_MIN
+        try:
+            from app.services.config import get_config
+            cfg = get_config().get_section("compute", {})
+            wv = cfg.get("wechat_video") if isinstance(cfg, dict) else None
+            if isinstance(wv, dict):
+                v = int(wv.get("max_size_mb", max_size_mb))
+                if v > 0:
+                    max_size_mb = v
+                f = float(wv.get("max_duration_min", max_duration_min))
+                if f > 0:
+                    max_duration_min = f
+        except Exception:  # noqa: BLE001
+            pass
+        return max_size_mb * 1024 * 1024, max_duration_min * 60.0
+
+    @staticmethod
+    def _precheck_msg_meta(msg: Any, max_bytes: float,
+                           max_seconds: float) -> Optional[str]:
+        """下载前预检：利用 SDK 消息元数据拦截明显超限的视频。
+
+        video 形态带 ``duration_ms`` 无 size；file 形态带 ``size`` 无
+        duration —— 两者互补覆盖。返回拒绝原因，通过则 None。
+        """
+        for v in getattr(msg, "videos", []) or []:
+            ms = getattr(v, "duration_ms", None)
+            if ms and ms / 1000.0 > max_seconds:
+                return (f"视频时长 {_fmt_ts(ms / 1000.0)} 超过上限 "
+                        f"{_fmt_ts(max_seconds)}，请裁剪后重新发送")
+            break
+        for f in getattr(msg, "files", []) or []:
+            sz = getattr(f, "size", None)
+            if sz and sz > max_bytes:
+                return (f"视频大小 {sz / 1024 / 1024:.1f} MB 超过上限 "
+                        f"{max_bytes / 1024 / 1024:.0f} MB，"
+                        f"请裁剪后重新发送")
+            break
+        return None
+
     def _process(self, user_id: str, seq: int, msg: Any) -> None:
         entry = self._entry_of(user_id, seq)
         if entry is None:
             return
+
+        # ---- 0. 资源上限（可配置，默认 200MB / 10 分钟）----
+        max_bytes, max_seconds = self._resolve_limits()
+        reject = self._precheck_msg_meta(msg, max_bytes, max_seconds)
+        if reject:
+            raise RuntimeError(reject)
 
         # ---- 1. 固定文案确认（A 组合播报节点）----
         self._notify(
@@ -304,6 +358,16 @@ class WechatVideoManager:
 
         # ---- 2. CDN 下载（SDK 透传，120s 上限）----
         path = self._download_video(user_id, entry, msg)
+        # 大小复核：video 形态消息无 size 元数据，预检拦不到，此处兜底
+        fsize = os.path.getsize(path)
+        if fsize > max_bytes:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"视频大小 {fsize / 1024 / 1024:.1f} MB 超过上限 "
+                f"{max_bytes / 1024 / 1024:.0f} MB，请裁剪后重新发送")
         with self._lock:
             entry.path = str(path)
         _LOG.info("wechat video: downloaded %s for %s",
@@ -316,6 +380,11 @@ class WechatVideoManager:
         fps = meta["fps"]
         duration_s = (meta["duration_s"] if meta["duration_s"] > 0
                       else meta["total_frames"] / fps)
+        # 时长复核（最终防线）：file 形态无时长元数据，预检拦不到
+        if duration_s > max_seconds:
+            raise RuntimeError(
+                f"视频时长 {_fmt_ts(duration_s)} 超过上限 "
+                f"{_fmt_ts(max_seconds)}，请裁剪后重新发送")
         step = _CHUNK_SECONDS - _CHUNK_OVERLAP_SECONDS
         total = max(1, int((max(0.0, duration_s - _CHUNK_OVERLAP_SECONDS))
                            // step) + 1)
