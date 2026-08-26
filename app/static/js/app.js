@@ -5089,14 +5089,12 @@ const ComputeConfigPage = {
         }
         prev.sig = sig;
         prev.isLocal = isLocal;
-        // 把 card 移到正确 container / 正确位置（用户可能在 local /
-        // peer 之间切了视图，或 reorder 导致 sibling 变了）。
+        // 容器错了才 detach + appendChild；ordering 交由末尾 newOrder
+        // loop 用 insertBefore 完成 —— 不要在这里做 reorder，否则 omni
+        // （CC_PRESET_ORDER 末位）在循环中途会被推到位置 0，浏览器若
+        // 中途 commit 就会先看到 omni 再看到真正点击的目标。
         if (prev.card.parentNode !== targetContainer) {
           if (prev.card.parentNode) prev.card.remove();
-          targetContainer.appendChild(prev.card);
-        } else if (prev.card.nextSibling !== prev.nextSibling) {
-          // 顺序变了 —— reorder（不影响 radio focus，因为是 move 不是 recreate）
-          targetContainer.removeChild(prev.card);
           targetContainer.appendChild(prev.card);
         }
         newCard[seenKey(s)] = prev;
@@ -5140,13 +5138,29 @@ const ComputeConfigPage = {
       }
     }
 
-    // 按 ordered 顺序把卡片 append 到对应 container（不 detach 已存在的）
+    // 按 ordered 顺序把卡片放到对应 container 的正确位置（不 detach
+    // 已存在的）。insertBefore + nextSibling 比较：已在正确位置则不动
+    // （focus / select dropdown 保留），否则只移动一次。
+    //
+    // **必须按 container 分组 + 反向迭代**：
+    //   * 跨 container 调用 insertBefore 真实 DOM 会抛 NotFoundError，
+    //     render 抛错后 _renderedCard 不更新、cleanup 不跑，下一 tick
+    //     又创建新卡片 —— 本地算力条目无限累积（peer 与本地共存即触发）。
+    //   * 反向迭代保证后继链不被打乱。
+    const byContainer = new Map();
     for (const item of newOrder) {
-      // appendChild 如果已挂在正确位置则不动；否则 append（自动从
-      // 旧位置 move 到新位置，select 焦点保留 —— 因为是 move 节点，
-      // 浏览器认得是同一节点）。
-      if (item.card.parentNode !== item.container) {
-        item.container.appendChild(item.card);
+      if (!byContainer.has(item.container)) byContainer.set(item.container, []);
+      byContainer.get(item.container).push(item);
+    }
+    for (const [container, items] of byContainer) {
+      for (let i = items.length - 1; i >= 0; i--) {
+        const item = items[i];
+        const desiredNext = i + 1 < items.length ? items[i + 1].card : null;
+        if (item.card.parentNode !== container) {
+          container.insertBefore(item.card, desiredNext);
+        } else if (item.card.nextSibling !== desiredNext) {
+          container.insertBefore(item.card, desiredNext);
+        }
       }
     }
 
