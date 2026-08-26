@@ -1818,6 +1818,33 @@ class ComputeRegistry:
         spawned = self._spawn_compute_worker(model_id, allow_adopt=allow_adopt)
         return spawned
 
+    def _refresh_rpc_clients(self, inst: ModelInstance) -> None:
+        """Destroy + recreate ``inst.rpc_client`` / ``probe_rpc_client``.
+
+        真机 v0.8.x 观测：spawn 时立即创建的 requester（worker 进程
+        尚未 ready）发出的 load RPC 全部 120s timeout，而同一 worker
+        就绪后**新建**的 requester 立即可用；外部对照实验证明 cshim
+        本身支持后期 endpoint 匹配，主进程 participant 上旧 handle
+        却始终不通。bind/load 前刷新一遍，保证拿到与当前 worker
+        endpoint 匹配的活 handle —— 与"外部新建 requester"形态等价。
+
+        destroy 前拿各自 requester._lock（对齐 admin-path 惯例），
+        防与 probe 线程正在进行的 C 调用并发 UAF。
+        """
+        with self._lock:
+            old_client = inst.rpc_client
+            old_probe = getattr(inst, "probe_rpc_client", None)
+        for obj in (old_probe, old_client):
+            if obj is None:
+                continue
+            try:
+                with obj._lock:
+                    obj.destroy()
+            except Exception:  # noqa: BLE001
+                LOG.debug("refresh: destroy old client failed (%s)",
+                          type(obj).__name__)
+        self._setup_rpc_client(inst)
+
     def bind_instance(self, inst: ModelInstance, npu_index: int) -> ModelInstance:
         """v0.8 fire-and-forget：立即把 ``inst.status="loading"`` 返回，
         让前端 1Hz tick 看到 loading 状态 + 倒计时；后台线程跑 RPC
@@ -1864,6 +1891,14 @@ class ComputeRegistry:
 
         def _run_load():
             try:
+                # worker ready 后刷新 RPC handle：spawn 时刻创建的
+                # requester 在真机上存在匹配失效（load 全 timeout），
+                # recreate 与"外部新建 requester"形态等价，实测立即可用。
+                try:
+                    self._refresh_rpc_clients(inst)
+                except Exception:  # noqa: BLE001
+                    LOG.warning("bind %s: rpc client refresh failed, "
+                                "keeping existing handle", inst.model_id)
                 r = inst.rpc_client.call(
                     {"action": "load", "npu_index": npu_index},
                     timeout_ms=120_000,
@@ -2235,6 +2270,8 @@ class ComputeRegistry:
         timeout_ms = 5000
         sleep_between = 1.0
         for attempt in range(1, attempts + 1):
+            svc = None
+            rpc = None
             try:
                 svc = self._hub.create_service(f"wdndds/rpc/{model_id}")
                 rpc = svc.create_requester(timeout_ms=timeout_ms)
@@ -2256,10 +2293,19 @@ class ComputeRegistry:
                     continue
                 return None
             finally:
-                try:
-                    rpc.destroy()
-                except Exception:
-                    pass
+                # v0.8.x 回归修复：requester 与 service 都必须销毁。
+                # 只 destroy rpc 留下 svc —— boot auto-adopt 每轮
+                # probe 泄漏一个 cshim service + FastDDS writer/reader
+                # 集合（5 model × 5 retry × 3 attempt ≈ 75 个），后续
+                # create_service 的 endpoint 匹配被打穿 → bind load
+                # RPC 全部 timeout。
+                for obj in (rpc, svc):
+                    if obj is None:
+                        continue
+                    try:
+                        obj.destroy()
+                    except Exception:
+                        pass
             if r and r.get("ok") and r.get("data"):
                 if attempt > 1:
                     LOG.info("probe: %s responded on attempt %d/%d "

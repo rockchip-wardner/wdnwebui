@@ -1954,6 +1954,20 @@ XML profile 路径：`$XDG_RUNTIME_DIR/wdndds_default_profile.xml`
   peer 失联最迟 ~3s（lease 20s 之内）后被探测到。
 * FastDDS 3.6 rrpc API 仍 stub（参见 Fast-DDS `DomainParticipantImpl.cpp`）：
   wdndds_cshim 仍走 raw `DataReader` / `DataWriter` 模拟 Request/Reply。
+* **冷启动 NIC 时序坑（真机实测）**：systemd autostart 拉起的
+  compute_worker 若早于网卡就绪启动，cshim 的 interfaceWhiteList pin
+  会绑错 interface → 该 worker 进程活着但 DDS 数据面完全不可达
+  （probe / bind 全 timeout，worker 日志零请求痕迹）。判别方法：
+  手动 kill 后重新 spawn（NIC 已就绪）即恢复。现有防线：① 主进程
+  `_ensure_hub` 的 `wait_for_network_ready` / socket fallback；
+  ② `bind_instance._run_load` 前调 `_refresh_rpc_clients()` recreate
+  handle（对 spawn→bind 的时序 race 兜底，destroy 拿 requester._lock
+  防 probe 线程 UAF）。待办：worker systemd 单元加
+  `After=network-online.target`。
+* **cshim Service 对象必须显式销毁**：`_probe_service` 曾只 destroy
+  requester 留下 svc —— boot auto-adopt 期累积约 75 个 FastDDS
+  endpoint 集合。已修复为双销毁；新增 probe/临时 requester 路径时
+  注意同样问题。
 * wdndds_daemon 完全删除；旧版 systemd unit
   `wdndds-daemon.service` 会因 unit 文件不存在报 `Unit not found`，
   `install_autostart.sh --uninstall` 会一并清掉。

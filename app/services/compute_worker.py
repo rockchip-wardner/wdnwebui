@@ -1471,15 +1471,24 @@ def main() -> int:
     stop_event = _WORKER_STOP_EVENT
 
     device_name = _read_device_name()
-    # v0.8.16: 必须注册 BOTH services。仅注册 unique (v0.8.15) 会让 LAN
+    # v0.8.16: 默认注册 BOTH services。仅注册 unique (v0.8.15) 会让 LAN
     # peer 的 boot probe 走 standard service 找不到本机 worker,NETWORK 栏
     # 为空。LOCAL main 用 unique 直连本机 (避免 routing 冲突),adopted main
     # 走 standard 找 LAN peer — 同时也会路由到本机,但本地 loading 完成后
     # 状态与 peer 一致,不再翻转。Do NOT 改回 only-unique。
-    services = [
-        f"wdndds/rpc/{model_id}/worker-{_WORKER_PID}",
-        f"wdndds/rpc/{model_id}",
-    ]
+    #
+    # v0.8.1 --local-only: 主进程 spawn 本机 worker 时只注册 per-PID
+    # unique service,不注册 standard —— 避免 standard topic 上本机 worker
+    # 与 boot adopt 探测互相路由污染(本机 probe 被自己 spawned worker 抢答)。
+    if args.local_only:
+        services = [
+            f"wdndds/rpc/{model_id}/worker-{_WORKER_PID}",
+        ]
+    else:
+        services = [
+            f"wdndds/rpc/{model_id}/worker-{_WORKER_PID}",
+            f"wdndds/rpc/{model_id}",
+        ]
     hub = Hub(
         participant_name=f"compute_worker-{device_name}-{model_id}",
         domain_id=0,
