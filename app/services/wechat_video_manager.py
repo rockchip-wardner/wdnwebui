@@ -81,6 +81,7 @@ class VideoEntry:
     index: List[dict] = field(default_factory=list)
     slices_total: int = 0
     slices_embedded: int = 0
+    cancel: threading.Event = field(default_factory=threading.Event)
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -112,13 +113,17 @@ class WechatVideoManager:
             self._seq += 1
             seq = self._seq
             old = self._entries.get(user_id)
-            if old is not None and old.path:
-                try:
-                    os.unlink(old.path)
-                except OSError:
-                    pass
-                _LOG.info("wechat video: dropped previous video of %s (%s)",
-                          user_id, old.filename)
+            if old is not None:
+                # 抢占语义：作废旧任务（正在执行的管线在协作式检查点
+                # 尽早退出），尽力删除落盘文件。
+                old.cancel.set()
+                if old.path:
+                    try:
+                        os.unlink(old.path)
+                    except OSError:
+                        pass
+                    _LOG.info("wechat video: dropped previous video of %s (%s)",
+                              user_id, old.filename)
             filename = time.strftime("video-%Y%m%d-%H%M%S")
             entry = VideoEntry(
                 seq=seq, user_id=user_id, filename=filename,
@@ -222,8 +227,15 @@ class WechatVideoManager:
                 return None   # 已被更新的视频覆盖 → 过期任务跳过
             return entry
 
-    def _download_video(self, user_id: str, entry: VideoEntry, msg: Any) -> str:
-        """CDN 下载并落盘，返回本地路径。瞬时网络故障自动重试。
+    def _superseded(self, user_id: str, seq: int) -> bool:
+        """该任务是否已被更新的视频覆盖（协作式取消判定）。"""
+        with self._lock:
+            cur = self._entries.get(user_id)
+            return cur is None or cur.seq != seq
+
+    def _download_video(self, user_id: str, entry: VideoEntry,
+                        msg: Any) -> Optional[str]:
+        """CDN 下载并落盘，返回本地路径；被新视频抢占返回 None。
 
         CDN 传输偶发中断（ContentLength 不满足 / SSL bad_record_mac 等，
         真机实测复现），SDK 的 ``resp.read()`` 无重试 —— 这里按指数退避
@@ -236,6 +248,8 @@ class WechatVideoManager:
         data_obj = None
         last_err: Optional[Exception] = None
         for attempt in range(1, _DOWNLOAD_RETRIES + 1):
+            if self._superseded(user_id, entry.seq):
+                return None
             try:
                 data_obj = get_wechat().download_message(msg)
                 break
@@ -267,6 +281,8 @@ class WechatVideoManager:
                or os.path.splitext(orig_name)[1].lstrip(".")
                or "mp4").lstrip(".").lower() or "mp4"
         path = out_dir / f"{entry.filename}.{ext}"
+        if self._superseded(user_id, entry.seq):
+            return None
         path.write_bytes(bytes(data_obj.data))
         _LOG.info("wechat video: downloaded %s (%.1f KiB) for %s",
                   path.name, len(data_obj.data) / 1024, user_id)
@@ -360,6 +376,8 @@ class WechatVideoManager:
         lock = get_session_call_lock()
 
         # ---- 1. 固定文案确认（A 组合播报节点）----
+        if self._superseded(user_id, seq):
+            return
         self._notify(
             user_id,
             f"📥 已收到视频 {entry.filename}，正在下载与分析，完成后会通知"
@@ -367,6 +385,11 @@ class WechatVideoManager:
 
         # ---- 2. CDN 下载（SDK 透传，120s 上限）----
         path = self._download_video(user_id, entry, msg)
+        if path is None:
+            # 等待下载期间用户发来了新视频 —— 抢占退出，静默无通知。
+            _LOG.info("wechat video: %s superseded while downloading — "
+                      "dropped silently", entry.filename)
+            return
         # 大小复核：video 形态消息无 size 元数据，预检拦不到，此处兜底
         fsize = os.path.getsize(path)
         if fsize > max_bytes:
@@ -397,6 +420,10 @@ class WechatVideoManager:
         step = _CHUNK_SECONDS - _CHUNK_OVERLAP_SECONDS
         total = max(1, int((max(0.0, duration_s - _CHUNK_OVERLAP_SECONDS))
                            // step) + 1)
+        if self._superseded(user_id, seq):
+            _LOG.info("wechat video: %s superseded after download — "
+                      "dropped silently", entry.filename)
+            return
         with self._lock:
             entry.fps = fps
             entry.duration_s = duration_s
@@ -411,6 +438,11 @@ class WechatVideoManager:
         chunk_idx = 0
         start = 0.0
         while start < duration_s:
+            if self._superseded(user_id, seq):
+                _LOG.info("wechat video: %s superseded mid-extraction "
+                          "(chunk %d/%d) — dropped silently",
+                          entry.filename, chunk_idx, total)
+                break
             frames = _read_chunk_frames(str(path), start, _CHUNK_SECONDS, fps)
             if not frames:
                 break
@@ -457,6 +489,11 @@ class WechatVideoManager:
         _cleanup_shm_session(shm_session_id)
 
         # ---- 5. 终态判定 + 完成通知 ----
+        if self._superseded(user_id, seq):
+            # 提取期间被新视频覆盖 —— 不写终态、不发完成通知。
+            _LOG.info("wechat video: %s superseded before finalize — "
+                      "dropped silently", entry.filename)
+            return
         with self._lock:
             if not entry.index:
                 raise RuntimeError(
