@@ -172,6 +172,9 @@ class Wechat:
 
         # Login state.
         self._login_state = self.STATE_IDLE
+        # True = start_login 已 kick 且尚未结束（并发去重占坑，见
+        # _on_login_done / cancel_login / logout 的清理点）。
+        self._login_kick = False
         self._qr_url: Optional[str] = None
         self._last_event: str = ""
         self._last_event_ts: float = 0.0
@@ -307,25 +310,38 @@ class Wechat:
         if self._bot is None:
             raise RuntimeError("wechat bot not initialised")
 
-        if self._login_state in self._ACTIVE_STATES:
-            return self.login_status()
-        if self._started or self._login_state == self.STATE_CONFIRMED:
-            return self.login_status()
+        # 幂等占坑必须原子：幂等检查读的 _login_state 要等 loop 线程里的
+        # _login_async 跑起来才变 ACTIVE —— 两个并发 POST 都能穿过旧检查
+        # 各起一个 long-poll（真机实测：前端 listener 双绑时每条消息被
+        # dispatch 两次）。用 _init_lock + _login_kick 占坑，done 回调清坑。
+        with self._init_lock:
+            if self._login_kick:
+                return self.login_status()
+            if self._login_state in self._ACTIVE_STATES:
+                return self.login_status()
+            if self._started or self._login_state == self.STATE_CONFIRMED:
+                return self.login_status()
+            self._login_kick = True
 
-        # Reset transient state for a new attempt.
-        self._qr_url = None
-        self._error = None
-        self._last_event = "starting"
-        self._last_event_ts = time.time()
+        try:
+            # Reset transient state for a new attempt.
+            self._qr_url = None
+            self._error = None
+            self._last_event = "starting"
+            self._last_event_ts = time.time()
 
-        fut = asyncio.run_coroutine_threadsafe(
-            self._login_async(force=force), self._loop,
-        )
-        # ``run_coroutine_threadsafe`` returns a concurrent.futures.Future
-        # wrapping a Task; the underlying asyncio Task is captured by
-        # ``_login_async`` itself once it starts running (see below), so
-        # ``close()`` can cancel it cleanly.
-        fut.add_done_callback(self._on_login_done)
+            fut = asyncio.run_coroutine_threadsafe(
+                self._login_async(force=force), self._loop,
+            )
+            # ``run_coroutine_threadsafe`` returns a concurrent.futures.Future
+            # wrapping a Task; the underlying asyncio Task is captured by
+            # ``_login_async`` itself once it starts running (see below), so
+            # ``close()`` can cancel it cleanly.
+            fut.add_done_callback(self._on_login_done)
+        except Exception:
+            with self._init_lock:
+                self._login_kick = False
+            raise
         return self.login_status()
 
     async def _login_async(self, *, force: bool) -> None:
@@ -370,6 +386,8 @@ class Wechat:
     def _on_login_done(self, fut: "asyncio.Future[None]") -> None:
         # ``_login_async`` already records errors on the state machine; this
         # hook is just a safety net to log unexpected crashes.
+        with self._init_lock:
+            self._login_kick = False
         try:
             fut.result()
         except Exception as exc:  # noqa: BLE001
@@ -384,6 +402,8 @@ class Wechat:
         their mind" UX; the next :meth:`start_login` resets the cancel flag.
         """
         self._cancelled = True
+        with self._init_lock:
+            self._login_kick = False
         self._login_state = self.STATE_IDLE
         self._qr_url = None
         self._last_event = "cancelled"
@@ -481,6 +501,8 @@ class Wechat:
         except OSError as exc:
             _LOG.warning("could not delete %s: %r", cred_path, exc)
         self._creds = None
+        with self._init_lock:
+            self._login_kick = False
         self._login_state = self.STATE_IDLE
         self._last_event = "logged_out"
         self._last_event_ts = time.time()

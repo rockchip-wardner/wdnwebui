@@ -6130,6 +6130,8 @@ const ImBridge = {
   chatCleared: false,    // true after 清屏: don't re-fill from backend on page re-entry
 
   init() {
+    if (this._inited) return;
+    this._inited = true;
     const $ = (id) => document.getElementById(id);
     $("imb-login-btn")?.addEventListener("click", () => this.login());
     $("imb-cancel-btn")?.addEventListener("click", () => this.cancelLogin());
@@ -6721,6 +6723,8 @@ const TextChat = {
   messages: [],             // local history mirror: [{role:"user"|"assistant", content, ts}]
 
   init() {
+    if (this._inited) return;
+    this._inited = true;
     const $ = (id) => document.getElementById(id);
     $("text-chat-send-btn")?.addEventListener("click", () => this.send());
     $("text-chat-stop-btn")?.addEventListener("click", () => this.stop());
