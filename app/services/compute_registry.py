@@ -704,6 +704,12 @@ class ComputeRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        # cshim/FastDDS 的 service/requester 生命周期 + call 在 C 层
+        # 非线程安全：peer discovered 事件会为每个 model 各起一条
+        # adopt 线程并发跑 _probe_service（create_service+call），
+        # 真机实测 3 线程并发即触发 SIGSEGV。所有 DDS 临时对象操作
+        # 必须串行 —— RLock 防 adopt 流程内嵌套。
+        self._dds_probe_lock = threading.RLock()
         self._instances: dict[Tuple[int, str], ModelInstance] = {}
         self._cards: list[dict] = []            # not used by RPC path
         self._cards_failed: str = ""
@@ -1829,21 +1835,24 @@ class ComputeRegistry:
         endpoint 匹配的活 handle —— 与"外部新建 requester"形态等价。
 
         destroy 前拿各自 requester._lock（对齐 admin-path 惯例），
-        防与 probe 线程正在进行的 C 调用并发 UAF。
+        防与 probe 线程正在进行的 C 调用并发 UAF；destroy+recreate 全程
+        拿 _dds_probe_lock —— 销毁与新建同样不得与 probe/adopt 的
+        cshim 操作并发。
         """
-        with self._lock:
-            old_client = inst.rpc_client
-            old_probe = getattr(inst, "probe_rpc_client", None)
-        for obj in (old_probe, old_client):
-            if obj is None:
-                continue
-            try:
-                with obj._lock:
-                    obj.destroy()
-            except Exception:  # noqa: BLE001
-                LOG.debug("refresh: destroy old client failed (%s)",
-                          type(obj).__name__)
-        self._setup_rpc_client(inst)
+        with self._dds_probe_lock:
+            with self._lock:
+                old_client = inst.rpc_client
+                old_probe = getattr(inst, "probe_rpc_client", None)
+            for obj in (old_probe, old_client):
+                if obj is None:
+                    continue
+                try:
+                    with obj._lock:
+                        obj.destroy()
+                except Exception:  # noqa: BLE001
+                    LOG.debug("refresh: destroy old client failed (%s)",
+                              type(obj).__name__)
+            self._setup_rpc_client(inst)
 
     def bind_instance(self, inst: ModelInstance, npu_index: int) -> ModelInstance:
         """v0.8 fire-and-forget：立即把 ``inst.status="loading"`` 返回，
@@ -2210,18 +2219,23 @@ class ComputeRegistry:
                 f"wdndds/rpc/{inst.model_id}/worker-{inst._peer_pid}")
         else:
             service_name = f"wdndds/rpc/{inst.model_id}"
-        svc = hub.create_service(service_name)
-        rpc_client = svc.create_requester(timeout_ms=10_000)
-        inst.rpc_client = rpc_client
-        # probe 线程用独立 requester：业务 proxy 在 wedged 自愈时会
-        # destroy + recreate 它内部持有的 client，若 probe 与其共享同一
-        # handle，destroy 会与 probe 正在进行的 C 调用并发（UAF）。
-        try:
-            inst.probe_rpc_client = svc.create_requester(timeout_ms=10_000)
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("probe requester create failed for %s: %s "
-                        "(falling back to shared client)", inst.model_id, e)
-            inst.probe_rpc_client = rpc_client
+        # 与 _probe_service 同一把 DDS 串行锁 —— create_service/
+        # create_requester 与 adopt probe 并发同样会踩 C 层竞争。
+        with self._dds_probe_lock:
+            svc = hub.create_service(service_name)
+            rpc_client = svc.create_requester(timeout_ms=10_000)
+            inst.rpc_client = rpc_client
+            # probe 线程用独立 requester：业务 proxy 在 wedged 自愈时会
+            # destroy + recreate 它内部持有的 client，若 probe 与其共享同一
+            # handle，destroy 会与 probe 正在进行的 C 调用并发（UAF）。
+            try:
+                inst.probe_rpc_client = svc.create_requester(
+                    timeout_ms=10_000)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("probe requester create failed for %s: %s "
+                            "(falling back to shared client)",
+                            inst.model_id, e)
+                inst.probe_rpc_client = rpc_client
         try:
             from app.services.rpc_session_proxy import make_rpc_session_proxy
 
@@ -2270,42 +2284,50 @@ class ComputeRegistry:
         timeout_ms = 5000
         sleep_between = 1.0
         for attempt in range(1, attempts + 1):
-            svc = None
-            rpc = None
-            try:
-                svc = self._hub.create_service(f"wdndds/rpc/{model_id}")
-                rpc = svc.create_requester(timeout_ms=timeout_ms)
-            except Exception as e:  # noqa: BLE001
-                LOG.debug("probe: create requester failed for %s "
-                          "(attempt %d/%d): %s",
-                          model_id, attempt, attempts, e)
-                if attempt < attempts:
-                    time.sleep(sleep_between)
-                    continue
-                return None
-            try:
-                r = rpc.call({"action": "info"}, timeout_ms=timeout_ms)
-            except Exception as e:  # noqa: BLE001
-                LOG.debug("probe: call failed for %s (attempt %d/%d): %s",
-                          model_id, attempt, attempts, e)
-                if attempt < attempts:
-                    time.sleep(sleep_between)
-                    continue
-                return None
-            finally:
-                # v0.8.x 回归修复：requester 与 service 都必须销毁。
-                # 只 destroy rpc 留下 svc —— boot auto-adopt 每轮
-                # probe 泄漏一个 cshim service + FastDDS writer/reader
-                # 集合（5 model × 5 retry × 3 attempt ≈ 75 个），后续
-                # create_service 的 endpoint 匹配被打穿 → bind load
-                # RPC 全部 timeout。
-                for obj in (rpc, svc):
-                    if obj is None:
+            # DDS 临时对象（svc/requester）的创建、call、销毁必须串行：
+            # 多条 adopt 线程并发跑这段在 cshim/FastDDS C 层数据竞争
+            # SIGSEGV（faulthandler 实锤 3 线程同崩于 Requester.call）。
+            # retry sleep 留在锁外。
+            with self._dds_probe_lock:
+                svc = None
+                rpc = None
+                try:
+                    svc = self._hub.create_service(
+                        f"wdndds/rpc/{model_id}")
+                    rpc = svc.create_requester(timeout_ms=timeout_ms)
+                except Exception as e:  # noqa: BLE001
+                    LOG.debug("probe: create requester failed for %s "
+                              "(attempt %d/%d): %s",
+                              model_id, attempt, attempts, e)
+                    if attempt < attempts:
+                        time.sleep(sleep_between)
                         continue
-                    try:
-                        obj.destroy()
-                    except Exception:
-                        pass
+                    return None
+                try:
+                    r = rpc.call({"action": "info"},
+                                 timeout_ms=timeout_ms)
+                except Exception as e:  # noqa: BLE001
+                    LOG.debug("probe: call failed for %s "
+                              "(attempt %d/%d): %s",
+                              model_id, attempt, attempts, e)
+                    if attempt < attempts:
+                        time.sleep(sleep_between)
+                        continue
+                    return None
+                finally:
+                    # v0.8.x 回归修复：requester 与 service 都必须销毁。
+                    # 只 destroy rpc 留下 svc —— boot auto-adopt 每轮
+                    # probe 泄漏一个 cshim service + FastDDS writer/reader
+                    # 集合（5 model × 5 retry × 3 attempt ≈ 75 个），后续
+                    # create_service 的 endpoint 匹配被打穿 → bind load
+                    # RPC 全部 timeout。
+                    for obj in (rpc, svc):
+                        if obj is None:
+                            continue
+                        try:
+                            obj.destroy()
+                        except Exception:
+                            pass
             if r and r.get("ok") and r.get("data"):
                 if attempt > 1:
                     LOG.info("probe: %s responded on attempt %d/%d "
