@@ -312,7 +312,9 @@ async def set_prompt(payload: dict) -> dict:
 @router.get("/video-detection/available-vision-sizes")
 async def available_vision_sizes() -> dict:
     """List the vision-model native sizes currently loaded into the
-    qwen3-vl-4b compute instance.
+    running ``swcap_video_describe`` compute instance (qwen3-vl-4b /
+    qwen3-5-vl-4b / future VLM presets — anything advertising that
+    capability whose backend exposes ``available_image_sizes``).
 
     Returned shape: ``{"sizes": [384, 768], "default": 384}`` where
     ``sizes`` is the data-driven enumeration reported by the worker's
@@ -330,7 +332,11 @@ async def available_vision_sizes() -> dict:
     registry = get_registry()
     sizes: list[int] = []
     for inst in registry.list_with_source():
-        if inst.get("model_id") != "qwen3-vl-4b":
+        # Filter by capability instead of model_id so any future VLM
+        # preset exposing ``swcap_video_describe`` (e.g.
+        # qwen3-5-vl-4b) is picked up automatically.
+        caps = inst.get("capability_types") or []
+        if "swcap_video_describe" not in caps:
             continue
         raw = inst.get("available_image_sizes") or []
         if not isinstance(raw, list):

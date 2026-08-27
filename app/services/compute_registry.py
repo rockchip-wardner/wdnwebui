@@ -462,6 +462,20 @@ def _qwen_2_5_omni_3b_spec():
     return SystemLanguageModel.qwen_2_5_omni_3b()
 
 
+def _qwen3_5_vl_4b_spec():
+    """Qwen3.5-VL-4B 多模态 preset（kind="vlm"，图像+文本）。
+
+    同时声明 ``swcap_text_chat`` 和 ``swcap_video_describe`` 两种
+    capability——VLM-mode 的 RKNN 既能做纯文本推理，也能消费视觉
+    token，因此文本对话页（text_chat / 微信桥接）和视频描述页
+    （音视频描述 / 视频内容检索 / 视频文件分析）都能用它。
+    内存占用 ~2.7 GB Qwen3.5 LLM 权重 + ~200 MB vision (384/768)
+    + ~200 MB embed；MRoPE 节点在 RKNN 模型内部烧录。
+    """
+    from wdnai import SystemLanguageModel
+    return SystemLanguageModel.qwen3_5_vl_4b()
+
+
 # 每个 model 的 ``estimated_init_seconds`` 是经验值，用来渲染"加载中"倒计时
 # 的初始起点；loading 段倒计时按 (estimate - (now - started_at)) 实算，estimate
 # 只影响倒计时的**起点**。真机冷启动实测（page cache dropped 之后）：
@@ -541,6 +555,24 @@ MODEL_PRESETS: dict[str, dict] = {
         "instance_name":    "llm-audio",
         "worker_name":      "audio-3b",     # comm = "worker:audio-3b" (13 chars)
         "description":      "多感知描述模型",
+        "available_targets": ["182x"],
+    },
+    "qwen3-5-vl-4b": {
+        # Qwen3.5-VL-4B 多模态模型（kind="vlm"，image-in/text-out）。
+        # 同时声明 swcap_text_chat + swcap_video_describe —— VLM-mode
+        # RKNN 既能做纯文本推理也能消费视觉 token，所以文本对话页 +
+        # 视频描述页（detector / VFA / audio_analysis 等）都能用它。
+        # 与 qwen3-vl-4b 共用 swcap_video_describe capability；算力
+        # 配置页同一 capability 内互斥（先加载的赢）。
+        "label":            "[VL]Qwen3.5-VL 视频描述/对话模型",
+        "preset_factory":   _qwen3_5_vl_4b_spec,
+        "model_dir_name":   "Qwen3.5-4B",
+        "memory_estimate_mb": 3500,
+        "estimated_init_seconds": 60,
+        "capability_types": ["swcap_text_chat", "swcap_video_describe"],
+        "instance_name":    "llm-q5-vl",
+        "worker_name":      "q5-vl",        # comm = "worker:q5-vl" (12 chars)
+        "description":      "Qwen3.5-4B 多模态模型，支持图像描述和文本对话",
         "available_targets": ["182x"],
     },
 }

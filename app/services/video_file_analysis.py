@@ -2518,10 +2518,14 @@ class VideoFileAnalysisService:
     def _on_call_timeout(self) -> None:
         """每次 _call_llm 触发 60s timeout 时调用。
 
-        连续 ≥2 次 → 触发 stop_instance_local("qwen3-vl-4b")，干掉旧
-        worker 进程 → 35s 内 spawn 新进程 + init LLMSession → 队列里
-        积压的 _call_llm 失败（但 1-2 个 error 事件比 5+ 分钟卡死好），
-        之后稳态运行。
+        连续 ≥2 次 → 触发 ``stop_instance_local(<swcap_video_describe>``)
+        干掉当前承载视频描述推理的 worker 进程 → 35s 内 spawn 新进程 +
+        init LLMSession → 队列里积压的 _call_llm 失败（但 1-2 个 error
+        事件比 5+ 分钟卡死好），之后稳态运行。
+
+        不再硬编码 ``"qwen3-vl-4b"`` —— 通过 registry 找当前 running
+        的 ``swcap_video_describe`` 实例的 model_id（qwen3-vl-4b 或
+        qwen3-5-vl-4b 都行），按实际加载的模型重启。
 
         阈值定 ≥2 而非 1：单次 timeout 可能是长 prompt / NPU 短暂忙，
         不必重启；连续 2 次说明 C 层 rknn3 session 真正 wedged，
@@ -2531,13 +2535,23 @@ class VideoFileAnalysisService:
         self._consecutive_timeouts += 1
         if self._consecutive_timeouts < 2:
             return
-        LOG.warning(
-            "vfa: %d 次连续 _call_llm 超时，触发 qwen3-vl-4b worker 重启（清 wedged C 层）",
-            self._consecutive_timeouts,
-        )
         try:
             from app.services.compute_registry import get_registry
-            get_registry().stop_instance_local("qwen3-vl-4b")
+            registry = get_registry()
+            target_model = None
+            for inst in registry.list_with_source():
+                caps = inst.get("capability_types") or []
+                if "swcap_video_describe" in caps and inst.get("status") == "running":
+                    target_model = inst.get("model_id")
+                    break
+            if not target_model:
+                LOG.warning("vfa: 重启跳过 —— 当前无 running swcap_video_describe 实例")
+                return
+            LOG.warning(
+                "vfa: %d 次连续 _call_llm 超时，触发 %s worker 重启（清 wedged C 层）",
+                self._consecutive_timeouts, target_model,
+            )
+            registry.stop_instance_local(target_model)
         except Exception as ex:
             LOG.error("vfa: worker 重启失败: %s", ex)
         # 重启后新 worker 是 fresh session，counter 清零。

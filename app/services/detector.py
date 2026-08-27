@@ -540,27 +540,32 @@ class WdnaiDetector:
             sess = None
             session_ready = False
             session_error = str(e)
-        # Query the running qwen3-vl-4b instance for its loaded
-        # vision-model native sizes — never hardcode [384, 768] on
-        # the client. Empty list when the worker hasn't reported yet
-        # (model not loaded, network probe failure, missing capability).
+        # Query the running ``swcap_video_describe`` instance for its
+        # loaded vision-model native sizes — never hardcode [384, 768]
+        # on the client. Filter by capability instead of model_id so
+        # any future VLM preset (qwen3-5-vl-4b etc.) is picked up
+        # automatically. Empty list when the worker hasn't reported
+        # yet (model not loaded, network probe failure, missing
+        # capability).
         available_sizes: List[int] = []
         if sess is not None:
             try:
                 for inst in registry.list_with_source():
-                    if inst.get("model_id") == "qwen3-vl-4b":
-                        raw = inst.get("available_image_sizes") or []
-                        if isinstance(raw, list):
-                            cleaned = []
-                            for s in raw:
-                                if isinstance(s, bool):
-                                    continue
-                                try:
-                                    cleaned.append(int(s))
-                                except (TypeError, ValueError):
-                                    continue
-                            available_sizes = sorted(set(cleaned))
-                        break
+                    caps = inst.get("capability_types") or []
+                    if "swcap_video_describe" not in caps:
+                        continue
+                    raw = inst.get("available_image_sizes") or []
+                    if isinstance(raw, list):
+                        cleaned = []
+                        for s in raw:
+                            if isinstance(s, bool):
+                                continue
+                            try:
+                                cleaned.append(int(s))
+                            except (TypeError, ValueError):
+                                continue
+                        available_sizes = sorted(set(cleaned))
+                    break
             except Exception:  # noqa: BLE001
                 pass
         with self._lock:
@@ -613,15 +618,17 @@ class WdnaiDetector:
             available_sizes: List[int] = []
             try:
                 for inst in registry.list_with_source():
-                    if inst.get("model_id") == "qwen3-vl-4b":
-                        raw = inst.get("available_image_sizes") or []
-                        if isinstance(raw, list):
-                            for s in raw:
-                                try:
-                                    available_sizes.append(int(s))
-                                except (TypeError, ValueError):
-                                    continue
-                        break
+                    caps = inst.get("capability_types") or []
+                    if "swcap_video_describe" not in caps:
+                        continue
+                    raw = inst.get("available_image_sizes") or []
+                    if isinstance(raw, list):
+                        for s in raw:
+                            try:
+                                available_sizes.append(int(s))
+                            except (TypeError, ValueError):
+                                continue
+                    break
             except Exception:  # noqa: BLE001
                 pass
             if available_sizes and image_size not in available_sizes:

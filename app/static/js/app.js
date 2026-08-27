@@ -4379,8 +4379,28 @@ const CC_PRESET_META = {
     description: "多感知描述模型",
     available_targets: ["182x"],
   },
+  "qwen3-5-vl-4b": {
+    // Qwen3.5-VL-4B 同时声明 swcap_text_chat + swcap_video_describe
+    // ——VLM-mode RKNN 既能做纯文本也能消费 vision token，一张一张卡
+    // 同时满足对话页 + 视频描述页。启用后文本对话、视频描述、视频
+    // 内容检索、视频文件分析、音视频描述等页均直接可用。
+    label: "[VL+LLM]Qwen3.5-VL 多模态模型",
+    capability_types: ["swcap_text_chat", "swcap_video_describe"],
+    instance_name: "llm-q5-vl",
+    memory_estimate_mb: 3500,
+    estimated_init_seconds: 60,
+    description: "Qwen3.5-VL-4B 多模态模型，同时支持文本对话和视频描述",
+    available_targets: ["182x"],
+  },
 };
-const CC_PRESET_ORDER = ["qwen3-vl-4b", "qwen3-tts", "qwen3-8b", "qwen3-vl-embedding-2b", "qwen2.5-omni-3b"];
+const CC_PRESET_ORDER = [
+  "qwen3-vl-4b",
+  "qwen3-5-vl-4b",     // 多模态卡（同时支持文本对话 + 视频描述）
+  "qwen3-8b",          // Qwen3 纯文本
+  "qwen3-tts",
+  "qwen3-vl-embedding-2b",
+  "qwen2.5-omni-3b",
+];
 
 // 系统拓扑：1× RK3588 主控（不占"算力卡"位置） + N× RK182x 协卡。
 // wdnai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡多
@@ -6350,7 +6370,7 @@ const ImBridge = {
 
     if (hint) {
       if (!available) {
-        hint.textContent = "文本对话模型未启用，请在算力配置页加载 qwen3-8b";
+        hint.textContent = "文本对话模型未启用，请在算力配置页启用 qwen3-8b / qwen3-5-vl-4b 任一文本对话实例";
         hint.className = "imb-bridge-hint danger";
       } else if (enabled) {
         hint.textContent = b.busy ? "已对接，生成中…" : "已对接，微信消息将自动回复";

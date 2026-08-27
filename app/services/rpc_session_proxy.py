@@ -453,7 +453,7 @@ class _RpcSessionProxy:
                                   "instruct", "volume", "no_play",
                                   "non_streaming_mode"}},
         }
-        # 视觉模型目标尺寸（音视频描述页 ``#vd-detect-size``）——
+# 视觉模型目标尺寸（音视频描述页 ``#vd-detect-size``）——
         # 顶层字段而非 ``options``，因为这是 vision backend 特有的
         # channel 控制，不是 sampling 参数；也不进白名单，避免
         # 误把它当成采样配置采样化。worker ``infer_handler`` 直接读
@@ -462,7 +462,16 @@ class _RpcSessionProxy:
         _image_size = overrides.get("image_size")
         if isinstance(_image_size, int) and not isinstance(_image_size, bool):
             payload["image_size"] = _image_size
-        reply = self._client.call(payload, timeout_ms=120_000)
+        # infer 路径走 ``_call_resilient``：冷启动 + 多模态首帧 vision
+        # prefill 容易单帧 90-150s（实测 Qwen3-VL-4B / Qwen3.5-VL-4B
+        # 第一次 infer 都偶发 130s+），单纯一次 120s 超时后直接 raise
+        # 会让用户看到"启动失败"而 worker 端其实跑完了。
+        # soft_retries=1 + hard_retries=2 → 最坏预算 ≈
+        #   3 × 240s + recreate ≈ 720s，覆盖最坏的多模态首帧延迟
+        # （vision + MRoPE prefill）；单帧稳态推理一般 < 5s 命中第 1 次。
+        # 超时后 recreate cshim client 清理可能的端点状态残留。
+        reply = self._call_resilient(payload, timeout_ms=240_000,
+                                     soft_retries=1, hard_retries=2)
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
             raise RuntimeError(
