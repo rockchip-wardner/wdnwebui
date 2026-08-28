@@ -466,7 +466,7 @@ class _RpcSessionProxy:
         _image_size = overrides.get("image_size")
         if isinstance(_image_size, int) and not isinstance(_image_size, bool):
             payload["image_size"] = _image_size
-        # infer 路径走 ``_call_resilient``：冷启动 + 多模态首帧 vision
+# infer 路径走 ``_call_resilient``：冷启动 + 多模态首帧 vision
         # prefill 容易单帧 90-150s（实测 Qwen3-VL-4B / Qwen3.5-VL-4B
         # 第一次 infer 都偶发 130s+），单纯一次 120s 超时后直接 raise
         # 会让用户看到"启动失败"而 worker 端其实跑完了。
