@@ -671,6 +671,8 @@ class TtsSession:
         def _on_chunk(payload: bytes) -> None:
             try:
                 if len(payload) < 12:
+                    LOG.debug(
+                        "DDS chunk short header: got %d bytes", len(payload))
                     return
                 sr, ch, n = struct.unpack("<III", payload[:12])
                 pcm = payload[12:]
