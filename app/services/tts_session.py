@@ -371,6 +371,12 @@ class TtsSession:
         self._pcm_sock: Optional[socket.socket] = None
         self._pcm_sock_path: str = ""
 
+        # LAN worker 的 DDS 分片 reader：TopicReader 挂在
+        # wdndds/audio/tts_chunk/<model_id>。本机无 DDS writer，
+        # 订阅一直 idle；LAN worker UDS 连不上时由 _run_safe 启用，
+        # finally 里 close。
+        self._dds_chunk_reader: Optional[object] = None
+
         self._model_dir = self._resolve_model_dir(model_dir)
 
         # Probe once at boot so the UI can render the banner without
@@ -558,6 +564,56 @@ class TtsSession:
                 loop.call_soon_threadsafe(self._enqueue_chunk, q, b"EOF")
             except Exception as exc:           # noqa: BLE001
                 LOG.debug("audio EOF schedule failed: %s", exc)
+
+    def _dds_chunk_reader_thread(self, model_id: str) -> None:
+        """订阅 LAN TTS worker 的音频分片 topic。
+
+        在 wdndds/audio/tts_chunk/<model_id> 起 cshim-backed DDS reader，
+        每片 payload 喂进现有 _on_audio_chunk（与 UDS reader 同路径）。
+        cshim pump 由 wdndds 内部托管，本方法只建订阅、把 handle 存到
+        self._dds_chunk_reader 供 _run_safe finally 关闭。
+
+        本机 worker 不向这个 topic 发 DDS（走 UDS），回调一直 idle，
+        cleanup 时关闭 reader 即可。
+        """
+        self._dds_chunk_reader = None
+        try:
+            from app.services.compute_registry import (
+                get_registry,
+                subscribe_tts_chunk_topic,
+            )
+            hub = get_registry()._hub_or_raise()
+        except Exception as exc:               # noqa: BLE001
+            LOG.debug("DDS chunk reader: no Hub available (%s)", exc)
+            return
+
+        def _on_chunk(payload: bytes) -> None:
+            try:
+                if len(payload) < 12:
+                    return
+                sr, ch, n = struct.unpack("<III", payload[:12])
+                pcm = payload[12:]
+                want = n * ch * 4
+                if len(pcm) < want:
+                    LOG.debug(
+                        "DDS chunk short: got %d bytes need %d",
+                        len(pcm), want)
+                    return
+                audio = np.frombuffer(
+                    pcm[:want], dtype="<f4").reshape(n, ch)
+                self._on_audio_chunk(audio, sr)
+            except Exception as exc:           # noqa: BLE001
+                LOG.debug("DDS chunk decode failed: %s", exc)
+
+        try:
+            reader = subscribe_tts_chunk_topic(hub, model_id, _on_chunk)
+            self._dds_chunk_reader = reader
+            LOG.debug("DDS chunk reader subscribed: model_id=%s", model_id)
+        except Exception as exc:               # noqa: BLE001
+            LOG.debug(
+                "DDS chunk reader subscribe failed: %s; LAN streaming off",
+                exc)
+            self._dds_chunk_reader = None
 
     def _emit(self) -> None:
         self._broadcast(self.snapshot())
@@ -802,6 +858,11 @@ class TtsSession:
                     daemon=True,
                 ).start()
 
+            # LAN fallback：worker 连不上 UDS 就改发
+            # wdndds/audio/tts_chunk/qwen3-tts；本机无 DDS writer
+            # 所以 reader 一直 idle、回调不触发。
+            self._dds_chunk_reader_thread(model_id="qwen3-tts")
+
             # ``_infer_one`` already routes through the SDK with the
             # user's ``no_play`` intent — the SDK's internal
             # ``AudioPlayer`` streams chunks live; we don't re-spawn
@@ -885,6 +946,16 @@ class TtsSession:
                 except OSError:
                     pass
                 self._pcm_sock_path = ""
+            # Tear down the DDS chunk reader. The Hub keeps the
+            # DomainParticipant alive for the lifetime of the main
+            # process, so leaked readers pile up across runs.
+            dds_reader = getattr(self, "_dds_chunk_reader", None)
+            if dds_reader is not None:
+                try:
+                    dds_reader.close()
+                except Exception as exc:           # noqa: BLE001
+                    LOG.debug("DDS chunk reader close failed: %s", exc)
+                self._dds_chunk_reader = None
 
     def _set_state(self, state: str, message: str = "") -> None:
         with self._lock:

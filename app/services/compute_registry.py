@@ -3183,3 +3183,24 @@ def get_session_call_lock() -> threading.Lock:
     so call sites can use it in multiple ``with`` blocks (e.g. inside
     a loop) without draining a single-use ``@contextmanager``."""
     return _call_lock
+
+
+# DDS TTS 音频分片 topic 订阅（LAN 流式，plan tts-streaming-lan）
+def subscribe_tts_chunk_topic(
+    participant: Any,
+    model_id: str,
+    callback: "Callable[[bytes], None]",
+) -> Any:
+    """给 worker TTS 分片 topic 起 cshim-backed DDS reader。
+
+    每片 payload 线缆格式与本地 UDS 一致：
+        struct.pack("<III", sr, ch, n) + n * ch * 4 bytes float32 LE PCM
+
+    callback 在 cshim daemon 线程里触发（wdndds 内部托管），保持短小。
+    返回的 TopicReader.close() 会 join pump 线程并拆 DataReader；
+    调用方必须持有 handle 并清理时关闭 —— Hub 的 DomainParticipant
+    跨 worker 生命周期常驻，reader 泄漏会叠加。
+    """
+    from wdndds.dds import create_topic_reader
+    topic_name = f"wdndds/audio/tts_chunk/{model_id}"
+    return create_topic_reader(participant, topic_name, callback)
