@@ -583,8 +583,9 @@ class TtsSession:
 
         if not req.output:
             req.output = str(self._default_output_path())
-        self._output = Path(req.output)
-        self._output.parent.mkdir(parents=True, exist_ok=True)
+        # 不要在这里赋 self._output —— _run_safe 写盘后才会赋，
+        # 否则 stop 中断会留下 phantom output_url → 404。
+        Path(req.output).parent.mkdir(parents=True, exist_ok=True)
 
         # For ``play_to=both`` we run our own aplay subprocess via
         # ``AplayWriter`` so the SDK's worker thread never blocks on
@@ -751,35 +752,46 @@ class TtsSession:
             attachments = list(getattr(result, "attachment", []) or [])
             wav_bytes = attachments[0].data if attachments else b""
 
-            with self._lock:
-                self._audio_sec = _wav_duration_seconds(wav_bytes)
-                self._elapsed = time.time() - t0
-                self._output = Path(req.output)
-
             if wav_bytes:
-                with open(self._output, "wb") as f:
+                output_path = Path(req.output)
+                with open(output_path, "wb") as f:
                     f.write(wav_bytes)
                 try:
-                    size = self._output.stat().st_size
+                    size = output_path.stat().st_size
                 except OSError:
                     size = 0
+                # 顺序很重要：先写盘，再在 lock 下 publish self._output ——
+                # 否则 200 ms 的 snapshot poll 会读到还没落盘的
+                # output_url → 404。
+                audio_sec = _wav_duration_seconds(wav_bytes)
+                elapsed = time.time() - t0
+                with self._lock:
+                    self._audio_sec = audio_sec
+                    self._elapsed = elapsed
+                    self._output = output_path
                 with self._history_lock:
                     self._history.append({
                         "ts":         time.time(),
                         "text":       req.text,
                         "language":   req.language,
                         "speaker":    req.ref_speaker or req.speaker,
-                        "output":     str(self._output),
-                        "output_url": self._output_url_for(self._output),
+                        "output":     str(output_path),
+                        "output_url": self._output_url_for(output_path),
                         "play_to":    req.play_to,
                         "size":       size,
-                        "audio_sec":  round(self._audio_sec, 3),
+                        "audio_sec":  round(audio_sec, 3),
                         "frames":     self._frames,
                     })
                     while len(self._history) > self.HISTORY_MAX:
                         self._history.pop(0)
 
-            self._set_state(self.STATE_DONE, f"saved {self._output}")
+                self._set_state(self.STATE_DONE, f"saved {output_path}")
+            else:
+                with self._lock:
+                    self._audio_sec = 0.0
+                    self._elapsed = time.time() - t0
+                    self._output = None
+                self._set_state(self.STATE_DONE, "no audio produced (wav_bytes=0)")
         except Exception as exc:                   # noqa: BLE001
             LOG.exception("tts synthesis failed")
             self._set_state(self.STATE_ERROR, f"{type(exc).__name__}: {exc}")
