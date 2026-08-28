@@ -18,3 +18,14 @@ app/services/uploads/
 app/services/vfa_runs/
 app/static/uploads/
 output.wav
+
+# 编辑器临时文件
+.*.swp
+.*.swo
+
+# opencode-ai CLI 工具依赖（与项目无关）
+package.json
+package-lock.json
+
+# JSONC 配置文件（设备级，应该各机器独立维护）
+config.jsonc
