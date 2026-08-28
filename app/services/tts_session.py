@@ -9,6 +9,7 @@ TTSBackend (env var → ``$WDNAI_MODELS_DIR/Qwen3-TTS`` →
 """
 from __future__ import annotations
 
+import atexit
 import asyncio
 import io
 import logging
@@ -21,7 +22,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 
@@ -377,7 +378,16 @@ class TtsSession:
         # finally 里 close。
         self._dds_chunk_reader: Optional[object] = None
 
+        # 专属 audio chunk Hub（独立 DomainParticipant）：registry 的 Hub
+        # 上挂了 set_peer_listener，会干扰同 participant 的
+        # create_topic_reader（实测回调从不触发）。本 Hub 无 peer_listener，
+        # 进程级常驻。
+        self._audio_chunk_hub: Optional[Any] = None
+        self._audio_chunk_hub_lock = threading.Lock()
+
         self._model_dir = self._resolve_model_dir(model_dir)
+
+        atexit.register(self._cleanup_audio_chunk_hub)
 
         # Probe once at boot so the UI can render the banner without
         # waiting for the first /start request.
@@ -396,6 +406,76 @@ class TtsSession:
             return Path(env)
         root = os.environ.get("WDNAI_MODELS_DIR", "/userdata/models")
         return Path(root) / "Qwen3-TTS"
+
+    @staticmethod
+    def _read_device_name() -> str:
+        """解析 device_name（mirror compute_registry._read_device_name，
+        单调用点就不导出公开 helper）。fallback 到 socket.gethostname()
+        保证 participant_name 非空。"""
+        try:
+            from app.services.config import get_config
+            base = get_config().get_section("base") or {}
+            v = (base.get("device_name") or "").strip()
+            if v:
+                return v
+        except Exception:  # noqa: BLE001
+            pass
+        return socket.gethostname()
+
+    def _get_or_init_audio_chunk_hub(self) -> Optional[Any]:
+        """懒构造 + 缓存专属 audio chunk DDS Hub。
+
+        已建则直接返回；否则起一个无 set_peer_listener 的 Hub，进程级
+        常驻。失败（cshim 缺失 / NIC 超时等）打 warning、cache 清 None，
+        调用方 fallback 到 WAV-only 路径。
+        并发：_audio_chunk_hub_lock 保护 —— 多次 _dds_chunk_reader_thread
+        并发进来会重复 init 出同名 DomainParticipant 泄漏一个。"""
+        with self._audio_chunk_hub_lock:
+            if self._audio_chunk_hub is not None:
+                return self._audio_chunk_hub
+            try:
+                from wdndds.dds._rpc import Hub as _RpcHub
+                device_name = self._read_device_name()
+                hub = _RpcHub(
+                    participant_name=f"wdnwebui-audio-chunk-{device_name}",
+                    domain_id=0,
+                    discovery_servers=[],
+                )
+                hub.start()
+                # 故意不挂 set_peer_listener —— 整件事就是要把 audio
+                # topic reader 跟 registry 的 capability-adoption
+                # peer_listener 隔开。
+                self._audio_chunk_hub = hub
+                try:
+                    hub_guid = hub.guid()
+                except Exception:
+                    hub_guid = "<unknown>"
+                _tts_log(
+                    f"dedicated audio chunk hub ready "
+                    f"(participant=wdnwebui-audio-chunk-{device_name} "
+                    f"guid={hub_guid})"
+                )
+                return hub
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "audio chunk Hub init failed: %s; "
+                    "LAN streaming disabled, WAV fallback still works",
+                    exc,
+                )
+                self._audio_chunk_hub = None
+                return None
+
+    def _cleanup_audio_chunk_hub(self) -> None:
+        """atexit 注册的进程退出钩子。Hub.close() 幂等，best-effort 防止
+        DomainParticipant 滞留到解释器退出之后。"""
+        hub = self._audio_chunk_hub
+        if hub is None:
+            return
+        try:
+            hub.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._audio_chunk_hub = None
 
     @property
     def available(self) -> bool:
@@ -568,23 +648,24 @@ class TtsSession:
     def _dds_chunk_reader_thread(self, model_id: str) -> None:
         """订阅 LAN TTS worker 的音频分片 topic。
 
-        在 wdndds/audio/tts_chunk/<model_id> 起 cshim-backed DDS reader，
-        每片 payload 喂进现有 _on_audio_chunk（与 UDS reader 同路径）。
-        cshim pump 由 wdndds 内部托管，本方法只建订阅、把 handle 存到
+在 **专属 audio chunk Hub**（独立 DomainParticipant，与 registry
+        Hub 隔离）上挂 cshim-backed DDS reader，避开 registry participant
+        上 set_peer_listener 对 create_topic_reader 的干扰。每片 payload
+        喂进 _on_audio_chunk（与 UDS reader 同路径）。
+        cshim pump 由 wdndds 托管，本方法只建订阅、handle 存到
         self._dds_chunk_reader 供 _run_safe finally 关闭。
+        Hub 进程级常驻，首次调用懒构造、后续复用。
 
         本机 worker 不向这个 topic 发 DDS（走 UDS），回调一直 idle，
         cleanup 时关闭 reader 即可。
         """
         self._dds_chunk_reader = None
-        try:
-            from app.services.compute_registry import (
-                get_registry,
-                subscribe_tts_chunk_topic,
+        hub = self._get_or_init_audio_chunk_hub()
+        if hub is None:
+            LOG.debug(
+                "DDS chunk reader: dedicated audio hub unavailable; "
+                "LAN streaming off (WAV fallback still works)"
             )
-            hub = get_registry()._hub_or_raise()
-        except Exception as exc:               # noqa: BLE001
-            LOG.debug("DDS chunk reader: no Hub available (%s)", exc)
             return
 
         def _on_chunk(payload: bytes) -> None:
@@ -606,11 +687,17 @@ class TtsSession:
                 LOG.debug("DDS chunk decode failed: %s", exc)
 
         try:
+            from app.services.compute_registry import (
+                subscribe_tts_chunk_topic,
+            )
             reader = subscribe_tts_chunk_topic(hub, model_id, _on_chunk)
             self._dds_chunk_reader = reader
-            LOG.debug("DDS chunk reader subscribed: model_id=%s", model_id)
+            _tts_log(
+                f"DDS chunk reader subscribed via dedicated audio hub: "
+                f"model_id={model_id}"
+            )
         except Exception as exc:               # noqa: BLE001
-            LOG.debug(
+            LOG.warning(
                 "DDS chunk reader subscribe failed: %s; LAN streaming off",
                 exc)
             self._dds_chunk_reader = None

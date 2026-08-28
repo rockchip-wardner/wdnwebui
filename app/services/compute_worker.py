@@ -187,6 +187,11 @@ def _setup_logging(debug: bool) -> None:
 _WORKER_STOP_EVENT: threading.Event = threading.Event()
 
 
+# LAN TTS 音频分片 DDS topic writer（main() 里 init，finally 里 close）。
+# None = DDS init 失败，infer_handler 在 UDS 也失败时退回 WAV-only。
+_AUDIO_CHUNK_WRITER: Any = None
+
+
 # --------------------------------------------------------------------------- #
 # wdnai lazy-import + session builder                                          #
 # --------------------------------------------------------------------------- #
@@ -1081,9 +1086,12 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 tts_pcm_client.settimeout(2.0)
                 tts_pcm_client.connect(tts_pcm_socket_path)
             except Exception as e:  # noqa: BLE001
+                # UDS 连失败，两条非致命路径：① LAN DDS topic writer
+                # (主进程订阅 wdndds/audio/tts_chunk/<model_id>，BEST_EFFORT
+                # 丢片留静默 gap 但不阻塞 SDK decoder)；② 只剩 WAV。
+                # writer boot 时 init 成功走 ①，否则走 ②。
                 LOG.warning(
-                    "tts_pcm_socket: connect to %s failed (%s); "
-                    "falling back to WAV-only path",
+                    "tts_pcm_socket: connect to %s failed (%s)",
                     tts_pcm_socket_path, e)
                 if tts_pcm_client is not None:
                     try:
@@ -1091,7 +1099,30 @@ def infer_handler(state: dict, payload: dict) -> dict:
                     except Exception:
                         pass
                     tts_pcm_client = None
+                if _AUDIO_CHUNK_WRITER is not None:
+                    def _pcm_chunk_dds_forwarder(
+                            audio, sr, _w=_AUDIO_CHUNK_WRITER):
+                        try:
+                            import struct as _struct
+                            import numpy as _np
+                            arr = _np.asarray(audio, dtype="<f4").reshape(-1)
+                            header = _struct.pack(
+                                "<III", int(sr), 1, int(arr.size))
+                            # write() best-effort：丢片返 0（静默），
+                            # 硬错（writer 关闭 / cshim）返非零；外层
+                            # try/except 兜 numpy copy / pack 异常，
+                            # 防止坏分片毒死 SDK decoder worker。
+                            _w.write(header + arr.tobytes())
+                        except Exception:
+                            pass
+                    tts_kwargs["on_audio_chunk"] = _pcm_chunk_dds_forwarder
+                    LOG.info("tts_pcm: using DDS topic writer (LAN fallback)")
+                else:
+                    LOG.info("tts_pcm: no DDS writer available; "
+                             "falling back to WAV-only path")
             else:
+                # 本机快路径：AF_UNIX 直连主进程 reader，线缆格式与
+                # DDS 路径一致，主进程 _on_audio_chunk 透明兼容两者。
                 def _pcm_chunk_forwarder(audio, sr, _c=tts_pcm_client):
                     try:
                         import struct as _struct
@@ -1102,6 +1133,7 @@ def infer_handler(state: dict, payload: dict) -> dict:
                     except Exception:
                         pass
                 tts_kwargs["on_audio_chunk"] = _pcm_chunk_forwarder
+                LOG.info("tts_pcm: using Unix domain socket (local fast path)")
 
         attachments = []
         for item in atts_meta:
@@ -1504,6 +1536,25 @@ def main() -> int:
     )
     hub.start()
 
+    # Per-worker LAN 流式 fallback：在 wdndds/audio/tts_chunk/<model_id>
+    # 起一个 DDS writer（BEST_EFFORT，避免重传阻塞实时音频）。
+    # 主进程 UDS 也连不上（LAN）时由对应的 reader 接管。
+    # 一次创建、跨所有 TTS 复用，免除每次新建 DataWriter 的开销。
+    # 失败非致命 —— /info /load /infer 仍可用，只是没有流式通路
+    # （infer_handler 退回 WAV-only）。
+    global _AUDIO_CHUNK_WRITER
+    try:
+        from wdndds.dds import create_topic_writer
+        _AUDIO_CHUNK_WRITER = create_topic_writer(
+            hub, f"wdndds/audio/tts_chunk/{model_id}",
+            qos_kind="best_effort")
+        LOG.info("audio_chunk_writer: ready on "
+                 "wdndds/audio/tts_chunk/%s (BEST_EFFORT)", model_id)
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("audio_chunk_writer: DDS init failed (%s); "
+                    "LAN TTS streaming will fall back to WAV-only", e)
+        _AUDIO_CHUNK_WRITER = None
+
     # Legacy compat: if --npu was passed on the command line, build the
     # session eagerly so old systemd / debug workflows keep working.
     # Production paths omit --npu and rely on the RPC load action.
@@ -1540,6 +1591,14 @@ def main() -> int:
             stop_event.wait(timeout=1.0)
     finally:
         LOG.info("compute_worker exit")
+        # Close the DDS audio-chunk writer before the Hub tears down the
+        # participant so any in-flight BEST_EFFORT chunks can flush.
+        # ``close()`` is idempotent so a double-close is a no-op.
+        try:
+            if _AUDIO_CHUNK_WRITER is not None:
+                _AUDIO_CHUNK_WRITER.close()
+        except Exception:
+            pass
         try:
             hub.close()
         except Exception:
