@@ -3822,6 +3822,7 @@ const TTS = {
     if (volEl && volValEl) {
       volEl.addEventListener("input", () => {
         volValEl.textContent = volEl.value + "%";
+        if (audioEl) audioEl.volume = Number(volEl.value) / 100;
       });
     }
     if (audioEl) {
@@ -3995,12 +3996,11 @@ const TTS = {
     // and waking it up at audio_start time costs 1-3 s of cold-start
     // tax. Doing it here, synchronously, runs under the gesture.
     if (this._wantsBrowser()) {
-      const ctx = this._ensureAudioCtx();
+      const ctx = await this._ensureAudioCtx();
       if (ctx) {
         try {
           if (ctx.state !== "running") await ctx.resume();
         } catch (_) {}
-        if (ctx.state === "running") this.audioReady = true;
       }
     }
 
@@ -4028,7 +4028,7 @@ const TTS = {
       // onopen doesn't fire when the WS is already OPEN (server keeps
       // it alive between runs) — resubscribe explicitly so the server
       // recreates the audio pump for this run.
-      if (this._wantsBrowser() && this.audioReady) {
+      if (this._wantsBrowser()) {
         this._subscribeAudio();
       }
     } catch (err) {
@@ -4200,7 +4200,7 @@ const TTS = {
       // Per-connection subscription: the server resets ``sub_id`` at
       // end-of-run, so re-subscribing on every WS open is cheap and
       // survives WS bounces mid-run.
-      if (this._wantsBrowser() && this.audioReady) {
+      if (this._wantsBrowser()) {
         this._subscribeAudio();
       } else if (this.pendingAudioSubscribe) {
         this._subscribeAudio();
@@ -4231,7 +4231,6 @@ const TTS = {
    * Browser-side audio playback (WebAudio, streaming chunks)
    * ------------------------------------------------------------------ */
   audioCtx: null,
-  audioReady: false,         // AudioContext created + resumed
   audioActive: false,        // current stream is feeding the context
   audioSampleRate: 24000,
   audioChannels: 1,
@@ -4264,11 +4263,19 @@ const TTS = {
     }
   },
 
-  _ensureAudioCtx() {
-    if (this.audioCtx) return this.audioCtx;
+  async _ensureAudioCtx() {
+    if (this.audioCtx) {
+      // Chrome 后台标签会把 ctx 翻回 "suspended"，重新 resume 即可。
+      if (this.audioCtx.state !== "running") {
+        try { await this.audioCtx.resume(); } catch (_) {}
+      }
+      return this.audioCtx;
+    }
     const Ctor = window.AudioContext || window.webkitAudioContext;
     if (!Ctor) return null;
     this.audioCtx = new Ctor();
+    // 必须在 osc.start() 之前 resume —— 否则 keep-alive 振荡器静默 no-op。
+    try { await this.audioCtx.resume(); } catch (_) {}
     // Keep the audio thread spinning. Chrome parks it when no source
     // is active, and a 1-3s cold-start tax hits the first real chunk
     // after a long idle. A 0-gain oscillator runs until ctx.close()
@@ -4321,25 +4328,13 @@ const TTS = {
   },
 
   async _onAudioStreamStart(sampleRate, channels) {
-    const ctx = this._ensureAudioCtx();
-    if (!ctx || !this.audioReady) {
-      this._setAudioChip("AudioContext 未就绪", "error");
-      return;
-    }
-    // Defensive resume: state can flip back to "suspended" after long
-    // idle. If still not running, skip and surface the error.
-    if (ctx.state !== "running") {
-      try { await ctx.resume(); } catch (_) {}
-      if (ctx.state !== "running") {
-        this._setAudioChip("AudioContext 已挂起", "error");
-        return;
-      }
-    }
+    const ctx = await this._ensureAudioCtx();
+    if (!ctx) return;
     this.audioSampleRate = sampleRate || 24000;
     this.audioChannels = channels || 1;
     this.audioActive = true;
     // No pre-roll: the keep-alive oscillator + eager resume() in
-    // start() already paid the AudioContext cold-start tax.
+    // _ensureAudioCtx already paid the AudioContext cold-start tax.
     this.audioScheduledUntil = ctx.currentTime;
     this.audioPushedSec = 0;
     this._setAudioChip("浏览器音频流开始", "live");
@@ -4358,11 +4353,14 @@ const TTS = {
   },
 
   _handleBinaryChunk(arrayBuf) {
-    if (!this.audioReady) {
-      this._setAudioChip("已收 chunk · 请先点 ▶ 启用浏览器音频", "error");
+    if (!this.audioCtx) {
+      this._setAudioChip("WebAudio ctx 未创建,请刷新页面重试", "error");
       return;
     }
     if (!this.audioActive) return;
+
+    const volEl = document.getElementById("tts-volume");
+    const vol = volEl ? Number(volEl.value) / 100 : 1.0;
 
     // 12-byte header (sr:u32, ch:u32, n:u32 little-endian) + float32 LE samples.
     const view = new DataView(arrayBuf);
@@ -4378,9 +4376,8 @@ const TTS = {
     if (arrayBuf.byteLength < 12 + expectedBytes) return;
 
     const ctx = this.audioCtx;
-    if (!ctx) return;
-
     const f32 = new Float32Array(arrayBuf.slice(12, 12 + expectedBytes));
+    for (let i = 0; i < f32.length; i++) f32[i] *= vol;
     const buffer = ctx.createBuffer(ch, sampleCount, this.audioSampleRate);
     // qwen3 is always mono; the ch>0 branch is here for future use.
     for (let c = 0; c < ch; c++) {
