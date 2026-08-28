@@ -2703,6 +2703,78 @@ class ComputeRegistry:
             daemon=True,
         ).start()
 
+        # v0.8.29：后台 daemon 对每个 adopted LAN peer 主动发一次 ``info``
+        # RPC，把 SEDP/SPDP endpoint 匹配提前到 boot 阶段 —— 否则用户
+        # 首次调用（TTS 长文本）会在 cshim Requester discovery race 上
+        # 卡 120s。详见 :meth:`_warm_adopted_workers`。
+        threading.Thread(
+            target=self._warm_adopted_workers,
+            name="compute-prewarm-adopted",
+            daemon=True,
+        ).start()
+
+    def _warm_adopted_workers(self) -> None:
+        """v0.8.29：boot 时 pre-warm adopted LAN peer 的 cshim Requester。
+
+        问题：cshim Requester 在 fresh boot 后**首次** LAN RPC 调用时撞
+        DDS discovery race —— reply topic 的 SEDP endpoint 映射还没建立，
+        即使 boot-time ``_probe_service`` 已通过（probe 用的是另一把
+        一次性 requester，详见 :meth:`_probe_service`）。首次真实用户
+        调用会把 requester 卡住 ~120s 才超时，用户看到 hung inference。
+
+        修法：遍历所有 ``adopted`` (LAN peer) 且 ``status="running"`` 的
+        instance，直接在 ``inst.rpc_client`` 上发一次 ``info`` RPC，强制
+        SEDP endpoint 匹配在 boot 时完成。这样之后
+        ``RpcSessionProxy.respond()`` 跑时 endpoint 已经 warm。
+
+        约束：
+          * 故意不走 ``_call_with_recreate`` —— 该 helper 在 wedged client
+            上调 ``RpcClient.destroy()`` 会 SEGV cshim (status=11)。boot
+            期间 pre-warm 失败非致命：卡在 boot 阶段用户无感；下一次
+            ``/start`` 要么成功（probe daemon 内重试成功），要么出干净错。
+          * 只 warm ``adopted``（LAN peer）—— ``spawned`` 和 ``adopted_local``
+            已经在 boot 时被 ``_probe_service``（一次性 client）和
+            ``_probe_instance``（原地 probe）warm 过了。
+          * 只 warm ``status="running"`` —— warm 一个 not_loaded instance
+            会强制 worker 提前加载。
+        """
+        warmed = 0
+        failed = 0
+        skipped = 0
+        for inst in list(self._instances.values()):
+            if inst._source != "adopted":
+                skipped += 1
+                continue
+            if inst.rpc_client is None:
+                skipped += 1
+                continue
+            if inst.status != "running":
+                skipped += 1
+                continue
+            try:
+                t0 = time.time()
+                reply = inst.rpc_client.call(
+                    {"action": "info"}, timeout_ms=5000)
+                dt_ms = (time.time() - t0) * 1000
+                if reply.get("ok"):
+                    LOG.info(
+                        "compute_registry: pre-warmed %s (%.0fms, peer=%s)",
+                        inst.model_id, dt_ms, inst._peer_ip)
+                    warmed += 1
+                else:
+                    LOG.warning(
+                        "compute_registry: pre-warm %s returned not-ok: %s",
+                        inst.model_id, reply.get("error"))
+                    failed += 1
+            except Exception as e:  # noqa: BLE001
+                LOG.warning(
+                    "compute_registry: pre-warm %s raised: %s",
+                    inst.model_id, e)
+                failed += 1
+        LOG.info(
+            "compute_registry: pre-warm done (%d ok, %d failed, %d skipped)",
+            warmed, failed, skipped)
+
     def _boot_bind_async(self, inst: "ModelInstance", npu_index: int,
                          *, reason: str) -> None:
         """Fire-and-forget ``bind_instance`` from boot context."""

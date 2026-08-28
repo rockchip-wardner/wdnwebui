@@ -3912,33 +3912,6 @@ const TTS = {
     if (metaEl) {
       metaEl.textContent = this.formatMeta(snap);
     }
-
-    // After the run finishes, expose the saved WAV via the <audio>
-    // element so the user can re-play the synthesis without
-    // re-running the model. Live chunks already played through the
-    // AudioContext; this is the post-run scrubber.
-    if (snap.output_url && (snap.state === "done" || snap.state === "stopped")) {
-      this._feedBrowserAudio(snap.output_url);
-    }
-  },
-
-  _feedBrowserAudio(url) {
-    const audioEl = this._audioEl();
-    if (!audioEl) return;
-    if (!this._wantsBrowser()) {
-      audioEl.classList.add("hidden");
-      return;
-    }
-    // Dedup 防止 render() 每次 WS snapshot 都重新设置 src（cache-buster
-    // 会把同一 WAV 反复 reload）。audioEl.src 是绝对 URL 而 ``url`` 是
-    // 后端给的相对路径，所以另存一份自己的 last-assigned 做对比。
-    if (this._lastPlayedAudioUrl === url) return;
-    const bust = (url.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now();
-    audioEl.src = url + bust;
-    audioEl.classList.remove("hidden");
-    this._lastPlayedAudioUrl = url;
-    // 无 user gesture 时 autoplay 可能被拒；catch 吞掉，用户可手动 ▶。
-    audioEl.play().catch(() => {});
   },
 
   formatMeta(snap) {
@@ -4242,8 +4215,6 @@ const TTS = {
   audioChannels: 1,
   audioScheduledUntil: 0,    // monotonic ctx time for back-to-back chunks
   audioPushedSec: 0,
-  // _feedBrowserAudio 上次赋给 <audio> 的 base URL（dedup 用）
-  _lastPlayedAudioUrl: null,
   /* True when subscribe_audio was sent but the WS wasn't OPEN yet;
    * ``onopen`` re-issues subscribe when the WS finishes opening. */
   pendingAudioSubscribe: false,
