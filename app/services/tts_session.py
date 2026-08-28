@@ -265,6 +265,36 @@ def _wav_duration_seconds(wav_bytes: bytes) -> float:
     return 0.0
 
 
+def _assemble_wav(pcm: np.ndarray, sample_rate: int) -> bytes:
+    """从 flat float32 PCM ndarray 构建 RIFF/WAVE 字节串。
+
+    格式 mirror SDK：format_tag=3 (IEEE_FLOAT)、1 通道、sample_rate Hz、
+    32-bit LE float。可经 _wav_duration_seconds round-trip，saved 文件
+    报告时长与累积 PCM 长度一致。
+    """
+    if pcm is None or pcm.size == 0:
+        return b""
+    sr = int(sample_rate) if sample_rate else 24000
+    bits_per_sample = 32
+    num_channels = 1
+    byte_rate = sr * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    pcm_bytes = np.ascontiguousarray(pcm, dtype="<f4").tobytes()
+    data_size = len(pcm_bytes)
+    fmt_size = 16
+    riff_size = 4 + (8 + fmt_size) + (8 + data_size)
+    return (
+        struct.pack("<4sI4s", b"RIFF", riff_size, b"WAVE")
+        + struct.pack(
+            "<4sIHHIIHH",
+            b"fmt ", fmt_size, 3, num_channels, sr, byte_rate,
+            block_align, bits_per_sample,
+        )
+        + struct.pack("<4sI", b"data", data_size)
+        + pcm_bytes
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Request / snapshot shapes
 # --------------------------------------------------------------------------- #
@@ -371,6 +401,13 @@ class TtsSession:
         # wdndds RPC pickle，此路径是 live audio 的唯一通道。
         self._pcm_sock: Optional[socket.socket] = None
         self._pcm_sock_path: str = ""
+
+# per-run PCM 累加器（重组 saved WAV 用）。worker 不再在 RPC reply
+        # 里塞 WAV 字节（那条路径触发 LAN 120s 超时），这里从浏览器
+        # 正在播的同一 chunk 流拼回去。
+        self._run_pcm_chunks: List[np.ndarray] = []
+        self._run_pcm_sr: int = 24000
+        self._run_pcm_lock = threading.Lock()
 
         # LAN worker 的 DDS 分片 reader：TopicReader 挂在
         # wdndds/audio/tts_chunk/<model_id>。本机无 DDS writer，
@@ -620,6 +657,19 @@ class TtsSession:
             except Exception as exc:           # noqa: BLE001
                 LOG.debug("aplay-writer write failed: %s", exc)
 
+        # 累加 PCM 用于合成结束后拼 WAV。worker 不再在 RPC reply 里塞 WAV，
+        # 必须从浏览器正在听的同一 chunk 流重建。lock 短暂持有即可，
+        # 让 _run_safe 能在推理完成后 snapshot + clear。
+        try:
+            flat = np.asarray(audio, dtype="<f4").reshape(-1)
+            with self._run_pcm_lock:
+                if flat.size:
+                    self._run_pcm_chunks.append(flat)
+                    if self._run_pcm_sr <= 0:
+                        self._run_pcm_sr = sr
+        except Exception as exc:               # noqa: BLE001
+            LOG.debug("pcm accumulate failed: %s", exc)
+
     @staticmethod
     def _enqueue_chunk(q: asyncio.Queue, data: bytes) -> None:
         """Runs on the subscriber's asyncio loop. Drop-oldest if the
@@ -731,6 +781,9 @@ class TtsSession:
             self._elapsed = 0.0
             self._output = None
             self._request = req
+            with self._run_pcm_lock:
+                self._run_pcm_chunks = []
+                self._run_pcm_sr = 24000
 
         if not req.output:
             req.output = str(self._default_output_path())
@@ -977,6 +1030,40 @@ class TtsSession:
 
             attachments = list(getattr(result, "attachment", []) or [])
             wav_bytes = attachments[0].data if attachments else b""
+
+            # worker reply 不再带 TTS WAV —— 从浏览器刚播的 PCM chunks 拼回。
+            # lock 下 snapshot + clear 防止迟到的 DDS chunk 在读到一半
+            # 时 append。
+            with self._run_pcm_lock:
+                pcm_chunks = self._run_pcm_chunks
+                self._run_pcm_chunks = []
+                pcm_sr = self._run_pcm_sr
+
+            if not wav_bytes and pcm_chunks:
+                try:
+                    pcm = np.concatenate(pcm_chunks)
+                except Exception as e:           # noqa: BLE001
+                    LOG.warning("pcm concat failed: %s", e)
+                    pcm = np.array([], dtype="<f4")
+                if pcm.size > 0:
+                    wav_bytes = _assemble_wav(pcm, pcm_sr)
+                    chunk_count = len(pcm_chunks)
+                    chunk_audio_sec = pcm.size / max(pcm_sr, 1)
+                    sdk_audio_sec = float(self._audio_sec or 0.0)
+                    if sdk_audio_sec > 0:
+                        dev = abs(chunk_audio_sec - sdk_audio_sec) / sdk_audio_sec
+                        if dev > 0.20:
+                            LOG.warning(
+                                "tts: WAV from PCM chunks deviates from SDK "
+                                "audio_sec (chunks=%.3fs sdk=%.3fs dev=%.1f%%); "
+                                "BEST_EFFORT drop gap likely",
+                                chunk_audio_sec, sdk_audio_sec, dev * 100,
+                            )
+                    _tts_log(
+                        f"WAV assembled from {chunk_count} PCM chunks "
+                        f"({pcm.size} samples, {chunk_audio_sec:.3f}s, "
+                        f"sr={pcm_sr}Hz)"
+                    )
 
             if wav_bytes:
                 output_path = Path(req.output)

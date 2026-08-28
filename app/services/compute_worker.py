@@ -1270,19 +1270,33 @@ def infer_handler(state: dict, payload: dict) -> dict:
             except Exception as e:  # noqa: BLE001
                 LOG.warning("tool instance dump failed: %s", e)
 
-        # Serialize ``result.attachment`` as base64 so the wire RPC can
-        # carry binary payloads (TTS WAV bytes, VLM decoded images,
-        # …). Earlier this dict only had text/level/tool_call/bbox/
-        # crop_b64, which meant TTS audio bytes silently disappeared
-        # at the worker boundary.
+        # 把 result.attachment 序列化为 base64 让 wire RPC 能携带二进制
+        # payload（VLM 解码图、embed 表…）。TTS 音频字节故意跳过 ——
+        # 走 DDS / UDS audio chunks live 流回主进程，TtsSession 在
+        # main 侧从 chunk 重组 WAV。把 WAV 再塞回 reply 会 (a) 重复占
+        # 两条传输、(b) 长文 reply 超过 1 MB 后 cshim RPC replier 的
+        # publisher 线程（与 audio chunk writer 共享）卡到 120 s 超时
+        # —— 而音频早已流完。解耦后 reply 恒 ~200 B。
+        is_tts_result = (
+            type(result).__name__ == "TTSResult"
+            or (state.get("model_id") == "qwen3-tts")
+        )
         attachment_b64: Optional[str] = None
-        try:
-            atts = list(getattr(result, "attachment", []) or [])
-            if atts and atts[0].data:
-                import base64 as _b64
-                attachment_b64 = _b64.b64encode(bytes(atts[0].data)).decode("ascii")
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("attachment serialize failed: %s", e)
+        if is_tts_result:
+            LOG.info(
+                "tts: skipping attachment_b64 (DDS chunks carry PCM); "
+                "text_len=%d, attachment_count=%d",
+                len(getattr(result, "text", "") or ""),
+                len(list(getattr(result, "attachment", []) or [])),
+            )
+        else:
+            try:
+                atts = list(getattr(result, "attachment", []) or [])
+                if atts and atts[0].data:
+                    import base64 as _b64
+                    attachment_b64 = _b64.b64encode(bytes(atts[0].data)).decode("ascii")
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("attachment serialize failed: %s", e)
 
         reply = {
             "text": text,
@@ -1536,24 +1550,38 @@ def main() -> int:
     )
     hub.start()
 
-    # Per-worker LAN 流式 fallback：在 wdndds/audio/tts_chunk/<model_id>
-    # 起一个 DDS writer（BEST_EFFORT，避免重传阻塞实时音频）。
-    # 主进程 UDS 也连不上（LAN）时由对应的 reader 接管。
-    # 一次创建、跨所有 TTS 复用，免除每次新建 DataWriter 的开销。
-    # 失败非致命 —— /info /load /infer 仍可用，只是没有流式通路
-    # （infer_handler 退回 WAV-only）。
+# Per-worker LAN 流式 fallback：Writer 跑在独立 DomainParticipant 上，
+    # 让 cshim publisher 线程不与 RPC replier 的 reply publish 共享——
+    # 共享 pump 在长文本 reply 上仍会卡（前一个 commit 解决了一类），
+    # 我们不想让 BEST_EFFORT 音频写入与 RELIABLE reply publish 抢队。
+    # 不挂 service / peer_listener：本 Hub 纯 DataWriter host。
+    audio_hub = None
     global _AUDIO_CHUNK_WRITER
     try:
+        from wdndds.dds._rpc import Hub as _RpcHub
         from wdndds.dds import create_topic_writer
+        audio_hub = _RpcHub(
+            participant_name=f"compute_worker-audio-{device_name}-{model_id}",
+            domain_id=0,
+            discovery_servers=[],
+        )
+        audio_hub.start()
         _AUDIO_CHUNK_WRITER = create_topic_writer(
-            hub, f"wdndds/audio/tts_chunk/{model_id}",
+            audio_hub, f"wdndds/audio/tts_chunk/{model_id}",
             qos_kind="best_effort")
         LOG.info("audio_chunk_writer: ready on "
-                 "wdndds/audio/tts_chunk/%s (BEST_EFFORT)", model_id)
+                 "wdndds/audio/tts_chunk/%s (BEST_EFFORT, separate_hub=True)",
+                 model_id)
     except Exception as e:  # noqa: BLE001
         LOG.warning("audio_chunk_writer: DDS init failed (%s); "
                     "LAN TTS streaming will fall back to WAV-only", e)
         _AUDIO_CHUNK_WRITER = None
+        if audio_hub is not None:
+            try:
+                audio_hub.close()
+            except Exception:
+                pass
+            audio_hub = None
 
     # Legacy compat: if --npu was passed on the command line, build the
     # session eagerly so old systemd / debug workflows keep working.
@@ -1601,6 +1629,11 @@ def main() -> int:
             pass
         try:
             hub.close()
+        except Exception:
+            pass
+        try:
+            if audio_hub is not None:
+                audio_hub.close()
         except Exception:
             pass
     return 0
