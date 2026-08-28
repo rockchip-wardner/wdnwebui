@@ -2,8 +2,8 @@
 
 Whole-file:
 - ``GET  /api/config``        — current snapshot + on-disk path (JSON body)
-- ``GET  /api/config/export`` — download the raw ``config.json`` file
-- ``POST /api/config/import`` — upload a new ``config.json`` (multipart
+- ``GET  /api/config/export`` — download the raw ``config.jsonc`` file
+- ``POST /api/config/import`` — upload a new ``config.jsonc`` (multipart
   file), validate it parses to a JSON object, persist atomically.
 
 Per-section (``base`` for now):
@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app.services.config import get_config
+from app.services.jsonc import parse_jsonc
 
 
 router = APIRouter(tags=["config"])
@@ -54,7 +55,7 @@ def _random_device_name() -> str:
 # `device_name` is a human-readable identifier for this device. The
 # default is generated once (random 8-char alphanumeric) the first time
 # the `base` section is read without one, then persisted to
-# ``config.json`` so the value stays stable across reads and reboots.
+# ``config.jsonc`` so the value stays stable across reads and reboots.
 # Users can overwrite it via PUT /api/config/base.
 #
 # `model_path` is the on-device directory where downstream SDKs (e.g.
@@ -127,7 +128,7 @@ class BaseConfig(BaseModel):
 # 系统配置 page. Defaults live in ``app/services/detector.py``
 # (``DEFAULT_*_DESC``). Three-layer nesting on disk:
 #
-#     config.json["compute"]["app_prompts"][<app_key>][<schema_cls>][<field>]
+#     config.jsonc["compute"]["app_prompts"][<app_key>][<schema_cls>][<field>]
 #
 # Adding a new app's prompts:
 #   1. Define a new ``<Schema>Prompts`` class with ``field_validator``
@@ -234,7 +235,7 @@ class AppPromptsConfig(BaseModel):
     detector-side default") but get pruned from the persisted
     payload in :func:`put_app_prompts` via
     :func:`_strip_empty_strings` so they never overwrite an existing
-    user value nor appear as ``""`` in ``config.json``."""
+    user value nor appear as ``""`` in ``config.jsonc``."""
 
     model_config = {"extra": "ignore", "validate_default": True}
 
@@ -306,7 +307,7 @@ def _generate_missing_defaults(stored: dict[str, Any]) -> dict[str, Any]:
     if not str(merged.get("device_name") or "").strip():
         merged["device_name"] = _random_device_name()
         changed = True
-    # Persist the other defaults too so config.json is a complete record
+    # Persist the other defaults too so config.jsonc is a complete record
     # of what's actually in effect (otherwise a fresh install would only
     # see `device_name` written, with the rest living only as Pydantic
     # defaults invisible on disk).
@@ -334,7 +335,7 @@ async def get_config_endpoint() -> dict:
 
 @router.get("/config/export")
 async def export_config() -> FileResponse:
-    """Serve the on-disk config.json as a download."""
+    """Serve the on-disk config.jsonc as a download."""
     store = get_config()
     if not store.path.exists():
         # First-time boot with no file: write an empty object so the
@@ -343,17 +344,19 @@ async def export_config() -> FileResponse:
     return FileResponse(
         store.path,
         media_type="application/json",
-        filename="config.json",
+        filename="config.jsonc",
     )
 
 
 @router.post("/config/import")
 async def import_config(file: UploadFile = File(...)) -> dict:
-    """Replace the on-disk config.json with the uploaded one.
+    """Replace the on-disk config.jsonc with the uploaded one.
 
-    Validates: non-empty, valid UTF-8, parses as JSON, top-level value
+    Validates: non-empty, valid UTF-8, parses as JSONC, top-level value
     is a JSON object (lists / scalars are rejected so config stays a
-    strict key→value bag).
+    strict key→value bag). JSONC means ``//`` and ``/* */`` comments
+    are accepted on the way in; user-written comments are *not*
+    preserved through the import (the next save will discard them).
     """
     raw = await file.read()
     if not raw:
@@ -363,9 +366,11 @@ async def import_config(file: UploadFile = File(...)) -> dict:
     except UnicodeDecodeError as e:
         raise HTTPException(status_code=400, detail=f"不是 UTF-8: {e}") from e
     try:
-        decoded = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"JSON 解析失败: {e}") from e
+        decoded = parse_jsonc(text)
+    except ValueError as e:
+        # json5 raises ValueError on parse failure; this catches both
+        # standard-JSON syntax errors and JSONC-only constructs gone wrong.
+        raise HTTPException(status_code=400, detail=f"JSONC 解析失败: {e}") from e
     if not isinstance(decoded, dict):
         raise HTTPException(
             status_code=400,
@@ -436,7 +441,7 @@ async def put_base_config(payload: BaseConfig) -> dict:
 def _app_prompts_leaf(
     app_prompts: dict[str, Any], app_key: str, schema_cls: str, field: str
 ) -> str:
-    """Read a single leaf string from ``compute.app_prompts``.
+    """Read a single leaf string from the prompts block.
 
     Walks ``app_prompts → app_key → schema_cls → field`` defensively
     (every layer can be absent / wrong-typed if the config was hand-
@@ -451,6 +456,44 @@ def _app_prompts_leaf(
     if not isinstance(cur, str):
         return ""
     return cur.strip()
+
+
+def _read_app_prompts() -> dict[str, Any]:
+    """Return the current prompts dict (always a dict, may be empty).
+
+    Read path prefers ``app.prompts`` (new layout, v0.11+); falls back
+    to ``compute.app_prompts`` for files carried over from older
+    releases so a fresh boot doesn't lose user overrides. The fallback
+    is intentionally read-only — ``put_app_prompts`` always writes to
+    ``app.prompts``, which on next save replaces the stale
+    ``compute.app_prompts`` cleanly (it's a top-level set_section on
+    the whole dict).
+    """
+    cfg_store = get_config()
+    # New path
+    app_cfg = cfg_store.get_section("app", {}) or {}
+    prompts_raw = app_cfg.get("prompts")
+    if isinstance(prompts_raw, dict) and prompts_raw:
+        return prompts_raw
+    # Backward-compat fallback
+    compute_cfg = cfg_store.get_section("compute", {}) or {}
+    prompts_raw = compute_cfg.get("app_prompts")
+    return prompts_raw if isinstance(prompts_raw, dict) else {}
+
+
+def _write_app_prompts(prompts: dict[str, Any]) -> None:
+    """Persist the prompts dict to ``app.prompts``.
+
+    Writes the whole ``app`` section back via ``set_section("app", ...)``
+    so sibling app-level keys (added later) are preserved.
+    """
+    cfg_store = get_config()
+    app_section = cfg_store.get_section("app", {}) or {}
+    if not isinstance(app_section, dict):
+        app_section = {}
+    app_section = dict(app_section)
+    app_section["prompts"] = json.loads(json.dumps(prompts))
+    cfg_store.set_section("app", app_section)
 
 
 def _deep_merge_dict(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -483,7 +526,7 @@ def _strip_empty_strings(d: dict[str, Any]) -> dict[str, Any]:
     default" (see :func:`put_app_prompts`), so dropping it from the
     payload prevents both (a) overwriting an existing user value
     with ``""`` during deep-merge and (b) leaving a literal ``""
-    key behind in ``config.json``.
+    key behind in ``config.jsonc``.
 
     Example:
         ``{"text": "X", "level": ""}`` → ``{"text": "X"}``
@@ -540,11 +583,14 @@ def _effective_app_prompts_section(
 
 @router.get("/config/app-prompts")
 async def get_app_prompts() -> dict:
-    """Return the ``compute.app_prompts`` section as a fully-populated
-    object — every known leaf is always present, and missing or empty
-    leaves are filled with the detector-side defaults from
+    """Return the prompts section as a fully-populated object — every
+    known leaf is always present, and missing or empty leaves are
+    filled with the detector-side defaults from
     :mod:`app.services.detector` so the page always sees the
     "effective" values the model will actually use.
+
+    Read path is ``app.prompts`` (v0.11+); falls back to
+    ``compute.app_prompts`` for configs from older releases.
 
     Shape:
 
@@ -576,18 +622,9 @@ async def get_app_prompts() -> dict:
         DEFAULT_VLM_DOC_TEXT_DESC,
     )
 
-    store = get_config()
-    compute_section = store.get_section("compute", {})
-    if not isinstance(compute_section, dict):
-        compute_section = {}
-    app_prompts_raw = compute_section.get("app_prompts", {})
-    app_prompts: dict[str, Any] = (
-        app_prompts_raw if isinstance(app_prompts_raw, dict) else {}
-    )
-
     return {
         "section": _effective_app_prompts_section(
-            app_prompts,
+            _read_app_prompts(),
             DEFAULT_VLM_DOC_TEXT_DESC,
             DEFAULT_VLM_DOC_LEVEL_DESC,
             DEFAULT_TARGET_DOC_DESC_DESC,
@@ -597,12 +634,11 @@ async def get_app_prompts() -> dict:
 
 @router.put("/config/app-prompts")
 async def put_app_prompts(payload: AppPromptsConfig) -> dict:
-    """Deep-merge ``payload`` into ``config.json["compute"]["app_prompts"]``
-    and persist the updated ``compute`` section. Other compute
-    subsections (``instances``, ``tool_call_max_iters``, ...) are
-    preserved; sibling apps in ``app_prompts`` are preserved too — a
-    PUT that only mentions ``video_detection`` never wipes
-    ``video_target_detection``.
+    """Deep-merge ``payload`` into ``config.jsonc["app"]["prompts"]``
+    and persist the updated ``app`` section. Other app subsections
+    (added in the future) are preserved; sibling apps in ``prompts``
+    are preserved too — a PUT that only mentions ``video_detection``
+    never wipes ``video_target_detection``.
 
     Validation:
 
@@ -631,28 +667,17 @@ async def put_app_prompts(payload: AppPromptsConfig) -> dict:
         DEFAULT_VLM_DOC_TEXT_DESC,
     )
 
-    store = get_config()
-    compute_section = store.get_section("compute", {})
-    if not isinstance(compute_section, dict):
-        compute_section = {}
-    existing_app_prompts_raw = compute_section.get("app_prompts", {})
-    existing_app_prompts: dict[str, Any] = (
-        existing_app_prompts_raw
-        if isinstance(existing_app_prompts_raw, dict)
-        else {}
-    )
-
+    existing_prompts = _read_app_prompts()
     incoming = _strip_empty_strings(payload.model_dump(exclude_none=True))
-    merged_app_prompts = _deep_merge_dict(existing_app_prompts, incoming)
+    merged_prompts = _deep_merge_dict(existing_prompts, incoming)
 
-    new_compute = dict(compute_section)
-    new_compute["app_prompts"] = merged_app_prompts
-    snap = store.set_section("compute", new_compute)
+    _write_app_prompts(merged_prompts)
 
+    snap = get_config().snapshot()
     return {
         "ok": True,
         "section": _effective_app_prompts_section(
-            merged_app_prompts,
+            merged_prompts,
             DEFAULT_VLM_DOC_TEXT_DESC,
             DEFAULT_VLM_DOC_LEVEL_DESC,
             DEFAULT_TARGET_DOC_DESC_DESC,
@@ -665,10 +690,9 @@ async def put_app_prompts(payload: AppPromptsConfig) -> dict:
 async def delete_app_prompts() -> dict:
     """Clear all per-app prompt overrides from config.
 
-    Removes ``compute.app_prompts`` from ``config.json`` so the GET
-    endpoint falls back to the detector-side defaults. Other compute
-    subsections (``instances``, ``tool_call_max_iters``, …) are
-    preserved.
+    Removes ``app.prompts`` from ``config.jsonc`` so the GET
+    endpoint falls back to the detector-side defaults. Other app
+    subsections (added in the future) are preserved.
 
     The response shape mirrors :func:`put_app_prompts` (same
     effective-section helper) so the UI can re-render the form without
@@ -685,10 +709,20 @@ async def delete_app_prompts() -> dict:
     )
 
     store = get_config()
+    app_section = store.get_section("app", {})
+    has_app_prompts = (
+        isinstance(app_section, dict)
+        and "prompts" in app_section
+    )
+    # Also check the legacy path so a stale compute.app_prompts gets
+    # wiped on DELETE — matches the GET read fallback semantics.
     compute_section = store.get_section("compute", {})
-    if not isinstance(compute_section, dict):
-        compute_section = {}
-    if "app_prompts" not in compute_section:
+    has_legacy_compute = (
+        isinstance(compute_section, dict)
+        and "app_prompts" in compute_section
+    )
+
+    if not has_app_prompts and not has_legacy_compute:
         # Already clean — skip the disk write and just return the
         # effective (default) section.
         return {
@@ -700,9 +734,19 @@ async def delete_app_prompts() -> dict:
                 DEFAULT_TARGET_DOC_DESC_DESC,
             ),
         }
-    new_compute = dict(compute_section)
-    new_compute.pop("app_prompts", None)
-    snap = store.set_section("compute", new_compute)
+
+    # Wipe both: app.prompts (new) and compute.app_prompts (legacy)
+    # so the next GET is forced onto the default path.
+    if has_app_prompts and isinstance(app_section, dict):
+        new_app = dict(app_section)
+        new_app.pop("prompts", None)
+        store.set_section("app", new_app)
+    if has_legacy_compute and isinstance(compute_section, dict):
+        new_compute = dict(compute_section)
+        new_compute.pop("app_prompts", None)
+        store.set_section("compute", new_compute)
+
+    snap = store.snapshot()
     return {
         "ok": True,
         "section": _effective_app_prompts_section(

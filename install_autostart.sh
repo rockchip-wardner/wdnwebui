@@ -64,7 +64,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=$SCRIPT_DIR
-Environment=WDNWEBUI_CONFIG=$SCRIPT_DIR/config.json
+Environment=WDNWEBUI_CONFIG=$SCRIPT_DIR/config.jsonc
 ExecStart=$SCRIPT_DIR/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5

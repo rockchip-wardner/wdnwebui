@@ -39,7 +39,7 @@ def _get_fs_root() -> str:
 
     1. ``VD_FS_ROOT`` env var (operator override; takes precedence over
        anything stored in config so a host-side lockdown still wins).
-    2. ``base.resource_dir`` from ``config.json`` — the on-device
+    2. ``base.resource_dir`` from ``config.jsonc`` — the on-device
        directory the user picked in the 基础配置 page (default
        ``/userdata``). Read live on every call so a save takes effect
        on the next click of 浏览设备.

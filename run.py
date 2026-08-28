@@ -2,7 +2,7 @@
 
 Usage:
     python run.py
-    python run.py --config /etc/wdnwebui/config.json
+    python run.py --config /etc/wdnwebui/config.jsonc
     # or
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
@@ -510,9 +510,9 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parent / "config.json",
-        help="Path to the service config.json "
-             "(default: <repo>/config.json). Propagated to the app via "
+        default=Path(__file__).resolve().parent / "config.jsonc",
+        help="Path to the service config.jsonc "
+             "(default: <repo>/config.jsonc). Propagated to the app via "
              "the WDNWEBUI_CONFIG env var.",
     )
     parser.add_argument(

@@ -1,0 +1,104 @@
+// wdnwebui 主配置文件
+//
+// 修改后需要重启服务生效的部分：
+//   - base.model_path  : 下游 SDK（wdnai 等）查找模型权重的根目录，
+//                       已被进程加载的 LLMSession 不会重新读。
+//   - 算力实例配置     : 通过算力配置页运行时改，本文件只存运行时配置。
+//
+// JSONC 格式说明：本文件允许 // 行注释和 /* 块注释 */，
+// 保存时会重新格式化（注释会被丢弃，但内容保持不变）。
+//
+// 顶层 3 个 section：
+//   base    —— 设备级配置（路径、HW 能力）
+//   compute —— RKNN 算力实例列表（services）
+//   app     —— 应用层配置（目前只有 prompts —— schema 字段的中文说明）
+{
+    // ---- 基础配置（设备级 / 跨 compute 实例）------------------------
+    "base": {
+        // 设备名：用于 LAN 内识别本机（FastDDS participant_name 后缀）
+        "device_name": "test-box",
+        // RKNN 模型权重存放目录（绝对路径）
+        "model_path": "/userdata/models/",
+        // 资源存放目录（视频检测浏览等场景的根目录）
+        "resource_dir": "/userdata",
+
+        // 本机对外公开的硬件能力（注册发现页 + 算力配置页 RK3588 列都引用）
+        "hardware_capabilities": {
+            "hwcap_video_input": true,
+            "hwcap_audio_input": true,
+            "hwcap_audio_output": true,
+            "hwcap_hdmi_display": true
+        }
+    },
+
+    // ---- 应用层配置 ----------------------------------------------------
+    // 路径：app.prompts.<app_key>.<schema_cls>.<field>
+    // 比如 app.prompts.video_detection.VLMDoc.text 写到 VLMDoc.text 的 description 上。
+    "app": {
+        "prompts": {
+            "video_detection": {
+                "VLMDoc": {
+                    "text":  "用中文一句话描述画面中的场景、主体（人/物）、动作和环境。",
+                    "level": "严重程度标签：正常 / 警告 / 危险。"
+                }
+            },
+            "video_target_detection": {
+                "TargetDoc": {
+                    "desc": "对目标框内内容的一句话中文描述。"
+                }
+            }
+        }
+    },
+
+    // ---- 算力配置 ----------------------------------------------------
+    // services[] 每条 entry 4 个字段：
+    //   name      —— MODEL_PRESETS key（如 "qwen3-vl-4b"）
+    //   label     —— 算力配置卡上显示的名字（可与 MODEL_PRESETS 内置 label 不同）
+    //   autostart —— "enabled" (开机自动 spawn+bind) / "disabled" (默认) / "hidden" (完全不显示不部署)
+    //   device    —— 0=主控 / 1=182x#0 / 2=182x#1（仅作为 UI radio + autostart 默认 NPU 的 hint，不是硬绑）
+    //
+    // 系统配置页面的算力实例列表区块会枚举所有 MODEL_PRESETS 一起列出，
+    // 即使某行不在 services[] 里也会以默认值（label=preset.label、
+    // autostart=disabled、device=1）展示，让用户可以直接编辑。
+    // 保存时也会把所有 6 条全量 PUT 回去（即使一行没改）。
+    "compute": {
+        "services": [
+            {
+                "name":      "qwen3-vl-4b",
+                "label":     "[VLM]视觉描述模型",
+                "autostart": "disabled",
+                "device":    1
+            },
+            {
+                "name":      "qwen3-tts",
+                "label":     "[TTS]文字转语音模型",
+                "autostart": "disabled",
+                "device":    1
+            },
+            {
+                "name":      "qwen3-8b",
+                "label":     "[LLM]文字对话模型",
+                "autostart": "disabled",
+                "device":    1
+            },
+            {
+                "name":      "qwen3-vl-embedding-2b",
+                "label":     "[VLEmb]视觉信息编码模型",
+                "autostart": "disabled",
+                "device":    1
+            },
+            {
+                "name":      "qwen2.5-omni-3b",
+                "label":     "[Omni]多感知描述模型",
+                "autostart": "disabled",
+                "device":    1
+            },
+            {
+                "name":      "qwen3-5-vl-4b",
+                "label":     "[VLLM]视觉和文字多模态模型",
+                "autostart": "disabled",
+                "device":    1
+            }
+        ]
+    }
+}

@@ -19,7 +19,7 @@
   从最旧历史滚动裁剪（超 ``context_limit - max_new_tokens`` 就丢更早的），
   拼 ChatML 后 ``keep_history=0`` 跑 —— 历史只写 ``content:answer``，
   不写 thinking，下一轮看不到。
-* **context_limit 可配置**：``config.json["compute"]["text_chat"]["context_limit"]``，
+* **context_limit 可配置**：``config.jsonc["compute"]["text_chat"]["context_limit"]``，
   默认 32768；每次推理前热读。超限自动裁剪最旧历史，仅单条消息超限才报错。
 * **停止 = 软停**：``stop()`` 置 ``_worker_stop_event``；proxy 的 ``chat_run``
   轮询循环感知后调 ``chat_stop`` RPC，worker 跑完返回 stopped，主进程丢本轮。
@@ -396,7 +396,7 @@ class _TextChatManager:
         self._broadcast({"type": "state", "state": self.snapshot()})
 
     def _resolve_context_limit(self) -> int:
-        """读 ``config.json["compute"]["text_chat"]["context_limit"]``。
+        """读 ``config.jsonc["compute"]["text_chat"]["context_limit"]``。
 
         默认 32768；缺失 / 类型错 / <1 → 回退默认。每次推理前重读，配置热生效。
         """

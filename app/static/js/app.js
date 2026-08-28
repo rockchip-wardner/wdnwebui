@@ -2362,7 +2362,7 @@ function onLogsFilterChanged() {
  *  base config page (基础配置) — currently just one field: the RKNN   *
  *  model_path. Read on click via GET /api/config/base; saved with    *
  *  PUT /api/config/base which validates the absolute-path shape and  *
- *  atomically swaps the "base" section in config.json without        *
+ *  atomically swaps the "base" section in config.jsonc without       *
  *  touching other sections.                                         *
  * ------------------------------------------------------------------ */
 const Base = {
@@ -2400,7 +2400,198 @@ const Base = {
 
     const promptsResetBtn = document.getElementById("bc-prompts-reset");
     if (promptsResetBtn) promptsResetBtn.addEventListener("click", () => this.resetPrompts());
+
+    // 算力实例列表固定列（所有 MODEL_PRESETS），无需添加按钮。
   },
+
+  // ----- 算力实例列表（compute.services[]，枚举所有 preset）----- #
+  // 系统配置页的算力实例区块：表格覆盖全部 MODEL_PRESETS，
+  // 不论 config.jsonc 里 services[] 是否已经写到它。每行可独立
+  // 编辑 label / autostart / device；不在 services[] 里的行用
+  // 默认值（label = preset.label, autostart = disabled, device = 1）
+  // —— 用户可以直接编辑它，省掉「+ 添加」按钮的中间步骤。
+  // 保存路径：收集所有行全量 PUT 给后端（不再是局部差集），
+  // 后端 Pydantic 校验通过后写盘。
+
+  /** Render the table: one row per MODEL_PRESETS key, with values from
+   *  ``services`` (the config.jsonc contents) or defaults.
+   *
+   * ``services```` is [{name, label, autostart, device}, ...] from
+   * GET /api/compute/config. If a preset isn't in there we still render
+   * a row with defaults — that's the whole point of this section.
+   */
+  renderServices(services) {
+    const tbody = document.getElementById("bc-cs-tbody");
+    if (!tbody) return;
+    tbody.textContent = "";
+
+    // Index current services by name so we can fast-lookup each preset.
+    const byName = new Map();
+    for (const s of (services || [])) {
+      if (s && s.name) byName.set(s.name, s);
+    }
+
+    // Stable order: walk CC_PRESET_META keys (mirrors MODEL_PRESETS).
+    const presetIds = Object.keys(CC_PRESET_META || {});
+    if (!presetIds.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 4;
+      td.className = "bc-cs-empty";
+      td.textContent = "（未检测到任何 MODEL_PRESETS —— 这通常是 SDK 加载失败，请检查 wdnai 安装）";
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
+
+    for (const name of presetIds) {
+      const meta = CC_PRESET_META[name] || {};
+      const existing = byName.get(name);
+      const entry = existing || {
+        name,
+        label: meta.label || name,
+        autostart: "disabled",
+        device: 1,
+      };
+      tbody.appendChild(this._renderServiceRow(entry));
+    }
+  },
+
+  /** Build one <tr> for the services table. */
+  _renderServiceRow(entry) {
+    const tr = document.createElement("tr");
+    tr.dataset.name = entry.name || "";
+    if (entry.autostart === "hidden") tr.classList.add("is-hidden");
+
+    // --- name (read-only — preset id; 不能从 UI 改名) ---
+    const tdName = document.createElement("td");
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "bc-input bc-input-name";
+    nameInput.value = entry.name || "";
+    nameInput.readOnly = true;
+    nameInput.title = "name 锁定为 MODEL_PRESETS key；如需更换请改 MODEL_PRESETS";
+    tdName.appendChild(nameInput);
+    tr.appendChild(tdName);
+
+    // --- label ---
+    const tdLabel = document.createElement("td");
+    const labelInput = document.createElement("input");
+    labelInput.type = "text";
+    labelInput.className = "bc-input";
+    labelInput.value = entry.label || "";
+    labelInput.placeholder = "算力配置卡显示的名字";
+    labelInput.dataset.field = "label";
+    labelInput.maxLength = 64;
+    tdLabel.appendChild(labelInput);
+    tr.appendChild(tdLabel);
+
+    // --- autostart ---
+    const tdAuto = document.createElement("td");
+    const autoSel = document.createElement("select");
+    autoSel.className = "bc-input";
+    autoSel.dataset.field = "autostart";
+    for (const v of ["disabled", "enabled", "hidden"]) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = v;
+      if (v === (entry.autostart || "disabled")) opt.selected = true;
+      autoSel.appendChild(opt);
+    }
+    tdAuto.appendChild(autoSel);
+    tr.appendChild(tdAuto);
+
+    // --- device ---
+    const tdDev = document.createElement("td");
+    const devSel = document.createElement("select");
+    devSel.className = "bc-input";
+    devSel.dataset.field = "device";
+    for (const v of [0, 1, 2]) {
+      const opt = document.createElement("option");
+      opt.value = String(v);
+      opt.textContent = v === 0 ? "0 (主控)" : `${v} (182x#${v - 1})`;
+      if (Number(v) === Number(entry.device ?? 1)) opt.selected = true;
+      devSel.appendChild(opt);
+    }
+    tdDev.appendChild(devSel);
+    tr.appendChild(tdDev);
+
+    return tr;
+  },
+
+  /** Read all rows in the table into [{name, label, autostart, device}, ...].
+   *  Always emits one row per MODEL_PRESETS (the table always shows all
+   *  of them, so collection is symmetric).
+   */
+  _collectServices() {
+    const tbody = document.getElementById("bc-cs-tbody");
+    if (!tbody) return [];
+    const out = [];
+    for (const tr of tbody.querySelectorAll("tr[data-name]")) {
+      const name = tr.dataset.name || "";
+      const label = tr.querySelector('input[data-field="label"]')?.value.trim() || "";
+      const autostart = tr.querySelector('select[data-field="autostart"]')?.value || "disabled";
+      const device = parseInt(
+        tr.querySelector('select[data-field="device"]')?.value || "1",
+        10,
+      );
+      if (!name) continue;
+      out.push({ name, label, autostart, device });
+    }
+    return out;
+  },
+
+  /** Load compute.services from GET /api/compute/config. */
+  async loadServices() {
+    try {
+      const r = await fetch(API_PREFIX + "/compute/config");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      this.renderServices(data.services || []);
+    } catch (e) {
+      console.error("loadServices failed:", e);
+      this.setFoot("加载算力实例列表失败: " + e.message, "danger");
+    }
+  },
+
+  /** Persist the table to PUT /api/compute/config. Returns a structured
+   *  result so Base.save can compose the success/error message:
+   *
+   *      { ok: true } | { ok: false, msg: "..." }
+   */
+  async saveServices() {
+    const services = this._collectServices();
+    // Client-side dedup (server validates too, but cheaper to fail fast).
+    const seen = new Set();
+    for (const s of services) {
+      if (!s.name) return { ok: false, msg: "算力实例 name 不能为空" };
+      if (!s.label) return { ok: false, msg: `${s.name}: label 不能为空` };
+      if (seen.has(s.name)) {
+        return { ok: false, msg: `同名 entry 重复: ${s.name}` };
+      }
+      seen.add(s.name);
+    }
+    try {
+      const r = await fetch(API_PREFIX + "/compute/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ services }),
+      });
+      const text = await r.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = { detail: text }; }
+      if (!r.ok) {
+        const msg = (body.detail && JSON.stringify(body.detail))
+          || ("HTTP " + r.status);
+        return { ok: false, msg: `算力实例保存失败: ${msg}` };
+      }
+      return { ok: true, count: services.length };
+    } catch (e) {
+      return { ok: false, msg: `算力实例保存异常: ${e.message}` };
+    }
+  },
+
+
 
   async load() {
     try {
@@ -2424,6 +2615,7 @@ const Base = {
       this.renderHwCapsError("加载失败: " + e2.message);
     }
     this.loadPrompts();
+    this.loadServices();
   },
 
   render(data) {
@@ -2657,6 +2849,15 @@ const Base = {
         }
       } catch (e3) {
         parts.push("⚠ 提示词保存失败: " + e3.message);
+      }
+
+      // 算力实例列表（compute.services）：写在 app.prompts 之后；
+      // 任何一项失败都不阻塞其它项的结果汇总。
+      const svcs = await this.saveServices();
+      if (svcs.ok) {
+        parts.push(`算力实例已保存（${svcs.count} 条）`);
+      } else {
+        parts.push("⚠ " + svcs.msg);
       }
 
       this.setFoot("已保存（" + parts.join(" · ") + "）", "ok");
@@ -3233,8 +3434,8 @@ PowerMenu.init();
 
 /* ------------------------------------------------------------------ *
  *  config menu: gear icon next to the power button. Opens a popover   *
- *  with two actions — export (download the current config.json) and   *
- *  import (upload a new config.json to overwrite). The hidden file    *
+ *  with two actions — export (download the current config.jsonc) and  *
+ *  import (upload a new config.jsonc to overwrite). The hidden file   *
  *  input is clicked programmatically when the user picks "导入配置".  *
  * ------------------------------------------------------------------ */
 
@@ -3368,12 +3569,12 @@ const ConfigMenu = {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "config.json";
+      a.download = "config.jsonc";
       document.body.appendChild(a);
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      this.setStatus("已导出 config.json", "ok");
+      this.setStatus("已导出 config.jsonc", "ok");
     } catch (err) {
       this.setStatus(`导出失败: ${err.message}`, "danger");
     } finally {
@@ -4335,7 +4536,7 @@ VdFsModal.pickCurrentDir = function () {
  */
 const CC_PRESET_META = {
   "qwen3-vl-4b": {
-    label: "[VL]视频描述模型",
+    label: "[VLM]视觉描述模型",
     capability_types: ["swcap_video_describe"],
     instance_name: "llm-vl",
     memory_estimate_mb: 3500,
@@ -4384,7 +4585,7 @@ const CC_PRESET_META = {
     // ——VLM-mode RKNN 既能做纯文本也能消费 vision token，一张一张卡
     // 同时满足对话页 + 视频描述页。启用后文本对话、视频描述、视频
     // 内容检索、视频文件分析、音视频描述等页均直接可用。
-    label: "[VL+LLM]Qwen3.5-VL 多模态模型",
+    label: "[VLLM]视觉和文字多模态模型",
     capability_types: ["swcap_text_chat", "swcap_video_describe"],
     instance_name: "llm-q5-vl",
     memory_estimate_mb: 3500,
@@ -5226,6 +5427,14 @@ const ComputeConfigPage = {
     titleEl.className = "cc-service-title";
     head.appendChild(titleEl);
 
+    // 策略徽章：autostart=enabled 时显示"开机自启"提示用户这个实例
+    // 是 boot 阶段就 spawn+bind 的，关掉只是 unload（worker 还在）；
+    // 重启 / 进程退出后下次 boot 还会自动拉起。
+    const autostartBadge = document.createElement("span");
+    autostartBadge.className = "cc-autostart-badge";
+    autostartBadge.style.display = "none";
+    head.appendChild(autostartBadge);
+
     const pidEl = document.createElement("span");
     pidEl.className = "cc-pid";
     pidEl.style.display = "none";
@@ -5320,7 +5529,7 @@ const ComputeConfigPage = {
     body.appendChild(errorEl);
 
     card._h = {
-      titleEl, pidEl, restartBtn, toggle, toggleInput,
+      titleEl, autostartBadge, pidEl, restartBtn, toggle, toggleInput,
       body, capsEl, missingDirEl, radioFieldsetEl,
       countdownEl, errorEl,
       // radioSig：上一次 _makeTargetFieldset 的输入签名；
@@ -5360,6 +5569,17 @@ const ComputeConfigPage = {
 
     // ---- title
     h.titleEl.textContent = meta.label;
+
+    // ---- autostart 徽章：enabled → 显示"开机自启"
+    if (svc._autostart === "enabled") {
+      h.autostartBadge.textContent = "开机自启";
+      h.autostartBadge.title = "compute.services[] 的 autostart=enabled —— boot 时自动 spawn + bind NPU；reload / 重启后会自动恢复";
+      h.autostartBadge.style.display = "";
+    } else {
+      h.autostartBadge.style.display = "none";
+      h.autostartBadge.textContent = "";
+      h.autostartBadge.title = "";
+    }
 
     // ---- PID
     if (svc.pid && svc._source !== "adopted" && svc._source !== "unavailable") {
@@ -5786,6 +6006,8 @@ const ComputeConfigPage = {
     );
 
     // 默认选中：用户已记录 → 那个；否则 instance.npu_index >= 0 → 那个；
+    // 否则从 config.compute.services[].device 推出的 default_npu_index
+    // （算力配置 autostart=enabled/disabled 都靠这个绑 NPU）；
     // 否则按 npu_index 升序排好后的第一个 supported 的 target。
     let defaultIdx = null;
     if (this._selectedTarget[modelId] != null
@@ -5795,6 +6017,10 @@ const ComputeConfigPage = {
     } else if (inst && inst.npu_index >= 0
                && sortedIndices.includes(inst.npu_index)) {
       defaultIdx = inst.npu_index;
+    } else if (inst && Number.isInteger(inst._default_npu_index)
+               && inst._default_npu_index >= 0
+               && sortedIndices.includes(inst._default_npu_index)) {
+      defaultIdx = inst._default_npu_index;
     } else {
       for (const idx of sortedIndices) {
         if (supported.has("182x")) { defaultIdx = idx; break; }
@@ -5952,10 +6178,12 @@ const Discovery = {
     const enableAll  = document.getElementById("discovery-hw-enable-all");
     const disableAll = document.getElementById("discovery-hw-disable-all");
     const saveBtn    = document.getElementById("discovery-hw-save");
+    const refreshBtn = document.getElementById("discovery-refresh");
 
     if (enableAll)  enableAll .addEventListener("click", () => this.setAllHw(true));
     if (disableAll) disableAll.addEventListener("click", () => this.setAllHw(false));
     if (saveBtn)    saveBtn   .addEventListener("click", () => this.saveHw());
+    if (refreshBtn) refreshBtn.addEventListener("click", () => this.load());
   },
 
   async load() {
@@ -6035,7 +6263,7 @@ const Discovery = {
     if (hint) hint.textContent = `${enabledCount} / ${this._hwCaps.length} 已启用`;
     if (summary) {
       summary.textContent = this._hwDirty
-        ? "有未保存的修改 —— 点“保存修改”写入 config.json。"
+        ? "有未保存的修改 —— 点“保存修改”写入 config.jsonc。"
         : "本机硬件能力（HW）配置；勾选/取消勾选后保存即生效。";
     }
     if (saveBtn) {

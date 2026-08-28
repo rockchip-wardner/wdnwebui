@@ -179,7 +179,7 @@ def _build_vlm_doc_class(text_desc: str, level_desc: str):
 
 # --------------------------------------------------------------------------- #
 # Schema cache keyed by (schema_name, tuple(sorted(field_descs))). The key
-# includes the description strings so any PUT to compute.app_prompts that
+# includes the description strings so any PUT to app.prompts that
 # changes one of the user-configurable Field descriptions yields a different
 # key and triggers a rebuild. Schema rebuilds only happen on key miss —
 # typically at most once per "保存" click in the 系统配置 page, not per
@@ -191,12 +191,27 @@ _SCHEMA_CACHE: dict[tuple, type] = {}
 
 
 def _load_app_prompts(app_key: str, schema_cls: str) -> dict[str, str]:
-    """从 config.json["compute"]["app_prompts"][app_key][schema_cls] 读 schema 提示词覆盖。
-    缺字段 / 空值 → fallback 到 DEFAULT_*_DESC（不写盘）。
+    """从 config.jsonc["app"]["prompts"][app_key][schema_cls] 读 schema 提示词覆盖。
+
+    配置结构在 v0.11 重整：``compute.app_prompts`` → ``app.prompts``
+    （新顶层 ``app`` section 装所有"应用层"用户配置 —— 目前只有 prompts，
+    未来可能加更多）。读路径保留 ``compute.app_prompts`` 兜底，让老
+    config.jsonc 不需要手动迁移；后续任意 save 触发落盘后，老路径会
+    自然被 ``app.prompts`` 替换。
+
+    缺字段 / 空值 → fallback 到 ``DEFAULT_*_DESC``（不写盘）。
     """
-    cfg = get_config().get_section("compute", {}) or {}
-    app_prompts = cfg.get("app_prompts") or {}
-    app_block = app_prompts.get(app_key) or {}
+    cfg_store = get_config()
+    # New path: app.prompts
+    app_cfg = cfg_store.get_section("app", {}) or {}
+    prompts = app_cfg.get("prompts") or {}
+    if not isinstance(prompts, dict) or not prompts:
+        # Backward-compat fallback: compute.app_prompts
+        compute_cfg = cfg_store.get_section("compute", {}) or {}
+        prompts = compute_cfg.get("app_prompts") or {}
+    if not isinstance(prompts, dict):
+        prompts = {}
+    app_block = prompts.get(app_key) or {}
     schema_block = app_block.get(schema_cls) or {}
     result: dict[str, str] = {}
     # 映射表：每个 schema 类的可配字段名 → 默认常量
@@ -462,7 +477,7 @@ class WdnaiDetector:
     续调多次 ``@Callable`` 工具（如 ``tts_alert``），每轮的"工具调
     用 + 返回"会以**文本 attachment** 形式回灌到下一轮的 prompt，
     直到模型返回 ``generating`` schema 的实例或循环上限命中。循环
-    上限从 ``config.json["compute"]["tool_call_max_iters"]`` 读取，
+    上限从 ``config.jsonc["compute"]["tool_call_max_iters"]`` 读取，
     默认 5；``0`` 表示无限循环（仍受 ``_ABSOLUTE_MAX_ITERS`` 硬上
     限兜底，防止失控模型锁死 worker）。``TargetDoc`` 模式没有工
     具，因此循环天然只跑一轮就跳出。
@@ -475,7 +490,7 @@ class WdnaiDetector:
     # 锁死。200 次 × 1s/inference ≈ 3 分钟单帧最坏延迟，足够 cover
     # 任何合理的多工具串联场景，又不至于把队列永久堵住。
     _ABSOLUTE_MAX_ITERS = 200
-    # 默认循环上限（config.json 缺失 / 类型不对 / 负值时使用）。
+    # 默认循环上限（config.jsonc 缺失 / 类型不对 / 负值时使用）。
     _DEFAULT_MAX_ITERS = 5
 
     def __init__(self, *, generating_cls=None) -> None:
@@ -1101,7 +1116,7 @@ class WdnaiDetector:
 
     # ------------------------------------------------------------------ #
     def _get_tool_call_max_iters(self) -> int:
-        """读 ``config.json["compute"]["tool_call_max_iters"]``。
+        """读 ``config.jsonc["compute"]["tool_call_max_iters"]``。
 
         默认 ``5``；``0`` 表示无限（仍受 ``_ABSOLUTE_MAX_ITERS`` 兜底）；
         缺失 / 类型错误 / 负值 → 回退到 ``5``。每次推理前重读，配置热生效。

@@ -80,12 +80,12 @@ def create_app() -> FastAPI:
 
     app.add_middleware(NoCacheStaticMiddleware)
 
-    # Resolve the on-disk config.json path early so it shows up in the
+    # Resolve the on-disk config.jsonc path early so it shows up in the
     # /health endpoint and the UI's config popover can render its
     # absolute path. Missing files are tolerated — they read as {}.
     cfg = get_config()
 
-    # Propagate WDNAI_MODELS_DIR from config.json so downstream SDKs
+    # Propagate WDNAI_MODELS_DIR from config.jsonc so downstream SDKs
     # (wdnai's `_models_root()`) pick up the configured model root
     # without each consumer having to read config separately. Setting
     # it before any LLMSession is built means the SDK reads the right

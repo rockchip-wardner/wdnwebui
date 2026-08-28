@@ -5,7 +5,7 @@ Endpoints
 * ``GET    /api/compute``                  完整 snapshot（cards / services /
                                           instances / capabilities / tools）。
                                           UI 算力配置页 / discovery 页都从这里读。
-* ``GET    /api/compute/config``           读 ``config.json["compute"]`` 数据。
+* ``GET    /api/compute/config``           读 ``config.jsonc["compute"]`` 数据。
 * ``PUT    /api/compute/config``           全量替换 ``compute`` section。
 * ``POST   /api/compute/instances``        ``{npu_index, model}`` → 用户在算力
                                           配置页点"启用"。两步：
@@ -34,7 +34,7 @@ Endpoints
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
@@ -104,15 +104,93 @@ class RestartRequest(BaseModel):
         return v
 
 
+class ServiceEntry(BaseModel):
+    """``compute.services[]`` 的单条 entry schema。
+
+    ``name``    ——  ``MODEL_PRESETS`` key（如 ``"qwen3-vl-4b"``）。
+    ``label``   ——  在算力配置卡上显示的名字（可与 preset 默认 label
+                  不同，让用户自定义品牌名）。
+    ``autostart`` ——  ``"enabled"`` / ``"disabled"`` / ``"hidden"``
+                  * ``enabled``:  boot 时 spawn worker + RPC bind 到
+                    NPU；服务常驻，重启 / reload 后自动恢复。
+                  * ``disabled``: boot 时仅 adopt 现有 peer（不 spawn /
+                    不 bind）。用户需在算力配置页点 启用 才加载模型。
+                  * ``hidden``:   完全禁用 —— boot 不碰、UI 不渲染、
+                    capability 也不对外暴露。相当于"在文件里注释掉"。
+    ``device``  ——  物理设备号（不是 npu_index）:
+                  * ``0`` —— 主控（RK3588 主机；当前没有 preset 跑这里）
+                  * ``1`` —— 第一张 RK182x 卡
+                  * ``2`` —— 第二张 RK182x 卡
+                  boot bind / UI radio 默认都按这个号选 NPU，但用户仍
+                  可在 radio 里手动覆盖（device 是 hint，不是硬绑）。
+
+    校验规则：
+    * ``name`` 必须在 ``MODEL_PRESETS`` 中存在（否则 422）；
+    * ``autostart`` 必须是上述三选一；
+    * ``device`` 必须是 0 / 1 / 2（其它值 422）；
+    * 同名 entry 在同一份 config 里**只允许一条**（多于一条 → 422）。
+    """
+
+    model_config = {"extra": "ignore"}
+
+    name: str
+    label: str
+    autostart: Literal["enabled", "disabled", "hidden"] = "disabled"
+    device: int = 1
+
+    @field_validator("name")
+    @classmethod
+    def _known_model(cls, v: str) -> str:
+        if v not in MODEL_PRESETS:
+            raise ValueError(
+                f"未知 model: {v!r}（可选: {sorted(MODEL_PRESETS.keys())}）"
+            )
+        return v
+
+    @field_validator("label")
+    @classmethod
+    def _label_nonempty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("label 不能为空")
+        return v
+
+    @field_validator("device")
+    @classmethod
+    def _device_in_range(cls, v: int) -> int:
+        if v not in (0, 1, 2):
+            raise ValueError(f"device 必须是 0/1/2（主控 / 182x#0 / 182x#1），got {v}")
+        return v
+
+
 class ComputeConfigPayload(BaseModel):
     """``PUT /api/compute/config`` 入参。
 
-    其它字段（hardware_capabilities / app_prompts /
+    ``services`` 每条由 :class:`ServiceEntry` 校验；同名 entry 在一份
+    config 里只允许一条（构造时在 model validator 里统一去重）。
+
+    其它字段（hardware_capabilities / app.prompts /
     tool_call_max_iters 等）按现有语义落盘；``instances`` 若存在被
     ``extra="ignore"`` 丢弃（实例选择不在 config 持久化）。
     """
 
     model_config = {"extra": "ignore"}
+
+    services: list[ServiceEntry] = Field(default_factory=list)
+
+    @field_validator("services")
+    @classmethod
+    def _unique_names(cls, v: list[ServiceEntry]) -> list[ServiceEntry]:
+        seen: set[str] = set()
+        for entry in v:
+            if entry.name in seen:
+                raise ValueError(
+                    f"compute.services 含重复 name: {entry.name!r}；"
+                    "同名 entry 只允许一条（要部署多实例请加 NPU 容量"
+                    "或拆分 capability，不在 config 层支持）"
+                )
+            seen.add(entry.name)
+        return v
 
 
 # --------------------------------------------------------------------------- #
@@ -160,18 +238,32 @@ async def get_compute(response: Response) -> dict:
 
 @router.get("/compute/config")
 async def get_compute_config() -> dict:
-    """读 ``config.json["compute"]``（不触发任何启动）。"""
+    """读 ``config.jsonc["compute"]``（不触发任何启动）。
+
+    ``services`` 字段是 :class:`ServiceEntry` 列表形式；如果文件里是
+    老格式（纯字符串数组），返 ``{"services": [], "legacy": [...]}"``
+    让前端能给出迁移提示（不主动改写文件 —— 用户的选择）。
+    """
     from app.services.config import get_config
     section = get_config().get_section("compute", {})
-    services = section.get("services") if isinstance(section, dict) else None
-    if not isinstance(services, list):
-        services = []
-    return {"services": services}
+    services_raw = section.get("services") if isinstance(section, dict) else None
+    services_out: list[dict] = []
+    legacy: list = []
+    if isinstance(services_raw, list):
+        for entry in services_raw:
+            if isinstance(entry, str):
+                legacy.append(entry)
+            elif isinstance(entry, dict):
+                services_out.append(entry)
+    result: dict = {"services": services_out}
+    if legacy:
+        result["legacy"] = legacy
+    return result
 
 
 @router.put("/compute/config")
 async def put_compute_config(payload: ComputeConfigPayload) -> dict:
-    """全量替换 ``config.json["compute"]``，**不**触发 live 启动。
+    """全量替换 ``config.jsonc["compute"]``，**不**触发 live 启动。
 
     Pydantic ``extra="ignore"``：未知字段（``instances`` 等）静默丢弃。
     """
@@ -286,7 +378,7 @@ async def get_capabilities() -> dict:
 
     * ``sw_capabilities`` 来自 running/loading/not_loaded 实例
     * ``hw_capabilities`` 来自 ``HARDWARE_CAPABILITIES`` 静态列表
-      + ``config.json["compute"]["hardware_capabilities"]`` 的 enabled 状态。
+      + ``config.jsonc["base"]["hardware_capabilities"]`` 的 enabled 状态。
     """
     reg = get_registry()
     return {
@@ -325,7 +417,7 @@ class HardwareCapabilityUpdate(BaseModel):
 
 @router.put("/compute/hardware-capabilities")
 async def put_hardware_capabilities(payload: HardwareCapabilityUpdate) -> dict:
-    """更新 HW 能力启用状态，落盘到 ``config.json["compute"]["hardware_capabilities"]``。"""
+    """更新 HW 能力启用状态，落盘到 ``config.jsonc["base"]["hardware_capabilities"]``。"""
     reg = get_registry()
     result = reg.set_hardware_capability_state(payload.updates)
     return {

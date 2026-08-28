@@ -151,12 +151,12 @@ _WORKER_IP: str = _read_local_ip()
 
 
 def _read_device_name() -> str:
-    """Resolve ``device_name`` from ``config.json["base"]``.
+    """Resolve ``device_name`` from ``config.jsonc["base"]``.
 
     Used as the FastDDS participant name suffix so LAN peers can
     identify which board each worker is running on. Falls back to the
     host's ``socket.gethostname()`` when the field is missing or
-    ``config.json`` is unreachable (workers running before the main
+    ``config.jsonc`` is unreachable (workers running before the main
     process, or in a stripped-down test environment).
     """
     try:
@@ -1387,10 +1387,10 @@ def router(service_name: str, payload: Any, state: dict,
 # Main — wdndds cshim Hub as RPC server                                      #
 # --------------------------------------------------------------------------- #
 def _config_path() -> str:
-    """Resolve config.json path from WDNWEBUI_CONFIG env var, defaulting
-    to the repo root config.json."""
+    """Resolve config.jsonc path from WDNWEBUI_CONFIG env var, defaulting
+    to the repo root config.jsonc."""
     import os
-    return os.environ.get('WDNWEBUI_CONFIG') or '/userdata/wdnwebui/config.json'
+    return os.environ.get('WDNWEBUI_CONFIG') or '/userdata/wdnwebui/config.jsonc'
 
 
 def main() -> int:

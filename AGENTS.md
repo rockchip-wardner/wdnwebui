@@ -32,7 +32,7 @@ creation); everything below is verified against the current tree.
    找不到对应 capability 就抛 `RuntimeError("功能未启用: <capability>")`，
    由调用方决定如何向上层报告（视频监控选择静默 error 返回，不阻塞 16 路
    解码；视频检测 / 语音生成选择 raise，由 HTTP 层 502 透传给前端）。
-实例集合在 算力配置 页配置，存到 `config.json["compute"]["instances"]`，
+实例集合在 算力配置 页配置，存到 `config.jsonc["compute"]["instances"]`，
     `run.py` 启动时**逐个 spawn 独立 compute_worker 子进程**（不阻塞 UI）。
 5. **所有演示页（音视频描述 / 视频目标检测 / 视频内容检索 / 语音生成）
    离开时必须主动关闭后台运行**。`app/static/js/app.js` 的 `DemoGuard`
@@ -449,7 +449,7 @@ class AudioEvent:
 * `compute_worker.py:_build_session` / `compute_worker_lazy.py:_preset_for`
   都加了 `model_id == "qwen2.5-omni-3b"` 分支（`SLM.qwen_2_5_omni_3b()`）。
 * `_LEGACY_CAPABILITY_TYPE_RENAMES` 加 `"audio_understand" → "swcap_audio_understand"`，
-  兼容老 config.json。
+  兼容老 config.jsonc。
 
 ### API 端点（`app/api/audio_analysis.py`）
 
@@ -589,7 +589,7 @@ shared session — see "Resource budget" below.
 * **Config persistence** — every per-channel edit (PATCH
   ``/api/surveillance/config/{id}``) calls
   ``SurveillanceManager.update_config()`` which writes the full
-  16-channel array back to ``config.json`` under
+  16-channel array back to ``config.jsonc`` under
   ``surveillance.channels[]``. Reset (POST
   ``/api/surveillance/reset``) restores the 16 default entries.
   Missing fields are back-filled with defaults so older configs keep
@@ -669,27 +669,43 @@ shared session — see "Resource budget" below.
 
 ## Configuration
 
-The service reads a single JSON-object `config.json` from disk and
+The service reads a single JSONC file `config.jsonc` from disk and
 holds it in memory. The file is seeded with a `base` section at
 `{}` + future sections stacked alongside it.
 
+- **JSONC, not JSON** — the on-disk file is JSONC (JSON with `//`
+  line comments and `/* ... */` block comments), parsed via the
+  ``json5`` library through ``app/services/jsonc.py``. **User-written
+  comments are accepted on read but discarded on write**: any save
+  through ``PUT /api/config/...`` or ``POST /api/config/import``
+  emits a freshly formatted JSONC file with no comments. Hand-edited
+  comments stay intact as long as nothing triggers a backend save;
+  once any save fires, they're gone. Rationale: round-tripping
+  comments faithfully would need a token-level rebuild that's brittle
+  to key reordering / nested array comments / multi-line block comments;
+  the simpler contract is "comments are for humans reading the file,
+  the backend rewrites it cleanly on save".
 - **Where it lives** — resolved from `WDNWEBUI_CONFIG` env var when
-  `run.py` starts (set by `--config /path/to/config.json`); if unset,
-  defaults to `<repo>/config.json`. Always absolute.
+  `run.py` starts (set by `--config /path/to/config.jsonc`); if unset,
+  defaults to `<repo>/config.jsonc`. Always absolute.
 - **Read-write** — `app/services/config.py` `ConfigStore` is a lazy
   singleton (`get_config()`) with an in-memory dict guarded by an
   `RLock`. Missing files / non-object payloads all collapse to `{}`.
 - **Atomic writes** — `replace()` / `set_section()` write a sibling
   temp file and `os.replace()`-s into place so a crash mid-write
-  can't corrupt the file.
+  can't corrupt the file. Output goes through
+  :func:`app.services.jsonc.dump_jsonc` (quoted keys, trailing commas,
+  UTF-8 native).
 - **Whole-file endpoints** (`app/api/config.py`):
   - `GET  /api/config`        — `{path, data}` (current snapshot).
   - `GET  /api/config/export` — `FileResponse` of the on-disk file
-    (downloads as `config.json`). If the file doesn't exist yet,
+    (downloads as `config.jsonc`). If the file doesn't exist yet,
     the endpoint writes `{}` first so the download always succeeds.
   - `POST /api/config/import` — `multipart/form-data` upload (field
-    name `file`). Validates UTF-8, JSON parse, top-level object —
-    rejects empty bodies, lists, scalars with HTTP 400.
+    name `file`). Validates UTF-8, JSONC parse, top-level object —
+    rejects empty bodies, lists, scalars with HTTP 400. Uploaded
+    JSONC with comments is accepted; the persisted file drops the
+    comments on write (see "JSONC, not JSON" above).
 - **Section endpoints** — `GET /api/config/{section}` reads a
   top-level key (e.g. `base`) and fills in missing fields with
   Pydantic defaults; `PUT /api/config/{section}` replaces just that
@@ -700,7 +716,7 @@ holds it in memory. The file is seeded with a `base` section at
   - `device_name` — human-readable device identifier. The default is
     generated lazily on the first `GET /api/config/base` after a
     missing/empty value (random 8-char alphanumeric, mixed case + digits,
-    via `secrets.choice`) and persisted to `config.json` so the value
+    via `secrets.choice`) and persisted to `config.jsonc` so the value
     stays stable across reads and reboots. Validated as non-empty
     (whitespace stripped).
   - `model_path` — absolute directory where RKNN model weights live
@@ -727,7 +743,7 @@ holds it in memory. The file is seeded with a `base` section at
   picker) / 检测提示词 / 检测尺寸 (384 / 768 单选下拉) / 播放 /
   检测 toggles.
   Save button does `PUT /api/surveillance/config` with the full
-  16-channel array; the same `config.json` powers the dedicated
+  16-channel array; the same `config.jsonc` powers the dedicated
   视频监控 sidebar page, so edits round-trip through the shared
   store. The browse button sets `VdFsModal._sourceTarget` to the
   row's source input before opening the modal; the
@@ -765,15 +781,19 @@ holds it in memory. The file is seeded with a `base` section at
   跨机器发现走 FastDDS SIMPLE multicast（v0.6+），`ComputeRegistry`
   的 `Hub` 服务名 `wdndds/rpc/<model_id>` 自动暴露给 peer。
 
-## App 提示词模板 (compute.app_prompts)
+## App 提示词模板 (app.prompts)
 
-`config.json["compute"]["app_prompts"]` 是一个 3 层 schema 驱动的提示词模板
+`config.jsonc["app"]["prompts"]` 是一个 3 层 schema 驱动的提示词模板
 配置 —— 给 wdnai 的 `@Generable` schema class (`VLMDoc` / `TargetDoc`)
 的每个 `Field(description=...)` 提供用户可编辑的中文说明。模型根据
 `description` 推断字段语义，描述越具体，返回字段越稳。
 
-* **路径** — `compute.app_prompts.<app_key>.<schema_cls>.<field>`，
-  三段都是字面 key。例如 `compute.app_prompts.video_detection.VLMDoc.text`
+v0.11 起从 `compute.app_prompts` 挪到独立 `app` section（顶层
+`base / app / compute` 三层结构更清晰 —— prompts 跟硬件能力 / 算力
+实例是不同抽象层）。
+
+* **路径** — `app.prompts.<app_key>.<schema_cls>.<field>`，
+  三段都是字面 key。例如 `app.prompts.video_detection.VLMDoc.text`
   写到 `text: str` 这一个 field 的 description 上。
 * **当前可配字段 (3 项)**：
   - `video_detection.VLMDoc.text` — 音视频描述页 `text` 字段描述。
@@ -828,7 +848,7 @@ holds it in memory. The file is seeded with a `base` section at
 `#page-discovery` 内部按从上到下两个 pane 排布：
 
 1. **硬件能力 (HW)** —— 本机硬件能力开关，源自 `HARDWARE_CAPABILITIES` 静态表 +
-   `config.json["compute"]["hardware_capabilities"]` 启用状态。checkbox 修改后
+   `config.jsonc["base"]["hardware_capabilities"]` 启用状态。checkbox 修改后
    点"保存修改"才落盘，避免误触。
 2. **软件能力 (SW)** —— 当前 running 实例暴露的能力（每条来自一个 RKNN 模型实例）。
 
@@ -951,11 +971,11 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   worker 独立进程生命周期由 systemd / 手动 / 跨主机发现共同管理。
 
 - **单帧工具循环硬上限**：`WdnaiDetector._ABSOLUTE_MAX_ITERS = 200`
-  是兜底，不论 `config.json["compute"]["tool_call_max_iters"]` 是 0
+  是兜底，不论 `config.jsonc["compute"]["tool_call_max_iters"]` 是 0
   （无限）还是用户显式填了超大值，单帧推理都不会超过 200 次
   `sess.respond`。200 次 × 1s/inference ≈ 3 分钟单帧最坏延迟 -
   — 失控模型可以跑很久但不会锁死整个 worker 线程 / 队列。
-  配置热生效：每次推理前 `_get_tool_call_max_iters()` 重读 config.json。
+  配置热生效：每次推理前 `_get_tool_call_max_iters()` 重读 config.jsonc。
 - **probe 线程（per-instance daemon）**：每个 spawned / adopted
   ModelInstance 在创建时起一个 daemon ``_probe_instance`` 线程，1Hz
   轮询 ``info`` RPC，把 worker 的 ``not_loaded / loading / running / error``
@@ -1029,7 +1049,7 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   fallback 扫 cmdline 兼容老 worker（reload 后的第一次清理会识别
   comm="python" 的历史 worker，全清之后 cmdline 退化为 no-op）。
 - **FastDDS participant_name 命名约定 (v0.8)**：每个 DomainParticipant
-  的名字都带 `config.json["base"]["device_name"]` 后缀，方便 LAN daemon
+  的名字都带 `config.jsonc["base"]["device_name"]` 后缀，方便 LAN daemon
   的 `/peers` 端点和 DDS 调试日志一眼区分板子：
    - 主进程：`wdnwebui-main-{device_name}`
    - discovery Hub（注册发现页）：`wdnwebui-discovery-{device_name}`
@@ -1332,7 +1352,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - **history_tokens 语义**：每次 done 后覆盖为 worker 返回的
     `prompt_tokens`（最近一次实际喂给模型的 prompt token 数），前端据此
     显示上下文占用。
-  - **context_limit 可配置**：`config.json["compute"]["text_chat"]["context_limit"]`，
+  - **context_limit 可配置**：`config.jsonc["compute"]["text_chat"]["context_limit"]`，
     默认 32768；每次推理前热读（`_resolve_context_limit`）。测试多轮裁剪
     可设 2048。
   - WS broadcaster pattern：worker 线程 push 到 `asyncio.Queue` 列表，
@@ -1447,7 +1467,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 | Anything that needs a new endpoint    | Add a route inside `create_app()` in `app/main.py`        |
 | Added/removed a model preset          | `MODEL_PRESETS` in `app/services/compute_registry.py` + `register` the new capability in the same table; update `app/static/index.html` and `app/static/js/app.js` only if the UI needs new model cards |
 | `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
-| Schema hint prompts (`VLMDoc.text`/`level`, `TargetDoc.desc`) | `compute.app_prompts.<app_key>.<schema_cls>.<field>` in `config.json`; UI under 系统配置 → App 提示词模板 section. `TargetDoc.x1/y1/x2/y2` stay hardcoded in `_build_target_doc_class` (`app/services/detector.py`) — protocol-level 0–1000 归一化坐标格式说明，刻意不开 UI 编辑 |
+| Schema hint prompts (`VLMDoc.text`/`level`, `TargetDoc.desc`) | `app.prompts.<app_key>.<schema_cls>.<field>` in `config.jsonc`; UI under 系统配置 → App 提示词模板 section. `TargetDoc.x1/y1/x2/y2` stay hardcoded in `_build_target_doc_class` (`app/services/detector.py`) — protocol-level 0–1000 归一化坐标格式说明，刻意不开 UI 编辑 |
 ## Tools (音视频检测页工具)
 
 `app/services/tools/` 装的是给音视频描述页 (`WdnaiDetector` 走
@@ -1492,12 +1512,12 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 
 * **会话级，不持久化**：用户在检测页勾选的 tools 集合只
   存在内存里 (``WdnaiDetector._enabled_tools``)；重启 / 关闭页
-  面 / 停止检测都清空，不写 ``config.json``。``tts_alert`` 触发
+  面 / 停止检测都清空，不写 ``config.jsonc``。``tts_alert`` 触发
   的副作用（已播放 / 失败等）只在 ``DetectorEvent`` deque 里活，
   刷新页面 / 重启就丢；不写盘、不另开缓存。
 
 * **单帧多轮工具调用（agent-loop）**：详见上文 detector 段。
-  配置入口 ``config.json["compute"]["tool_call_max_iters"``（默认
+  配置入口 ``config.jsonc["compute"]["tool_call_max_iters"``（默认
   5，``0`` = 无限，缺失 / 负值 / 类型错 → 回退默认 5）；任何路径
   都被 ``WdnaiDetector._ABSOLUTE_MAX_ITERS = 200`` 硬上限兜底。
   工具调用 + 返回按 prose 格式写进下一轮 prompt（不是 JSON，避免
@@ -1859,7 +1879,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
 * **来源透传**：`ToolContext` 新增 `user_id` / `channel` 字段，
   `run_chat_with_tools()` 对应形参由 wechat_llm 传真实值（web 侧
   channel="web"、user_id 空 → 工具返回 no_video 引导走微信渠道）。
-* **资源上限（可配置）**：`config.json["compute"]["wechat_video"]`
+* **资源上限（可配置）**：`config.jsonc["compute"]["wechat_video"]`
   的 `max_size_mb`（默认 200）与 `max_duration_min`（默认 10），热读
   即时生效、非法值回退默认。三道校验：下载前按 SDK 元数据预检
   （video 形态 duration_ms / file 形态 size，互补覆盖）；落盘后大小

@@ -112,9 +112,26 @@ def _hardware_capability_default_state() -> dict[str, bool]:
 
 
 def _load_hardware_capability_state() -> dict[str, bool]:
-    cfg = get_config().get_section("compute", {})
-    stored = cfg.get("hardware_capabilities") if isinstance(cfg, dict) else None
+    """读 ``base.hardware_capabilities`` 的 enabled 状态。
+
+    ``hardware_capabilities`` 已从 ``compute`` 挪到 ``base``（跟设备
+    自身的硬件能力绑定，不属于 RKNN 实例配置）。老 config.jsonc 里
+    仍写在 ``compute.hardware_capabilities`` 也能读 —— 这是过渡期
+    兜底，等下次任意 save 触发落盘后老路径自然被替换。
+
+    返回每个 ``HARDWARE_CAPABILITIES`` key 对应 bool；缺省全 True。
+    """
+    cfg = get_config()
     state = _hardware_capability_default_state()
+    # New path: base.hardware_capabilities
+    base_cfg = cfg.get_section("base", {})
+    stored = (base_cfg.get("hardware_capabilities")
+              if isinstance(base_cfg, dict) else None)
+    # Backward-compat fallback: compute.hardware_capabilities (legacy)
+    if not isinstance(stored, dict):
+        compute_cfg = cfg.get_section("compute", {})
+        stored = (compute_cfg.get("hardware_capabilities")
+                  if isinstance(compute_cfg, dict) else None)
     if isinstance(stored, dict):
         for k, v in stored.items():
             if k in state and isinstance(v, bool):
@@ -139,7 +156,7 @@ _RKNN_PROBE_TIMEOUT = 5.0
 
 
 def _read_device_name() -> str:
-    """Read ``device_name`` from ``config.json["base"]``.
+    """Read ``device_name`` from ``config.jsonc["base"]``.
 
     Used both for the main process's ``Hub(participant_name=...)`` and
     to compare against the ``hostname`` field on the worker's ``info``
@@ -495,7 +512,7 @@ def _qwen3_5_vl_4b_spec():
 # 保证倒计时结束时实际加载大概率已就绪，避免 UI 卡很久才更新。
 MODEL_PRESETS: dict[str, dict] = {
     "qwen3-vl-4b": {
-        "label":            "[VL]视频描述模型",
+        "label":            "[VLM]视觉描述模型",
         "preset_factory":   _qwen3_vl_4b_spec,
         "model_dir_name":   "Qwen3-VL-4B",
         "memory_estimate_mb": 3500,
@@ -564,7 +581,7 @@ MODEL_PRESETS: dict[str, dict] = {
         # 视频描述页（detector / VFA / audio_analysis 等）都能用它。
         # 与 qwen3-vl-4b 共用 swcap_video_describe capability；算力
         # 配置页同一 capability 内互斥（先加载的赢）。
-        "label":            "[VL]Qwen3.5-VL 视频描述/对话模型",
+        "label":            "[VLLM]视觉和文字多模态模型",
         "preset_factory":   _qwen3_5_vl_4b_spec,
         "model_dir_name":   "Qwen3.5-4B",
         "memory_estimate_mb": 3500,
@@ -593,6 +610,140 @@ _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
     "video_analyse":   "swcap_video_analyse",
     "text_chat":       "swcap_text_chat",
 }
+
+
+# --------------------------------------------------------------------------- #
+# compute.services[] schema (ServiceEntry) helpers                            #
+# --------------------------------------------------------------------------- #
+# A config-driven entry has 4 fields:
+#   name      : MODEL_PRESETS key
+#   label     : display name on the compute config card (overrides preset)
+#   autostart : "enabled" | "disabled" | "hidden"
+#   device    : 0 = main, 1 = 182x#0, 2 = 182x#1
+#
+# `hidden`   = 完全禁用 (no spawn, no UI render, no capability exposure).
+# `enabled`  = spawn worker + boot-bind to NPU at startup.
+# `disabled` = adopt-from-peer at boot only (current legacy behaviour);
+#              user must click 启用 on the page to spawn + bind.
+#
+# device is a HINT, not a hard pin: boot-bind uses device→npu_index as
+# the default, but the user can still pick a different NPU on the radio.
+
+_VALID_AUTOSTART: frozenset[str] = frozenset({"enabled", "disabled", "hidden"})
+_VALID_DEVICES:   frozenset[int] = frozenset({0, 1, 2})
+
+
+def _parse_services_config(raw) -> list[dict]:
+    """Validate the ``compute.services`` config payload.
+
+    Returns a list of dicts ``{name, label, autostart, device}`` — one
+    per valid entry. The list is filtered / rejected as follows:
+
+    * non-list (None / dict / scalar) → ``[]`` (no services declared)
+    * list entry not a dict → **raise** ``ValueError`` (old format
+      ``["qwen3-vl-4b", ...]`` is rejected; user said "不兼容")
+    * dict entry missing required keys → **raise** ``ValueError``
+    * ``name`` not in ``MODEL_PRESETS`` → **raise** ``ValueError``
+    * ``autostart`` not in ``_VALID_AUTOSTART`` → **raise** ``ValueError``
+    * ``device`` not in ``_VALID_DEVICES`` → **raise** ``ValueError``
+    * duplicate ``name`` → **raise** ``ValueError``
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    seen_names: set[str] = set()
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"compute.services[{idx}] 必须是 object "
+                "(新格式 {name, label, autostart, device})；"
+                "老格式字符串数组已不再支持，请在算力配置页或手工编辑"
+                "config.jsonc 改为对象格式"
+            )
+        # Reject any other *known-legacy* field names so silent
+        # misconfigurations don't propagate (e.g. a user copying an
+        # older sample would otherwise get autostart default + ignore
+        # the legacy ``policy`` key entirely, hiding the intent).
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"compute.services[{idx}].name 缺失或非字符串")
+        if name not in MODEL_PRESETS:
+            raise ValueError(
+                f"compute.services[{idx}].name={name!r} 不在 "
+                f"MODEL_PRESETS {sorted(MODEL_PRESETS.keys())} 中"
+            )
+        if name in seen_names:
+            raise ValueError(
+                f"compute.services 含重复 name={name!r}；"
+                "同名 entry 只允许一条"
+            )
+        seen_names.add(name)
+        label = entry.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"compute.services[{idx}].label 缺失或为空")
+        # Explicitly reject the legacy ``policy`` field name so users
+        # don't silently get autostart=disabled when their old config
+        # had policy="hidden" (which they expected to *hide* the entry).
+        if "policy" in entry:
+            raise ValueError(
+                f"compute.services[{idx}].policy 字段已重命名为 autostart；"
+                "值对应 manual → disabled、auto_start → enabled、"
+                "hidden → hidden。请在 config.jsonc 改为 autostart 字段。"
+            )
+        autostart = entry.get("autostart", "disabled")
+        if autostart not in _VALID_AUTOSTART:
+            raise ValueError(
+                f"compute.services[{idx}].autostart={autostart!r} 非法；"
+                f"可选 {sorted(_VALID_AUTOSTART)}"
+            )
+        device = entry.get("device", 1)
+        if device not in _VALID_DEVICES:
+            raise ValueError(
+                f"compute.services[{idx}].device={device!r} 非法；"
+                f"可选 {sorted(_VALID_DEVICES)}"
+            )
+        out.append({
+            "name":      name,
+            "label":     label.strip(),
+            "autostart": autostart,
+            "device":    int(device),
+        })
+    return out
+
+
+def _sorted(it):
+    return sorted(it) if not isinstance(it, (set, frozenset)) else sorted(it)
+
+
+def _device_to_npu_index(device: int, cards: list[dict]) -> int:
+    """Map logical ``device`` number → physical ``npu_index``.
+
+    Mapping
+    -------
+    * ``device=0`` (main controller / RK3588 host) → ``-1`` (no NPU
+      pinned; presets currently all target RK182x so this is effectively
+      "not used"). Callers should skip auto-bind for device 0.
+    * ``device=1`` → first enumerated ``npu_index`` in ``cards``.
+    * ``device=2`` → second enumerated ``npu_index``.
+    * If the device index exceeds available cards → ``-1``.
+
+    The mapping assumes ``cards`` is ordered by ``npu_index`` (which is
+    how ``list_cards`` returns them). Chip-type discrimination
+    (RK3588 built-in NPU vs RK182x add-on) is not implemented yet —
+    the current ``MODEL_PRESETS`` are all ``available_targets=["182x"]``
+    anyway, so the enum order on a typical RK3588+2×RK182x board maps
+    cleanly to "first/second 182x".
+
+    Returns ``-1`` when no mapping is possible; callers should treat
+    that as "let the user pick" or "skip".
+    """
+    if device == 0:
+        return -1
+    cards_sorted = sorted(cards, key=lambda c: c.get("npu_index", -1))
+    target = device - 1
+    if target >= len(cards_sorted):
+        return -1
+    return int(cards_sorted[target].get("npu_index", -1))
 
 
 # --------------------------------------------------------------------------- #
@@ -644,6 +795,17 @@ class ModelInstance:
     instance_name: str = ""
     label: str = ""
     memory_estimate_mb: int = 0
+    # Config-driven overrides (from compute.services[] entry).
+    # ``_config_label`` overrides preset label when present (non-empty).
+    # ``_autostart`` mirrors the entry's autostart value: "enabled" /
+    # "disabled" / "hidden". ``_default_npu_index`` is the device→npu
+    # mapping used as UI radio default + boot-bind target. All three
+    # are empty/-1 when the model isn't in compute.services[] (presets
+    # not in config fall through to legacy behaviour: show as
+    # unavailable, user enables manually).
+    _config_label: str = ""
+    _autostart: str = ""
+    _default_npu_index: int = -1
     status: str = "not_loaded"                  # not_loaded | loading | running | error
     error: str = ""
     stderr_full: str = ""
@@ -725,6 +887,11 @@ class ModelInstance:
             "_peer_name":         self._peer_name,
             "_peer_ip":           self._peer_ip,
             "_peer_pid":          self._peer_pid,
+            # Config-driven overrides from compute.services[] entry. Empty
+            # when the model isn't declared in services (legacy fallback).
+            "_autostart":         self._autostart,
+            "_default_npu_index": self._default_npu_index,
+            "_config_label":      self._config_label,
         }
 
 
@@ -1218,13 +1385,14 @@ class ComputeRegistry:
             new_state[k] = v
             applied.append(k)
         if applied:
+            # Write to base.hardware_capabilities (not compute — moved).
             with self._lock:
-                cfg = get_config().get_section("compute", {})
+                cfg = get_config().get_section("base", {})
                 if not isinstance(cfg, dict):
                     cfg = {}
                 cfg["hardware_capabilities"] = new_state
                 try:
-                    get_config().set_section("compute", cfg)
+                    get_config().set_section("base", cfg)
                 except Exception as e:  # noqa: BLE001
                     LOG.warning("failed to persist hardware_capabilities: %s", e)
         return {"applied": applied, "rejected": rejected, "state": new_state}
@@ -2398,7 +2566,33 @@ class ComputeRegistry:
           * ``"unavailable"`` — daemon probed, no peer responded
 
         Ordered: spawned first, adopted second, unavailable last.
+
+        Hidden-by-config filter
+        ------------------------
+        Entries in ``compute.services[]`` with ``autostart="hidden"`` are
+        dropped from the snapshot entirely — they're "configured to
+        never be exposed". Their entries don't appear as "unavailable"
+        placeholder cards either; the UI simply doesn't see them.
+        This matches the boot path which doesn't spawn / adopt /
+        register hidden entries.
         """
+        # Resolve hidden set (best-effort; if config is broken, treat as
+        # empty hidden set and let other layers surface the error).
+        hidden_set: set[str] = set()
+        cfg_overrides: dict[str, dict] = {}
+        try:
+            stored = get_config().get_section("compute", {})
+            if isinstance(stored, dict):
+                raw = stored.get("services")
+                if isinstance(raw, list):
+                    for e in raw:
+                        if isinstance(e, dict) and isinstance(e.get("name"), str):
+                            cfg_overrides[e["name"]] = e
+                            if e.get("autostart") == "hidden":
+                                hidden_set.add(e["name"])
+        except Exception:  # noqa: BLE001
+            pass
+
         out: list[dict] = []
         with self._lock:
             # v0.8.13:by_model 改成 list of insts per model_id,而不是只留
@@ -2407,13 +2601,26 @@ class ComputeRegistry:
             # 被互相挤掉,UI 列表只看到其中一个。
             by_model: dict[str, list[ModelInstance]] = {}
             for inst in self._instances.values():
+                if inst.model_id in hidden_set:
+                    # Hidden: should never have an instance; defensive
+                    # drop in case boot missed it (e.g. user just
+                    # flipped hidden=true at runtime).
+                    continue
                 by_model.setdefault(inst.model_id, []).append(inst)
 
         def _unavailable_entry(model_id: str) -> dict:
             preset = MODEL_PRESETS[model_id]
+            entry = cfg_overrides.get(model_id, {})
+            cfg_label = (entry.get("label") or "").strip() if isinstance(entry, dict) else ""
+            cfg_autostart = entry.get("autostart", "") if isinstance(entry, dict) else ""
+            cfg_device = entry.get("device", 1) if isinstance(entry, dict) else 1
+            cfg_default_npu = _device_to_npu_index(
+                cfg_device if isinstance(cfg_device, int) else 1,
+                self._cards or [],
+            )
             return {
                 "model_id":           model_id,
-                "label":              preset["label"],
+                "label":              cfg_label or preset["label"],
                 "instance_name":      preset["instance_name"],
                 "capability_types":   list(preset["capability_types"]),
                 "memory_estimate_mb": preset["memory_estimate_mb"],
@@ -2430,9 +2637,15 @@ class ComputeRegistry:
                 "_peer_guid":         "",
                 "_peer_name":         "",
                 "_peer_ip":           "",
+                "_autostart":         cfg_autostart,
+                "_default_npu_index": cfg_default_npu,
+                "_config_label":      cfg_label,
             }
 
         for model_id, preset in MODEL_PRESETS.items():
+            if model_id in hidden_set:
+                # Hidden entries are not rendered at all.
+                continue
             insts = by_model.get(model_id, [])
             if not insts:
                 out.append(_unavailable_entry(model_id))
@@ -2459,13 +2672,28 @@ class ComputeRegistry:
         return out
 
     def boot_compute_services(self) -> None:
-        """App boot: for each model in ``config.compute.services`` try
-        to adopt a LAN peer that already runs it. Local workers are
-        not auto-spawned here — they only come up when the user
-        clicks 启用 on the 算力配置 page. See
-        :func:`app.main.create_app` for the daemon-thread wrapper
-        and :meth:`_cleanup_unregistered_workers` for the orphan
-        sweep.
+        """App boot: for each ``compute.services[]`` entry, decide what
+        to do based on its ``autostart`` field.
+
+        Per-entry behaviour
+        -------------------
+        * ``"hidden"``   —— 完全跳过（不 adopt、不 spawn、不 bind、不参与
+          capability 路由）。UI 算力配置页也看不到这张卡。
+        * ``"disabled"`` —— 仅尝试 adopt LAN peer（不 spawn 本地 worker，
+          不 bind）。用户到算力配置页点 启用 才会 spawn + bind。
+        * ``"enabled"``  —— 同 disabled 的 adopt 流程 + 后台 daemon
+          线程走 ``bind_instance(device→npu_index)``：让模型常驻。
+          adopt 失败的也照常 spawn + bind（peer-only 场景 fall through）。
+
+        老格式（``services: ["name", ...]``）会被
+        :func:`_parse_services_config` 直接拒绝，让 PUT /api/config
+        校验那一关先拦下。如果文件直接写到磁盘上、读到这里遇到老格式，
+        LOG warning + skip 全部 —— 不破坏 boot。
+
+        Presets NOT in ``services`` 完全不参与 boot（无 adopt / spawn /
+        bind）；UI 仍按现有逻辑把它们渲染为 "unavailable"，用户可手动
+        启用。这是"permissive" 路径，避免新增 preset 后忘了同步 config
+        导致模型"消失"的体验回归。
         """
         try:
             self.list_cards()
@@ -2475,29 +2703,83 @@ class ComputeRegistry:
             stored = get_config().get_section("compute", {})
         except Exception:
             stored = {}
-        services = stored.get("services") if isinstance(stored, dict) else None
-        if not isinstance(services, list):
-            services = []
-        for entry in services:
-            if not isinstance(entry, str):
+        services_raw = stored.get("services") if isinstance(stored, dict) else None
+        try:
+            entries = _parse_services_config(services_raw)
+        except ValueError as e:
+            LOG.error("compute.services 配置非法: %s；老格式字符串数组"
+                      "不再支持，请在算力配置页或手工编辑 config.jsonc "
+                      "改为对象格式", e)
+            entries = []
+
+        # device→npu_index 映射一次性算好（每张 entry 都要用）
+        cards_snapshot = self._cards or []
+
+        for entry in entries:
+            if entry["autostart"] == "hidden":
+                LOG.info("boot: %s hidden by config, skip entirely",
+                         entry["name"])
                 continue
-            model_id = entry
-            if model_id not in MODEL_PRESETS:
-                LOG.warning("config.compute.services 跳过未知 model: %s",
-                            model_id)
-                continue
+
+            model_id = entry["name"]
+            cfg_label = entry["label"]
+            cfg_device = entry["device"]
+            cfg_default_npu = _device_to_npu_index(cfg_device, cards_snapshot)
+
+            # 已经 register 过的实例也要把 config metadata 灌进去
+            with self._lock:
+                existing = [i for i in self._instances.values()
+                            if i.model_id == model_id]
+            for inst in existing:
+                if cfg_label and cfg_label != inst.label:
+                    inst.label = cfg_label
+                if cfg_default_npu >= 0 and inst._default_npu_index < 0:
+                    inst._default_npu_index = cfg_default_npu
+                if not inst._autostart:
+                    inst._autostart = entry["autostart"]
+                if not inst._config_label:
+                    inst._config_label = cfg_label
+
             with self._lock:
                 if any(i.model_id == model_id
                        for i in self._instances.values()):
+                    LOG.info("boot: %s already in registry, skip adopt",
+                             model_id)
                     continue
+
             adopted = None
             try:
                 adopted = self._adopt_existing_worker(model_id)
             except Exception as e:  # noqa: BLE001
-                LOG.warning("boot peer-adopt failed for %s: %s", model_id, e)
+                LOG.warning("boot peer-adopt failed for %s: %s",
+                            model_id, e)
             if adopted is not None:
-                LOG.info("boot: adopted %s (peer guid=%s status=%s)",
-                         model_id, adopted._peer_guid, adopted.status)
+                if cfg_label:
+                    adopted.label = cfg_label
+                adopted._config_label = cfg_label
+                adopted._autostart = entry["autostart"]
+                adopted._default_npu_index = cfg_default_npu
+                LOG.info("boot: adopted %s (peer guid=%s status=%s "
+                         "autostart=%s device=%d→npu=%d)",
+                         model_id, adopted._peer_guid, adopted.status,
+                         entry["autostart"], cfg_device, cfg_default_npu)
+                # enabled: 如果 adopt 成功且 autostart=enabled,
+                # 把 bind 也走了（远端 adopted 本机无法 bind，但语义上
+                # "enabled" 在远端 peer 那边早就 load 好了；这里仅在
+                # inst 是 adopted_local 时尝试 bind）。
+                if entry["autostart"] == "enabled" \
+                        and adopted._source == "adopted_local" \
+                        and cfg_default_npu >= 0:
+                    self._boot_bind_async(adopted, cfg_default_npu,
+                                          reason="enabled+adopted_local")
+            else:
+                # 没 adopt 到 —— 不在 boot 时 spawn（保留 legacy 行为：
+                # 用户点 启用 才 spawn）。如果 autostart=enabled,
+                # 还是要走 spawn + bind 流程。
+                if entry["autostart"] == "enabled" and cfg_default_npu >= 0:
+                    self._boot_spawn_and_bind_async(
+                        model_id, cfg_default_npu, cfg_label)
+
         try:
             self._cleanup_unregistered_workers()
         except Exception as e:  # noqa: BLE001
@@ -2510,6 +2792,44 @@ class ComputeRegistry:
             name="compute-peer-discovery",
             daemon=True,
         ).start()
+
+    def _boot_bind_async(self, inst: "ModelInstance", npu_index: int,
+                         *, reason: str) -> None:
+        """Fire-and-forget ``bind_instance`` from boot context."""
+        def _runner():
+            try:
+                self.bind_instance(inst, npu_index)
+                LOG.info("boot-bind (%s): %s → npu=%d → status=%s",
+                         reason, inst.model_id, npu_index, inst.status)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("boot-bind (%s) failed for %s @ npu=%d: %s",
+                            reason, inst.model_id, npu_index, e)
+        threading.Thread(target=_runner, name=f"boot-bind-{inst.model_id}",
+                         daemon=True).start()
+
+    def _boot_spawn_and_bind_async(self, model_id: str, npu_index: int,
+                                   cfg_label: str) -> None:
+        """Fire-and-forget spawn + bind for ``autostart=enabled`` entries."""
+        def _runner():
+            try:
+                inst = self.ensure_worker_for_model(model_id, allow_adopt=True)
+                if cfg_label:
+                    inst.label = cfg_label
+                    inst._config_label = cfg_label
+                if inst._source == "adopted":
+                    LOG.info("boot enabled: %s adopted from peer "
+                             "(peer is the active instance); no bind needed",
+                             model_id)
+                    return
+                self.bind_instance(inst, npu_index)
+                LOG.info("boot enabled: %s spawned+bound to npu=%d → %s",
+                         model_id, npu_index, inst.status)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("boot enabled failed for %s @ npu=%d: %s",
+                            model_id, npu_index, e)
+        threading.Thread(target=_runner,
+                         name=f"boot-autostart-{model_id}",
+                         daemon=True).start()
 
     def _discover_additional_peers(self) -> None:
         """v0.8.24: 后台扫 LAN peer,补 boot probe 漏掉的 NETWORK 卡。
@@ -2699,7 +3019,7 @@ class ComputeRegistry:
     # ------------------------------------------------------------------ #
     # Note: boot 不再自动 spawn worker。实例 (npu, model) 由用户在算力
     # 配置页点击启动时通过 ``POST /api/compute/instances`` 指定，npu_index
-    # 作为命令行 ``--npu <idx>`` 透传给子进程，不写 config.json；主进程
+    # 作为命令行 ``--npu <idx>`` 透传给子进程，不写 config.jsonc；主进程
     # 重启后用户需重新点击启用。registry 单例本身仍会被构造（_ensure_hub
     # 起主进程 Hub 做 RPC client），但 _instances 一律为空起步。
 
@@ -2900,7 +3220,7 @@ class ComputeRegistry:
     def _persist(self) -> None:
         """No-op stub kept for backward compat with older call sites.
 
-        ``config.json["compute"]["instances"]`` 不再被 registry 维护——
+        ``config.jsonc["compute"]["instances"]`` 不再被 registry 维护——
         实例 (npu, model) 由用户在算力配置页点击启动时通过
         ``POST /api/compute/instances`` 指定并作为子进程命令行
         （``--npu <idx>``）传入，不持久化。

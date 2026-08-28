@@ -2799,6 +2799,16 @@ html, body {
   color: var(--text);
   margin: 0;
 }
+.cc-autostart-badge {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: #fff;
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-left: 8px;
+  flex: 0 0 auto;
+}
 .cc-service-cap {
   font-size: 11px;
   font-family: var(--mono);
@@ -3469,16 +3479,17 @@ html, body {
 .bc-hw-cap {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: 8px;
+  padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface-2);
+  min-width: 0;
 }
 .bc-hw-cap input[type="checkbox"] {
-  margin-top: 3px;
-  width: 16px;
-  height: 16px;
+  margin-top: 2px;
+  width: 14px;
+  height: 14px;
   flex-shrink: 0;
   cursor: pointer;
 }
@@ -3488,20 +3499,23 @@ html, body {
 }
 .bc-hw-cap-title {
   font-weight: 600;
-  font-size: 14px;
+  font-size: 12px;
   color: var(--text);
   margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .bc-hw-cap-type {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-2);
-  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .bc-hw-cap-desc {
-  font-size: 12px;
-  color: var(--text-2);
-  line-height: 1.4;
+  display: none;        /* 一行 4 个时省空间，desc 保留在 hint 里 */
 }
 
 /* ---------- tools (音视频描述 + 视频目标检测) ---------- */
@@ -5414,3 +5428,177 @@ html, body {
   word-break: break-word;
 }
 
+
+/* 算力实例列表（系统配置 → bc-section-compute-services） */
+.bc-cs-table-wrap {
+  overflow-x: auto;
+  margin-bottom: 0.75rem;
+}
+.bc-cs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.bc-cs-table thead th {
+  text-align: left;
+  padding: 0.45rem 0.5rem;
+  background: #f3f4f6;
+  border-bottom: 1px solid var(--border);
+  color: #374151;
+  font-weight: 600;
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+.bc-cs-table tbody td {
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.bc-cs-table tbody tr.is-hidden td {
+  opacity: 0.6;
+}
+.bc-cs-col-name  { width: 26%; }
+.bc-cs-col-label { width: 28%; }
+.bc-cs-col-autostart { width: 14%; }
+.bc-cs-col-device { width: 14%; }
+.bc-cs-col-op    { width: 8%; text-align: right; }
+.bc-cs-table input.bc-input,
+.bc-cs-table select.bc-input {
+  padding: 0.3rem 0.5rem;
+  font-size: 0.85rem;
+  width: 100%;
+  box-sizing: border-box;
+}
+.bc-cs-table .bc-input-name {
+  font-family: var(--mono);
+  color: var(--muted);
+  background: #f3f4f6;
+}
+.bc-cs-remove-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.8rem;
+  color: #b91c1c;
+  cursor: pointer;
+}
+.bc-cs-remove-btn:hover {
+  background: rgba(220, 80, 80, 0.08);
+  border-color: #b91c1c;
+}
+.bc-cs-add-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+.bc-cs-add-row select.bc-input {
+  width: auto;
+  min-width: 220px;
+}
+.bc-cs-empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 0.6rem 0;
+  font-style: italic;
+}
+
+/* 基础配置 section 的左右结构（label 左 + value 右） */
+.bc-kv-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.45rem 0;
+  border-bottom: 1px dashed var(--border);
+}
+.bc-kv-row:last-child {
+  border-bottom: none;
+}
+.bc-kv-row > .bc-kv-label {
+  flex: 0 0 110px;
+  text-align: right;
+  color: #374151;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.bc-kv-row > .bc-kv-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.bc-kv-row > .bc-kv-value > .bc-kv-input-wrap {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  position: relative;
+}
+.bc-kv-row > .bc-kv-value > .bc-kv-input-wrap > input.bc-input {
+  flex: 1 1 auto;
+  width: 100%;
+  padding-right: 72px;        /* 给右侧 bc-status 留位 */
+}
+.bc-kv-row > .bc-kv-value > .bc-kv-input-wrap > .bc-status {
+  position: absolute;
+  right: 0.6rem;
+  top: 50%;
+  transform: translateY(-50%);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.bc-kv-row > .bc-kv-value > .bc-kv-input-wrap > .bc-status.ok {
+  color: #16a34a;
+}
+.bc-kv-row > .bc-kv-value > .bc-kv-input-wrap > .bc-status.danger {
+  color: #b91c1c;
+}
+.bc-kv-row > .bc-kv-value > .bc-kv-input-wrap > .bc-status.warn {
+  color: #b45309;
+}
+.bc-kv-row > .bc-kv-value > .bc-hint {
+  flex: 1 1 100%;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+/* 硬件能力行：固定 4 列一行展示所有 caps */
+.bc-kv-row--hw > .bc-kv-value {
+  align-items: flex-start;
+  flex-direction: column;
+}
+.bc-kv-row--hw > .bc-kv-value > .bc-hw-caps-list {
+  flex: 0 0 auto;
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+.bc-kv-row--hw > .bc-kv-value > .bc-hint {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 900px) {
+  /* 屏幕窄到撑不开 4 列时退化为 2 列 */
+  .bc-kv-row--hw > .bc-kv-value > .bc-hw-caps-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 600px) {
+  .bc-kv-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .bc-kv-row > .bc-kv-label {
+    text-align: left;
+    flex-basis: auto;
+  }
+  .bc-kv-row--hw > .bc-kv-value > .bc-hw-caps-list {
+    grid-template-columns: 1fr;
+  }
+}
