@@ -1069,6 +1069,39 @@ def infer_handler(state: dict, payload: dict) -> dict:
                   "volume", "no_play", "non_streaming_mode"):
             if k in options:
                 tts_kwargs[k] = options[k]
+        # TTS PCM 分片通过 UDS 回传主进程：bound method 无法跨 wdndds RPC
+        # pickle，缺这条路径 SDK 的 on_audio_chunk 就只能为 None，每片
+        # 解码窗口静默丢弃。线缆格式: struct.pack("<III", sr, ch, n)
+        # + float32 LE PCM —— 与 TtsSession._on_audio_chunk 一致。
+        tts_pcm_socket_path = options.get("tts_pcm_socket_path")
+        tts_pcm_client = None
+        if isinstance(tts_pcm_socket_path, str) and tts_pcm_socket_path:
+            try:
+                tts_pcm_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                tts_pcm_client.settimeout(2.0)
+                tts_pcm_client.connect(tts_pcm_socket_path)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning(
+                    "tts_pcm_socket: connect to %s failed (%s); "
+                    "falling back to WAV-only path",
+                    tts_pcm_socket_path, e)
+                if tts_pcm_client is not None:
+                    try:
+                        tts_pcm_client.close()
+                    except Exception:
+                        pass
+                    tts_pcm_client = None
+            else:
+                def _pcm_chunk_forwarder(audio, sr, _c=tts_pcm_client):
+                    try:
+                        import struct as _struct
+                        import numpy as _np
+                        arr = _np.asarray(audio, dtype="<f4").reshape(-1)
+                        header = _struct.pack("<III", int(sr), 1, int(arr.size))
+                        _c.sendall(header + arr.tobytes())
+                    except Exception:
+                        pass
+                tts_kwargs["on_audio_chunk"] = _pcm_chunk_forwarder
 
         attachments = []
         for item in atts_meta:
@@ -1171,7 +1204,14 @@ def infer_handler(state: dict, payload: dict) -> dict:
                  len(prompt or ""), len(attachments))
         import time as _time_inf
         t0_inf = _time_inf.time()
-        result = asyncio.run(_call())
+        try:
+            result = asyncio.run(_call())
+        finally:
+            if tts_pcm_client is not None:
+                try:
+                    tts_pcm_client.close()
+                except Exception:
+                    pass
         LOG.info("infer: done in %.2fs (result_type=%s)",
                  _time_inf.time() - t0_inf, type(result).__name__)
         text = getattr(result, "text", None) or (

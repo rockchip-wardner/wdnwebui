@@ -449,9 +449,13 @@ class _RpcSessionProxy:
                                   "sample_rate", "n_channels", "sample_width",
                                   # TTS channel kwargs — see wdnai/backends/tts.py
                                   # TTSBackend.run_text overrides.get() calls.
-                                  "language", "speaker", "ref_speaker",
-                                  "instruct", "volume", "no_play",
-                                  "non_streaming_mode"}},
+"language", "speaker", "ref_speaker",
+                                   "instruct", "volume", "no_play",
+                                   "non_streaming_mode",
+                                   # UDS 路径：worker 连过来把 SDK 的
+                                   # on_audio_chunk 流回主进程（bound
+                                   # method 不能 pickle，此为唯一通道）。
+                                   "tts_pcm_socket_path"}},
         }
 # 视觉模型目标尺寸（音视频描述页 ``#vd-detect-size``）——
         # 顶层字段而非 ``options``，因为这是 vision backend 特有的

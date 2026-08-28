@@ -13,6 +13,7 @@ import asyncio
 import io
 import logging
 import os
+import socket
 import struct
 import subprocess
 import threading
@@ -365,6 +366,11 @@ class TtsSession:
         self._audio_lock = threading.Lock()
         self._audio_subs: dict = {}
 
+        # 分片 UDS：worker 把 PCM 流回主进程。bound method 无法跨
+        # wdndds RPC pickle，此路径是 live audio 的唯一通道。
+        self._pcm_sock: Optional[socket.socket] = None
+        self._pcm_sock_path: str = ""
+
         self._model_dir = self._resolve_model_dir(model_dir)
 
         # Probe once at boot so the UI can render the banner without
@@ -693,7 +699,7 @@ class TtsSession:
             no_play = req.play_to in (PLAY_BROWSER, PLAY_BOTH)
 
             async def _run() -> TTSResult:
-                return await sess.respond(
+                kwargs = dict(
                     attachment=[Attachment(req.text, kind="text")],
                     generating=TTSResult,
                     language=req.language,
@@ -707,6 +713,11 @@ class TtsSession:
                     on_step=self._on_step,
                     on_audio_chunk=self._on_audio_chunk,
                 )
+                # 路径走 proxy 的 options 白名单，让 worker 开 client socket
+                # 回流 PCM（_run_safe 里建 socket）。
+                if self._pcm_sock_path:
+                    kwargs["tts_pcm_socket_path"] = self._pcm_sock_path
+                return await sess.respond(**kwargs)
             return asyncio.run(_run())
         except Exception as e:  # pragma: no cover - depends on NPU
             raise RuntimeError(f"TTS 推理失败: {e}")
@@ -723,8 +734,73 @@ class TtsSession:
     # ------------------------------------------------------------------ #
     def _run_safe(self, req: TTSRequest) -> None:
         t0 = time.time()
+        sock: Optional[socket.socket] = None
+        sock_path = ""
         try:
             self._set_state(self.STATE_RUNNING, "synthesizing")
+
+            # When the browser (or both) is the audio sink, stand up
+            # the per-chunk Unix domain socket BEFORE the RPC so the
+            # worker can connect and start streaming as soon as its SDK
+            # decoder thread produces its first window. ``play_to=
+            # device`` skips this path entirely (SDK owns the audio
+            # output; no WS feed needed).
+            if req.play_to in (PLAY_BROWSER, PLAY_BOTH):
+                sock_path = (
+                    f"/tmp/wdnwebui-tts-{os.getpid()}-{time.time_ns()}.sock"
+                )
+                try:
+                    if os.path.exists(sock_path):
+                        os.unlink(sock_path)
+                except OSError:
+                    pass
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.bind(sock_path)
+                sock.listen(1)
+                sock.settimeout(60.0)
+                self._pcm_sock = sock
+                self._pcm_sock_path = sock_path
+
+                def _pcm_reader():
+                    conn = None
+                    try:
+                        conn, _ = sock.accept()
+                        conn.settimeout(None)
+                        f = conn.makefile("rb")
+                        while True:
+                            header = f.read(12)
+                            if not header or len(header) < 12:
+                                break
+                            try:
+                                sr, ch, n = struct.unpack("<III", header)
+                            except struct.error:
+                                break
+                            want = n * ch * 4
+                            buf = b""
+                            while len(buf) < want:
+                                piece = f.read(want - len(buf))
+                                if not piece:
+                                    break
+                                buf += piece
+                            if len(buf) < want:
+                                break
+                            audio = np.frombuffer(
+                                buf, dtype="<f4").reshape(n, ch)
+                            self._on_audio_chunk(audio, sr)
+                    except Exception as e:           # noqa: BLE001
+                        LOG.debug("pcm reader terminated: %s", e)
+                    finally:
+                        try:
+                            if conn is not None:
+                                conn.close()
+                        except Exception:
+                            pass
+
+                threading.Thread(
+                    target=_pcm_reader,
+                    name="tts-pcm-reader",
+                    daemon=True,
+                ).start()
 
             # ``_infer_one`` already routes through the SDK with the
             # user's ``no_play`` intent — the SDK's internal
@@ -795,6 +871,20 @@ class TtsSession:
         except Exception as exc:                   # noqa: BLE001
             LOG.exception("tts synthesis failed")
             self._set_state(self.STATE_ERROR, f"{type(exc).__name__}: {exc}")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                self._pcm_sock = None
+            if sock_path:
+                try:
+                    if os.path.exists(sock_path):
+                        os.unlink(sock_path)
+                except OSError:
+                    pass
+                self._pcm_sock_path = ""
 
     def _set_state(self, state: str, message: str = "") -> None:
         with self._lock:
