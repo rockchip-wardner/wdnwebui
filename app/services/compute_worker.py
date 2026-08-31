@@ -860,41 +860,6 @@ def reset_handler(state: dict) -> dict:
         return {"status": "error", "error": f"reset failed: {e}"}
 
 
-def _chat_shm_publish(state: dict) -> None:
-    """把 chat 运行状态原子发布到 ``/dev/shm``（仅本机主进程消费）。
-
-    DDS RELIABLE 存在抖动（SEDP/HeartBeat 经discovery daemon 中转，
-    endpoint 频繁增删后新 writer 的样本会被reader 拒收直到发现收敛）
-    ，chat_poll 这类高频小消息偶发整窗丢失，表现为 web 文本对话流式
-    中断。同机场景用共享内存文件旁路**数据面**（deltas / status / 
-    result），DDS 只保留控制面（chat_run / chat_stop），主进程读不
-    到文件（跨机 peer）时自动回退 RPC。
-
-    原子性：写临时文件 + :func:`os.replace`，读者要么看到完整旧快照
-    要么完整新快照。
-    """
-    chat = state.get("chat")
-    if not isinstance(chat, dict):
-        return
-    mid = state.get("model_id") or "unknown"
-    path = f"/dev/shm/wdnwebui_chat_{mid}.json"
-    try:
-        tmp = f"{path}.{os.getpid()}.tmp"
-        deltas = chat.get("deltas") or []
-        with open(tmp, "w") as f:
-            json.dump({
-                "start_ts": chat.get("start_ts"),
-                "status":   chat.get("status"),
-                "deltas":   deltas,
-                "offset":   len(deltas),
-                "result":   chat.get("result"),
-                "error":    chat.get("error"),
-            }, f, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception as e:  # noqa: BLE001
-        LOG.debug("chat shm publish failed: %s", e)
-
-
 def chat_run_handler(state: dict, payload: dict) -> dict:
     sess = state.get("session")
     if sess is None:
@@ -920,7 +885,6 @@ def chat_run_handler(state: dict, payload: dict) -> dict:
         tool_names = []
     chat.update({
         "status": "running",
-        "start_ts": time.time(),
         "deltas": [],
         "offset": 0,
         "stop": False,
@@ -933,7 +897,6 @@ def chat_run_handler(state: dict, payload: dict) -> dict:
         "error": "",
     })
     state["chat"] = chat
-    _chat_shm_publish(state)
     threading.Thread(target=_chat_run_loop, args=(state,),
                      daemon=True, name="chat-run").start()
     return {"status": "chat_started"}
@@ -961,7 +924,6 @@ def _chat_run_loop(state: dict) -> None:
         if err:
             chat["status"] = "error"
             chat["error"] = err
-            _chat_shm_publish(state)
             return
 
         # ---- 工具 schema 注入 + tool_call 解析 ----
@@ -998,7 +960,6 @@ def _chat_run_loop(state: dict) -> None:
         def _on_delta(d: str) -> None:
             if d:
                 chat["deltas"].append(d)
-                _chat_shm_publish(state)
 
         sess.reset()
         register_observer(sink, _on_delta)
@@ -1047,11 +1008,9 @@ def _chat_run_loop(state: dict) -> None:
             "tool_call": tool_call_name,
             "tool_call_args": tool_call_args,
         }
-        _chat_shm_publish(state)
     except Exception as e:  # noqa: BLE001
         chat["status"] = "error"
         chat["error"] = f"{type(e).__name__}: {e}"
-        _chat_shm_publish(state)
 
 
 def chat_poll_handler(state: dict, payload: dict) -> dict:
@@ -1486,24 +1445,15 @@ def main() -> int:
     stop_event = _WORKER_STOP_EVENT
 
     device_name = _read_device_name()
-    # v0.8.16: 默认注册 BOTH services。仅注册 unique (v0.8.15) 会让 LAN
+    # v0.8.16: 必须注册 BOTH services。仅注册 unique (v0.8.15) 会让 LAN
     # peer 的 boot probe 走 standard service 找不到本机 worker,NETWORK 栏
     # 为空。LOCAL main 用 unique 直连本机 (避免 routing 冲突),adopted main
     # 走 standard 找 LAN peer — 同时也会路由到本机,但本地 loading 完成后
     # 状态与 peer 一致,不再翻转。Do NOT 改回 only-unique。
-    #
-    # v0.8.1 --local-only: 主进程 spawn 本机 worker 时只注册 per-PID
-    # unique service,不注册 standard —— 避免 standard topic 上本机 worker
-    # 与 boot adopt 探测互相路由污染(本机 probe 被自己 spawned worker 抢答)。
-    if args.local_only:
-        services = [
-            f"wdndds/rpc/{model_id}/worker-{_WORKER_PID}",
-        ]
-    else:
-        services = [
-            f"wdndds/rpc/{model_id}/worker-{_WORKER_PID}",
-            f"wdndds/rpc/{model_id}",
-        ]
+    services = [
+        f"wdndds/rpc/{model_id}/worker-{_WORKER_PID}",
+        f"wdndds/rpc/{model_id}",
+    ]
     hub = Hub(
         participant_name=f"compute_worker-{device_name}-{model_id}",
         domain_id=0,
