@@ -223,15 +223,15 @@ pre-stage the .so files out-of-band.
   # expect (True, None)
   ```
 
-* `bootstrap_wdndds_native.sh` is the recommended one-shot setup
-  (idempotent, ~1s fast-path when already done). It installs the
-  apt build deps (`libfoonathan-memory-dev`, `libfoonathan-memory0.7.2`,
-  `patchelf`), writes a stub for `native/bin/nodesize_dbg` (partial
-  native-install workaround for foonathan's cmake IMPORTED-target
-  existence check), and runs `pip install --force-reinstall --no-deps
-  .venv/src/wdndds` to trigger `_build.py` end-to-end. The script
-  refuses to fall back to `apt install libfastrtps-dev` — that's
-  FastDDS 2.x and incompatible with the v0.5 cshim ABI.
+* `bootstrap_wdndds_native.sh` is the recommended one-shot setup.
+  It installs the apt build deps (`libfoonathan-memory-dev`,
+  `libfoonathan-memory0.7.2`, `patchelf`), writes a stub for
+  `native/bin/nodesize_dbg` (partial native-install workaround for
+  foonathan's cmake IMPORTED-target existence check), and runs
+  `pip install --force-reinstall --no-deps .venv/src/wdndds` to
+  trigger `_build.py` end-to-end. The script refuses to fall back to
+  `apt install libfastrtps-dev` — that's FastDDS 2.x and incompatible
+  with the v0.5 cshim ABI.
 
 * `native/lib/libfastdds.so.3.6.2.0` + `libfastcdr.so.2.3.6` already
   vendored (typical partial build) — the bootstrap script handles
@@ -249,6 +249,37 @@ pre-stage the .so files out-of-band.
   rebuilding. The `WDNDDS_FASTDDS_PREFIX` env var (read by
   `_build.py`) is auto-detected from `native/`, no need to set it.
 
+* **v0.6.1 unconditional rebuild** — both `_build.py::build_py.run()`
+  (`.venv/src/wdndds/src/wdndds/_build.py`) and
+  `bootstrap_wdndds_native.sh` now unconditionally rebuild on every
+  invocation, no fast-path skip. The hook `unlink()`s the two
+  `libwdndds_*.so` files at the start of every `pip install` /
+  `pip install -e`; bootstrap no longer exits 0 when the `.so` files
+  exist. Cost is the cmake build itself (~20s on this dev box).
+
+  **Why**: the previous "if both .so files exist, skip pip" fast path
+  in bootstrap was a silent correctness trap. After `git pull` of
+  wdndds source that added new bindings to `_cshim.py` (commit
+  `871d00f feat(wdndds): 新增 create_topic_writer/reader 流式分片助手`
+  — added `wdndds_topic_writer_create` / `wdndds_topic_reader_create`
+  + friends), the pre-existing `.so` would still satisfy the
+  existence check, bootstrap would exit 0, and the user would later
+  hit
+  `AttributeError: .../libwdndds_cshim.so: undefined symbol: wdndds_topic_writer_create`
+  when `ComputeRegistry._ensure_hub()` tried to instantiate
+  `wdndds.dds._rpc.Hub`. End-user symptom was every compute card on
+  the 算力配置 page failing with
+  `RpcClient: wdndds Hub not available (fastdds init failed)`.
+
+  **Workaround if you want the old behaviour back** — for production
+  images that pre-stage the `.so` files out-of-band and don't want to
+  pay the ~20s rebuild, gate the bootstrap with
+  `WDNWEBUI_SKIP_WDNDDS_BOOTSTRAP=1` (see `run.py`'s
+  `_ensure_wdndds_built`). Don't try to bypass bootstrap from inside
+  the script itself; the hook in `_build.py` is always invoked by
+  `pip install` and there's no environment knob to skip just the
+  build step without bypassing the whole bootstrap.
+
 * `native/` empty (fresh clone after `git clean -fd`, or new board) —
   run `bash .venv/src/wdndds/build_native.sh` first (20-30 min,
   builds FastDDS 3.6 + FastCDR 2.3 from source), then the bootstrap
@@ -262,12 +293,45 @@ bootstrap script; a `git clean -fdx` that also wipes
 `idl/build/` + `cshim_src/build/` needs the full `build_native.sh` +
 bootstrap dance.
 
+## SDK native-`.so` rebuild policy — all three `.venv/src/` repos (since v0.3.1)
+
+All three internal SDKs live behind SSH at
+`git@10.10.10.10:wardner/{wdnav,wdnai,wdndds}.git`. Two of them
+ship in-tree C/C++ that's linked into a `.so` and **dynamically
+bound at import time** via ctypes (`_lib.<sym>.argtypes = […]` at
+module top). The previous build hooks checked only C-source mtime,
+which silently missed the case where a Python wrapper added a new
+ctypes binding while the C source was unchanged — leaving a stale
+`.so` that `import <sdk>` would crash on at startup with
+`AttributeError: undefined symbol`. Two separate instances so far:
+
+| SDK    | hook location                                   | stale symbol that crashed                                | fix commit | rebuild cost |
+|--------|-------------------------------------------------|----------------------------------------------------------|------------|--------------|
+| wdndds | `.venv/src/wdndds/src/wdndds/_build.py`         | `wdndds_topic_writer_create` (after `git pull` of 871d00f)| v0.6.1     | ~20s cmake   |
+| wdnav  | `.venv/src/wdnav/src/wdnav/_build_wdnav.py`     | any new `_lib.rkv_xxx.argtypes` binding                  | v0.3.1     | ~5s gcc      |
+| wdnai  | (no build hook — pure Python, no in-tree `.so`) | n/a                                                      | n/a        | 0            |
+
+Both hooks now unconditionally `os.unlink()` the pre-existing
+`.so` at the start of every `pip install` / `pip install -e` and
+rebuild from scratch. Opt-outs:
+
+* **wdndds** — `WDNWEBUI_SKIP_WDNDDS_BOOTSTRAP=1` gates the whole
+  bootstrap script (the only path that triggers a rebuild for
+  wdndds is the bootstrap, not the user's own `pip install`).
+* **wdnav** — `--skip-wdnav-video-build` CLI flag or
+  `SKIP_WDNAV_VIDEO_BUILD=1` env var (CI pre-built images).
+
+The hard rule for users of these SDKs: **after `git pull` on
+`.venv/src/<sdk>`, re-run `pip install -e .venv/src/<sdk>` (or the
+wdnwebui bootstrap for wdndds).** The hooks now guarantee a fresh
+build, but the `git pull` itself doesn't trigger one.
+
 ## Layout
 
 ```
 wdnwebui/
 ├── run.py                          # entry point — uvicorn.run("app.main:app", ...)
-├── bootstrap_wdndds_native.sh      # one-time wdndds .so build (apt + stub + pip)
+├── bootstrap_wdndds_native.sh      # wdndds .so build (apt + stub + pip; unconditional rebuild since v0.6.1)
 ├── app/
 │   ├── __init__.py       # __version__ = "0.3.0"
 │   ├── main.py           # create_app() factory + module-level `app`

@@ -109,12 +109,28 @@ STUB
     chmod +x "${NATIVE_BIN}/nodesize_dbg"
 fi
 
-# -- Fast path: both .so files already built ------------------------------
-if [[ -f "${CSHIM}" ]] && [[ -f "${IDL}" ]]; then
-    log "libwdndds_cshim.so + libwdndds_idl.so already built — skip pip rebuild"
-    log "OK"
-    exit 0
-fi
+# -- Always rebuild: no fast-path skip -----------------------------------
+#
+# v0.6.1: the previous "if both .so exist, exit 0" fast path was a
+# silent correctness trap — after a `git pull` of wdndds source that
+# added new bindings to _cshim.py (e.g. commit 871d00f
+# feat(wdndds): 新增 create_topic_writer/reader 流式分片助手), the
+# pre-existing .so would still satisfy the existence check, bootstrap
+# would exit 0, and the user would later hit
+# `AttributeError: undefined symbol: wdndds_topic_writer_create` from
+# the wrapper. The fix lives in two places:
+#
+#   1. `_build.py::build_py.run()` unconditionally `unlink()`s both
+#      .so files at the start of every invocation, so any
+#      `pip install` (editable or not) re-creates them from scratch
+#      against the current cshim_src + _cshim.py.
+#   2. bootstrap no longer skips pip when .so files exist, so even
+#      a user who ONLY ran bootstrap (no `pip install -e` after
+#      `git pull`) gets a fresh build. ~20s cost on every invocation.
+#
+# For production images that pre-stage the .so files out-of-band, gate
+# the bootstrap itself with `WDNWEBUI_SKIP_WDNDDS_BOOTSTRAP=1`
+# (see run.py). Don't bypass bootstrap from inside this script.
 
 # -- Step 4: trigger _build.py via non-editable install --------------------
 log "running \`pip install --force-reinstall --no-deps ${WDNDDS_SRC}\` as ${ORIG_USER} to compile the .so"
