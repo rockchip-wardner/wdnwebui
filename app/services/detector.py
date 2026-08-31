@@ -95,6 +95,8 @@ def _load_wdnai():
             _WDNAI_CACHE["_LMOutput"],
             _WDNAI_CACHE["_Generable"],
             _WDNAI_CACHE["_Field"],
+            _WDNAI_CACHE["_letterbox_resize_with_meta"],
+            _WDNAI_CACHE["_unletterbox_bbox"],
             _WDNAI_CACHE["_error"],
         )
     try:
@@ -106,6 +108,22 @@ def _load_wdnai():
             LLMSession,
             SystemLanguageModel,
         )
+        # `wdnai.utils` lives outside the top-level package (it's the
+        # SDK helper module), so it's imported explicitly here. Lazy
+        # import keeps the wdnav/RKNN init order untouched (mirrors
+        # `_load_wdnai`'s overall constraint).
+        try:
+            from wdnai.utils import (
+                letterbox_resize_with_meta,
+                unletterbox_bbox,
+            )
+            _lbox_ok = True
+            _lbox_err = ""
+        except Exception as _e:  # noqa: BLE001
+            letterbox_resize_with_meta = None  # type: ignore[assignment]
+            unletterbox_bbox = None  # type: ignore[assignment]
+            _lbox_ok = False
+            _lbox_err = str(_e)
         _WDNAI_CACHE.update(
             _ok=True,
             _Attachment=Attachment,
@@ -114,9 +132,15 @@ def _load_wdnai():
             _LMOutput=LMOutput,
             _Generable=Generable,
             _Field=Field,
-            _error="",
+            _letterbox_resize_with_meta=letterbox_resize_with_meta,
+            _unletterbox_bbox=unletterbox_bbox,
+            _error="" if _lbox_ok else _lbox_err,
         )
-        return True, Attachment, LLMSession, SystemLanguageModel, LMOutput, Generable, Field, ""
+        return (
+            True, Attachment, LLMSession, SystemLanguageModel,
+            LMOutput, Generable, Field,
+            letterbox_resize_with_meta, unletterbox_bbox, "",
+        )
     except Exception as e:
         _WDNAI_CACHE.update(
             _ok=False,
@@ -126,9 +150,14 @@ def _load_wdnai():
             _LMOutput=None,
             _Generable=None,
             _Field=None,
+            _letterbox_resize_with_meta=None,
+            _unletterbox_bbox=None,
             _error=str(e),
         )
-        return False, None, None, None, None, None, None, str(e)
+        return (
+            False, None, None, None, None, None, None,
+            None, None, str(e),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -266,16 +295,17 @@ def _build_target_doc_class(desc_desc: str):
 
     from pydantic import BaseModel as _PydBaseModel
 
+    # 重要：TargetDoc **不能带 class docstring**。pydantic 把 docstring
+    # 渲染到 ``model_json_schema()`` 的顶层 ``description`` 字段 —— 模
+    # 型在 prompt 里看到 ``{"description": "...", "properties": {...}}``
+    # 时，会把 ``description`` 当成数据字段（不是 JSON Schema 元数据），
+    # 把真正的 x1/y1/x2/y2/desc 包到 ``{"description": {...}}`` 里。
+    # pydantic 校验失败 → 走 ``_safe_validate`` 的 raw text fallback →
+    # ``DetectorEvent.text`` 变成半截 schema JSON，事件历史列表里
+    # 显示 ``{ "description": "Structured target-detection..." }`` 这
+    # 类乱码 + bbox/crop 全无。VLMDoc 没这个 bug 是因为它本就没 docstring。
     @Generable
     class TargetDoc(_PydBaseModel):
-        """Structured target-detection output for wdnwebui's
-        video-target-detection panel.
-
-        模型应给出 0–1000 归一化 ROI 坐标 ``x1, y1, x2, y2``（左上 +
-        右下）以及 ``desc``（对 ROI 框出内容的描述）。detector 会按
-        坐标裁原图 + JPEG 编码 + base64 内嵌，把 ``desc`` 写到事件
-        ``text`` 字段。
-        """
         x1: float = Field(description="ROI 左上角 x，0–1000 归一化。")
         y1: float = Field(description="ROI 左上角 y，0–1000 归一化。")
         x2: float = Field(description="ROI 右下角 x，0–1000 归一化。")
@@ -408,32 +438,98 @@ def _strip_trailing_punct(s: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 视频目标检测页专用：bbox 区域裁切 + JPEG 编码 + base64 内嵌
+# 视频目标检测页专用：letterbox 尺寸选择 + bbox 区域裁切 + JPEG 编码 + base64 内嵌
 # --------------------------------------------------------------------------- #
-def _crop_and_encode(frame_bgr: "np.ndarray", bbox_0_1000) -> tuple:
+def _pick_letterbox_size(
+    image_size, available_sizes, h: int, w: int,
+) -> int:
+    """Decide which vision-variant size the script should pre-letterbox
+    the input frame to.
+
+    Mirrors ``wdnai.backends.vlm._pick_variant``'s auto-pick rule
+    (closest by longest edge, ties broken by smaller) so that the
+    backend always agrees with our script-side choice. When the user
+    explicitly selected an ``image_size``, that value wins.
+
+    Returns the chosen edge length as an int (one of ``available_sizes``
+    when the list is non-empty, else a hard-coded fallback of ``768``
+    which matches the largest currently-shipped variant).
+    """
+    if image_size is not None:
+        try:
+            return int(image_size)
+        except (TypeError, ValueError):
+            pass
+    cleaned: List[int] = []
+    for s in available_sizes or []:
+        if isinstance(s, bool):
+            continue
+        try:
+            cleaned.append(int(s))
+        except (TypeError, ValueError):
+            continue
+    if not cleaned:
+        return 768
+    target = max(int(h), int(w))
+    return min(cleaned, key=lambda s: abs(s - target))
+
+
+def _crop_and_encode(
+    frame_bgr: "np.ndarray",
+    bbox_0_1000,
+    meta,
+    unletterbox_bbox_fn,
+) -> tuple:
     """Crop ``frame_bgr`` at the given 0–1000 normalized bbox, JPEG-encode,
     base64 the bytes. Returns ``(b64_str, w, h)``. Empty / invalid bbox
     → ``("", 0, 0)``.
 
-    Kept module-private (no leading underscore on import) so a unit test
-    can target it directly. OpenCV import is lazy: we only need it on
-    TargetDoc invocation, and opencv-python-headless is a hard dep
-    already used by the upload pipeline.
+    ``bbox_0_1000`` is interpreted in the **letterboxed canvas's**
+    coordinate space (the canvas that was sent to the VLM as
+    ``Attachment``); ``meta`` is the :class:`LetterboxMeta` returned by
+    ``letterbox_resize_with_meta`` and ``unletterbox_bbox_fn`` is the
+    matching helper. Together they map the bbox back to original-frame
+    pixels so the ROI has the source aspect ratio (no grey padding).
+
+    OpenCV import is lazy: we only need it on TargetDoc invocation,
+    and opencv-python-headless is a hard dep already used by the
+    upload pipeline.
     """
     if frame_bgr is None or frame_bgr.ndim < 2:
         return "", 0, 0
     try:
         if not isinstance(bbox_0_1000, (list, tuple)) or len(bbox_0_1000) != 4:
             return "", 0, 0
-        x1f, y1f, x2f, y2f = (float(v) for v in bbox_0_1000)
-    except (TypeError, ValueError):
+    except TypeError:
         return "", 0, 0
 
-    h, w = frame_bgr.shape[:2]
-    x1 = max(0, min(w, int(round(x1f / 1000.0 * w))))
-    x2 = max(0, min(w, int(round(x2f / 1000.0 * w))))
-    y1 = max(0, min(h, int(round(y1f / 1000.0 * h))))
-    y2 = max(0, min(h, int(round(y2f / 1000.0 * h))))
+    if unletterbox_bbox_fn is None or meta is None:
+        # Defensive fallback: if the SDK helpers aren't available (older
+        # wheel installed), fall back to the old "treat bbox as
+        # original-frame 0-1000" math so detection still produces *some*
+        # crop rather than crashing the frame loop.
+        try:
+            x1f, y1f, x2f, y2f = (float(v) for v in bbox_0_1000)
+        except (TypeError, ValueError):
+            return "", 0, 0
+        h, w = frame_bgr.shape[:2]
+        x1 = max(0, min(w, int(round(x1f / 1000.0 * w))))
+        x2 = max(0, min(w, int(round(x2f / 1000.0 * w))))
+        y1 = max(0, min(h, int(round(y1f / 1000.0 * h))))
+        y2 = max(0, min(h, int(round(y2f / 1000.0 * h))))
+    else:
+        try:
+            x1, y1, x2, y2 = unletterbox_bbox_fn(bbox_0_1000, meta)
+        except (TypeError, ValueError):
+            return "", 0, 0
+        x1, x2 = int(round(x1)), int(round(x2))
+        y1, y2 = int(round(y1)), int(round(y2))
+        h, w = frame_bgr.shape[:2]
+        x1 = max(0, min(w, x1))
+        x2 = max(0, min(w, x2))
+        y1 = max(0, min(h, y1))
+        y2 = max(0, min(h, y2))
+
     if x1 > x2:
         x1, x2 = x2, x1
     if y1 > y2:
@@ -808,9 +904,10 @@ class WdnaiDetector:
           （``VLMDoc`` 或 ``TargetDoc``）→ 构造 ``DetectorEvent`` →
           跳出循环：
           - ``VLMDoc``：取 ``text`` / ``level``；
-          - ``TargetDoc``：取 ``x1, y1, x2, y2, desc``，按 bbox 裁原
-            图 + JPEG 编码 + base64 内嵌进 ``crop_b64``，``desc`` 复
-            制到 ``text``。
+          - ``TargetDoc``：取 ``x1, y1, x2, y2, desc``，按
+            ``unletterbox_bbox`` 把 letterboxed 坐标映射回原图像素
+            后裁原图 + JPEG 编码 + base64 内嵌进 ``crop_b64``，
+            ``desc`` 复制到 ``text``。
         * 工具抛异常 → 构造 error/disabled ``DetectorEvent`` → **直接**
           跳出循环（按设计：异常立即报 error，不再继续喂回 prompt）。
         * 命中循环上限（``compute.tool_call_max_iters``，默认 5）→ 跳出
@@ -847,7 +944,10 @@ class WdnaiDetector:
             image_size = self._image_size
 
         try:
-            ok, Attachment, *_ = _load_wdnai()
+            (
+                ok, Attachment, _sess_cls, _model_cls, _lm_cls, _gen_cls,
+                _field_cls, letterbox_resize_with_meta, unletterbox_bbox, wdnai_err,
+            ) = _load_wdnai()
             if generating_cls is None:
                 # 兜底：start() 之前没跑过（实际不会发生——start() 第一
                 # 件事就是解析 schema，这里只是防御性 null-check）。
@@ -879,7 +979,61 @@ class WdnaiDetector:
             from app.services.tools.registry import ToolContext
             ctx = ToolContext(width=w, height=h, prompt=prompt)
 
-            frame_attachment = Attachment(frame_bgr)
+            # ---- script-side pre-letterbox ---------------------------------
+            # 模型看到的 image 必须是一个 letterboxed 正方形（vision RKNN
+            # 训练 / 导出只接受方形）。脚本侧做 letterbox（而不是让
+            # backend 在 worker 里做）有两个收益：
+            #   1. backend 返回的 bbox 一定在已知 letterboxed 坐标空间里，
+            #      配合 ``unletterbox_bbox(meta)`` 能精确还原到原图像素；
+            #      旧的“直接拿 0-1000 当原图坐标”路径在 16:9 帧 +
+            #      768×768 变体上会系统性偏 ~50px（参见 start() 里
+            #      的 0-1→0-1000 hack，正是这个偏的征兆）。
+            #   2. 主进程这边就能拿到 ``LetterboxMeta``，传给
+            #      ``_crop_and_encode``，让 JPEG 缩略图按原图宽高比裁，
+            #      不会带 letterbox 灰边进 UI 缩略图。
+            # ``image_size`` 用户显式指定 → 用之；否则按 backend
+            # ``_pick_variant`` 的 auto 规则（最长边最近匹配）选一个，
+            # 然后把同一个 ``target_size`` 透传给 ``sess.respond``，让
+            # backend 走我们选中的变体，bbox 坐标空间与 meta 严格对齐。
+            try:
+                from app.services.compute_registry import get_registry
+                available_sizes: List[int] = []
+                for inst in get_registry().list_with_source():
+                    if "swcap_video_describe" not in (inst.get("capability_types") or []):
+                        continue
+                    for s in (inst.get("available_image_sizes") or []):
+                        if isinstance(s, bool):
+                            continue
+                        try:
+                            available_sizes.append(int(s))
+                        except (TypeError, ValueError):
+                            continue
+                    break
+            except Exception:  # noqa: BLE001
+                available_sizes = []
+            target_size = _pick_letterbox_size(
+                image_size, available_sizes, h, w,
+            )
+            if letterbox_resize_with_meta is not None:
+                try:
+                    frame_attachment = Attachment(
+                        letterbox_resize_with_meta(frame_bgr, target_size)[0]
+                    )
+                    lbox_meta = letterbox_resize_with_meta(frame_bgr, target_size)[1]
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning(
+                        "frame infer: letterbox failed (%s) — falling back "
+                        "to raw frame attachment", e,
+                    )
+                    frame_attachment = Attachment(frame_bgr)
+                    lbox_meta = None
+            else:
+                LOG.warning(
+                    "frame infer: wdnai.utils.letterbox_resize_with_meta "
+                    "missing (%s) — bbox→pixel mapping may drift", wdnai_err,
+                )
+                frame_attachment = Attachment(frame_bgr)
+                lbox_meta = None
             events: List[DetectorEvent] = []
             tool_transcripts: List[str] = []
 
@@ -921,11 +1075,14 @@ class WdnaiDetector:
                     attachment=attachments,
                     generating=generating_cls,
                     tools=tool_classes,
-                    # 用户在 ``#vd-detect-size`` 选定的视觉模型
-                    # 目标尺寸；backend 端 ``VLMBackend.run_images`` 会
-                    # 透传给 ``_pick_variant(image_size=...)`` 强制选
-                    # 那个变体。``None`` 时保留 auto-pick。
-                    image_size=image_size,
+                    # 始终传 ``target_size``（与脚本侧 letterbox 的
+                    # canvas 边长严格一致），让 backend ``_pick_variant``
+                    # 选我们预先 letterbox 好的那个变体 —— bbox 坐标空
+                    # 间与 ``LetterboxMeta`` 才能对齐。否则 backend 自
+                    # 作主张切到另一个变体会让 bbox→pixel 映射整体偏移
+                    # 几十像素（之前 16:9 帧 + 768×768 路径上的
+                    # 0-1→0-1000 hack 就是这个偏移的征兆）。
+                    image_size=target_size,
                 )
                 result = asyncio.run(coro)
 
@@ -967,7 +1124,9 @@ class WdnaiDetector:
                 # JSON，``desc`` 复制到 ``text`` 字段。事件历史列表沿
                 # 用现有展示路径。
                 if TargetDoc is not None and isinstance(result, TargetDoc):
-                    target_ev = self._build_target_event(result, frame_bgr, prompt)
+                    target_ev = self._build_target_event(
+                        result, frame_bgr, prompt, lbox_meta, unletterbox_bbox,
+                    )
                     events.append(target_ev)
                     bbox = target_ev.bbox or [0.0, 0.0, 0.0, 0.0]
                     LOG.info(
@@ -1059,19 +1218,33 @@ class WdnaiDetector:
         result: "object",
         frame_bgr: "np.ndarray",
         prompt: str,
+        lbox_meta=None,
+        unletterbox_bbox_fn=None,
     ) -> DetectorEvent:
         """把 ``TargetDoc`` 实例 + 原帧包成 ``DetectorEvent``。
 
-        * 从 ``x1, y1, x2, y2`` 拼 ``bbox`` 数组；
+        * 从 ``x1, y1, x2, y2`` 拼 ``bbox`` 数组（4 维 0–1000 坐标，
+          坐标空间 = ``_infer_sync`` 里脚本侧 letterbox 后送进 VLM 的
+          正方形 canvas）；
         * ``desc`` 过 sanitize（防 chatml token / 控制字符 / 半截
           JSON 漏出），再复制到 ``text``（沿用历史展示路径）；
-        * 按 bbox 裁原图 + JPEG 编码 + base64 内嵌到 ``crop_b64``；
-          裁切为空时 ``crop_b64=""``，事件仍写出，``level='error'``。
+        * 按 bbox 裁原图 + JPEG 编码 + base64 内嵌到 ``crop_b64``：
+          ``_crop_and_encode`` 拿 ``lbox_meta`` + ``unletterbox_bbox``
+          把 letterboxed 坐标精确映射回原图像素，裁出来的 ROI 是原
+          比例（不包含 letterbox 灰边）；``lbox_meta=None`` 时退回
+          到老的“把 0-1000 当原图坐标”的粗略算法以保证向下兼容。
+        * 裁切为空时 ``crop_b64=""``，事件仍写出，``level='error'``。
         * ``tool_call='target_detection'`` —— 沿用历史事件的判别
           字段，前端用它识别"带 bbox / crop 的目标检测事件"。
           注意这里不再是 ``@Callable`` 工具调用，而是 schema 名
           语义化产物；与 ``tts_alert`` 区分（后者
           ``tool_call='tts_alert'`` 仍是真正的工具调用路径）。
+
+        历史上曾经有一段“0-1 → 0-1000 隐式校正”（model 在 768 变体
+        偶发输出小数 0-1 范围 bbox，~6% 概率）。脚本侧改成预先
+        letterbox + 把 ``image_size`` 强制对齐到 letterbox canvas
+        之后，模型的 0-1000 bbox 已经和 canvas 严格对齐，不会再
+        跑到 0-1 范围，所以这段 hack 已经过时 —— 直接删除。
         """
         try:
             bbox = [
@@ -1089,7 +1262,9 @@ class WdnaiDetector:
                 tool_call="target_detection",
             )
         desc = _sanitize_event_text(getattr(result, "desc", "") or "") or ""
-        crop_b64, crop_w, crop_h = _crop_and_encode(frame_bgr, bbox)
+        crop_b64, crop_w, crop_h = _crop_and_encode(
+            frame_bgr, bbox, lbox_meta, unletterbox_bbox_fn,
+        )
         if not crop_b64:
             return DetectorEvent(
                 id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
