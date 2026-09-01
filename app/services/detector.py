@@ -183,7 +183,7 @@ def _build_vlm_doc_class(text_desc: str, level_desc: str):
     # for ``level`` cannot be evaluated and instantiation fails.
     from typing import Optional
 
-    _, _, _, _, LMOutput, Generable, Field, _ = _load_wdnai()
+    _, _, _, _, LMOutput, Generable, Field, _, _, _ = _load_wdnai()
 
     # 注意：继承 LMOutput 会带上 ``attachment: List[Attachment]`` 字段，
     # 但 Attachment 不是 pydantic 模型 —— pydantic v2 的
@@ -291,7 +291,7 @@ def _build_target_doc_class(desc_desc: str):
     """
     from typing import Optional  # noqa: F401  (kept for parity w/ VLMDoc)
 
-    _, _, _, _, _, Generable, Field, _ = _load_wdnai()
+    _, _, _, _, _, Generable, Field, _, _, _ = _load_wdnai()
 
     from pydantic import BaseModel as _PydBaseModel
 
@@ -608,7 +608,9 @@ class WdnaiDetector:
         self._every_n = 30
         self._enabled_tools: List[str] = []
         self._frame_count = 0
-        self._model_name = "qwen3-vl-4b"
+        self._model_name = ""  # UI 仅作状态文案，已加载即已加载 —— 不展示
+                                # 模型名（音视频描述 / 视频目标检测页都不暴露
+                                # 当前模型 id 给前端）。
         self._generating_cls = generating_cls
         # 视觉模型目标尺寸 —— 用户从 ``#vd-detect-size`` 下拉框选
         # 的值。``None`` 表示"按图像分辨率自动选最近的变体"（leg‐
@@ -686,7 +688,8 @@ class WdnaiDetector:
                 "enabled":                self._enabled,
                 "prompt":                 self._prompt,
                 "every_n":                self._every_n,
-                "model":                  self._model_name,
+                "model":                  "",  # UI 不再展示模型名，仅作
+                                                # snapshot shape 兼容位
                 "session_ready":          session_ready,
                 "worker_alive":           self._worker is not None and self._worker.is_alive(),
                 "queue_size":             self._item_q.qsize(),

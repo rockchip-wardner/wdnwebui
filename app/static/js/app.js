@@ -1187,7 +1187,7 @@ function updateVdDetectorStatus(snap) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
   } else if (snap.session_ready) {
-    statusEl.textContent = `已加载 (${snap.model})`;
+    statusEl.textContent = "已加载";
   } else {
     statusEl.textContent = "已安装但未启动";
   }
@@ -1302,7 +1302,7 @@ async function vdLoadVisionSizes() {
     opt.textContent = "— 模型未加载 —";
     sel.appendChild(opt);
     sel.disabled = true;
-    if (hint) hint.textContent = "无可用变体（等待 qwen3-vl-4b 加载）";
+    if (hint) hint.textContent = "无可用变体（等待模型加载）";
     return;
   }
   for (const s of sizes) {
@@ -1318,8 +1318,8 @@ async function vdLoadVisionSizes() {
   sel.disabled = false;
   if (hint) {
     hint.textContent = sizes.length > 1
-      ? `${sizes.join(" / ")} — 选定后端到对应 vision 变体`
-      : `仅 ${sizes[0]}×${sizes[0]}（单变体部署）`;
+      ? sizes.join(" / ")
+      : `${sizes[0]}×${sizes[0]}（单变体）`;
   }
 }
 
@@ -1869,7 +1869,7 @@ function updateVtdDetectorStatus(snap) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
   } else if (snap.session_ready) {
-    statusEl.textContent = `已加载 (${snap.model})`;
+    statusEl.textContent = "已加载";
   } else {
     statusEl.textContent = "已安装但未启动";
   }
@@ -1974,7 +1974,7 @@ async function vtdLoadVisionSizes() {
     opt.textContent = "— 模型未加载 —";
     sel.appendChild(opt);
     sel.disabled = true;
-    if (hint) hint.textContent = "无可用变体（等待 qwen3-vl-4b 加载）";
+    if (hint) hint.textContent = "无可用变体（等待模型加载）";
     return;
   }
   for (const s of sizes) {
@@ -1990,8 +1990,8 @@ async function vtdLoadVisionSizes() {
   sel.disabled = false;
   if (hint) {
     hint.textContent = sizes.length > 1
-      ? `${sizes.join(" / ")} — 选定后端到对应 vision 变体`
-      : `仅 ${sizes[0]}×${sizes[0]}（单变体部署）`;
+      ? sizes.join(" / ")
+      : `${sizes[0]}×${sizes[0]}（单变体）`;
   }
 }
 async function vtdDetectorStop() {
