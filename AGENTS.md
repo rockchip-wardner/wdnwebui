@@ -322,9 +322,18 @@ rebuild from scratch. Opt-outs:
   `SKIP_WDNAV_VIDEO_BUILD=1` env var (CI pre-built images).
 
 The hard rule for users of these SDKs: **after `git pull` on
-`.venv/src/<sdk>`, re-run `pip install -e .venv/src/<sdk>` (or the
-wdnwebui bootstrap for wdndds).** The hooks now guarantee a fresh
-build, but the `git pull` itself doesn't trigger one.
+`.venv/src/<sdk>`, run `./update_rkwhl.sh`.** It `git pull`s all three
+SDKs and forces `pip install -e --force-reinstall --no-deps` on each,
+which is what actually triggers the rebuild hooks. The previous
+heuristic of "only reinstall when `pyproject.toml` changed" missed
+wrapper-only commits — root cause of the wdndds
+`undefined symbol: wdndds_topic_writer_create` incident after commit
+871d00f (`_cshim.py` gained new ctypes bindings, `pyproject.toml`
+untouched). `update_rkwhl.sh` now rebuilds unconditionally on any HEAD
+advance. For one-off sync of a single SDK, `pip install -e
+--force-reinstall --no-deps .venv/src/<sdk>` is the minimum; on a
+fresh host, `bootstrap_wdndds_native.sh` is still required for apt
+deps + native lib vendoring.
 
 ## Layout
 
