@@ -1137,6 +1137,45 @@ def infer_handler(state: dict, payload: dict) -> dict:
 
         attachments = []
         for item in atts_meta:
+            if isinstance(item, dict) and "data_path" in item:
+                # 主进程写到 /dev/shm 的原始 BGR ndarray (无 JPEG 损失)。
+                # 这是音视频描述 / 视频目标检测页的默认路径；
+                # raw 1080p = 6.2 MB 远超 FastDDS SHM/UDP per-message 上限，
+                # 所以 wire 只传路径，worker 端 ``np.fromfile().reshape()``
+                # 读回 byte-exact 帧。/dev/shm 是 RAM-backed tmpfs，
+                # 板上典型 4 GB 可用，每秒 1 帧推理 ~6 MB/s 完全可承受。
+                # 用完即删（np.fromfile 已经 mmap 进内存，源文件可立即回收）。
+                path = item["data_path"]
+                shape = item.get("shape") or [0, 0, 3]
+                dtype = item.get("dtype", "uint8")
+                img = None
+                try:
+                    import numpy as _np
+                    raw = _np.fromfile(path, dtype=dtype)
+                    if dtype == "uint8" and len(shape) == 3 and shape[2] == 3 \
+                            and raw.size == shape[0] * shape[1] * shape[2]:
+                        img = raw.reshape(shape)
+                    else:
+                        # Fallback: try cv2.imread (PNG fallback) if raw reshape fails
+                        # （主进程写 raw bytes 时只有 uint8 BGR HxWx3 路径命中，
+                        # 其他 dtype / shape 通过这条 fallback 走 PNG/JPEG 解码）。
+                        import cv2 as _cv2
+                        img = _cv2.imread(path, _cv2.IMREAD_COLOR)
+                except FileNotFoundError:
+                    LOG.warning("infer: data_path %s missing (skipping)", path)
+                except Exception as e:
+                    LOG.warning("infer: data_path %s failed (%s)", path, e)
+                finally:
+                    # 立即回收 /dev/shm 临时文件，避免每秒 1 帧堆积。
+                    try:
+                        import os as _os
+                        if _os.path.exists(path):
+                            _os.unlink(path)
+                    except OSError:
+                        pass
+                if img is not None:
+                    attachments.append(Attachment(img))
+                continue
             if isinstance(item, dict) and "data_b64" in item:
                 # audio 走 tag dict（``kind=="audio"``）；图片走裸 base64 字符串。
                 import base64 as _b64

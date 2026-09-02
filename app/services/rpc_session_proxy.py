@@ -30,7 +30,70 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
+import numpy as _np
+
 LOG = logging.getLogger("rpc_session_proxy")
+
+
+# shm image transfer — same pattern as ``video_content_search``
+# ``embed_video`` path-list form (see ``compute_worker.embed_video_handler``).
+# 主进程把原始 BGR ndarray 直接 ``tofile()`` 写到 ``/dev/shm``，wire 只
+# 传 path + shape + dtype；worker 端 ``np.fromfile().reshape()`` 还原。
+# 1080p 裸 BGR = 6.2 MB >> FastDDS SHM/UDP per-message 上限，
+# 所以走 path-list 绕开 wire 体积限制。/dev/shm 是 tmpfs（RAM），
+# 板上典型 4 GB 充裕，每秒 1 帧推理 ~6 MB/s 完全可承受。
+_VD_SHM_DIR = "/dev/shm"
+_VD_SHM_PREFIX = "wdnwebui_vd_"
+
+
+# Cleanup hook — if the main process is killed between
+# ``_bgr_ndarray_to_path`` write and the worker's ``np.fromfile`` +
+# ``os.unlink``, the /dev/shm temp file would leak (no other process
+# will pick it up). The boot sweep clears entries older than 1 h
+# (so concurrent boots don't sweep each other's in-flight writes);
+# the atexit hook (max_age=0) clears whatever's still here at shutdown.
+def _sweep_stale_vd_shm(max_age_seconds: float = 3600.0) -> int:
+    """Remove stale ``/dev/shm/wdnwebui_vd_*.bin`` files.
+
+    Args:
+        max_age_seconds: skip files newer than this (default 1 h).
+    Returns:
+        Number of files actually removed.
+    """
+    try:
+        import glob as _glob
+        import os as _os
+        import time as _time
+    except ImportError:
+        return 0
+    n = 0
+    now = _time.time()
+    try:
+        for p in _glob.glob(_os.path.join(_VD_SHM_DIR, f"{_VD_SHM_PREFIX}*.bin")):
+            try:
+                st = _os.stat(p)
+            except OSError:
+                continue
+            if now - st.st_mtime < max_age_seconds:
+                continue
+            try:
+                _os.unlink(p)
+                n += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if n:
+        LOG.info("swept %d stale %s files", n, _VD_SHM_PREFIX)
+    return n
+
+
+try:
+    import atexit as _atexit
+    _atexit.register(_sweep_stale_vd_shm, 0.0)
+except ImportError:
+    pass
+_sweep_stale_vd_shm()  # best-effort sweep on import
 
 
 # Lazy import for cv2 (only used by image-encoding path).
@@ -38,12 +101,50 @@ _cv2_lock = __import__("threading").Lock()
 
 
 def _bgr_ndarray_to_b64(arr, quality: int = 85) -> str:
-    """Encode a BGR ndarray as JPEG and base64."""
+    """JPEG-encode a BGR ndarray then base64.
+
+    **Kept only for the TTS/embed fallback paths** (legacy), the
+    primary VLM image path now goes through ``_bgr_ndarray_to_path``
+    which writes raw BGR bytes to ``/dev/shm`` and ships the path
+    over the cshim RPC — see ``_bgr_ndarray_to_path`` docstring for
+    the rationale (FastDDS 3.6.2 SHM/UDP effective per-message
+    payload cap is below 1 MB so 1080p raw can't fit, but path-list
+    form sidesteps the cap entirely).
+    """
     import cv2  # lazy
     ok, buf = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         raise RuntimeError("cv2.imencode failed")
     return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _bgr_ndarray_to_path(arr) -> dict:
+    """Write a BGR ``uint8`` ndarray to ``/dev/shm`` and return the path
+    descriptor.
+
+    Returns ``{"data_path": "<abs path>", "shape": [h, w, 3], "dtype": "uint8"}``.
+    Worker reads with ``np.fromfile(path).reshape(h, w, 3)`` — no
+    compression, no base64, byte-exact to what the detector sent.
+    """
+    import os as _os
+    import uuid as _uuid
+    if not isinstance(arr, _np.ndarray):
+        # Fallback for unusual inputs — go through the JPEG path.
+        # (Should never hit: detector only sends uint8 BGR HxWx3.)
+        return {"data_b64": _bgr_ndarray_to_b64(arr)}
+    if arr.dtype != _np.uint8 or arr.ndim != 3 or arr.shape[2] != 3:
+        # Same fallback for non-BGR images.
+        return {"data_b64": _bgr_ndarray_to_b64(arr)}
+    _os.makedirs(_VD_SHM_DIR, exist_ok=True)
+    name = f"{_VD_SHM_PREFIX}{_uuid.uuid4().hex}.bin"
+    path = _os.path.join(_VD_SHM_DIR, name)
+    arr.tofile(path)  # raw C-contig uint8 bytes
+    h, w, _ = arr.shape
+    return {
+        "data_path": path,
+        "shape": [int(h), int(w), 3],
+        "dtype": "uint8",
+    }
 
 
 class _AttachmentProxy:
@@ -658,11 +759,11 @@ class _RpcSessionProxy:
                     # 让 worker 端能识别（否则字符串会被当成 text 兜底）。
                     if getattr(item, "images", None):
                         for img in item.images:
-                            out.append(_bgr_ndarray_to_b64(img))
+                            out.append(_bgr_ndarray_to_path(img))
                         continue
                     if getattr(item, "frames", None):
                         for fr in item.frames:
-                            out.append(_bgr_ndarray_to_b64(fr))
+                            out.append(_bgr_ndarray_to_path(fr))
                         continue
                     if getattr(item, "text", None):
                         out.append(item.text)
@@ -683,7 +784,7 @@ class _RpcSessionProxy:
             except ImportError:
                 pass
             if hasattr(item, "shape") and hasattr(item, "dtype"):
-                out.append(_bgr_ndarray_to_b64(item))
+                out.append(_bgr_ndarray_to_path(item))
                 continue
             if isinstance(item, (bytes, bytearray)):
                 # 裸 bytes：默认按音频处理（TTS 常见输出 shape）。
