@@ -83,6 +83,22 @@ is no public fallback — these SDKs aren't published.
 
 After install you'll find them at `.venv/src/wdnav/` and `.venv/src/wdnai/`.
 
+## 4b. Keep the SDKs up to date
+
+After pulling upstream changes (or for routine sync), run:
+
+```bash
+./update_rkwhl.sh
+```
+
+It `git pull`s all three SDKs (wdnav / wdnai / wdndds) and forces
+`pip install -e --force-reinstall --no-deps` on each — that is what
+actually triggers the `.so` rebuild hooks for wdndds and wdnav.
+HEAD advances → rebuild (~5–20s per SDK). For manual single-SDK sync,
+`pip install -e --force-reinstall --no-deps .venv/src/<sdk>` is the
+minimum; on a fresh host, `sudo ./bootstrap_wdndds_native.sh` is still
+required for apt deps + native lib vendoring.
+
 ## 5. Run the service
 
 Development (auto-reload on Python edits):
