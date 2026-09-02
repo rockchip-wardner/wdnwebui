@@ -91,13 +91,13 @@ After pulling upstream changes (or for routine sync), run:
 ./update_rkwhl.sh
 ```
 
-It `git pull`s all three SDKs (wdnav / wdnai / wdndds) and forces
-`pip install -e --force-reinstall --no-deps` on each — that is what
-actually triggers the `.so` rebuild hooks for wdndds and wdnav.
-HEAD advances → rebuild (~5–20s per SDK). For manual single-SDK sync,
-`pip install -e --force-reinstall --no-deps .venv/src/<sdk>` is the
-minimum; on a fresh host, `sudo ./bootstrap_wdndds_native.sh` is still
-required for apt deps + native lib vendoring.
+It `git pull`s all three SDKs (wdnav / wdnai / wdndds) and runs
+`pip install --no-deps -e` on each — that is what actually triggers
+the `.so` rebuild hooks for wdndds and wdnav. HEAD advances → rebuild
+(~5–20s per SDK). For manual single-SDK sync,
+`pip install --no-deps -e .venv/src/<sdk>` is the minimum; on a fresh
+host, `sudo ./bootstrap_wdndds_native.sh` is still required for apt
+deps + native lib vendoring.
 
 ## 5. Run the service
 

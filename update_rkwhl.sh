@@ -4,8 +4,12 @@
 #
 # 设计要点（v1 起）：
 #   * git pull 之后**无条件**对三个 SDK 都跑
-#     `pip install -e --force-reinstall --no-deps`，强制触发
+#     `pip install --no-deps -e <path>`，强制触发
 #     wdndds._build.py / wdnav._build_wdnav.py 的 .so rebuild hook。
+#   * 注意：pip >= 24 拒绝 `--force-reinstall` + `-e` 组合（PEP 660
+#     后 editable install 不再支持该 flag）；且所有非 editable 标志
+#     必须放在 `-e` 之前，否则 pip 26.x 会把它们当成 editable
+#     requirement 报 "is not a valid editable requirement"。
 #   * 旧版只检测 `pyproject.toml` 变更；wrapper-only commit（典型：
 #     在 _cshim.py 加 ctypes 绑定）会被漏掉，导致 stale .so + 运行时
 #     `undefined symbol`。HEAD 推进就 rebuild，~5-20s 代价换彻底
@@ -46,14 +50,13 @@ update_pkg() {
         else
             reason="UPDATE_RKWHL_FORCE_REBUILD=1"
         fi
-        echo "==> [$pkg] ${reason}，强制 pip install -e --force-reinstall --no-deps 触发 build hook"
-        # 直接传本地路径而非 $repo_url，避免 SSH 重新 clone；同时
-        # --force-reinstall 强制 setuptools 跑 build_py hook（pip 默认
-        # 会跳过它认为没动的包）。_build.py 的 so.unlink() 保证 stale
-        # .so 永远被覆盖；若 build 失败，旧 .so 已被删，运行时 import
-        # 会以 FileNotFoundError 失败 —— 比 silent undefined symbol
-        # 容易诊断得多。
-        ( cd "$SCRIPT_DIR" && $PIP_TARGET install -e --force-reinstall --no-deps "$dir" )
+        echo "==> [$pkg] ${reason}，强制 pip install --no-deps -e 触发 build hook"
+        # 直接传本地路径而非 $repo_url，避免 SSH 重新 clone。_build.py
+        # / _build_wdnav.py 的 cmdclass 内部对 .so 做 os.unlink() +
+        # 重新编译，所以即使没有 --force-reinstall 也会强制覆盖 stale
+        # .so；若 build 失败旧 .so 已被删，运行时 import 抛
+        # FileNotFoundError——比 silent undefined symbol 容易诊断。
+        ( cd "$SCRIPT_DIR" && $PIP_TARGET install --no-deps -e "$dir" )
     else
         echo "==> [$pkg] HEAD 未推进，跳过 rebuild"
     fi
