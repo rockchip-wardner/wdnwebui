@@ -829,6 +829,7 @@ class ModelInstance:
     proc: Optional[subprocess.Popen] = None
     rpc_client: Any = None
     rpc_session_proxy: Any = None
+    _svc: Any = None                            # wdndds Service handle; needed for full cleanup in stop_instance_local
     _probe_thread: Optional[threading.Thread] = None
     _logged_running: bool = False
     # Provenance / discovery
@@ -2248,6 +2249,23 @@ class ComputeRegistry:
                 inst.rpc_client.destroy()
         except Exception:
             pass
+        # Tear down the per-worker wdndds Service and remove it from
+        # the Hub's tracking dict. Without this, each enable→restart
+        # cycle leaks one Service (which pins DataReader + DataWriter
+        # + payload pool = ~60 MB of RSS in the main process), plus
+        # the dead Python Requester object stays in ``svc._requesters``
+        # holding its ``_c_keepalive_id`` slot forever.
+        svc = getattr(inst, "_svc", None)
+        if svc is not None:
+            try:
+                svc_name = svc.name
+                hub = self._hub
+                if hub is not None:
+                    hub.destroy_service(svc_name)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("stop: hub.destroy_service(%s) raised: %s",
+                            model_id, e)
+            inst._svc = None
         with self._lock:
             self._instances.pop(inst.key, None)
         LOG.info("stopped local worker for %s", model_id)
@@ -2371,6 +2389,14 @@ class ComputeRegistry:
         svc = hub.create_service(service_name)
         rpc_client = svc.create_requester(timeout_ms=10_000)
         inst.rpc_client = rpc_client
+        # Stash the Service on the instance so ``stop_instance_local``
+        # / ``unload_instance`` can tear it down and pop it from
+        # ``hub._services``. Without this, every enable→disable cycle
+        # accumulates one Service per (npu, model, worker_pid),
+        # each pinning a DataReader + DataWriter + payload pool
+        # totalling ~60 MB of RSS that never gets reclaimed (the
+        # pre-fix main-process RSS jumped ~80 MB per restart cycle).
+        inst._svc = svc
         try:
             from app.services.rpc_session_proxy import make_rpc_session_proxy
             inst.rpc_session_proxy = make_rpc_session_proxy(
@@ -3079,10 +3105,22 @@ class ComputeRegistry:
                                    inst.model_id, consecutive_failures, e)
                         # BrokenPipe 后 cshim 端 endpoint 已坏;重建 RpcClient
                         # 让 cshim 重新走 endpoint 发现,可能命中别的健康 peer。
+                        old_svc = getattr(inst, "_svc", None)
+                        old_client = inst.rpc_client
                         try:
-                            inst.rpc_client.destroy()
+                            old_client.destroy()
                         except Exception:
                             pass
+                        # Drop the dead Requester from the Service's
+                        # tracking list BEFORE re-allocating, otherwise
+                        # ``Service._requesters`` grows unbounded on
+                        # every consecutive-failure rebuild and the
+                        # wedged cshim handle stays pinned in memory.
+                        if old_svc is not None:
+                            try:
+                                old_svc.remove_requester(old_client)
+                            except Exception:
+                                pass
                         try:
                             self._setup_rpc_client(inst)
                             LOG.info("rebuilt rpc_client for %s after "

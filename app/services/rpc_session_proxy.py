@@ -270,6 +270,14 @@ class _RpcSessionProxy:
         requester 在 call），实测会产出损坏 reply 甚至直接 SIGSEGV。
         recreate 完成后通过 ``_on_client_recreated`` 回调通知 registry
         同步替换 ``inst.rpc_client``，消除悬挂引用。
+
+        Memory: ``Service.create_requester`` appends the new
+        ``Requester`` to ``Service._requesters`` for lifecycle tracking;
+        the old wedged requester was already in there. Without an
+        explicit ``Service.remove_requester(old)`` after destroy(), the
+        list would grow unbounded — every wedged-client recreate
+        leaks one Python ``Requester`` object + its (now-dead) C
+        handle + its slot in the wdndds ``_cb_refs`` keepalive dict.
         """
         if self._svc is None:
             LOG.warning("rpc-proxy[%s]: no _svc ref, can't recreate", self._model_id)
@@ -281,6 +289,14 @@ class _RpcSessionProxy:
                     old.destroy()
             except Exception as e:  # noqa: BLE001
                 LOG.debug("rpc-proxy[%s]: destroy old client raised %s",
+                          self._model_id, e)
+            # Drop the dead Requester from the Service's tracking list
+            # BEFORE allocating the new one — this keeps the list
+            # size at exactly 1 for the lifetime of the proxy.
+            try:
+                self._svc.remove_requester(old)
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("rpc-proxy[%s]: svc.remove_requester(old) raised %s",
                           self._model_id, e)
             try:
                 new_client = self._svc.create_requester(timeout_ms=10_000)
