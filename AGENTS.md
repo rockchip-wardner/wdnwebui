@@ -170,6 +170,46 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   `(npu_index, model_id)` 不重复；UI  已经在加「instance_name」
   之前按 (npu, model) 唯一。
 
+### 内存模型：主进程 RSS 稳态 ~300 MB（修复后）
+
+主进程 RSS 由三部分组成（`/proc/PID/smaps_rollup` 看）：
+
+```
+RSS = python_heap (~140 MB)
+    + shared_libs  (~50 MB, fastdds.so/cv2/libmali/...)
+    + anon rw      (~200 MB, FastDDS TopicPayloadPool + glibc arena)
+    + shm files    (~12 MB, /dev/shm/fastdds_*)
+```
+
+**anon rw 段是 FastDDS 内部 TopicPayloadPool**（不是 Python 对象），
+每个 `DataWriter`/`DataReader` 创建时按
+`max_serialized_type_size × allocated_samples` 预分配 payload pool，
+delete entity 后池不释放（topic 留在 `Participant::req_topics` map 里，
+要等 `wdndds_participant_destroy()` 才整批 free）。
+
+**两层防御把稳态 RSS 从 ~1.35 GB 压到 ~300 MB**：
+
+1. **Service 生命周期**（`compute_registry.stop_instance_local`）—
+   `hub.destroy_service(name)` 把 Service 从 `hub._services` 删掉，
+   触发 `Service.destroy()` 清掉所有 repliers/requesters + C 侧
+   `wdndds_service_destroy`。修复前每次 enable→disable 循环 +80 MB
+   主进程 RSS。
+2. **resource_limits 上限封顶**（`cshim_src/wdndds_cshim.cpp:213`
+   `apply_bounded_resource_limits`）— 每个 writer/Reader 创建时设
+   `allocated_samples=8, max_samples=16`（reliable）/
+   `4/8`（best_effort），把单 entity pool 从 ~63 MB 压到 ~18 MB。
+
+**剩余 ~200 MB anon rw 不能压**：
+* ~265 MB 单段（malloc arena，没回 OS）
+* 18 MB × N entities（bounded pool 自身）
+* 65 MB + 35 MB × few（FastDDS discovery builtin endpoint cache，
+  改不了）
+
+**verifier**：连续 15+ 次 restart cycle 后 RSS 应稳定在 ±50 MB 范围内。
+若 RSS 单调上涨，说明 Service 没被 destroy（看 `hub._services` 大小
+或 `_instances` 的 `inst._svc` 是不是 None）；若 RSS 上限变高，说明
+QoS 上限被改宽（看 `apply_bounded_resource_limits` 调用点）。
+
 ## TL;DR commands
 
 ```bash
