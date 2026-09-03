@@ -1051,6 +1051,30 @@ def infer_handler(state: dict, payload: dict) -> dict:
     if sess is None:
         return {"status": "error", "error": "session not loaded; send action='load' first"}
 
+    # ---- 诊断日志 (768 切档后无返回) -------------------------------------
+    # 4 类故障定位：
+    #   1) worker 没收到 call        → 主进程 log 看 RPC fail / timeout
+    #   2) worker 收到但 sess.respond 抛错/挂死 → 看下面 "infer: exception" / "infer: started but no 'done'"
+    #   3) worker 算出结果但 reply 没回主进程 → 看 "infer: done" 后是否接 "infer_handler: returning reply"
+    #   4) reply 格式坏掉主进程解析失败  → 看 reply 的 keys / 序列化大小
+    import time as _t_inf
+    _t_req_in = _t_inf.time()
+    _req_id = payload.get("request_id") or f"local-{_t_inf.time_ns()}"
+    _diag_image_size = payload.get("image_size")
+    _diag_atts_meta_count = len(payload.get("attachment", []) or [])
+    _diag_generating = payload.get("generating")
+    _diag_tools = payload.get("tools") or []
+    try:
+        _diag_prompt_preview = (payload.get("prompt") or "")[:50]
+    except Exception:
+        _diag_prompt_preview = "<unreadable>"
+    LOG.info(
+        "infer_handler[%s]: ENTER image_size=%r attachments=%d "
+        "generating=%r tools=%r prompt=%r",
+        _req_id, _diag_image_size, _diag_atts_meta_count,
+        _diag_generating, _diag_tools, _diag_prompt_preview,
+    )
+
     try:
         mod = _load_wdnai()
         Attachment = mod["Attachment"]
@@ -1273,20 +1297,40 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 **kwargs,
             )
 
-        LOG.info("infer: starting (prompt_len=%d, attachments=%d)",
-                 len(prompt or ""), len(attachments))
+        LOG.info("infer: starting (prompt_len=%d, attachments=%d) image_size=%r",
+                 len(prompt or ""), len(attachments), _diag_image_size)
         import time as _time_inf
         t0_inf = _time_inf.time()
         try:
             result = asyncio.run(_call())
+        except Exception as _infer_exc:
+            LOG.warning(
+                "infer_handler[%s]: sess.respond raised in %.2fs: %s: %s",
+                _req_id, _time_inf.time() - t0_inf,
+                type(_infer_exc).__name__, _infer_exc,
+            )
+            raise
         finally:
             if tts_pcm_client is not None:
                 try:
                     tts_pcm_client.close()
                 except Exception:
                     pass
-        LOG.info("infer: done in %.2fs (result_type=%s)",
-                 _time_inf.time() - t0_inf, type(result).__name__)
+        # 诊断：拿到 result 之后的实际属性
+        try:
+            _rtext_len = len(getattr(result, "text", "") or "")
+        except Exception:
+            _rtext_len = -1
+        try:
+            _ratts_count = len(list(getattr(result, "attachment", []) or []))
+        except Exception:
+            _ratts_count = -1
+        LOG.info(
+            "infer: done in %.2fs (result_type=%s, text_len=%d, attachment_count=%d) "
+            "image_size=%r",
+            _time_inf.time() - t0_inf, type(result).__name__,
+            _rtext_len, _ratts_count, _diag_image_size,
+        )
         text = getattr(result, "text", None) or (
             result if isinstance(result, str) else None)
 
@@ -1401,9 +1445,33 @@ def infer_handler(state: dict, payload: dict) -> dict:
                     "schema instance dump failed (%s): %s",
                     type(result).__name__, e,
                 )
+        # 诊断：reply 即将被 cshim 序列化回主进程。记下 keys / 体积
+        # 以区分 "worker 算出来了但 reply 格式坏" vs "cshim 回不去"。
+        try:
+            import json as _json_diag
+            _reply_str = _json_diag.dumps(reply, ensure_ascii=False)
+            _reply_bytes = len(_reply_str.encode("utf-8"))
+        except Exception as _enc_exc:
+            _reply_bytes = -1
+            _reply_str = ""
+            LOG.warning(
+                "infer_handler[%s]: reply NOT JSON-serializable: %s — "
+                "this is the most likely cause of 'no result returned' "
+                "(cshim json.dumps will fail at the worker boundary)",
+                _req_id, _enc_exc,
+            )
+        LOG.info(
+            "infer_handler[%s]: returning reply keys=%s bytes=%d "
+            "image_size=%r total=%.2fs",
+            _req_id, sorted(reply.keys()), _reply_bytes,
+            _diag_image_size, _t_inf.time() - _t_req_in,
+        )
         return reply
     except Exception as e:  # noqa: BLE001
-        LOG.warning("infer_handler exception: %s", e)
+        LOG.warning(
+            "infer_handler[%s]: exception (image_size=%r): %s: %s",
+            _req_id, _diag_image_size, type(e).__name__, e,
+        )
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 

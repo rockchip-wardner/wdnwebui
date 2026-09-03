@@ -622,9 +622,29 @@ class _RpcSessionProxy:
                                      soft_retries=1, hard_retries=2)
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
+            LOG.warning(
+                "rpc-proxy[%s]: infer failed (image_size=%r): %s",
+                self._model_id, _image_size, err,
+            )
             raise RuntimeError(
                 f"compute_worker[{self._model_id}] infer failed: {err}")
         data = reply.get("data") or {}
+        # 诊断：worker 已经把 reply 发回主进程，记录 data 的 keys / 体积
+        # 区分 "worker 算出但 reply 格式坏" vs "正常 reply"
+        try:
+            import json as _json_diag
+            _data_str = _json_diag.dumps(data, ensure_ascii=False)
+            _data_bytes = len(_data_str.encode("utf-8"))
+        except Exception:
+            _data_bytes = -1
+        LOG.info(
+            "rpc-proxy[%s]: infer reply received (image_size=%r) "
+            "data_keys=%s bytes=%d text_len=%d",
+            self._model_id, _image_size,
+            sorted(data.keys()) if isinstance(data, dict) else type(data).__name__,
+            _data_bytes,
+            len(data.get("text", "") or "") if isinstance(data, dict) else 0,
+        )
 
         # ---- Tool-instance path -------------------------------------------
         # Worker 端 SDK 的 ``dispatch_tool_call`` 把模型返回的 JSON
