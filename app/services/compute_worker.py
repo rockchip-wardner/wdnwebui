@@ -1139,12 +1139,14 @@ def infer_handler(state: dict, payload: dict) -> dict:
         for item in atts_meta:
             if isinstance(item, dict) and "data_path" in item:
                 # 主进程写到 /dev/shm 的原始 BGR ndarray (无 JPEG 损失)。
-                # 这是音视频描述 / 视频目标检测页的默认路径；
-                # raw 1080p = 6.2 MB 远超 FastDDS SHM/UDP per-message 上限，
-                # 所以 wire 只传路径，worker 端 ``np.fromfile().reshape()``
-                # 读回 byte-exact 帧。/dev/shm 是 RAM-backed tmpfs，
-                # 板上典型 4 GB 可用，每秒 1 帧推理 ~6 MB/s 完全可承受。
-                # 用完即删（np.fromfile 已经 mmap 进内存，源文件可立即回收）。
+                # 这是音视频描述 / 视频目标检测页的默认路径。
+                # 配套说明见 ``rpc_session_proxy._bgr_ndarray_to_path``
+                # 顶部的 4 点 rationale —— 简言之：wire 只传 ~150 字节
+                # path 描述符，worker ``np.fromfile().reshape()`` 还原
+                # byte-exact 帧，零 DDS serialize / 反序列化开销。
+                # 跨机时 LAN peer 拿不到 caller 的 /dev/shm → FileNotFoundError
+                # （proxy 侧 is_remote=True 已经切回 base64 JPEG 兜底，
+                #  不会进这一分支）。
                 path = item["data_path"]
                 shape = item.get("shape") or [0, 0, 3]
                 dtype = item.get("dtype", "uint8")

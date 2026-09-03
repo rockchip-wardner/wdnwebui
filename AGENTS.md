@@ -79,9 +79,40 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   —— `RpcSessionProxy` 保持 `wdnai.LLMSession` 的 `.reset()` /
   `await .respond(prompt, attachment, ...)` 表面。
 * **服务端 lock**：worker 进程内一个 cshim pump 线程串行消费请求，
-  处理完 reply 完毕后才接下一个；多个 worker 并行是允许的
-  （不同 NPU / 不同 model 实例各跑各的）。跨进程互斥锁在 v0.4 不需要
-  —— 主进程侧 `RpcSessionProxy.respond` 内部 1 个 ThreadPoolExecutor
+   处理完 reply 完毕后才接下一个；多个 worker 并行是允许的
+   （不同 NPU / 不同 model 实例各跑各的）。跨进程互斥锁在 v0.4 不需要
+   —— 主进程侧 `RpcSessionProxy.respond` 内部 1 个 ThreadPoolExecutor
+   串行化同一 instance 的并发请求。
+
+* **VLM 图像传输：raw BGR via `/dev/shm` path-list**：
+  `RpcSessionProxy._encode_attachments()` 把每个
+  `Attachment.images` / `Attachment.frames` BGR ndarray 走
+  `_bgr_ndarray_to_path()`：
+  1. 主进程 `arr.tofile()` 写到 `/dev/shm/wdnwebui_vd_<uuid>.bin`
+     （tmpfs RAM，板上 4 GB 充裕）
+  2. wire 上只传 `{"data_path": ..., "shape": [h,w,3], "dtype": "uint8"}`
+     （~150 字节，远小于 FastDDS builtin per-message 限额）
+  3. worker `np.fromfile().reshape()` 还原 byte-exact 帧，立刻 `os.unlink()`
+  4. boot + atexit 各扫一次 `/dev/shm/wdnwebui_vd_*.bin` 防泄漏
+     （boot sweep 默认 `max_age=1h`，atexit 用 `max_age=0` 全清）
+
+  为什么走 path-list 而不是 base64 inline（之前是 JPEG q=85 + base64）：
+  * **无损**：480×640 单帧 max 像素差从 JPEG q=85 的 96/255 → 0。
+    VLM 4B 类模型对像素抖动敏感，JPEG 块状 artifact 在 1080p + 768
+    variant 上让模型误判 / 输出退化（实测报"泰文 / 乱码"）。
+  * **LAN peer 兜底**：内置 FastDDS transport（`use_builtin_transports=true`，
+    见 `cshim_src/wdndds_cshim.cpp:312`）自动 SHM（同机）+ UDPv4/TCPv4（跨机）。
+    跨机时 proxy 收 `ModelInstance._source == "adopted"` 自动设
+    `is_remote=True` → 切回 `_bgr_ndarray_to_b64`（JPEG+base64）。
+    path-list 在 caller 自己的 /dev/shm 上才能被同机 worker 读，
+    LAN peer 拿不到 → 自动 fallback。
+  * **wire 体积 + DDS 开销**：wire 不带图本身，每帧省 6.2 MB DDS
+    serialize / 反序列化（builtin TCPv4 兜底虽能塞但每帧一遍不便宜）。
+
+  用途覆盖：`WdnaiDetector`（音视频描述 / 视频目标检测）+ 视频文件分析
+  共用同一 `RpcSessionProxy`，都走 path-list。视频内容检索（embed_video）
+  走自己的 `wdndds_vcs_*` path-list（基于 JPEG，嵌入模型对像素抖动不敏感）。
+  音频走 base64（PCM bytes 不是图）。
   串行化同一 instance 的并发请求。
 * **`boot_compute_services` 在 boot 默认开启**。`app/main.py`
   `create_app` 把整个调用挪到 daemon thread

@@ -35,13 +35,30 @@ import numpy as _np
 LOG = logging.getLogger("rpc_session_proxy")
 
 
-# shm image transfer — same pattern as ``video_content_search``
-# ``embed_video`` path-list form (see ``compute_worker.embed_video_handler``).
-# 主进程把原始 BGR ndarray 直接 ``tofile()`` 写到 ``/dev/shm``，wire 只
-# 传 path + shape + dtype；worker 端 ``np.fromfile().reshape()`` 还原。
-# 1080p 裸 BGR = 6.2 MB >> FastDDS SHM/UDP per-message 上限，
-# 所以走 path-list 绕开 wire 体积限制。/dev/shm 是 tmpfs（RAM），
-# 板上典型 4 GB 充裕，每秒 1 帧推理 ~6 MB/s 完全可承受。
+# shm image transfer for the VLM image pipeline (音视频描述 / 视频目标检测
+# / 视频文件分析 共用)。主进程把原始 BGR ndarray 直接 ``tofile()`` 写到
+# ``/dev/shm``，wire 只传 path + shape + dtype；worker 端
+# ``np.fromfile().reshape()`` 还原 byte-exact。
+#
+# 为什么走 /dev/shm path-list 而不是 base64 inline（参考
+# ``video_content_search._write_frames_to_shm`` 的相同写法）：
+#   1. **无损**：480×640 单帧 max 像素差从 JPEG q=85 的 96/255 → 0。
+#      VLM 4B 类模型对像素抖动敏感，JPEG 块状 artifact 在 1080p + 768
+#      variant 上会让模型误判 / 输出退化（用户实测报"泰文 / 乱码"）。
+#   2. **LAN peer 兜底**：内置 FastDDS SHM transport（同机）+ UDPv4/TCPv4
+#      （跨机）由 wdndds cshim 自动切换（use_builtin_transports=true,
+#      见 cshim_src/wdndds_cshim.cpp:312），同机走 SHM；LAN peer 走
+#      builtin UDPv4/TCPv4，proxy 的 ``is_remote=True`` 切回 base64 JPEG。
+#      path-list 只能在 caller 自己的 /dev/shm 上被同机 worker 读，
+#      LAN peer 拿不到 → 自动 fallback。
+#   3. **Wire payload 小**：wire 只传 ~150 字节（path + shape + dtype），
+#      跨 builtin SHM / UDPv4 / TCPv4 都远低于 per-message 限额。1080p
+#      裸 BGR 6.2 MB 即使 builtin TCPv4 兜底能塞，DDS serialize / 反序列化
+#      每帧一遍太重；走 tmpfs RAM 拷贝更便宜。
+#   4. **tmpfs 资源**：/dev/shm 是 RAM-backed，板上典型 4 GB 充裕。
+#      每秒 1 帧推理净占用 ≈ 0（每帧 unlink 立刻回收）。boot +
+#      atexit 各扫一次 ``wdnwebui_vd_*.bin`` 防泄漏（max_age=1h，
+#      防并发 boot 互清；atexit 用 max_age=0 全清）。
 _VD_SHM_DIR = "/dev/shm"
 _VD_SHM_PREFIX = "wdnwebui_vd_"
 
@@ -103,13 +120,12 @@ _cv2_lock = __import__("threading").Lock()
 def _bgr_ndarray_to_b64(arr, quality: int = 85) -> str:
     """JPEG-encode a BGR ndarray then base64.
 
-    **Kept only for the TTS/embed fallback paths** (legacy), the
-    primary VLM image path now goes through ``_bgr_ndarray_to_path``
-    which writes raw BGR bytes to ``/dev/shm`` and ships the path
-    over the cshim RPC — see ``_bgr_ndarray_to_path`` docstring for
-    the rationale (FastDDS 3.6.2 SHM/UDP effective per-message
-    payload cap is below 1 MB so 1080p raw can't fit, but path-list
-    form sidesteps the cap entirely).
+    **Kept only for the LAN-peer fallback path** (when the proxy's
+    ``_is_remote=True``, see :func:`make_rpc_session_proxy`) and for
+    non-uint8-BGR ndarrays that fall through the path-list branch.
+    Local-worker VLM image transfer uses ``_bgr_ndarray_to_path``
+    instead — the path-list form is byte-exact (no JPEG) and avoids
+    paying the wire payload / DDS serialize overhead on every frame.
     """
     import cv2  # lazy
     ok, buf = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
@@ -125,6 +141,11 @@ def _bgr_ndarray_to_path(arr) -> dict:
     Returns ``{"data_path": "<abs path>", "shape": [h, w, 3], "dtype": "uint8"}``.
     Worker reads with ``np.fromfile(path).reshape(h, w, 3)`` — no
     compression, no base64, byte-exact to what the detector sent.
+
+    Non-uint8-BGR-HxWx3 inputs fall through to
+    :func:`_bgr_ndarray_to_b64` (legacy JPEG+base64 path); this should
+    never trigger from the detector (which always feeds uint8 BGR)
+    but keeps audio-byte / text / multi-frame-list paths working.
     """
     import os as _os
     import uuid as _uuid
@@ -219,7 +240,7 @@ class _RpcSessionProxy:
     """
 
     def __init__(self, rpc_client, model_id: str, _svc=None,
-                 on_client_recreated=None):
+                 on_client_recreated=None, *, is_remote: bool = False):
         self._client = rpc_client
         self._model_id = model_id
         # wdndds cshim requester 一次性：timeout / send-failed 后 channel
@@ -233,6 +254,12 @@ class _RpcSessionProxy:
             max_workers=1,
             thread_name_prefix=f"rpc-proxy-{model_id}",
         )
+        # ``True`` when the proxy targets a LAN peer worker on another
+        # machine. /dev/shm is per-host, so the raw-bytes path-list
+        # trick can't reach the remote worker — fall back to
+        # JPEG+base64 (lossy but crosses machine boundaries). Local
+        # workers default to ``False`` (raw BGR via /dev/shm, byte-exact).
+        self._is_remote = bool(is_remote)
 
     def _recreate_client(self) -> None:
         """Destroy wedged cshim client + spin up a fresh requester.
@@ -759,11 +786,17 @@ class _RpcSessionProxy:
                     # 让 worker 端能识别（否则字符串会被当成 text 兜底）。
                     if getattr(item, "images", None):
                         for img in item.images:
-                            out.append(_bgr_ndarray_to_path(img))
+                            if self._is_remote:
+                                out.append(_bgr_ndarray_to_b64(img))
+                            else:
+                                out.append(_bgr_ndarray_to_path(img))
                         continue
                     if getattr(item, "frames", None):
                         for fr in item.frames:
-                            out.append(_bgr_ndarray_to_path(fr))
+                            if self._is_remote:
+                                out.append(_bgr_ndarray_to_b64(fr))
+                            else:
+                                out.append(_bgr_ndarray_to_path(fr))
                         continue
                     if getattr(item, "text", None):
                         out.append(item.text)
@@ -784,7 +817,10 @@ class _RpcSessionProxy:
             except ImportError:
                 pass
             if hasattr(item, "shape") and hasattr(item, "dtype"):
-                out.append(_bgr_ndarray_to_path(item))
+                if self._is_remote:
+                    out.append(_bgr_ndarray_to_b64(item))
+                else:
+                    out.append(_bgr_ndarray_to_path(item))
                 continue
             if isinstance(item, (bytes, bytearray)):
                 # 裸 bytes：默认按音频处理（TTS 常见输出 shape）。
@@ -801,16 +837,26 @@ class _RpcSessionProxy:
 
 
 def make_rpc_session_proxy(rpc_client, model_id: str, _svc=None,
-                           on_client_recreated=None) -> _RpcSessionProxy:
+                           on_client_recreated=None,
+                           *, is_remote: bool = False) -> _RpcSessionProxy:
     """Build a proxy.
 
     ``on_client_recreated(new_requester)`` — optional callback invoked
     after a wedged client was destroyed + recreated. The registry uses
     it to keep ``inst.rpc_client`` pointing at the live requester so
     probe threads and admin operations never touch a destroyed handle.
+
+    ``is_remote=True`` when the proxy targets a **LAN peer worker** (a
+    worker running on another machine). The proxy then falls back to
+    JPEG+base64 for image attachments instead of writing to
+    ``/dev/shm`` — the path string travels through DDS, but the
+    file lives on the caller's filesystem which the remote worker
+    cannot access. Default ``False`` (local worker → /dev/shm path,
+    lossless).
     """
     return _RpcSessionProxy(rpc_client, model_id, _svc=_svc,
-                            on_client_recreated=on_client_recreated)
+                            on_client_recreated=on_client_recreated,
+                            is_remote=is_remote)
 
 
 # Public alias

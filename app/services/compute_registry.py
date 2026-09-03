@@ -2374,7 +2374,14 @@ class ComputeRegistry:
         try:
             from app.services.rpc_session_proxy import make_rpc_session_proxy
             inst.rpc_session_proxy = make_rpc_session_proxy(
-                rpc_client, inst.model_id, _svc=svc)
+                rpc_client, inst.model_id, _svc=svc,
+                # LAN peer (adopted from another machine): the proxy's
+                # /dev/shm path-list trick can't reach the remote worker
+                # (different filesystem namespace). Fall back to JPEG +
+                # base64 — slightly lossy but byte-exact through FastDDS's
+                # builtin UDPv4/TCPv4 transports on the LAN hop.
+                is_remote=(inst._source == "adopted"),
+            )
             inst.llm_session = inst.rpc_session_proxy
         except Exception as e:  # noqa: BLE001
             LOG.warning("RpcSessionProxy create failed for %s: %s",
