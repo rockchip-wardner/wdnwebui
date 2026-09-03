@@ -213,11 +213,15 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
                 exe_link = ""
 
             # (c) uvicorn-reloader multiprocessing children.
+            # /proc/<pid>/exe for a venv python resolves to the real
+            # binary (e.g. /usr/bin/python3.11), not .venv/bin/python;
+            # the wrapper path is preserved in cmdline[0] instead.
             if (b"multiprocessing.spawn" in raw
-                    or b"multiprocessing.resource_tracker" in raw) \
-                    and repo_python_marker in exe_link:
-                candidates.append(("uvicorn-reload-fork", pid))
-                continue
+                    or b"multiprocessing.resource_tracker" in raw):
+                argv = [a for a in raw.split(b"\0") if a]
+                if any(b".venv/bin/python" in a for a in argv):
+                    candidates.append(("uvicorn-reload-fork", pid))
+                    continue
 
             # (d) orphan ``compute_worker.py``. The triple filter
             # (bare filename + resolved path + repo name) excludes
@@ -299,30 +303,35 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
         # Give the kernel a moment to release sockets.
         time.sleep(0.5)
 
-    # Post-kill verification: if port 8000 is STILL occupied, the
-    # original sweep missed something (common when the previous run
-    # was launched under a wrapper like ``nohup`` that stripped the
-    # argv path or the holder's cmdline is unreadable). Walk the
-    # parent's PPid chain until we find a wdnwebui-flavored ancestor
-    # and kill its process group as a last resort. If even that
-    # can't release the port, leave a loud hint and let ``uvicorn.run``
-    # raise the [Errno 98] — caller can then ``kill -9`` by hand.
+    # Post-kill verification: kill whoever still holds 8000 (covers
+    # orphan uvicorn workers whose PPid chain has been reaped by
+    # init — _find_wdnwebui_ancestor returns None for those). Fall
+    # back to ancestor-walk + group kill if a foreign process rebinds
+    # the socket after the direct kill. If even that can't release
+    # the port, leave a loud hint and let uvicorn raise [Errno 98].
     new_holder = _pid_listening_on_port(8000)
     if new_holder and new_holder != my_pid and new_holder not in ancestors:
-        ancestor = _find_wdnwebui_ancestor(new_holder, repo_root, ancestors)
-        if ancestor and ancestor not in {p for _, p in expanded}:
-            print(
-                f"[run.py] kill-stale: port 8000 still held by pid={new_holder}; "
-                f"killing wdnwebui ancestor pid={ancestor} (+ descendants)",
-                file=sys.stderr,
-            )
-            for child in _descendant_pids(ancestor):
-                _signal_pid(child, signal.SIGKILL)
-            _signal_pid(ancestor, signal.SIGKILL)
-            time.sleep(0.5)
-            # If STILL busy (foreign process holding 8000), surface it
-            # so the user knows what to kill manually.
-            leftover = _pid_listening_on_port(8000)
+        print(
+            f"[run.py] kill-stale: port 8000 still held by pid={new_holder}; "
+            f"killing holder directly",
+            file=sys.stderr,
+        )
+        _signal_pid(new_holder, signal.SIGKILL)
+        time.sleep(0.5)
+        leftover = _pid_listening_on_port(8000)
+        if leftover and leftover != my_pid and leftover not in ancestors:
+            ancestor = _find_wdnwebui_ancestor(leftover, repo_root, ancestors)
+            if ancestor and ancestor not in {p for _, p in expanded}:
+                print(
+                    f"[run.py] kill-stale: port 8000 still held by pid={leftover}; "
+                    f"killing wdnwebui ancestor pid={ancestor} (+ descendants)",
+                    file=sys.stderr,
+                )
+                for child in _descendant_pids(ancestor):
+                    _signal_pid(child, signal.SIGKILL)
+                _signal_pid(ancestor, signal.SIGKILL)
+                time.sleep(0.5)
+                leftover = _pid_listening_on_port(8000)
             if leftover and leftover != my_pid and leftover not in ancestors:
                 try:
                     with open(f"/proc/{leftover}/cmdline", "rb") as f:
