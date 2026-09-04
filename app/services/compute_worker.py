@@ -662,6 +662,7 @@ def embed_text_handler(state: dict, payload: dict) -> dict:
     import threading as _threading
     sess = state.get("session")
     if sess is None:
+        LOG.warning("embed_text: session not loaded — rejecting request")
         return {"status": "error",
                 "error": "session not loaded; send action='load' first"}
     text = payload.get("text") or ""
@@ -754,6 +755,9 @@ def embed_video_handler(state: dict, payload: dict) -> dict:
     import threading as _threading
     sess = state.get("session")
     if sess is None:
+        LOG.warning("embed_video: session not loaded — rejecting request "
+                    "(n_paths=%s)", len(payload.get("frame_paths") or
+                                        payload.get("frames") or []))
         return {"status": "error",
                 "error": "session not loaded; send action='load' first"}
     import numpy as _np
@@ -770,6 +774,13 @@ def embed_video_handler(state: dict, payload: dict) -> dict:
         for p in paths:
             img = _cv2.imread(p, _cv2.IMREAD_COLOR)
             if img is None:
+                # 读失败必须可见 —— OpenCV 只往 stderr 打一行 WARN，
+                # handler 层再记一条带存在性/大小的，事后排查才有据。
+                import os as _os
+                LOG.warning(
+                    "embed_video: cv2.imread failed for %s (exists=%s "
+                    "size=%s)", p, _os.path.exists(p),
+                    _os.path.getsize(p) if _os.path.exists(p) else -1)
                 return {"status": "error",
                         "error": f"cv2.imread returned None for {p}"}
             frames.append(img)
@@ -1548,6 +1559,23 @@ def _config_path() -> str:
 
 
 def main() -> int:
+    # fd 保险：把 soft RLIMIT_NOFILE 提到 hard 上限。worker 是长寿命进程，
+    # RKNN init（每 context/卡一堆 fd）+ mmap 权重 + DDS endpoint 的 fd
+    # 占用远超交互 shell 默认的 1024 soft limit —— 一旦逼近上限，
+    # cv2.imread 的 fopen 会**间歇性** EMFILE 失败，OpenCV 只报一句
+    # "can't open/read file: check file path/integrity"，表象与文件缺失
+    # 无法区分。失败不致命 —— 低 hard 环境下保持原值继续跑。
+    try:
+        import resource as _resource
+        _soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+        if _soft < _hard:
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (_hard, _hard))
+            print(f"[compute_worker] RLIMIT_NOFILE soft {_soft} -> {_hard}",
+                  flush=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[compute_worker] RLIMIT_NOFILE raise skipped: {_e}",
+              flush=True)
+
     ap = argparse.ArgumentParser(prog="compute_worker")
     ap.add_argument("--model", required=True,
                     help="model id (key in MODEL_PRESETS)")

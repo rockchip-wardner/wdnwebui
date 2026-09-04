@@ -368,6 +368,24 @@ class _RpcSessionProxy:
     _POLL_RETRY_SLEEP = 0.5
     _POLL_TIMEOUT_MS = 5_000
 
+    @staticmethod
+    def _worker_business_error(reply: Any) -> Optional[str]:
+        """Return the worker-side business error text, or ``None``.
+
+        wire 顶层 ``ok`` 只反映**传输层**成败 —— cshim Replier 回调没崩
+        就恒为 ``True``（见 wdndds_cshim.cpp reply 组装：handler 返回的
+        dict 原样嵌进 ``data`` 字段，ok 与 handler 语义无关）。handler
+        的业务错误以 ``{"status": "error", "error": ...}`` 形状放在
+        ``data`` 里（与 chat_poll 的消费方式一致）。只查顶层 ``ok`` 会
+        把 handler 错误吞成空结果。
+        """
+        if not isinstance(reply, dict):
+            return None
+        data = reply.get("data")
+        if isinstance(data, dict) and data.get("status") == "error":
+            return str(data.get("error") or "unknown worker error")
+        return None
+
     def _call_resilient(self, payload: dict, timeout_ms: int, *,
                         soft_retries: Optional[int] = None,
                         hard_retries: Optional[int] = None) -> dict:
@@ -628,6 +646,17 @@ class _RpcSessionProxy:
             )
             raise RuntimeError(
                 f"compute_worker[{self._model_id}] infer failed: {err}")
+        biz_err = self._worker_business_error(reply)
+        if biz_err:
+            # handler 业务错误（session not loaded / SDK 抛错 / 参数校验）
+            # —— wire 顶层 ok 是 True，不在这里 raise 就会被解析成空
+            # _ProxyResult，detector 端静默丢弃。
+            LOG.warning(
+                "rpc-proxy[%s]: infer handler error (image_size=%r): %s",
+                self._model_id, _image_size, biz_err,
+            )
+            raise RuntimeError(
+                f"compute_worker[{self._model_id}] infer failed: {biz_err}")
         data = reply.get("data") or {}
         # 诊断：worker 已经把 reply 发回主进程，记录 data 的 keys / 体积
         # 区分 "worker 算出但 reply 格式坏" vs "正常 reply"
@@ -750,6 +779,10 @@ class _RpcSessionProxy:
             err = reply.get("error", "unknown error")
             raise RuntimeError(
                 f"compute_worker[{self._model_id}] embed_text failed: {err}")
+        biz_err = self._worker_business_error(reply)
+        if biz_err:
+            raise RuntimeError(
+                f"compute_worker[{self._model_id}] embed_text failed: {biz_err}")
         data = reply.get("data") or {}
         vec = data.get("vec") or []
         import numpy as _np
@@ -802,6 +835,17 @@ class _RpcSessionProxy:
             err = reply.get("error", "unknown error")
             raise RuntimeError(
                 f"compute_worker[{self._model_id}] embed_video failed: {err}")
+        biz_err = self._worker_business_error(reply)
+        if biz_err:
+            # worker 端 imread / SDK 失败（如 cv2.imread can't open/read）
+            # —— 不在这里 raise 就会静默返回空向量，上层
+            # wechat_video_manager 的 norm 检查再静默跳过，最终只报
+            # "0/10 段成功" 而真因全无。
+            LOG.warning(
+                "rpc-proxy[%s]: embed_video handler error: %s",
+                self._model_id, biz_err)
+            raise RuntimeError(
+                f"compute_worker[{self._model_id}] embed_video failed: {biz_err}")
         data = reply.get("data") or {}
         vec = data.get("vec") or []
         import numpy as _np

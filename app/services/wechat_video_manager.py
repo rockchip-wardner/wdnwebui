@@ -437,6 +437,7 @@ class WechatVideoManager:
         shm_session_id = f"wxv{seq:x}"
         chunk_idx = 0
         start = 0.0
+        failures: list = []
         while start < duration_s:
             if self._superseded(user_id, seq):
                 _LOG.info("wechat video: %s superseded mid-extraction "
@@ -445,6 +446,8 @@ class WechatVideoManager:
                 break
             frames = _read_chunk_frames(str(path), start, _CHUNK_SECONDS, fps)
             if not frames:
+                failures.append(
+                    f"c{chunk_idx}: PyAV 解码 0 帧 @ {start:.0f}s")
                 break
             end_time = start + len(frames)
             frame_paths = _write_frames_to_shm(frames, shm_session_id, chunk_idx)
@@ -476,6 +479,16 @@ class WechatVideoManager:
                         entry.slices_embedded += 1
                         entry.progress = (
                             entry.slices_embedded / total if total else 1.0)
+                else:
+                    failures.append(
+                        f"c{chunk_idx}: embedding 向量退化 (norm={norm:.3g})")
+            except Exception as chunk_err:  # noqa: BLE001
+                # 单片失败记录后继续（对齐 VCS UI 页行为）——不再单片
+                # 中止整轮。失败原因进 failures，终态聚合错误里可见，
+                # 微信用户直接收到真因而非笼统的 "全部失败"。
+                failures.append(f"c{chunk_idx}: {chunk_err}")
+                _LOG.warning("wechat video: chunk %d/%d embed failed: %s",
+                             chunk_idx, total, chunk_err)
             finally:
                 for _p in frame_paths:
                     try:
@@ -496,9 +509,19 @@ class WechatVideoManager:
             return
         with self._lock:
             if not entry.index:
+                detail = ""
+                if failures:
+                    detail = f"首个失败: {failures[0]}"
+                    if len(failures) > 1:
+                        detail += f"; 末次失败: {failures[-1]}"
                 raise RuntimeError(
-                    f"提取完成但 0/{total} 段成功 embedding — "
-                    "所有切片解码或推理失败")
+                    f"提取完成但 0/{total} 段成功 embedding"
+                    f"（{len(failures)} 次失败）— {detail or '所有切片解码或推理失败'}")
+            if failures:
+                _LOG.warning("wechat video: %s ready with %d/%d segments "
+                             "(%d chunk failures, first: %s)",
+                             entry.filename, len(entry.index), total,
+                             len(failures), failures[0])
             entry.state = _STATE_READY
             entry.progress = 1.0
             n_hits_src = len(entry.index)
