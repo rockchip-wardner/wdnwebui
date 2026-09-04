@@ -419,7 +419,7 @@ def _terminate_orphan_pids(pids: List[int], grace_sec: int = 5) -> int:
 
 
 def _resolve_worker_model_id(comm: str) -> Optional[str]:
-    """Reverse-lookup: given a comm string (e.g. ``worker:llm-8b``),
+    """Reverse-lookup: given a comm string (e.g. ``worker:llm-4b``),
     return the ``model_id`` whose ``MODEL_PRESETS[model_id].worker_name``
     matches the suffix. Returns ``None`` for unknown comms (e.g.
     ``worker:debug``, future aliases not in the preset table).
@@ -447,11 +447,11 @@ def _qwen3_tts_spec():
     return SystemLanguageModel.qwen3_tts()
 
 
-def _qwen3_8b_spec():
+def _qwen3_4b_spec():
     from dataclasses import replace as _dc_replace
     from wdnai import SystemLanguageModel
-    spec = SystemLanguageModel.qwen3_8b()
-    return _dc_replace(spec, max_context_len=32768).with_options(
+    spec = SystemLanguageModel.qwen3_4b()
+    return _dc_replace(spec, max_context_len=16384).with_options(
         max_new_tokens=2048,
         keep_history=1,
         enable_thinking=True,
@@ -535,15 +535,15 @@ MODEL_PRESETS: dict[str, dict] = {
         "description":      "文字转语音模型",
         "available_targets": ["182x"],
     },
-    "qwen3-8b": {
+    "qwen3-4b": {
         "label":            "[LLM]文字对话模型",
-        "preset_factory":   _qwen3_8b_spec,
-        "model_dir_name":   "Qwen3-8B",
+        "preset_factory":   _qwen3_4b_spec,
+        "model_dir_name":   "Qwen3-4B",
         "memory_estimate_mb": 4950,
         "estimated_init_seconds": 60,
         "capability_types": ["swcap_text_chat"],
         "instance_name":    "llm-chat",
-        "worker_name":      "llm-8b",          # comm = "worker:llm-8b"（12 chars）
+        "worker_name":      "llm-4b",          # comm = "worker:llm-4b"（12 chars）
         "description":      "文字对话模型",
         "available_targets": ["182x"],
     },

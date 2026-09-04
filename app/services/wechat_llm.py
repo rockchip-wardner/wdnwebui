@@ -1,14 +1,14 @@
 """微信对接文本对话模型桥接。
 
 开启开关后，微信用户发来的文字消息自动进入一个串行 worker 队列，桥接
-调用 ``swcap_text_chat``（qwen3-8b）的 ``chat_run`` 推理，把回答通过
+调用 ``swcap_text_chat``（qwen3-4b）的 ``chat_run`` 推理，把回答通过
 ``Wechat.send_text`` 发回给该微信用户。
 
 设计要点
 ========
 
 * **开关内存态**：``_enabled`` 只存内存，不落盘（重启即关）；开关可开性
-  由 ``available()`` 决定 —— qwen3-8b 未加载时无法开启（后端校验兜底）。
+  由 ``available()`` 决定 —— qwen3-4b 未加载时无法开启（后端校验兜底）。
 * **per-user 上下文隔离**：``self.histories: dict[user_id, deque]`` 各自
   独立，与 web 文本对话的全局历史完全无关。上下文裁剪复用
   ``chat_runner.trim_history``。
@@ -49,7 +49,7 @@ def _llm_log(msg: str) -> None:
 
 
 class _LlmBridge:
-    """微信文字消息 → qwen3-8b → 自动回复 的串行桥接。"""
+    """微信文字消息 → qwen3-4b → 自动回复 的串行桥接。"""
 
     MAX_NEW_TOKENS = 2048
 
@@ -68,7 +68,7 @@ class _LlmBridge:
 
     # ------------------------------------------------------------- 状态
     def available(self) -> bool:
-        """qwen3-8b 是否已加载、可对话（用于前端置灰 + 后端开启校验）。"""
+        """qwen3-4b 是否已加载、可对话（用于前端置灰 + 后端开启校验）。"""
         try:
             from app.services.compute_registry import get_registry
             get_registry().get_session("swcap_text_chat")
@@ -100,7 +100,7 @@ class _LlmBridge:
     def set_enabled(self, on: bool) -> dict:
         if on and not self.available():
             raise RuntimeError(
-                "文本对话模型未启用（请在算力配置页启用 qwen3-8b / "
+                "文本对话模型未启用（请在算力配置页启用 qwen3-4b / "
                 "qwen3-5-vl-4b 任一文本对话实例）"
             )
         with self._lock:
@@ -356,12 +356,12 @@ class _LlmBridge:
             if isinstance(cfg, dict):
                 tc = cfg.get("text_chat")
                 if isinstance(tc, dict):
-                    v = int(tc.get("context_limit") or 32768)
+                    v = int(tc.get("context_limit") or 16384)
                     if v >= 1:
                         return v
         except Exception:  # noqa: BLE001
             pass
-        return 32768
+        return 16384
 
     def _resolve_tool_names(self) -> list:
         """列出**当前可用**的 ``@Callable`` class 名（capability 过滤）。

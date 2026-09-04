@@ -4503,7 +4503,7 @@ VdFsModal.pickCurrentDir = function () {
  *
  *  顶部一行：内存条（3588 系统内存 + 每张 RK182x 卡显存），复用
  *           /api/system-monitor 的 memory / npu.devices 字段。
- *  中间三张：按 preset（Qwen3-VL-4B / Qwen3-TTS / Qwen3-8B）划分
+ *  中间三张：按 preset（Qwen3-VL-4B / Qwen3-TTS / Qwen3-4B）划分
  *           的 service 卡片 —— 每张卡片列出子模型清单（来自本地
  *           CC_PRESET_META，按文件后缀标注可用 target），下方用
  *           radio 选运行在哪张 NPU，点 启用 / 停用 走现有的
@@ -4529,7 +4529,7 @@ const CC_PRESET_META = {
     description: "文字转语音模型",
     available_targets: ["182x"],
   },
-  "qwen3-8b": {
+  "qwen3-4b": {
     label: "[LLM]文字对话模型",
     capability_types: ["swcap_text_chat"],
     instance_name: "llm-chat",
@@ -4573,7 +4573,7 @@ const CC_PRESET_META = {
 const CC_PRESET_ORDER = [
   "qwen3-vl-4b",
   "qwen3-5-vl-4b",     // 多模态卡（同时支持文本对话 + 视频描述）
-  "qwen3-8b",          // Qwen3 纯文本
+  "qwen3-4b",          // Qwen3 纯文本
   "qwen3-tts",
   "qwen3-vl-embedding-2b",
   "qwen2.5-omni-3b",
@@ -6574,7 +6574,7 @@ const ImBridge = {
 
     if (hint) {
       if (!available) {
-        hint.textContent = "文本对话模型未启用，请在算力配置页启用 qwen3-8b / qwen3-5-vl-4b 任一文本对话实例";
+        hint.textContent = "文本对话模型未启用，请在算力配置页启用 qwen3-4b / qwen3-5-vl-4b 任一文本对话实例";
         hint.className = "imb-bridge-hint danger";
       } else if (enabled) {
         hint.textContent = b.busy ? "已对接，生成中…" : "已对接，微信消息将自动回复";
@@ -7119,7 +7119,7 @@ const TextChat = {
     const tokens = document.getElementById("text-chat-tokens");
     if (tokens) {
       const ht = s.history_tokens || 0;
-      const limit = s.context_limit || 32768;
+      const limit = s.context_limit || 16384;
       const maxNew = s.max_new_tokens || 2048;
       tokens.textContent = `${ht} / ${limit} tokens（预留 ${maxNew} 给输出）`;
     }

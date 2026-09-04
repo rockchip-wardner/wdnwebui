@@ -72,10 +72,10 @@ def _preset_for(model_id: str) -> Any:
         return SLM.qwen3_vl_4b()
     if model_id == "qwen3-tts":
         return SLM.qwen3_tts()
-    if model_id == "qwen3-8b":
+    if model_id == "qwen3-4b":
         from dataclasses import replace as _dc_replace
-        spec = SLM.qwen3_8b()
-        return _dc_replace(spec, max_context_len=32768).with_options(
+        spec = SLM.qwen3_4b()
+        return _dc_replace(spec, max_context_len=16384).with_options(
             max_new_tokens=2048,
             keep_history=1,
             enable_thinking=True,

@@ -1,4 +1,4 @@
-"""Qwen3-8B 文本对话服务：单例 + worker + RPC 流式拉取。
+"""Qwen3-4B 文本对话服务：单例 + worker + RPC 流式拉取。
 
 设计要点
 ========
@@ -20,7 +20,7 @@
   拼 ChatML 后 ``keep_history=0`` 跑 —— 历史只写 ``content:answer``，
   不写 thinking，下一轮看不到。
 * **context_limit 可配置**：``config.jsonc["compute"]["text_chat"]["context_limit"]``，
-  默认 32768；每次推理前热读。超限自动裁剪最旧历史，仅单条消息超限才报错。
+  默认 16384；每次推理前热读。超限自动裁剪最旧历史，仅单条消息超限才报错。
 * **停止 = 软停**：``stop()`` 置 ``_worker_stop_event``；proxy 的 ``chat_run``
   轮询循环感知后调 ``chat_stop`` RPC，worker 跑完返回 stopped，主进程丢本轮。
 * **broadcast pattern**：worker 线程 push 到 ``asyncio.Queue`` 列表；
@@ -103,7 +103,7 @@ class _TextChatManager:
     # ---- 限制 ----
     HISTORY_MAX        = 200          # deque maxlen
     MAX_NEW_TOKENS     = 2048         # spec max_new_tokens
-    CONTEXT_LIMIT      = 32768        # spec max_context_len
+    CONTEXT_LIMIT      = 16384        # spec max_context_len（qwen3-4b）
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -398,7 +398,7 @@ class _TextChatManager:
     def _resolve_context_limit(self) -> int:
         """读 ``config.jsonc["compute"]["text_chat"]["context_limit"]``。
 
-        默认 32768；缺失 / 类型错 / <1 → 回退默认。每次推理前重读，配置热生效。
+        默认 16384；缺失 / 类型错 / <1 → 回退默认。每次推理前重读，配置热生效。
         """
         try:
             cfg = get_config().get_section("compute", {})
@@ -434,7 +434,7 @@ class _TextChatManager:
 class _ThinkingRouter:
     """增量状态机：维护一个游标决定下一段 delta 推 thinking 还是 answer。
 
-    进入点固定假设模型先输出 thinking（用户已确认 Qwen3-8B 走 enable_thinking
+    进入点固定假设模型先输出 thinking（用户已确认 Qwen3-4B 走 enable_thinking
     必输出 ``<think>...</think>``）；首次见到 ``</think>`` 后切到 answer。
     """
 

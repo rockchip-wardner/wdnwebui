@@ -1,4 +1,4 @@
-"""Qwen3-8B 文本对话 REST + WebSocket API。
+"""Qwen3-4B 文本对话 REST + WebSocket API。
 
 端点
 ====
@@ -16,9 +16,9 @@
 错误码
 ======
 
-* 400 —— text 为空 / 对话过长（prompt 超过 32K 上下文）。
+* 400 —— text 为空 / 对话过长（prompt 超过 16K 上下文）。
 * 409 —— 上一条请求还在生成中。
-* 502 —— ``RuntimeError("功能未启用: swcap_text_chat")``（未启动 Qwen3-8B 实例）。
+* 502 —— ``RuntimeError("功能未启用: swcap_text_chat")``（未启动 Qwen3-4B 实例）。
 
 WS 帧类型
 =========

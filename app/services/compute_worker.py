@@ -258,7 +258,7 @@ def _resolve_tool_classes(names):
     return out
 
 
-# qwen3-8b 输出工具调用时使用 ``<tool_call>{...}</tool_call>`` XML
+# qwen3-4b 输出工具调用时使用 ``<tool_call>{...}</tool_call>`` XML
 # 标签包裹的 JSON 格式（与 wdnai ``try_parse_tool_call`` 期望的裸 JSON
 # / markdown 围栏不同）。先按标签定位再剥离出 JSON。
 _TOOL_CALL_TAG_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
@@ -339,7 +339,7 @@ def _parse_qwen_tool_call(
     """从模型 answer 部分解析 tool_call 并做参数校验。
 
     策略（双重保险）：
-    1. ``<tool_call>...</tool_call>`` 标签定位（qwen3-8b 在 System 强调
+    1. ``<tool_call>...</tool_call>`` 标签定位（qwen3-4b 在 System 强调
        "exactly one JSON" 后通常用此格式；标签天然给出唯一边界）。
     2. fallback：扫描 answer 中所有顶层 JSON 对象，**倒序**尝试
        ``dispatch_tool_call``，最后一个 dispatch 成功的为准。
@@ -395,10 +395,10 @@ def _build_session(model_id: str, npu_index: int):
         spec = mod["SystemLanguageModel"].qwen3_vl_4b()
     elif model_id == "qwen3-tts":
         spec = mod["SystemLanguageModel"].qwen3_tts()
-    elif model_id == "qwen3-8b":
+    elif model_id == "qwen3-4b":
         from dataclasses import replace as _dc_replace
-        spec = mod["SystemLanguageModel"].qwen3_8b()
-        spec = _dc_replace(spec, max_context_len=32768).with_options(
+        spec = mod["SystemLanguageModel"].qwen3_4b()
+        spec = _dc_replace(spec, max_context_len=16384).with_options(
             max_new_tokens=2048, keep_history=1, enable_thinking=True,
         )
     elif model_id == "qwen3-vl-embedding-2b":

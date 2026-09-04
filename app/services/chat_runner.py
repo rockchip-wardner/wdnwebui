@@ -5,7 +5,7 @@ from typing import Any, List, Optional, Tuple
 
 MAX_NEW_TOKENS = 2048
 
-# 严格配对：``<think>...</think>``。Qwen3-8B / Qwen3.5-VL 在某些输出
+# 严格配对：``<think>...</think>``。Qwen3-4B / Qwen3.5-VL 在某些输出
 # 里也会丢开口只写 ``</think>``（实测 Qwen3.5-VL 自报家门那段就漏了
 # ``<think>``），所以还要有 ``_THINK_TAIL_RE`` 兜底。
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
@@ -23,7 +23,7 @@ def split_thinking(text: str) -> Tuple[str, str]:
     """把 ``text`` 切成 ``(thinking, answer)``。
 
     三档兜底（从最严到最松）：
-      1. ``<think>...</think>`` 严格配对（Qwen3-8B / 多数 Qwen3-VL 都
+      1. ``<think>...</think>`` 严格配对（Qwen3-4B / 多数 Qwen3-VL 都
          走这条路径）→ 取出 group(1) 当 thinking，其余当 answer。
       2. 只有 ``</think>`` 没 ``<think>`` 开头（实测 Qwen3.5-VL
          在 ``enable_thinking=True`` 时的偶发输出）：

@@ -639,7 +639,7 @@ class AudioEvent:
 | omni 内存 | ~ 2500 MB | audio encoder + llm + embed；按 VL-4B 同档估；真机测后回填 |
 | omni init | ~ 50s | 两个 rknn + embed；倒计时同其它 preset |
 | 60s 音频切片 | 10 段 × ~ 1s | 单线程串行 ≈ 10s 总耗时 |
-| 与 qwen3-vl-4b 共存 | ~ 6 GB | OK；与 qwen3-8b 同时跑超 8 GB |
+| 与 qwen3-vl-4b 共存 | ~ 6 GB | OK；与 qwen3-4b 同时跑超 8 GB |
 | NPU 互斥 | 进程级 `_llm_session_call_lock` 串行 | 与 detector / VFA / text_chat 共享同一把锁 |
 
 `_check_npu_memory_budget()`（`compute_registry.py`）自动纳入 omni preset
@@ -654,7 +654,7 @@ class AudioEvent:
 * **超时熔断**：单段 SDK 卡死没有 timeout；上层若需要可包一层
   `asyncio.wait_for(...)`，但当前按 detector / VFA 现有风格不做。
 * **不做二次聚合**：60 秒以上音频不会自动生成"综述"；如未来需要，
-  加一段独立的 LLM 调用（建议复用 `swcap_text_chat` 的 qwen3-8b）。
+  加一段独立的 LLM 调用（建议复用 `swcap_text_chat` 的 qwen3-4b）。
 
 ## Surveillance page (视频监控)
 
@@ -914,7 +914,7 @@ holds it in memory. The file is seeded with a `base` section at
   （由 `RKNN3Lite().get_devices_id()` 枚举）+ 一个 model preset。同一
   NPU 上多个不同 model 允许（按内存预算自我约束），但同 NPU 重复同
   model 拒绝（pydantic 校验 + 注册中心运行时校验双层防护）。内存估算
-  硬编码：Qwen3-VL-4B ≈ 3500 MB / Qwen3-TTS ≈ 1900 MB / Qwen3-8B ≈
+  硬编码：Qwen3-VL-4B ≈ 3500 MB / Qwen3-TTS ≈ 1900 MB / Qwen3-4B ≈
   4950 MB。Boot 流程：`boot_compute_services()` 遍历
   `config.compute.services` 逐条 probe → adopt-or-spawn；worker 起来
   后**不** build LLMSession，等用户在算力配置页选 NPU 触发 RPC load
@@ -1183,7 +1183,7 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   alias 来自 ``MODEL_PRESETS[model_id]["worker_name"]``。预设：
   - qwen3-vl-4b → `worker:vlm-4b`（13 字符）
   - qwen3-tts → `worker:tts`（10 字符）
-  - qwen3-8b → `worker:llm-8b`（12 字符）
+  - qwen3-4b → `worker:llm-4b`（12 字符）
   - qwen3-vl-embedding-2b → `worker:emb-2b`（12 字符）
   - qwen3-5-vl-4b → `worker:q5-vl`（12 字符；多模态 LLM+vision）
 
@@ -1446,7 +1446,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 
 ## Text chat (文本对话) page
 
-`#page-text-chat` 暴露 Qwen3-8B 纯文本对话（`swcap_text_chat` capability），
+`#page-text-chat` 暴露 Qwen3-4B 纯文本对话（`swcap_text_chat` capability），
 流式逐字渲染 ` thinking... response` 与正式回答，单页实例串行推理，
 多轮上下文由 worker 端滚动裁剪 + ChatML 拼接维持。
 
@@ -1497,7 +1497,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     `prompt_tokens`（最近一次实际喂给模型的 prompt token 数），前端据此
     显示上下文占用。
   - **context_limit 可配置**：`config.jsonc["compute"]["text_chat"]["context_limit"]`，
-    默认 32768；每次推理前热读（`_resolve_context_limit`）。测试多轮裁剪
+    默认 16384；每次推理前热读（`_resolve_context_limit`）。测试多轮裁剪
     可设 2048。
   - WS broadcaster pattern：worker 线程 push 到 `asyncio.Queue` 列表，
     WS handler 在主 event loop 里 `await queue.get()` drain；observer
@@ -1524,7 +1524,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - `chat_poll` action：按 offset 返回新 delta + status（running / done /
     error / idle），done 时附 result。
   - `chat_stop` action：置 `state["chat"]["stop"]`（软停标志）。
-  - `_build_session` 已支持 qwen3-8b（`max_context_len=32768` +
+  - `_build_session` 已支持 qwen3-4b（`max_context_len=16384` +
     `with_options(max_new_tokens=2048, keep_history=1, enable_thinking=True)`）。
 
 * **流式采集 = C 回调注入**（`app/services/chat_stream.py`）：
@@ -1553,14 +1553,14 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - `chat_stop()` — RPC `chat_stop`。
 
 * **ComputeRegistry** preset（`app/services/compute_registry.py:136-164`）：
-  - 新增 `MODEL_PRESETS["qwen3-8b"]`：`capability_types=["swcap_text_chat"]`，
-    `memory_estimate_mb=5500`，`estimated_init_seconds=90`（实测待校准）。
-  - `_qwen3_8b_spec()` 工厂用 `dataclasses.replace(spec, max_context_len=32768)`
+  - 新增 `MODEL_PRESETS["qwen3-4b"]`：`capability_types=["swcap_text_chat"]`，
+    `memory_estimate_mb=4950`，`estimated_init_seconds=60`。
+  - `_qwen3_4b_spec()` 工厂用 `dataclasses.replace(spec, max_context_len=16384)`
     + `with_options(max_new_tokens=2048, keep_history=1, enable_thinking=True)`。
     注意 `max_context_len` 是 `ModelSpec` 的 dataclass 字段（被
     `_common.build_llm_args` 直接读），**不能用 `with_options` 设**，必须
     `replace`。
-  - `_init_session_subprocess` 子进程硬编码分支加 `elif model_id == 'qwen3-8b'`。
+  - `_init_session_subprocess` 子进程硬编码分支加 `elif model_id == 'qwen3-4b'`。
 
 * **Frontend** (`app/static/index.html` + `app/static/js/app.js` + `style.css`)：
   - 左栏 demo 区第 5 项 `<a data-page="text-chat" data-icon="✎">文本对话</a>`，
@@ -1584,10 +1584,10 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - `loadPageData("text-chat")` 调 `TextChat.init() + refresh() + ensureWs()`；
     `showPage()` 离开时调 `TextChat.closeWs()`。
 
-* **资源预算** —— 单实例常驻 ~5.5 GB（Qwen3-8B 量化权重 + embed table +
+* **资源预算** —— 单实例常驻 ~5.5 GB（Qwen3-4B 量化权重 + embed table +
   KV cache 200×2K token）。板上 8 GB 统一内存比较紧张，但与 Qwen3-VL-4B
   单实例不冲突（2 个同时跑超 9 GB）。多用户并发首版不支持 —— worker
-  串行；如需横向扩展，在算力配置页加第 2 个 Qwen3-8B 实例（多卡环境）。
+  串行；如需横向扩展，在算力配置页加第 2 个 Qwen3-4B 实例（多卡环境）。
 
 * **限制 / 已知问题**：
   - stop 为**软停**：`chat_stop` 只置 worker 标志，`_backend.run` 同步阻塞
@@ -1836,7 +1836,7 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
 调用），将来真机若出现 abort，可以把 `_run_one` 改回原路径（恢复
 双 init）或加 fallback 策略。
 
-**实例配置**（`MODEL_PRESETS["qwen3-8b"]`）：
+**实例配置**（`MODEL_PRESETS["qwen3-4b"]`）：
 
 | 字段 | 值 | 备注 |
 |---|---|---|
@@ -1936,14 +1936,14 @@ asyncio loop），不是直接 `await` SDK。`wechatbot-sdk` 是 wdnwebui
 
 im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模型」开关。开启后
 微信用户发来的**文字**消息自动进入桥接队列 → 调 `swcap_text_chat`
-（qwen3-8b）推理 → 把回答（只回 answer，不含 thinking）通过
+（qwen3-4b）推理 → 把回答（只回 answer，不含 thinking）通过
 `Wechat.send_text` 发回给该微信用户，实现微信上的多轮文本对话。
 
 * **Service** (`app/services/wechat_llm.py`)：
   - `_LlmBridge` 单例（`get_llm_bridge()`），由 `_WechatManager` 持有并
     在 `_handle_incoming` 里转发 `handle_incoming(msg)`。
   - **开关内存态**：`_enabled` 不落盘（重启即关）。`available()` 通过
-    `get_registry().get_session("swcap_text_chat")` 判断 qwen3-8b 是否
+    `get_registry().get_session("swcap_text_chat")` 判断 qwen3-4b 是否
     已加载；未加载时 `set_enabled(True)` 抛 `RuntimeError`（前端置灰 +
     后端 409 双层防护）。
   - **per-user 上下文隔离**：`histories: dict[user_id, deque(maxlen=200)]`
@@ -1975,7 +1975,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
 
 * **前端**（`app/static/index.html` + `app.js` `ImBridge`）：
   - 调试收发卡片顶部一行：checkbox + 提示。`available=false` → checkbox
-    disabled + 红字提示「文本对话模型未启用，请在算力配置页加载 qwen3-8b」；
+    disabled + 红字提示「文本对话模型未启用，请在算力配置页加载 qwen3-4b」；
     `enabled` + `busy` → 「已对接，生成中…」。
   - `_toggleLlmBridge` 调 `POST /api/wechat/llm-bridge`；409 时 revert +
     提示。`send()` 顶部也兜底拦截（按钮已置灰，防 Cmd+Enter 绕过）。
@@ -2059,7 +2059,7 @@ multicast bug。v0.6 改成 **FastDDS SIMPLE discovery** 直接走组播
 ```
         ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
         │  main    │  │ worker   │  │ worker   │  │ worker   │  (FastDDS
-        │ (wdnwebui│  │ qwen3-vl │  │ qwen3-tts│  │ qwen3-8b │   SIMPLE)
+        │ (wdnwebui│  │ qwen3-vl │  │ qwen3-tts│  │ qwen3-4b │   SIMPLE)
         │  main)   │  │  -4b     │  │          │  │          │
         └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
              │              │             │             │
