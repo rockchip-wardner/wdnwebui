@@ -617,7 +617,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "description":      "Qwen3.5-4B 多模态模型，支持图像描述和文本对话",
         "available_targets": ["182x"],
     },
-    "locate-anything": {
+    "LocateAnything-3b": {
         # LocateAnything 视觉定位模型（kind="grounding"，image-in / text-out
         # 含 0-1000 归一化 bbox）。文件布局位于
         # $WDNAI_MODELS_DIR/LocateAnything/，由

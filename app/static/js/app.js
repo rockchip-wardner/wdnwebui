@@ -4569,6 +4569,15 @@ const CC_PRESET_META = {
     description: "Qwen3.5-VL-4B 多模态模型，同时支持文本对话和视频描述",
     available_targets: ["182x"],
   },
+  "LocateAnything-3b": {
+    label: "[GD]视觉定位模型",
+    capability_types: ["swcap_grounding"],
+    instance_name: "llm-ground",
+    memory_estimate_mb: 5500,
+    estimated_init_seconds: 60,
+    description: "视觉定位模型，给定文本描述输出图像中目标区域",
+    available_targets: ["182x"],
+  },
 };
 const CC_PRESET_ORDER = [
   "qwen3-vl-4b",
@@ -4577,6 +4586,7 @@ const CC_PRESET_ORDER = [
   "qwen3-tts",
   "qwen3-vl-embedding-2b",
   "qwen2.5-omni-3b",
+  "LocateAnything-3b",
 ];
 
 // 系统拓扑：1× RK3588 主控（不占"算力卡"位置） + N× RK182x 协卡。

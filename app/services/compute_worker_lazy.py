@@ -87,12 +87,12 @@ def _preset_for(model_id: str) -> Any:
     if model_id == "qwen2.5-omni-3b":
         # Qwen2.5-Omni-3B（kind="omni"）。单次 run_audio 上限 6s，调用方切片。
         return SLM.qwen_2_5_omni_3b()
-    if model_id == "locate-anything":
+    if model_id == "LocateAnything-3b":
         # LocateAnything（kind="grounding"）。lazy 版本与 kind 1
         # (compute_worker._build_session) 的 preset 结构不同：返回
-        # (kind, MODEL_PRESETS["locate-anything"]) 元组供上层分发。
+        # (kind, MODEL_PRESETS["LocateAnything-3b"]) 元组供上层分发。
         from app.services.compute_registry import MODEL_PRESETS
-        return ("grounding", MODEL_PRESETS["locate-anything"])
+        return ("grounding", MODEL_PRESETS["LocateAnything-3b"])
     raise ValueError(f"unknown model_id: {model_id!r}")
 
 
