@@ -493,6 +493,31 @@ def _qwen3_5_vl_4b_spec():
     return SystemLanguageModel.qwen3_5_vl_4b()
 
 
+def _locate_anything_spec():
+    """LocateAnything grounding preset（kind="grounding"）。
+
+    图片输入 + 文本输出（归一化 bbox 坐标）。绑定
+    ``$WDNAI_MODELS_DIR/LocateAnything`` 下全套文件
+    （llm_LocateAnything.1828.rknn + weight、vision 448x448、tokenizer、
+    embed），任意文件缺失会抛 :class:`FileNotFoundError`。
+    """
+    from wdnai import SystemLanguageModel
+    return SystemLanguageModel.locate_anything()
+
+
+def _locate_anything_spec_template():
+    """LocateAnything preset 但不绑路径 —— 用于模型未部署场景。
+
+    跳过 ``_verify_locate_anything_files``（``SystemLanguageModel.locate_anything``
+    内部会调），直接返回 ``_locate_anything_spec()`` 的裸 spec；调用方
+    可以再 ``.with_paths(...)`` 覆盖默认路径，或者单纯用作 schema / 类
+    形态的占位 spec。算力配置页 / 启动预检不强制要求模型已就位，但
+    真实 ``LLMSession(model=spec, npu=K)`` init 时仍会报 ``FileNotFoundError``。
+    """
+    from wdnai.model import _locate_anything_spec as _sdk_locate_spec
+    return _sdk_locate_spec()
+
+
 # 每个 model 的 ``estimated_init_seconds`` 是经验值，用来渲染"加载中"倒计时
 # 的初始起点；loading 段倒计时按 (estimate - (now - started_at)) 实算，estimate
 # 只影响倒计时的**起点**。真机冷启动实测（page cache dropped 之后）：
@@ -590,6 +615,26 @@ MODEL_PRESETS: dict[str, dict] = {
         "instance_name":    "llm-q5-vl",
         "worker_name":      "q5-vl",        # comm = "worker:q5-vl" (12 chars)
         "description":      "Qwen3.5-4B 多模态模型，支持图像描述和文本对话",
+        "available_targets": ["182x"],
+    },
+    "locate-anything": {
+        # LocateAnything 视觉定位模型（kind="grounding"，image-in / text-out
+        # 含 0-1000 归一化 bbox）。文件布局位于
+        # $WDNAI_MODELS_DIR/LocateAnything/，由
+        # ``_default_locate_anything_paths`` 在 wdnai 内 resolve
+        # （可用 ``WDNAI_LOCATE_ANYTHING_DIR`` 覆写）。
+        # 模型未部署时 ``_locate_anything_spec`` 会抛 FileNotFoundError；
+        # ``_locate_anything_spec_template`` 跳过校验返回裸 spec，
+        # 仅供预检 / 形态占位用，真实 LLMSession init 仍会报缺文件。
+        "label":            "[GD]视觉定位模型",
+        "preset_factory":   _locate_anything_spec,
+        "model_dir_name":   "LocateAnything",
+        "memory_estimate_mb": 5500,
+        "estimated_init_seconds": 60,
+        "capability_types": ["swcap_grounding"],
+        "instance_name":    "llm-ground",
+        "worker_name":      "ground",       # comm = "worker:ground" (13 chars); alias 6 chars, < 8 chars AGENTS 硬限
+        "description":      "视觉定位模型，给定文本描述输出图像中目标区域",
         "available_targets": ["182x"],
     },
 }
