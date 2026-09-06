@@ -497,7 +497,7 @@ def _locate_anything_spec():
     """LocateAnything grounding preset（kind="grounding"）。
 
     图片输入 + 文本输出（归一化 bbox 坐标）。绑定
-    ``$WDNAI_MODELS_DIR/LocateAnything`` 下全套文件
+    ``$WDNAI_MODELS_DIR/LocateAnything-3B`` 下全套文件
     （llm_LocateAnything.1828.rknn + weight、vision 448x448、tokenizer、
     embed），任意文件缺失会抛 :class:`FileNotFoundError`。
     """
@@ -620,7 +620,7 @@ MODEL_PRESETS: dict[str, dict] = {
     "LocateAnything-3b": {
         # LocateAnything 视觉定位模型（kind="grounding"，image-in / text-out
         # 含 0-1000 归一化 bbox）。文件布局位于
-        # $WDNAI_MODELS_DIR/LocateAnything/，由
+        # $WDNAI_MODELS_DIR/LocateAnything-3B/，由
         # ``_default_locate_anything_paths`` 在 wdnai 内 resolve
         # （可用 ``WDNAI_LOCATE_ANYTHING_DIR`` 覆写）。
         # 模型未部署时 ``_locate_anything_spec`` 会抛 FileNotFoundError；
@@ -628,7 +628,7 @@ MODEL_PRESETS: dict[str, dict] = {
         # 仅供预检 / 形态占位用，真实 LLMSession init 仍会报缺文件。
         "label":            "[GD]视觉定位模型",
         "preset_factory":   _locate_anything_spec,
-        "model_dir_name":   "LocateAnything",
+        "model_dir_name":   "LocateAnything-3B",
         "memory_estimate_mb": 5500,
         "estimated_init_seconds": 60,
         "capability_types": ["swcap_grounding"],
