@@ -414,6 +414,8 @@ def _build_session(model_id: str, npu_index: int):
         # 里 presence_penalty=1.5（来自 examples/Qwen3_5_VL/cpp/main.cc
         # 默认值，避免长 multimodal 输出的重复）。
         spec = mod["SystemLanguageModel"].qwen3_5_vl_4b()
+    elif model_id == "locate-anything":
+        spec = mod["SystemLanguageModel"].locate_anything()
     else:
         raise ValueError(f"unknown model_id: {model_id!r}")
     LOG.info("building LLMSession(model=%s, npu=%d) ...", model_id, npu_index)
