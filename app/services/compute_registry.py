@@ -658,6 +658,15 @@ _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
 
 
 # --------------------------------------------------------------------------- #
+# Legacy preset-name migration (kept for backward compat with old configs)   #
+# --------------------------------------------------------------------------- #
+_LEGACY_PRESET_NAME_RENAMES: dict[str, str] = {
+    "qwen3-8b":        "qwen3-4b",
+    "locate-anything": "LocateAnything-3b",
+}
+
+
+# --------------------------------------------------------------------------- #
 # compute.services[] schema (ServiceEntry) helpers                            #
 # --------------------------------------------------------------------------- #
 # A config-driven entry has 4 fields:
@@ -712,6 +721,12 @@ def _parse_services_config(raw) -> list[dict]:
         name = entry.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError(f"compute.services[{idx}].name 缺失或非字符串")
+        new_name = _LEGACY_PRESET_NAME_RENAMES.get(name)
+        if new_name and new_name in MODEL_PRESETS:
+            LOG.info("compute.services[%d].name=%r 已自动迁移到 %r",
+                     idx, name, new_name)
+            entry["name"] = new_name
+            name = new_name
         if name not in MODEL_PRESETS:
             raise ValueError(
                 f"compute.services[{idx}].name={name!r} 不在 "
@@ -959,6 +974,7 @@ class ComputeRegistry:
         self._adopt_inflight: set[str] = set()
         self._mode: str = _resolve_compute_mode()
         self._migrate_legacy_capability_types()
+        self._migrate_legacy_preset_names()
         if self._mode == "subprocess":
             self._ensure_hub()
 
@@ -1170,6 +1186,30 @@ class ComputeRegistry:
                 get_config().set_section("compute", cfg)
             except Exception as e:  # noqa: BLE001
                 LOG.warning("failed to persist migrated capability_types: %s", e)
+
+    def _migrate_legacy_preset_names(self) -> None:
+        cfg = get_config().get_section("compute", {})
+        services = cfg.get("services") if isinstance(cfg, dict) else None
+        if not isinstance(services, list):
+            return
+        renamed_total = 0
+        for idx, entry in enumerate(services):
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            new_name = _LEGACY_PRESET_NAME_RENAMES.get(name)
+            if new_name and new_name in MODEL_PRESETS:
+                entry["name"] = new_name
+                renamed_total += 1
+                LOG.info("compute.services[%d].name=%r 已自动迁移到 %r "
+                         "（如有疑问参见 git log / AGENTS.md）",
+                         idx, name, new_name)
+        if renamed_total:
+            cfg["services"] = services
+            try:
+                get_config().set_section("compute", cfg)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("failed to persist migrated preset names: %s", e)
 
     # ------------------------------------------------------------------ #
     # 元数据查询                                                          #
