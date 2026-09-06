@@ -1561,6 +1561,23 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     `_common.build_llm_args` 直接读），**不能用 `with_options` 设**，必须
     `replace`。
   - `_init_session_subprocess` 子进程硬编码分支加 `elif model_id == 'qwen3-4b'`。
+* **ComputeRegistry 配置 — `locate-anything` grounding preset**
+  （`app/services/compute_registry.py`）：纯图像输入 + 文本输出（0–1000
+  归一化 bbox + 描述），与 VLM 共用同款文件布局（`rknn_llm_path` +
+  `rknn_vision_path` + `embed_path` + `tokenizer_path`），但绑定到
+  `LocateAnything` backend（`wdnai.backends.locate_anything.LocateAnythingBackend`）。
+  - `MODEL_PRESETS["locate-anything"]`：
+    `kind="grounding"`（probe 按 vlm 文件布局校验），
+    `capability_types=["swcap_grounding"]`，
+    `memory_estimate_mb=5500`，
+    `estimated_init_seconds=60`，
+    `worker_name="ground"`（comm = `worker:ground`，13 字符；alias 6 字符
+    在 TASK_COMM_LEN=16 的 8 字符硬限内）。
+  - `_locate_anything_spec()` 工厂直接调
+    `wdnai.SystemLanguageModel.locate_anything()`，文件缺失时抛
+    `FileNotFoundError`；`_locate_anything_spec_template()` 跳过路径校验
+    返回裸 spec，仅供算力配置页 / 启动预检的形态占位用，真实
+    `LLMSession(model=spec, npu=K)` init 仍会报缺文件。
 
 * **Frontend** (`app/static/index.html` + `app/static/js/app.js` + `style.css`)：
   - 左栏 demo 区第 5 项 `<a data-page="text-chat" data-icon="✎">文本对话</a>`，
@@ -1812,12 +1829,19 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
 1. **轻量预检** (`_probe_session_setup`，<1s)：
    * model_id 在 preset 白名单
    * preset 工厂能正常构造 `ModelSpec`（不调 rknn3）
-   * **模型文件**按 `spec.kind` 分支校验（v0.5.x 起）：
-     - `kind="llm"`：`rknn_path` + `weight_path` + `embed_path` + `tokenizer_path`
-     - `kind="vlm"`：`rknn_llm_path` + `rknn_vision_path` + `embed_path` +
-       `tokenizer_path`（`weight_llm_path` / `weight_vision_path` 由
-       `.1828.rknn` 路径自动 derive，probe 不单独校验）
-- `kind="tts"`：`tts_model_dir` 目录存在即可；具体
+    * **模型文件**按 `spec.kind` 分支校验（v0.5.x 起）：
+      - `kind="llm"`：`rknn_path` + `weight_path` + `embed_path` + `tokenizer_path`
+      - `kind="vlm"`：`rknn_llm_path` + `rknn_vision_path` + `embed_path` +
+        `tokenizer_path`（`weight_llm_path` / `weight_vision_path` 由
+        `.1828.rknn` 路径自动 derive，probe 不单独校验）
+      - `kind="grounding"`：`rknn_llm_path` + `rknn_vision_path` +
+        `embed_path` + `tokenizer_path`（与 `kind="vlm"` 同布局，
+        LocateAnything backend `wdnai.backends.locate_anything.LocateAnythingBackend`
+        走 RKNN 视觉 encoder + RKNN LLM decoder；输出 0–1000 归一化 bbox + 文本）
+        — `MODEL_PRESETS["locate-anything"]` memory_estimate_mb=5500、
+        capability_types=["swcap_grounding"]、`worker_name="ground"`（alias 6 字符，
+        在 TASK_COMM_LEN=16 的 8 字符硬限内）。
+ - `kind="tts"`：`tts_model_dir` 目录存在即可；具体
         `.1828.rknn` / `.weight` / `.fp16.bin` 清单交给 backend 真实 init
         阶段报更精确错误
     * `RKNN3Lite().get_devices_id()` 枚举得到 ≥ `npu_index + 1` 张卡
