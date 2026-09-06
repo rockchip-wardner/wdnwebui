@@ -4216,11 +4216,6 @@ html, body {
   letter-spacing: 0.02em;
   font-variant-numeric: tabular-nums;
 }
-.vfa-progress-count-sep {
-  margin: 0 0.18rem;
-  color: var(--muted);
-  font-weight: 400;
-}
 .vfa-progress-count-unit {
   margin-left: 0.18rem;
   font-size: 0.78rem;

@@ -8349,8 +8349,7 @@ function vfaUpdateProgress(snap) {
   const trackEl   = document.getElementById("vfa-progress-track");
   const fillEl    = document.getElementById("vfa-progress-analyze");
   const nowEl     = document.getElementById("vfa-progress-count-now");
-  const totalEl   = document.getElementById("vfa-progress-count-total");
-  if (!root || !trackEl || !fillEl || !nowEl || !totalEl) return;
+  if (!root || !trackEl || !fillEl || !nowEl) return;
 
   const state = (snap?.state) || VFA.state || "idle";
 
@@ -8414,34 +8413,30 @@ function vfaUpdateProgress(snap) {
 
   let expected = 0;
   let ratio = null;
-  let progressLabel = null;
-  // 进度条只在"真正在干活或刚干完"的状态下显示数字：
+  // 进度条只在"真正在干活或刚干完"的状态下显示百分比：
   //   running / opening  → 实跑帧数（analyzed / expected）
   //   summarizing       → chunk 完成度
   //   done              → 100% 满格（强制 ratio=1，与 events.length 解耦）
-  // idle / stopped / error 一律不显示帧数（哪怕 VFA.meta 残留上次运行的值
-  // —— 此时 ratio=null → indeterminate 滑动 / 0%，避免用户以为"还在跑"）。
-  const showNumbers = state === "running" || state === "opening" ||
+  // idle / stopped / error 一律不显示百分比（哪怕 VFA.meta 残留上次运行的
+  // 值 —— 此时 ratio=null → indeterminate 滑动 / 0%，避免用户以为"还在跑"）。
+  const showPercent = state === "running" || state === "opening" ||
                       state === "summarizing" || state === "done";
-  if (!showNumbers) {
+  if (!showPercent) {
     expected = 0;
     ratio = null;
-    progressLabel = null;
   } else if (state === "summarizing" && snap && Array.isArray(snap.summary_progress)
       && snap.summary_progress[1] > 0) {
     expected = snap.summary_progress[1];
     ratio = Math.min(1, snap.summary_progress[0] / expected);
-    progressLabel = "综述 chunk " + snap.summary_progress[0] + "/" + expected;
   } else if (state === "done") {
-    // **done 状态下强制 ratio=1**，且 **expected = analyzed** 让数字显示
-    // "30 / 30" / "5 / 5" 而不是 "30 / 40" / "5 / 10" 这种看上去很怪
-    // 的"已完成但只填到 75%"。原因：
+    // **done 状态下强制 ratio=1**，且 **expected = analyzed** 让百分比显示
+    // "100%" 而不是 "75%" 这种看上去很怪的"已完成但只填到 75%"。原因：
     // 1) events API 可能比 state 慢 1-2 帧（events 端没追上）
     // 2) analyzed 本身可能因 dirty / timeout 大于实际成功 event 数
     // 3) floor(totalFrames/everyN) **是上限估计不是真实需求**——
     //    视频最后一帧可能不整除、也可能有 B 帧 / 关键帧让后端
     //    实际只采了 7 帧（10 帧的 70%），这 7 帧是"我们能采的
-    //    全部"不是"7/10 必须采满"，已完成就显示 7/7。
+    //    全部"不是"7/10 必须采满"，已完成就显示 100%。
     expected = analyzed;
     ratio = 1;
   } else if (totalFrames > 0 && everyN > 0) {
@@ -8449,13 +8444,15 @@ function vfaUpdateProgress(snap) {
     ratio = Math.min(1, analyzed / expected);
   }
 
-  if (progressLabel) {
-    nowEl.textContent = progressLabel;
-    totalEl.textContent = "已分析 " + analyzed + " 帧";
+  let percentText;
+  if (!showPercent) {
+    percentText = "0%";
+  } else if (ratio !== null) {
+    percentText = Math.round(ratio * 100) + "%";
   } else {
-    nowEl.textContent = String(analyzed);
-    totalEl.textContent = String(expected);
+    percentText = "--%";
   }
+  nowEl.textContent = percentText;
 
   if (ratio === null) {
     // 不知道总数 —— 只有正在分析时才显示 indeterminate 滑动；
