@@ -415,8 +415,20 @@ def run_chat_with_tools(
 
     if interrupted and not final_answer:
         final_answer = ""
-    if error_msg and not final_answer:
+    # 工具轮的 answer 本来就是 tool_call 原文（模型应答工具 schema
+    # 时把 JSON 放 answer 段，是正常现象），从未对用户展示过。
+    # error / iters 用尽时不得让这个残留当作最终回答发出。
+    # error 优先级高于 final_answer，无条件覆盖。
+    if error_msg:
         final_answer = f"抱歉，{error_msg}"
+    # 兜底二：即使"正常出口"（无 error、模型没再发 tool_call），
+    # final_answer 也不许是 tool_call 原文 —— 那说明解析层/循环有
+    # 缝隙，内部协议文本绝不能进用户消息。
+    if final_answer.startswith("<tool_call>"):
+        _LOG.warning(
+            "agent final_answer is raw tool-call JSON (parse gap) — "
+            "suppressed, replaced with generic refusal")
+        final_answer = "抱歉，这个请求暂时没能完成，请稍后再试一次。"
 
     return {
         "answer": final_answer,

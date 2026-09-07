@@ -975,11 +975,44 @@ def _chat_run_loop(state: dict) -> None:
 
         from app.services.chat_stream import register_observer, unregister_observer
 
+        # ---- SHM 快照发布（配 rpc_session_proxy.chat_run 的 via_shm
+        # 双通道协议）----
+        # proxy 每 150ms 读 /dev/shm/wdnwebui_chat_<model>.json 拿
+        # status/deltas；RPC chat_poll 仅作回退。不发布快照时 poll RPC
+        # 会撞 worker 推理期间 pump 线程 35-60s 的 GIL 聋哑窗口
+        # （实测中发现，iter2 poll 重试 51s 耗尽 raise
+        # "chat_poll failed: timeout"，agent 循环因 error 残留会把上一轮
+        # tool_call 原文当最终回答发给微信）。
+        _chat_shm_path = f"/dev/shm/wdnwebui_chat_{state.get('model_id') or 'chat'}.json"
+        _chat_start_ts = time.time()
+
+        def _publish_chat_snapshot() -> None:
+            """原子发布 chat 状态快照。失败静默 —— 快照是数据面加速
+            通道，proxy 在读不到时自动回退 chat_poll RPC。"""
+            try:
+                snap = {
+                    "start_ts": _chat_start_ts,
+                    "status": chat.get("status") or "running",
+                    "deltas": list(chat.get("deltas") or []),
+                }
+                if chat.get("status") == "done":
+                    snap["result"] = dict(chat.get("result") or {})
+                elif chat.get("status") == "error":
+                    snap["error"] = chat.get("error") or ""
+                tmp = f"{_chat_shm_path}.{os.getpid()}.tmp"
+                with open(tmp, "w") as f:
+                    json.dump(snap, f)
+                os.replace(tmp, _chat_shm_path)
+            except Exception:  # noqa: BLE001
+                pass
+
         def _on_delta(d: str) -> None:
             if d:
                 chat["deltas"].append(d)
+                _publish_chat_snapshot()
 
         sess.reset()
+        _publish_chat_snapshot()
         register_observer(sink, _on_delta)
         t0 = time.time()
         # VLMBackend（Qwen3-VL / Qwen3.5-VL）只暴露 ``run_text`` 而非
@@ -1026,9 +1059,14 @@ def _chat_run_loop(state: dict) -> None:
             "tool_call": tool_call_name,
             "tool_call_args": tool_call_args,
         }
+        _publish_chat_snapshot()
     except Exception as e:  # noqa: BLE001
         chat["status"] = "error"
         chat["error"] = f"{type(e).__name__}: {e}"
+        try:
+            _publish_chat_snapshot()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def chat_poll_handler(state: dict, payload: dict) -> dict:
