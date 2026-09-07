@@ -3341,15 +3341,41 @@ class ComputeRegistry:
     # ------------------------------------------------------------------ #
     def get_session(self, capability_type: str) -> Any:
         """Return the RpcSessionProxy for the first running instance
-        exposing ``capability_type``. Raises RuntimeError if none."""
+        exposing ``capability_type``. Raises RuntimeError if none.
+
+        **本机优先**：多实例可用时（如 LAN 上两台板都加载了同一
+        embedding），优先返回本机 ``spawned`` / ``adopted_local``
+        实例 —— 视频类消费方（VCS / wechat_video_manager）走
+        ``/dev/shm`` path-list 传帧，跨机Worker 读不到本机 tmpfs，
+        命中远端实例会逐片 imread 失败；同时本机 NPU 推理延迟也远低
+        于 LAN RPC。无本机 running 时才退回 LAN peer（远端 wire
+        上仅 base64 图像可达，见 rpc_session_proxy 的 is_remote
+        分支）。
+        """
         with self._lock:
+            local = remote = None
             for inst in self._instances.values():
                 if (inst.status == "running"
                         and capability_type in inst.capability_types):
-                    if inst.rpc_session_proxy is None:
-                        raise RuntimeError(
-                            f"功能未启用: {capability_type} (instance has no proxy)")
-                    return inst.rpc_session_proxy
+                    if ((inst._source or "") in ("spawned", "adopted_local")
+                            and local is None):
+                        local = inst
+                    elif remote is None:
+                        remote = inst
+            chosen = local or remote
+            if chosen is None:
+                raise RuntimeError(f"功能未启用: {capability_type}")
+            LOG.info(
+                "get_session(%s): %s instance %s %s (pid=%s)",
+                capability_type,
+                "LOCAL" if local is not None else "REMOTE",
+                chosen.model_id, chosen._source,
+                chosen._peer_pid if isinstance(chosen._peer_pid, int)
+                else getattr(chosen.proc, "pid", None))
+            if chosen.rpc_session_proxy is None:
+                raise RuntimeError(
+                    f"功能未启用: {capability_type} (instance has no proxy)")
+            return chosen.rpc_session_proxy
         raise RuntimeError(f"功能未启用: {capability_type}")
 
 

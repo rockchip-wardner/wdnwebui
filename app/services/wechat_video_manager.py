@@ -43,6 +43,7 @@ from app.services.video_content_search import (
     _read_chunk_frames,
     _write_frames_to_shm,
 )
+from app.services.wechat_video_cache import file_md5, get_video_cache
 
 _LOG = logging.getLogger("wechat_video_manager")
 
@@ -73,6 +74,7 @@ class VideoEntry:
     filename: str                 # 展示用名（video-YYYYmmdd-HHMMSS）
     path: str                     # 落盘绝对路径
     ts: float
+    md5: str = ""                 # 下载后本地计算（缓存 key）
     state: str = _STATE_DOWNLOADING
     progress: float = 0.0         # extracting 阶段 0-1
     error: str = ""
@@ -405,6 +407,54 @@ class WechatVideoManager:
         _LOG.info("wechat video: downloaded %s for %s",
                   Path(path).name, user_id)
 
+        # ---- 2.5 本地 md5 + LanceDB 缓存命中判定 ----
+        # md5 只能对已下载文件计算（video 形态消息不带 md5；file 形态
+        # 自带的服务端 md5 与实际下发文件存在极小概率不一致，按用户
+        # 决策统一"下载 + 本地复核"）。命中即恢复结果：跳过全部切片
+        # embedding（每片 1-3s NPU 推理），播报与正常分析完成完全一致
+        # —— 用户无感知。
+        try:
+            md5_hex = file_md5(path)
+        except OSError as exc:
+            raise RuntimeError(f"视频文件 md5 计算失败：{exc}") from exc
+        with self._lock:
+            entry.md5 = md5_hex
+        cache = get_video_cache()
+        if cache is not None:
+            model_id = (getattr(session, "model_id", None)
+                        or getattr(session, "_model_id", "") or "")
+            cached = None
+            if model_id:
+                try:
+                    cached = cache.lookup(md5_hex, model_id)
+                except Exception as exc:  # noqa: BLE001
+                    _LOG.warning("wechat video: cache lookup failed "
+                                 "(treat as miss): %s", exc)
+            if cached and not self._superseded(user_id, seq):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                with self._lock:
+                    entry.index = cached["index"]
+                    entry.fps = cached.get("fps", 0.0) or 0.0
+                    entry.duration_s = cached["duration_s"]
+                    entry.state = _STATE_READY
+                    entry.progress = 1.0
+                    entry.slices_total = cached["slices_total"]
+                    entry.slices_embedded = cached["slices_embedded"]
+                    entry.path = ""
+                    n_restore = len(cached["index"])
+                _LOG.info("wechat video: cache hit md5=%s for %s — "
+                          "restored %d segments, skipped embedding",
+                          md5_hex[:12], user_id, n_restore)
+                self._notify(
+                    user_id,
+                    f"✅ 视频 {entry.filename} 分析完成"
+                    f"（{n_restore}/{entry.slices_total} 段），"
+                    f"现在可以针对它提问了。")
+                return
+
         # ---- 3. 元数据探测 ----
         meta = _probe_video_meta(str(path))
         if meta is None or meta.get("fps", 0) <= 0:
@@ -517,20 +567,58 @@ class WechatVideoManager:
                 raise RuntimeError(
                     f"提取完成但 0/{total} 段成功 embedding"
                     f"（{len(failures)} 次失败）— {detail or '所有切片解码或推理失败'}")
-            if failures:
-                _LOG.warning("wechat video: %s ready with %d/%d segments "
-                             "(%d chunk failures, first: %s)",
-                             entry.filename, len(entry.index), total,
-                             len(failures), failures[0])
             entry.state = _STATE_READY
             entry.progress = 1.0
             n_hits_src = len(entry.index)
         _LOG.info("wechat video: ready %s for %s — %d/%d segments",
                   entry.filename, user_id, n_hits_src, total)
-        self._notify(
-            user_id,
-            f"✅ 视频 {entry.filename} 分析完成（{n_hits_src}/{total} 段），"
-            f"现在可以针对它提问了。")
+        all_ok = not failures and n_hits_src >= total
+        if all_ok:
+            # ---- 全成功：结果入库（md5 缓存，重发同视频可跳过分析），
+            #      本地视频文件已无用（检索只回时间段）→ 删除省磁盘。
+            #      入库失败仅 LOG —— 不影响本次内存可用性。
+            cache = get_video_cache()
+            if cache is not None and entry.md5:
+                model_id = (getattr(session, "model_id", None)
+                            or getattr(session, "_model_id", "") or "")
+                if model_id:
+                    try:
+                        cache.save(entry.md5, model_id, entry.index, {
+                            "filename": entry.filename,
+                            "fps": fps,
+                            "duration_s": duration_s,
+                            "slices_total": total,
+                            "slices_embedded": n_hits_src,
+                            "chunk_seconds": _CHUNK_SECONDS,
+                            "chunk_overlap_seconds": _CHUNK_OVERLAP_SECONDS,
+                        })
+                    except Exception as exc:  # noqa: BLE001
+                        _LOG.warning("wechat video: cache save failed "
+                                     "(skipped): %s", exc)
+            try:
+                os.unlink(path)
+                _LOG.info("wechat video: cleaned up local file %s",
+                          Path(path).name)
+            except OSError:
+                pass
+            with self._lock:
+                entry.path = ""
+            self._notify(
+                user_id,
+                f"✅ 视频 {entry.filename} 分析完成（{n_hits_src}/{total} 段），"
+                f"现在可以针对它提问了。")
+        else:
+            # ---- 部分成功：警告播报让用户明确感知不完整；不入缓存、
+            #      不删文件（保留现场，重发可重试失败段）。
+            _LOG.warning("wechat video: %s ready with %d/%d segments "
+                         "(%d chunk failures, first: %s)",
+                         entry.filename, n_hits_src, total,
+                         len(failures), failures[0])
+            self._notify(
+                user_id,
+                f"⚠️ 视频 {entry.filename} 分析完成（{n_hits_src}/{total} 段），"
+                f"有 {len(failures)} 段提取失败（{failures[0]}），"
+                f"相关内容可能不完整；如需完整分析请重新发送视频重试。")
 
     # ------------------------------------------------------------ shutdown
     def close(self) -> None:

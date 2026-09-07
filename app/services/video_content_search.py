@@ -260,8 +260,24 @@ def _write_frames_to_shm(frames: List[np.ndarray], shm_session_id: str,
         ok, buf = _cv2.imencode(".jpg", fr, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
         if not ok:
             raise RuntimeError(f"cv2.imencode failed for chunk {chunk_idx} frame {fi}")
-        with open(p, "wb") as f:
-            f.write(buf.tobytes())
+        try:
+            with open(p, "wb") as f:
+                f.write(buf.tobytes())
+        except OSError as exc:
+            raise RuntimeError(
+                f"/dev/shm 写入失败 {p}（fd 耗尽或 tmpfs 异常）: {exc}") from exc
+        # fail-loud 自校验：写即 stat。tmpfs 同机对 worker 应立即可见；
+        # 若此刻文件已消失/为空，说明存在外部清扫或写穿透假象 ——
+        # 与其让 worker 端 imread 间接报错，不如在写端留真因铁证。
+        try:
+            st = os.stat(p)
+            if st.st_size == 0:
+                raise RuntimeError(
+                    f"/dev/shm 写入后文件为空（可能被外部截断）: {p}")
+            LOG.info("vcs: shm write ok %s (%d bytes)", p, st.st_size)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"/dev/shm 写入后文件立即消失（存在外部清理者）: {p}") from exc
         paths.append(p)
     return paths
 

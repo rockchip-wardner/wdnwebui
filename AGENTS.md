@@ -2023,17 +2023,47 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   - **单槽注册表** `{user_id: VideoEntry}` —— 每用户仅保留最新 1 个
     视频，新视频到达即覆盖旧的（删落盘文件 + 释放旧索引）；串行队列
     中被覆盖的任务按 seq 判定自动跳过。
-  - 管线：SDK CDN 下载（`Wechat.download_message()` 同步透传，120s
-    上限）→ 落盘 `uploads/wechat_videos/<uid>/` → PyAV 探测 → 逐片
-    **6s 片 / 1s 重叠** embedding（复用 VCS 底层函数 `_probe_video_meta`
-    / `_read_chunk_frames` / `_write_frames_to_shm` / `_cosine_similarity`
-    + `get_session("swcap_video_retrieval")`，SHM 帧传递 + timeout 重试
-    与 UI 页同款）→ ready。
-  - **进度感知 A+C**：推送侧节点播报固定文案（📥 收到 / ⏳ 开始分析
-    N 段 / ✅ 完成 / ⚠️ 失败）；拉取侧工具返回实时 progress。不做周期
-    百分比消息（个人号高频发消息有风控风险，且协议无编辑消息能力、
-    无法做原地刷新的进度条）。
-  - shutdown hook `close_wechat_video_manager()` 在 main.py 注册。
+   - 管线：SDK CDN 下载（`Wechat.download_message()` 同步透传，120s
+     上限）→ 落盘 `uploads/wechat_videos/<uid>/` → PyAV 探测 → 逐片
+     **6s 片 / 1s 重叠** embedding（复用 VCS 底层函数 `_probe_video_meta`
+     / `_read_chunk_frames` / `_write_frames_to_shm` / `_cosine_similarity`
+     + `get_session("swcap_video_retrieval")`，SHM 帧传递 + timeout 重试
+     与 UI 页同款）→ ready。
+   - **md5 缓存命中短路**（下载落盘后、PyAV 探测前）：流式算本地
+     md5 → `get_video_cache().lookup(md5, model_id)` 命中即把
+     LanceDB 里的切片索引恢复进 entry（秒级 ready，跳过全部
+     embedding），播报与正常分析完成**完全一致**（用户无感知）；
+     随后删刚下载的文件。所有消息形态（video / file）统一走
+     "下载 → 本地 md5 → 查缓存"；file 形态自带的服务端 md5 不使用
+     （与实际下发文件存在极小概率不一致，本地复核是唯一真源）。
+   - **进度感知**：推送侧节点播报固定文案（📥 收到 / ⏳ 开始分析
+     N 段 / ✅ 完成 / ⚠️ 失败）；拉取侧工具返回实时 progress。不做周期
+     百分比消息（个人号高频发消息有风控风险，且协议无编辑消息能力、
+     无法做原地刷新的进度条）。
+   - **全成功（failures==0 且段数满）**：分析结果写入 LanceDB 缓存
+     （见下节）+ 删本地视频文件（检索只回时间段，文件无用途；
+     200MB/个，板上磁盘稀缺）；**部分成功**：⚠️ 警告播报带失败数 +
+     首个失败原因，让用户明确感知不完整；不入缓存、不删文件（重发
+     可重试失败段）。播报格式对命中 / 全成功完全一致。
+   - shutdown hook `close_wechat_video_manager()` 在 main.py 注册。
+* **LanceDB 分析结果缓存**（`app/services/wechat_video_cache.py`，
+  v0.12）：key = 视频文件本地 md5；value = 切片 embedding 索引，
+  **一行一片**（表 `wechat_video_index`：md5 / chunk_idx / 时间窗 /
+  `vec` FixedSizeList(2048,float32) / filename / duration / 切片参数 /
+  embedding_model / analyzed_at）。数据目录
+  `app/services/uploads/lancedb/`（uploads/ 已 gitignore）。要点：
+  - **embedding_model 隔离**：每行记录产生向量的模型 id；模型换代后
+    旧缓存自动失配（lookup 按 md5 + embedding_model 过滤查不到），
+    不会拿旧向量硬算余弦。
+  - **仅全成功的分析入库**；部分成功只驻留内存。save 前 delete 同
+    md5 再 add（幂等覆盖）。
+  - **LRU 淘汰**：按视频条数（distinct md5）计，超上限删
+    `analyzed_at` 最旧条目；`config.compute.wechat_video`
+    热读 `cache_max_entries`（默认 100，≈1MB / 10min 视频）与
+    `cache_enabled`（默认 true；false 时旁路 → 全部退回无缓存行为）。
+  - **故障兜底**：lookup/save 任何异常（lancedb 不可用 / 表损坏 /
+    维度不匹配）只 LOG warning 降级 —— 缓存层任何异常都不阻塞
+    分析管线；`get_video_cache()` 返回 None 表示旁路。
 * **VideoSearch 工具**（`app/services/tools/video_search.py`，
   `requires_capability="swcap_video_retrieval"`）：**无调用时机限制**
   的四态结果型返回 —— `ok`（命中片段）/ `extracting`（附实时进度）/
@@ -2158,6 +2188,31 @@ XML profile 路径：`$XDG_RUNTIME_DIR/wdndds_default_profile.xml`
   handle（对 spawn→bind 的时序 race 兜底，destroy 拿 requester._lock
   防 probe 线程 UAF）。待办：worker systemd 单元加
   `After=network-online.target`。
+* **get_session 本机优先（v0.8.30）**：`ComputeRegistry.get_session`
+  同 capability 多实例 running 时按 `spawned` / `adopted_local` 优先
+  于 `adopted`（LAN peer）选择。原因：视频类消费方
+  （VCS / wechat_video_manager）用 `/dev/shm` path-list 传帧，
+  **远端 worker 读不到本机 tmpfs** —— 命中远端实例会逐片
+  `cv2.imread exists=False` read操作全灭；
+  `rpc_session_proxy.embed_video` 的 path-list分支**没有**
+  is_remote 守卫（ndarray 分支有 base64 fallback，
+  path-list 分支跨机就是不可用）。无本机 running 时才退回
+  LAN peer。每次调用打 `get_session(cap): LOCAL/REMOTE` 日志。
+* **主进程 fd 防线（v0.8.30）**：`run.py main()` 开头
+  `setrlimit(RLIMIT_NOFILE soft→hard)`。reboot 后手动 shell /
+  systemd 拉起的主进程默认 soft=1024，而主进程长寿命持有 FastDDS
+  endpoint、uvicorn 连接、journalctl WS 等 —— reload 的
+  multiprocessing.spawn 子进程与 Popen 出的 compute_worker 都继承
+  本 limit（worker main() 另有自己的 setrlimit 兜底，见
+  "compute_worker.py" 段）。**本仓库无生产 systemd unit**
+  （install_autostart.sh 未部署的主机 reboot 后 run.py 由手动
+  shell 拉起），部署环境重启后务必确认主进程 `Max open files`
+  为 524288。
+* **shim 写端 fail-loud**（`_write_frames_to_shm`，v0.8.30）：每个
+  帧文件写后立即 `os.stat` 校验（size>0），失败 raise
+  `RuntimeError("/dev/shm 写入失败…/立即消失…")` → 走早前加的
+  失败聚合 → 微信用户直接收到真因。此前"写端静默、worker imread
+  None"的三层吞错即使修复后仍难以诊断"文件消失"类环境事故。
 * **cshim Service 对象必须显式销毁**：`_probe_service` 曾只 destroy
   requester 留下 svc —— boot auto-adopt 期累积约 75 个 FastDDS
   endpoint 集合。已修复为双销毁；新增 probe/临时 requester 路径时

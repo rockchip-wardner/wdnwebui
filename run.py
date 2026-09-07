@@ -512,6 +512,19 @@ _ensure_wdndds_native_path()
 
 
 def main() -> None:
+    # fd 防线：主进程把 soft RLIMIT_NOFILE 提到 hard 上限。systemd /
+    # rc.local / 手动 shell 环境下默认 soft=1024，而主进程长寿命持有
+    # FastDDS endpoint + uvicorn 连接 + journalctl WS + 各类 fd；
+    # reload 的 multiprocessing.spawn 子进程与本进程 Popen 出的
+    # compute_worker 都会继承本 limit（worker main() 还有自己的
+    # setrlimit 兜底）。
+    try:
+        import resource
+        _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if _soft < _hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (_hard, _hard))
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(
         prog="wdnwebui",
         description=f"wdnwebui service v{__version__}",
