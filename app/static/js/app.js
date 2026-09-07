@@ -7461,6 +7461,10 @@ const VCS = {
   playPaused: false,
   lastImg: null,    // 最近一帧 <img> 的 objectURL
 
+  // ---- 勾选路径（缓存窗口）：selected key = `${md5}|${chunk}|${overlap}`
+  cacheSel: new Set(),
+  cacheEntries: [],
+
   init() { return initVideoContentSearch(); },
 };
 
@@ -7504,6 +7508,12 @@ function vcsApplySnapshot(snap) {
   if (!snap) return;
   VCS.snap = snap;
   vcsRenderSnapshot(snap);
+  // 提取完成（首次现有条目入库）后刷新缓存窗口 —— 让新条目立即可勾选。
+  if (snap.state === "ready" && VCS._cacheWinOnReady !== snap.slices_embedded
+      + "|" + snap.slices_total) {
+    VCS._cacheWinOnReady = snap.slices_embedded + "|" + snap.slices_total;
+    vcsCacheRefresh().catch(() => {});
+  }
   if (typeof DemoGuard !== "undefined") {
     DemoGuard.report("video-content-search", { vcs: snap, playing: VCS.playing });
   }
@@ -7560,10 +7570,280 @@ function vcsUpdateButtons(st) {
   // 开始提取依据前端输入框当前值（浏览/手输路径即点亮），而非后端
   // snap.source —— 后者只在点按钮后经 /open 才写入。
   const src = (vcsEl("vcs-source")?.value || "").trim();
-  if (startBtn) startBtn.disabled = st === "extracting" || !src;
+  // 勾选路径互斥：勾选 ≥1 个缓存条目时"开始提取/停止"链路禁用
+  //（缓存已就绪无需提取），检索按钮保持可用（走 query_multi）。
+  const anyChecked = VCS.cacheSel && VCS.cacheSel.size > 0;
+  if (startBtn) startBtn.disabled = st === "extracting" || !src || anyChecked;
   if (stopBtn) stopBtn.disabled = st !== "extracting";
-  if (queryBtn) queryBtn.disabled = st !== "ready";
+  if (queryBtn) queryBtn.disabled = (st !== "ready" && !anyChecked) ||
+      (st === "ready" && !anyChecked && !src);
 }
+
+// ---- 勾选路径 / 缓存窗口（v0.12.2）----
+function vcsCacheKey(e) {
+  return `${e.md5}|${e.chunk_seconds || 0}|${e.chunk_overlap_seconds || 0}`;
+}
+
+async function vcsCacheRefresh() {
+  const win = vcsEl("vcs-cache-window");
+  if (!win) return;
+  let enabled = false;
+  let videos = [];
+  let failed = false;
+  try {
+    const r = await fetch(API_PREFIX + "/video-content-search/cache/list");
+    if (r.ok) {
+      const d = await r.json();
+      enabled = !!d.enabled;
+      videos = d.videos || [];
+    } else {
+      failed = true;
+    }
+  } catch (_) {
+    failed = true;
+  }
+  VCS.cacheEntries = videos;
+  // 清除已失效勾选（条目被删 / 全清后）
+  const alive = new Set(videos.map(vcsCacheKey));
+  Array.from(VCS.cacheSel).forEach((k) => {
+    if (!alive.has(k)) VCS.cacheSel.delete(k);
+  });
+  vcsCacheRender(videos, enabled);
+  if (failed) {
+    // 请求失败时窗口空态不能停留在"加载中…"（骨架文案）——
+    // 提示可重试（⭘ = 窗口头部的刷新按钮）。
+    const empty = vcsEl("vcs-cache-empty");
+    if (empty) empty.textContent = "缓存列表加载失败，点右上 ⭘ 重试";
+  }
+  vcsApplyMutualExclusion();
+}
+
+function vcsCacheRender(videos, enabled) {
+  const rows = vcsEl("vcs-cache-rows");
+  const empty = vcsEl("vcs-cache-empty");
+  const count = vcsEl("vcs-cache-count");
+  const win = vcsEl("vcs-cache-window");
+  if (!rows || !win) return;
+  win.hidden = false;
+  if (count) count.textContent = String(videos.length);
+  if (empty) {
+    empty.hidden = videos.length > 0;
+    // 空态文案恢复（HTML 初始是骨架"加载中…"，fetch 返回后按实际
+    // 状态回填；空表 → 引导文案，避免"加载中…"常驻。请求失败时
+    // 由 vcsCacheRefresh 在本函数之后覆盖为"加载失败"提示）。
+    if (!videos.length) {
+      empty.textContent = "暂无缓存条目 —— 完成一次视频分析后自动出现";
+    }
+  }
+  rows.innerHTML = videos.map((e) => {
+    const key = vcsCacheKey(e);
+    const checked = VCS.cacheSel.has(key) ? " checked" : "";
+    const meta = `${e.chunk_seconds || "?"}s/${e.chunk_overlap_seconds || "?"}s`
+               + ` · ${e.slices || 0}段`;
+    const tip = `md5=${(e.md5 || "").slice(0, 12)}… ${e.source_path || "(微信入库，无本地路径)"}`;
+    return (
+      `<label class="vcs-cache-row" title="${vcsEsc(tip)}">` +
+        `<input type="checkbox" class="vcs-cache-check" data-key="${vcsEsc(key)}"` +
+          ` data-md5="${vcsEsc(e.md5)}" data-chunk="${e.chunk_seconds || 0}"` +
+          ` data-overlap="${e.chunk_overlap_seconds || 0}"${checked} />` +
+        `<span class="vcs-cache-name">${vcsEsc(e.filename || "(未命名)")}</span>` +
+        `<span class="vcs-cache-meta">${vcsEsc(meta)}</span>` +
+        `<button class="vcs-cache-del" type="button" data-key="${vcsEsc(key)}"` +
+          ` data-md5="${vcsEsc(e.md5)}" data-chunk="${e.chunk_seconds || 0}"` +
+          ` data-overlap="${e.chunk_overlap_seconds || 0}">删除</button>` +
+      "</label>"
+    );
+  }).join("");
+  rows.querySelectorAll(".vcs-cache-check").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      if (cb.checked) VCS.cacheSel.add(cb.dataset.key);
+      else VCS.cacheSel.delete(cb.dataset.key);
+      vcsApplyMutualExclusion();
+    });
+  });
+  rows.querySelectorAll(".vcs-cache-del").forEach((btn) => {
+    btn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const md5 = btn.dataset.md5 || "";
+      if (!confirm("从缓存数据库删除该条视频索引？(索引可重新分析重建)")) return;
+      try {
+        const r = await fetch(API_PREFIX + "/video-content-search/cache/entry", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            md5,
+            chunk_seconds: Number(btn.dataset.chunk) || 0,
+            chunk_overlap_seconds: Number(btn.dataset.overlap) || 0,
+          }),
+        });
+        if (r.ok) await vcsCacheRefresh();
+      } catch (_) {}
+    });
+  });
+}
+
+function vcsApplyMutualExclusion() {
+  // 双路径互斥：路径文本非空 → 勾选框全部置灰；
+  // 勾选 ≥1 → 路径文本/浏览/开始提取 置灰。
+  const sourceEl = vcsEl("vcs-source");
+  const browseBtn = vcsEl("vcs-browse");
+  const pathSet = (sourceEl?.value || "").trim() !== "";
+  const anyChecked = VCS.cacheSel.size > 0;
+  vcsEl("vcs-cache-window")?.querySelectorAll(".vcs-cache-check").forEach((cb) => {
+    cb.disabled = pathSet;
+  });
+  if (sourceEl) sourceEl.disabled = anyChecked;
+  if (browseBtn) browseBtn.disabled = anyChecked;
+  vcsUpdateButtons();
+}
+
+async function vcsQueryMulti(text, simThreshold, topK, minResults) {
+  // 勾选路径：按窗口选中顺序（窗口行序 = analyzed_at 倒序）检索。
+  const entries = [];
+  const win = vcsEl("vcs-cache-window");
+  (win?.querySelectorAll(".vcs-cache-check:checked") || []).forEach((cb) => {
+    entries.push({
+      md5: cb.dataset.md5,
+      chunk_seconds: Number(cb.dataset.chunk) || 0,
+      chunk_overlap_seconds: Number(cb.dataset.overlap) || 0,
+    });
+  });
+  if (!entries.length) {
+    vcsShowError("请先勾选至少一个缓存条目");
+    return;
+  }
+  // 防重复点击：与单视频路径共用 vcsQueryAbort 守卫（本路径不携带
+  // abort signal，仅作互斥 + 40s 卡死兜底计时）。
+  if (vcsQueryAbort) return;
+  vcsQueryAbort = new AbortController();
+  const timer = setTimeout(() => {
+    try { vcsQueryAbort.abort(); } catch (_) {}
+  }, 40000);
+  const btn = vcsEl("vcs-query");
+  const meta = vcsEl("vcs-query-meta");
+  if (btn) { btn.disabled = true; btn.textContent = "检索中"; }
+  if (meta) meta.textContent = "检索中…（" + entries.length + " 个视频）";
+  const list = vcsEl("vcs-results-list");
+  if (list) list.innerHTML = '<li class="vcs-results-empty">检索中…</li>';
+  const count = vcsEl("vcs-results-count");
+  if (count) count.textContent = "";
+  try {
+    const r = await fetch(API_PREFIX + "/video-content-search/query_multi", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text, sim_threshold: simThreshold, top_k: topK,
+        min_results: minResults || 0, entries,
+      }),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      vcsShowError(d.detail || `query_multi 失败 (HTTP ${r.status})`);
+      return;
+    }
+    const d = await r.json();
+    vcsRenderMultiGroups(d.groups || [], text, topK, simThreshold);
+  } catch (e) {
+    vcsShowError("query_multi 请求失败：" + e);
+  } finally {
+    // busy 态完整恢复 —— multi 渲染不走 vcsApplySnapshot，meta / btn 必须在此清掉
+    clearTimeout(timer);
+    vcsQueryAbort = null;
+    if (btn) { btn.disabled = false; btn.textContent = "检索"; }
+    if (meta && meta.textContent === "检索中…（" + entries.length + " 个视频）") {
+      meta.textContent = "";
+    }
+  }
+}
+
+function vcsRenderMultiGroups(groups, text, topK, threshold) {
+  const list = vcsEl("vcs-results-list");
+  const count = vcsEl("vcs-results-count");
+  if (!list) return;
+  let html = "";
+  let cardSeq = 0;
+  const multi = { hits: [], sourceMap: [] };
+  groups.forEach((g) => {
+    if (g.miss) {
+      html += `<li class="vcs-results-empty">${vcsEsc(g.md5.slice(0,12)
+        )}：缓存索引不可读（可能已被删除或清空）</li>`;
+      return;
+    }
+    const params = `${g.chunk_seconds || "?"}s/${g.chunk_overlap_seconds || "?"}s`;
+    const frameTag = g.frame_enabled ? "可取帧回看" : "（无本地文件，仅时间段）";
+    html += `<li class="vcs-group-head">${vcsEsc(g.filename || "(未命名)")}` +
+      `<span class="vcs-g-meta">${vcsEsc(params)}` +
+      ` · ${g.slices}段 · top ${g.top_score != null ? Number(g.top_score).toFixed(2) : "--"}` +
+      `</span><span class="vcs-g-frame-tag">${!g.frame_enabled
+        ? "仅文本" : "可取帧回看"}</span></li>`;
+    const list0 = g.hits || [];
+    if (!list0.length) {
+      html += '<li class="vcs-results-empty">该视频无达到阈值或上限的命中。</li>';
+      return;
+    }
+    html += list0.map((h) => {
+      const t = vcsFormatTime(h.start_time) + " – " + vcsFormatTime(h.end_time);
+      const sim = (h.similarity != null) ? Number(h.similarity).toFixed(2) : "--";
+      const aboveTh = h.above_threshold !== false;
+      const badgeCls = aboveTh ? "vcs-badge vcs-badge-ok" : "vcs-badge vcs-badge-low";
+      const badgeTxt = aboveTh ? "达标" : "低于阈值";
+      const idx = cardSeq++;
+      multi.hits.push(h);
+      multi.sourceMap.push(g.source_path || "");
+      return (
+        `<li class="vcs-card${g.frame_enabled ? "" : " vcs-card-frame-disabled"}` +
+          (aboveTh ? "" : " vcs-card-low") +
+          `" data-mi="${idx}" data-gi="${multi.hits.length - 1}"` +
+          ` data-src="${vcsEsc(g.source_path || "")}" role="button" tabindex="0">` +
+          `<div class="vcs-thumb" data-mt="${Number(h.start_time) || 0}">缩略图</div>` +
+          `<div class="vcs-card-info">` +
+            `<span class="vcs-card-time">${vcsEsc(t)}</span>` +
+            `<span class="vcs-card-score">相似度 <b>${sim}</b></span>` +
+          "</div>" +
+          `<span class="${badgeCls}">${badgeTxt}</span>` +
+          `<span class="vcs-card-play">▶</span>` +
+        "</li>"
+      );
+    }).join("");
+  });
+  list.innerHTML = html;
+  if (count) count.textContent =
+    `${groups.filter((g) => !g.miss).length} 个视频 · ${multi.hits.length} 条`;
+  // 事件绑定：点击 → 播放（source 用条目路径；无路径时仅提示）
+  Array.from(list.querySelectorAll("li[data-mi]")).forEach((li) => {
+    const h = multi.hits[Number(li.dataset.mi)];
+    if (!h) return;
+    const src = li.dataset.src || "";
+    li.addEventListener("click", () => {
+      if (!src) { vcsShowError("该视频无本地文件（微信入库），无法播放/取帧"); return; }
+      vcsPlaySegment(Number(li.dataset.mi), src);
+    });
+    li.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        if (!src) { vcsShowError("该视频无本地文件，无法播放/取帧"); return; }
+        vcsPlaySegment(Number(li.dataset.mi), src);
+      }
+    });
+    const thumb = li.querySelector(".vcs-thumb");
+    const tSec = thumb && Number(thumb.dataset.mt);
+    if (thumb && src && tSec != null) {
+      const url = API_PREFIX + "/video-content-search/frame?source=" +
+        encodeURIComponent(src) + "&t=" + encodeURIComponent(tSec);
+      const img = document.createElement("img");
+      img.alt = "";
+      img.onload = () => { thumb.textContent = ""; thumb.appendChild(img); };
+      img.onerror = () => { thumb.textContent = "取帧失败"; };
+      img.src = url;
+    }
+  });
+}
+
+/** 勾选检索入口：score+多组渲染复用单视频播放器 ——
+ * ``vcsPlaySegment(idx, srcOverride)`` 的 srcOverride 位索选定 video
+ * 的 source_path（多视频场景下不再读 VCS.snap.source）。 */
+
 
 function vcsRenderHits(hits, query) {
   const list = vcsEl("vcs-results-list");
@@ -7655,11 +7935,11 @@ function vcsEsc(s) {
 }
 
 /* ------------------------- 播放器（WS 帧流） ----------------------- */
-function vcsPlaySegment(idx) {
+function vcsPlaySegment(idx, srcOverride) {
   const hits = (VCS.snap && VCS.snap.hits) || [];
-  const h = hits[idx];
+  const h = (typeof idx === "number") ? hits[idx] : idx;
   if (!h) return;
-  const source = (VCS.snap && VCS.snap.source) || "";
+  const source = srcOverride || (VCS.snap && VCS.snap.source) || "";
   if (!source) { vcsShowError("缺少视频源路径，无法播放"); return; }
   const start = Number(h.start_time) || 0;
   const end = Number(h.end_time) || start + 1;
@@ -7961,12 +8241,20 @@ async function vcsQuery() {
   const topK = Number(vcsEl("vcs-top-k")?.value || 10);
   const btn = vcsEl("vcs-query");
   const meta = vcsEl("vcs-query-meta");
+  // 宽松匹配在两条路径里都要读（分叉后各自携带 min_results 语义）
+  const lenient = !!vcsEl("vcs-lenient")?.checked;
+  // ---- 双路径分叉（在设置全局 busy 态之前）：勾选 ≥1 缓存条目 →
+  // 多视频检索（query_multi，自带完整的 busy 态生命周期）；否则走
+  // 原单视频 query
+  if (VCS.cacheSel && VCS.cacheSel.size > 0) {
+    await vcsQueryMulti(text, threshold, topK, lenient ? topK : 0);
+    return;
+  }
   vcsQueryAbort = new AbortController();
   const timer = setTimeout(() => vcsQueryAbort.abort(), 40000);
   if (btn) { btn.disabled = true; btn.textContent = "检索中"; }
   if (meta) meta.textContent = "检索中…";
   try {
-    const lenient = !!vcsEl("vcs-lenient")?.checked;
     const body = { text, sim_threshold: threshold, top_k: topK };
     // 严格模式（默认）：阈值过滤后无命中就返回空。
     // 勾选"宽松匹配" → min_results=topK，启用 fallback：
@@ -8030,6 +8318,12 @@ function initVideoContentSearch() {
   startBtn?.addEventListener("click", vcsStartExtract);
   stopBtn?.addEventListener("click", vcsStopExtract);
   queryBtn?.addEventListener("click", vcsQuery);
+  // 勾选路径（缓存窗口）：刷新按钮 + 进入页面即拉一次列表 +
+  // 路径输入变化触发互斥重算（vcsApplyMutualExclusion 内部含
+  // checkbox disabled 反向）。
+  vcsEl("vcs-cache-refresh")?.addEventListener("click", vcsCacheRefresh);
+  vcsEl("vcs-source")?.addEventListener("input", vcsApplyMutualExclusion);
+  vcsCacheRefresh().catch(() => {});
   const clearCacheBtn = vcsEl("vcs-clear-cache");
   clearCacheBtn?.addEventListener("click", async () => {
     let stats = null;
@@ -8049,6 +8343,7 @@ function initVideoContentSearch() {
       alert(k > 0
             ? `已清空 ${k} 条缓存。`
             : "缓存已空（或缓存未启用），无需清理。");
+      vcsCacheRefresh().catch(() => {});
     } catch (e) {
       alert("清空缓存失败：" + e);
     }

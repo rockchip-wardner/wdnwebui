@@ -889,9 +889,22 @@
                   <input type="text" id="vcs-source" class="surv-input"
                          placeholder="例如 /userdata/clips/sample.mp4" spellcheck="false" />
                   <button type="button" class="vd-btn" id="vcs-browse">浏览…</button>
+                  <button type="button" class="vd-btn" id="vcs-clear-cache"
+                          title="一键删除 LanceDB 里全部已缓存的视频分析结果（清空后重发/重选视频需重新分析）">清空缓存</button>
                 </div>
                 <div class="vd-actions-row">
                   <span class="vd-meta" id="vcs-source-meta">尚未选择</span>
+                </div>
+                <div class="vcs-cache-window" id="vcs-cache-window">
+                  <div class="vcs-cache-head">
+                    <span>已缓存视频 (<span id="vcs-cache-count">0</span>)</span>
+                    <button type="button" id="vcs-cache-refresh"
+                            title="刷新缓存列表" tabindex="-1">⭘</button>
+                  </div>
+                  <div class="vcs-cache-rows" id="vcs-cache-rows"></div>
+                  <div class="vcs-cache-empty" id="vcs-cache-empty">
+                    加载中…
+                  </div>
                 </div>
               </div>
             </section>
@@ -932,8 +945,6 @@
                 <div class="vd-actions-row">
                   <button type="button" class="vd-btn vd-btn-primary" id="vcs-start">开始提取</button>
                   <button type="button" class="vd-btn" id="vcs-stop" disabled>停止</button>
-                  <button type="button" class="vd-btn" id="vcs-clear-cache"
-                          title="一键删除 LanceDB 里全部已缓存的视频分析结果（清空后重发/重选视频需重新分析）">清空缓存</button>
                 </div>
                 <div class="vcs-progress" id="vcs-progress" hidden>
                   <div class="vcs-progress-meta">

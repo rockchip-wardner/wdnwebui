@@ -69,6 +69,7 @@ def _build_schema() -> "pa.Schema":
         ("fps", pa.float32()),
         ("vec", pa.list_(pa.float32(), _vec_dim())),
         ("filename", pa.string()),
+        ("source_path", pa.string()),
         ("duration_s", pa.float32()),
         ("slices_total", pa.int32()),
         ("slices_embedded", pa.int32()),
@@ -77,6 +78,54 @@ def _build_schema() -> "pa.Schema":
         ("embedding_model", pa.string()),
         ("analyzed_at", pa.float64()),
     ])
+
+
+def _migrate_add_source_path(table) -> None:
+    """v0.12.2 schema migration：旧表补 ``source_path`` 列（空串默认）。
+
+    lancedb 0.34 的 ``add_columns`` 接受 ``{col: sql_default}`` 形状
+    （实测 ``{"source_path": "''"}``），**持久化**且幂等；失败兜底为
+    drop + 新 schema 重建（缓存是可再生资源，旧条目 source_path 为
+    空 → UI 勾选检索时该条目 frame 置灰，功能不受影响）。
+    """
+    if "source_path" in table.schema.names:
+        return
+    try:
+        table.add_columns({"source_path": "''"})
+        _LOG.info("wechat video cache: added source_path column via "
+                  "add_columns")
+        return
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("wechat video cache: add_columns failed (%s) — "
+                     "rebuilding table", exc)
+    # 兜底：读全行 → drop → 按新 schema 重建 → 原行写回（source_path=""）
+    try:
+        import pyarrow as pa
+        old_tbl = table.search().limit(_LRU_SCAN_ROWS).to_arrow()
+        db = None
+        try:
+            db_path = str(_DB_DIR)
+            import lancedb as _lance
+            db = _lancedb.connect(db_path)
+        except Exception:  # noqa: BLE001
+            db = None
+        if db is not None:
+            db.drop_table(_TABLE_NAME)
+            new = db.create_table(
+                _TABLE_NAME, data=None, schema=_build_schema(), mode="create")
+            if old_tbl.num_rows:
+                keep = [c for c in old_tbl.column_names
+                        if c != "source_path"]
+                rows = {c: old_tbl.column(c).to_pylist() for c in keep}
+                n = old_tbl.num_rows
+                rows["source_path"] = [""] * n
+                new.add(pa.Table.from_pydict(rows, schema=_build_schema()))
+            _LOG.info("wechat video cache: rebuilt table with "
+                      "source_path (%d legacy rows preserved)",
+                      old_tbl.num_rows)
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("wechat video cache: schema migration failed "
+                     "(clear cache and re-analyze to rebuild): %s", exc)
 
 
 def file_md5(path: str, chunk_size: int = 1 << 20) -> str:
@@ -155,6 +204,7 @@ class WechatVideoCache:
                         schema=_build_schema(),
                         mode="create",
                     )
+                _migrate_add_source_path(self._table)
                 return self._table
             except Exception as exc:  # noqa: BLE001
                 self._init_failed = True
@@ -229,6 +279,7 @@ class WechatVideoCache:
         return {
             "index": index,
             "filename": str(first("filename") or ""),
+            "source_path": str(first("source_path") or ""),
             "fps": float(first("fps") or 0.0),
             "duration_s": float(first("duration_s") or 0.0),
             "slices_total": int(first("slices_total") or 0),
@@ -272,6 +323,7 @@ class WechatVideoCache:
                     "chunk_overlap_seconds": [
                         int(meta.get("chunk_overlap_seconds") or 1)] * n,
                     "embedding_model": [embedding_model] * n,
+                    "source_path": [str(meta.get("source_path") or "")] * n,
                     "analyzed_at": [now] * n,
                 }
                 arrow = pa.Table.from_pydict(rows, schema=_build_schema())
@@ -338,6 +390,103 @@ class WechatVideoCache:
             _LOG.warning("wechat video cache: stats failed: %s", exc)
             return {"enabled": enabled, "max_entries": max_entries,
                     "videos": 0, "rows": 0}
+
+    def list_videos(self, channel: Optional[str] = None) -> List[dict]:
+        """UI"已缓存视频"窗口数据源：按 (md5, chunk 参数) 聚合的条目列表。
+
+        每条 = 一个可检索的独立索引单元（同视频不同切片参数是不同
+        行）；``source_path`` 为空（微信管线分析完即删文件）→ UI 侧
+        frame 功能置灰。
+
+        **渠道过滤**：``source_path`` 同时承担渠道判别 —— 微信管线
+        固定存 ``""`` 占位、web（VCS）恒存真实本地路径（入库约定，
+        不随文件存亡漂移），因此：
+
+        * ``channel="web"`` → 只返回 ``source_path != ''`` 的条目
+          （web 窗口/勾选/行删除的数据源；微信条目不进 web 界面）；
+        * ``channel=None``（默认）→ 全量（微信工具链路如需枚举时的
+          兼容入口）。
+
+        ``lookup`` / 命中短路 / LRU 淘汰不受影响 —— 跨入口命中复用
+        保持（表共享、展示隔离）。
+        """
+        table = self._ensure_table()
+        if table is None:
+            return []
+        where = None
+        if channel == "web":
+            where = "source_path != ''"
+        try:
+            with self._lock:
+                builder = table.search().select(
+                    ["md5", "filename", "source_path",
+                     "chunk_seconds", "chunk_overlap_seconds",
+                     "duration_s", "analyzed_at"])
+                if where:
+                    builder = builder.where(where)
+                tbl = (builder
+                       .limit(_LRU_SCAN_ROWS).to_arrow())
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("wechat video cache: list failed: %s", exc)
+            return []
+        if tbl.num_rows == 0:
+            return []
+        grouped: Dict[tuple, dict] = {}
+        for i in range(tbl.num_rows):
+            md5 = str(tbl.column("md5")[i].as_py() or "")
+            chunk_sec = int(tbl.column("chunk_seconds")[i].as_py() or 0)
+            overlap = int(tbl.column("chunk_overlap_seconds")[i].as_py() or 0)
+            fname = str(tbl.column("filename")[i].as_py() or "")
+            spath = str(tbl.column("source_path")[i].as_py() or "")
+            dur = float(tbl.column("duration_s")[i].as_py() or 0.0)
+            at = float(tbl.column("analyzed_at")[i].as_py() or 0.0)
+            key = (md5, chunk_sec, overlap)
+            g = grouped.setdefault(key, {
+                "md5": md5, "filename": fname, "source_path": spath,
+                "chunk_seconds": chunk_sec,
+                "chunk_overlap_seconds": overlap,
+                "duration_s": dur, "slices": 0, "analyzed_at": at,
+            })
+            g["slices"] += 1
+            if (at or 0.0) > g["analyzed_at"]:
+                g["analyzed_at"] = at
+            if spath and not g["source_path"]:
+                g["source_path"] = spath
+        return sorted(grouped.values(), key=lambda g: -g["analyzed_at"])
+
+    def delete_video(self, md5: str, chunk_seconds: int,
+                     chunk_overlap_seconds: int) -> int:
+        """按行（md5 × 切片参数三元键）删除条目，返回删除行数。
+
+        同 md5 其它切片参数档的索引保留 —— UI 删除按钮按行删除。
+        """
+        if not md5:
+            return 0
+        table = self._ensure_table()
+        if table is None:
+            return 0
+        where = f"md5 = '{md5}'"
+        if chunk_seconds:
+            where += f" AND chunk_seconds = {int(chunk_seconds)}"
+        if chunk_overlap_seconds:
+            where += (f" AND chunk_overlap_seconds = "
+                      f"{int(chunk_overlap_seconds)}")
+        try:
+            with self._lock:
+                before = table.count_rows()
+                table.delete(where)
+                after = table.count_rows()
+                deleted = before - after
+                if deleted:
+                    _LOG.info("wechat video cache: deleted %d rows "
+                              "(md5=%s chunk=%s/overlap=%s)",
+                              deleted, md5[:12], chunk_seconds,
+                              chunk_overlap_seconds)
+                return deleted
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("wechat video cache: delete failed (%s): %s",
+                         md5[:12], exc)
+            return 0
 
     def clear(self) -> int:
         """清空缓存（UI"清空缓存"按钮 / 管理用途），返回删除的视频条数。"""

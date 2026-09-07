@@ -39,6 +39,164 @@ async def get_cache_stats() -> dict:
     return c.stats()
 
 
+@router.get("/video-content-search/cache/list")
+async def list_cache_entries() -> dict:
+    """UI"已缓存视频"窗口数据源（按 analyzed_at 倒序）。
+
+    每条 = (md5 × 切片参数) —— 同视频不同切片参数是不同行。
+    ``source_path`` 为空（微信管线）或文件已不在本机的条目，
+    ``frame_enabled=false`` —— 前端据此置灰取帧回看。
+    """
+    from app.services.wechat_video_cache import get_video_cache
+    c = get_video_cache()
+    if c is None:
+        return {"enabled": False, "videos": []}
+    # 窗口只显示 web 端（VCS）条目：渠道判别复用 source_path 双语义
+    # （微信管线固定存 "" 占位 —— 见 wechat_video_cache.list_videos）。
+    entries = c.list_videos(channel="web")
+    for e in entries:
+        e["frame_enabled"] = bool(
+            e.get("source_path") and os.path.isfile(e["source_path"]))
+    return {"enabled": True, "videos": entries}
+
+
+@router.delete("/video-content-search/cache/entry")
+async def delete_cache_entry(payload: dict) -> dict:
+    """按行（md5 × 切片参数三元键）删除单个缓存条目。
+
+    Body: ``{md5, chunk_seconds, chunk_overlap_seconds}``。同视频
+    其它切片参数档的索引保留。
+    """
+    payload = payload or {}
+    md5 = (payload.get("md5") or "").strip()
+    chunk_seconds = int(payload.get("chunk_seconds") or 0)
+    chunk_overlap_seconds = int(payload.get("chunk_overlap_seconds") or 0)
+    if not md5:
+        raise HTTPException(status_code=400, detail="md5 不能为空")
+    from app.services.wechat_video_cache import get_video_cache
+    c = get_video_cache()
+    deleted = c.delete_video(md5, chunk_seconds, chunk_overlap_seconds) \
+        if c is not None else 0
+    LOG.info("vcs API: DELETE /cache/entry md5=%s chunk=%s → %d rows",
+             md5[:12], chunk_seconds, deleted)
+    return {"ok": True, "rows_deleted": deleted}
+
+
+@router.post("/video-content-search/query_multi")
+async def query_multi(payload: dict) -> dict:
+    """对**一组已缓存条目**依次做文本检索（勾选路径，多选）。
+
+    Body: ``{text, sim_threshold?, top_k?, min_results?,
+    entries: [{md5, chunk_seconds, chunk_overlap_seconds}]}``。
+
+    无状态批量语义：``embed_text`` 只算一次，然后逐条目从 lance
+    还原向量做余弦检索 —— 不触碰当前单例的内存索引 / 状态机
+    （"浏览选文件"路径不受勾选检索污染）。返回::
+
+        {groups: [{md5, filename, source_path, chunk_seconds,
+          chunk_overlap_seconds, duration_s, slices, frame_enabled,
+          hits, top_score, fallback_used, miss}]}
+    （lance 里查不到的条目 → ``miss=True, hits=[]``）
+    """
+    payload = payload or {}
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="检索问题不能为空")
+    entries = payload.get("entries") or []
+    if not isinstance(entries, list) or not entries:
+        raise HTTPException(status_code=400, detail="entries 不能为空")
+
+    try:
+        sim_threshold = float(payload.get("sim_threshold", 0.5))
+        top_k = int(payload.get("top_k", 10))
+        min_results = int(payload.get("min_results", 0) or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="参数类型错误")
+    if not 0.0 <= sim_threshold <= 1.0:
+        raise HTTPException(status_code=400, detail="阈值必须在 0–1.0 之间")
+    if not 1 <= top_k <= 10:
+        raise HTTPException(status_code=400, detail="上限必须在 1–10 之间")
+    if min_results < 0:
+        min_results = 0
+
+    from app.services.wechat_video_cache import get_video_cache
+    from app.services.compute_registry import get_session_call_lock
+    c = get_video_cache()
+    if c is None:
+        raise HTTPException(status_code=409, detail="缓存未启用（cache_enabled=false 或 lancedb 不可用）")
+    # 去重 + 截断条目数（防误传超大列表）
+    clean: list = []
+    seen = set()
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        md5 = (e.get("md5") or "").strip()
+        cs = int(e.get("chunk_seconds") or 0)
+        ov = int(e.get("chunk_overlap_seconds") or 0)
+        key = (md5, cs, ov)
+        if md5 and key not in seen:
+            seen.add(key)
+            clean.append({"md5": md5, "chunk_seconds": cs,
+                          "chunk_overlap_seconds": ov})
+    if not clean:
+        raise HTTPException(status_code=400, detail="entries 里的 md5 均为空")
+
+    from app.services.video_content_search import _score_hits
+    try:
+        # 未启用模型 → RuntimeError → 502（与单视频 query 端点同语义）。
+        session = get_service()._ensure_session()
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    lock = get_session_call_lock()
+    with lock:
+        qvec = session.embed_text(text)
+    import numpy as np
+    qvec = np.asarray(qvec, dtype=np.float32).reshape(-1)
+    qvec = qvec / (float(np.linalg.norm(qvec)) + 1e-9)
+
+    groups = []
+    for e in clean:
+        cached = None
+        try:
+            cached = c.lookup(e["md5"],
+                              getattr(session, "model_id", None)
+                              or getattr(session, "_model_id", "") or "",
+                              e["chunk_seconds"], e["chunk_overlap_seconds"])
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("vcs query_multi: lookup %s failed: %s",
+                        e["md5"][:12], exc)
+        if cached is None:
+            groups.append({
+                "md5": e["md5"], "miss": True, "filename": "",
+                "hits": [], "frame_enabled": False,
+            })
+            continue
+        # video_path 不覆写 —— cache 索引无 video_path 字段；
+        # hits 的取帧走 group.source_path。
+        hits_, meta = _score_hits(
+            qvec, cached["index"], sim_threshold, top_k, min_results)
+        source_path = cached.get("source_path") or ""
+        groups.append({
+            "md5": e["md5"],
+            "miss": False,
+            "filename": cached.get("filename") or "",
+            "source_path": source_path,
+            "frame_enabled": bool(source_path) and os.path.isfile(source_path),
+            "chunk_seconds": e["chunk_seconds"],
+            "chunk_overlap_seconds": e["chunk_overlap_seconds"],
+            "duration_s": cached.get("duration_s") or 0.0,
+            "slices": len(cached["index"]),
+            "hits": hits_,
+            "top_score": meta["top_score"],
+            "above_threshold_count": meta["above_threshold_count"],
+            "below_threshold_count": meta["below_threshold_count"],
+            "fallback_used": meta["fallback_used"],
+        })
+    return {"ok": True, "text": text, "sim_threshold": sim_threshold,
+            "top_k": top_k, "groups": groups}
+
+
 @router.post("/video-content-search/cache/clear")
 async def clear_cache() -> dict:
     """一键删除 LanceDB 里全部已缓存的视频分析结果。

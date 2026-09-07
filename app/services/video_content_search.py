@@ -53,6 +53,57 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+def _score_hits(qvec: np.ndarray, index: List[dict], sim_threshold: float,
+                top_k: int, min_results: int = 0) -> "tuple[List[dict], dict]":
+    """对一组归一化向量索引做余弦检索（threshold 过滤 + top_k 截断 +
+    min_results 兜底）—— ``VideoContentSearchService.query`` 与
+    ``POST /query_multi`` 共用的评分实现。
+
+    返回 ``(hits: [{video_path, start_time, end_time, chunk_idx,
+    similarity, above_threshold}], meta: {top_score, above_count,
+    below_count, fallback_used})``。
+    """
+    scored = [(_cosine_similarity(qvec, e["vec"]), e) for e in index]
+    scored.sort(key=lambda t: -t[0])
+    all_sims = [s for s, _ in scored]
+    hits: list = []
+    fallback: list = []
+    for sim, entry in scored:
+        if sim < sim_threshold:
+            if min_results > 0 and len(fallback) < min_results:
+                fallback.append((sim, entry))
+            continue
+        hits.append((sim, entry))
+        if len(hits) >= top_k:
+            break
+    fallback_used = False
+    if not hits and fallback:
+        hits = fallback[:top_k]
+        fallback_used = True
+        LOG.info("vcs: query threshold %.2f filtered all hits — fallback "
+                 "top-%d (best sim=%.3f)", sim_threshold, len(hits),
+                 hits[0][0] if hits else 0.0)
+    out = [{
+        "video_path": entry.get("video_path") or "",
+        "start_time": entry["start_time"],
+        "end_time": entry["end_time"],
+        "chunk_idx": entry["chunk_idx"],
+        "similarity": round(float(sim), 4),
+        "above_threshold": bool(sim >= sim_threshold),
+    } for sim, entry in hits]
+    above_count = sum(1 for s in all_sims if s >= sim_threshold)
+    below_count = len(all_sims) - above_count
+    top_score = max(all_sims) if all_sims else None
+    meta = {
+        "top_score": round(float(top_score), 4) if top_score is not None else None,
+        "above_threshold_count": above_count,
+        "below_threshold_count": below_count,
+        "fallback_used": fallback_used,
+        "all_sims": [round(float(s), 4) for s in all_sims],
+    }
+    return out, meta
+
+
 def _probe_video_meta(source: str) -> Optional[dict]:
     """用 PyAV 探测 fps / 总帧数 / 时长。失败返回 None。
 
@@ -553,46 +604,10 @@ class VideoContentSearchService:
             qvec = session.embed_text(text)
         qvec = qvec / (np.linalg.norm(qvec) + 1e-9)
 
-        scored: List[Tuple[float, dict]] = []
         with self._lock:
             index = list(self._index)
-        for entry in index:
-            sim = _cosine_similarity(qvec, entry["vec"])
-            scored.append((sim, entry))
-
-        scored.sort(key=lambda t: -t[0])
-        all_sims = [s for s, _ in scored]
-        hits: list = []
-        fallback: list = []
-        for sim, entry in scored:
-            if sim < sim_threshold:
-                if len(fallback) < min_results:
-                    fallback.append((sim, entry))
-                continue
-            hits.append((sim, entry))
-            if len(hits) >= top_k:
-                break
-        fallback_used = False
-        if not hits and fallback:
-            hits = fallback[:top_k]
-            fallback_used = True
-            LOG.info("vcs: query threshold %.2f filtered all hits — "
-                     "falling back to top-%d (best sim=%.3f)",
-                     sim_threshold, len(hits),
-                     hits[0][0] if hits else 0.0)
-
-        result_hits = [{
-            "video_path": entry["video_path"],
-            "start_time": entry["start_time"],
-            "end_time": entry["end_time"],
-            "chunk_idx": entry["chunk_idx"],
-            "similarity": round(float(sim), 4),
-            "above_threshold": bool(sim >= sim_threshold),
-        } for sim, entry in hits]
-
-        above_count = sum(1 for s in all_sims if s >= sim_threshold)
-        below_count = len(all_sims) - above_count
-        top_score = max(all_sims) if all_sims else None
+        result_hits, meta = _score_hits(
+            qvec, index, sim_threshold, top_k, min_results)
 
         snap = None
         with self._lock:
@@ -601,14 +616,14 @@ class VideoContentSearchService:
             snap = self.snapshot()
             snap["query_meta"] = {
                 "index_size": len(index),
-                "top_score": round(float(top_score), 4) if top_score is not None else None,
-                "above_threshold_count": above_count,
-                "below_threshold_count": below_count,
-                "fallback_used": fallback_used,
+                "top_score": meta["top_score"],
+                "above_threshold_count": meta["above_threshold_count"],
+                "below_threshold_count": meta["below_threshold_count"],
+                "fallback_used": meta["fallback_used"],
             }
             if debug:
                 snap["query_debug"] = {
-                    "all_similarities": [round(float(s), 4) for s in all_sims],
+                    "all_similarities": meta["all_sims"],
                     "qvec_norm": round(float(np.linalg.norm(qvec)), 4),
                     "qvec_l2_unit": abs(round(float(np.linalg.norm(qvec)), 4) - 1.0) < 0.01,
                 }
@@ -813,6 +828,7 @@ class VideoContentSearchService:
                 try:
                     cache.save(self._md5, model_id, self._index, {
                         "filename": os.path.basename(self._source),
+                        "source_path": self._source,
                         "fps": fps,
                         "duration_s": duration_s,
                         "slices_total": self._slices_total,

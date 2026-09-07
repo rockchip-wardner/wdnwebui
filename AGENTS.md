@@ -2080,12 +2080,51 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   - `_worker_loop` 收尾 `slices_embedded >= slices_total`（全成功
     语义与微信一致）→ `cache.save(...)`；部分成功不存（与微信
     决策一致，重跑可补全）。
-  - **"清空缓存"按钮**（`#vcs-clear-cache`，UI 按钮行尾部）→
+  - **$json "清空缓存"按钮**（`#vcs-clear-cache`，视频源 input 行）→
     `confirm()`（含 `cache/stats` 返回的条数提示）→
     `POST /api/video-content-search/cache/clear` → 幂等
     `{videos_cleared}`；`GET .../cache/stats` 返回
     `{enabled, max_entries, videos, rows}` 给确认框展示。内存中
     当前索引不受影响（缓存是持久备份层）。
+  - **schema v0.12.2 加列 `source_path`**（入库时的本地视频路径）：
+    微信路径固定存 `""` 占位（分析完删文件，无可取帧），VCS 传
+    `self._source`；`_migrate_add_source_path` 用 lancedb 0.34
+    `add_columns({"source_path": "''"})`（SQL-dict 形状，持久化）
+    幂等补列，失败兜底 drop + 新 schema 重建（缓存可再生，旧条目
+    frame 置灰不影响检索）。
+* **VCS 勾选双路径（v0.12.2）**：缓存窗口让已分析视频可被直接勾选
+  检索，无需重新上传/提取：
+  - **窗口/数据**：`GET /api/video-content-search/cache/list`
+    （`cache.list_videos()`：`[{md5, filename, source_path, chunk/
+    overlap, slices, duration_s, analyzed_at}]`，按 analyzed_at 真
+    倒序）渲染 `#vcs-cache-window`（max-height 滚动）—— 每行=
+    (md5 × 切片参数) 三元键条目：checkbox + 文件名 + "Ns/Ms·N段" +
+    行删除按钮（`DELETE .../cache/entry` 按行删，同 md5 其它参数档
+    保留）。
+  - **互斥**（前端 `vcsApplyMutualExclusion`）：路径 text 非空 → 勾
+    选框全 disabled；勾选 ≥1 → `#vcs-source` / `#vcs-browse` /
+    `#vcs-start` disabled。
+  - **多选检索**：检索按钮在勾选 ≥1 时分叉
+    `POST /query_multi {text, sim_threshold, top_k, min_results,
+    entries[]}` —— **embed_text 只算一次**、逐条目 LanceDB lookup
+    向量做余弦（`_score_hits` 与单视频 query 共用）；返回
+    `groups[{filename, source_path, chunk params, hits, top_score,
+    frame_enabled, miss}]`，前端 `vcsRenderMultiGroups` 按视频小节
+    分组渲染（命中卡点击播放 → `vcsPlaySegment(idx, srcOverride)`
+    用条目 source；`frame_enabled=false` 时卡片置灰"取帧失败"，
+    点击提示）。**无状态批量语义** —— 不污染单例的 `_index` /
+    `_source` / 状态机。
+  - **source_path 语义**：缓存条目存的入库时路径仅当**该文件仍在
+    本机**才允许取帧/播放（`frame_enabled`，端点侧
+    `os.path.isfile` 校验）—— 移走/删除的旧文件条目仍可纯文本
+    检索（时间段 + 相似度）。
+  - **渠道隔离（v0.12.3）**：`source_path` 双语义兼作渠道判别 ——
+    微信管线固定 `""` 占位、web（VCS）恒存真实本地路径（均不随
+    文件存亡漂移）。`cache/list`（web 窗口/勾选/行删除的数据源）
+    调 `list_videos(channel="web")` → 只出 `source_path != ''` 条目；
+    **微信条目不进 web 界面**。`lookup`/命中短路/LRU/`clear`（全清
+    含微信条目，用户决策）不变 —— 跨入口命中复用保持（表共享、
+    展示隔离）。同 md5 同参数两渠道互覆（save 幂等语义，检索等价）。
 * **VideoSearch 工具**（`app/services/tools/video_search.py`，
   `requires_capability="swcap_video_retrieval"`）：**无调用时机限制**
   的四态结果型返回 —— `ok`（命中片段）/ `extracting`（附实时进度）/
