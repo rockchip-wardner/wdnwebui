@@ -1242,7 +1242,11 @@ class ComputeRegistry:
 
             def _probe():
                 try:
-                    from rknn3lite.api import RKNN3Lite
+                    # wdnai ≥ 0.4: ``RKNN3Lite`` is the vendored ctypes
+                    # shim (drives /usr/lib/librknn3_api.so directly);
+                    # the rknn3lite / rknn3-toolkit-lite wheel is no
+                    # longer installed.
+                    from wdnai._librknn import RKNN3Lite
                     probe = RKNN3Lite()
                     holder["probe"] = probe
                     holder["device_ids"] = probe.get_devices_id()

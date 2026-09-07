@@ -221,7 +221,10 @@ def _wdnai_canonical_device_index(bus_id: str | None) -> int | None:
     global _wdnai_dev_ids
     if _wdnai_dev_ids is None:
         try:
-            from rknn3lite.api import RKNN3Lite
+            # wdnai ≥ 0.4: ``RKNN3Lite`` is the vendored ctypes shim;
+            # the rknn3lite / rknn3-toolkit-lite wheel is no longer
+            # installed.
+            from wdnai._librknn import RKNN3Lite
             _wdnai_probe = RKNN3Lite()
             _wdnai_dev_ids = _wdnai_probe.get_devices_id()
         except Exception:

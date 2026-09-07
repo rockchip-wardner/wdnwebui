@@ -43,11 +43,8 @@ pip install -r requirements.txt
 ```
 
 That pulls FastAPI, Uvicorn, Pydantic, psutil, opencv-python-headless,
-python-multipart, **`rknn3-toolkit-lite`**, and **`gguf`**.
+python-multipart, and **`gguf`**.
 
-- `rknn3-toolkit-lite` — public Rockchip PyPI package; provides the
-  Python `rknn3lite` module and the `.so` bindings used by
-  `app/services/detector.py` for VLM inference.
 - `gguf` — used by `wdnai.gguf_tokenizer` to parse the
   `*.tokenizer.gguf` files that ship with each RKNN model. The
   `wdnai` SDK imports it but doesn't declare it as a dependency, so
@@ -56,12 +53,14 @@ python-multipart, **`rknn3-toolkit-lite`**, and **`gguf`**.
   wrapper that drives the im-bridge page lives in
   `app/services/wechat_bot.py` (inlined from `wdndds.Wechat` in 0.5+).
 
-> ⚠️  `rknn3-toolkit-lite` only ships the **Python** half of the
-> runtime. The kernel-mode driver (`/dev/rknn3`), the userspace libs
-> (`/usr/lib/librknnrt.so`, `librknn3_api.so`), and the helper
-> binaries (`/usr/bin/rknn3_startup`, `rknn3_model_test`, …) come
-> from the BSP image and must already be on the host. On a fresh
-> target that means running the BSP installer first; on the standard
+> ℹ️  As of `wdnai ≥ 0.4.0`, the `rknn3-toolkit-lite` wheel is **no
+> longer** a wdnwebui dependency. `wdnai` ships its own vendored
+> ctypes shim (`wdnai._librknn`) that drives
+> `/usr/lib/librknn3_api.so` directly. The kernel-mode driver
+> (`/dev/rknn3`) and the userspace libs (`librknn3_api.so` + helper
+> binaries `rknn3_startup`, `rknn3_model_test`, …) still come from
+> the BSP image and must be present on the host. On a fresh target
+> that means running the BSP installer first; on the standard
 > Rockchip images they're pre-installed. The web service will boot
 > fine without them, but the NPU section of the system monitor and
 > the VLM detector will report "offline" / fail to load.

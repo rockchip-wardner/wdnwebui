@@ -26,8 +26,8 @@ def install_patch() -> None:
         sink_id = id(sink)
         last_text_ref = [""]
 
-        def _cb_with_observer(userdata, result_ptr, state):
-            ret = inner_cb(userdata, result_ptr, state)
+        def _cb_with_observer(userdata, new_tokens, state):
+            ret = inner_cb(userdata, new_tokens, state)
             if state == _STATE_NORMAL or state in _STATE_FINISH_STATES:
                 with _OBSERVER_LOCK:
                     obs = _OBSERVERS.get(sink_id)
@@ -43,8 +43,12 @@ def install_patch() -> None:
                             LOG.warning("observer raised: %s", e)
             return ret
 
-        from rknn3lite.api import LLMResultCallback
-        return LLMResultCallback(_cb_with_observer)
+        # No more ``LLMResultCallback`` wrap: ``wdnai.backends._common.make_result_callback``
+        # now returns a plain Python callable matching the vendored shim's
+        # ``(userdata, new_tokens: List[int], state: int) -> int`` contract.
+        # ``build_llm_callback`` does the ctypes trampoline; the SDK no
+        # longer depends on the rknn3lite wheel.
+        return _cb_with_observer
 
     _common.make_result_callback = _patched
     _PATCH_DONE = True
