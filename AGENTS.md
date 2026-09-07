@@ -2064,6 +2064,28 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   - **故障兜底**：lookup/save 任何异常（lancedb 不可用 / 表损坏 /
     维度不匹配）只 LOG warning 降级 —— 缓存层任何异常都不阻塞
     分析管线；`get_video_cache()` 返回 None 表示旁路。
+  - **切片参数进缓存键（v0.12.1）**：`lookup/save` 均以
+    `(md5, embedding_model, chunk_seconds, chunk_overlap_seconds)`
+    定位条目 —— UI 检索页的 chunk/overlap 是用户可选的
+    （3-6s / 1-2s），不同参数的索引时间窗与帧数完全不同，混用会
+    时间戳错位。微信管线传固定 6/1；VCS 传用户选值；同视频不同
+    参数是**独立条目**（各自占 LRU 槽，命中互不干扰）。
+* **VCS 页接入缓存（v0.12.1）**：视频内容检索页与微信管线共享同一
+  张表 + 同一单例：
+  - `VideoContentSearchService.start_extract` 参数校验通过后算
+    md5（本地文件直接流式算，无需下载）→ `lookup(...)` 命中即
+    还原 index（`video_path` 换绑为当前 source basename，帧接口
+    走当前源）→ state 秒级 READY（广播 state，前端进度条直接
+    满格）；不命中走原有 worker。
+  - `_worker_loop` 收尾 `slices_embedded >= slices_total`（全成功
+    语义与微信一致）→ `cache.save(...)`；部分成功不存（与微信
+    决策一致，重跑可补全）。
+  - **"清空缓存"按钮**（`#vcs-clear-cache`，UI 按钮行尾部）→
+    `confirm()`（含 `cache/stats` 返回的条数提示）→
+    `POST /api/video-content-search/cache/clear` → 幂等
+    `{videos_cleared}`；`GET .../cache/stats` 返回
+    `{enabled, max_entries, videos, rows}` 给确认框展示。内存中
+    当前索引不受影响（缓存是持久备份层）。
 * **VideoSearch 工具**（`app/services/tools/video_search.py`，
   `requires_capability="swcap_video_retrieval"`）：**无调用时机限制**
   的四态结果型返回 —— `ok`（命中片段）/ `extracting`（附实时进度）/

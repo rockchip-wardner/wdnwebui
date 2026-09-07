@@ -34,6 +34,7 @@ from app.services.compute_registry import (
     get_registry,
     get_session_call_lock,
 )
+from app.services.wechat_video_cache import file_md5, get_video_cache
 
 LOG = logging.getLogger(__name__)
 
@@ -328,6 +329,7 @@ class VideoContentSearchService:
         self._index: List[dict] = []
         self._fps: float = 0.0
         self._duration_s: float = 0.0
+        self._md5: str = ""   # start_extract 时算（全成功后 save 缓存用）
 
     # ------------------------------------------------------------------ #
     # 状态 / 快照
@@ -396,6 +398,7 @@ class VideoContentSearchService:
             self._index = []
             self._fps = 0.0
             self._duration_s = 0.0
+            self._md5 = ""
             # 新开一次 video 时给帧的 /dev/shm 临时文件分配新 session id。
             # 旧的 session 文件被 _cleanup_shm_session 清掉（保险起见——
             # 正常路径每个 chunk 结束或 close() 都会清各自的 frame 文件）。
@@ -436,6 +439,61 @@ class VideoContentSearchService:
             self._state = _STATE_EXTRACTING
             self._error = ""
             self._stop_worker.clear()
+
+        # 缓存判定（lock 外做 IO：md5 计算 + LanceDB 查询）：
+        # 同视频 + 同模型 + 同切片参数 → 直接还原索引，跳过全部
+        # 切片 embedding（每片 1-3s NPU 推理）—— state 秒级 READY，
+        # 前端进度条直接满格。跨入口共享：微信端已分析过的视频
+        # （6s/1s）在此页选同参数提取也命中。
+        cache = get_video_cache()
+        cached = None
+        md5_hex = ""
+        if cache is not None:
+            try:
+                md5_hex = file_md5(self._source)
+            except OSError as exc:
+                raise RuntimeError(f"视频文件 md5 计算失败：{exc}") from exc
+            try:
+                session_for_id = self._ensure_session()
+            except RuntimeError:
+                session_for_id = None
+            model_id = ""
+            if session_for_id is not None:
+                model_id = (getattr(session_for_id, "model_id", None)
+                            or getattr(session_for_id, "_model_id", "") or "")
+            if model_id:
+                try:
+                    cached = cache.lookup(
+                        md5_hex, model_id, chunk_seconds,
+                        chunk_overlap_seconds)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("vcs: cache lookup failed (treat as "
+                                "miss): %s", exc)
+            if cached:
+                base = os.path.basename(self._source)
+                with self._lock:
+                    self._md5 = md5_hex
+                    self._index = [
+                        {**e, "video_path": base}
+                        for e in cached["index"]
+                    ]
+                    self._fps = cached.get("fps", 0.0) or 0.0
+                    self._duration_s = cached["duration_s"]
+                    self._slices_total = cached["slices_total"]
+                    self._slices_embedded = cached["slices_embedded"]
+                    self._state = _STATE_READY
+                    self._error = ""
+                LOG.info("vcs: cache hit md5=%s (%d segments, "
+                         "chunk=%ds/overlap=%ds) — restored, skipped "
+                         "embedding", md5_hex[:12],
+                         len(cached["index"]), chunk_seconds,
+                         chunk_overlap_seconds)
+                snap = self.snapshot()
+                self._broadcast({"type": "state", **snap})
+                return snap
+
+        with self._lock:
+            self._md5 = md5_hex
             self._worker = threading.Thread(
                 target=self._worker_loop, name="vcs-extract-worker", daemon=True
             )
@@ -743,6 +801,31 @@ class VideoContentSearchService:
                  self._slices_embedded, self._slices_total,
                  time.time() - self._started_at)
         self._broadcast({"type": "state", **self.snapshot()})
+
+        # ---- 全成功入库（与微信管线同语义：部分成功不存，重跑可补全）。
+        # 同 model + 同 chunk 参数的条目幂等覆盖。失败仅 LOG 不阻塞。
+        cache = get_video_cache()
+        if (cache is not None and self._md5
+                and self._slices_embedded >= self._slices_total):
+            model_id = (getattr(session, "model_id", None)
+                        or getattr(session, "_model_id", "") or "")
+            if model_id:
+                try:
+                    cache.save(self._md5, model_id, self._index, {
+                        "filename": os.path.basename(self._source),
+                        "fps": fps,
+                        "duration_s": duration_s,
+                        "slices_total": self._slices_total,
+                        "slices_embedded": self._slices_embedded,
+                        "chunk_seconds": self._chunk_seconds,
+                        "chunk_overlap_seconds": self._chunk_overlap_seconds,
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("vcs: cache save failed (skipped): %s", exc)
+        elif self._slices_embedded < self._slices_total:
+            LOG.warning("vcs: partial extraction (%d/%d) — not saved to "
+                        "cache; re-extract to complete",
+                        self._slices_embedded, self._slices_total)
 
 
 _service: Optional[VideoContentSearchService] = None

@@ -163,23 +163,42 @@ class WechatVideoCache:
                 return None
 
     # ------------------------------------------------------------ 查询
-    def lookup(self, md5: str, embedding_model: str) -> Optional[dict]:
-        """按 md5 + 模型标识取分析结果；未命中返回 None。
+    def lookup(self, md5: str, embedding_model: str,
+               chunk_seconds: int = 0, chunk_overlap_seconds: int = 0,
+               ) -> Optional[dict]:
+        """按 md5 + 模型 + 切片参数取分析结果；未命中返回 None。
 
+        **切片参数必须进缓存键**：同一视频不同 ``chunk_seconds`` /
+        ``overlap`` 的索引时间窗与帧数完全不同，混用会产生时间戳
+        错位（微信管线固定 6s/1s；UI 检索页用户可选 3-6s / 1-2s）。
+        历史行为：也可不传参数向后兼容（部分影片条目若有请避免），
+        建议调用方永不过滤为同一参数子集和提示 —— VCS 端
+        （UI 默认 4s/1s，`meta.blocked_list` 有列）仅为 warning。
         返回::
 
             {"index": [ {start_time, end_time, chunk_idx, fps, vec}, ... ],
-             "filename", "duration_s", "slices_total", "slices_embedded"}
+             "filename", "fps", "duration_s", "slices_total",
+             "slices_embedded", "chunk_seconds", "chunk_overlap_seconds"}
+
+        返回值未标记 ``video_path``（VCS 还原后自行按当前用户选择
+        source 的 basename 重绑 —— 帧接口与 ``GET .../frame`` 走当前
+        source，与 md5 无关）。
         """
         if not md5 or not embedding_model:
             return None
         table = self._ensure_table()
         if table is None:
             return None
+        where = (f"md5 = '{md5}' AND "
+                 f"embedding_model = '{embedding_model}'")
+        # 切片参数过滤：>0 时入条件（保持老调用方兼容 —— 旧参数一律
+        # 查不过滤将混淆不同档位的索引）。
+        if chunk_seconds and chunk_overlap_seconds:
+            where += (f" AND chunk_seconds = {int(chunk_seconds)} AND "
+                      f"chunk_overlap_seconds = {int(chunk_overlap_seconds)}")
         try:
             tbl = (table.search()
-                   .where(f"md5 = '{md5}' AND "
-                          f"embedding_model = '{embedding_model}'")
+                   .where(where)
                    .limit(_MAX_ROWS_PER_VIDEO)
                    .to_arrow())
         except Exception as exc:  # noqa: BLE001
@@ -214,6 +233,8 @@ class WechatVideoCache:
             "duration_s": float(first("duration_s") or 0.0),
             "slices_total": int(first("slices_total") or 0),
             "slices_embedded": int(first("slices_embedded") or 0),
+            "chunk_seconds": int(first("chunk_seconds") or 0),
+            "chunk_overlap_seconds": int(first("chunk_overlap_seconds") or 0),
         }
 
     # ------------------------------------------------------------ 写入
@@ -298,7 +319,7 @@ class WechatVideoCache:
 
     # ------------------------------------------------------------ 管理
     def stats(self) -> dict:
-        """调试用：条目数 / 行数 / 配置快照。"""
+        """调试 / UI"清空缓存"提示用：条目数 / 行数 / 配置快照。"""
         enabled, max_entries = _resolve_cache_config()
         table = self._ensure_table() if enabled else None
         if table is None:
@@ -319,7 +340,7 @@ class WechatVideoCache:
                     "videos": 0, "rows": 0}
 
     def clear(self) -> int:
-        """清空缓存（管理用途），返回删除的视频条数。"""
+        """清空缓存（UI"清空缓存"按钮 / 管理用途），返回删除的视频条数。"""
         table = self._ensure_table()
         if table is None:
             return 0
@@ -329,6 +350,8 @@ class WechatVideoCache:
                        .select(["md5"])
                        .limit(_LRU_SCAN_ROWS).to_arrow())
                 videos = len(set(sel.column("md5").to_pylist()))
+                if videos == 0:
+                    return 0
                 table.delete("md5 != ''")
                 _LOG.info("wechat video cache: cleared %d entries", videos)
                 return videos

@@ -8030,6 +8030,29 @@ function initVideoContentSearch() {
   startBtn?.addEventListener("click", vcsStartExtract);
   stopBtn?.addEventListener("click", vcsStopExtract);
   queryBtn?.addEventListener("click", vcsQuery);
+  const clearCacheBtn = vcsEl("vcs-clear-cache");
+  clearCacheBtn?.addEventListener("click", async () => {
+    let stats = null;
+    try {
+      const r = await fetch(API_PREFIX + "/video-content-search/cache/stats");
+      if (r.ok) stats = await r.json();
+    } catch (_) {}
+    const n = stats?.videos || 0;
+    if (!confirm(n > 0
+        ? `确认清空全部已缓存的视频分析结果？(当前 ${n} 条，清空后重发/重选视频需重新分析)`
+        : "确认清空全部已缓存的视频分析结果？")) return;
+    try {
+      const r = await fetch(API_PREFIX + "/video-content-search/cache/clear",
+                            { method: "POST" });
+      const d = await r.json();
+      const k = d.videos_cleared || 0;
+      alert(k > 0
+            ? `已清空 ${k} 条缓存。`
+            : "缓存已空（或缓存未启用），无需清理。");
+    } catch (e) {
+      alert("清空缓存失败：" + e);
+    }
+  });
   errClose?.addEventListener("click", () => vcsShowError(""));
   resultsClear?.addEventListener("click", async () => {
     try {

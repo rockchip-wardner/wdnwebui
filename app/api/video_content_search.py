@@ -29,6 +29,30 @@ async def get_snapshot() -> dict:
     return get_service().snapshot()
 
 
+@router.get("/video-content-search/cache/stats")
+async def get_cache_stats() -> dict:
+    """清空缓存按钮的提示条数来源：{enabled, max_entries, videos, rows}。"""
+    from app.services.wechat_video_cache import get_video_cache
+    c = get_video_cache()
+    if c is None:
+        return {"enabled": False, "max_entries": 0, "videos": 0, "rows": 0}
+    return c.stats()
+
+
+@router.post("/video-content-search/cache/clear")
+async def clear_cache() -> dict:
+    """一键删除 LanceDB 里全部已缓存的视频分析结果。
+
+    幂等：缓存不可用 / 空表都返回 200（videos_cleared=0）。内存中的
+    当前索引不受影响（缓存是持久备份层，页面状态与本次会话延续）。
+    """
+    from app.services.wechat_video_cache import get_video_cache
+    c = get_video_cache()
+    cleared = c.clear() if c is not None else 0
+    LOG.info("vcs API: POST /cache/clear → %d entries", cleared)
+    return {"ok": True, "videos_cleared": cleared}
+
+
 @router.post("/video-content-search/open")
 async def open_source(payload: dict) -> dict:
     """选择视频源。Body: ``{source: str}``（本期只允许单个视频文件）。"""

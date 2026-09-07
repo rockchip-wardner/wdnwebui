@@ -426,7 +426,9 @@ class WechatVideoManager:
             cached = None
             if model_id:
                 try:
-                    cached = cache.lookup(md5_hex, model_id)
+                    cached = cache.lookup(md5_hex, model_id,
+                                          _CHUNK_SECONDS,
+                                          _CHUNK_OVERLAP_SECONDS)
                 except Exception as exc:  # noqa: BLE001
                     _LOG.warning("wechat video: cache lookup failed "
                                  "(treat as miss): %s", exc)
