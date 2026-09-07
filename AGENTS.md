@@ -1531,11 +1531,30 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - **不能靠独立线程轮询 `sink.text`** —— `_backend.run` 的 `session_run`
     是同步阻塞的 C 调用，解码回调持有 GIL 逐批执行，并行轮询线程抢不到
     GIL，`deltas` 恒为空（真机实测：状态走到 done 但前端无任何回复）。
-  - `install_patch()`：幂等包装 `wdnai.backends._common.make_result_callback`，
-    在原 callback 之后按 `id(sink)` 查全局 observer，算 `sink.text` 增量并
-    调用它；回调本身在 C 层持有 GIL 时执行，采集可靠。**必须显式
-    `return ret`**（`LLMResultCallback` 是 CFUNCTYPE(c_int)，漏 return 会
-    被 ctypes 吞掉并导致原 callback 副作用失效）。
+  - `install_patch()`：幂等包装 wdnai 的结果回调工厂（在原 callback
+    之后按 `id(sink)` 查全局 observer，算 `sink.text` 增量并调用它；
+    回调本身在 C 层持有 GIL 时执行，采集可靠。**必须显式
+    `return ret`**，漏 return 会让 ctypes/shim 把返回值吞掉并导致
+    原 callback 副作用失效）。**patch 点随 wdnai 上游重构演进**
+    （f61dddd 把 backends 从 rknn3lite 迁到 vendored
+    `wdnai._librknn` shim 时把工厂 `make_result_callback` 改名为
+    `_make_sink_result_cb`，2026-09 事故：真机算力配置页所有模型
+    加载报 `AttributeError: ... no attribute 'make_result_callback'`
+    —— wrapper 依赖 SDK 私有符号，SDK 一重构就断）。现行探测顺序：
+    `_make_sink_result_cb`（当前 SDK）→ `make_result_callback`
+    （旧 SDK 回滚兼容）→ 都缺则 **fail-soft**：LOG.error 后放弃
+    patch —— chat 退化为无流式（done 一次性输出全文），
+    **不阻断模型加载**。`compute_worker._load_wdnai()` 里对
+    install_patch 再包一层 try/except（双保险，patch 内部任何
+    意外都不阻断 worker 加载模型）。**pull wdnai 后 chat 若无流式，
+    先查 worker 日志里 chat_stream 的 patch 行**。
+  - shim 调用契约（`wdnai._librknn._result_trampoline`）：
+    `user_cb(py_obj, tokens, state)` 3 实参，`py_obj` 取
+    `getattr(cb, "__self__", cb)`（free closure 无 `__self__` →
+    pin closure 本身）—— wrapper 用 free closure 3 参签名直接兼容，
+    无需 bound-method 改造；`_LLMCallState` 数值
+    NORMAL=0 / FINISH 族 (2,3,4) / ERROR=5 与 `chat_stream.py`
+    顶部常量一致。
   - 在 `compute_worker._load_wdnai()` 里安装（早于任何 `_build_session`
     构造 LLMSession，patch 才能绑进 `init_runtime`）。未注册 observer 的
     sink（detector / vlm / tts）走原 callback 零开销。

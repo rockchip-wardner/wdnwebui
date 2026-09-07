@@ -210,8 +210,11 @@ def _load_wdnai() -> dict:
         )
     except ImportError as e:
         raise RuntimeError(f"wdnai import failed: {e}")
-    from app.services.chat_stream import install_patch as _install_chat_stream_patch
-    _install_chat_stream_patch()
+    try:
+        from app.services.chat_stream import install_patch as _install_chat_stream_patch
+        _install_chat_stream_patch()
+    except Exception as e:  # noqa: BLE001 — patch 失败只损失 chat 流式，不阻断加载
+        LOG.warning("chat_stream patch 安装失败（chat 将无流式）：%s", e)
     _WDNAI = {
         "Attachment": Attachment,
         "LLMSession": LLMSession,

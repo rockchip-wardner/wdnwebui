@@ -15,11 +15,35 @@ _STATE_FINISH_STATES = (2, 3, 4)
 
 
 def install_patch() -> None:
+    """给 wdnai 的结果回调工厂挂 observer 采集（幂等 + fail-soft）。
+
+    ``make_result_callback`` 改名为 ``_make_sink_result_cb``）：
+
+    * 优先 ``_make_sink_result_cb``（当前 SDK）；
+    * 兼容旧符号 ``make_result_callback``（若回滚 wdnai 版本）；
+    * 都缺失 → **fail-soft**：LOG.error 后放弃 —— chat 退化为无流式
+      （done 一次性输出全文），**不阻断模型加载**（避免 SDK 再改私有
+      符号时把算力配置页的模型加载整体失败）。
+    """
     global _PATCH_DONE
     if _PATCH_DONE:
         return
+    # 无论成败只尝试一次（失败反复重试只会刷日志，不会自愈）。
+    _PATCH_DONE = True
     import wdnai.backends._common as _common
-    _original_factory = _common.make_result_callback
+    patch_name = None
+    for name in ("_make_sink_result_cb", "make_result_callback"):
+        if hasattr(_common, name):
+            patch_name = name
+            break
+    if patch_name is None:
+        LOG.error(
+            "chat 流式 patch 未安装：wdnai.backends._common 缺少回调工厂"
+            "符号（_make_sink_result_cb / make_result_callback 都不存在）"
+            "—— chat 将退化为无流式（done 一次性输出），模型加载不受影响；"
+            "如需恢复流式请适配 chat_stream.install_patch 的 patch 点")
+        return
+    _original_factory = getattr(_common, patch_name)
 
     def _patched(sink):
         inner_cb = _original_factory(sink)
@@ -43,16 +67,14 @@ def install_patch() -> None:
                             LOG.warning("observer raised: %s", e)
             return ret
 
-        # No more ``LLMResultCallback`` wrap: ``wdnai.backends._common.make_result_callback``
-        # now returns a plain Python callable matching the vendored shim's
-        # ``(userdata, new_tokens: List[int], state: int) -> int`` contract.
-        # ``build_llm_callback`` does the ctypes trampoline; the SDK no
-        # longer depends on the rknn3lite wheel.
+        # 新 shim（wdnai._librknn）以 3 实参调用 user_cb：
+        # ``user_cb(py_obj, tokens, state)``，py_obj 是从 ``__self__``
+        # 自动 pin 的 userdata（free closure 无 __self__ → pin closure
+        # 本身），与 adapter/旧 rknn3lite 契约一致。
         return _cb_with_observer
 
-    _common.make_result_callback = _patched
-    _PATCH_DONE = True
-    LOG.info("monkey-patched wdnai.backends._common.make_result_callback")
+    setattr(_common, patch_name, _patched)
+    LOG.info("monkey-patched wdnai.backends._common.%s", patch_name)
 
 
 def register_observer(sink: Any, callback: Callable[[str], None]) -> None:
