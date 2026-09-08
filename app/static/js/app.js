@@ -5159,7 +5159,7 @@ const ComputeConfigPage = {
     const out = [];
     for (const inst of snap.instances || []) {
       if (inst.status !== "queued" && inst.status !== "loading") continue;
-      const est = perModel[inst.model] ?? snap.default_estimated_init_seconds ?? 10;
+      const est = perModel[inst.model_id] ?? snap.default_estimated_init_seconds ?? 10;
       const startTs = inst.status === "queued"
         ? (inst.queued_at || 0)
         : (inst.started_at || inst.queued_at || 0);
