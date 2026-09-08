@@ -1500,7 +1500,23 @@ class WdnaiDetector:
                     or text_stripped in _DEGENERATE_VLM_TEXT
                     or not text_stripped
                 )
-                if degenerate:
+                # 修复 (v0.13): schema 解析失败的事件**必须**写进 history,
+                # 否则用户看到「什么都没推理出来」却无法区分:
+                #   (a) 模型根本没产生可用输出 (clean_text 为空 + parse 失败)
+                #   (b) 模型正常输出但被 degenerate 误过滤掉
+                # 之前 (a) 的事件 _history_text 是 "[VLMDoc 解析失败] (空)",
+                # 但 degenerate 检查的是 clean_text (空) → 整条事件被丢弃,
+                # history 里看不到任何东西。本次修复: schema_parse_failed=True
+                # 时跳过 degenerate 过滤,让事件 (含 [解析失败] 前缀 + level=error)
+                # 一定写出 ——前端能立刻识别"模型输出了但没解析成 schema"。
+                # 同样的逻辑对 TargetDoc 救援路径也适用: 救援出来的 TargetDoc
+                # 实例 text 仍可能为空 (desc 写在 desc 字段,不是 text),
+                # 但事件含 bbox/crop_b64,不能被这个过滤丢。
+                force_keep = _schema_parse_failed or (
+                    TargetDoc is not None
+                    and isinstance(result, TargetDoc)
+                )
+                if degenerate and not force_keep:
                     LOG.info(
                         "frame iter %d: VLMDoc degenerate (text_len=%d "
                         "text=%r) — drop event",
@@ -1509,6 +1525,15 @@ class WdnaiDetector:
                         clean_text,  # 完整文本, 不再截断
                     )
                 else:
+                    if degenerate and force_keep:
+                        LOG.info(
+                            "frame iter %d: VLMDoc degenerate but "
+                            "schema_parse_failed=True — keep event for "
+                            "diagnostics (text_len=%d text=%r)",
+                            i + 1,
+                            len(clean_text),
+                            clean_text,  # 完整文本, 不再截断
+                        )
                     events.append(final_ev)
                 LOG.info(
                     "frame iter %d: VLMDoc level=%s text_len=%d (sanitized %d) "
