@@ -1089,12 +1089,10 @@ SUMMARY_PROMPT_CHAR_BUDGET     = 3000    # 兜底：最终 prompt parts 字符�
 CHUNK_MAX_NEW_TOKENS           = 150     # pass 1 单块硬控输出（v0.10: 200→150，省 ~2s/call）
 FINAL_MAX_NEW_TOKENS           = 280     # pass 2 最终综述硬控输出（v0.10: 400→280，省 ~6s）
 
-# 单次 LLM 推理的 asyncio.wait_for 上限（秒）。v0.10：30 → 60。
-# 30s 在 RK3588 qwen3-vl-4b 上贴着 Apollo 综述最后一步的边界：1829-frame
-# 视频 ≈ 10 个 chunk，每段 ≤120 字 + 模板 ≈ 2500 字 prompt + 400
-# 新 token 输出，实测 ~25-30s；任何 prompt 略长或 NPU 短暂忙就破。
-# 60s 留余量覆盖合理慢调用，又不至于让真卡死的 SDK hang 几分钟才报错。
-_INFER_TIMEOUT_SEC             = 60.0
+# 单次 LLM 推理的 asyncio.wait_for 上限（秒）。统一 5s —— 健康推理
+# 单帧稳态 < 5s,超出必有异常(worker hang / NPU 抢占 / 通道 wedge)。
+# 不留余量让真卡死的 SDK 立即报错而不是 hang 几分钟才被发现。
+_INFER_TIMEOUT_SEC             = 5.0
 
 # Chunk-level rescue 在早期实现里嵌在 _infer_one（每 30 events 同步跑一次
 # batch LLM 兜底）。问题：worker 线程被 rescue 阻塞，且 30 events × 500 字符
@@ -2716,14 +2714,14 @@ class VideoFileAnalysisService:
 
                 t = threading.Thread(target=_runner, daemon=True)
                 t.start()
-                # join 留 5s 余量覆盖 asyncio.wait_for 拆 + runner 收尾
-                t.join(timeout=_INFER_TIMEOUT_SEC + 5.0)
+                # join 与 asyncio.wait_for 同一上限,不额外留余量。
+                t.join(timeout=_INFER_TIMEOUT_SEC)
 
                 # 防呆：超时/异常路径返回安全的 error string 而非 None
                 # （下游 text.startswith("(") 会 NoneType 崩溃）
                 if not finished[0]:
                     LOG.warning("vfa: _call_llm thread %.0fs 内未完成（SDK 卡死）",
-                                _INFER_TIMEOUT_SEC + 5.0)
+                                _INFER_TIMEOUT_SEC)
                     _interrupt_rknn_session(sess, wait_sec=5.0)
                     self._on_call_timeout()
                     return f"(推理失败：超时 {_INFER_TIMEOUT_SEC:.0f}s SDK 未响应)"
@@ -2738,8 +2736,7 @@ class VideoFileAnalysisService:
                     # embed_video handler:611-619）。
                     #
                     # session_stop() 是 async signal，C 层在 kernel 间
-                    # 协作点检查 → 实际释放可能花数秒（长 prompt prefill /
-                    # generation 跑到一半）。这里 sync 等待最多 5s 让 C 层
+                    # 协作点检查 → 实际释放可能花数秒。这里 sync 等待让 C 层
                     # 处理 stop 信号并实际让出 NPU mutex，下次 reset() 不阻塞。
                     _interrupt_rknn_session(sess, wait_sec=5.0)
                     self._on_call_timeout()

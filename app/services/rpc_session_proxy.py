@@ -724,7 +724,7 @@ class _RpcSessionProxy:
 
     def chat_run(self, history, text, *, context_limit=None,
                  max_new_tokens=2048, on_delta=None, stop_event=None,
-                 poll_interval_ms=150, timeout_ms=300000,
+                 poll_interval_ms=150, timeout_ms=60_000,
                  tool_names: Optional[list] = None) -> dict:
         """Run one text-chat turn against the worker.
 
@@ -757,8 +757,11 @@ class _RpcSessionProxy:
         }
         # 首次 call 也走弹性路径：通道若已 wedge，soft 重试 + recreate
         # 自愈后再发起；否则用户会直接看到 chat_run failed。
-        reply = self._call_resilient(payload, timeout_ms=10_000,
-                                     soft_retries=1, hard_retries=4)
+        # 所有 wire RPC 超时统一 5s —— 健康 RPC 应在 < 5s 返 reply,
+        # 超出意味着 DDS 通道 wedge / worker 异常 / 计算资源争用。
+        # 不重试直接 raise,让上层立即感知(不掩盖 bug)。
+        reply = self._call_resilient(payload, timeout_ms=5_000,
+                                     soft_retries=0, hard_retries=0)
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
             raise RuntimeError(
@@ -901,16 +904,13 @@ class _RpcSessionProxy:
         _image_size = overrides.get("image_size")
         if isinstance(_image_size, int) and not isinstance(_image_size, bool):
             payload["image_size"] = _image_size
-# infer 路径走 ``_call_resilient``：冷启动 + 多模态首帧 vision
-        # prefill 容易单帧 90-150s（实测 Qwen3-VL-4B / Qwen3.5-VL-4B
-        # 第一次 infer 都偶发 130s+），单纯一次 120s 超时后直接 raise
-        # 会让用户看到"启动失败"而 worker 端其实跑完了。
-        # soft_retries=1 + hard_retries=2 → 最坏预算 ≈
-        #   3 × 240s + recreate ≈ 720s，覆盖最坏的多模态首帧延迟
-        # （vision + MRoPE prefill）；单帧稳态推理一般 < 5s 命中第 1 次。
-        # 超时后 recreate cshim client 清理可能的端点状态残留。
-        reply = self._call_resilient(payload, timeout_ms=240_000,
-                                     soft_retries=1, hard_retries=2)
+# infer 路径走 ``_call_resilient``：
+        # 所有 wire RPC 超时统一 5s —— 健康推理单帧稳态 < 5s,
+        # 超出 5s 必有异常（worker hang / NPU 抢占 / 通道 wedge）。
+        # 不重试不延后,立即 raise 让上层 (detector / VFA / chat) 走错误
+        # 处理路径,而不是花 720s 等 worker 自己完成。
+        reply = self._call_resilient(payload, timeout_ms=5_000,
+                                     soft_retries=0, hard_retries=0)
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
             LOG.warning(
@@ -1099,7 +1099,7 @@ class _RpcSessionProxy:
         """
         reply = self._call_with_recreate(
             {"action": "embed_text", "text": text},
-            timeout_ms=60_000,
+            timeout_ms=5_000,
         )
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")
@@ -1139,7 +1139,7 @@ class _RpcSessionProxy:
             reply = self._call_with_recreate(
                 {"action": "embed_video", "frame_paths": paths,
                  "prompt": prompt or ""},
-                timeout_ms=300_000,
+                timeout_ms=5_000,
             )
         else:
             # Legacy fallback: keep the old base64 path working for
@@ -1155,7 +1155,7 @@ class _RpcSessionProxy:
                         f"frame must be BGR ndarray, bytes, or str path; got {type(fr).__name__}")
             reply = self._call_with_recreate(
                 {"action": "embed_video", "frames": encoded, "prompt": prompt or ""},
-                timeout_ms=300_000,
+                timeout_ms=5_000,
             )
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")

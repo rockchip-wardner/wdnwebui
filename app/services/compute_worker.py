@@ -150,8 +150,8 @@ if not isinstance(sys.stderr, _BrokenPipeSafeStderr):
     sys.stderr = _BrokenPipeSafeStderr(sys.stderr)
 
 
-_EMBED_TEXT_TIMEOUT = 30.0
-_EMBED_VIDEO_TIMEOUT = 60.0
+_EMBED_TEXT_TIMEOUT = 5.0
+_EMBED_VIDEO_TIMEOUT = 5.0
 
 
 _PR_SET_NAME = 15
