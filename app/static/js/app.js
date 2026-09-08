@@ -4660,7 +4660,7 @@ const CC_PRESET_META = {
     capability_types: ["swcap_audio_understand"],
     instance_name: "llm-audio",
     memory_estimate_mb: 2500,
-    estimated_init_seconds: 50,
+    estimated_init_seconds: 60,
     description: "多感知描述模型",
     available_targets: ["182x"],
   },
