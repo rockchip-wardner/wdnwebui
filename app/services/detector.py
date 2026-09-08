@@ -519,24 +519,84 @@ def _try_rescue_target_doc(raw_text: str, target_doc_cls):
         if not required_fields:
             return None
 
-        # 形式 1:顶层 dict 含全部 required
-        if all(k in data for k in required_fields):
+        # 数字字段归一化:模型偶尔把 ``x1`` 输出成 ``[60, 425]`` 数组
+        # (Qwen3.5-VL-4B 的 bbox 训练数据有时是 ``[x1, y1, x2, y2]`` 4-tuple
+        # 格式或 ``[x1, y1, x2]`` 3-tuple 格式,模型就照着输),pydantic model_validate
+        # 会 reject list[float] 期望 scalar float。归一化时:
+        #   - 标量 str:转 float(兼容 "590" 这种字符串)
+        #   - list 长度 1:取唯一元素
+        #   - list 长度 ≥ 2:按字段名做启发式映射 (x1→v[0], y1→v[0], x2→v[1]...)
+        #     — 模型在 4-tuple 时把 (x1, y1, x2, y2) 摊开到各自字段,所以
+        #     x1=[60,425] 时取 [0] 表示第一个车的 x1,丢掉 [1] 第二个车
+        #     (单车场景够用;多车场景需要 detector 层多事件处理,见下)
+        def _flatten(v, field: str = ""):
+            if isinstance(v, bool):
+                return int(v)
+            if isinstance(v, (int, float)):
+                return float(v)
+            if isinstance(v, str):
+                try:
+                    return float(v.strip())
+                except (TypeError, ValueError):
+                    return None
+            if isinstance(v, list):
+                # 4-tuple [x1, y1, x2, y2] 摊开:模型把同一组 4 元组
+                # 写进每个字段,实际只取第一辆车的 bbox。
+                # 启发式:如果 list 长度 == 4 且字段名是 4 个坐标之一,按
+                # 字段位置取对应索引 (x1→0, y1→1, x2→2, y2→3)。
+                if len(v) == 4 and field in ("x1", "y1", "x2", "y2"):
+                    pos = ("x1", "y1", "x2", "y2").index(field)
+                    return _flatten(v[pos])
+                # 其它长度:取第一个元素 (最保守)
+                if v:
+                    return _flatten(v[0])
+                return None
+            return None
+
+        def _try_validate(d: dict):
+            """尝试 model_validate,失败前先把数字字段 flatten 成 scalar。"""
+            if not all(k in d for k in required_fields):
+                return None
+            # flatten 数字字段
             try:
-                return target_doc_cls.model_validate(data)
+                fields_info = schema_dict.get("properties") or {}
+                flat = {}
+                for k in required_fields:
+                    ftype = (fields_info.get(k) or {}).get("type", "")
+                    if ftype in ("number", "integer"):
+                        v = _flatten(d.get(k), field=k)
+                        if v is None:
+                            return None
+                        flat[k] = v
+                    elif ftype == "string":
+                        v = d.get(k)
+                        if not isinstance(v, str):
+                            v = str(v) if v is not None else ""
+                        flat[k] = v
+                    else:
+                        flat[k] = d.get(k)
+                # 复制所有非 required 字段(如果有)
+                for k, v in d.items():
+                    if k not in flat:
+                        flat[k] = v
+                return target_doc_cls.model_validate(flat)
             except Exception:
-                pass
+                return None
+
+        # 形式 1:顶层 dict 含全部 required (含 flatten)
+        r = _try_validate(data)
+        if r is not None:
+            return r
         # 形式 2:properties 嵌套 (Qwen3.5 把 schema 当模板填值)
         props = data.get("properties")
         if isinstance(props, dict) and all(k in props for k in required_fields):
-            try:
-                return target_doc_cls.model_validate(props)
-            except Exception:
-                pass
+            r = _try_validate(props)
+            if r is not None:
+                return r
         # 形式 3:data 顶层有部分字段 (其他用 default)
-        try:
-            return target_doc_cls.model_validate(data)
-        except Exception:
-            pass
+        r = _try_validate(data)
+        if r is not None:
+            return r
         return None
     except Exception:
         return None
