@@ -592,7 +592,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "preset_factory":   _qwen_2_5_omni_3b_spec,
         "model_dir_name":   "Qwen2.5-Omni-3B",
         "memory_estimate_mb": 2500,
-        "estimated_init_seconds": 60,
+        "estimated_init_seconds": 50,
         "capability_types": ["swcap_audio_understand"],
         "instance_name":    "llm-audio",
         "worker_name":      "audio-3b",     # comm = "worker:audio-3b" (13 chars)
