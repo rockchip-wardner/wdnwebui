@@ -261,12 +261,15 @@ async def set_prompt(payload: dict) -> dict:
     """Start (or update) VLM detection.
 
     Body: ``{prompt: str, every_n: int, enabled_tools: list[str],
-            image_size: int | None}``
+            image_size: int | None, model_id: str | None}``
     — ``prompt`` 必填；``enabled_tools`` 可选，默认 ``[]``，每一项
     必须是 ``/api/video-detection/tools`` 返回的合法 ``key``；
     ``image_size`` 可选，指定视觉模型目标尺寸（必须由
     ``/api/video-detection/available-vision-sizes`` 返回的合法值之
-    一；缺省 / ``None`` = 按帧自动选最近的变体，保留 legacy 行为）。
+    一；缺省 / ``None`` = 按帧自动选最近的变体，保留 legacy 行为）；
+    ``model_id`` 可选，从前端下拉框选的 ``swcap_video_describe``
+    实例 id（不传 / 空 = 走 ``get_session`` 的本机优先 auto-pick，
+    与旧行为一致）。
     """
     payload = payload or {}
     prompt = (payload.get("prompt") or "").strip()
@@ -298,10 +301,22 @@ async def set_prompt(payload: dict) -> dict:
         )
     else:
         image_size = raw_image_size
+    # model_id：前端下拉框选中值；None 或 "" 走 auto-pick。
+    raw_model_id = payload.get("model_id", None)
+    if raw_model_id is None or (isinstance(raw_model_id, str)
+                                and not raw_model_id.strip()):
+        model_id: str | None = None
+    elif not isinstance(raw_model_id, str):
+        raise HTTPException(
+            status_code=400,
+            detail=f"model_id 必须是字符串或 null: {raw_model_id!r}",
+        )
+    else:
+        model_id = raw_model_id
     try:
         return get_detector().start(
             prompt, every_n=every_n, enabled_tools=enabled_tools,
-            image_size=image_size,
+            image_size=image_size, model_id=model_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

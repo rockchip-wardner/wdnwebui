@@ -387,6 +387,28 @@ async def get_capabilities() -> dict:
     }
 
 
+@router.get("/compute/instances-by-capability")
+async def list_instances_by_capability(capability: str) -> dict:
+    """返回当前 running 实例中能提供指定 capability 的清单。
+
+    供音视频描述 / 视频目标检测 / 音频理解等消费者页面的"模型选择"
+    下拉框使用。返回每条实例的最小展示信息 (``model_id`` /
+    ``label`` / ``source`` / ``npu_index`` / ``pid``),前端用
+    ``model_id`` 在 start 请求体里回传给后端。 本机实例排序在前,
+    跟 ``get_session`` 自动选择语义一致,默认选项就是无下拉框时
+    用户会拿到的那个。
+    """
+    if not capability or not isinstance(capability, str):
+        raise HTTPException(
+            status_code=400,
+            detail="capability query 参数必填 (例如 swcap_video_describe)")
+    reg = get_registry()
+    return {
+        "capability":  capability,
+        "instances":   reg.list_running_by_capability(capability),
+    }
+
+
 class HardwareCapabilityUpdate(BaseModel):
     """PUT /api/compute/hardware-capabilities 的请求体。
 

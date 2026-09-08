@@ -80,6 +80,9 @@ class AudioAnalysisService:
         self._source: str = ""
         self._prompt: str = ""
         self._progress: tuple = (0, 0)
+        # 用户从下拉框选中的 swcap_audio_understand 实例 model_id;
+        # 空串 = auto-pick (与旧行为一致)。
+        self._chosen_model_id: str = ""
         self._next_id: int = 1
         self._closed = False
 
@@ -91,6 +94,7 @@ class AudioAnalysisService:
                 "source":       self._source,
                 "prompt":       self._prompt,
                 "progress":     list(self._progress),
+                "model_id":     self._chosen_model_id,
                 "events_count": self._events_count_unlocked(),
                 "available":    self._probe_capability_available(),
             }
@@ -141,20 +145,34 @@ class AudioAnalysisService:
             snap = self.snapshot()
         self._broadcast({"type": "state", **snap})
 
-    def start(self, source: str, prompt: str) -> dict:
+    def start(self, source: str, prompt: str,
+              model_id: Optional[str] = None) -> dict:
         """启动一次音频理解。失败 → ValueError / FileNotFoundError / RuntimeError
-        由 API 层映射到 400 / 404 / 502。"""
+        由 API 层映射到 400 / 404 / 502。
+
+        ``model_id``：前端下拉框选中的 ``swcap_audio_understand``
+        实例 id。``None`` 或 ``""`` = 走 ``get_session`` 的本机优先
+        auto-pick (默认行为,与旧版本一致)。
+        """
         source = (source or "").strip()
         prompt = (prompt or "").strip()
         if not source:
             raise ValueError("source 不能为空")
         if not prompt:
             raise ValueError("prompt 不能为空")
+        if model_id is not None and (not isinstance(model_id, str)
+                                     or not model_id.strip()):
+            raise ValueError(f"model_id 必须是字符串或 None: {model_id!r}")
         if not os.path.isfile(source):
             raise FileNotFoundError(f"视频源不存在: {source!r}")
 
         # 预检 capability —— 不等 worker 探测才报错
-        get_registry().get_session("swcap_audio_understand")
+        # 显式 model_id 时校验该实例是否 running,失败抛 RuntimeError。
+        if model_id:
+            get_registry().get_session_for_model(
+                "swcap_audio_understand", model_id.strip())
+        else:
+            get_registry().get_session("swcap_audio_understand")
 
         self._stop_event.set()
         old = self._thread
@@ -168,6 +186,9 @@ class AudioAnalysisService:
             self._progress = (0, 0)
             self._error = ""
             self._closed = False
+            self._chosen_model_id = (model_id.strip()
+                                    if model_id and isinstance(model_id, str)
+                                    else "")
         self.clear_events()
 
         self._set_state(_STATE_EXTRACTING)
@@ -295,7 +316,13 @@ class AudioAnalysisService:
         ev_id = self._next_id_and_inc()
 
         try:
-            sess = get_registry().get_session("swcap_audio_understand")
+            # 用户从下拉框选了特定实例时,锁定到该 instance;
+            # 否则走 ``get_session`` 的本机优先 auto-pick。
+            if self._chosen_model_id:
+                sess = get_registry().get_session_for_model(
+                    "swcap_audio_understand", self._chosen_model_id)
+            else:
+                sess = get_registry().get_session("swcap_audio_understand")
         except RuntimeError as e:
             return AudioEvent(
                 id=ev_id, chunk_idx=idx,

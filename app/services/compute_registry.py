@@ -3389,6 +3389,102 @@ class ComputeRegistry:
             return chosen.rpc_session_proxy
         raise RuntimeError(f"功能未启用: {capability_type}")
 
+    def get_session_for_model(self, capability_type: str, model_id: str) -> Any:
+        """Return the RpcSessionProxy for a specific running instance
+        matching both ``capability_type`` and ``model_id``.
+
+        Used by the consumer pages (音视频描述 / 视频目标检测 / 音频理解)
+        after the user picks one model from a UI dropdown that lists all
+        running instances exposing ``capability_type``.  Local preferred
+        over remote when multiple instances of the same ``model_id``
+        coexist (e.g.  spawned + adopted), mirroring ``get_session``'s
+        本机优先 rule.
+
+        Raises ``RuntimeError`` if no running instance matches.
+        """
+        with self._lock:
+            local = remote = None
+            for inst in self._instances.values():
+                if (inst.status != "running"
+                        or inst.model_id != model_id
+                        or capability_type not in inst.capability_types):
+                    continue
+                if ((inst._source or "") in ("spawned", "adopted_local")
+                        and local is None):
+                    local = inst
+                elif remote is None:
+                    remote = inst
+            chosen = local or remote
+            if chosen is None:
+                raise RuntimeError(
+                    f"功能未启用: {capability_type} (model_id={model_id!r} "
+                    f"未在 running 实例中找到)")
+            if chosen.rpc_session_proxy is None:
+                raise RuntimeError(
+                    f"功能未启用: {capability_type} (model_id={model_id!r} "
+                    f"instance has no proxy)")
+            LOG.info(
+                "get_session_for_model(%s, %s): %s instance %s (pid=%s)",
+                capability_type, model_id,
+                "LOCAL" if chosen is local else "REMOTE",
+                chosen._source,
+                chosen._peer_pid if isinstance(chosen._peer_pid, int)
+                else getattr(chosen.proc, "pid", None))
+            return chosen.rpc_session_proxy
+
+    def list_running_by_capability(self, capability_type: str) -> list[dict]:
+        """Return one entry per running instance exposing ``capability_type``.
+
+        Powers the consumer-page "model dropdown": each entry carries the
+        minimum fields the UI needs to render an option + submit a
+        choice back.  Local-first ordering (spawned + adopted_local
+        before adopted) matches ``get_session`` semantics so the
+        dropdown default matches the auto-pick the user would have got
+        had they not asked for a choice.
+
+        Hidden-by-config entries are filtered out so the dropdown never
+        surfaces something the boot path won't actually start.
+        """
+        hidden_set: set[str] = set()
+        try:
+            stored = get_config().get_section("compute", {})
+            if isinstance(stored, dict):
+                raw = stored.get("services")
+                if isinstance(raw, list):
+                    for e in raw:
+                        if (isinstance(e, dict)
+                                and isinstance(e.get("name"), str)
+                                and e.get("autostart") == "hidden"):
+                            hidden_set.add(e["name"])
+        except Exception:  # noqa: BLE001
+            pass
+
+        def _source_rank(src: str) -> int:
+            return 0 if src in ("spawned", "adopted_local") else 1
+
+        out: list[dict] = []
+        with self._lock:
+            for inst in self._instances.values():
+                if (inst.status != "running"
+                        or capability_type not in inst.capability_types
+                        or inst.model_id in hidden_set):
+                    continue
+                pid_val = (inst._peer_pid if isinstance(inst._peer_pid, int)
+                           else getattr(inst.proc, "pid", None))
+                out.append({
+                    "model_id":        inst.model_id,
+                    "label":           inst.instance_name,
+                    "source":          inst._source or "spawned",
+                    "npu_index":       inst.npu_index,
+                    "pid":             pid_val or 0,
+                    "memory_estimate_mb": inst.memory_estimate_mb,
+                    "_rank":           _source_rank(inst._source or ""),
+                })
+        out.sort(key=lambda x: (x["_rank"], x["model_id"]))
+        for e in out:
+            e.pop("_rank", None)
+        return out
+
 
 # --------------------------------------------------------------------------- #
 # Singleton                                                                  #

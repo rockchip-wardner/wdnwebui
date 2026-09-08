@@ -563,6 +563,12 @@ const AudioAnalysis = {
       if (!r.ok) return;
       const snap = await r.json();
       setVdAudioMeta(snap);
+      // 模型下拉框:running 实例可能刚加载完,重试拉一次。
+      const audioModelEl = document.getElementById("vd-audio-model-pick");
+      if (audioModelEl && audioModelEl.disabled) {
+        loadModelPick("vd-audio-model-pick",
+                      "swcap_audio_understand", "vd.audio.model_id");
+      }
       return snap;
     } catch (_) { return null; }
   },
@@ -587,10 +593,11 @@ const AudioAnalysis = {
     this.events = [];
     this.render();
     try {
+      const model_id = (document.getElementById("vd-audio-model-pick")?.value || "") || null;
       const r = await fetch(API_PREFIX + "/audio-analysis/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source, prompt }),
+        body: JSON.stringify({ source, prompt, model_id }),
       });
       if (!r.ok) {
         const e = await r.json().catch(() => ({}));
@@ -1223,9 +1230,17 @@ async function refreshVdDetector() {
     if (sizeEl && sizeEl.disabled) {
       vdLoadVisionSizes();
     }
+    // 模型下拉框同理:running 实例可能刚加载完 / 刚停掉,定时再拉
+    // 一次保证用户能看到最新的可选实例。
+    const modelEl = document.getElementById("vd-model-pick");
+    if (modelEl && modelEl.disabled) {
+      loadModelPick("vd-model-pick", "swcap_video_describe", "vd.model_id");
+    }
     return data;
   } catch (_) { return null; }
 }
+
+
 
 async function vdDetectorStart() {
   const promptEl  = document.getElementById("vd-prompt");
@@ -1248,6 +1263,7 @@ async function vdDetectorStart() {
     return;
   }
   const enabled_tools = vdCollectEnabledTools();
+  const model_id = (document.getElementById("vd-model-pick")?.value || "") || null;
   try {
     const r = await fetch(API_PREFIX + "/video-detection/prompt", {
       method: "POST",
@@ -1255,6 +1271,7 @@ async function vdDetectorStart() {
       body: JSON.stringify({
         prompt, every_n, enabled_tools,
         image_size: Number.isFinite(image_size) ? image_size : null,
+        model_id: model_id,
       }),
     });
     if (!r.ok) {
@@ -1267,6 +1284,84 @@ async function vdDetectorStart() {
     setVdOverlay("", false);
   } catch (e) {
     setVdOverlay("启动检测失败: " + e.message, true);
+  }
+}
+
+/**
+ * Populate a model-pick ``<select>`` (``#vd-model-pick`` /
+ * ``#vd-audio-model-pick`` / ``#vtd-model-pick``) with running compute
+ * instances exposing ``capability``.
+ *
+ * Data flow:
+ *   - GET /api/compute/instances-by-capability?capability=X returns
+ *     ``{capability, instances: [{model_id, label, source, npu_index,
+ *     pid, memory_estimate_mb}, ...]}`` sorted local-first (mirrors
+ *     ``get_session`` auto-pick semantics).
+ *   - Empty list → dropdown 留 "自动 (本机优先)" 单选项 + 灰色禁用,
+ *     提示用户当前 capability 没有 running 实例。
+ *   - N entries → "自动" + N 实例选项;
+ *     用户保存的选择从 localStorage 读,选中回填。
+ *   - 用户切换下拉框时也写 localStorage,刷新页面后保留。
+ *
+ * 控件语义:
+ *   - option.value="" → 服务端 get_session auto-pick (默认行为)。
+ *   - option.value=model_id → 服务端 get_session_for_model 锁定。
+ */
+async function loadModelPick(selId, capability, storageKey) {
+  const sel = document.getElementById(selId);
+  if (!sel) return;
+  let data = { instances: [] };
+  try {
+    const url = `${API_PREFIX}/compute/instances-by-capability`
+              + `?capability=${encodeURIComponent(capability)}`;
+    const r = await fetch(url, { cache: "no-store" });
+    if (r.ok) data = await r.json();
+  } catch (_) { /* best-effort */ }
+  const insts = Array.isArray(data.instances) ? data.instances : [];
+
+  // 重置 dropdown,保留 placeholder 元素("自动" 那条 option 由 HTML
+  // 静态给出,这里只 append 真正可用的实例)。
+  sel.innerHTML = "";
+  const autoOpt = document.createElement("option");
+  autoOpt.value = "";
+  autoOpt.textContent = "自动 (本机优先)";
+  sel.appendChild(autoOpt);
+
+  let savedVal = "";
+  try {
+    savedVal = window.localStorage?.getItem(storageKey) || "";
+  } catch (_) { /* localStorage may be blocked */ }
+
+  for (const inst of insts) {
+    const opt = document.createElement("option");
+    opt.value = inst.model_id || "";
+    // source: spawned/adopted_local 显示 "本机",
+    //         adopted (LAN peer) 显示 "远端"
+    const srcText = (inst.source === "spawned"
+                  || inst.source === "adopted_local") ? "本机" : "远端";
+    const npuText = (typeof inst.npu_index === "number"
+                  && inst.npu_index >= 0) ? `NPU${inst.npu_index}` : "NPU?";
+    opt.textContent = `${inst.label || inst.model_id} · ${srcText} · ${npuText}`;
+    sel.appendChild(opt);
+  }
+
+  // 选择回填:优先 localStorage;如果保存的 model_id 现在不在列表里
+  // (用户刚刚停了对应实例),回退到 "自动"。
+  let chosen = "";
+  if (savedVal && Array.from(sel.options).some((o) => o.value === savedVal)) {
+    chosen = savedVal;
+  }
+  sel.value = chosen || "";
+
+  // 启用 /禁用取决于是否有 running 实例。"自动" 永远可选 (auto-pick
+  // 失败时由后端 RuntimeError → 503 透传)。
+  sel.disabled = insts.length === 0;
+  sel.onchange = () => {
+    try { window.localStorage?.setItem(storageKey, sel.value || ""); }
+    catch (_) { /* best-effort */ }
+  };
+  if (insts.length === 0) {
+    autoOpt.textContent = "自动 (本机优先 · 无可用实例)";
   }
 }
 
@@ -1460,6 +1555,9 @@ function initVideoDetection() {
   // 客户端硬编码 384/768 列表；大小由 qwen3-vl-4b 实例的 worker
   // info RPC 动态返回。
   vdLoadVisionSizes();
+  // 模型选择下拉框（音视频描述 + 音频理解都走这里）
+  loadModelPick("vd-model-pick", "swcap_video_describe", "vd.model_id");
+  loadModelPick("vd-audio-model-pick", "swcap_audio_understand", "vd.audio.model_id");
 
   const sourceEl = document.getElementById("vd-source");
   const loopEl   = document.getElementById("vd-loop");
@@ -1729,6 +1827,12 @@ async function vtdStatus() {
   if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
   const payload = document.getElementById("data-video-target-detection");
   if (payload) payload.textContent = JSON.stringify(snap, null, 2);
+  // 模型下拉框:running 实例可能刚加载完,重试拉一次。
+  const modelEl = document.getElementById("vtd-model-pick");
+  if (modelEl && modelEl.disabled) {
+    loadModelPick("vtd-model-pick",
+                  "swcap_video_describe", "vtd.model_id");
+  }
   return snap;
 }
 async function vtdClose() {
@@ -1921,12 +2025,14 @@ async function vtdDetectorStart() {
     return;
   }
   try {
+    const model_id = (document.getElementById("vtd-model-pick")?.value || "") || null;
     const r = await fetch(API_PREFIX + "/video-target-detection/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         prompt, every_n,
         image_size: Number.isFinite(image_size) ? image_size : null,
+        model_id: model_id,
       }),
     });
     if (!r.ok) {
@@ -2025,6 +2131,8 @@ function initVideoTargetDetection() {
   // 客户端硬编码 384/768 列表；大小由 qwen3-vl-4b 实例的 worker
   // info RPC 动态返回。
   vtdLoadVisionSizes();
+  // 模型选择下拉框
+  loadModelPick("vtd-model-pick", "swcap_video_describe", "vtd.model_id");
 
   const sourceEl = document.getElementById("vtd-source");
   const loopEl   = document.getElementById("vtd-loop");

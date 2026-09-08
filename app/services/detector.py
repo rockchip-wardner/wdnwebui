@@ -833,6 +833,12 @@ class WdnaiDetector:
         self._diag_lock = threading.Lock()
         # watchdog: _worker_loop 上一次产出事件的时间戳。
         self._last_event_ts: float = 0.0
+        # 选中的 swcap_video_describe 实例 model_id。
+        # ``""`` (空) = auto-pick (跟 ``get_session`` 一致的本机优先规则)。
+        # ``start(model_id=...)`` 时填入；``_infer_sync`` 每次拿 session
+        # 都按这个值走,允许用户在不重启 worker 的前提下切换底层实例
+        # (例如两个 qwen3-vl-4b 不同 NPU,或本机 vs LAN peer)。
+        self._chosen_model_id: str = ""
 
 
     # ------------------------------------------------------------------ #
@@ -902,16 +908,39 @@ class WdnaiDetector:
                 # 调用的 ``image_size``）。None 表示 auto-pick by
                 # image resolution（legacy behaviour preserved）。
                 "image_size":             self._image_size,
+                # 当前选定的 model_id ("", "qwen3-vl-4b", "qwen3-5-vl-4b"...)。
+                # 空字符串 = auto-pick,前端用此判定下拉框是否用户自定义过。
+                "model_id":               self._chosen_model_id,
             }
 
     # ------------------------------------------------------------------ #
     def start(self, prompt: str, every_n: int = 30,
               enabled_tools: Optional[List[str]] = None,
-              image_size: Optional[int] = None) -> dict:
+              image_size: Optional[int] = None,
+              model_id: Optional[str] = None) -> dict:
         if not self.available:
             raise RuntimeError("wdnai 不可用")
         if not (prompt or "").strip():
             raise ValueError("prompt 不能为空")
+        # model_id：用户从下拉框选的 swcap_video_describe 实例。
+        # ``None``（默认）→ 走 ``get_session`` 的本机优先 auto-pick，
+        # 与旧行为一致。显式传入时校验该实例正在 running + 暴露
+        # ``swcap_video_describe`` + 给出对应的 RpcSessionProxy，失败
+        # 抛 RuntimeError 让 HTTP 层 503 透传。
+        from app.services.compute_registry import get_registry
+        registry = get_registry()
+        if model_id is not None:
+            if not isinstance(model_id, str) or not model_id.strip():
+                raise ValueError(f"model_id 必须是字符串或 None: {model_id!r}")
+            try:
+                registry.get_session_for_model("swcap_video_describe", model_id)
+            except RuntimeError:
+                raise
+            # 记录选中的 model_id，``_infer_sync`` 取 proxy 时再次校验
+            # (防止用户在 running 列表变化时仍用旧选择 → 服务层兜底)。
+            chosen_model_id = model_id.strip()
+        else:
+            chosen_model_id = ""
         # image_size 校验：必须是 qwen3-vl-4b 实例实际加载的某个
         # vision 变体尺寸。``None`` 表示"按图自动选"（legacy 行
         # 为）。Backend 的 ``_pick_variant(image_size=...)`` 在不匹
@@ -933,6 +962,12 @@ class WdnaiDetector:
                 for inst in registry.list_with_source():
                     caps = inst.get("capability_types") or []
                     if "swcap_video_describe" not in caps:
+                        continue
+                    # 用户选过 model_id 时,只对那个实例校验;
+                    # 否则取任意 swcap_video_describe running 实例
+                    # (auto-pick 与 get_session 一致)。
+                    if (chosen_model_id
+                            and inst.get("model_id") != chosen_model_id):
                         continue
                     raw = inst.get("available_image_sizes") or []
                     if isinstance(raw, list):
@@ -1004,6 +1039,7 @@ class WdnaiDetector:
             self._every_n = max(1, int(every_n))
             self._enabled_tools = tool_keys
             self._image_size = image_size  # None → backend auto-pick
+            self._chosen_model_id = chosen_model_id
             self._frame_count = 0
         if self._worker is None or not self._worker.is_alive():
             self._stop_event.clear()
@@ -1146,7 +1182,12 @@ class WdnaiDetector:
         _t0_infer = time.monotonic()
         try:
             from app.services.compute_registry import get_registry
-            sess = get_registry().get_session("swcap_video_describe")
+            _registry = get_registry()
+            if self._chosen_model_id:
+                sess = _registry.get_session_for_model(
+                    "swcap_video_describe", self._chosen_model_id)
+            else:
+                sess = _registry.get_session("swcap_video_describe")
         except RuntimeError as e:
             LOG.warning(
                 "frame infer: capability disabled (swcap_video_describe): %s",

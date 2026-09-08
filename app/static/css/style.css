@@ -1155,6 +1155,30 @@ html, body {
   text-align: right;
 }
 
+/* 模型选择下拉框 — 三个消费者页面 (音视频描述 / 视频目标检测 /
+   音频理解) 共享同一控件:从 GET /api/compute/instances-by-capability
+   拉 running 实例列表填充;空值 "自动" 走服务端 auto-pick。 */
+.vd-model-pick-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 0.4rem;
+}
+.vd-model-pick {
+  flex: 1;
+  max-width: 16rem;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  background: #fff;
+}
+.vd-model-pick:disabled {
+  background: #f3f4f6;
+  color: #9ca3af;
+  cursor: not-allowed;
+}
+
 .vd-event-list {
   list-style: none;
   margin: 0;

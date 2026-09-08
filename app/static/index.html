@@ -642,6 +642,14 @@
                   <span class="surv-hint" id="vd-detector-status">未启动</span>
                 </header>
                 <div class="surv-field">
+                  <div class="vd-model-pick-row">
+                    <label class="vd-detector-label">模型
+                      <select id="vd-model-pick" class="surv-input vd-model-pick"
+                              data-capability="swcap_video_describe">
+                        <option value="">自动 (本机优先)</option>
+                      </select>
+                    </label>
+                  </div>
                   <textarea id="vd-prompt" class="surv-input surv-textarea"
                             placeholder="例如：检测画面中是否有人进入，或描述图中发生的事件"></textarea>
                   <div class="vd-detector-row">
@@ -680,6 +688,14 @@
                 <div class="surv-field">
                   <div class="vd-audio-hint">
                     当前视频源：<code id="vd-audio-source">—</code>
+                  </div>
+                  <div class="vd-model-pick-row">
+                    <label class="vd-detector-label">模型
+                      <select id="vd-audio-model-pick" class="surv-input vd-model-pick"
+                              data-capability="swcap_audio_understand">
+                        <option value="">自动 (本机优先)</option>
+                      </select>
+                    </label>
                   </div>
                   <textarea id="vd-audio-prompt" class="surv-input surv-textarea"
                             placeholder="例：请转写这段音频里的人在说什么 / 描述音频中的环境音"></textarea>
@@ -796,6 +812,14 @@
                   <span class="surv-hint" id="vtd-detector-status">未启动</span>
                 </header>
                 <div class="surv-field">
+                  <div class="vd-model-pick-row">
+                    <label class="vd-detector-label">模型
+                      <select id="vtd-model-pick" class="surv-input vd-model-pick"
+                              data-capability="swcap_video_describe">
+                        <option value="">自动 (本机优先)</option>
+                      </select>
+                    </label>
+                  </div>
                   <textarea id="vtd-prompt" class="surv-input surv-textarea"
                             placeholder="例如：描述画面中需要标注的目标位置，直接返回 0–1000 归一化 ROI 坐标 x1,y1,x2,y2 和该 ROI 内的描述文本"></textarea>
                   <div class="vd-detector-row">

@@ -69,11 +69,13 @@ async def get_prompt() -> dict:
 async def set_prompt(payload: dict) -> dict:
     """Start (or update) target-detection.
 
-    Body: ``{prompt: str, every_n: int, image_size: int | None}``
+    Body: ``{prompt: str, every_n: int, image_size: int | None,
+             model_id: str | None}``
     — ``prompt`` 必填；``image_size`` 可选，指定视觉模型目标尺寸
     （必须由 ``/api/video-detection/available-vision-sizes`` 返回的
     合法值之一；缺省 / ``None`` = 按帧自动选最近的变体，保留 legacy
-    行为）。
+    行为）；``model_id`` 可选，前端下拉框选中的 ``swcap_video_describe``
+    实例 id（不传 / 空 = auto-pick）。
 
     旧版 ``enabled_tools`` 字段不再生效 —— 该页只走 ``TargetDoc``
     结构化输出，不再挂任何 ``@Callable`` 工具。仍接受该字段以便
@@ -103,11 +105,23 @@ async def set_prompt(payload: dict) -> dict:
         )
     else:
         image_size = raw_image_size
+    # model_id：前端下拉框选中值；None 或 "" 走 auto-pick。
+    raw_model_id = payload.get("model_id", None)
+    if raw_model_id is None or (isinstance(raw_model_id, str)
+                                and not raw_model_id.strip()):
+        model_id: str | None = None
+    elif not isinstance(raw_model_id, str):
+        raise HTTPException(
+            status_code=400,
+            detail=f"model_id 必须是字符串或 null: {raw_model_id!r}",
+        )
+    else:
+        model_id = raw_model_id
     try:
         # enabled_tools 显式置 [] — 该页不再挂工具。
         return get_target_detector().start(
             prompt, every_n=every_n, enabled_tools=[],
-            image_size=image_size,
+            image_size=image_size, model_id=model_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

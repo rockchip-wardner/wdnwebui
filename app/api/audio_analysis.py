@@ -26,6 +26,11 @@ router = APIRouter(tags=["audio-analysis"])
 class StartPayload(BaseModel):
     source: str = Field(..., min_length=1, description="视频文件绝对路径")
     prompt: str = Field(..., min_length=1, description="音频理解提示词")
+    model_id: str | None = Field(
+        default=None,
+        description=("可选,从下拉框选的 swcap_audio_understand 实例 id;"
+                     " 不传/空 = auto-pick (本机优先,旧行为)"),
+    )
 
 
 @router.get("/audio-analysis")
@@ -45,7 +50,10 @@ async def list_audio_analysis_events() -> dict:
 @router.post("/audio-analysis/start")
 async def start_audio_analysis(payload: StartPayload) -> dict:
     try:
-        return get_service().start(payload.source, payload.prompt)
+        return get_service().start(
+            payload.source, payload.prompt,
+            model_id=payload.model_id,
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
