@@ -1094,6 +1094,13 @@ FINAL_MAX_NEW_TOKENS           = 280     # pass 2 最终综述硬控输出（v0.
 # 不留余量让真卡死的 SDK 立即报错而不是 hang 几分钟才被发现。
 _INFER_TIMEOUT_SEC             = 5.0
 
+# 慢路径 per-call timeout 上限（秒）。per-frame 走默认 5s 守住
+# "快速发现 hang"；以下三条已知耗时 > 5s，调用方显式传对应上限避免
+# 被 5s 默认误杀并触发 worker 重启（每个被误杀 = 30s init 成本）。
+RESCUE_TIMEOUT_SEC            = 30.0  # rescue batch LLM（5000 char + ≤2000 token）
+CHUNK_TIMEOUT_SEC             = 30.0  # chunk 小结（CHUNK_SUMMARY_PROMPT 模板 + N 行）
+FINAL_SUMMARY_TIMEOUT_SEC     = 60.0  # Apollo 最终综述（10 chunk × 120 字 ≈ 2500 字 prompt，RK3588 实测 ~25-30s）
+
 # Chunk-level rescue 在早期实现里嵌在 _infer_one（每 30 events 同步跑一次
 # batch LLM 兜底）。问题：worker 线程被 rescue 阻塞，且 30 events × 500 字符
 # 的 prompt 已经接近 8192 token 窗口上限，RKNN3 偶发 abort / hang；中途失败
@@ -2175,6 +2182,7 @@ class VideoFileAnalysisService:
                 raw = self._call_llm(
                     prompt, None,
                     max_new_tokens=min(2000, 80 * len(batch) + 200),
+                    timeout_sec=RESCUE_TIMEOUT_SEC,
                 )
             except Exception as e:
                 LOG.warning(
@@ -2350,7 +2358,8 @@ class VideoFileAnalysisService:
                     last_frame=chunk[-1][0],
                     lines=lines,
                 )
-                text = self._call_llm(prompt, None, max_new_tokens=CHUNK_MAX_NEW_TOKENS)
+                text = self._call_llm(prompt, None, max_new_tokens=CHUNK_MAX_NEW_TOKENS,
+                                   timeout_sec=CHUNK_TIMEOUT_SEC)
                 if not text or text.startswith("("):
                     LOG.warning(
                         "vfa: chunk %d/%d summary failed: %s",
@@ -2387,6 +2396,7 @@ class VideoFileAnalysisService:
                 )
                 summary = self._call_llm(
                     final_prompt, None, max_new_tokens=FINAL_MAX_NEW_TOKENS,
+                    timeout_sec=FINAL_SUMMARY_TIMEOUT_SEC,
                 )
                 if not summary or summary.startswith("("):
                     LOG.warning(
@@ -2565,7 +2575,8 @@ class VideoFileAnalysisService:
 
     def _call_llm(self, prompt: str, frame_bgr, *,
                   max_new_tokens: Optional[int] = None,
-                  generating=None) -> Any:
+                  generating=None,
+                  timeout_sec: Optional[float] = None) -> Any:
         """调 LLMSession。
 
         ``max_new_tokens`` 透传给 rknn3 session_run（通过 ``**overrides``），
@@ -2683,14 +2694,16 @@ class VideoFileAnalysisService:
                 # 重要：在线程隔离的新 event loop 里跑 SDK coroutine。
                 # 用 `asyncio.run` 在 worker thread 里偶发死锁（与 main loop
                 # 共享 thread 池资源），改用独立 Thread + new_event_loop。
-                # 加 _INFER_TIMEOUT_SEC timeout 防 SDK 永久 hang（rknn3lite
-                # 偶发 bug 或 NPU 满载时会等无穷）。
+                # 加 timeout 防 SDK 永久 hang（rknn3lite 偶发 bug 或
+                # NPU 满载时会等无穷）。
                 #
-                # v0.10：30s → 60s。Apollo 三段式综述最后一步（final summary）
-                # 把所有 chunk 小结拼起来再调一次 LLM：1829-frame 视频通常 10
-                # 个 chunk，每段 ≤120 字 + 模板 ≈ 2500 字 prompt + 400
-                # 新 token 输出。RK3588 qwen3-vl-4b 实测这一调用 ~25-30s，
-                # 30s 阈值被贴着边缘，任何 prompt 略长或 NPU 短暂忙就破。
+                # 默认 5s（per-frame 设计意图：健康推理单帧稳态 < 5s，超
+                # 出必有异常，连续 ≥2 次触发 worker 重启清 wedged C 层）。
+                # 已知的慢路径（chunk/final summary、rescue batch）由调用方
+                # 显式传 timeout_sec=30s/60s，不走 5s 默认。
+                _eff_timeout = float(
+                    timeout_sec if timeout_sec is not None else _INFER_TIMEOUT_SEC
+                )
                 result_holder = [None]
                 error_holder = [None]
                 finished = [False]
@@ -2699,7 +2712,7 @@ class VideoFileAnalysisService:
                     loop = asyncio.new_event_loop()
                     try:
                         result_holder[0] = loop.run_until_complete(
-                            asyncio.wait_for(coro, timeout=_INFER_TIMEOUT_SEC)
+                            asyncio.wait_for(coro, timeout=_eff_timeout)
                         )
                     except asyncio.TimeoutError:
                         error_holder[0] = "timeout"
@@ -2715,19 +2728,19 @@ class VideoFileAnalysisService:
                 t = threading.Thread(target=_runner, daemon=True)
                 t.start()
                 # join 与 asyncio.wait_for 同一上限,不额外留余量。
-                t.join(timeout=_INFER_TIMEOUT_SEC)
+                t.join(timeout=_eff_timeout)
 
                 # 防呆：超时/异常路径返回安全的 error string 而非 None
                 # （下游 text.startswith("(") 会 NoneType 崩溃）
                 if not finished[0]:
                     LOG.warning("vfa: _call_llm thread %.0fs 内未完成（SDK 卡死）",
-                                _INFER_TIMEOUT_SEC)
+                                _eff_timeout)
                     _interrupt_rknn_session(sess, wait_sec=5.0)
                     self._on_call_timeout()
-                    return f"(推理失败：超时 {_INFER_TIMEOUT_SEC:.0f}s SDK 未响应)"
+                    return f"(推理失败：超时 {_eff_timeout:.0f}s SDK 未响应)"
                 if error_holder[0] == "timeout":
                     LOG.warning("vfa: LLM 推理超时（%.0fs），可能 NPU 满载或 prompt 过长",
-                                _INFER_TIMEOUT_SEC)
+                                _eff_timeout)
                     # 关键：asyncio.wait_for 只取消 Python 协程，C 层
                     # rknn3.session_run() 还在 NPU 上跑（无人在等它返回）。
                     # 不显式 session_stop() + 等待，下次 sess.reset() → clear_kvcache()
@@ -2740,7 +2753,7 @@ class VideoFileAnalysisService:
                     # 处理 stop 信号并实际让出 NPU mutex，下次 reset() 不阻塞。
                     _interrupt_rknn_session(sess, wait_sec=5.0)
                     self._on_call_timeout()
-                    return f"(推理超时：{_INFER_TIMEOUT_SEC:.0f}s 内 LLM 未响应)"
+                    return f"(推理超时：{_eff_timeout:.0f}s 内 LLM 未响应)"
                 if error_holder[0] is not None:
                     # 关键：不要 raise！否则 _run_summary 异常退出，
                     # state 卡在 STATE_RUNNING，前端永远显"分析中"。
