@@ -41,9 +41,68 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Optional, Tuple
 
 LOG = logging.getLogger("compute_worker")
+
+
+# --------------------------------------------------------------------------- #
+# Response-side /dev/shm path-list (mirror of main's _bgr_ndarray_to_path)
+# --------------------------------------------------------------------------- #
+# ComputeReply IDL has 11 unbounded string fields, each capped at the
+# FastCDR default 255-byte assumption (ComputeReply_max_cdr_typesize =
+# 2653 bytes total). Stuffing ``{"structured": ..., "result_data": ...,
+# "crop_b64": "<50KB base64>"}`` into the single ``text`` field would
+# silently truncate when desc/crop grew, breaking JSON parse downstream
+# ("malformed reply: '...{...一辆停'" — text cut mid-Chinese-character).
+#
+# Fix: route heavy payloads through /dev/shm path-list, just like the
+# request side does for BGR ndarray attachments (``data_path``/``shape``/
+# ``dtype``). The wire only carries a ~50-byte path string per payload,
+# keeping the entire reply dict inside the 255-byte IDL field cap. The
+# main process reads the file (in ``RpcSessionProxy._sync_call``) and
+# inlines the result back into the ``_ProxyResult`` so the rest of the
+# detector / VFA code path stays unchanged.
+_REPLY_SHM_DIR = "/dev/shm"
+_REPLY_SHM_PREFIX = "wdnwebui_cr_"  # cr = compute reply (crop / result_data)
+
+
+def _write_reply_payload_to_shm(payload: bytes, suffix: str) -> Optional[str]:
+    # Failure → caller drops the field rather than crashing the worker.
+    try:
+        os.makedirs(_REPLY_SHM_DIR, exist_ok=True)
+    except OSError:
+        return None
+    name = f"{_REPLY_SHM_PREFIX}{uuid.uuid4().hex}.{suffix}"
+    path = os.path.join(_REPLY_SHM_DIR, name)
+    try:
+        with open(path, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        LOG.warning("reply shm write failed for %s: %s", suffix, e)
+        return None
+    return path
+
+
+def _write_crop_b64_to_shm(b64_str: str) -> Optional[str]:
+    import base64 as _b64
+    try:
+        raw = _b64.b64decode(b64_str)
+    except Exception:
+        return None
+    return _write_reply_payload_to_shm(raw, "jpg")
+
+
+def _write_result_data_to_shm(result_data: dict) -> Optional[str]:
+    import json as _json
+    try:
+        encoded = _json.dumps(result_data, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return _write_reply_payload_to_shm(encoded, "json")
 
 
 # Orphan-worker SIGPIPE pre-arm. compute_worker is spawned with
@@ -1437,68 +1496,118 @@ def infer_handler(state: dict, payload: dict) -> dict:
             except Exception as e:  # noqa: BLE001
                 LOG.warning("attachment serialize failed: %s", e)
 
+        # v0.12 修复 ("malformed reply" 视频目标检测截断):
+        # ComputeReply IDL 把整个 reply JSON dict 塞进单 string 字段
+        # ``text``，单字段默认 255 字节上限。TargetDoc/VLMDoc/TTSResult
+        # 的 reply 同时塞了 ``structured`` 和 ``result_data``（两份相同
+        # model_dump），desc 一长就超 255 → FastCDR 静默截断 → 主进程
+        # JSON parse 失败报 "malformed reply: '...{...一辆停'"。
+        # 修法 (a) schema-instance 不再写 ``structured`` —— ``result_data``
+        # 已覆盖；SceneFrame 这种没 ``result_data`` 的才写 ``structured``。
+        # (b) ``crop_b64``（JPEG base64，50 KB+）和超过 200 字节的
+        # ``result_data`` 走 /dev/shm path-list，wire 只传 ~50 字节 path。
+        # 主进程 ``RpcSessionProxy._sync_call`` 读文件后填回 ``crop_b64`` /
+        # ``result_data``，detector / VFA 看到的是原 shape。
         reply = {
             "text": text,
             "level": getattr(result, "level", None),
             "tool_call": tool_call_name if is_tool_instance else getattr(result, "tool_call", None),
             "bbox": getattr(result, "bbox", None),
-            "crop_b64": getattr(result, "crop_b64", None),
         }
-        # v0.10 修复：当 ``generating=SceneFrame`` / TargetDoc 等 pydantic
-        # 类被 SDK 成功解析时，result 是 BaseModel 实例，但其字段（scene /
-        # actors / action / objects / text / note 等）并不在 ``reply`` 里
-        # —— 历史 reply 只搬 text/level/tool_call/bbox/crop_b64，把结构化
-        # 字段全部丢在 worker 边界。主进程 ``_ProxyResult._raw`` 收到这份
-        # 精简 reply，导致 VFA 的 ``_split_scene_frame_result`` 看到空
-        # structured。这里 model_dump 把结构化字段塞进 reply["structured"]，
-        # 主进程 ``rpc_session_proxy`` 那边解析后填进 ``_ProxyResult._raw``，
-        # VFA Path 2 就能拿到完整字段。
-        #
-        # 弹掉 ``attachment``：LMOutput 的 attachment 字段是
-        # ``List[Attachment]``，Attachment 是 plain class（不是
-        # pydantic model）— model_dump 要么把 Attachment 实例原样塞进
-        # dict，要么直接抛 PydanticUserError，两种情况都会让 reply
-        # 无法 JSON 序列化（cshim 在 worker 边界 json.dumps 整个
-        # reply）。audio bytes 已经走 ``attachment_b64`` 单独走线，主进程
-        # proxy 从那里重建 ``_AttachmentProxy``（rpc_session_proxy.py:
-        # 287-299）— pop 掉 result_data.attachment 对 TTS / VLM
-        # 重构无影响。
-        if not is_tool_instance and not isinstance(result, (str, bytes, dict)):
-            try:
-                if hasattr(result, "model_dump") and callable(getattr(result, "model_dump", None)):
-                    _dump = result.model_dump()
-                    if isinstance(_dump, dict) and _dump:
-                        _dump.pop("attachment", None)
-                        if _dump:
-                            reply["structured"] = _dump
-            except Exception as _dump_ex:
-                LOG.warning("model_dump failed: %s", _dump_ex)
+        crop_b64_inline = getattr(result, "crop_b64", None)
+        if crop_b64_inline:
+            crop_path = _write_crop_b64_to_shm(crop_b64_inline)
+            if crop_path:
+                reply["crop_path"] = crop_path
+            else:
+                LOG.warning(
+                    "infer: failed to route crop_b64 via /dev/shm — "
+                    "dropping (%d chars). main process will re-crop "
+                    "from frame_bgr as fallback.",
+                    len(crop_b64_inline),
+                )
         if attachment_b64 is not None:
             reply["attachment_b64"] = attachment_b64
         if is_tool_instance and tool_call_args is not None:
             reply["tool_call_args"] = tool_call_args
+
         # Schema instances (TargetDoc / VLMDoc / TTSResult) — forward the
         # full ``model_dump()`` so the proxy can reconstruct the actual
-        # class. The ``text / level / bbox / crop_b64`` slots above only
-        # cover VLMDoc's surface; for TargetDoc (``x1 / y1 / x2 / y2 /
-        # desc``) every structured field would otherwise be lost at the
-        # worker boundary and the detector's ``isinstance(result,
-        # TargetDoc)`` branch never matches on the main side. Mirrors the
-        # ``tool_call_args`` pattern for ``@Callable`` reconstruction
-        # (see ``_run_tool_side_effect`` docstring). 同上 strip
-        # ``attachment`` 让 reply 可 JSON 序列化。
+        # class. ``text / level / bbox`` slots above only cover VLMDoc's
+        # surface; for TargetDoc (``x1 / y1 / x2 / y2 / desc``) every
+        # structured field would otherwise be lost at the worker boundary
+        # and the detector's ``isinstance(result, TargetDoc)`` branch
+        # never matches on the main side. Mirrors the ``tool_call_args``
+        # pattern for ``@Callable`` reconstruction. strip ``attachment``
+        # so reply stays JSON-serializable.
+        result_data_dict: Optional[dict] = None
         if (not is_tool_instance
                 and type(result).__name__ in {"VLMDoc", "TargetDoc", "TTSResult"}):
             try:
                 _dump = result.model_dump()
                 if isinstance(_dump, dict):
                     _dump.pop("attachment", None)
-                    reply["result_data"] = _dump
+                    result_data_dict = _dump
             except Exception as e:
                 LOG.warning(
                     "schema instance dump failed (%s): %s",
                     type(result).__name__, e,
                 )
+        if result_data_dict is not None:
+            import json as _json_rd
+            try:
+                rd_size = len(_json_rd.dumps(result_data_dict, ensure_ascii=False).encode("utf-8"))
+            except (TypeError, ValueError):
+                rd_size = 0
+            if rd_size > 200:
+                rd_path = _write_result_data_to_shm(result_data_dict)
+                if rd_path:
+                    reply["result_data_path"] = rd_path
+                else:
+                    LOG.warning(
+                        "infer: failed to route result_data via /dev/shm — "
+                        "dropping (%d bytes). TargetDoc reconstruction will "
+                        "fall back to _ProxyResult._raw default fields.",
+                        rd_size,
+                    )
+            else:
+                reply["result_data"] = result_data_dict
+
+        # SceneFrame 等非 schema-instance（VFA 路径）：proxy 端没有对应
+        # model_validate，所以 ``result_data`` 留空；``structured`` 是 VFA
+        # ``_split_scene_frame_result`` Path 2 拿完整字段的唯一来源。
+        structured_dict: Optional[dict] = None
+        if (not is_tool_instance
+                and not isinstance(result, (str, bytes, dict))
+                and result_data_dict is None):
+            try:
+                if hasattr(result, "model_dump") and callable(getattr(result, "model_dump", None)):
+                    _dump = result.model_dump()
+                    if isinstance(_dump, dict) and _dump:
+                        _dump.pop("attachment", None)
+                        if _dump:
+                            structured_dict = _dump
+            except Exception as _dump_ex:
+                LOG.warning("model_dump failed: %s", _dump_ex)
+        if structured_dict is not None:
+            import json as _json_s
+            try:
+                sd_size = len(_json_s.dumps(structured_dict, ensure_ascii=False).encode("utf-8"))
+            except (TypeError, ValueError):
+                sd_size = 0
+            if sd_size > 100:
+                sd_path = _write_result_data_to_shm(structured_dict)
+                if sd_path:
+                    reply["structured_path"] = sd_path
+                else:
+                    LOG.warning(
+                        "infer: failed to route structured via /dev/shm — "
+                        "dropping (%d bytes). VFA Path 2 will see empty "
+                        "_raw.structured.",
+                        sd_size,
+                    )
+            else:
+                reply["structured"] = structured_dict
         # 诊断：reply 即将被 cshim 序列化回主进程。记下 keys / 体积
         # 以区分 "worker 算出来了但 reply 格式坏" vs "cshim 回不去"。
         try:

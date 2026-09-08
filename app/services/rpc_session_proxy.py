@@ -63,6 +63,14 @@ _VD_SHM_DIR = "/dev/shm"
 _VD_SHM_PREFIX = "wdnwebui_vd_"
 
 
+# Response-side shm files (mirror of _VD_SHM_*) — worker writes crop /
+# result_data payloads to ``/dev/shm/wdnwebui_cr_*`` and main process
+# reads + unlinks them inside ``_sync_call``. Same boot/atexit sweep
+# pattern: max_age=1h on import (don't yank files another process may
+# still be reading) + max_age=0 on shutdown (clear all leftovers).
+_REPLY_SHM_PREFIX = "wdnwebui_cr_"
+
+
 # Cleanup hook — if the main process is killed between
 # ``_bgr_ndarray_to_path`` write and the worker's ``np.fromfile`` +
 # ``os.unlink``, the /dev/shm temp file would leak (no other process
@@ -105,12 +113,54 @@ def _sweep_stale_vd_shm(max_age_seconds: float = 3600.0) -> int:
     return n
 
 
+def _sweep_stale_reply_shm(max_age_seconds: float = 3600.0) -> int:
+    """Remove stale ``/dev/shm/wdnwebui_cr_*.{jpg,json}`` files.
+
+    Same pattern as :func:`_sweep_stale_vd_shm` — the worker writes
+    these (crop JPEG bytes, result_data JSON) and the main process
+    reads + unlinks inside ``_sync_call``. A kill between write/read
+    leaves them behind; the boot sweep (1 h max_age) protects against
+    concurrent boot races; the atexit sweep (max_age=0) cleans up at
+    shutdown.
+    """
+    try:
+        import glob as _glob
+        import os as _os
+        import time as _time
+    except ImportError:
+        return 0
+    n = 0
+    now = _time.time()
+    for suffix in ("jpg", "json"):
+        try:
+            for p in _glob.glob(
+                    _os.path.join(_VD_SHM_DIR, f"{_REPLY_SHM_PREFIX}*.{suffix}")):
+                try:
+                    st = _os.stat(p)
+                except OSError:
+                    continue
+                if now - st.st_mtime < max_age_seconds:
+                    continue
+                try:
+                    _os.unlink(p)
+                    n += 1
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    if n:
+        LOG.info("swept %d stale %s files", n, _REPLY_SHM_PREFIX)
+    return n
+
+
 try:
     import atexit as _atexit
     _atexit.register(_sweep_stale_vd_shm, 0.0)
+    _atexit.register(_sweep_stale_reply_shm, 0.0)
 except ImportError:
     pass
 _sweep_stale_vd_shm()  # best-effort sweep on import
+_sweep_stale_reply_shm()  # best-effort sweep on import
 
 
 # Lazy import for cv2 (only used by image-encoding path).
@@ -350,6 +400,106 @@ class _RpcSessionProxy:
             LOG.debug("rpc-proxy[%s]: post-recreate warmup raised %s",
                       self._model_id, e)
         return self._client.call(payload, timeout_ms=timeout_ms)
+
+    def _decode_reply_shm(self, data: dict) -> dict:
+        """Replace ``crop_path`` / ``result_data_path`` with their inlined
+        values read from /dev/shm. Mirrors the request-side
+        ``_bgr_ndarray_to_path`` round trip — the worker writes the heavy
+        payload to tmpfs and ships only the path string; we read the file,
+        in-place replace the reference with the original content, and
+        unlink so the file doesn't accumulate across frames.
+
+        Returns the (mutated) ``data`` dict for chaining. If neither path
+        is present, returns ``data`` unchanged.
+        """
+        crop_path = data.get("crop_path")
+        if isinstance(crop_path, str) and crop_path:
+            try:
+                with open(crop_path, "rb") as f:
+                    raw_bytes = f.read()
+                import base64 as _b64
+                data["crop_b64"] = _b64.b64encode(raw_bytes).decode("ascii")
+            except FileNotFoundError:
+                LOG.warning(
+                    "rpc-proxy[%s]: crop_path %s missing (worker may "
+                    "have crashed between write and reply) — falling "
+                    "back to None, detector will re-crop from frame_bgr",
+                    self._model_id, crop_path,
+                )
+            except OSError as e:
+                LOG.warning(
+                    "rpc-proxy[%s]: crop_path %s read failed: %s",
+                    self._model_id, crop_path, e,
+                )
+            finally:
+                try:
+                    import os as _os_cr
+                    _os_cr.unlink(crop_path)
+                except OSError:
+                    pass
+            data.pop("crop_path", None)
+
+        result_data_path = data.get("result_data_path")
+        if isinstance(result_data_path, str) and result_data_path:
+            try:
+                with open(result_data_path, "rb") as f:
+                    raw_bytes = f.read()
+                import json as _json_rd
+                parsed = _json_rd.loads(raw_bytes.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    data["result_data"] = parsed
+            except FileNotFoundError:
+                LOG.warning(
+                    "rpc-proxy[%s]: result_data_path %s missing — "
+                    "TargetDoc/VLMDoc reconstruction will fall back "
+                    "to _ProxyResult defaults",
+                    self._model_id, result_data_path,
+                )
+            except (OSError, ValueError) as e:
+                LOG.warning(
+                    "rpc-proxy[%s]: result_data_path %s read failed: %s",
+                    self._model_id, result_data_path, e,
+                )
+            finally:
+                try:
+                    import os as _os_rd
+                    _os_rd.unlink(result_data_path)
+                except OSError:
+                    pass
+            data.pop("result_data_path", None)
+
+        # Same path-list pattern for SceneFrame's ``structured`` payload
+        # (VFA's `_split_scene_frame_result` reads `_raw["structured"]`
+        # in Path 2). Worker routes through /dev/shm when JSON > 100 B.
+        structured_path = data.get("structured_path")
+        if isinstance(structured_path, str) and structured_path:
+            try:
+                with open(structured_path, "rb") as f:
+                    raw_bytes = f.read()
+                import json as _json_s
+                parsed = _json_s.loads(raw_bytes.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    data["structured"] = parsed
+            except FileNotFoundError:
+                LOG.warning(
+                    "rpc-proxy[%s]: structured_path %s missing — "
+                    "VFA Path 2 will see empty _raw.structured",
+                    self._model_id, structured_path,
+                )
+            except (OSError, ValueError) as e:
+                LOG.warning(
+                    "rpc-proxy[%s]: structured_path %s read failed: %s",
+                    self._model_id, structured_path, e,
+                )
+            finally:
+                try:
+                    import os as _os_s
+                    _os_s.unlink(structured_path)
+                except OSError:
+                    pass
+            data.pop("structured_path", None)
+
+        return data
 
     # chat_poll resilience budget.
     #
@@ -658,6 +808,12 @@ class _RpcSessionProxy:
             raise RuntimeError(
                 f"compute_worker[{self._model_id}] infer failed: {biz_err}")
         data = reply.get("data") or {}
+        # v0.12 修复：worker 把 heavy payload（crop JPEG / result_data JSON）
+        # 写到 /dev/shm 并把 path + size 走 wire 顶替内联 base64 / 大 JSON，
+        # 避免 ComputeReply 单 string 字段 255 字节上限触发 FastCDR 截断。
+        # 这里把 ``crop_path`` / ``result_data_path`` 还原成原来的内联形式，
+        # 后续 detector / VFA 代码看到的还是 ``crop_b64`` / ``result_data``。
+        data = self._decode_reply_shm(data)
         # 诊断：worker 已经把 reply 发回主进程，记录 data 的 keys / 体积
         # 区分 "worker 算出但 reply 格式坏" vs "正常 reply"
         try:
