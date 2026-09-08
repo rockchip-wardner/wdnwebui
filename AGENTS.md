@@ -55,6 +55,20 @@ creation); everything below is verified against the current tree.
    的承诺。若可靠性要求更高，需要服务端按 session TTL / 心跳
    自动回收 —— 不在本期范围。
 
+## 修改守则
+
+改动某个功能的时候，不影响其它功能；如果需要改动到公共功能，需要自动
+跑真实测试每个关联的功能项是否都正常。
+
+- 改动只触及目标功能及其直接依赖，不顺手 refactor 无关代码。
+- 公共功能改动（`app/services/compute_registry.py`、LLM 会话栈、
+  `app/services/detector.py` / `video_session.py` / `surveillance.py`
+  等共享 service、`wdndds` cshim、`wdnai._librknn` shim 等被多个
+  调用方共享的模块）必须跑所有关联功能的真实测试（不止单元测试），
+  不允许"测试跳过"或"代码改对了就行"。
+- 失败 → 修到全通过再交；提交前在 PR/commit message 列出跑了哪些
+  feature 的 smoke test + 结果。
+
 ## 算力注册中心 — per-model-subprocess RPC (v0.4)
 
 v0.4 重大重构：每个 (npu_index, model_id) 实例现在跑在**独立
