@@ -8,6 +8,7 @@ lazy — the wdnav/AGENTS.md gotcha about non-Rockchip dev boxes still applies
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -20,6 +21,9 @@ try:
     from wdnav import VideoCapture as _WdnavVideoCapture
 except Exception:  # pragma: no cover - platform-specific load failure
     _WdnavVideoCapture = None
+
+
+LOG = logging.getLogger("video_session")
 
 
 class VideoSession:
@@ -439,12 +443,20 @@ class VideoSession:
                 is_live = self._is_live
             # Per-frame sinks get the raw BGR. Sinks must not raise —
             # a misbehaving one shouldn't take down the decode loop.
+            # 诊断 (v0.13): sink 抛错不再静默吞,LOG.warning 记录 (sink
+            # 是 lambda 包 detector.submit_frame,理论上不会抛错;但
+            # 一旦抛错会导致 detector 永远拿不到帧,warning 让上游能
+            # 立即察觉)。
             sinks = self._current_sinks()
             for sink in sinks:
                 try:
                     sink(frame, cur_frame_pos)
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning(
+                        "video_session: frame sink raised (frame_pos=%d): "
+                        "%s: %s — sink will be skipped this frame",
+                        cur_frame_pos, type(e).__name__, e,
+                    )
             # Drop oldest on overflow — favor low latency over completeness.
             try:
                 self._frame_queue.put_nowait(jpg)

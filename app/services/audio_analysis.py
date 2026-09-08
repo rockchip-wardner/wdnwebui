@@ -382,6 +382,20 @@ class AudioAnalysisService:
             )
 
         result = result_holder[0]
+        # 诊断：probe 多代理返回类型分支。AudioAnalysis 是纯文本输出，
+        # 没有 schema / tool 概念，理论上只可能是 str / _ProxyResult /
+        # LMOutput 之一。如果 result 是 None / 异常类型 / BaseModel
+        # 子类，可能是 proxy 端 `_sync_call` 的 ``_worker_business_error``
+        # 抛错路径漏掉、或者 SDK 走的 raw text fallback 之外的小概率
+        # 路径。
+        LOG.info(
+            "audio chunk %d: post-respond result_type=%s "
+            "has_text_attr=%s repr_len=%d",
+            idx,
+            type(result).__name__,
+            isinstance(getattr(result, "text", None), str),
+            len(repr(result)) if result is not None else -1,
+        )
         # 兼容三种返回：str / _ProxyResult / LMOutput。先取 .text，None
         # 时回退到 str(result)（_ProxyResult.__str__ 也走 self.text）。
         text_attr = getattr(result, "text", None)

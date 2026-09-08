@@ -419,6 +419,30 @@ async def clear_events() -> dict:
 
 
 # --------------------------------------------------------------------- #
+# 诊断端点 (v0.13): 暴露最近 N 次推理的诊断 trace                          #
+# --------------------------------------------------------------------- #
+# 与 ``/api/video-target-detection/diagnostics`` 同源,指向音视频描述页
+# 的 detector 单例 (VLMDoc + tts_alert 工具)。
+@router.get("/video-detection/diagnostics")
+async def get_diagnostics() -> dict:
+    """Dump the detector's recent inference diagnostics ring buffer.
+
+    字段约定见 ``app/services/detector.py`` ``WdnaiDetector.__init__``
+    里 ``_diag_history`` 的注释。
+    """
+    det = get_detector()
+    items = det.diag_history()
+    items_reversed = list(reversed(items))
+    return {"count": len(items_reversed), "items": items_reversed}
+
+
+@router.post("/video-detection/diagnostics/clear")
+async def clear_diagnostics() -> dict:
+    get_detector().clear_diagnostics()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------- #
 @router.websocket("/video-detection/ws")
 async def stream_ws(ws: WebSocket) -> None:
     """Push decoded JPEG frames + VLM events to the browser.

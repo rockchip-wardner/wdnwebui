@@ -38,6 +38,7 @@ On boxes without the model files ``start()`` records an error in
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import re
 import threading
@@ -49,6 +50,16 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 from app.services.config import get_config
+
+
+# 诊断 (v0.13): client 端 (detector) 引用 _RpcSessionProxy 的内部 _ProxyResult
+# class 用于 type check —— worker 端 sess.respond() 在 schema 校验失败时
+# 返回 raw text,proxy 把 raw text 塞进 _ProxyResult.text 字段,client 收到后
+# 在应用层 rescue。
+try:
+    from app.services.rpc_session_proxy import _ProxyResult
+except ImportError:  # pragma: no cover
+    _ProxyResult = None  # type: ignore[assignment,misc]
 
 
 # 历史默认（不再使用，简化版见 DEFAULT_*_DESC）：见 _build_vlm_doc_class / _build_target_doc_class 函数体内 inline 字符串
@@ -437,6 +448,100 @@ def _strip_trailing_punct(s: str) -> str:
     return _TRAILING_PUNCT.sub("", s)
 
 
+# 诊断 (v0.13): 应用层 TargetDoc rescue —— worker 是 thin RPC server
+# (只把 client 传的 prompt / generating / tools 透传给 wdnai SDK,不做
+# schema-specific 解析);SDK 在 ValidationError 时返回 raw text;client
+# (本 detector) 负责从 raw text 里抢救结构化数据。
+#
+# wdnai SDK 对没 ``text`` 字段的 schema (TargetDoc) 在 JSON 解析失败时
+# 会 fallback 到 raw text (见 ``session.py:_safe_validate``)。Qwen3.5-VL-4B
+# 在 schema-constrained 模式下经常把 SDK 自动注入的 schema hint 复述为
+# 输出,形如:
+#   {"properties": {"x1": 590, "y1": 478, "x2": 830, "y2": 690, ...},
+#    "required": [...], "title": "TargetDoc", "type": "object"}
+# 这种形态 SDK 解析失败,返回 raw text。本函数从 ``TargetDoc.model_json_schema()``
+# 动态知道 required 字段集,然后尝试在 raw_text 解析出的 dict (顶层或
+# 嵌套 ``properties``) 里找到这些字段,``model_validate`` 成 TargetDoc 实例。
+#
+# 这是**应用层**逻辑,不是 SDK 内部 —— worker 不知道 TargetDoc 这个具体
+# schema,所有 rescue 知识都在调用方 (detector) 这里。
+def _try_rescue_target_doc(raw_text: str, target_doc_cls):
+    """Try to rescue a TargetDoc instance from a raw-text model output.
+
+    输入:模型返回的 raw text + TargetDoc class。
+    输出:TargetDoc 实例 (校验通过) 或 None (无法 rescue)。
+
+    尝试形式 (按优先级):
+      1. 顶层 ``{x1, y1, x2, y2, desc: ...}`` 标准 JSON 实例
+         (理想形态,但 Qwen3.5-VL-4B 经常吐不出这个)
+      2. 嵌套 ``{properties: {x1: ..., y1: ..., ...}, required,
+         title, type}``:模型把 schema 当模板填值 (Qwen3.5 误读
+         SDK 默认 schema_hint 时的常见形态)
+      3. 顶层部分字段 + 缺字段 → 仍尝试 model_validate 让 pydantic
+         用默认值补齐
+
+    失败返回 None,继续走原 VLMDoc fallthrough 路径。
+    """
+    if not raw_text or not isinstance(raw_text, str) or target_doc_cls is None:
+        return None
+    try:
+        s = raw_text.strip()
+        # 去掉 markdown fence (```json ... ```),如果模型意外加了
+        if s.startswith("```"):
+            lines = s.split("\n")
+            cleaned = []
+            in_fence = False
+            for ln in lines:
+                ln_stripped = ln.strip()
+                if ln_stripped.startswith("```"):
+                    in_fence = not in_fence
+                    continue
+                cleaned.append(ln)
+            s = "\n".join(cleaned).strip()
+        # extract_json 优先 (SDK helper,有 fence / 杂字符容忍)
+        data = None
+        try:
+            from wdnai.utils import extract_json as _exj
+            data = _exj(s)
+        except Exception:
+            try:
+                data = json.loads(s)
+            except Exception:
+                return None
+        if not isinstance(data, dict):
+            return None
+        # 从 schema 动态知道 required 字段集 (不强写 x1/y1/x2/y2/desc)
+        try:
+            schema_dict = target_doc_cls.model_json_schema()
+        except Exception:
+            schema_dict = {}
+        required_fields = list(schema_dict.get("required") or [])
+        if not required_fields:
+            return None
+
+        # 形式 1:顶层 dict 含全部 required
+        if all(k in data for k in required_fields):
+            try:
+                return target_doc_cls.model_validate(data)
+            except Exception:
+                pass
+        # 形式 2:properties 嵌套 (Qwen3.5 把 schema 当模板填值)
+        props = data.get("properties")
+        if isinstance(props, dict) and all(k in props for k in required_fields):
+            try:
+                return target_doc_cls.model_validate(props)
+            except Exception:
+                pass
+        # 形式 3:data 顶层有部分字段 (其他用 default)
+        try:
+            return target_doc_cls.model_validate(data)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # 视频目标检测页专用：letterbox 尺寸选择 + bbox 区域裁切 + JPEG 编码 + base64 内嵌
 # --------------------------------------------------------------------------- #
@@ -588,6 +693,14 @@ class WdnaiDetector:
     _ABSOLUTE_MAX_ITERS = 200
     # 默认循环上限（config.jsonc 缺失 / 类型不对 / 负值时使用）。
     _DEFAULT_MAX_ITERS = 5
+    # 诊断 (v0.13): 保留最近 N 次推理的诊断信息 (worker 端 + proxy 端 +
+    # 主进程侧的事件 trace),供 /diagnostics 端点 dump 给用户 / 调试。
+    # 不持久化,只用于"刚刚发生了什么"的现场还原。
+    _DIAG_HISTORY_MAX = 50
+    # watchdog: _worker_loop 连续 N 秒没产出任何事件时 LOG.warning。
+    # 注意 frame source 可能本来就不密集 (every_n=30 + 25fps = 1.2s/帧),
+    # 所以阈值要放得足够宽(默认 120s = 100 帧 @ 30 fps @ every_n=30)。
+    _WATCHDOG_IDLE_SECONDS = 120.0
 
     def __init__(self, *, generating_cls=None) -> None:
         """``generating_cls`` —— 该 detector 实例要传给
@@ -634,6 +747,32 @@ class WdnaiDetector:
         self._stop_event = threading.Event()
         self._broadcaster_lock = threading.Lock()
         self._broadcasters: List[Callable[[dict], None]] = []
+        # 诊断 (v0.13): 最近 N 次推理的诊断 trace, 每条形如:
+        #   {
+        #     "ts":          float,    # wall-clock 时间戳
+        #     "frame_pos":   int,      # 来自 sink 的 frame_pos
+        #     "it_infer_ms": float,    # 单次 _infer_sync 总耗时
+        #     "schema":      str,      # generating_cls.__name__
+        #     "result_type": str,      # worker 端 sess.respond 返回类型
+        #     "text_len":    int,      # 模型输出文本长度 (clean 后)
+        #     "text":        str,      # 完整清洗后文本 (不再截断,便于复盘)
+        #     "exit_reason": str,      # vlm_doc / target_doc / cap_hit / tool_*
+        #     "events":      int,      # 本帧产出事件数
+        #     "bbox":        list|None,
+        #     "crop_w":      int|None,
+        #     "crop_h":      int|None,
+        #     "schema_parse_failed": bool,
+        #     "had_exception": bool,
+        #     "exception_type": str|None,
+        #     "exception_msg":  str|None,
+        #     "raw_text_first": str,   # raw_text 前 500 字符,排查 SDK fallback
+        #   }
+        # ``deque(maxlen=N)`` 自动环形覆盖; ring buffer 让 ``start()`` /
+        # 首次推理前为空,不影响业务逻辑。
+        self._diag_history: deque = deque(maxlen=self._DIAG_HISTORY_MAX)
+        self._diag_lock = threading.Lock()
+        # watchdog: _worker_loop 上一次产出事件的时间戳。
+        self._last_event_ts: float = 0.0
 
 
     # ------------------------------------------------------------------ #
@@ -922,6 +1061,29 @@ class WdnaiDetector:
         （多次工具调用 + 一次 schema 实例），由 ``_worker_loop`` 分配
         连续 id 并依次广播。
         """
+        # 诊断 (v0.13): 入口日志 + diag history 占位 (耗时 / exit_reason /
+        # text / bbox / exception 等 end-of-call 时填充)。frame_pos 由
+        # _worker_loop 调用时再写入,这里拿到的是 -1 占位。
+        _diag_rec: dict = {
+            "ts": time.time(),
+            "frame_pos": -1,
+            "it_infer_ms": 0.0,
+            "schema": getattr(self._generating_cls, "__name__", "?") if self._generating_cls else "?",
+            "result_type": "?",
+            "text_len": 0,
+            "text": "",
+            "exit_reason": "none",
+            "events": 0,
+            "bbox": None,
+            "crop_w": None,
+            "crop_h": None,
+            "schema_parse_failed": False,
+            "had_exception": False,
+            "exception_type": None,
+            "exception_msg": None,
+            "raw_text_first": "",
+        }
+        _t0_infer = time.monotonic()
         try:
             from app.services.compute_registry import get_registry
             sess = get_registry().get_session("swcap_video_describe")
@@ -930,6 +1092,14 @@ class WdnaiDetector:
                 "frame infer: capability disabled (swcap_video_describe): %s",
                 e,
             )
+            _diag_rec.update(
+                it_infer_ms=(time.monotonic() - _t0_infer) * 1000.0,
+                exit_reason="disabled",
+                had_exception=True,
+                exception_type="RuntimeError",
+                exception_msg=str(e),
+            )
+            self._append_diag(_diag_rec)
             return [DetectorEvent(
                 id=-1, frame_pos=-1, ts=time.time(),
                 prompt=prompt, text=f"({e})",
@@ -1046,10 +1216,12 @@ class WdnaiDetector:
                 enabled_tools or "(none)",
                 max_iters_cfg,
                 effective_max,
-                (prompt[:60] + "…") if len(prompt) > 60 else prompt,
+                prompt,  # 完整 prompt, 不再截断,便于复盘
             )
 
             exit_reason = "none"
+            last_result_type: Optional[str] = None
+            last_raw_text: str = ""
             for i in range(effective_max):
                 # attachments: 第一轮只放帧，后续轮追加文本 transcript。
                 attachments = [frame_attachment]
@@ -1088,6 +1260,60 @@ class WdnaiDetector:
                     image_size=target_size,
                 )
                 result = asyncio.run(coro)
+                last_result_type = type(result).__name__
+                # 完整 raw text, 不再截断 —— 排查 SDK fallback 时 [:120]
+                # 看不清是 JSON 半截还是空字符串。Log 端用 LOG.warning
+                # 接收完整字符串。
+                last_raw_text = str(getattr(result, "text", "") or "")
+
+                # 诊断：result 类型是 SDK / proxy 路径的核心信号。任何
+                # "推理 2 次后停"的问题几乎都跟 result 类型与生成
+                # schema / tool 不匹配有关。下面所有分支的 fallback 日志
+                # 都依赖这个 type name。
+                try:
+                    _VLMDocCls = _get_vlm_doc_cls()
+                    _TargetDocCls = _get_target_doc_cls()
+                except Exception:  # noqa: BLE001
+                    _VLMDocCls = _TargetDocCls = None
+                LOG.info(
+                    "frame iter %d: post-respond result_type=%s "
+                    "is_vlm_doc=%s is_target_doc=%s is_tts_alert=%s "
+                    "raw_text_len=%d schema_parse_failed=%s",
+                    i + 1,
+                    type(result).__name__,
+                    _VLMDocCls is not None and isinstance(result, _VLMDocCls),
+                    _TargetDocCls is not None and isinstance(result, _TargetDocCls),
+                    type(result).__name__ == "TtsAlert",
+                    len(last_raw_text),
+                    bool(getattr(result, "schema_parse_failed", False)),
+                )
+
+                # ------------------------------------------------------------------ #
+                # 诊断 (v0.13): 应用层 rescue —— wdnai SDK 的 ``_safe_validate``  #
+                # 对没 ``text`` 字段的 schema (TargetDoc) 在 ValidationError 时返 #
+                # 回 raw text string,主进程拿到 ``_ProxyResult(text=raw_text)`` 而 #
+                # 不是 TargetDoc 实例,Qwen3.5-VL-4B 经常把 SDK 自动注入的   #
+                # schema hint 复述为输出(形如 ``{properties: {x1: 590, ...}, ...")`` #
+                # 这种形态 SDK 解析失败。worker 是 thin RPC server,不应该做     #
+                # schema-specific 解析 —— 由 client (本 detector) 应用层处理。  #
+                # ------------------------------------------------------------------ #
+                # duck-type check:不用 isinstance(_ProxyResult) (RPC 链路细节),
+                # 而是看 result 有 .text 属性 + 不是 TargetDoc 实例。
+                if (TargetDoc is not None
+                        and not isinstance(result, TargetDoc)
+                        and getattr(result, "text", None)
+                        and isinstance(getattr(result, "text", None), str)):
+                    _rescued = _try_rescue_target_doc(
+                        result.text, TargetDoc,
+                    )
+                    if _rescued is not None:
+                        LOG.info(
+                            "frame iter %d: RESCUED TargetDoc from raw "
+                            "text (model output didn't match schema, "
+                            "extracted bbox/desc)",
+                            i + 1,
+                        )
+                        result = _rescued
 
                 # ---- tool branch -------------------------------------------
                 tool_ev, is_fatal = self._run_tool_side_effect(
@@ -1149,13 +1375,58 @@ class WdnaiDetector:
                 att_count = len(getattr(result, "attachment", []) or [])
                 raw_text = str(getattr(result, "text", "") or "")
                 clean_text = _sanitize_event_text(raw_text) or ""
+                # 诊断 (v0.13): worker 端 schema_parse_failed marker 透传
+                # 来了 —— 模型输出没解析成 generating schema,主进程拿
+                # 到的不是 TargetDoc 实例而是 _ProxyResult(raw_text)。
+                # 给事件 text 加 ``[解析失败]`` 前缀,前端历史记录里能直接
+                # 区分"正常 VLM 描述" vs "目标检测 schema 解析失败"。
+                _schema_parse_failed = bool(getattr(result, "schema_parse_failed", False))
+                if _schema_parse_failed:
+                    LOG.error(
+                        "frame iter %d: SCHEMA PARSE FAILED (worker marker) — "
+                        "result_type=%s raw_text=%r",
+                        i + 1, type(result).__name__, raw_text,
+                    )
+                # 诊断：探测"result 不是 generating schema 实例"的隐形
+                # 失败模式 —— 当生成 schema 是 VLMDoc 时，正常情况下
+                # _parse_output 应该返回 VLMDoc 实例；如果不是，要么是
+                # SDK 走了 raw-text fallback (返回 str)，要么是 _ProxyResult
+                # 解析后构造出奇怪的 BaseModel 子类。两种都打 warning 让
+                # 后续复现可定位。
+                try:
+                    _is_schema_inst = (
+                        generating_cls is not None
+                        and isinstance(result, generating_cls)
+                    )
+                except TypeError:
+                    _is_schema_inst = False
+                if generating_cls is not None and not _is_schema_inst:
+                    # 升级到 ERROR: 目标检测页触发 = 用户能看到的"概率性
+                    # 推理失败"事件,但事件 history 里没有任何 bbox/crop,
+                    # 用户无法区分"模型正常输出文字" vs "模型输出没解析"。
+                    LOG.error(
+                        "frame iter %d: result not an instance of %s — "
+                        "actual=%s (full raw_text=%r)",
+                        i + 1,
+                        getattr(generating_cls, "__name__", "?"),
+                        type(result).__name__, raw_text,
+                    )
+                # schema parse 失败时,事件 text 加前缀 (不再仅 LOG.error
+                # 而是写进 history 让用户能复盘)。
+                _history_text = clean_text
+                if _schema_parse_failed and generating_cls is not None:
+                    _schema_name = getattr(generating_cls, "__name__", "?")
+                    _history_text = (
+                        f"[{_schema_name} 解析失败] "
+                        f"{clean_text if clean_text else '(空)'}"
+                    )
                 final_ev = DetectorEvent(
                     id=-1,
                     frame_pos=-1,
                     ts=time.time(),
                     prompt=prompt,
-                    text=clean_text,
-                    level=getattr(result, "level", None),
+                    text=_history_text,
+                    level=getattr(result, "level", None) if not _schema_parse_failed else "error",
                     attachment_count=att_count,
                 )
                 prompt_stripped = (prompt or "").strip()
@@ -1175,19 +1446,42 @@ class WdnaiDetector:
                         "text=%r) — drop event",
                         i + 1,
                         len(clean_text),
-                        clean_text[:80],
+                        clean_text,  # 完整文本, 不再截断
                     )
                 else:
                     events.append(final_ev)
                 LOG.info(
-                    "frame iter %d: VLMDoc level=%s text_len=%d (sanitized %d)",
+                    "frame iter %d: VLMDoc level=%s text_len=%d (sanitized %d) "
+                    "schema_parse_failed=%s",
                     i + 1,
                     final_ev.level,
                     len(raw_text),
                     len(clean_text),
+                    _schema_parse_failed,
                 )
                 exit_reason = "vlm_doc"
                 break
+            else:
+                # Python 没有 do-while/until —— for 循环里所有分支都
+                # break 出来后实际不会到这里。保留 else 仅为安全垫，
+                # 不应被命中。命中说明上面三个 break 都漏了。
+                pass
+
+            # 不应到达这里 —— 上面的 tool / TargetDoc / VLMDoc 三个
+            # 分支里只要有一个匹配都会 break。日志埋点，捕获 SDK 返回
+            # result 类型与任何已知分支都不匹配的"第四态"（例如
+            # _ProxyResult 重构后仍不是 VLMDoc/TargetDoc/工具实例）。
+            # 这是用户报告"推理 2 次后停"的核心可疑路径 —— 若该类
+            # 结果反复出现而 multi-iter 循环命中 cap_hit，可能让上层
+            # 误判"推理停"。
+            LOG.warning(
+                "frame iter ?: result type %s fell through ALL branches "
+                "(not tool / not TargetDoc / not %s) — last_raw_text=%r",
+                last_result_type or "?",
+                getattr(generating_cls, "__name__", "?")
+                if generating_cls else "?",
+                last_raw_text,  # 完整 raw_text, 不再截断
+            )
 
             if exit_reason == "none":
                 exit_reason = (
@@ -1199,21 +1493,88 @@ class WdnaiDetector:
                     effective_max,
                 )
 
+            # 诊断 (v0.13): 填充 diag record 关键字段并写入 ring buffer。
+            _diag_rec.update(
+                it_infer_ms=(time.monotonic() - _t0_infer) * 1000.0,
+                exit_reason=exit_reason,
+                events=len(events),
+            )
+            # 取最近一次 result 的类型 / 文本 (如果有),否则保持 "?"。
+            # last_result_type / last_raw_text 在循环里更新过;events 里
+            # 可能含有 schema_parse_failed 标记的 DetectorEvent。
+            _diag_rec["result_type"] = last_result_type or "?"
+            _diag_rec["raw_text_first"] = (
+                last_raw_text[:500] if last_raw_text else ""
+            )
+            for _ev in events:
+                if _ev.text:
+                    _diag_rec["text"] = _ev.text
+                    _diag_rec["text_len"] = len(_ev.text)
+                if _ev.bbox is not None:
+                    _diag_rec["bbox"] = list(_ev.bbox)
+                    _diag_rec["crop_w"] = _ev.crop_w
+                    _diag_rec["crop_h"] = _ev.crop_h
+                if getattr(_ev, "level", None) == "error":
+                    _diag_rec["schema_parse_failed"] = True
+                break
+            self._append_diag(_diag_rec)
+
             LOG.info(
-                "frame infer done: iters=%d events=%d tools_called=%s exit=%s",
+                "frame infer done: iters=%d events=%d tools_called=%s exit=%s "
+                "it_infer=%.0fms",
                 len(events),
                 len(events),
                 [e.tool_call for e in events if e.tool_call],
                 exit_reason,
+                _diag_rec["it_infer_ms"],
             )
             return events
-        except Exception as e:  # pragma: no cover - depends on model
-            LOG.exception("frame infer crashed: %s", e)
+        except BaseException as e:
+            # 诊断 (v0.13): 用 BaseException (不只是 Exception) 兜底 —
+            # SIGSEGV / SystemError / RecursionError 在某些 rknn3 后端
+            # 卡死场景下会以 BaseException 子类抛出,之前的 ``except
+            # Exception`` 抓不到 → _worker_loop 直接死。
+            LOG.exception(
+                "frame infer crashed (BaseException): %s: %s — prompt=%r",
+                type(e).__name__, e, prompt,
+            )
+            _diag_rec.update(
+                it_infer_ms=(time.monotonic() - _t0_infer) * 1000.0,
+                exit_reason=f"exception[{type(e).__name__}]",
+                had_exception=True,
+                exception_type=type(e).__name__,
+                exception_msg=str(e)[:500],
+            )
+            self._append_diag(_diag_rec)
             return [DetectorEvent(
                 id=-1, frame_pos=-1, ts=time.time(),
-                prompt=prompt, text=f"(推理失败: {e})",
+                prompt=prompt, text=f"(推理失败: {type(e).__name__}: {e})",
                 level=None, attachment_count=0,
             )]
+
+    # ------------------------------------------------------------------ #
+    def _append_diag(self, rec: dict) -> None:
+        """Append a diagnosis record to the in-memory ring buffer
+        (``self._diag_history``). Lock-protected so _worker_loop /
+        _infer_sync / diagnostics 端点并发读安全。
+
+        字段约定见 ``__init__`` 中 ``_diag_history`` 的注释; 调用方
+        写入前先把 ``text`` / ``bbox`` 等填好。
+        """
+        with self._diag_lock:
+            self._diag_history.append(rec)
+
+    def diag_history(self) -> list:
+        """Read-only snapshot of recent diagnosis records (新 → 旧)。
+        Used by ``/diagnostics`` HTTP endpoint.
+        """
+        with self._diag_lock:
+            return list(self._diag_history)
+
+    def clear_diagnostics(self) -> None:
+        """Clear the diagnostics ring buffer (历史事件 ``_events`` 不动)。"""
+        with self._diag_lock:
+            self._diag_history.clear()
 
     # ------------------------------------------------------------------ #
     def _build_target_event(
@@ -1417,7 +1778,10 @@ class WdnaiDetector:
         try:
             arguments = _sanitize_event_text(repr(arguments)) or ""
         except Exception:
-            arguments = repr(arguments)[:200]
+            # 不再截断 [:200] —— tool transcript 是喂给模型做 wrap-up
+            # 的输入,截断会让模型看到半截 JSON / 参数,影响下一轮推理
+            # 质量。完整保留,模型自己会截到 context limit。
+            arguments = repr(arguments)
 
         if event.tool_call == "tts_alert":
             played = event.level is None and (event.text or "").startswith("语音提醒")
@@ -1432,15 +1796,61 @@ class WdnaiDetector:
 
     # ------------------------------------------------------------------ #
     def _worker_loop(self) -> None:
+        # 诊断 (v0.13): 入口 / watchdog 日志 + BaseException 兜底
+        LOG.info(
+            "worker_loop[%s] started (generating_cls=%s)",
+            self._generating_cls.__name__ if self._generating_cls else "?",
+            self._generating_cls.__name__ if self._generating_cls else "?",
+        )
+        _last_seen_event_ts = time.monotonic()
+        _WATCHDOG_CHECK_EVERY = 30  # 每 N 次循环 (~30s) 检查一次 idle
+        _loop_iter = 0
         while not self._stop_event.is_set():
+            _loop_iter += 1
             try:
                 item = self._item_q.get(timeout=1.0)
             except queue.Empty:
+                # 诊断 (v0.13): 每 30 次空轮询 (~30s) 触发 watchdog 检测,
+                # 如果从最后一次事件时间戳算起超过 _WATCHDOG_IDLE_SECONDS
+                # (默认 120s) 没事件 → LOG.warning 给上游排查源是否还在
+                # 推帧。注意: video_session 一旦源 EOF 或文件短,frame_pos
+                # 停滞是正常行为,warning 让用户区分"框架空闲" vs "源停了"。
+                if _loop_iter % _WATCHDOG_CHECK_EVERY == 0:
+                    _now = time.monotonic()
+                    _idle = _now - _last_seen_event_ts
+                    if _idle > self._WATCHDOG_IDLE_SECONDS:
+                        LOG.warning(
+                            "worker_loop[%s] idle for %.0fs (last event "
+                            "_last_seen_event_ts ago, source 可能停了 / "
+                            "submit_frame 未被调用 / every_n 太大)",
+                            self._generating_cls.__name__ if self._generating_cls else "?",
+                            _idle,
+                        )
                 continue
             if item is None:
+                # explicit stop sentinel
+                LOG.info(
+                    "worker_loop[%s] received stop sentinel — exiting",
+                    self._generating_cls.__name__ if self._generating_cls else "?",
+                )
                 return
             frame_bgr, frame_pos, prompt = item
-            events = self._infer_sync(frame_bgr, prompt)
+            _t0_infer = time.monotonic()
+            try:
+                events = self._infer_sync(frame_bgr, prompt)
+            except BaseException as e:
+                # 兜底: _infer_sync 内部已经 catch BaseException 写 diag,
+                # 但万一再次冒出,worker_loop 也要保命,不让一次异常永久
+                # 杀掉整个 daemon thread (用户报告"推理 2 次后停"的可疑
+                # 路径之一)。
+                LOG.exception(
+                    "worker_loop[%s] caught unhandled exception from "
+                    "_infer_sync (will continue): %s: %s",
+                    self._generating_cls.__name__ if self._generating_cls else "?",
+                    type(e).__name__, e,
+                )
+                continue
+            _infer_ms = (time.monotonic() - _t0_infer) * 1000.0
             with self._events_lock:
                 for ev in events:
                     ev.id = self._next_event_id
@@ -1448,11 +1858,22 @@ class WdnaiDetector:
                     self._next_event_id += 1
                     self._events.append(ev)
                     self._latest = ev.to_dict()
+                    _last_seen_event_ts = time.monotonic()
                 # ``latest`` 在多 event 帧下指向最后一个；前端
                 # ``addVtdEvent`` 用 unshift() 重新排序，最终列表的
                 # 顺序仍是 frame_pos 内 id 倒序（最新在前）。
             for ev in events:
                 self._broadcast(ev.to_dict())
+            # 诊断 (v0.13): 每帧处理耗时日志 (DEBUG 级别,高频不刷屏)
+            LOG.debug(
+                "worker_loop[%s] frame_pos=%d events=%d it_infer=%.0fms",
+                self._generating_cls.__name__ if self._generating_cls else "?",
+                frame_pos, len(events), _infer_ms,
+            )
+        LOG.info(
+            "worker_loop[%s] stopped (stop_event set)",
+            self._generating_cls.__name__ if self._generating_cls else "?",
+        )
 
 
 _detector: Optional[WdnaiDetector] = None

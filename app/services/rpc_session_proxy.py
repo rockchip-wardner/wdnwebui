@@ -258,7 +258,8 @@ class _ProxyResult:
     """
 
     def __init__(self, *, text=None, level=None, tool_call=None,
-                 bbox=None, crop_b64=None, attachment=None, raw=None):
+                 bbox=None, crop_b64=None, attachment=None, raw=None,
+                 schema_parse_failed: bool = False):
         self.text = text
         self.level = level
         self.tool_call = tool_call
@@ -266,6 +267,11 @@ class _ProxyResult:
         self.crop_b64 = crop_b64
         self.attachment = attachment or []
         self._raw = raw or {}
+        # 诊断 (v0.13): worker 端 schema parse 失败 → 主进程拿到的不是
+        # TargetDoc 实例而是 _ProxyResult(text=raw) 时,detector 端根据此
+        # flag 给事件 text 加 ``[解析失败]`` 前缀,前端历史记录里能区分
+        # "正常 VLM 描述" vs "目标检测 schema 解析失败"。
+        self.schema_parse_failed = bool(schema_parse_failed)
 
     @property
     def desc(self) -> Optional[str]:
@@ -349,7 +355,9 @@ class _RpcSessionProxy:
                 LOG.debug("rpc-proxy[%s]: svc.remove_requester(old) raised %s",
                           self._model_id, e)
             try:
-                new_client = self._svc.create_requester(timeout_ms=10_000)
+                # create_requester 内部不发起 RPC,只是 cshim entity
+                # 创建 (SEDP discovery grace ~5s)。5s 足够。
+                new_client = self._svc.create_requester(timeout_ms=5_000)
             except Exception as e:  # noqa: BLE001
                 LOG.error("rpc-proxy[%s]: recreate failed: %s",
                           self._model_id, e)
@@ -394,8 +402,9 @@ class _RpcSessionProxy:
                     self._model_id, err)
         self._recreate_client()
         # probe warm-up so retry doesn't re-hit the same discovery race
+        # (info handler 立即返回,5s 足够)
         try:
-            self._client.call({"action": "info"}, timeout_ms=10_000)
+            self._client.call({"action": "info"}, timeout_ms=5_000)
         except Exception as e:  # noqa: BLE001
             LOG.debug("rpc-proxy[%s]: post-recreate warmup raised %s",
                       self._model_id, e)
@@ -551,11 +560,28 @@ class _RpcSessionProxy:
         if hard_retries is None:
             hard_retries = self._POLL_HARD_RETRIES
         last = {"ok": False, "error": "unknown"}
+        # 诊断 (v0.13): 每个 attempt 独立计时 + report_id / matched_count
+        # 信息,便于排查 cshim discovery race / 240s timeout 之类阻塞。
+        import time as _t_cshim
+        _t_total = _t_cshim.monotonic()
+        _matched_count = self._matched_count()
+        LOG.info(
+            "rpc-proxy[%s]: _call_resilient START action=%s timeout_ms=%d "
+            "soft_retries=%d hard_retries=%d matched_count(before)=%d "
+            "payload_keys=%s",
+            self._model_id, payload.get("action"),
+            timeout_ms, soft_retries, hard_retries, _matched_count,
+            sorted(payload.keys()),
+        )
         for attempt in range(hard_retries):
+            _t_attempt = _t_cshim.monotonic()
             if attempt > soft_retries:
                 LOG.warning(
                     "rpc-proxy[%s]: %d consecutive transient failures — "
-                    "recreating cshim client", self._model_id, attempt)
+                    "recreating cshim client (matched before=%d)",
+                    self._model_id, attempt,
+                    self._matched_count(),
+                )
                 self._recreate_client()
                 # warm-up 加速新 requester 的 SEDP 匹配；失败无碍
                 try:
@@ -564,15 +590,62 @@ class _RpcSessionProxy:
                 except Exception as e:  # noqa: BLE001
                     LOG.debug("rpc-proxy[%s]: post-recreate warmup raised "
                               "%s", self._model_id, e)
+            LOG.info(
+                "rpc-proxy[%s]: _call_resilient ATTEMPT %d/%d enter "
+                "matched_count=%d",
+                self._model_id, attempt + 1, hard_retries,
+                self._matched_count(),
+            )
             r = self._client.call(payload, timeout_ms=timeout_ms)
+            _elapsed_ms = (_t_cshim.monotonic() - _t_attempt) * 1000.0
+            _r_req_id = r.get("request_id") if isinstance(r, dict) else None
+            _r_err = str(r.get("error", "")) if isinstance(r, dict) else "?"
+            _r_ok = bool(r.get("ok")) if isinstance(r, dict) else False
+            _r_has_data = (
+                isinstance(r, dict)
+                and isinstance(r.get("data"), dict)
+                and bool(r.get("data"))
+            )
+            LOG.info(
+                "rpc-proxy[%s]: _call_resilient ATTEMPT %d/%d exit "
+                "elapsed=%.0fms ok=%s request_id=%s data=%s error=%r",
+                self._model_id, attempt + 1, hard_retries,
+                _elapsed_ms, _r_ok, _r_req_id, _r_has_data, _r_err,
+            )
             if r.get("ok") or not r.get("error"):
+                LOG.info(
+                    "rpc-proxy[%s]: _call_resilient SUCCESS total=%.0fms "
+                    "after attempt %d/%d",
+                    self._model_id,
+                    (_t_cshim.monotonic() - _t_total) * 1000.0,
+                    attempt + 1, hard_retries,
+                )
                 return r
             err = str(r.get("error", "")).lower()
             last = r
             if not any(k in err for k in ("timeout", "no data",
                                           "send failed")):
+                LOG.info(
+                    "rpc-proxy[%s]: _call_resilient NON-TRANSIENT error "
+                    "(no retry): %r",
+                    self._model_id, err,
+                )
                 return r
+            # 瞬时错误 (timeout/no data/send failed) — log 决策
+            LOG.warning(
+                "rpc-proxy[%s]: _call_resilient attempt %d/%d TRANSIENT "
+                "error after %.0fms: %r (matched_count=%d, will retry)",
+                self._model_id, attempt + 1, hard_retries,
+                _elapsed_ms, err, self._matched_count(),
+            )
             time.sleep(self._POLL_RETRY_SLEEP)
+        LOG.error(
+            "rpc-proxy[%s]: _call_resilient EXHAUSTED %d attempts total=%.0fms "
+            "last_error=%r matched_count(after)=%d",
+            self._model_id, hard_retries,
+            (_t_cshim.monotonic() - _t_total) * 1000.0,
+            last.get("error"), self._matched_count(),
+        )
         return last
 
     def _call_poll_with_retry(self, offset: int) -> dict:
@@ -587,7 +660,8 @@ class _RpcSessionProxy:
 
     def reset(self) -> None:
         try:
-            r = self._client.call({"action": "reset"}, timeout_ms=10_000)
+            # reset_handler 立即返回 {"status":"reset"}/{"status":"noop"},5s 足够。
+            r = self._client.call({"action": "reset"}, timeout_ms=5_000)
             if not r.get("ok"):
                 LOG.warning("reset on %s returned: %s", self._model_id, r)
         except Exception as e:  # noqa: BLE001
@@ -598,6 +672,55 @@ class _RpcSessionProxy:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
+
+    def _matched_count(self) -> int:
+        """返回当前 cshim requester 的 rep_reader matched count,用于
+        排查 discovery race / SEDP 状态。返回 -1 表示 cshim 不可用 / query 失败。
+        """
+        try:
+            client = getattr(self, "_client", None)
+            if client is None:
+                return -1
+            native = getattr(client, "_native", None)
+            svc = getattr(client, "_service", None)
+            hub = getattr(svc, "_hub", None) if svc is not None else None
+            lib = getattr(hub, "_lib", None) if hub is not None else None
+            if native is None or lib is None:
+                return -1
+            return int(lib.wdndds_requester_matched_count(native))
+        except Exception as e:  # noqa: BLE001
+            LOG.debug("rpc-proxy[%s]: matched_count query failed: %s",
+                      self._model_id, e)
+            return -1
+
+    def start_matched_sampler(self, interval_s: float = 5.0) -> None:
+        """启动 daemon 线程,周期性 LOG matched_count (5s 默认),用于
+        排查 cshim discovery race 时看 SEDP 状态演化。仅第一次调用生效。
+        """
+        if getattr(self, "_sampler_started", False):
+            return
+        self._sampler_started = True
+        import threading as _thr
+        def _loop():
+            while True:
+                try:
+                    mc = self._matched_count()
+                    LOG.info(
+                        "rpc-proxy[%s] MATCHED_SAMPLE: matched_count=%d "
+                        "(call_active=%s)",
+                        self._model_id, mc,
+                        self._client is not None,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    LOG.debug("rpc-proxy[%s] sampler raised: %s",
+                              self._model_id, e)
+                _thr.Event().wait(timeout=interval_s)
+        _thr.Thread(target=_loop, name=f"rpc-match-sampler-{self._model_id}",
+                    daemon=True).start()
+        LOG.info(
+            "rpc-proxy[%s] MATCHED_SAMPLE started (interval=%.1fs)",
+            self._model_id, interval_s,
+        )
 
     def chat_run(self, history, text, *, context_limit=None,
                  max_new_tokens=2048, on_delta=None, stop_event=None,
@@ -892,17 +1015,63 @@ class _RpcSessionProxy:
         # branch with empty text and gets silently dropped as degenerate.
         gen_name = payload.get("generating")
         result_data = data.get("result_data")
+        # 诊断：worker 端 model_dump 后传回的 result_data 是 detector
+        # 后续分支（VLMDoc / TargetDoc / TargetEvent 重建）的唯一依据。
+        # 一旦 worker 端 dump 失败 / data 类型不对 / 字段缺失，主进程
+        # 会拿到 _ProxyResult 而不是真 schema 实例，触发 detector 端
+        # "result not an instance of VLMDoc" 的 warning。预先在这里把
+        # 缺失 / 类型异常打出来，避免上游再去反推。
+        if gen_name and gen_name != "TargetDoc" and isinstance(
+                result_data, dict) and result_data:
+            LOG.warning(
+                "proxy: gen_name=%s delivered with structured result_data — "
+                "only TargetDoc is reconstructed here; other schema will "
+                "fall through to _ProxyResult (fields=%s)",
+                gen_name, sorted(result_data.keys())[:8],
+            )
+        # ------------------------------------------------------------------ #
+        # 诊断 (v0.13): gen_name=TargetDoc 但 result_data 缺失 = 模型输出     #
+        # 没解析成 TargetDoc schema (worker 端 silent 跳过 model_dump)。     #
+        # 这条路径是用户报告"概率性目标检测失败"的核心可疑路径之一:          #
+        #   worker.infer_handler 在 result 是 str 且 gen_name 非 None 时      #
+        #   跳过了 result_data 块,主进程这里又拿不到 dict,TargetDoc 重建    #
+        #   路径走不进去,fallback 到 _ProxyResult。 detector 端拿到          #
+        #   _ProxyResult 后 isinstance(_, TargetDoc) 永假 → fall through    #
+        #   到 VLMDoc 分支,把 raw text 当 VLMDoc.text 写出 (无 bbox/crop)。 #
+        # 现在补 ERROR 日志 + 让 _ProxyResult 携带 schema_parse_failed       #
+        # marker 透传给 detector,detector 在 fall-through 写事件时给 text     #
+        # 加 ``[解析失败]`` 前缀,前端历史记录里能直接看到是"目标检测解析     #
+        # 失败"而不是普通 VLM 文本。                                          #
+        # ------------------------------------------------------------------ #
+        if gen_name == "TargetDoc" and not isinstance(result_data, dict):
+            LOG.error(
+                "rpc-proxy[%s]: TargetDoc result_data MISSING (gen_name=%s, "
+                "result_data_type=%s, reply_keys=%s, text_len=%d) — worker "
+                "端 schema parse 失败,silent fallback 到 _ProxyResult。 "
+                "raw_reply_text=%r",
+                self._model_id, gen_name,
+                type(result_data).__name__ if result_data is not None else "None",
+                sorted(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                len(data.get("text", "") or "") if isinstance(data, dict) else 0,
+                data.get("text", "") if isinstance(data, dict) else None,
+            )
         if gen_name == "TargetDoc" and isinstance(result_data, dict):
             try:
                 from app.services.detector import _get_target_doc_cls
                 TargetDoc = _get_target_doc_cls()
                 return TargetDoc.model_validate(result_data)
             except Exception as e:  # noqa: BLE001
-                LOG.warning(
-                    "proxy: TargetDoc reconstruct failed (%s: %s) — "
-                    "falling back to _ProxyResult",
-                    type(e).__name__, e,
+                LOG.error(
+                    "rpc-proxy[%s]: TargetDoc reconstruct failed (%s: %s) — "
+                    "raw_result_data=%r — falling back to _ProxyResult",
+                    self._model_id, type(e).__name__, e, result_data,
                 )
+
+        # ------------------------------------------------------------------ #
+        # 诊断 (v0.13): 把 worker 端写入的 schema_parse_failed marker 透传     #
+        # 给 _ProxyResult._raw,detector 端可读 ``_raw`` 字段识别。           #
+        # ------------------------------------------------------------------ #
+        _schema_parse_failed = bool(data.get("schema_parse_failed"))
 
         return _ProxyResult(
             text=data.get("text"),
@@ -912,6 +1081,7 @@ class _RpcSessionProxy:
             crop_b64=data.get("crop_b64"),
             attachment=attachments,
             raw=data,
+            schema_parse_failed=_schema_parse_failed,
         )
 
     # ---- Embedding surface (Qwen3-VL-Embedding-2B only) -------------------
@@ -1090,9 +1260,17 @@ def make_rpc_session_proxy(rpc_client, model_id: str, _svc=None,
     cannot access. Default ``False`` (local worker → /dev/shm path,
     lossless).
     """
-    return _RpcSessionProxy(rpc_client, model_id, _svc=_svc,
-                            on_client_recreated=on_client_recreated,
-                            is_remote=is_remote)
+    proxy = _RpcSessionProxy(rpc_client, model_id, _svc=_svc,
+                             on_client_recreated=on_client_recreated,
+                             is_remote=is_remote)
+    # 诊断 (v0.13): 启动 matched_count 周期 sampler,排查 cshim discovery race
+    # 时能直接看 SEDP 状态演化 (matched_count 从 0 → 1 表示 worker writer
+    # 已被本机 reader 看见)。
+    try:
+        proxy.start_matched_sampler(interval_s=5.0)
+    except Exception as e:  # noqa: BLE001
+        LOG.debug("make_rpc_session_proxy: start_matched_sampler failed: %s", e)
+    return proxy
 
 
 # Public alias

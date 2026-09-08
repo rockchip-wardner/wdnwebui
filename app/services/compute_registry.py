@@ -2148,9 +2148,13 @@ class ComputeRegistry:
 
         def _run_load():
             try:
+                # load_handler 立即返回 {"status": "loading"} + npu_index
+                # (实际 init 在 worker 后台线程跑,~50-90s)。所以这里只需
+                # 等 RPC round-trip + cshim discovery grace,5 秒足够。
+                # 240s 旧值浪费且一旦超时浪费一整个 init cycle。
                 r = inst.rpc_client.call(
                     {"action": "load", "npu_index": npu_index},
-                    timeout_ms=120_000,
+                    timeout_ms=5_000,
                 )
                 data = (r or {}).get("data") or {}
                 if not (r or {}).get("ok"):
@@ -2282,8 +2286,9 @@ class ComputeRegistry:
         if inst is None or inst.rpc_client is None:
             return
         try:
+            # unload_handler 立即返回 {"status": "unloaded"}。5s 足够。
             inst.rpc_client.call(
-                {"action": "unload"}, timeout_ms=30_000)
+                {"action": "unload"}, timeout_ms=5_000)
         except Exception as e:  # noqa: BLE001
             LOG.warning("unload %s RPC failed: %s", model_id, e)
         with self._lock:
@@ -2476,7 +2481,9 @@ class ComputeRegistry:
         else:
             service_name = f"wdndds/rpc/{inst.model_id}"
         svc = hub.create_service(service_name)
-        rpc_client = svc.create_requester(timeout_ms=10_000)
+        # create_requester 内部不发 RPC,只是 cshim entity 创建 + SEDP
+        # discovery grace ~5s。5s 足够。
+        rpc_client = svc.create_requester(timeout_ms=5_000)
         inst.rpc_client = rpc_client
         # Stash the Service on the instance so ``stop_instance_local``
         # / ``unload_instance`` can tear it down and pop it from

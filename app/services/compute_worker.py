@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import importlib
 import json
 import logging
 import os
@@ -1374,16 +1375,68 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 generating_cls = _get_tts_result_cls()
             except Exception as e:  # noqa: BLE001
                 LOG.warning("TTSResult schema load failed in worker: %s", e)
+        elif gen_name is not None:
+            # 诊断：未识别的 gen_name。RPC payload 引用了一种 worker 没
+            # 听过的 schema 类 —— 可能主进程 / worker 版本错位、或
+            # 有人在 schema 列表里加了新条目忘了同步 worker。
+            LOG.warning(
+                "infer_handler[%s]: unrecognized gen_name=%r (no schema "
+                "lookup) — sess.respond() will fall through to raw-text "
+                "parse path",
+                _req_id, gen_name,
+            )
 
         async def _call():
             try:
                 sess.reset()
             except Exception:
                 pass
+
+            # ---------------------------------------------------------------- #
+            # 诊断 (v0.13): monkey-patch SDK 让 worker 在 raw model output 进    #
+            # ``_parse_output`` 之前先 dump 一次。这才是模型**真正**的输出(没有 #
+            # 经过 SDK 的 JSON 提取 / strip fence / model_validate)。              #
+            # 这步让"模型吐了啥"和"SDK 把它变成啥"分开看 —— 用户怀疑              #
+            # "reply 是 cache" 用这条日志直接证实。                                       #
+            # ---------------------------------------------------------------- #
+            _orig_parse_output = None
+            try:
+                if hasattr(sess, "_parse_output"):
+                    _orig_parse_output = sess._parse_output
+
+                    def _diag_parse_output(raw_text, generating,
+                                            attachments_out=None):
+                        try:
+                            LOG.debug(
+                                "diag_raw_model_output[%s]: type=%s "
+                                "len=%d content=%r",
+                                _req_id,
+                                type(raw_text).__name__,
+                                len(str(raw_text)),
+                                str(raw_text)[:600],
+                            )
+                        except Exception:
+                            pass
+                        return _orig_parse_output(
+                            raw_text, generating, attachments_out)
+
+                    sess._parse_output = _diag_parse_output
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("diag[%s]: parse_output monkey-patch failed: %s",
+                          _req_id, e)
             # 合并 channel kwargs：audio 通道（omni run_audio）+ TTS 通道。
             # 顺序无关（key 不重叠），但 audio 优先覆盖以防未来 TTS 也
             # 引入 sample_rate 类参数时单边胜出（当前无重叠）。
             kwargs = {**audio_kwargs, **tts_kwargs}
+            # ---------------------------------------------------------------- #
+            # worker 是 thin RPC server:直接把 client 传的 ``generating`` /
+            # ``tools`` 透传给 wdnai SDK,prompt 构造 / schema hint 注入由
+            # SDK 的 ``_maybe_inject_json_hint`` + ``@Generable`` 装饰器
+            # 自动完成。worker 不干预 SDK 内部行为 (sdk 行为由
+            # ``@Generable`` 定义,client 应用 (detector) 用 ``generating=``
+            # 触发 schema 注入 + 用 ``tools=`` 注入 function-call schema)。
+            # 如果模型输出格式异常, 由 client 端 (detector) 应用层 rescue
+            # 解析,见 ``app/services/detector.py``。
             if generating_cls is not None:
                 kwargs["generating"] = generating_cls
             # ``tools`` 是 wdnai 的 ``@Callable`` 类列表。RPC 只透传
@@ -1404,11 +1457,90 @@ def infer_handler(state: dict, payload: dict) -> dict:
             image_size = payload.get("image_size")
             if isinstance(image_size, int) and not isinstance(image_size, bool):
                 kwargs["image_size"] = image_size
-            return await sess.respond(
-                prompt=prompt,
-                attachment=attachments if attachments else None,
-                **kwargs,
+            # ---------------------------------------------------------------- #
+            # 诊断 (v0.13): 核对 worker 实际传给 SDK 的 prompt 与 image 是不是  #
+            # 我们想要的。如果 RPC 链路中间 prompt 被改动 (stale cache / 序列化  #
+            # 丢字段) 或 image bytes 损坏,模型会输出非预期格式 —— 用户怀疑    #
+            # "reply 是 cache",这条日志直接证实。                                     #
+            # ---------------------------------------------------------------- #
+            # 1) RPC payload user_prompt (worker 收到的)
+            LOG.debug(
+                "diag_infer_input[%s]: prompt=%r attachments=%d kwargs_keys=%s",
+                _req_id, prompt, len(attachments),
+                sorted(kwargs.keys()),
             )
+            # 2) attachment 元信息 (验 /dev/shm 路径读出来的 ndarray 是否完整)
+            for _ai, _att in enumerate(attachments):
+                try:
+                    _img = getattr(_att, "images", None) or getattr(_att, "frames", None)
+                    if _img:
+                        _arr = _img[0]
+                        LOG.info(
+                            "diag_infer_input[%s]: att[%d] shape=%s "
+                            "dtype=%s size=%d bytes",
+                            _req_id, _ai,
+                            getattr(_arr, "shape", None),
+                            getattr(_arr, "dtype", None),
+                            getattr(_arr, "nbytes", 0),
+                        )
+                    else:
+                        LOG.info(
+                            "diag_infer_input[%s]: att[%d] non-image "
+                            "kind=%s mime=%s data_len=%d",
+                            _req_id, _ai,
+                            getattr(_att, "kind", "?"),
+                            getattr(_att, "mime_type", "?"),
+                            len(getattr(_att, "data", b"") or b""),
+                        )
+                except Exception as e:
+                    LOG.debug("diag_infer_input[%s]: att[%d] inspect failed: %s",
+                              _req_id, _ai, e)
+            # 3) kwargs 细节
+            LOG.debug(
+                "diag_infer_input[%s]: generating=%s tools=%s image_size=%s",
+                _req_id,
+                getattr(kwargs.get("generating"), "__name__", None),
+                [t.__name__ for t in kwargs.get("tools", []) or []],
+                kwargs.get("image_size"),
+            )
+            # 4) SDK 最终 prompt (用 ``_compose_prompt`` 模拟)
+            try:
+                mod_session = importlib.import_module("wdnai.session")
+                LLMSession_cls = getattr(mod_session, "LLMSession", None)
+                if LLMSession_cls is not None:
+                    _tool_specs = []
+                    try:
+                        from wdnai._callable import get_tool_specs as _gts
+                        _tool_specs = _gts(kwargs.get("tools") or [])
+                    except Exception:
+                        pass
+                    _final_prompt = LLMSession_cls._compose_prompt(
+                        prompt, kwargs.get("generating"), _tool_specs,
+                    )
+                    LOG.debug(
+                        "diag_infer_input[%s]: FINAL prompt to model "
+                        "(%d chars):\n%s",
+                        _req_id, len(_final_prompt), _final_prompt,
+                    )
+            except Exception as e:
+                LOG.debug("diag_infer_input[%s]: _compose_prompt dump "
+                          "failed: %s", _req_id, e)
+
+            # 调 sess.respond 后立刻还原 _parse_output patch,防止同 sess 上
+            # 下次 call (chat_run / chat_poll) 累积包装。
+            try:
+                _resp = await sess.respond(
+                    prompt=prompt,
+                    attachment=attachments if attachments else None,
+                    **kwargs,
+                )
+            finally:
+                try:
+                    if _orig_parse_output is not None and hasattr(sess, "_parse_output"):
+                        sess._parse_output = _orig_parse_output
+                except Exception:
+                    pass
+            return _resp
 
         LOG.info("infer: starting (prompt_len=%d, attachments=%d) image_size=%r",
                  len(prompt or ""), len(attachments), _diag_image_size)
@@ -1526,6 +1658,20 @@ def infer_handler(state: dict, payload: dict) -> dict:
                     "from frame_bgr as fallback.",
                     len(crop_b64_inline),
                 )
+        # ------------------------------------------------------------------ #
+        # 诊断 (v0.13): dump worker 给主进程的实际 reply.text (前 800 字符),  #
+        # 确认模型真实 raw output 是什么。reply 构造完后插在 result_data/  #
+        # structured 路由之前,这样 dump 的是 SDK 处理后的 reply.text (等同   #
+        # 主进程拿到的 _ProxyResult.text),不是用户期望的 model output (那是  #
+        # diag_raw_model_output)。                                                  #
+        # ------------------------------------------------------------------ #
+        if text is not None:
+            LOG.debug(
+                "diag_reply[%s]: reply.text (%d chars, type=%s):\n%s%s",
+                _req_id, len(text), type(result).__name__,
+                text[:800],
+                "..." if len(text) > 800 else "",
+            )
         if attachment_b64 is not None:
             reply["attachment_b64"] = attachment_b64
         if is_tool_instance and tool_call_args is not None:
@@ -1553,6 +1699,38 @@ def infer_handler(state: dict, payload: dict) -> dict:
                     "schema instance dump failed (%s): %s",
                     type(result).__name__, e,
                 )
+        # ------------------------------------------------------------------ #
+        # 诊断 (v0.13): schema parse 失败 silent 路径补日志 + marker         #
+        # ------------------------------------------------------------------ #
+        # SDK ``_safe_validate`` 对没 ``text`` 字段的 schema (TargetDoc)  #
+        # 在 ValidationError 时 fallback 到 raw text string → result 是   #
+        # ``str``,主进程拿不到 TargetDoc 实例 → silent fallback 到       #
+        # _ProxyResult,bbox/crop_b64 全无,目标检测失败。现在把异常状态提 #
+        # 到 ERROR 级别,并通过 ``schema_parse_failed: True`` marker 写到   #
+        # reply 让 proxy / detector 都能识别,事件历史里也能看到带            #
+        # ``[TargetDoc 解析失败]`` 前缀的标记。                              #
+        # ------------------------------------------------------------------ #
+        if (not is_tool_instance
+                and _diag_generating is not None
+                and type(result).__name__ not in {"VLMDoc", "TargetDoc", "TTSResult"}):
+            _raw_text_for_log = (
+                text if isinstance(text, str) else str(result)[:500]
+            )
+            LOG.error(
+                "infer_handler[%s]: SCHEMA PARSE FAILED — gen=%r but "
+                "result_type=%s (expected VLMDoc/TargetDoc/TTSResult). "
+                "raw_text=%r",
+                _req_id, _diag_generating, type(result).__name__,
+                _raw_text_for_log,
+            )
+            reply["schema_parse_failed"] = True
+            reply["actual_result_type"] = type(result).__name__
+            # 把 raw text 也塞进 reply 给 proxy / diagnostics 看(主进程
+            # 已经从 reply.text 拿到,这里多发一份便于诊断端点区分 raw vs
+            # 清洗后)。
+            if isinstance(text, str):
+                reply["raw_text"] = text
+
         if result_data_dict is not None:
             import json as _json_rd
             try:
@@ -1625,9 +1803,12 @@ def infer_handler(state: dict, payload: dict) -> dict:
             )
         LOG.info(
             "infer_handler[%s]: returning reply keys=%s bytes=%d "
-            "image_size=%r total=%.2fs",
+            "image_size=%r total=%.2fs request_id=%s",
             _req_id, sorted(reply.keys()), _reply_bytes,
             _diag_image_size, _t_inf.time() - _t_req_in,
+            _req_id,  # 诊断 (v0.13): reply.request_id 由 cshim 从 req.request_id 拿
+            # 用于排查主进程 cshim discovery race 时核对主进程收到的
+            # request_id 与 worker 发出的 request_id 是否一致。
         )
         return reply
     except Exception as e:  # noqa: BLE001

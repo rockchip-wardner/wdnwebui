@@ -137,6 +137,43 @@ async def clear_events() -> dict:
 
 
 # --------------------------------------------------------------------- #
+# 诊断端点 (v0.13): 暴露最近 N 次推理的诊断 trace                          #
+# --------------------------------------------------------------------- #
+# 用户报告"概率性目标检测失败"时,需要快速看到:
+#   - worker 端 schema parse 是否成功 (gen_name + actual_result_type)
+#   - proxy 端 result_data 是否缺失 (TargetDoc 重建路径)
+#   - detector 端 isinstance(result, TargetDoc) 是否命中
+#   - 每次推理耗时 / 事件数 / exit_reason
+# 把这些信息塞到一个 GET 端点,curl 即可 dump 现场。生产环境也保留。
+@router.get("/video-target-detection/diagnostics")
+async def get_diagnostics() -> dict:
+    """Dump the detector's recent inference diagnostics ring buffer.
+
+    字段约定见 ``app/services/detector.py`` ``WdnaiDetector.__init__``
+    里 ``_diag_history`` 的注释。每条记录包含:
+      ``ts`` / ``frame_pos`` / ``it_infer_ms`` / ``schema`` /
+      ``result_type`` / ``text_len`` / ``text`` / ``exit_reason`` /
+      ``events`` / ``bbox`` / ``crop_w`` / ``crop_h`` /
+      ``schema_parse_failed`` / ``had_exception`` / ``exception_type`` /
+      ``exception_msg`` / ``raw_text_first``
+
+    返回 ``{"count": int, "items": [dict, ...]}``,新 → 旧。
+    """
+    det = get_target_detector()
+    items = det.diag_history()
+    # 倒序 (新 → 旧) 方便调试时先看最近的失败
+    items_reversed = list(reversed(items))
+    return {"count": len(items_reversed), "items": items_reversed}
+
+
+@router.post("/video-target-detection/diagnostics/clear")
+async def clear_diagnostics() -> dict:
+    """Clear the diagnostics ring buffer (不影响 _events 历史)。"""
+    get_target_detector().clear_diagnostics()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------- #
 # WebSocket: server -> browser frame + event stream                     #
 # --------------------------------------------------------------------- #
 @router.websocket("/video-target-detection/ws")
