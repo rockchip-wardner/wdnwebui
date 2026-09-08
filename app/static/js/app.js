@@ -7508,11 +7508,20 @@ function vcsApplySnapshot(snap) {
   if (!snap) return;
   VCS.snap = snap;
   vcsRenderSnapshot(snap);
-  // 提取完成（首次现有条目入库）后刷新缓存窗口 —— 让新条目立即可勾选。
+  // 提取完成（首次现有条目入库）后刷新缓存窗口 —— 让新条目立即可勾选；
+  // 同时清空视频源路径文本框（仅成功清空，error/stopped 保留便于重试），
+  // 引导后续检索走"已缓存视频"勾选路径。
   if (snap.state === "ready" && VCS._cacheWinOnReady !== snap.slices_embedded
       + "|" + snap.slices_total) {
     VCS._cacheWinOnReady = snap.slices_embedded + "|" + snap.slices_total;
     vcsCacheRefresh().catch(() => {});
+    const srcEl = vcsEl("vcs-source");
+    if (srcEl && srcEl.value) {
+      srcEl.value = "";
+      const metaEl = vcsEl("vcs-source-meta");
+      if (metaEl) metaEl.textContent = "提取完成，路径已清空 —— 可在\"已缓存视频\"中勾选检索";
+      vcsApplyMutualExclusion();
+    }
   }
   if (typeof DemoGuard !== "undefined") {
     DemoGuard.report("video-content-search", { vcs: snap, playing: VCS.playing });
@@ -7575,8 +7584,10 @@ function vcsUpdateButtons(st) {
   const anyChecked = VCS.cacheSel && VCS.cacheSel.size > 0;
   if (startBtn) startBtn.disabled = st === "extracting" || !src || anyChecked;
   if (stopBtn) stopBtn.disabled = st !== "extracting";
-  if (queryBtn) queryBtn.disabled = (st !== "ready" && !anyChecked) ||
-      (st === "ready" && !anyChecked && !src);
+  // 检索可用性：后端 state=ready（单例内存索引存活，与路径输入框
+  // 无关 —— 输入框只是提取入口，提取完成后会被清空）或勾选 ≥1
+  // 缓存条目（走 query_multi），二者满足其一即可检索。
+  if (queryBtn) queryBtn.disabled = !(st === "ready" || anyChecked);
 }
 
 // ---- 勾选路径 / 缓存窗口（v0.12.2）----
@@ -8245,7 +8256,9 @@ async function vcsQuery() {
   const lenient = !!vcsEl("vcs-lenient")?.checked;
   // ---- 双路径分叉（在设置全局 busy 态之前）：勾选 ≥1 缓存条目 →
   // 多视频检索（query_multi，自带完整的 busy 态生命周期）；否则走
-  // 原单视频 query
+  // 原单视频 query。两路排他（勾选优先）且数据面隔离 —— multi 只读
+  // LanceDB、不触碰单例的内存索引；ready 状态下取消勾选再检索，
+  // 单例索引原样可用。
   if (VCS.cacheSel && VCS.cacheSel.size > 0) {
     await vcsQueryMulti(text, threshold, topK, lenient ? topK : 0);
     return;

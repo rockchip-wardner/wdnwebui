@@ -889,22 +889,9 @@
                   <input type="text" id="vcs-source" class="surv-input"
                          placeholder="例如 /userdata/clips/sample.mp4" spellcheck="false" />
                   <button type="button" class="vd-btn" id="vcs-browse">浏览…</button>
-                  <button type="button" class="vd-btn" id="vcs-clear-cache"
-                          title="一键删除 LanceDB 里全部已缓存的视频分析结果（清空后重发/重选视频需重新分析）">清空缓存</button>
                 </div>
                 <div class="vd-actions-row">
                   <span class="vd-meta" id="vcs-source-meta">尚未选择</span>
-                </div>
-                <div class="vcs-cache-window" id="vcs-cache-window">
-                  <div class="vcs-cache-head">
-                    <span>已缓存视频 (<span id="vcs-cache-count">0</span>)</span>
-                    <button type="button" id="vcs-cache-refresh"
-                            title="刷新缓存列表" tabindex="-1">⭘</button>
-                  </div>
-                  <div class="vcs-cache-rows" id="vcs-cache-rows"></div>
-                  <div class="vcs-cache-empty" id="vcs-cache-empty">
-                    加载中…
-                  </div>
                 </div>
               </div>
             </section>
@@ -958,6 +945,30 @@
               </div>
             </section>
 
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>已缓存视频</h3>
+                <span class="surv-hint">历史分析结果</span>
+              </header>
+              <div class="surv-field">
+                <div class="vcs-cache-window" id="vcs-cache-window">
+                  <div class="vcs-cache-head">
+                    <span>已缓存视频 (<span id="vcs-cache-count">0</span>)</span>
+                    <div class="vcs-cache-actions">
+                      <button type="button" class="vcs-cache-clear" id="vcs-clear-cache"
+                              title="一键删除全部已缓存的视频分析结果（含微信渠道条目；清空后重发/重选视频需重新分析）">清空缓存</button>
+                      <button type="button" class="vcs-cache-refresh" id="vcs-cache-refresh"
+                              title="刷新缓存列表" tabindex="-1">⭘</button>
+                    </div>
+                  </div>
+                  <div class="vcs-cache-rows" id="vcs-cache-rows"></div>
+                  <div class="vcs-cache-empty" id="vcs-cache-empty">
+                    加载中…
+                  </div>
+                </div>
+              </div>
+            </section>
+
             <section class="surv-form-section vd-grow">
               <header class="surv-form-head">
                 <h3>检索问题</h3>
@@ -983,7 +994,7 @@
                 </div>
                 <label class="vcs-lenient-row">
                   <input type="checkbox" id="vcs-lenient" />
-                  <span>宽松匹配（阈值过滤后无命中时补回 top-<span id="vcs-lenient-k">10</span>，无视阈值，标"低于阈值"）</span>
+                  <span>宽松匹配（所有选中视频合计无命中时，全局补回最接近的 top-<span id="vcs-lenient-k">10</span> 条，无视阈值，标"低于阈值"）</span>
                 </label>
                 <div class="vd-actions-row">
                   <button type="button" class="vd-btn vd-btn-primary" id="vcs-query" disabled>检索</button>

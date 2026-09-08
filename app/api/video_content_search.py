@@ -91,7 +91,12 @@ async def query_multi(payload: dict) -> dict:
 
     无状态批量语义：``embed_text`` 只算一次，然后逐条目从 lance
     还原向量做余弦检索 —— 不触碰当前单例的内存索引 / 状态机
-    （"浏览选文件"路径不受勾选检索污染）。返回::
+    （"浏览选文件"路径不受勾选检索污染）。
+
+    宽松匹配（``min_results > 0``）为**全局判定 + 全局兜底**：所有
+    组合计无达标命中时，才把各组低于阈值的候选全局降序取 top
+    ``min_results`` 条按来源组落位（共享一份配额，标 below）；任一
+    组有达标命中则全部不兜底。返回::
 
         {groups: [{md5, filename, source_path, chunk_seconds,
           chunk_overlap_seconds, duration_s, slices, frame_enabled,
@@ -155,7 +160,14 @@ async def query_multi(payload: dict) -> dict:
     qvec = np.asarray(qvec, dtype=np.float32).reshape(-1)
     qvec = qvec / (float(np.linalg.norm(qvec)) + 1e-9)
 
+    # ---- 两阶段评分（宽松匹配 = 全局判定 + 全局兜底） ----
+    # 阶段 1：每组先做**严格**检索（min_results=0，阈值过滤 + 组内
+    # top_k），累计全组合计的达标命中数。此前每组各自带 min_results
+    # 兜底 —— N 个视频全无命中会兜出 N×top_k 条（每个视频各一份），
+    # 与"一次总的宽松匹配"语义不符（用户决策 v0.12.4）。
     groups = []
+    index_by_gi: list = []      # (group_dict, cached_index) 供阶段 2
+    total_above = 0
     for e in clean:
         cached = None
         try:
@@ -175,9 +187,10 @@ async def query_multi(payload: dict) -> dict:
         # video_path 不覆写 —— cache 索引无 video_path 字段；
         # hits 的取帧走 group.source_path。
         hits_, meta = _score_hits(
-            qvec, cached["index"], sim_threshold, top_k, min_results)
+            qvec, cached["index"], sim_threshold, top_k, 0)
+        total_above += int(meta["above_threshold_count"])
         source_path = cached.get("source_path") or ""
-        groups.append({
+        g = {
             "md5": e["md5"],
             "miss": False,
             "filename": cached.get("filename") or "",
@@ -191,8 +204,35 @@ async def query_multi(payload: dict) -> dict:
             "top_score": meta["top_score"],
             "above_threshold_count": meta["above_threshold_count"],
             "below_threshold_count": meta["below_threshold_count"],
-            "fallback_used": meta["fallback_used"],
-        })
+            "fallback_used": False,
+        }
+        groups.append(g)
+        index_by_gi.append((g, cached["index"]))
+
+    # 阶段 2：全组合计**零达标命中**且勾选宽松匹配 → 收集所有组低于
+    # 阈值的候选，全局降序取 top min_results 条（跨组共享一份配额，
+    # 非"每组一份"），按来源组落位并标 below_threshold。有任一达标
+    # 命中时不兜底（无命中的组只显示"无命中"提示行）。
+    if min_results > 0 and total_above == 0 and index_by_gi:
+        cands: list = []
+        for gi, (g, index) in enumerate(index_by_gi):
+            if g["hits"]:
+                continue
+            fb, _ = _score_hits(
+                qvec, index, sim_threshold, top_k, min_results)
+            for h in fb:
+                if h.get("similarity", 0.0) >= sim_threshold:
+                    continue
+                cands.append((float(h["similarity"]), gi, h))
+        cands.sort(key=lambda t: -t[0])
+        for sim, gi, h in cands[:min_results]:
+            g = index_by_gi[gi][0]
+            h["above_threshold"] = False
+            g["hits"].append(h)
+            g["fallback_used"] = True
+        LOG.info("vcs query_multi: global lenient fallback — %d strict "
+                 "hits total=%d candidates, kept=%d",
+                 total_above, len(cands), min(len(cands), min_results))
     return {"ok": True, "text": text, "sim_threshold": sim_threshold,
             "top_k": top_k, "groups": groups}
 

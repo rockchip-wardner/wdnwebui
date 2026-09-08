@@ -2133,6 +2133,21 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     用条目 source；`frame_enabled=false` 时卡片置灰"取帧失败"，
     点击提示）。**无状态批量语义** —— 不污染单例的 `_index` /
     `_source` / 状态机。
+  - **宽松匹配全局化（v0.12.4）**：`query_multi` 改**两阶段**评分
+    —— 阶段 1 每组严格检索（`min_results=0`，阈值过滤 + 组内
+    top_k）累计全组合计达标数；阶段 2 仅当**合计零达标**且
+    lenient 时，收集各组低于阈值候选**全局降序**取 top
+    `min_results` 条按来源组落位（共享一份配额，标 below）——
+    此前每组各自带 min_results 兜底（N 视频全无命中兜出 N×top_k
+    条，"每视频各一份"与"一次总的"语义不符，用户决策改为全局
+    判定：任一视频有达标命中则全部不兜底）。单视频 `query` 路径
+    与微信 `VideoSearch` 工具的兜底不受影响（各自单组语义不变）。
+  - **布局（v0.12.4）**：`#vcs-cache-window` 从"视频源"栏移出为
+    独立 section（位于"操作"与"检索问题"之间），"清空缓存"按钮
+    移入窗口 head（`.vcs-cache-actions` 右侧按钮组，警示 hover）；
+    提取完成（state 首次 ready，`_cacheWinOnReady` 防抖块）自动
+    清空 `#vcs-source` 路径文本框（仅成功清空，error/stopped 保留
+    便于重试）并刷新缓存窗口 —— 引导检索走勾选路径。
   - **source_path 语义**：缓存条目存的入库时路径仅当**该文件仍在
     本机**才允许取帧/播放（`frame_enabled`，端点侧
     `os.path.isfile` 校验）—— 移走/删除的旧文件条目仍可纯文本
