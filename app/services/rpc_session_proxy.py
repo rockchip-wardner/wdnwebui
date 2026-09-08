@@ -573,7 +573,11 @@ class _RpcSessionProxy:
             timeout_ms, soft_retries, hard_retries, _matched_count,
             sorted(payload.keys()),
         )
-        for attempt in range(hard_retries):
+        # hard_retries=0 表示"不重试",但首次调用必须执行(否则函数
+        # 返回初始值 {"ok": False, "error": "unknown"},掩盖真实错误)。
+        # 用 ``max(1, hard_retries)`` 强制至少 1 次 call,真正不重试
+        # 是指 attempt > 0 时不再重试 (loop 里 attempt 从 0 开始,只跑一次)。
+        for attempt in range(max(1, hard_retries)):
             _t_attempt = _t_cshim.monotonic()
             if attempt > soft_retries:
                 LOG.warning(
