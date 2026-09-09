@@ -1063,7 +1063,23 @@ class _RpcSessionProxy:
             try:
                 from app.services.detector import _get_target_doc_cls
                 TargetDoc = _get_target_doc_cls()
-                return TargetDoc.model_validate(result_data)
+                # v0.14 schema-version 兼容:老 worker 进程仍是 v1
+                # (x1/y1/x2/y2 4 独立 field) schema 时,model_dump 出来
+                # 的 dict 不含 ``bbox`` 字段;主进程 cache 是 v2 schema
+                # (期望 bbox:list[float]) → 直接 model_validate 会失败。
+                # 桥接:dict 含 x1/y1/x2/y2 时,内部合成 bbox 字段重试。
+                converted = result_data
+                if "bbox" not in result_data:
+                    _xy = (
+                        result_data.get("x1"),
+                        result_data.get("y1"),
+                        result_data.get("x2"),
+                        result_data.get("y2"),
+                    )
+                    if all(isinstance(v, (int, float)) for v in _xy):
+                        converted = dict(result_data)
+                        converted["bbox"] = [float(v) for v in _xy]
+                return TargetDoc.model_validate(converted)
             except Exception as e:  # noqa: BLE001
                 LOG.error(
                     "rpc-proxy[%s]: TargetDoc reconstruct failed (%s: %s) — "
