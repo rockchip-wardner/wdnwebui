@@ -709,6 +709,24 @@ def unload_handler(state: dict) -> dict:
     state["npu_index"] = None
     state["load_time_sec"] = None
     state["loaded_at"] = None
+    # Force-release any large numpy buffers (embed tables, tokenizer
+    # vocab, hidden-state caches) that ``sess.close()`` doesn't explicitly
+    # drop. backend.__dict__ references drop naturally once ``sess._backend``
+    # is None, but glibc arena holds the freed memory until malloc_trim.
+    # TTS's 3 custom embed tables (text_embed/input_embed/codec_embed
+    # ~750 MB) bypass ``load_embed_table`` and are the dominant leak;
+    # the 6 other backends are fixed at the SDK side via mmap but this
+    # is a defense-in-depth net for any future backend.
+    try:
+        import gc
+        gc.collect()
+        import ctypes
+        import ctypes.util
+        ctypes.CDLL(
+            ctypes.util.find_library("c") or "libc.so.6"
+        ).malloc_trim(0)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("post-unload arena trim failed: %s", exc)
     return {"status": "unloaded"}
 
 
