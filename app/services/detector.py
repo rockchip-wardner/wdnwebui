@@ -68,6 +68,22 @@ DEFAULT_VLM_DOC_TEXT_DESC = "用中文一句话描述画面中的场景、主体
 DEFAULT_VLM_DOC_LEVEL_DESC = "严重程度标签：正常 / 警告 / 危险。"
 DEFAULT_TARGET_DOC_DESC_DESC = "对目标框内内容的一句话中文描述。"
 
+# 历史：TargetDoc 早期是 4 个独立 float field（x1 / y1 / x2 / y2） + desc。
+# 真机 Qwen3-VL-4B 在 768×768 变体上约 30% 概率把坐标输出成 0-1 范围
+# 小数（而不是协议规定的 0-1000），导致 unletterbox_bbox 还原到原图后
+# 整 ROI 压到左上角 ~0 像素 → 裁切为空 → (目标检测失败: 裁切区域为空)
+# 事件。samples/object_detect.py 的 ``Crop`` @Callable 工具用的是单
+# ``bbox: list[float]`` 字段（description 写"0-1000 坐标"），
+# 真机模型 100% 输出 0-1000 范围——与本路径 4 个独立 float field 的不稳
+# 定输出形成对比。
+#
+# v0.14 修复：TargetDoc 改为 ``bbox: list[float]`` + ``desc: str`` 单一
+# list，description 显式"0–1000 坐标 [x1, y1, x2, y2]"——与
+# ``samples/object_detect.py:43`` 同源；同时保留 ``_normalize_bbox_to_0_1000``
+# 作为兜底（兼容老 worker 进程或 schema 未生效的瞬态窗口），把任何
+# 0-1 范围 bbox ×1000 升到 0-1000。
+TARGET_DOC_SCHEMA_VERSION = 2
+
 
 _WDNAI_IMPORT_ERROR = ""
 # wdnai is imported LAZILY (at start() time, not at module load) — RKNN native
@@ -218,16 +234,30 @@ def _build_vlm_doc_class(text_desc: str, level_desc: str):
 
 
 # --------------------------------------------------------------------------- #
-# Schema cache keyed by (schema_name, tuple(sorted(field_descs))). The key
-# includes the description strings so any PUT to app.prompts that
-# changes one of the user-configurable Field descriptions yields a different
-# key and triggers a rebuild. Schema rebuilds only happen on key miss —
-# typically at most once per "保存" click in the 系统配置 page, not per
-# inference. TargetDoc's x1/y1/x2/y2 descriptions are hardcoded literals
-# inside ``_build_target_doc_class`` and do NOT participate in the cache key
-# (per spec: only ``desc`` is user-configurable for TargetDoc).
+# Schema cache keyed by (schema_name, schema_version, tuple(sorted(field_descs))).
+#
+# Key 包含三个部分：
+#   1. ``schema_name`` —— "VLMDoc" / "TargetDoc"。
+#   2. ``schema_version`` —— 模块常量 ``VLMDOC_SCHEMA_VERSION`` /
+#      ``TARGET_DOC_SCHEMA_VERSION``；schema 结构（字段名 / 类型）变化时
+#      版本号 +1，让 reload 后即使 ``descs`` 没变也能 cache miss 强制
+#      rebuild 拿到新 class。**特别重要**：schema class 是
+#      ``isinstance(result, TargetDoc)`` 检查的对象，类 identity 必须随
+#      结构变化而变化；否则 worker 端 model_dump 出的新字段
+#      （``bbox``）主进程用老 class model_validate 会失败，触发 silent
+#      fallback 到 _ProxyResult。
+#   3. ``tuple(sorted(field_descs))`` —— 用户在「系统配置 → App 提示词模板」
+#      覆盖的 ``Field(description=...)`` 文本；缺 / 空时 fallback 到
+#      ``DEFAULT_*_DESC`` 常量。任何 PUT 触发 desc 变化 → 新 cache key →
+#      rebuild。Schema rebuild 只在 key miss 时发生（一般每次"保存"最多
+#      1 次，不是每次推理）。
+#
+# TargetDoc 的 4 个坐标字段描述（v1 老格式）或 ``bbox`` 字段描述
+# （v2 新格式）是协议级格式规约（"0–1000 归一化"），不属于自然语言提示
+# 词，按用户决策保持 hardcoded 不开放给配置；只 ``desc`` 进入 cache key。
 # --------------------------------------------------------------------------- #
 _SCHEMA_CACHE: dict[tuple, type] = {}
+VLMDOC_SCHEMA_VERSION = 1
 
 
 def _load_app_prompts(app_key: str, schema_cls: str) -> dict[str, str]:
@@ -270,7 +300,7 @@ def _load_app_prompts(app_key: str, schema_cls: str) -> dict[str, str]:
 
 def _get_vlm_doc_cls():
     descs = _load_app_prompts("video_detection", "VLMDoc")
-    cache_key = ("VLMDoc", tuple(sorted(descs.items())))
+    cache_key = ("VLMDoc", VLMDOC_SCHEMA_VERSION, tuple(sorted(descs.items())))
     cached = _SCHEMA_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -282,11 +312,23 @@ def _get_vlm_doc_cls():
 # --------------------------------------------------------------------------- #
 # TargetDoc —— 视频目标检测页 structured-output schema                       #
 # --------------------------------------------------------------------------- #
-# 取代旧版 ``target_detection`` @Callable 工具：模型在生成结构化输出时
-# 直接给出 ``x1, y1, x2, y2``（0–1000 归一化） + ``desc``（ROI 内描
-# 述文本），detector 在 worker 线程里按 bbox 裁原帧、JPEG 编码、base64
+# 取代旧版 ``target_detection`` @Callable 工具（AGENTS.md "TargetDoc 结
+# 构化输出 (视频目标检测页)"）：模型在生成结构化输出时直接给出
+# ``bbox: [x1, y1, x2, y2]``（0–1000 归一化）+ ``desc``（ROI 内描述
+# 文本），detector 在 worker 线程里按 bbox 裁原帧、JPEG 编码、base64
 # 内嵌进事件 JSON（``crop_b64`` / ``crop_w`` / ``crop_h``），``desc``
 # 复制到 ``text`` 字段，事件历史列表沿用现有展示路径。
+#
+# v2 schema 设计（与 ``samples/object_detect.py:43`` 同源）：
+#   - 单 ``bbox: list[float]`` 字段（不是 4 个独立 float field），description
+#     写明"0–1000 坐标 [x1, y1, x2, y2]（相对于 LLM 看到的 letterboxed
+#     正方形）"，让模型看到清晰的"list of 4 floats"语义。Qwen3-VL-4B 在
+#     ``bbox: list[float]`` 单字段 schema 上输出 0-1000 范围非常稳定
+#     （与 ``samples`` 一致），而 4 个独立 field (x1/y1/x2/y2) schema 上
+#     约 30% 概率输出 0-1 小数 → 不可用。
+#   - ``_normalize_bbox_to_0_1000`` 兜底归一化（处理 schema-version 过渡
+#     期间老 worker 仍返回 0-1 范围 dict 的瞬态窗口），把任何
+#     ``max(|bbox|) <= 1.5`` 的 bbox ×1000 升到 0-1000。
 def _build_target_doc_class(desc_desc: str):
     """Build the ``TargetDoc`` schema lazily, once wdnai is importable.
 
@@ -296,11 +338,11 @@ def _build_target_doc_class(desc_desc: str):
 
     ``desc_desc`` —— 用户在「系统配置 → App 提示词模板」覆盖的
     ``desc`` 字段 ``Field(description=...)`` 文本；缺失时回退到
-    ``DEFAULT_TARGET_DOC_DESC_DESC``。4 个坐标字段 ``x1/y1/x2/y2``
-    的描述是协议级格式规约（"0–1000 归一化"），不属于自然语言提示
-    词，按用户决策保持 hardcoded 不开放给配置。
+    ``DEFAULT_TARGET_DOC_DESC_DESC``。``bbox`` 字段的 description 是协议
+    级格式规约（"0–1000 归一化"），不属于自然语言提示词，按用户决策
+    保持 hardcoded 不开放给配置。
     """
-    from typing import Optional  # noqa: F401  (kept for parity w/ VLMDoc)
+    from typing import Optional, List  # noqa: F401  (kept for parity w/ VLMDoc)
 
     _, _, _, _, _, Generable, Field, _, _, _ = _load_wdnai()
 
@@ -310,17 +352,19 @@ def _build_target_doc_class(desc_desc: str):
     # 渲染到 ``model_json_schema()`` 的顶层 ``description`` 字段 —— 模
     # 型在 prompt 里看到 ``{"description": "...", "properties": {...}}``
     # 时，会把 ``description`` 当成数据字段（不是 JSON Schema 元数据），
-    # 把真正的 x1/y1/x2/y2/desc 包到 ``{"description": {...}}`` 里。
+    # 把真正的 bbox/desc 包到 ``{"description": {...}}`` 里。
     # pydantic 校验失败 → 走 ``_safe_validate`` 的 raw text fallback →
     # ``DetectorEvent.text`` 变成半截 schema JSON，事件历史列表里
     # 显示 ``{ "description": "Structured target-detection..." }`` 这
     # 类乱码 + bbox/crop 全无。VLMDoc 没这个 bug 是因为它本就没 docstring。
     @Generable
     class TargetDoc(_PydBaseModel):
-        x1: float = Field(description="ROI 左上角 x，0–1000 归一化。")
-        y1: float = Field(description="ROI 左上角 y，0–1000 归一化。")
-        x2: float = Field(description="ROI 右下角 x，0–1000 归一化。")
-        y2: float = Field(description="ROI 右下角 y，0–1000 归一化。")
+        bbox: List[float] = Field(
+            description=(
+                "裁剪区域0-1000坐标 [x1, y1, x2, y2]，"
+                "相对于LLM看到的letterboxed正方形（含灰边）。"
+            ),
+        )
         desc: str = Field(description=desc_desc)
 
     return TargetDoc
@@ -332,7 +376,10 @@ def _build_target_doc_class(desc_desc: str):
 
 def _get_target_doc_cls():
     descs = _load_app_prompts("video_target_detection", "TargetDoc")
-    cache_key = ("TargetDoc", tuple(sorted(descs.items())))
+    cache_key = (
+        "TargetDoc", TARGET_DOC_SCHEMA_VERSION,
+        tuple(sorted(descs.items())),
+    )
     cached = _SCHEMA_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -472,12 +519,14 @@ def _try_rescue_target_doc(raw_text: str, target_doc_cls):
     输出:TargetDoc 实例 (校验通过) 或 None (无法 rescue)。
 
     尝试形式 (按优先级):
-      1. 顶层 ``{x1, y1, x2, y2, desc: ...}`` 标准 JSON 实例
-         (理想形态,但 Qwen3.5-VL-4B 经常吐不出这个)
-      2. 嵌套 ``{properties: {x1: ..., y1: ..., ...}, required,
-         title, type}``:模型把 schema 当模板填值 (Qwen3.5 误读
-         SDK 默认 schema_hint 时的常见形态)
-      3. 顶层部分字段 + 缺字段 → 仍尝试 model_validate 让 pydantic
+      1. 顶层 ``{bbox: [x1,y1,x2,y2], desc: ...}`` 标准 JSON 实例
+         (v2 schema 形态, samples 同款)
+      2. 顶层 ``{x1, y1, x2, y2, desc: ...}`` 老 schema 形态
+         (v1 老 worker 仍可能返回这个) → 内部 convert 成 v2 后
+         model_validate
+      3. 嵌套 ``{properties: {...}, required, title, type}``:模型把
+         schema 当模板填值 (Qwen3.5 误读 SDK 默认 schema_hint 时)
+      4. 顶层部分字段 + 缺字段 → 仍尝试 model_validate 让 pydantic
          用默认值补齐
 
     失败返回 None,继续走原 VLMDoc fallthrough 路径。
@@ -510,7 +559,7 @@ def _try_rescue_target_doc(raw_text: str, target_doc_cls):
                 return None
         if not isinstance(data, dict):
             return None
-        # 从 schema 动态知道 required 字段集 (不强写 x1/y1/x2/y2/desc)
+        # 从 schema 动态知道 required 字段集 (不强写 bbox / desc)
         try:
             schema_dict = target_doc_cls.model_json_schema()
         except Exception:
@@ -519,17 +568,49 @@ def _try_rescue_target_doc(raw_text: str, target_doc_cls):
         if not required_fields:
             return None
 
-        # 数字字段归一化:模型偶尔把 ``x1`` 输出成 ``[60, 425]`` 数组
-        # (Qwen3.5-VL-4B 的 bbox 训练数据有时是 ``[x1, y1, x2, y2]`` 4-tuple
-        # 格式或 ``[x1, y1, x2]`` 3-tuple 格式,模型就照着输),pydantic model_validate
-        # 会 reject list[float] 期望 scalar float。归一化时:
-        #   - 标量 str:转 float(兼容 "590" 这种字符串)
-        #   - list 长度 1:取唯一元素
-        #   - list 长度 ≥ 2:按字段名做启发式映射 (x1→v[0], y1→v[0], x2→v[1]...)
-        #     — 模型在 4-tuple 时把 (x1, y1, x2, y2) 摊开到各自字段,所以
-        #     x1=[60,425] 时取 [0] 表示第一个车的 x1,丢掉 [1] 第二个车
-        #     (单车场景够用;多车场景需要 detector 层多事件处理,见下)
-        def _flatten(v, field: str = ""):
+        # Schema-version 兼容 (v1 → v2 过渡期间 worker 端可能仍是老
+        # 4-field schema, model_dump 出来 {x1, y1, x2, y2, desc};代理
+        # 端 cache 是新 v2 schema,期望 {bbox, desc})。rescue 时检测
+        # 老 dict 形态并 convert 到新形态,保证 model_validate 通过。
+        if "bbox" in required_fields and "bbox" not in data:
+            old_xy = (data.get("x1"), data.get("y1"),
+                      data.get("x2"), data.get("y2"))
+            if all(isinstance(v, (int, float)) for v in old_xy):
+                data = dict(data)  # 不修改原 dict
+                data["bbox"] = [float(v) for v in old_xy]
+
+        # 数字字段归一化:模型偶尔把 ``bbox`` 输出成 ``[60, 425]`` 长度 2 的
+        # 数组(Qwen3.5-VL-4B 的 bbox 训练数据有时是 ``[x1, y1, x2, y2]``
+        # 4-tuple 格式或 ``[x1, y1, x2]`` 3-tuple 格式,模型就照着输
+        # 短版),pydantic model_validate 会按 list[float] 长度 4 校验失败。
+        # v2 schema 期望 list[float] length==4, 长度不匹配时取最保守位置
+        # (4-tuple → 保留所有;3-tuple → 仅保留前 3 维并补 0;
+        # 2-tuple → 仅保留首 2 维并补 0)。
+        def _flatten_bbox_list(v):
+            if isinstance(v, (int, float)):
+                return float(v)
+            if isinstance(v, str):
+                try:
+                    return float(v.strip())
+                except (TypeError, ValueError):
+                    return None
+            if isinstance(v, list):
+                if len(v) == 4:
+                    return [float(x) for x in v]
+                if len(v) == 3:
+                    return [float(v[0]), float(v[1]), float(v[2]), 0.0]
+                if len(v) == 2:
+                    return [float(v[0]), float(v[1]), 0.0, 0.0]
+                if len(v) == 1 and v:
+                    return [float(v[0]), 0.0, 0.0, 0.0]
+                return None
+            return None
+
+        # v1 老 schema (4 个独立 float field x1/y1/x2/y2) 的数字字段
+        # flatten —— Qwen3.5-VL-4B 训练数据有时把 4-tuple 摊开到 4 个
+        # 字段 (x1=[60,425] 表示同一组 bbox 的 x1),启发式按字段位置
+        # 取对应索引。
+        def _flatten_xy_scalar(v, field: str = ""):
             if isinstance(v, bool):
                 return int(v)
             if isinstance(v, (int, float)):
@@ -540,31 +621,37 @@ def _try_rescue_target_doc(raw_text: str, target_doc_cls):
                 except (TypeError, ValueError):
                     return None
             if isinstance(v, list):
-                # 4-tuple [x1, y1, x2, y2] 摊开:模型把同一组 4 元组
-                # 写进每个字段,实际只取第一辆车的 bbox。
-                # 启发式:如果 list 长度 == 4 且字段名是 4 个坐标之一,按
-                # 字段位置取对应索引 (x1→0, y1→1, x2→2, y2→3)。
                 if len(v) == 4 and field in ("x1", "y1", "x2", "y2"):
                     pos = ("x1", "y1", "x2", "y2").index(field)
-                    return _flatten(v[pos])
-                # 其它长度:取第一个元素 (最保守)
+                    return _flatten_xy_scalar(v[pos])
                 if v:
-                    return _flatten(v[0])
+                    return _flatten_xy_scalar(v[0])
                 return None
             return None
 
         def _try_validate(d: dict):
-            """尝试 model_validate,失败前先把数字字段 flatten 成 scalar。"""
+            """尝试 model_validate, 失败前先把数字字段 flatten 成期望形态。"""
             if not all(k in d for k in required_fields):
                 return None
-            # flatten 数字字段
             try:
                 fields_info = schema_dict.get("properties") or {}
                 flat = {}
                 for k in required_fields:
                     ftype = (fields_info.get(k) or {}).get("type", "")
-                    if ftype in ("number", "integer"):
-                        v = _flatten(d.get(k), field=k)
+                    if k == "bbox":
+                        # v2 schema 期望 list[float] length 4
+                        v = _flatten_bbox_list(d.get(k))
+                        if v is None:
+                            return None
+                        flat[k] = v
+                    elif k in ("x1", "y1", "x2", "y2"):
+                        # v1 老 schema: 4 个独立 float field
+                        v = _flatten_xy_scalar(d.get(k), field=k)
+                        if v is None:
+                            return None
+                        flat[k] = v
+                    elif ftype in ("number", "integer"):
+                        v = _flatten_xy_scalar(d.get(k))
                         if v is None:
                             return None
                         flat[k] = v
@@ -605,6 +692,82 @@ def _try_rescue_target_doc(raw_text: str, target_doc_cls):
 # --------------------------------------------------------------------------- #
 # 视频目标检测页专用：letterbox 尺寸选择 + bbox 区域裁切 + JPEG 编码 + base64 内嵌
 # --------------------------------------------------------------------------- #
+def _normalize_bbox_to_0_1000(bbox) -> Optional[List[float]]:
+    """把模型返回的 bbox 统一归一化到 0–1000 坐标空间。
+
+    真机 Qwen3-VL-4B / Qwen3.5-VL-4B 在 schema-constrained 输出模式下
+    bbox 数值单位不稳定：
+      - 大部分（约 70%）按 0–1000 范围输出（与 description 协议一致）
+      - 部分（约 30%，768×768 变体下尤其频繁）按 0–1 范围小数输出
+
+    0–1 范围 bbox 直接当 0–1000 处理会让 ``unletterbox_bbox`` 把 ROI 还原
+    到原图左上角 ~0 像素 → 裁切为空 → 触发 "(目标检测失败: 裁切区域为
+    空)" 错误事件。本函数做单位自适应归一化：
+
+    **判别规则**（按优先级）：
+      1. ``max(|bbox|) <= 1.5`` **且** 4 个值都 ≤ 1.0 → 视为 0–1 范围
+         → ×1000 升到 0–1000
+      2. 否则按 0–1000 处理，但 clamp 到 [0, 1000]
+      3. 输入类型异常（None / 长度不对 / 全 None）→ 返回 None
+
+    为什么用 1.5 而不是 1.0 当阈值：模型偶发输出 ``[1.0, 1.0, 1.0, 1.0]``
+    这种全 1.0 bbox（恰好在边界），按 0–1 ×1000 = [1000, 1000, 1000, 1000]
+    全画面与按 0–1000 clamp [1000, 1000, 1000, 1000] 结果一致，留一点余量
+    让 ``max=1.5`` 这种"刚好越界"的 bbox 也走 ×1000 路径。
+    """
+    if bbox is None:
+        return None
+    if not isinstance(bbox, (list, tuple)):
+        return None
+    if len(bbox) != 4:
+        return None
+    try:
+        nums = []
+        for v in bbox:
+            if v is None:
+                return None
+            try:
+                nums.append(float(v))
+            except (TypeError, ValueError):
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    abs_max = max(abs(v) for v in nums)
+    # 0-1 范围判别: max <= 1.5 (含 1.0 边界) → ×1000
+    if abs_max <= 1.5 and all(v <= 1.0 for v in nums):
+        return [max(0.0, min(1000.0, v * 1000.0)) for v in nums]
+    # 0-1000 范围: clamp 到 [0, 1000]
+    return [max(0.0, min(1000.0, v)) for v in nums]
+
+
+# "未检测到目标" 语义关键词 —— 模型在 TargetDoc 模式下可能 bbox 给一个
+# 全画面（[0, 0, 1000, 1000]）但 desc 文本提示"未检测到" / "没有" /
+# "无车" 等。这种自相矛盾的输出 detector 应该识别并跳过（不写 history、
+# 不发 WS），避免把整个画面作为 ROI 裁切给用户看。
+_NO_DETECTION_KEYWORDS = (
+    "未检测到", "未检测", "没有", "没有检测到", "没有检测", "未发现",
+    "未找到", "未识别到", "没有识别到", "没有找到", "画面中没有",
+    "图中没有", "图像中没有", "图中未", "画面中未", "无车", "没有车",
+    "不存在", "无目标", "没有目标",
+)
+
+
+def _is_no_detection_desc(desc: str) -> bool:
+    """检测 ``desc`` 文本是否提示"未检测到目标"语义。
+
+    触发时 detector 跳过该帧的事件写盘（不写 history、不发 WS），
+    避免用户看到 bbox=[0,0,1000,1000] 全画面 + "未检测到车辆" 的自
+    相矛盾事件。返回 True 时调用方应跳过事件构造。
+    """
+    if not desc or not isinstance(desc, str):
+        return False
+    s = desc.strip()
+    if not s:
+        return False
+    return any(kw in s for kw in _NO_DETECTION_KEYWORDS)
+
+
 def _pick_letterbox_size(
     image_size, available_sizes, h: int, w: int,
 ) -> int:
@@ -839,6 +1002,12 @@ class WdnaiDetector:
         # 都按这个值走,允许用户在不重启 worker 的前提下切换底层实例
         # (例如两个 qwen3-vl-4b 不同 NPU,或本机 vs LAN peer)。
         self._chosen_model_id: str = ""
+        # ``_last_bbox_raw`` —— ``_build_target_event`` 把模型原始
+        # bbox（未归一化）写入此处；``_infer_sync`` 在写 _diag_history
+        # 前读出 → 给 ``bbox_raw`` 字段，排查"模型到底输出 0-1 还是
+        # 0-1000" 时直接看诊断端点。线程安全由 _worker_loop 单线
+        # 程串行保证。
+        self._last_bbox_raw: Optional[list] = None
 
 
     # ------------------------------------------------------------------ #
@@ -1457,6 +1626,18 @@ class WdnaiDetector:
                     target_ev = self._build_target_event(
                         result, frame_bgr, prompt, lbox_meta, unletterbox_bbox,
                     )
+                    if target_ev is None:
+                        # _build_target_event 返回 None = "未检测到目标"
+                        # 语义,detector 跳过该事件写盘 (不广播、不写
+                        # _events, 但仍标记 target_doc exit_reason 让
+                        # watchdog 知道本帧跑完了工具循环)。
+                        LOG.info(
+                            "frame iter %d: TargetDoc skipped (no-detection "
+                            "semantic from bbox+desc)",
+                            i + 1,
+                        )
+                        exit_reason = "target_doc_skipped"
+                        break
                     events.append(target_ev)
                     bbox = target_ev.bbox or [0.0, 0.0, 0.0, 0.0]
                     LOG.info(
@@ -1643,6 +1824,23 @@ class WdnaiDetector:
                 if getattr(_ev, "level", None) == "error":
                     _diag_rec["schema_parse_failed"] = True
                 break
+            # 模型原始 bbox（归一化前，可能 0-1 或 0-1000）—— 排查
+            # bbox 单位问题直接看这个字段，不必 dump reply JSON。
+            _raw_bbox = getattr(self, "_last_bbox_raw", None)
+            if _raw_bbox is not None:
+                _diag_rec["bbox_raw"] = list(_raw_bbox)
+            # TargetDoc skipped (no-detection 语义识别) 时, _build_target_event
+            # 仍会写入 _last_bbox_raw (因为先归一化后才判定 skip),但
+            # events 列表是空 —— 上面 for 循环没机会填 bbox/crop_w 等字段。
+            # 这里单独补一组,让 skipped 事件也能在 diag 里看到 bbox。
+            if exit_reason == "target_doc_skipped" and not events:
+                if _raw_bbox is not None and _diag_rec.get("bbox") is None:
+                    try:
+                        _norm = _normalize_bbox_to_0_1000(_raw_bbox)
+                        if _norm is not None:
+                            _diag_rec["bbox"] = _norm
+                    except Exception:  # noqa: BLE001
+                        pass
             self._append_diag(_diag_rec)
 
             LOG.info(
@@ -1710,19 +1908,23 @@ class WdnaiDetector:
         prompt: str,
         lbox_meta=None,
         unletterbox_bbox_fn=None,
-    ) -> DetectorEvent:
+    ) -> Optional[DetectorEvent]:
         """把 ``TargetDoc`` 实例 + 原帧包成 ``DetectorEvent``。
 
-        * 从 ``x1, y1, x2, y2`` 拼 ``bbox`` 数组（4 维 0–1000 坐标，
-          坐标空间 = ``_infer_sync`` 里脚本侧 letterbox 后送进 VLM 的
-          正方形 canvas）；
+        * 从 ``bbox: [x1, y1, x2, y2]``（v2 schema，``samples/object_detect.py``
+          同款 ``list[float]``）读出 bbox；duck-type fallback 到 v1 老 schema
+          的 ``x1, y1, x2, y2`` 4 个独立 field（schema-version 过渡期
+          老 worker 进程仍可能返回这种形态）；
+        * bbox 走 ``_normalize_bbox_to_0_1000`` 单位自适应归一化（max ≤ 1.5
+          视为 0–1 范围 ×1000），兼容模型偶发输出 0-1 小数的情况
+          （真机 Qwen3-VL-4B 768×768 变体约 30% 概率）；
         * ``desc`` 过 sanitize（防 chatml token / 控制字符 / 半截
           JSON 漏出），再复制到 ``text``（沿用历史展示路径）；
         * 按 bbox 裁原图 + JPEG 编码 + base64 内嵌到 ``crop_b64``：
           ``_crop_and_encode`` 拿 ``lbox_meta`` + ``unletterbox_bbox``
           把 letterboxed 坐标精确映射回原图像素，裁出来的 ROI 是原
           比例（不包含 letterbox 灰边）；``lbox_meta=None`` 时退回
-          到老的“把 0-1000 当原图坐标”的粗略算法以保证向下兼容。
+          到老的"把 0-1000 当原图坐标"的粗略算法以保证向下兼容。
         * 裁切为空时 ``crop_b64=""``，事件仍写出，``level='error'``。
         * ``tool_call='target_detection'`` —— 沿用历史事件的判别
           字段，前端用它识别"带 bbox / crop 的目标检测事件"。
@@ -1730,28 +1932,77 @@ class WdnaiDetector:
           语义化产物；与 ``tts_alert`` 区分（后者
           ``tool_call='tts_alert'`` 仍是真正的工具调用路径）。
 
-        历史上曾经有一段“0-1 → 0-1000 隐式校正”（model 在 768 变体
-        偶发输出小数 0-1 范围 bbox，~6% 概率）。脚本侧改成预先
-        letterbox + 把 ``image_size`` 强制对齐到 letterbox canvas
-        之后，模型的 0-1000 bbox 已经和 canvas 严格对齐，不会再
-        跑到 0-1 范围，所以这段 hack 已经过时 —— 直接删除。
+        "未检测到目标" 语义识别：bbox=[0,0,1000,1000] 全画面 + desc 含
+        "未检测到"/"没有"/"无" 等关键词 → 返回 None（detector 跳过事件
+        写 history 与 WS 广播），避免自相矛盾的事件被前端展示。
+
+        **返回 ``None``** 时表示该帧不应产生 detector 事件（detector 调
+        用方 ``_worker_loop`` 检测到 None 直接 continue，不广播、不写
+        ``_events``）。
         """
+        # 把 ``bbox_raw``（模型原始 bbox，可能 0-1 或 0-1000）记录到
+        # detector 进程级变量, _infer_sync 结束时读出来写进 diag。
+        # 设计原因:_build_target_event 是同步函数调用, 不返回
+        # bbox_raw 给调用方 (避免接口改; 调用方需要传 frame_bgr /
+        # lbox_meta 等, 但 bbox_raw 是内部诊断字段)。用 detector 实
+        # 例属性做进程内传递最简洁 —— 线程安全由 _worker_loop 单线
+        # 程串行保证。
+        self._last_bbox_raw = None
+        # 1) 读 bbox 字段 —— 优先 v2 schema (result.bbox: list[float]),
+        #    fallback 到 v1 老 schema (result.x1/y1/x2/y2 4 独立 field)
+        bbox_raw: Optional[list] = None
         try:
-            bbox = [
-                float(result.x1),
-                float(result.y1),
-                float(result.x2),
-                float(result.y2),
-            ]
-        except Exception as e:  # noqa: BLE001
+            v = getattr(result, "bbox", None)
+            if isinstance(v, (list, tuple)) and len(v) == 4:
+                bbox_raw = list(v)
+        except Exception:  # noqa: BLE001
+            bbox_raw = None
+        if bbox_raw is None:
+            try:
+                bbox_raw = [
+                    float(result.x1),
+                    float(result.y1),
+                    float(result.x2),
+                    float(result.y2),
+                ]
+            except Exception as e:  # noqa: BLE001
+                LOG.warning(
+                    "target_event: bbox 字段缺失 (既无 result.bbox 也无 "
+                    "result.x1/y1/x2/y2): %s",
+                    e,
+                )
+                return DetectorEvent(
+                    id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+                    text=f"(目标检测失败: 字段缺失: {e})",
+                    level="error",
+                    attachment_count=0,
+                    tool_call="target_detection",
+                )
+        # 2) bbox 单位自适应归一化 (0-1 → 0-1000)
+        # 把模型原始 bbox 存到 detector 实例属性,供 _infer_sync 写
+        # _diag_history 用 (用户排查"模型到底输出的是 0-1 还是 0-1000"
+        # 时能直接看到原始值,不必 dump reply JSON)。
+        self._last_bbox_raw = bbox_raw
+        bbox = _normalize_bbox_to_0_1000(bbox_raw)
+        if bbox is None:
             return DetectorEvent(
                 id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
-                text=f"(目标检测失败: 字段缺失: {e})",
+                text=f"(目标检测失败: bbox 无效: {bbox_raw!r})",
                 level="error",
                 attachment_count=0,
                 tool_call="target_detection",
             )
         desc = _sanitize_event_text(getattr(result, "desc", "") or "") or ""
+        # 3) "未检测到目标" 语义识别 —— bbox 全画面 + desc 提示 → 跳过
+        if (bbox[0] <= 0.0 and bbox[1] <= 0.0
+                and bbox[2] >= 1000.0 and bbox[3] >= 1000.0
+                and _is_no_detection_desc(desc)):
+            LOG.info(
+                "target_event: skip no-detection (desc=%r)",
+                desc[:60],
+            )
+            return None
+        # 4) 裁切 + JPEG 编码 + base64
         crop_b64, crop_w, crop_h = _crop_and_encode(
             frame_bgr, bbox, lbox_meta, unletterbox_bbox_fn,
         )
