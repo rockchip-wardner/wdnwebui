@@ -2081,16 +2081,11 @@ class ComputeRegistry:
                         "ensure_worker_for_model: %s inst=%s stale "
                         "(proc rc=%s); respawning",
                         model_id, id(inst), inst.proc.returncode)
-                    try:
-                        if inst.rpc_session_proxy is not None:
-                            inst.rpc_session_proxy.close()
-                    except Exception:
-                        pass
-                    try:
-                        if inst.rpc_client is not None:
-                            inst.rpc_client.destroy()
-                    except Exception:
-                        pass
+                    # v0.14.3: full teardown — also destroy the wdndds
+                    # Service (was missing pre-fix; old code only closed
+                    # the proxy + destroyed the Requester, leaking the
+                    # Service in hub._services).
+                    self._teardown_rpc_client(inst)
                     self._instances.pop(inst.key, None)
                     # fall through to adopt / spawn
                     break
@@ -2132,7 +2127,14 @@ class ComputeRegistry:
             raise RuntimeError(
                 f"{inst.model_id} 是 peer 提供的 service，本机无权 bind")
         if inst.rpc_client is None:
-            raise RuntimeError(f"{inst.model_id} worker RPC client 未就绪")
+            # Service was torn down on a previous unload (v0.14.3+) so
+            # the cshim payload pool doesn't pin in hub._services.
+            # Worker process is still alive (inst.proc preserved);
+            # spin a fresh Service + Requester + Proxy for this re-bind.
+            self._setup_rpc_client(inst)
+            if inst.rpc_client is None:
+                raise RuntimeError(
+                    f"{inst.model_id} worker RPC client 未就绪 (re-setup 失败)")
         if not isinstance(npu_index, int) or npu_index < 0:
             raise RuntimeError(f"npu_index 非法: {npu_index!r}")
 
@@ -2147,12 +2149,22 @@ class ComputeRegistry:
         inst._bind_inflight = True
 
         def _run_load():
+            # v0.14.3: capture the RPC client at thread start. If the
+            # user disables mid-load, ``unload_instance`` →
+            # ``_teardown_rpc_client`` sets ``inst.rpc_client = None``
+            # while this thread is still in flight. The old code would
+            # then hit ``NoneType.call(...)`` → silently fall into the
+            # ``except`` branch → overwrite the just-set ``not_loaded``
+            # status with ``error``. Bail early instead.
+            rpc_client = inst.rpc_client
+            if rpc_client is None:
+                return
             try:
                 # load_handler 立即返回 {"status": "loading"} + npu_index
                 # (实际 init 在 worker 后台线程跑,~50-90s)。所以这里只需
                 # 等 RPC round-trip + cshim discovery grace,5 秒足够。
                 # 240s 旧值浪费且一旦超时浪费一整个 init cycle。
-                r = inst.rpc_client.call(
+                r = rpc_client.call(
                     {"action": "load", "npu_index": npu_index},
                     timeout_ms=5_000,
                 )
@@ -2281,16 +2293,27 @@ class ComputeRegistry:
 
         Works for adopted peers too — we just ask the peer to release
         the resource; we don't terminate anything we don't own.
+
+        v0.14.3: after the worker drops its session, also tear down
+        the per-instance FastDDS Service / Requester / RpcSessionProxy
+        in the main process via :meth:`_teardown_rpc_client`. Without
+        this, every enable→disable cycle leaks one Service (cshim
+        payload pool ~60 MB per the AGENTS.md "Service 生命周期"
+        note) + one Python Requester + one ThreadPoolExecutor until
+        the next registry stop. The worker process (``inst.proc``) is
+        preserved — re-enable rebuilds the Service via
+        :meth:`_setup_rpc_client` in :meth:`bind_instance`.
         """
         inst = self._find_by_model(model_id)
-        if inst is None or inst.rpc_client is None:
+        if inst is None:
             return
-        try:
-            # unload_handler 立即返回 {"status": "unloaded"}。5s 足够。
-            inst.rpc_client.call(
-                {"action": "unload"}, timeout_ms=5_000)
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("unload %s RPC failed: %s", model_id, e)
+        if inst.rpc_client is not None:
+            try:
+                # unload_handler 立即返回 {"status": "unloaded"}。5s 足够。
+                inst.rpc_client.call(
+                    {"action": "unload"}, timeout_ms=5_000)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("unload %s RPC failed: %s", model_id, e)
         with self._lock:
             old_key = inst.key
             inst.npu_index = -1
@@ -2300,6 +2323,12 @@ class ComputeRegistry:
             inst.loaded_at = None
             self._instances.pop(old_key, None)
             self._instances[inst.key] = inst
+        # Tear down the local FastDDS endpoints so the cshim payload
+        # pool doesn't pin in hub._services. The hub Service / Requester
+        # is what AGENTS.md calls "每个 ~60 MB of RSS" per Service;
+        # stopping here gives the user real memory reclaim on disable
+        # without a worker process restart.
+        self._teardown_rpc_client(inst)
 
     def stop_instance_local(self, model_id: str) -> None:
         """Spawned-only: unload → RPC shutdown → wait 3 s → kill -9.
@@ -2508,6 +2537,77 @@ class ComputeRegistry:
         except Exception as e:  # noqa: BLE001
             LOG.warning("RpcSessionProxy create failed for %s: %s",
                         inst.model_id, e)
+
+    def _teardown_rpc_client(self, inst: ModelInstance) -> None:
+        """Tear down the per-instance FastDDS Requester / RpcSessionProxy
+        / wdndds Service in the **main process** so the cshim payload
+        pool (~60 MB per Service per the AGENTS.md "Service 生命周期"
+        note) doesn't pin in ``hub._services`` until next restart.
+
+        Worker process (``inst.proc``) is NOT touched — caller is
+        responsible for keeping / killing the process independently
+        (``unload_instance`` keeps it alive for fast re-enable;
+        ``stop_instance_local`` kills it).
+
+        For ``_source == "adopted"`` (LAN peer): keep the local Service
+        (the peer's Replier is still subscribed to the same service
+        name; destroying the local Service would break cross-machine
+        discovery). Only close the local Requester + Proxy.
+
+        Idempotent: safe to call twice or on a never-set-up instance.
+        Each step is wrapped in ``try/except`` so one failure doesn't
+        short-circuit the rest.
+        """
+        proxy = getattr(inst, "rpc_session_proxy", None)
+        if proxy is not None:
+            try:
+                # ``_RpcSessionProxy.close()`` only shuts down its
+                # ThreadPoolExecutor + stops the matched-sampler daemon
+                # — it does NOT touch the cshim client / Service.
+                # We do those separately below.
+                proxy.close()
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("teardown[%s]: proxy.close raised: %s",
+                          inst.model_id, e)
+            inst.rpc_session_proxy = None
+
+        rpc = inst.rpc_client
+        svc = getattr(inst, "_svc", None)
+        if rpc is not None:
+            try:
+                rpc.destroy()
+            except Exception as e:  # noqa: BLE001
+                LOG.debug("teardown[%s]: rpc_client.destroy raised: %s",
+                          inst.model_id, e)
+            # Drop the dead Requester from the Service's tracking list
+            # BEFORE tearing down the Service, so the Service's
+            # ``_requesters`` list goes to 0 (or stays at 0 if we're
+            # about to destroy the Service entirely).
+            if svc is not None:
+                try:
+                    svc.remove_requester(rpc)
+                except Exception as e:  # noqa: BLE001
+                    LOG.debug("teardown[%s]: svc.remove_requester raised: %s",
+                              inst.model_id, e)
+            inst.rpc_client = None
+
+        if svc is not None and inst._source != "adopted":
+            try:
+                svc_name = svc.name
+                hub = self._hub
+                if hub is not None:
+                    hub.destroy_service(svc_name)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("teardown[%s]: hub.destroy_service raised: %s",
+                            inst.model_id, e)
+            inst._svc = None
+        elif svc is not None:
+            # adopted (LAN peer): keep Service; just clear our handle
+            # to the local Service so we don't accidentally re-destroy
+            # it on a subsequent teardown attempt.
+            inst._svc = None
+
+        inst.llm_session = None
 
     def _probe_service(self, model_id: str) -> Optional[dict]:
         """Short-timeout RPC ``info`` probe on ``wdndds/rpc/<model_id>``.
@@ -3217,6 +3317,23 @@ class ComputeRegistry:
                                 old_svc.remove_requester(old_client)
                             except Exception:
                                 pass
+                        # v0.14.3: also destroy the old Service so the
+                        # cshim payload pool doesn't pin in hub._services
+                        # on every consecutive-failure rebuild. The new
+                        # ``_setup_rpc_client`` call will create a fresh
+                        # Service with the same name. adopted (LAN peer)
+                        # is excluded — see _teardown_rpc_client for why.
+                        if old_svc is not None and inst._source != "adopted":
+                            try:
+                                svc_name = old_svc.name
+                                hub = self._hub
+                                if hub is not None:
+                                    hub.destroy_service(svc_name)
+                            except Exception as svc_e:  # noqa: BLE001
+                                LOG.warning(
+                                    "probe-rebuild: hub.destroy_service"
+                                    "(%s) raised: %s",
+                                    inst.model_id, svc_e)
                         try:
                             self._setup_rpc_client(inst)
                             LOG.info("rebuilt rpc_client for %s after "
