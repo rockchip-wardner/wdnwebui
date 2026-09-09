@@ -1736,11 +1736,20 @@ def infer_handler(state: dict, payload: dict) -> dict:
             )
             LOG.error(
                 "infer_handler[%s]: SCHEMA PARSE FAILED — gen=%r but "
-                "result_type=%s (expected VLMDoc/TargetDoc/TTSResult). "
-                "raw_text=%r",
+                "result_type=%s (expected VLMDoc/TargetDoc/TTSResult).",
                 _req_id, _diag_generating, type(result).__name__,
-                _raw_text_for_log,
             )
+            # raw_text 独立多行 LOG：%r 会把 \n 转成 \\n，多行 JSON 全挤
+            # 一行没法看。这里尝试 json.dumps(indent=2) 美化；非 JSON 原文
+            # 输出；超过 1500 字符截断,避免 log 爆炸。
+            try:
+                _obj = json.loads(_raw_text_for_log)
+                _formatted = json.dumps(_obj, indent=2, ensure_ascii=False)
+            except Exception:
+                _formatted = _raw_text_for_log
+            if len(_formatted) > 1500:
+                _formatted = _formatted[:1500] + f"\n...[truncated {len(_formatted) - 1500} chars]"
+            LOG.error("raw_text (formatted):\n%s", _formatted)
             reply["schema_parse_failed"] = True
             reply["actual_result_type"] = type(result).__name__
             # 把 raw text 也塞进 reply 给 proxy / diagnostics 看(主进程

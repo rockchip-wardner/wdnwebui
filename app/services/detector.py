@@ -495,6 +495,30 @@ def _strip_trailing_punct(s: str) -> str:
     return _TRAILING_PUNCT.sub("", s)
 
 
+def _format_raw_text_for_log(text, label: str = "raw_text", limit: int = 1500) -> None:
+    """Dump ``text`` as a multi-line, JSON-formatted LOG.error for debugging.
+
+    用 ``%r`` 会把 ``\\n`` 转义成字面 ``\\\\n``,多行 JSON 全挤一行没法看。
+    这里先尝试 ``json.loads`` + ``json.dumps(indent=2, ensure_ascii=False)``
+    美化;非 JSON 原文输出;超过 ``limit`` 字符截断。两条独立 LOG 调用:
+    一条 metadata + 一条 formatted text,后者换行缩进可直接看。
+    """
+    if not text:
+        LOG.error("%s: (empty)", label)
+        return
+    try:
+        _obj = json.loads(text)
+        _formatted = json.dumps(_obj, indent=2, ensure_ascii=False)
+    except Exception:
+        _formatted = str(text)
+    if len(_formatted) > limit:
+        _formatted = (
+            _formatted[:limit]
+            + f"\n...[truncated {len(_formatted) - limit} chars]"
+        )
+    LOG.error("%s (formatted):\n%s", label, _formatted)
+
+
 # 诊断 (v0.13): 应用层 TargetDoc rescue —— worker 是 thin RPC server
 # (只把 client 传的 prompt / generating / tools 透传给 wdnai SDK,不做
 # schema-specific 解析);SDK 在 ValidationError 时返回 raw text;client
@@ -1666,9 +1690,10 @@ class WdnaiDetector:
                 if _schema_parse_failed:
                     LOG.error(
                         "frame iter %d: SCHEMA PARSE FAILED (worker marker) — "
-                        "result_type=%s raw_text=%r",
-                        i + 1, type(result).__name__, raw_text,
+                        "result_type=%s",
+                        i + 1, type(result).__name__,
                     )
+                    _format_raw_text_for_log(raw_text, "raw_text (worker-side)")
                 # 诊断：探测"result 不是 generating schema 实例"的隐形
                 # 失败模式 —— 当生成 schema 是 VLMDoc 时，正常情况下
                 # _parse_output 应该返回 VLMDoc 实例；如果不是，要么是
@@ -1688,11 +1713,12 @@ class WdnaiDetector:
                     # 用户无法区分"模型正常输出文字" vs "模型输出没解析"。
                     LOG.error(
                         "frame iter %d: result not an instance of %s — "
-                        "actual=%s (full raw_text=%r)",
+                        "actual=%s",
                         i + 1,
                         getattr(generating_cls, "__name__", "?"),
-                        type(result).__name__, raw_text,
+                        type(result).__name__,
                     )
+                    _format_raw_text_for_log(raw_text, "full raw_text")
                 # schema parse 失败时,事件 text 加前缀 (不再仅 LOG.error
                 # 而是写进 history 让用户能复盘)。
                 _history_text = clean_text
@@ -1783,12 +1809,12 @@ class WdnaiDetector:
             # 误判"推理停"。
             LOG.warning(
                 "frame iter ?: result type %s fell through ALL branches "
-                "(not tool / not TargetDoc / not %s) — last_raw_text=%r",
+                "(not tool / not TargetDoc / not %s)",
                 last_result_type or "?",
                 getattr(generating_cls, "__name__", "?")
                 if generating_cls else "?",
-                last_raw_text,  # 完整 raw_text, 不再截断
             )
+            _format_raw_text_for_log(last_raw_text, "last_raw_text")
 
             if exit_reason == "none":
                 exit_reason = (
