@@ -2533,7 +2533,7 @@ class VideoFileAnalysisService:
 
         不再硬编码 ``"qwen3-vl-4b"`` —— 通过 registry 找当前 running
         的 ``swcap_video_describe`` 实例的 model_id（qwen3-vl-4b 或
-        qwen3-5-vl-4b 都行），按实际加载的模型重启。
+        qwen3.5-vl-4b 都行），按实际加载的模型重启。
 
         阈值定 ≥2 而非 1：单次 timeout 可能是长 prompt / NPU 短暂忙，
         不必重启；连续 2 次说明 C 层 rknn3 session 真正 wedged，

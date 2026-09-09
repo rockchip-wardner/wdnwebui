@@ -101,7 +101,7 @@ class _LlmBridge:
         if on and not self.available():
             raise RuntimeError(
                 "文本对话模型未启用（请在算力配置页启用 qwen3-4b / "
-                "qwen3-5-vl-4b 任一文本对话实例）"
+                "qwen3.5-vl-4b 任一文本对话实例）"
             )
         with self._lock:
             self._enabled = bool(on)

@@ -1232,7 +1232,7 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   - qwen3-tts → `worker:tts`（10 字符）
   - qwen3-4b → `worker:llm-4b`（12 字符）
   - qwen3-vl-embedding-2b → `worker:emb-2b`（12 字符）
-  - qwen3-5-vl-4b → `worker:q5-vl`（12 字符；多模态 LLM+vision）
+  - qwen3.5-vl-4b → `worker:q5-vl`（12 字符；多模态 LLM+vision）
 
   受 TASK_COMM_LEN=16 限制 alias 必须在 8 字符内（15 - len("worker:")）。
   命名放在 worker 端 main() 里调 —— preexec_fn 里调 prctl 会被紧随的

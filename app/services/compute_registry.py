@@ -537,49 +537,49 @@ def _locate_anything_spec_template():
 # 保证倒计时结束时实际加载大概率已就绪，避免 UI 卡很久才更新。
 MODEL_PRESETS: dict[str, dict] = {
     "qwen3-vl-4b": {
-        "label":            "[VLM]视觉描述模型",
+        "label":            "[VLM]视觉描述v3",
         "preset_factory":   _qwen3_vl_4b_spec,
         "model_dir_name":   "Qwen3-VL-4B",
         "memory_estimate_mb": 3500,
         "estimated_init_seconds": 60,
         "capability_types": ["swcap_video_describe"],
-        "instance_name":    "llm-vl",
+        "instance_name":    "vlm-q30-4b",
         "worker_name":      "vlm-4b",          # comm = "worker:vlm-4b"（15 chars）
         "description":      "视频描述模型",
         "available_targets": ["182x"],   # .1828.rknn 权重 — RK182x 协卡
     },
     "qwen3-tts": {
-        "label":            "[TTS]文字转语音模型",
+        "label":            "[TTS]文字转语音v3",
         "preset_factory":   _qwen3_tts_spec,
         "model_dir_name":   "Qwen3-TTS",
         "memory_estimate_mb": 1900,
         "estimated_init_seconds": 30,
         "capability_types": ["swcap_audio_tts"],
-        "instance_name":    "llm-tts",
+        "instance_name":    "tts-q30",
         "worker_name":      "tts",             # comm = "worker:tts"（10 chars）
         "description":      "文字转语音模型",
         "available_targets": ["182x"],
     },
     "qwen3-4b": {
-        "label":            "[LLM]文字对话模型",
+        "label":            "[LLM]文字对话v3",
         "preset_factory":   _qwen3_4b_spec,
         "model_dir_name":   "Qwen3-4B",
         "memory_estimate_mb": 4950,
         "estimated_init_seconds": 60,
         "capability_types": ["swcap_text_chat"],
-        "instance_name":    "llm-chat",
+        "instance_name":    "llm-q30-4b",
         "worker_name":      "llm-4b",          # comm = "worker:llm-4b"（12 chars）
         "description":      "文字对话模型",
         "available_targets": ["182x"],
     },
     "qwen3-vl-embedding-2b": {
-        "label":            "[VLEmb]视觉信息编码模型",
+        "label":            "[VLEmb]视觉信息编码v3",
         "preset_factory":   _qwen3_vl_embedding_2b_spec,
         "model_dir_name":   "Qwen3-VL-Embedding-2B",
         "memory_estimate_mb": 2000,        # ~1GB 权重 + 622MB embed 表 + vision
         "estimated_init_seconds": 30,      # 加载两个 rknn + embed 表
         "capability_types": ["swcap_video_retrieval"],
-        "instance_name":    "llm-embed",
+        "instance_name":    "vlemb-q30-2b",
         "worker_name":      "emb-2b",          # comm = "worker:emb-2b"（12 chars）
         "description":      "视觉信息编码模型",
         "available_targets": ["182x"],
@@ -588,31 +588,31 @@ MODEL_PRESETS: dict[str, dict] = {
         # Qwen2.5-Omni-3B（kind="omni"，wav-in/text-out）。单次推理上限
         # 6.0 秒（omni.py 硬限制），调用方负责切片。memory_estimate_mb /
         # estimated_init_seconds 是预估值，真机测后回填。
-        "label":            "[Omni]多感知描述模型",
+        "label":            "[Omni]多感知描述v2.5",
         "preset_factory":   _qwen_2_5_omni_3b_spec,
         "model_dir_name":   "Qwen2.5-Omni-3B",
         "memory_estimate_mb": 2500,
         "estimated_init_seconds": 50,
         "capability_types": ["swcap_audio_understand"],
-        "instance_name":    "llm-audio",
+        "instance_name":    "omni-q25-3b",
         "worker_name":      "audio-3b",     # comm = "worker:audio-3b" (13 chars)
         "description":      "多感知描述模型",
         "available_targets": ["182x"],
     },
-    "qwen3-5-vl-4b": {
+    "qwen3.5-vl-4b": {
         # Qwen3.5-VL-4B 多模态模型（kind="vlm"，image-in/text-out）。
         # 同时声明 swcap_text_chat + swcap_video_describe —— VLM-mode
         # RKNN 既能做纯文本推理也能消费视觉 token，所以文本对话页 +
         # 视频描述页（detector / VFA / audio_analysis 等）都能用它。
         # 与 qwen3-vl-4b 共用 swcap_video_describe capability；算力
         # 配置页同一 capability 内互斥（先加载的赢）。
-        "label":            "[VLLM]视觉和文字多模态模型",
+        "label":            "[VLLM]视觉文字多模态v3.5",
         "preset_factory":   _qwen3_5_vl_4b_spec,
         "model_dir_name":   "Qwen3.5-4B",
         "memory_estimate_mb": 3500,
         "estimated_init_seconds": 60,
         "capability_types": ["swcap_text_chat", "swcap_video_describe"],
-        "instance_name":    "llm-q5-vl",
+        "instance_name":    "vlm-q35-4b",
         "worker_name":      "q5-vl",        # comm = "worker:q5-vl" (12 chars)
         "description":      "Qwen3.5-4B 多模态模型，支持图像描述和文本对话",
         "available_targets": ["182x"],
@@ -632,7 +632,7 @@ MODEL_PRESETS: dict[str, dict] = {
         "memory_estimate_mb": 5500,
         "estimated_init_seconds": 60,
         "capability_types": ["swcap_grounding"],
-        "instance_name":    "llm-ground",
+        "instance_name":    "llm-ground-3b",
         "worker_name":      "ground",       # comm = "worker:ground" (13 chars); alias 6 chars, < 8 chars AGENTS 硬限
         "description":      "视觉定位模型，给定文本描述输出图像中目标区域",
         "available_targets": ["182x"],

@@ -1054,7 +1054,7 @@ class WdnaiDetector:
         # Query the running ``swcap_video_describe`` instance for its
         # loaded vision-model native sizes — never hardcode [384, 768]
         # on the client. Filter by capability instead of model_id so
-        # any future VLM preset (qwen3-5-vl-4b etc.) is picked up
+        # any future VLM preset (qwen3.5-vl-4b etc.) is picked up
         # automatically. Empty list when the worker hasn't reported
         # yet (model not loaded, network probe failure, missing
         # capability).
@@ -1101,7 +1101,7 @@ class WdnaiDetector:
                 # 调用的 ``image_size``）。None 表示 auto-pick by
                 # image resolution（legacy behaviour preserved）。
                 "image_size":             self._image_size,
-                # 当前选定的 model_id ("", "qwen3-vl-4b", "qwen3-5-vl-4b"...)。
+                # 当前选定的 model_id ("", "qwen3-vl-4b", "qwen3.5-vl-4b"...)。
                 # 空字符串 = auto-pick,前端用此判定下拉框是否用户自定义过。
                 "model_id":               self._chosen_model_id,
             }

@@ -472,7 +472,7 @@ def _build_session(model_id: str, npu_index: int):
     elif model_id == "qwen2.5-omni-3b":
         # Qwen2.5-Omni-3B（kind="omni"）。单次 run_audio 上限 6s，调用方负责切片。
         spec = mod["SystemLanguageModel"].qwen_2_5_omni_3b()
-    elif model_id == "qwen3-5-vl-4b":
+    elif model_id == "qwen3.5-vl-4b":
         # Qwen3.5-VL-4B 多模态（kind="vlm"，MRoPE 烙印）。spec.options
         # 里 presence_penalty=1.5（来自 examples/Qwen3_5_VL/cpp/main.cc
         # 默认值，避免长 multimodal 输出的重复）。
@@ -1101,7 +1101,7 @@ def _chat_run_loop(state: dict) -> None:
         # 种 backend 都该走文本推理路径 —— 镜像 ``wdnai.session``
         # 的 dispatch 顺序（``getattr(run_text) or run``）。
         # 历史 bug：chat_run 直接 ``backend.run(prompt, ...)``，碰到
-        # qwen3-5-vl-4b 等 VLM preset 时 ``AttributeError: 'VLMBackend'
+        # qwen3.5-vl-4b 等 VLM preset 时 ``AttributeError: 'VLMBackend'
         # object has no attribute 'run'`` 直接挂在 worker，main 进
         # 程 ``_chat_run_loop`` 把 RuntimeError 透传回前端的 ``error``
         # 帧，文本对话页一直停在"未启用"状态。

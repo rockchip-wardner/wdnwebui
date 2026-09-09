@@ -4707,58 +4707,58 @@ VdFsModal.pickCurrentDir = function () {
  */
 const CC_PRESET_META = {
   "qwen3-vl-4b": {
-    label: "[VLM]视觉描述模型",
+    label: "[VLM]视觉描述v3",
     capability_types: ["swcap_video_describe"],
-    instance_name: "llm-vl",
+    instance_name: "vlm-q30-4b",
     memory_estimate_mb: 3500,
     estimated_init_seconds: 60,
     description: "视频描述模型",
     available_targets: ["182x"],
   },
   "qwen3-tts": {
-    label: "[TTS]文字转语音模型",
+    label: "[TTS]文字转语音v3",
     capability_types: ["swcap_audio_tts"],
-    instance_name: "llm-tts",
+    instance_name: "tts-q30",
     memory_estimate_mb: 1900,
     estimated_init_seconds: 30,
     description: "文字转语音模型",
     available_targets: ["182x"],
   },
   "qwen3-4b": {
-    label: "[LLM]文字对话模型",
+    label: "[LLM]文字对话v3",
     capability_types: ["swcap_text_chat"],
-    instance_name: "llm-chat",
+    instance_name: "llm-q30-4b",
     memory_estimate_mb: 4950,
     estimated_init_seconds: 60,
     description: "文字对话模型",
     available_targets: ["182x"],
   },
   "qwen3-vl-embedding-2b": {
-    label: "[VLEmb]视觉信息编码模型",
+    label: "[VLEmb]视觉信息编码v3",
     capability_types: ["swcap_video_retrieval"],
-    instance_name: "llm-embed",
+    instance_name: "vlemb-q30-2b",
     memory_estimate_mb: 2000,
     estimated_init_seconds: 30,
     description: "视觉信息编码模型",
     available_targets: ["182x"],
   },
   "qwen2.5-omni-3b": {
-    label: "[Omni]多感知描述模型",
+    label: "[Omni]多感知描述v2.5",
     capability_types: ["swcap_audio_understand"],
-    instance_name: "llm-audio",
+    instance_name: "omni-q25-3b",
     memory_estimate_mb: 2500,
     estimated_init_seconds: 50,
     description: "多感知描述模型",
     available_targets: ["182x"],
   },
-  "qwen3-5-vl-4b": {
+  "qwen3.5-vl-4b": {
     // Qwen3.5-VL-4B 同时声明 swcap_text_chat + swcap_video_describe
     // ——VLM-mode RKNN 既能做纯文本也能消费 vision token，一张一张卡
     // 同时满足对话页 + 视频描述页。启用后文本对话、视频描述、视频
     // 内容检索、视频文件分析、音视频描述等页均直接可用。
-    label: "[VLLM]视觉和文字多模态模型",
+    label: "[VLLM]视觉文字多模态v3.5",
     capability_types: ["swcap_text_chat", "swcap_video_describe"],
-    instance_name: "llm-q5-vl",
+    instance_name: "vlm-q35-4b",
     memory_estimate_mb: 3500,
     estimated_init_seconds: 60,
     description: "Qwen3.5-VL-4B 多模态模型，同时支持文本对话和视频描述",
@@ -4767,7 +4767,7 @@ const CC_PRESET_META = {
   "LocateAnything-3b": {
     label: "[GD]视觉定位模型",
     capability_types: ["swcap_grounding"],
-    instance_name: "llm-ground",
+    instance_name: "llm-ground-3b",
     memory_estimate_mb: 5500,
     estimated_init_seconds: 60,
     description: "视觉定位模型，给定文本描述输出图像中目标区域",
@@ -4776,7 +4776,7 @@ const CC_PRESET_META = {
 };
 const CC_PRESET_ORDER = [
   "qwen3-vl-4b",
-  "qwen3-5-vl-4b",     // 多模态卡（同时支持文本对话 + 视频描述）
+  "qwen3.5-vl-4b",     // 多模态卡（同时支持文本对话 + 视频描述）
   "qwen3-4b",          // Qwen3 纯文本
   "qwen3-tts",
   "qwen3-vl-embedding-2b",
@@ -6783,7 +6783,7 @@ const ImBridge = {
 
     if (hint) {
       if (!available) {
-        hint.textContent = "文本对话模型未启用，请在算力配置页启用 qwen3-4b / qwen3-5-vl-4b 任一文本对话实例";
+        hint.textContent = "文本对话模型未启用，请在算力配置页启用 qwen3-4b / qwen3.5-vl-4b 任一文本对话实例";
         hint.className = "imb-bridge-hint danger";
       } else if (enabled) {
         hint.textContent = b.busy ? "已对接，生成中…" : "已对接，微信消息将自动回复";

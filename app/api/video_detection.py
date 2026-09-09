@@ -328,7 +328,7 @@ async def set_prompt(payload: dict) -> dict:
 async def available_vision_sizes() -> dict:
     """List the vision-model native sizes currently loaded into the
     running ``swcap_video_describe`` compute instance (qwen3-vl-4b /
-    qwen3-5-vl-4b / future VLM presets — anything advertising that
+    qwen3.5-vl-4b / future VLM presets — anything advertising that
     capability whose backend exposes ``available_image_sizes``).
 
     Returned shape: ``{"sizes": [384, 768], "default": 384}`` where
@@ -349,7 +349,7 @@ async def available_vision_sizes() -> dict:
     for inst in registry.list_with_source():
         # Filter by capability instead of model_id so any future VLM
         # preset exposing ``swcap_video_describe`` (e.g.
-        # qwen3-5-vl-4b) is picked up automatically.
+        # qwen3.5-vl-4b) is picked up automatically.
         caps = inst.get("capability_types") or []
         if "swcap_video_describe" not in caps:
             continue
