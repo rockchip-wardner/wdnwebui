@@ -54,6 +54,39 @@ creation); everything below is verified against the current tree.
    浏览器崩溃、某些移动浏览器会丢弃 beacon）；AGENTS 不做超出此限制
    的承诺。若可靠性要求更高，需要服务端按 session TTL / 心跳
    自动回收 —— 不在本期范围。
+6. **worker 进程是薄 RPC server，类云端 AI 调用语义**。
+   `compute_worker.py` / `compute_worker_lazy.py` 进程只负责：
+   * 接收 prompt / attachment / generating schema / tools 参数；
+   * 透传给 `wdnai.LLMSession.respond(...)`；
+   * 把模型返回结果（schema 实例的 `model_dump()` 或原始 str）原样发回。
+
+   worker **不应做**：
+   * schema 字段语义理解（如 bbox 单位归一化、bbox 是否全画面、
+     desc 是否"未检测到"语义识别等）—— 这些是业务侧（detector）
+     的职责；
+   * 图像裁切 / 编码 / base64 内嵌 —— 主进程 `_crop_and_encode`
+     负责；
+   * 历史事件持久化 / 缓存 / 诊断 ring buffer 维护 —— 主进程
+     detector 自己的 `_events` / `_diag_history` 负责；
+   * 业务级 schema-version 兼容 —— 跨主/worker schema 兼容应在
+     proxy / detector 侧做（rpc_session_proxy 的 schema-version 桥
+     接是合规的——它在主进程侧）。
+
+   **判断标准**：worker 端任何对 `result.text` / `result.bbox` /
+   `result.desc` 等字段做语义解析 / 转换 / 二次封装的提交都违规。
+   worker 只做 `result.model_dump()` 序列化与 RPC 收发。修复
+   `73b8808` 误删的 0-1→0-1000 hack 在 v0.14 重新引入主进程侧
+   （`_normalize_bbox_to_0_1000`）而不是 worker 侧，正是这条原则
+   的应用。
+
+   **历史上下文**：早期（`73b8808` 之前）worker 端曾把"0-1 → 0-1000
+   隐式校正"塞在 `compute_worker.py:infer_handler` 里（~12 行 +
+   LOG.info），看起来无害但违反本原则——业务级语义理解放在 worker
+   端会导致：(a) worker 必须知道 calling context（哪条业务线 /
+   哪个 schema）才能决定要不要做这步；(b) 一份代码处理多种模型
+   时归一化阈值互相干扰；(c) detach 进程不能 reload，bug fix 必须
+   restart worker（50s+ LLMSession 重启）。当前归一化已挪到主
+   进程 `_normalize_bbox_to_0_1000`，worker 端模型输出原样透传。
 
 ## 修改守则
 
