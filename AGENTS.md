@@ -101,6 +101,12 @@ creation); everything below is verified against the current tree.
   不允许"测试跳过"或"代码改对了就行"。
 - 失败 → 修到全通过再交；提交前在 PR/commit message 列出跑了哪些
   feature 的 smoke test + 结果。
+- **`config.jsonc` 不得 commit** —— 设备级运行时配置，由
+  `ConfigStore._seed_defaults()` 在文件缺失时自动落盘（device_name /
+  model_path / 算力实例绑定 / 提示词覆盖等）；每台机器独立维护，**不**
+  入版本库。已在 `.gitignore` 排除。改动 preset 默认值只改
+  `MODEL_PRESETS` / 相关 spec factory / `_seed_defaults`，由运行时
+  自动生成新文件；agent 不要"先编辑 config.jsonc 再 commit 进去"。
 
 ## 算力注册中心 — per-model-subprocess RPC (v0.4)
 
@@ -859,6 +865,10 @@ shared session — see "Resource budget" below.
   per-channel one.
 
 ## Configuration
+
+> **不要 commit `config.jsonc`** —— 设备级运行时配置，由
+> `ConfigStore._seed_defaults()` 自动生成，每台机器独立维护；详见
+> [修改守则](#修改守则)。已 `.gitignore` 排除。
 
 The service reads a single JSONC file `config.jsonc` from disk and
 holds it in memory. The file is seeded with a `base` section at
