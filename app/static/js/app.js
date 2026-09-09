@@ -5686,8 +5686,12 @@ const ComputeConfigPage = {
       h.pidEl.style.display = "none";
     }
 
-    // ---- 重启按钮：只 spawned 显示；loading 时禁用
-    h.restartBtn.style.display = (isOrphan || isUnavail) ? "none" : "";
+    // ---- 重启按钮：仅 spawned 且模型已加载（running / loading / error）
+    // 时显示；loading 时禁用；卸载后（not_loaded / missing_model_dir）
+    // 必须隐藏 —— 否则用户在禁用态残留看到按钮是 UX bug。adopted_local
+    // / unavailable 本就无 Popen 句柄，always 隐藏。
+    const isOff = state === "not_loaded" || state === "missing_model_dir";
+    h.restartBtn.style.display = (isOrphan || isUnavail || isOff) ? "none" : "";
     h.restartBtn.disabled = isLoad;
 
     // ---- toggle 状态
