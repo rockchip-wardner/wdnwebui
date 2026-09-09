@@ -1690,6 +1690,9 @@ const VTD = {
 };
 const VTDDetector = {
   events: [],
+  renderedIds: new Set(),
+  eventNodes: new Map(),
+  MAX_RENDERED: 50,
   refresh() { return refreshVtdDetector(); },
 };
 
@@ -1858,59 +1861,134 @@ function refreshVtdButtons(state) {
   }
 }
 
-function addVtdEvent(ev) {
-  VTDDetector.events.unshift(ev);
-  if (VTDDetector.events.length > 200) VTDDetector.events.length = 200;
-  renderVtdEventList();
+function buildVtdEventLi(ev, isLatest) {
+  const li = document.createElement("li");
+  li.className = "vd-event" + (isLatest ? " latest" : "");
+  li.dataset.evId = String(ev.id);
+  const meta = document.createElement("div");
+  meta.className = "vd-event-meta";
+  const tsSpan = document.createElement("span");
+  tsSpan.textContent = fmtEventTime(ev.ts);
+  const fpSpan = document.createElement("span");
+  fpSpan.textContent = "帧 " + (ev.frame_pos ?? "?");
+  const tag = document.createElement("span");
+  tag.className = "tag";
+  tag.textContent = "#" + ev.id;
+  meta.appendChild(tsSpan);
+  meta.appendChild(fpSpan);
+  meta.appendChild(tag);
+  const body = document.createElement("div");
+  body.className = "vd-event-body";
+  if (ev.tool_call === "target_detection" && ev.crop_b64) {
+    const thumb = document.createElement("img");
+    thumb.className = "vtd-crop-thumb";
+    thumb.alt = "目标检测剪裁";
+    thumb.dataset.src = "data:image/jpeg;base64," + ev.crop_b64;
+    body.appendChild(thumb);
+  }
+  const text = document.createElement("div");
+  text.className = "vd-event-text";
+  const rawText = (ev.desc && String(ev.desc).trim())
+               || (ev.text && String(ev.text).trim())
+               || "(空)";
+  text.textContent = sanitizeEventText(rawText);
+  body.appendChild(text);
+  li.appendChild(meta);
+  li.appendChild(body);
+  return li;
 }
+
+const vtdThumbObserver = ("IntersectionObserver" in window)
+  ? new IntersectionObserver((entries, obs) => {
+      for (const ent of entries) {
+        if (ent.isIntersecting) {
+          const img = ent.target;
+          if (img.dataset.src && !img.src) {
+            img.src = img.dataset.src;
+            delete img.dataset.src;
+          }
+          obs.unobserve(img);
+        }
+      }
+    }, { rootMargin: "120px" })
+  : null;
+
+function mountVtdThumb(img) {
+  if (!img) return;
+  if (!img.dataset.src) return;
+  if (vtdThumbObserver) {
+    vtdThumbObserver.observe(img);
+    return;
+  }
+  if (!img.src) img.src = img.dataset.src;
+  delete img.dataset.src;
+}
+
+function trimVtdEventList(list) {
+  while (VTDDetector.renderedIds.size > VTDDetector.MAX_RENDERED) {
+    const oldestId = list.lastElementChild
+      ? Number(list.lastElementChild.dataset.evId)
+      : null;
+    if (oldestId == null || Number.isNaN(oldestId)) break;
+    const node = VTDDetector.eventNodes.get(oldestId);
+    if (node) {
+      try { node.remove(); } catch (_) { /* ignore */ }
+    }
+    VTDDetector.eventNodes.delete(oldestId);
+    VTDDetector.renderedIds.delete(oldestId);
+  }
+}
+
 function renderVtdEventList() {
   const list = document.getElementById("vtd-event-list");
   const count = document.getElementById("vtd-events-count");
   if (!list || !count) return;
   count.textContent = VTDDetector.events.length + " 条";
+  list.innerHTML = "";
+  VTDDetector.renderedIds.clear();
+  VTDDetector.eventNodes.clear();
   if (VTDDetector.events.length === 0) {
     list.innerHTML =
       '<li class="vd-event-empty">尚未检测到目标，启动检测后结果显示在这里。</li>';
     return;
   }
-  list.innerHTML = "";
-  VTDDetector.events.forEach((ev, idx) => {
-    const li = document.createElement("li");
-    li.className = "vd-event" + (idx === 0 ? " latest" : "");
-    const meta = document.createElement("div");
-    meta.className = "vd-event-meta";
-    const tsSpan = document.createElement("span");
-    tsSpan.textContent = fmtEventTime(ev.ts);
-    const fpSpan = document.createElement("span");
-    fpSpan.textContent = "帧 " + (ev.frame_pos ?? "?");
-    const tag = document.createElement("span");
-    tag.className = "tag";
-    tag.textContent = "#" + ev.id;
-    meta.appendChild(tsSpan);
-    meta.appendChild(fpSpan);
-    meta.appendChild(tag);
-    const body = document.createElement("div");
-    body.className = "vd-event-body";
-    if (ev.tool_call === "target_detection" && ev.crop_b64) {
-      const thumb = document.createElement("img");
-      thumb.className = "vtd-crop-thumb";
-      thumb.alt = "目标检测剪裁";
-      thumb.src = "data:image/jpeg;base64," + ev.crop_b64;
-      body.appendChild(thumb);
-    }
-    const text = document.createElement("div");
-    text.className = "vd-event-text";
-    // ``ev.desc`` 是模型对 ROI 的描述（target_detection 专用字段）；
-    // 若为空回退到 ``ev.text``。前端始终展示模型给出的描述文本。
-    const rawText = (ev.desc && String(ev.desc).trim())
-                 || (ev.text && String(ev.text).trim())
-                 || "(空)";
-    text.textContent = sanitizeEventText(rawText);
-    body.appendChild(text);
-    li.appendChild(meta);
-    li.appendChild(body);
+  const slice = VTDDetector.events.slice(0, VTDDetector.MAX_RENDERED);
+  for (const ev of slice) {
+    const li = buildVtdEventLi(ev, ev === slice[0]);
     list.appendChild(li);
-  });
+    VTDDetector.renderedIds.add(ev.id);
+    VTDDetector.eventNodes.set(ev.id, li);
+    const thumb = li.querySelector("img.vtd-crop-thumb");
+    if (thumb) mountVtdThumb(thumb);
+  }
+}
+
+function appendVtdEventLi(ev) {
+  const list = document.getElementById("vtd-event-list");
+  if (!list) return;
+  const emptyLi = list.querySelector(".vd-event-empty");
+  if (emptyLi) {
+    list.innerHTML = "";
+    VTDDetector.renderedIds.clear();
+    VTDDetector.eventNodes.clear();
+  }
+  const prevLatest = list.querySelector(".vd-event.latest");
+  if (prevLatest) prevLatest.classList.remove("latest");
+  const li = buildVtdEventLi(ev, true);
+  list.insertBefore(li, list.firstChild);
+  VTDDetector.renderedIds.add(ev.id);
+  VTDDetector.eventNodes.set(ev.id, li);
+  const thumb = li.querySelector("img.vtd-crop-thumb");
+  if (thumb) mountVtdThumb(thumb);
+  trimVtdEventList(list);
+}
+
+function addVtdEvent(ev) {
+  VTDDetector.events.unshift(ev);
+  if (VTDDetector.events.length > 200) VTDDetector.events.length = 200;
+  appendVtdEventLi(ev);
+  const count = document.getElementById("vtd-events-count");
+  if (count) count.textContent = VTDDetector.events.length + " 条";
 }
 let vtdBadgeHideTimer = null;
 function showVtdEventBadge(ev) {
@@ -1931,9 +2009,16 @@ function showVtdEventBadge(ev) {
 }
 
 let vtdCropHideTimer = null;
+let vtdCropLastShownTs = 0;
+const VTD_CROP_POPUP_MIN_INTERVAL_MS = 2500;
 function showVtdCropPopup(cropB64, w, h) {
   const overlay = document.getElementById("vtd-overlay");
   if (!overlay || !cropB64) return;
+  const now = performance.now();
+  if (now - vtdCropLastShownTs < VTD_CROP_POPUP_MIN_INTERVAL_MS) {
+    return;
+  }
+  vtdCropLastShownTs = now;
   const existing = overlay.querySelector(".vtd-crop-popup");
   if (existing) {
     try { existing.remove(); } catch (_) { /* ignore */ }
@@ -2112,6 +2197,8 @@ async function vtdEventsClear() {
   try {
     await fetch(API_PREFIX + "/video-target-detection/events/clear", { method: "POST" });
     VTDDetector.events = [];
+    VTDDetector.renderedIds.clear();
+    VTDDetector.eventNodes.clear();
     renderVtdEventList();
   } catch (_) {}
 }
