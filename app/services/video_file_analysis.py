@@ -1090,17 +1090,21 @@ FINAL_MAX_NEW_TOKENS           = 280     # pass 2 最终综述硬控输出（v0.
 # 单次 LLM 推理的 asyncio.wait_for 上限（秒）。
 # - qwen3-vl-4b / qwen2.5-vl-3b 健康推理 ~0.5-3s, 5s 已够
 # - qwen3.5-vl-4b schema-constrained mode (~46% 概率 schema-echo, 详见
-#   commit 5c33fb3) 稳态 5.5-6s —— wire RPC 层 5c33fb3 已对齐 10s,
-#   Python 层 5s 误杀健康慢路径导致用户看到"推理失败"
-# - 与 rpc_session_proxy._sync_call._call_resilient(timeout_ms=10_000)
-#   对齐, 两层都触底时序几乎重合
+#   commit 5c33fb3) 稳态 5.5-6s
+# - 方案B: 10s → 15s, 给健康慢路径 5s 余量 (commit 6fa3df9 修字段后
+#   用户报 "(推理失败：超时 10s SDK 未响应)" 概率性出现, 真机
+#   NPU 暂忙 / prefill 长 / 其他并发偷 NPU 都会让单次跑 > 10s)
+# - wire RPC 层同步对齐到 15s (rpc_session_proxy._call_resilient),
+#   避免 wire 先于 Python 触底留下 "discovery_pending" 误报
 # - 兜底不变: _on_call_timeout ≥2 次连续 timeout → worker restart
-_INFER_TIMEOUT_SEC             = 10.0
+# - 下一步: telemetry (verify_vfa_infer_telemetry.py 已加) 收一晚数据
+#   决定 15s 是否够, 不够再调 (但若需 ≥ 30s 就要查 NPU / 长 context 真因)
+_INFER_TIMEOUT_SEC             = 15.0
 
 # 60s 窗口 infer telemetry —— 让运维看到真实慢路径分布, 后续 v0.16+
 # 可基于 p95 数据细化 timeout / 调度 / NPU 预算. 不影响任何 service 模块.
 _INFER_TELEMETRY_WINDOW_SEC     = 60.0   # 检查窗口
-_INFER_TELEMETRY_P95_WARN_SEC   = 4.5    # 接近 _INFER_TIMEOUT_SEC 10 的一半, 提前预警
+_INFER_TELEMETRY_P95_WARN_SEC   = 4.5    # 接近 _INFER_TIMEOUT_SEC 15 的一半, 提前预警
 _INFER_TELEMETRY_MAXLEN         = 200    # deque 上限, ~3-4 分钟滚动窗口 (1fps VFA)
 
 # 慢路径 per-call timeout 上限（秒）。per-frame 走默认 5s 守住
@@ -2576,7 +2580,7 @@ class VideoFileAnalysisService:
         设计: 抽样 (而不是每帧) + 周期检查 (而不是 per-frame LOG)。
         - 200 帧 deque = ~3-4 分钟 (1fps VFA) 滚动, 长窗口更平滑
         - 60s 节流: 避免 1fps VFA 每帧 1 行 LOG 刷屏
-        - p95 > 4.5s 阈值 = 接近 _INFER_TIMEOUT_SEC 10s 的一半, 提前预警
+        - p95 > 4.5s 阈值 = 接近 _INFER_TIMEOUT_SEC 15s 的一半, 提前预警
           慢路径聚集 (例如: 多人同时跑 / NPU 抢占 / 队列调度), 让运维
           在 timeout 真的开始报错前就能看到
         - 不影响任何 service 模块, 仅 +1 dict append + period LOG
@@ -2605,7 +2609,7 @@ class VideoFileAnalysisService:
         if p95 > _INFER_TELEMETRY_P95_WARN_SEC:
             LOG.warning(
                 "vfa: infer duration telemetry (60s window, n=%d): "
-                "p50=%.2fs p95=%.2fs p99=%.2fs — 接近 _INFER_TIMEOUT_SEC=10s, "
+                "p50=%.2fs p95=%.2fs p99=%.2fs — 接近 _INFER_TIMEOUT_SEC=15s, "
                 "建议排查 NPU 抢占 / 队列调度 / 上下文长度",
                 n, p50, p95, p99,
             )

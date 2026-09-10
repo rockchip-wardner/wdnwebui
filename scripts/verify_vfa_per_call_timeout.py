@@ -256,8 +256,8 @@ def test_summary_constants_above_5s():
     """
     from app.services import video_file_analysis as vfa_mod
     per_frame = vfa_mod._INFER_TIMEOUT_SEC
-    assert per_frame == 10.0, (
-        f"FAIL: per-frame default must be 10s (v0.15 方案A 对齐 wire), "
+    assert per_frame == 15.0, (
+        f"FAIL: per-frame default must be 15s (v0.15 方案B 缓解 10-12s 健康慢路径), "
         f"got {per_frame}"
     )
     assert vfa_mod.RESCUE_TIMEOUT_SEC > per_frame, (

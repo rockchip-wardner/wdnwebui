@@ -1,8 +1,9 @@
-"""Smoke test: 验证 v0.15 per-frame timeout 10s 真在 SDK 卡死时触发。
+"""Smoke test: 验证方案B per-frame timeout 15s (默认) + 10s (显式 override) 真在 SDK 卡死时触发。
 
-VFA 线上报 "(推理失败：超时 10s SDK 未响应)" 概率性出现。
+VFA 线上报 "(推理失败：超时 15s SDK 未响应)" 概率性出现。
 本测试用 mock 模拟 SDK 慢响应, 验证:
-1. SDK > 10s 时 _call_llm 返回 timeout 错误 string (10s 路径生效)
+1. SDK > 15s 时 _call_llm 返回 timeout 错误 string (默认 15s 路径生效)
+2. 显式 timeout_sec=10.0 仍 work (per-call override 不被 15s 默认值吞掉)
 2. _on_call_timeout 触发, _consecutive_timeouts 计数 +1
 3. SDK > 30s 时 仍能走 _interrupt_rknn_session(5s) 兜底 (路径 2738)
 4. 超时后 runner thread 仍存活 (t.join 返回, 但 finished[0] 已 True)
@@ -102,36 +103,37 @@ def _make_service_stubbed(stub_session):
 # --------------------------------------------------------------------------- #
 # Tests                                                                       #
 # --------------------------------------------------------------------------- #
-def test_10s_timeout_fires_for_12s_sdk_call():
-    """SDK 真实 12s 响应 + 10s per-frame timeout → 命中 "(推理失败：超时 10s SDK 未响应)"。
+def test_15s_timeout_default_for_17s_sdk_call():
+    """SDK 真实 17s 响应 + 默认 15s per-frame timeout (方案B) → 命中 "(推理失败：超时 15s SDK 未响应)"。
 
-    模拟 "健康慢但超过 10s" 的场景: SDK 是健康的 (不是卡死), 只是
-    schema-echo / 长 context / NPU 暂忙 让单次跑 12s。
+    模拟 "健康慢但超过 15s" 的场景: SDK 是健康的 (不是卡死), 只是
+    schema-echo / 长 context / NPU 暂忙 让单次跑 17s。
 
     预期:
-    - _call_llm 总 wall-time ≈ 10s (asyncio.wait_for + t.join 同上限)
-    - 返回字符串以 "(推理失败：超时 10s SDK 未响应)" 开头
+    - _call_llm 总 wall-time ≈ 15s (asyncio.wait_for + t.join 同上限)
+    - 返回字符串以 "(推理失败：超时 15s SDK 未响应)" 开头
     - _on_call_timeout 触发 (path 2722 总是调, 计数 +1, ≥2 才真重启)
     - SDK 实际没跑完 (cancelled 在 Python 层, C 继续在 background)
-    - _record_infer_duration 记录 ≈ 10s
+    - _record_infer_duration 记录 ≈ 15s
     """
-    sess = _StubSessionSlowSDK(sdk_delay_sec=12.0)
+    sess = _StubSessionSlowSDK(sdk_delay_sec=17.0)
     svc, patches = _make_service_stubbed(sess)
     try:
         t0 = time.time()
-        result = svc._call_llm("test", None, timeout_sec=10.0)
+        # 关键: 不传 timeout_sec → 走 _INFER_TIMEOUT_SEC=15s 默认
+        result = svc._call_llm("test", None)
         elapsed = time.time() - t0
-        # wall-time 应 ~10s (Python 层 timeout 触发, 不等 SDK 跑完)
-        assert 9.5 <= elapsed <= 11.5, (
-            f"FAIL: wall-time {elapsed:.2f}s 不在 [9.5, 11.5] "
-            f"(Python 层 10s timeout 没生效?)"
+        # wall-time 应 ~15s (Python 层 timeout 触发, 不等 SDK 跑完)
+        assert 14.5 <= elapsed <= 16.5, (
+            f"FAIL: wall-time {elapsed:.2f}s 不在 [14.5, 16.5] "
+            f"(Python 层 15s 默认 timeout 没生效?)"
         )
         # 返回字符串
         assert isinstance(result, str) and result.startswith("("), (
             f"FAIL: 期望 error string, got {result!r}"
         )
-        assert "10s" in result, (
-            f"FAIL: 返回字符串应包含 '10s' 反映实际 timeout, got {result!r}"
+        assert "15s" in result, (
+            f"FAIL: 返回字符串应包含 '15s' 反映默认 timeout, got {result!r}"
         )
         # path 2722 总是调 _on_call_timeout (不分 SDK 健康还是卡死,
         # ≥2 次连续才真重启 worker), 单次只 +1
@@ -139,7 +141,7 @@ def test_10s_timeout_fires_for_12s_sdk_call():
             f"FAIL: 1 次 timeout 应 _on_call_timeout +1, "
             f"got {svc._consecutive_timeouts}"
         )
-        # _record_infer_duration 记录 ≈ 10s (SDK 实际跑了 10s+)
+        # _record_infer_duration 记录 ≈ 15s
         assert len(svc._infer_durations) >= 1, "FAIL: telemetry 没记录"
         # SDK 实际没跑完 (Python 层 cancel 后 C 还在 background)
         assert sess.respond_completed is False, (
@@ -147,8 +149,8 @@ def test_10s_timeout_fires_for_12s_sdk_call():
             f"但 completed={sess.respond_completed} (C 层没被中断)"
         )
         LOG.info(
-            "✓ test_10s_timeout_fires_for_12s_sdk_call: "
-            "elapsed=%.2fs result=%r consecutive={}",
+            "✓ test_15s_timeout_default_for_17s_sdk_call: "
+            "elapsed=%.2fs result=%r consecutive=%d",
             elapsed, result[:60], svc._consecutive_timeouts,
         )
     finally:
@@ -178,7 +180,7 @@ def test_5s_override_honored():
             p.stop()
 
 
-def test_15s_sdk_completes_within_10s_timeout():
+def test_explicit_10s_override_still_works():
     """SDK 真正 15s → Python 层 10s 提前 cancel (asyncio.wait_for 真触发)。
 
     asyncio.wait_for 真实计时: SDK coroutine 等待 10s 后被 cancel。
@@ -193,10 +195,10 @@ def test_15s_sdk_completes_within_10s_timeout():
         t0 = time.time()
         result = svc._call_llm("test", None, timeout_sec=10.0)
         elapsed = time.time() - t0
-        # asyncio.wait_for 真 cancel, 不等 15s
+        # asyncio.wait_for 真 cancel, 不等 15s (10s override 路径)
         assert 9.5 <= elapsed <= 11.5, (
-            f"FAIL: elapsed {elapsed:.2f}s 接近 15s 表明 asyncio.wait_for "
-            f"没真 cancel (SDK coroutine 还在跑) → Python 层 timeout 失效"
+            f"FAIL: elapsed {elapsed:.2f}s 不在 [9.5, 11.5] "
+            f"(10s override 失效 或 asyncio.wait_for 没真 cancel)"
         )
         # 关键: SDK 实际没跑完 (cancel 生效)
         assert sess.respond_completed is False, (
@@ -204,10 +206,10 @@ def test_15s_sdk_completes_within_10s_timeout():
         )
         assert sess.respond_started_at is not None, "SDK 都没开始"
         # 整体超时 10s 路径触发
-        assert "(推理超时" in result or "超时 10s" in result, (
-            f"FAIL: 应走 path 2738 (asyncio.wait_for 真 cancel), got {result!r}"
+        assert "10s" in result, (
+            f"FAIL: 应返回 timeout 10s error string (override 反映), got {result!r}"
         )
-        LOG.info("✓ test_15s_sdk_completes_within_10s_timeout: "
+        LOG.info("✓ test_explicit_10s_override_still_works: "
                  "elapsed=%.2fs SDK_cancelled=%s result=%r",
                  elapsed, not sess.respond_completed, result[:60])
     finally:
@@ -219,6 +221,7 @@ def test_hang_forever_kicks_off_consecutive_timeout():
     """SDK 真正 hang 死 → 10s 路径触发 + _on_call_timeout 计数 +1。
 
     模拟 wedged NPU / C 层卡死: sess.respond 永不 resolve。
+    显式 timeout_sec=10.0 (验证 hang 路径不被默认 15s 吞掉)。
     _call_llm 走超时分支, _on_call_timeout 计数 (不立即 restart, 需 ≥2)。
     """
     sess = _StubSessionHangsForever()
@@ -227,6 +230,7 @@ def test_hang_forever_kicks_off_consecutive_timeout():
         t0 = time.time()
         result = svc._call_llm("test", None, timeout_sec=10.0)
         elapsed = time.time() - t0
+        # hang + 10s override → wall ≈ 10s
         assert 9.5 <= elapsed <= 11.5, (
             f"FAIL: elapsed {elapsed:.2f}s (hang 应该 ~10s timeout)"
         )
@@ -236,6 +240,7 @@ def test_hang_forever_kicks_off_consecutive_timeout():
             f"got _consecutive_timeouts={svc._consecutive_timeouts}"
         )
         assert result.startswith("(")
+        assert "10s" in result
         LOG.info(
             "✓ test_hang_forever_kicks_off_consecutive_timeout: "
             "elapsed=%.2fs consecutive_timeouts=%d",
@@ -277,12 +282,12 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     cases = (
-        ("test_10s_timeout_fires_for_12s_sdk_call",
-         test_10s_timeout_fires_for_12s_sdk_call),
+        ("test_15s_timeout_default_for_17s_sdk_call",
+         test_15s_timeout_default_for_17s_sdk_call),
         ("test_5s_override_honored",
          test_5s_override_honored),
-        ("test_15s_sdk_completes_within_10s_timeout",
-         test_15s_sdk_completes_within_10s_timeout),
+        ("test_explicit_10s_override_still_works",
+         test_explicit_10s_override_still_works),
         ("test_hang_forever_kicks_off_consecutive_timeout",
          test_hang_forever_kicks_off_consecutive_timeout),
         ("test_fast_call_completes_normally",

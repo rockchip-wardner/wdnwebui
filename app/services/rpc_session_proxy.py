@@ -954,16 +954,16 @@ class _RpcSessionProxy:
         if isinstance(_image_size, int) and not isinstance(_image_size, bool):
             payload["image_size"] = _image_size
 # infer 路径走 ``_call_resilient``：
-        # wire RPC 超时:infer 走 10s（覆盖 Qwen3.5-VL-4B schema-echo
-        # 边界）—— Qwen3.5-VL-4B 在 schema-constrained 模式有 ~46% 概率
-        # 复述 SDK 注入的 schema definition（schema-echo），LLM decoder
-        # 跑 ~500 token，稳态 5.5-5.6s。低于 5s 会把这条"健康但慢"的
-        # 路径误判成 timeout → worker reply 丢失 → 主进程 raise →
-        # detector 报 frame infer crashed。其他 wire RPC（info / reset /
-        # chat_stop）保持 5s 不变。
-        # 不重试不延后,立即 raise 让上层 (detector / VFA / chat) 走错误
-        # 处理路径,而不是花 720s 等 worker 自己完成。
-        reply = self._call_resilient(payload, timeout_ms=10_000,
+        # wire RPC 超时:infer 走 15s —— 与 video_file_analysis
+        # ._INFER_TIMEOUT_SEC 对齐 (方案B)。Qwen3.5-VL-4B 在
+        # schema-constrained 模式有 ~46% 概率复述 SDK 注入的 schema
+        # definition (schema-echo, 详见 commit 5c33fb3), 稳态 5.5-6s,
+        # 但真机 NPU 暂忙 / prefill 长 偶尔跑到 10-12s。5c33fb3 设
+        # 5s → 后改 10s → 这次 15s 给 5s 余量。兜底: _on_call_timeout
+        # ≥2 次连续 timeout → worker restart。其他 wire RPC (info /
+        # reset / chat_stop) 保持 5s 不变。不重试不延后,立即 raise 让上层
+        # (detector / VFA / chat) 走错误处理路径,而不是花 720s 等 worker。
+        reply = self._call_resilient(payload, timeout_ms=15_000,
                                      soft_retries=0, hard_retries=0)
         if not reply.get("ok"):
             err = reply.get("error", "unknown error")

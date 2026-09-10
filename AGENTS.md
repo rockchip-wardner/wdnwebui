@@ -259,6 +259,17 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   LAN peer + local 自动支持任意大小 payload。需 wdndds 仓库 review
   节奏配合，独立排期。
 
+* **VFA per-frame timeout 方案B (10s → 15s, 配套 wire RPC 10s → 15s)**:
+  - 5c33fb3 设 5s → 后续 10s 都覆盖 qwen3.5-vl-4b schema-echo 健康路径
+  - 但线上仍偶发 `(推理失败：超时 10s SDK 未响应)`, 真机 NPU 暂忙 /
+    prefill 长 / 其他并发偷 NPU 让单次跑 10-12s
+  - 方案B: 默认 15s 给 5s 余量, 跟 wire RPC 同步 (避免 wire 先触底
+    留下 `discovery_pending` 误报错误)
+  - 下一步: telemetry (commit cd74486 加的 _record_infer_duration 60s
+    窗口 p95 告警) 收一晚真实 p50/p95/p99 数据决定 15s 是否够, 不够
+    再调 (但若 ≥ 30s 就要查 NPU / 长 context 真因, 不应再加 timeout)
+  - 真机 VFA 服务需 restart 才能让新默认值生效
+
 ### 内存模型：主进程 RSS 稳态 ~300 MB（修复后）
 
 主进程 RSS 由三部分组成（`/proc/PID/smaps_rollup` 看）：
