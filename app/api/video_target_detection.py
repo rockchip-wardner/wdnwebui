@@ -72,9 +72,9 @@ async def set_prompt(payload: dict) -> dict:
     Body: ``{prompt: str, every_n: int, image_size: int | None,
              model_id: str | None}``
     — ``prompt`` 必填；``image_size`` 可选，指定视觉模型目标尺寸
-    （必须由 ``/api/video-detection/available-vision-sizes`` 返回的
-    合法值之一；缺省 / ``None`` = 按帧自动选最近的变体，保留 legacy
-    行为）；``model_id`` 可选，前端下拉框选中的 ``swcap_video_describe``
+    （必须落在 worker 已加载变体尺寸集合 ``available_image_sizes``
+    内；缺省 / ``None`` = 按帧自动选最近的变体，保留 legacy 行为）；
+    ``model_id`` 可选，前端下拉框选中的 ``swcap_video_describe``
     实例 id（不传 / 空 = auto-pick）。
 
     旧版 ``enabled_tools`` 字段不再生效 —— 该页只走 ``TargetDoc``
