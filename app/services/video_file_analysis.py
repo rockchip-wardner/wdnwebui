@@ -1036,7 +1036,6 @@ class FrameEvent:
     id: int
     frame_pos: int
     ts: float
-    prompt: str
     text: str
     structured: Optional[dict] = None
     _dirty: bool = False
@@ -1046,7 +1045,6 @@ class FrameEvent:
             "id":        self.id,
             "frame_pos": self.frame_pos,
             "ts":        self.ts,
-            "prompt":    self.prompt,
             "text":      self.text,
         }
         if self.structured is not None:
@@ -1683,7 +1681,6 @@ class VideoFileAnalysisService:
                     id=int(raw.get("id", 0)),
                     frame_pos=int(raw.get("frame_pos", 0)),
                     ts=float(raw.get("ts", 0.0)),
-                    prompt=str(raw.get("prompt", "")),
                     text=str(raw.get("text", "")),
                     structured=raw.get("structured"),
                 )
@@ -2091,7 +2088,6 @@ class VideoFileAnalysisService:
                 id=self._next_event_id,
                 frame_pos=frame_pos,
                 ts=time.time(),
-                prompt=prompt,
                 text=text,
                 structured=structured_dict,
                 _dirty=is_dirty,
