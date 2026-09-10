@@ -1087,10 +1087,21 @@ SUMMARY_PROMPT_CHAR_BUDGET     = 3000    # 兜底：最终 prompt parts 字符�
 CHUNK_MAX_NEW_TOKENS           = 150     # pass 1 单块硬控输出（v0.10: 200→150，省 ~2s/call）
 FINAL_MAX_NEW_TOKENS           = 280     # pass 2 最终综述硬控输出（v0.10: 400→280，省 ~6s）
 
-# 单次 LLM 推理的 asyncio.wait_for 上限（秒）。统一 5s —— 健康推理
-# 单帧稳态 < 5s,超出必有异常(worker hang / NPU 抢占 / 通道 wedge)。
-# 不留余量让真卡死的 SDK 立即报错而不是 hang 几分钟才被发现。
-_INFER_TIMEOUT_SEC             = 5.0
+# 单次 LLM 推理的 asyncio.wait_for 上限（秒）。
+# - qwen3-vl-4b / qwen2.5-vl-3b 健康推理 ~0.5-3s, 5s 已够
+# - qwen3.5-vl-4b schema-constrained mode (~46% 概率 schema-echo, 详见
+#   commit 5c33fb3) 稳态 5.5-6s —— wire RPC 层 5c33fb3 已对齐 10s,
+#   Python 层 5s 误杀健康慢路径导致用户看到"推理失败"
+# - 与 rpc_session_proxy._sync_call._call_resilient(timeout_ms=10_000)
+#   对齐, 两层都触底时序几乎重合
+# - 兜底不变: _on_call_timeout ≥2 次连续 timeout → worker restart
+_INFER_TIMEOUT_SEC             = 10.0
+
+# 60s 窗口 infer telemetry —— 让运维看到真实慢路径分布, 后续 v0.16+
+# 可基于 p95 数据细化 timeout / 调度 / NPU 预算. 不影响任何 service 模块.
+_INFER_TELEMETRY_WINDOW_SEC     = 60.0   # 检查窗口
+_INFER_TELEMETRY_P95_WARN_SEC   = 4.5    # 接近 _INFER_TIMEOUT_SEC 10 的一半, 提前预警
+_INFER_TELEMETRY_MAXLEN         = 200    # deque 上限, ~3-4 分钟滚动窗口 (1fps VFA)
 
 # 慢路径 per-call timeout 上限（秒）。per-frame 走默认 5s 守住
 # "快速发现 hang"；以下三条已知耗时 > 5s，调用方显式传对应上限避免
@@ -2555,6 +2566,41 @@ class VideoFileAnalysisService:
         """
         self._consecutive_timeouts = 0
 
+    def _record_infer_duration(self, elapsed_sec: float) -> None:
+        """记录单次 _call_llm 耗时到 200 帧滚动 deque; 60s 窗口 p95 > 4.5s 告警。
+
+        设计: 抽样 (而不是每帧) + 周期检查 (而不是 per-frame LOG)。
+        - 200 帧 deque = ~3-4 分钟 (1fps VFA) 滚动, 长窗口更平滑
+        - 60s 节流: 避免 1fps VFA 每帧 1 行 LOG 刷屏
+        - p95 > 4.5s 阈值 = 接近 _INFER_TIMEOUT_SEC 10s 的一半, 提前预警
+          慢路径聚集 (例如: 多人同时跑 / NPU 抢占 / 队列调度), 让运维
+          在 timeout 真的开始报错前就能看到
+        - 不影响任何 service 模块, 仅 +1 dict append + period LOG
+        """
+        self._infer_durations.append(elapsed_sec)
+        now = time.time()
+        if (now - self._last_telemetry_check_ts) < _INFER_TELEMETRY_WINDOW_SEC:
+            return
+        if len(self._infer_durations) < 10:
+            # 样本不足, 跳过本次检查, 等下一轮再 emit
+            self._last_telemetry_check_ts = now
+            return
+        sorted_d = sorted(self._infer_durations)
+        n = len(sorted_d)
+        p50 = sorted_d[n // 2]
+        p95_idx = min(int(n * 0.95), n - 1)
+        p95 = sorted_d[p95_idx]
+        p99_idx = min(int(n * 0.99), n - 1)
+        p99 = sorted_d[p99_idx]
+        if p95 > _INFER_TELEMETRY_P95_WARN_SEC:
+            LOG.warning(
+                "vfa: infer duration telemetry (60s window, n=%d): "
+                "p50=%.2fs p95=%.2fs p99=%.2fs — 接近 _INFER_TIMEOUT_SEC=10s, "
+                "建议排查 NPU 抢占 / 队列调度 / 上下文长度",
+                n, p50, p95, p99,
+            )
+        self._last_telemetry_check_ts = now
+
     def _call_llm(self, prompt: str, frame_bgr, *,
                   max_new_tokens: Optional[int] = None,
                   generating=None,
@@ -2665,6 +2711,7 @@ class VideoFileAnalysisService:
         lock = get_session_call_lock()
         try:
             with lock:
+                t0 = time.time()  # telemetry: SDK call start
                 sess.reset()
                 attachment = [Attachment(frame_bgr)] if frame_bgr is not None else []
                 coro = sess.respond(
@@ -2719,6 +2766,7 @@ class VideoFileAnalysisService:
                                 _eff_timeout)
                     _interrupt_rknn_session(sess, wait_sec=5.0)
                     self._on_call_timeout()
+                    self._record_infer_duration(time.time() - t0)
                     return f"(推理失败：超时 {_eff_timeout:.0f}s SDK 未响应)"
                 if error_holder[0] == "timeout":
                     LOG.warning("vfa: LLM 推理超时（%.0fs），可能 NPU 满载或 prompt 过长",
@@ -2735,6 +2783,7 @@ class VideoFileAnalysisService:
                     # 处理 stop 信号并实际让出 NPU mutex，下次 reset() 不阻塞。
                     _interrupt_rknn_session(sess, wait_sec=5.0)
                     self._on_call_timeout()
+                    self._record_infer_duration(time.time() - t0)
                     return f"(推理超时：{_eff_timeout:.0f}s 内 LLM 未响应)"
                 if error_holder[0] is not None:
                     # 关键：不要 raise！否则 _run_summary 异常退出，
@@ -2743,12 +2792,15 @@ class VideoFileAnalysisService:
                     # 路径（startswith("(")），下游 graceful 处理。
                     LOG.warning("vfa: _call_llm 异常: %s", error_holder[0])
                     self._reset_timeout_counter()
+                    self._record_infer_duration(time.time() - t0)
                     return f"(推理失败：{error_holder[0]})"
                 if result_holder[0] is None:
                     self._reset_timeout_counter()
+                    self._record_infer_duration(time.time() - t0)
                     return f"(推理失败：返回为空)"
                 result = result_holder[0]
                 self._reset_timeout_counter()
+                self._record_infer_duration(time.time() - t0)
         except Exception as e:
             # pydantic.ValidationError：SDK 拿到了 JSON 但字段对不上
             # SceneFrame（如模型输出 {"analysis":"..."} 缺 scene/actors 等字段）。
@@ -2768,6 +2820,7 @@ class VideoFileAnalysisService:
             except ImportError:
                 pass
             LOG.warning("vfa: sess.respond 抛异常: %s", e)
+            self._record_infer_duration(time.time() - t0)
             return f"(推理失败: {e})"
 
         # 调试：记录 SDK 实际返回类型（揭示 JSON 解析失败还是 raw str）

@@ -7,7 +7,12 @@ The final-summary / chunk-summary / rescue-batch calls in VFA are
 legitimately slower than 5s on real hardware (Apollo final summary
 ~25-30s on qwen3-vl-4b per the original 46135b2 commit's own docstring).
 Those calls now pass ``timeout_sec=...`` explicitly so they are not
-killed by the 5s default, while per-frame calls keep the strict 5s.
+killed by the per-frame default, while per-frame calls keep the default.
+
+v0.15 (方案A 短期降级): per-frame default 5s → 10s, 对齐 5c33fb3 wire
+10s 上限。qwen3.5-vl-4b schema-constrained mode ~46% 概率 schema-echo
+稳态 5.5-6s, 5s 误杀健康慢路径。10s 与 wire RPC layer 触底时序几乎重合,
+保留 _on_call_timeout ≥2 次连续 → worker restart 兜底。
 
 This test verifies the contract:
   1. per-call timeout override is honored (asyncio.wait_for sees the
@@ -110,9 +115,14 @@ def _patches_for(registry):
 
 
 def _make_service():
+    from collections import deque
     from app.services.video_file_analysis import VideoFileAnalysisService
     svc = VideoFileAnalysisService.__new__(VideoFileAnalysisService)
     svc._consecutive_timeouts = 0
+    # v0.15 telemetry 字段: 测试 stub service 也得初始化, 否则
+    # _record_infer_duration 调用会 AttributeError
+    svc._infer_durations = deque(maxlen=200)
+    svc._last_telemetry_check_ts = 0.0
     return svc
 
 
@@ -238,28 +248,33 @@ def test_no_override_uses_module_default():
 
 
 def test_summary_constants_above_5s():
-    """Slow-path constants must exceed the 5s default — that's the entire
-    point of the fix. If any regress to ≤5s the regression returns.
+    """Slow-path constants must exceed the per-frame default — that's the entire
+    point of the fix. If any regress to ≤ per-frame, the regression returns.
+
+    v0.15: per-frame default 5s → 10s (对齐 5c33fb3 wire 10s). Slow-path
+    constants (rescue 30s, chunk 30s, final 60s) 必须仍 > per-frame。
     """
     from app.services import video_file_analysis as vfa_mod
-    assert vfa_mod._INFER_TIMEOUT_SEC == 5.0, (
-        f"FAIL: per-frame default must stay 5s, "
-        f"got {vfa_mod._INFER_TIMEOUT_SEC}"
+    per_frame = vfa_mod._INFER_TIMEOUT_SEC
+    assert per_frame == 10.0, (
+        f"FAIL: per-frame default must be 10s (v0.15 方案A 对齐 wire), "
+        f"got {per_frame}"
     )
-    assert vfa_mod.RESCUE_TIMEOUT_SEC > 5.0, (
+    assert vfa_mod.RESCUE_TIMEOUT_SEC > per_frame, (
         f"FAIL: RESCUE_TIMEOUT_SEC={vfa_mod.RESCUE_TIMEOUT_SEC} must "
-        f"exceed 5s (rescue batch legitimately slow)"
+        f"exceed per-frame default {per_frame}s (rescue batch legitimately slow)"
     )
-    assert vfa_mod.CHUNK_TIMEOUT_SEC > 5.0, (
+    assert vfa_mod.CHUNK_TIMEOUT_SEC > per_frame, (
         f"FAIL: CHUNK_TIMEOUT_SEC={vfa_mod.CHUNK_TIMEOUT_SEC} must "
-        f"exceed 5s (chunk summary legitimately slow)"
+        f"exceed per-frame default {per_frame}s (chunk summary legitimately slow)"
     )
-    assert vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC > 5.0, (
+    assert vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC > per_frame, (
         f"FAIL: FINAL_SUMMARY_TIMEOUT_SEC={vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC} "
-        f"must exceed 5s (Apollo final summary ~25-30s on qwen3-vl-4b)"
+        f"must exceed per-frame default {per_frame}s "
+        f"(Apollo final summary ~25-30s on qwen3-vl-4b)"
     )
     return True, {
-        "_INFER_TIMEOUT_SEC":      vfa_mod._INFER_TIMEOUT_SEC,
+        "_INFER_TIMEOUT_SEC":      per_frame,
         "RESCUE_TIMEOUT_SEC":      vfa_mod.RESCUE_TIMEOUT_SEC,
         "CHUNK_TIMEOUT_SEC":       vfa_mod.CHUNK_TIMEOUT_SEC,
         "FINAL_SUMMARY_TIMEOUT_SEC": vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC,
