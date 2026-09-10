@@ -265,8 +265,11 @@ def _load_wdnai() -> dict:
     try:
         from wdnai import (
             Attachment,
+            AudioAttachment,
+            ImageAttachment,
             LLMSession,
             SystemLanguageModel,
+            TextAttachment,
         )
     except ImportError as e:
         raise RuntimeError(f"wdnai import failed: {e}")
@@ -277,6 +280,9 @@ def _load_wdnai() -> dict:
         LOG.warning("chat_stream patch 安装失败（chat 将无流式）：%s", e)
     _WDNAI = {
         "Attachment": Attachment,
+        "AudioAttachment": AudioAttachment,
+        "ImageAttachment": ImageAttachment,
+        "TextAttachment": TextAttachment,
         "LLMSession": LLMSession,
         "SystemLanguageModel": SystemLanguageModel,
     }
@@ -1211,6 +1217,9 @@ def infer_handler(state: dict, payload: dict) -> dict:
     try:
         mod = _load_wdnai()
         Attachment = mod["Attachment"]
+        AudioAttachment = mod["AudioAttachment"]
+        ImageAttachment = mod["ImageAttachment"]
+        TextAttachment = mod["TextAttachment"]
         prompt = payload.get("prompt")
         atts_meta = payload.get("attachment", [])
         # audio 通道参数（omni run_audio 需要）。未传则用 omni 默认
@@ -1333,21 +1342,23 @@ def infer_handler(state: dict, payload: dict) -> dict:
                     except OSError:
                         pass
                 if img is not None:
-                    attachments.append(Attachment(img))
+                    attachments.append(ImageAttachment(img))
                 continue
             if isinstance(item, dict) and "data_b64" in item:
                 # audio 走 tag dict（``kind=="audio"``）；图片走裸 base64 字符串。
                 import base64 as _b64
                 raw = _b64.b64decode(item["data_b64"])
                 if item.get("kind") == "audio":
-                    attachments.append(Attachment(raw, kind="audio"))
+                    attachments.append(AudioAttachment(
+                        raw, mime_type=item.get("mime_type", "audio/wav"),
+                    ))
                     continue
                 import numpy as _np
                 arr = _np.frombuffer(raw, dtype=_np.uint8)
                 import cv2 as _cv2
                 img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
                 if img is not None:
-                    attachments.append(Attachment(img))
+                    attachments.append(ImageAttachment(img))
                 continue
             if isinstance(item, str):
                 try:
@@ -1358,14 +1369,14 @@ def infer_handler(state: dict, payload: dict) -> dict:
                     import cv2 as _cv2
                     img = _cv2.imdecode(arr, _cv2.IMREAD_COLOR)
                     if img is not None:
-                        attachments.append(Attachment(img))
+                        attachments.append(ImageAttachment(img))
                         continue
                 except Exception:
                     pass
-                attachments.append(Attachment(item, kind="text"))
+                attachments.append(TextAttachment(item))
                 continue
             if hasattr(item, "shape"):
-                attachments.append(Attachment(item))
+                attachments.append(ImageAttachment(item))
 
         import asyncio
         generating_cls = None

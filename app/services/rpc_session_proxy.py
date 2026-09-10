@@ -220,15 +220,15 @@ def _bgr_ndarray_to_path(arr) -> dict:
 
 class _AttachmentProxy:
     """Adapter carrying the same attribute surface as
-    :class:`wdnai.Attachment` — ``kind`` / ``mime_type`` / ``data``
-    plus the small accessors ``tts_session.py`` reads.
+    :class:`wdnai.AudioAttachment` — ``kind`` / ``mime_type`` / ``data``
+    (TTS WAV bytes only). New code should use :class:`wdnai.ImageAttachment`
+    / / ``TextAttachment`` / ``AudioAttachment`` directly; this proxy
+    stays around for the wire encode path which historically populated
+    it on the reply side from the worker's ``attachment_b64`` field.
 
-    Kept minimal so we don't have to import the real
-    ``wdnai.Attachment`` (which would pull in RKNN3 native libs
-    eagerly and segfault on a non-RK dev box — see
-    ``WdnaiDetector._load_wdnai`` constraint). The wdnai Attachment
-    is just a dataclass; the only method tts_session uses is
-    ``.data`` / ``.kind`` / ``.mime_type``.
+    Kept minimal so we don't have to import the real wdnai.Attachment
+    tree (which would chain through backends / librknn and segfault on
+    a non-RK dev box — see ``WdnaiDetector._load_wdnai`` constraint).
     """
 
     __slots__ = ("kind", "mime_type", "data")
@@ -1210,24 +1210,49 @@ class _RpcSessionProxy:
         out = []
         for item in attachment:
             try:
-                from wdnai import Attachment as _WdnaiAttach
+                from wdnai import (
+                    Attachment as _WdnaiAttach,
+                    AudioAttachment as _WdnaiAudio,
+                    ImageAttachment as _WdnaiImage,
+                    TextAttachment as _WdnaiText,
+                )
+                if isinstance(item, _WdnaiImage):
+                    # Multi-frame ImageAttachment — each frame ships as
+                    # its own wire entry (data_path for local worker /
+                    # data_b64 JPEG for LAN peer). Worker reconstructs
+                    # one ImageAttachment per frame.
+                    for img in item.images:
+                        if self._is_remote:
+                            out.append(_bgr_ndarray_to_b64(img))
+                        else:
+                            out.append(_bgr_ndarray_to_path(img))
+                    continue
+                if isinstance(item, _WdnaiText):
+                    # Text prefix — sent as a plain string. The worker's
+                    # wire decoder falls through to the text branch.
+                    out.append(item.text)
+                    continue
+                if isinstance(item, _WdnaiAudio):
+                    # Audio bytes — wrap with kind so the worker decoder
+                    # routes to the audio branch (otherwise it would be
+                    # mistaken for a base64 image).
+                    out.append({
+                        "data_b64": base64.b64encode(
+                            bytes(item.data)).decode("ascii"),
+                        "kind":     "audio",
+                    })
+                    continue
+                # Generic Attachment (custom subclass / duck-typed
+                # _AttachmentProxy from older code paths) — fall back to
+                # the historical ``getattr`` probing so existing
+                # serialisation keeps working.
                 if isinstance(item, _WdnaiAttach):
-                    # wdnai.Attachment channels: image/video/text/audio
-                    # (按 ``kind`` 字段)。音频用 dict 包成``data_b64+kind``
-                    # 让 worker 端能识别（否则字符串会被当成 text 兜底）。
                     if getattr(item, "images", None):
                         for img in item.images:
                             if self._is_remote:
                                 out.append(_bgr_ndarray_to_b64(img))
                             else:
                                 out.append(_bgr_ndarray_to_path(img))
-                        continue
-                    if getattr(item, "frames", None):
-                        for fr in item.frames:
-                            if self._is_remote:
-                                out.append(_bgr_ndarray_to_b64(fr))
-                            else:
-                                out.append(_bgr_ndarray_to_path(fr))
                         continue
                     if getattr(item, "text", None):
                         out.append(item.text)

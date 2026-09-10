@@ -36,11 +36,14 @@ def _load_wdnai() -> dict:
     try:
         from wdnai import (
             Attachment,
+            AudioAttachment,
             Field,
             Generable,
+            ImageAttachment,
             LLMSession,
             LMOutput,
             SystemLanguageModel,
+            TextAttachment,
         )
     except ImportError as e:
         LOG.exception("wdnai import failed")
@@ -50,6 +53,9 @@ def _load_wdnai() -> dict:
         )
     _WDNAI_CACHE.update({
         "Attachment": Attachment,
+        "AudioAttachment": AudioAttachment,
+        "ImageAttachment": ImageAttachment,
+        "TextAttachment": TextAttachment,
         "Field": Field,
         "Generable": Generable,
         "LLMSession": LLMSession,
@@ -143,6 +149,8 @@ def run_infer(session, payload: dict) -> dict:
     """
     mod = _load_wdnai()
     Attachment = mod["Attachment"]
+    ImageAttachment = mod["ImageAttachment"]
+    TextAttachment = mod["TextAttachment"]
 
     prompt = payload.get("prompt", "")
     atts_meta = payload.get("attachment", [])  # list of strings
@@ -154,14 +162,14 @@ def run_infer(session, payload: dict) -> dict:
             # build an image attachment; otherwise treat as text.
             try:
                 img = _attachment_from_b64(item)
-                attachments.append(Attachment(img))
+                attachments.append(ImageAttachment(img))
                 continue
             except Exception:
                 pass
-            attachments.append(Attachment(item, kind="text"))
+            attachments.append(TextAttachment(item))
         elif isinstance(item, dict) and "data_b64" in item:
             img = _attachment_from_b64(item["data_b64"])
-            attachments.append(Attachment(img))
+            attachments.append(ImageAttachment(img))
 
     generating_name = payload.get("generating")
     generating_cls = None
