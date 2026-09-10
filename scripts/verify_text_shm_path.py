@@ -291,6 +291,74 @@ def test_worker_infer_handler_reads_is_remote_payload():
 # Runner
 # ----------------------------------------------------------------------------
 
+
+def test_schema_parse_failed_branch_skips_raw_text_when_text_path_set():
+    """worker 端 schema_parse_failed 分支里的 raw_text inline 必须有
+    text_path 守卫,否则长文本 (VFA SceneFrame 解析失败时典型 300+B)
+    与 text_path 重复落 wire → FastCDR ComputeReply.text 255B 静默截断
+    → 主进程 json.loads 失败报 "malformed reply: ...{...scene 小区入口...}"。
+
+    Static AST check: 找 reply["raw_text"] = text 赋值,确认它的
+    父 if 条件里出现 "text_path" not in reply Compare 节点。
+    """
+    import ast as _ast
+    tree = _ast.parse(open("app/services/compute_worker.py").read())
+
+    raw_text_assignment = None
+    for node in _ast.walk(tree):
+        if (isinstance(node, _ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], _ast.Subscript)
+                and isinstance(node.targets[0].value, _ast.Name)
+                and node.targets[0].value.id == "reply"
+                and isinstance(node.targets[0].slice, _ast.Constant)
+                and node.targets[0].slice.value == "raw_text"):
+            raw_text_assignment = node
+            break
+    assert raw_text_assignment is not None, (
+        "FAIL: compute_worker.py 里没找到 reply['raw_text'] = ... 赋值, "
+        "可能已重构,需手动确认回归测试是否仍 relevant"
+    )
+
+    def _parent(tree, target):
+        for p in _ast.walk(tree):
+            for c in _ast.iter_child_nodes(p):
+                if c is target:
+                    return p
+        return None
+
+    def _has_text_path_guard(expr):
+        for sub in _ast.walk(expr):
+            if not isinstance(sub, _ast.Compare):
+                continue
+            for op, comp in zip(sub.ops, sub.comparators):
+                if (isinstance(op, _ast.NotIn)
+                        and isinstance(comp, _ast.Name) and comp.id == "reply"
+                        and isinstance(sub.left, _ast.Constant)
+                        and sub.left.value == "text_path"):
+                    return True
+        return False
+
+    cur = raw_text_assignment
+    guarded = False
+    for _ in range(10):
+        p = _parent(tree, cur)
+        if p is None:
+            break
+        if isinstance(p, _ast.If) and _has_text_path_guard(p.test):
+            guarded = True
+            break
+        cur = p
+    assert guarded, (
+        """FAIL: reply["raw_text"] = text 没有 text_path 守卫!
+VFA SceneFrame 解析失败时 reply 会同时含 text_path + raw_text
+(同一份中文文本塞两次), wire 超过 FastCDR 255B 静默截断,
+主进程 json.loads 失败报 'malformed reply: ...{...scene 小区入口...}'。
+修法: 在 raw_text inline 的 if 里加 `"text_path" not in reply`。"""
+    )
+
+
+
 TESTS = [
     test_threshold_short_text_kept_inline,
     test_threshold_long_text_routed_to_shm,
@@ -303,6 +371,7 @@ TESTS = [
     test_is_remote_short_text_kept_inline,
     test_proxy_payload_contains_is_remote_field,
     test_worker_infer_handler_reads_is_remote_payload,
+    test_schema_parse_failed_branch_skips_raw_text_when_text_path_set,
 ]
 
 

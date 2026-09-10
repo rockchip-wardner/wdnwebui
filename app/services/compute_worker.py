@@ -1853,10 +1853,12 @@ def infer_handler(state: dict, payload: dict) -> dict:
             LOG.error("raw_text (formatted):\n%s", _formatted)
             reply["schema_parse_failed"] = True
             reply["actual_result_type"] = type(result).__name__
-            # 把 raw text 也塞进 reply 给 proxy / diagnostics 看(主进程
-            # 已经从 reply.text 拿到,这里多发一份便于诊断端点区分 raw vs
-            # 清洗后)。
-            if isinstance(text, str):
+            # raw_text 仅在 text_path 没设时 inline (短文本诊断路径):
+            # text_path 已设说明长文本走 SHM path-list,wire 上再 inline
+            # 一份 = FastCDR ComputeReply.text 255B 静默截断 → 主进程
+            # json.loads 失败报 "malformed reply: '...{...scene 小区入口}'"
+            # (VFA SceneFrame 解析失败时必现)。
+            if isinstance(text, str) and "text_path" not in reply:
                 reply["raw_text"] = text
 
         if result_data_dict is not None:
