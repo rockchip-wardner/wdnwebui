@@ -1223,13 +1223,6 @@ async function refreshVdDetector() {
       VDDetector.events = data.events.slice();
       renderVdEventList();
     }
-    // Vision sizes may not have been ready on first page open
-    // (worker still loading). Re-poll on every detector refresh until
-    // the dropdown is enabled at least once.
-    const sizeEl = document.getElementById("vd-detect-size");
-    if (sizeEl && sizeEl.disabled) {
-      vdLoadVisionSizes();
-    }
     // 模型下拉框同理:running 实例可能刚加载完 / 刚停掉,定时再拉
     // 一次保证用户能看到最新的可选实例。
     const modelEl = document.getElementById("vd-model-pick");
@@ -1252,15 +1245,17 @@ async function vdDetectorStart() {
     setVdOverlay("请先填写检测提示词", true);
     return;
   }
-  // image_size：用户从 ``#vd-detect-size`` 选的尺寸。``null``/空
-  // /disabled 时表示"按帧自动选最近变体"，让 backend 走 legacy
-  // auto-pick；服务端校验合法性（必须是 worker 已加载的某个变体
-  // 尺寸，否则 400）。
-  const sizeVal = sizeEl && !sizeEl.disabled ? sizeEl.value : "";
-  const image_size = sizeVal ? parseInt(sizeVal, 10) : null;
-  if (sizeVal && !Number.isFinite(image_size)) {
-    setVdOverlay("检测尺寸值非法: " + sizeVal, true);
-    return;
+  // image_size：用户从 ``#vd-detect-size`` 选的尺寸。"auto"/ 空
+  // 时表示按帧自动选最近变体（后端 auto-pick）；其它值必须落在
+  // 后端允许的尺寸集合内，否则 400。
+  const sizeVal = sizeEl?.value || "";
+  let image_size = null;
+  if (sizeVal && sizeVal !== "auto") {
+    image_size = parseInt(sizeVal, 10);
+    if (!Number.isFinite(image_size)) {
+      setVdOverlay("检测尺寸值非法: " + sizeVal, true);
+      return;
+    }
   }
   const enabled_tools = vdCollectEnabledTools();
   const model_id = (document.getElementById("vd-model-pick")?.value || "") || null;
@@ -1362,59 +1357,6 @@ async function loadModelPick(selId, capability, storageKey) {
   };
   if (insts.length === 0) {
     autoOpt.textContent = "自动 (本机优先 · 无可用实例)";
-  }
-}
-
-/**
- * Populate the ``#vd-detect-size`` dropdown from the worker's
- * currently-loaded vision variants.
- *
- * Data flow:
- *   - GET /api/video-detection/available-vision-sizes returns
- *     ``{"sizes": [...], "default": N}`` from the running qwen3-vl-4b
- *     compute instance (queried via ComputeRegistry → worker info
- *     RPC, never hardcoded on the client).
- *   - Empty list → dropdown disabled + "无可用变体" hint.
- *   - One entry → single option, marked default.
- *   - Multiple entries → all options; first one selected (= smallest
- *     = matches the prior hardcoded 384×384 default).
- */
-async function vdLoadVisionSizes() {
-  const sel  = document.getElementById("vd-detect-size");
-  const hint = document.getElementById("vd-detect-size-hint");
-  if (!sel) return;
-  let data = { sizes: [], default: null };
-  try {
-    const r = await fetch(API_PREFIX + "/video-detection/available-vision-sizes",
-                         { cache: "no-store" });
-    if (r.ok) data = await r.json();
-  } catch (_) { /* best-effort: leave dropdown disabled */ }
-  const sizes = Array.isArray(data.sizes) ? data.sizes.slice().sort((a, b) => a - b) : [];
-  sel.innerHTML = "";
-  if (!sizes.length) {
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = "— 模型未加载 —";
-    sel.appendChild(opt);
-    sel.disabled = true;
-    if (hint) hint.textContent = "无可用变体（等待模型加载）";
-    return;
-  }
-  for (const s of sizes) {
-    const opt = document.createElement("option");
-    opt.value = String(s);
-    opt.textContent = `${s}×${s}`;
-    sel.appendChild(opt);
-  }
-  const def = (typeof data.default === "number" && sizes.includes(data.default))
-    ? String(data.default)
-    : String(sizes[0]);
-  sel.value = def;
-  sel.disabled = false;
-  if (hint) {
-    hint.textContent = sizes.length > 1
-      ? sizes.join(" / ")
-      : `${sizes[0]}×${sizes[0]}（单变体）`;
   }
 }
 
@@ -1551,10 +1493,6 @@ function initVideoDetection() {
   if (window.__vdInit) return;
   window.__vdInit = true;
 
-  // 数据驱动填充 ``#vd-detect-size`` 下拉框 —— 永远不要在
-  // 客户端硬编码 384/768 列表；大小由 qwen3-vl-4b 实例的 worker
-  // info RPC 动态返回。
-  vdLoadVisionSizes();
   // 模型选择下拉框（音视频描述 + 音频理解都走这里）
   loadModelPick("vd-model-pick", "swcap_video_describe", "vd.model_id");
   loadModelPick("vd-audio-model-pick", "swcap_audio_understand", "vd.audio.model_id");
@@ -2079,13 +2017,6 @@ async function refreshVtdDetector() {
       VTDDetector.events = data.events.slice();
       renderVtdEventList();
     }
-    // Vision sizes may not have been ready on first page open
-    // (worker still loading). Re-poll on every detector refresh until
-    // the dropdown is enabled at least once.
-    const sizeEl = document.getElementById("vtd-detect-size");
-    if (sizeEl && sizeEl.disabled) {
-      vtdLoadVisionSizes();
-    }
     return data;
   } catch (_) { return null; }
 }
@@ -2099,15 +2030,17 @@ async function vtdDetectorStart() {
     setVtdOverlay("请先填写检测提示词", true);
     return;
   }
-  // image_size：用户从 ``#vtd-detect-size`` 选的尺寸。``null``/空
-  // /disabled 时表示"按帧自动选最近变体"，让 backend 走 legacy
-  // auto-pick；服务端校验合法性（必须是 worker 已加载的某个变体
-  // 尺寸，否则 400）。
-  const sizeVal = sizeEl && !sizeEl.disabled ? sizeEl.value : "";
-  const image_size = sizeVal ? parseInt(sizeVal, 10) : null;
-  if (sizeVal && !Number.isFinite(image_size)) {
-    setVtdOverlay("检测尺寸值非法: " + sizeVal, true);
-    return;
+  // image_size：用户从 ``#vtd-detect-size`` 选的尺寸。"auto"/ 空
+  // 时表示按帧自动选最近变体（后端 auto-pick）；其它值必须落在
+  // 后端允许的尺寸集合内，否则 400。
+  const sizeVal = sizeEl?.value || "";
+  let image_size = null;
+  if (sizeVal && sizeVal !== "auto") {
+    image_size = parseInt(sizeVal, 10);
+    if (!Number.isFinite(image_size)) {
+      setVtdOverlay("检测尺寸值非法: " + sizeVal, true);
+      return;
+    }
   }
   try {
     const model_id = (document.getElementById("vtd-model-pick")?.value || "") || null;
@@ -2133,58 +2066,6 @@ async function vtdDetectorStart() {
   }
 }
 
-/**
- * Populate the ``#vtd-detect-size`` dropdown from the worker's
- * currently-loaded vision variants.
- *
- * Data flow:
- *   - GET /api/video-detection/available-vision-sizes returns
- *     ``{"sizes": [...], "default": N}`` from the running qwen3-vl-4b
- *     compute instance (queried via ComputeRegistry → worker info
- *     RPC, never hardcoded on the client).
- *   - Empty list → dropdown disabled + "无可用变体" hint.
- *   - One entry → single option, marked default.
- *   - Multiple entries → all options; first one selected (= smallest
- *     = matches the prior hardcoded 384×384 default).
- */
-async function vtdLoadVisionSizes() {
-  const sel  = document.getElementById("vtd-detect-size");
-  const hint = document.getElementById("vtd-detect-size-hint");
-  if (!sel) return;
-  let data = { sizes: [], default: null };
-  try {
-    const r = await fetch(API_PREFIX + "/video-detection/available-vision-sizes",
-                         { cache: "no-store" });
-    if (r.ok) data = await r.json();
-  } catch (_) { /* best-effort: leave dropdown disabled */ }
-  const sizes = Array.isArray(data.sizes) ? data.sizes.slice().sort((a, b) => a - b) : [];
-  sel.innerHTML = "";
-  if (!sizes.length) {
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = "— 模型未加载 —";
-    sel.appendChild(opt);
-    sel.disabled = true;
-    if (hint) hint.textContent = "无可用变体（等待模型加载）";
-    return;
-  }
-  for (const s of sizes) {
-    const opt = document.createElement("option");
-    opt.value = String(s);
-    opt.textContent = `${s}×${s}`;
-    sel.appendChild(opt);
-  }
-  const def = (typeof data.default === "number" && sizes.includes(data.default))
-    ? String(data.default)
-    : String(sizes[0]);
-  sel.value = def;
-  sel.disabled = false;
-  if (hint) {
-    hint.textContent = sizes.length > 1
-      ? sizes.join(" / ")
-      : `${sizes[0]}×${sizes[0]}（单变体）`;
-  }
-}
 async function vtdDetectorStop() {
   try {
     const r = await fetch(API_PREFIX + "/video-target-detection/prompt/stop", { method: "POST" });
@@ -2214,10 +2095,6 @@ function initVideoTargetDetection() {
   if (window.__vtdInit) return;
   window.__vtdInit = true;
 
-  // 数据驱动填充 ``#vtd-detect-size`` 下拉框 —— 永远不要在
-  // 客户端硬编码 384/768 列表；大小由 qwen3-vl-4b 实例的 worker
-  // info RPC 动态返回。
-  vtdLoadVisionSizes();
   // 模型选择下拉框
   loadModelPick("vtd-model-pick", "swcap_video_describe", "vtd.model_id");
 

@@ -667,14 +667,13 @@
               <section class="surv-form-section">
                 <header class="surv-form-head">
                   <h3>检测尺寸</h3>
-                  <span class="surv-hint" id="vd-detect-size-hint">从模型加载中…</span>
                 </header>
                 <div class="surv-field">
                   <label class="surv-input-split">
-                    <select id="vd-detect-size" class="surv-input" disabled>
-                      <!-- 由 JS 从 ``GET /api/video-detection/
-                           available-vision-sizes`` 动态填充；空
-                           列表时显示"无变体"提示。 -->
+                    <select id="vd-detect-size" class="surv-input">
+                      <option value="auto" selected>自动选择</option>
+                      <option value="384">384x384 (更快)</option>
+                      <option value="768">768x768 (更准)</option>
                     </select>
                   </label>
                 </div>
@@ -837,11 +836,13 @@
               <section class="surv-form-section">
                 <header class="surv-form-head">
                   <h3>检测尺寸</h3>
-                  <span class="surv-hint" id="vtd-detect-size-hint">从模型加载中…</span>
                 </header>
                 <div class="surv-field">
                   <label class="surv-input-split">
-                    <select id="vtd-detect-size" class="surv-input" disabled>
+                    <select id="vtd-detect-size" class="surv-input">
+                      <option value="auto" selected>自动选择</option>
+                      <option value="384">384x384 (更快)</option>
+                      <option value="768">768x768 (更准)</option>
                     </select>
                   </label>
                 </div>
