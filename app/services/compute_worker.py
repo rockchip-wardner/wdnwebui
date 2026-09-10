@@ -68,6 +68,18 @@ LOG = logging.getLogger("compute_worker")
 _REPLY_SHM_DIR = "/dev/shm"
 _REPLY_SHM_PREFIX = "wdnwebui_cr_"  # cr = compute reply (crop / result_data)
 
+# v0.15 (LAN peer 降级):
+# 主进程 proxy 在 is_remote=True (LAN peer worker) 时透传该 flag,
+# worker 端跳过所有 /dev/shm path-list 路由, 防止 reply 字段超过
+# FastCDR 255 字节硬截断 → 主进程 JSON parse 失败。后果:
+# - text / result_data / structured / crop_b64 大字段一律 drop
+# - 主进程拿到 None / 空 _ProxyResult._raw, VFA Path 1 garbage
+#   检标"本帧分析失败"占位, 不崩
+# - crop_b64 走主进程 frame_bgr 重新裁切兜底 (现有行为)
+# 一次性 WARNING 标志: per-worker 进程内只 log 一次, 避免每帧
+# repeat 刷屏 (VFA 每秒 1 帧, 1 小时 = 3600 行 log 噪声)。
+_LAN_PEER_WARNED: bool = False
+
 
 def _write_reply_payload_to_shm(payload: bytes, suffix: str) -> Optional[str]:
     # Failure → caller drops the field rather than crashing the worker.
@@ -1222,6 +1234,25 @@ def infer_handler(state: dict, payload: dict) -> dict:
         TextAttachment = mod["TextAttachment"]
         prompt = payload.get("prompt")
         atts_meta = payload.get("attachment", [])
+        # v0.15 LAN peer 降级标记: 主进程 proxy 在 ``is_remote=True`` 时
+        # (跨机 worker, 主机 hostname 不同) 透传该 flag。worker 端跳过
+        # 全部 /dev/shm path-list 路由 (4 个块: crop_b64 / result_data /
+        # structured / text) → 大字段一律 drop, 避免 FastCDR 255 字节
+        # 截断崩 wire。同机 (``is_remote=False``, 默认) 行为不变。
+        is_remote = bool(payload.get("is_remote", False))
+        if is_remote and not _LAN_PEER_WARNED:
+            globals()["_LAN_PEER_WARNED"] = True
+            LOG.warning(
+                "compute_worker[%s]: LAN peer mode (is_remote=True) — "
+                "skipping /dev/shm path-list for all reply payloads. "
+                "Large text / structured / result_data / crop_b64 will be "
+                "dropped (FastCDR 255-byte cap on inline fields). "
+                "Consumer fallback: VFA Path 1 garbage → 解析失败 "
+                "placeholder (no crash); crop_b64 re-crop from frame_bgr. "
+                "Long-term fix: IDL change to sequence<octet> or "
+                "per-call heavy payload topic — see AGENTS.md TODO.",
+                state.get("model_id", "?"),
+            )
         # audio 通道参数（omni run_audio 需要）。未传则用 omni 默认
         # 契约（16 kHz mono s16le），兜底靠 session.py 内部 default。
         options = payload.get("options") or {}
@@ -1670,24 +1701,82 @@ def infer_handler(state: dict, payload: dict) -> dict:
         # ``result_data`` 走 /dev/shm path-list，wire 只传 ~50 字节 path。
         # 主进程 ``RpcSessionProxy._sync_call`` 读文件后填回 ``crop_b64`` /
         # ``result_data``，detector / VFA 看到的是原 shape。
+        #
+        # v0.14 修复 (VFA SceneFrame Path 5 兜底截断):
+        # ``text`` 字段同样受 255 字节限制。VFA SceneFrame 路径下 SDK 解析
+        # 失败 (extract_json 返 None) 时, wdnai/session.py:
+        # _construct_text_instance 构造 SceneFrame(text=<raw_text>,
+        # scene="", actors=[], action="", objects=[], note="") 把整段
+        # 模型原始输出塞进 .text。ab93f37 删了 VFA prompt 示例引导后,
+        # 5 字段 SceneFrame JSON 经常超过 200 字节 JSON-encoded,加上
+        # 模型可能逼近 max_new_tokens=250 上限 → reply.text 整段序列化进
+        # ComputeReply.text 时触发 FastCDR 255 字节静默截断 → 主进程
+        # json.loads 失败报 "malformed reply: '...{...厨房内灶上...橙红'"。
+        # 修法: ``text`` 字段长度 (JSON-encoded) 超过 200 字节时走
+        # /dev/shm path-list,与 ``result_data`` / ``structured`` 路径对称。
+        # 主进程 RpcSessionProxy._decode_reply_shm 读回填 ``data["text"]``,
+        # VFA _call_llm → _split_scene_frame_result Path 2 拿到完整
+        # ``_raw["text"]`` 后, regex 抽 JSON 走智能归一化兜底。
+        # SHM 写失败: 整段 text drop (与 ``crop_b64`` 失败同款),
+        # 主进程拿到 text=None → VFA Path 1 garbage check 标"本帧分析失败"
+        # 占位事件,不崩。
+        text_inline: Optional[str] = text
+        text_path: Optional[str] = None
+        if isinstance(text_inline, str) and text_inline:
+            try:
+                _text_json_bytes = len(json.dumps(
+                    text_inline, ensure_ascii=False).encode("utf-8"))
+            except (TypeError, ValueError):
+                _text_json_bytes = 0
+            if _text_json_bytes > 200:
+                if is_remote:
+                    LOG.warning(
+                        "infer[%s]: LAN peer — dropping %d-byte text "
+                        "(no SHM route, FastCDR 255-byte inline cap)",
+                        _req_id, _text_json_bytes,
+                    )
+                    text_inline = None
+                else:
+                    text_path = _write_reply_payload_to_shm(
+                        text_inline.encode("utf-8"), "txt")
+                    if text_path:
+                        text_inline = None  # proxy 端从 SHM 读回填 data["text"]
+                    else:
+                        LOG.warning(
+                            "infer: failed to route reply.text via /dev/shm — "
+                            "dropping (%d bytes JSON-encoded). main process "
+                            "will see text=None; VFA Path 1 garbage check "
+                            "marks frame as 解析失败 (placeholder, not crash).",
+                            _text_json_bytes,
+                        )
+                        text_inline = None
         reply = {
-            "text": text,
+            "text": text_inline,
             "level": getattr(result, "level", None),
             "tool_call": tool_call_name if is_tool_instance else getattr(result, "tool_call", None),
             "bbox": getattr(result, "bbox", None),
         }
+        if text_path:
+            reply["text_path"] = text_path
         crop_b64_inline = getattr(result, "crop_b64", None)
         if crop_b64_inline:
-            crop_path = _write_crop_b64_to_shm(crop_b64_inline)
-            if crop_path:
-                reply["crop_path"] = crop_path
-            else:
+            if is_remote:
                 LOG.warning(
-                    "infer: failed to route crop_b64 via /dev/shm — "
-                    "dropping (%d chars). main process will re-crop "
-                    "from frame_bgr as fallback.",
-                    len(crop_b64_inline),
+                    "infer[%s]: LAN peer — dropping %d-byte crop_b64 "
+                    "(no SHM route, inline > 255B FastCDR cap)",
+                    _req_id, len(crop_b64_inline),
                 )
+            else:
+                crop_path = _write_crop_b64_to_shm(crop_b64_inline)
+                if crop_path:
+                    reply["crop_path"] = crop_path
+                else:
+                    LOG.warning(
+                        "infer: failed to route crop_b64 via /dev/shm — "
+                        "dropping (%d chars). main process will re-crop "
+                        "from frame_bgr as fallback.",
+                        len(crop_b64_inline),
+                    )
         # ------------------------------------------------------------------ #
         # 诊断 (v0.13): dump worker 给主进程的实际 reply.text (前 800 字符),  #
         # 确认模型真实 raw output 是什么。reply 构造完后插在 result_data/  #
@@ -1776,7 +1865,14 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 rd_size = len(_json_rd.dumps(result_data_dict, ensure_ascii=False).encode("utf-8"))
             except (TypeError, ValueError):
                 rd_size = 0
-            if rd_size > 200:
+            if is_remote:
+                LOG.warning(
+                    "infer[%s]: LAN peer — dropping %d-byte result_data "
+                    "(no SHM route, inline > 255B FastCDR cap; "
+                    "TargetDoc falls back to _ProxyResult._raw defaults)",
+                    _req_id, rd_size,
+                )
+            elif rd_size > 200:
                 rd_path = _write_result_data_to_shm(result_data_dict)
                 if rd_path:
                     reply["result_data_path"] = rd_path
@@ -1812,7 +1908,14 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 sd_size = len(_json_s.dumps(structured_dict, ensure_ascii=False).encode("utf-8"))
             except (TypeError, ValueError):
                 sd_size = 0
-            if sd_size > 100:
+            if is_remote:
+                LOG.warning(
+                    "infer[%s]: LAN peer — dropping %d-byte structured "
+                    "(no SHM route, inline > 255B FastCDR cap; "
+                    "VFA Path 2 will see empty _raw.structured)",
+                    _req_id, sd_size,
+                )
+            elif sd_size > 100:
                 sd_path = _write_result_data_to_shm(structured_dict)
                 if sd_path:
                     reply["structured_path"] = sd_path

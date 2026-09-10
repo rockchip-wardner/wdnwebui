@@ -411,16 +411,57 @@ class _RpcSessionProxy:
         return self._client.call(payload, timeout_ms=timeout_ms)
 
     def _decode_reply_shm(self, data: dict) -> dict:
-        """Replace ``crop_path`` / ``result_data_path`` with their inlined
-        values read from /dev/shm. Mirrors the request-side
-        ``_bgr_ndarray_to_path`` round trip — the worker writes the heavy
-        payload to tmpfs and ships only the path string; we read the file,
-        in-place replace the reference with the original content, and
-        unlink so the file doesn't accumulate across frames.
+        """Replace ``crop_path`` / ``result_data_path`` / ``structured_path``
+        / ``text_path`` with their inlined values read from /dev/shm.
+        Mirrors the request-side ``_bgr_ndarray_to_path`` round trip —
+        the worker writes the heavy payload to tmpfs and ships only the
+        path string; we read the file, in-place replace the reference with
+        the original content, and unlink so the file doesn't accumulate
+        across frames.
 
-        Returns the (mutated) ``data`` dict for chaining. If neither path
+        Returns the (mutated) ``data`` dict for chaining. If no path
         is present, returns ``data`` unchanged.
+
+        v0.14 加 ``text_path`` 处理 (VFA SceneFrame Path 5 兜底截断):
+        当 SDK extract_json 失败返 SceneFrame(text=<raw_text>) 时,
+        整段模型原始输出 (5 字段 SceneFrame JSON, ~200-600 字节)
+        原本会被 FastCDR 在 ComputeReply.text 255 字节处静默截断。
+        worker 改为 JSON-encoded > 200 字节时写 ``/dev/shm/wdnwebui_cr_*.txt``
+        并把 ``data["text"] = None`` + ``data["text_path"] = path``;这里
+        读回 SHM 内容填 ``data["text"]``, 与 ``crop_path`` /
+        ``result_data_path`` / ``structured_path`` 三路同源同款 (都用
+        ``_write_reply_payload_to_shm`` 写、``os.unlink`` 回收,
+        FileNotFoundError 走 warning + None fallback)。VFA
+        ``_split_scene_frame_result`` Path 2 拿到完整 ``_raw["text"]`` 后
+        regex 抽 JSON 走智能归一化兜底 (regex 在 truncation 文本上失败,
+        但在 SHM 读回的完整文本上能拿到 scene/actors/action/objects/text)。
         """
+        text_path = data.get("text_path")
+        if isinstance(text_path, str) and text_path:
+            try:
+                with open(text_path, "rb") as f:
+                    raw_bytes = f.read()
+                data["text"] = raw_bytes.decode("utf-8")
+            except FileNotFoundError:
+                LOG.warning(
+                    "rpc-proxy[%s]: text_path %s missing (worker may "
+                    "have crashed between write and reply) — falling "
+                    "back to None, VFA Path 2 will see empty _raw.text",
+                    self._model_id, text_path,
+                )
+            except (OSError, UnicodeDecodeError) as e:
+                LOG.warning(
+                    "rpc-proxy[%s]: text_path %s read failed: %s",
+                    self._model_id, text_path, e,
+                )
+            finally:
+                try:
+                    import os as _os_text
+                    _os_text.unlink(text_path)
+                except OSError:
+                    pass
+            data.pop("text_path", None)
+
         crop_path = data.get("crop_path")
         if isinstance(crop_path, str) and crop_path:
             try:
@@ -898,6 +939,10 @@ class _RpcSessionProxy:
                                    # on_audio_chunk 流回主进程（bound
                                    # method 不能 pickle，此为唯一通道）。
                                    "tts_pcm_socket_path"}},
+            # v0.15 LAN peer flag: 主进程在 ``_is_remote=True`` 时 (跨机
+            # worker) 透传, worker 端跳过所有 /dev/shm path-list 路由
+            # (4 个 SHM 块全 drop), 避免 FastCDR 255 字节截断崩 wire。
+            "is_remote": self._is_remote,
         }
 # 视觉模型目标尺寸（音视频描述页 ``#vd-detect-size``）——
         # 顶层字段而非 ``options``，因为这是 vision backend 特有的

@@ -222,6 +222,42 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
 * **同 model 不允许重复实例**：`compute_registry.start_one` 校验
   `(npu_index, model_id)` 不重复；UI  已经在加「instance_name」
   之前按 (npu, model) 唯一。
+* **跨机 LAN peer reply-side /dev/shm 不可达（v0.15 短期降级 + 中/长期待办）**：
+  `ComputeReply` IDL 5 个 string 字段（`text` / `level` / `tool_call` /
+  `bbox_json` / `crop_b64`）受 FastCDR 默认 255 字节硬截断。worker 端
+  reply 用 `/dev/shm` path-list（`/dev/shm/wdnwebui_cr_<uuid>.{jpg,json,txt}`）
+  把 > 200 字节的 payload 写**本机** tmpfs、主进程**同机** `/dev/shm` 读回，
+  绕开限制。跨机 LAN peer（`_source == "adopted"`，主机 hostname 不同）
+  时 worker 写到本机 tmpfs、主进程读不到 → 之前 `FileNotFoundError`
+  + VFA 拿到空 `_raw.text` → 占位事件（"不崩但功能全废"）。
+  v0.8.30 的 `get_session` 本机优先 / `embed_video` path-list
+  无 is_remote 守卫同源（见"get_session 本机优先"段）。
+
+  **v0.15 短期降级（已实施）**：`rpc_session_proxy._sync_call` 在
+  payload 加 `is_remote: self._is_remote`；worker `infer_handler` 读到
+  `True` 时 4 个 SHM 路由块（`crop_b64` / `result_data` / `structured` /
+  `text`）全部 drop + per-worker 进程一次性 WARNING log。consumer
+  fallback：VFA Path 1 garbage → "本帧分析失败"占位 / TargetDoc 从
+  `frame_bgr` 重裁 / detector 走 `_ProxyResult._raw` 默认值。同机
+  （`_is_remote=False`，默认）行为完全不变。smoke：
+  `scripts/verify_text_shm_path.py` 11/11 pass。
+
+  **待办 — 中期（方案 C, 估 1-2 天）**：worker 端 `is_remote=True`
+  时把大 payload 走**专用 wdndds topic multi-packet 通路**——复用
+  `wdndds_topic_writer_create` / `wdndds_topic_reader_create` 助手
+  （wdndds 0.4+ 已在 `871d00f` 引入），wire 不受 255 字节限。改动范围
+  仅 `compute_worker.py` + `rpc_session_proxy.py` + 新建一对
+  `wdndds/rpc/result_heavy/<model_id>` topic 句柄，无需动 wdndds
+  IDL / cshim。
+
+  **待办 — 长期（方案 B, 估 3-5 天, 动 wdndds 仓库）**：改
+  `.venv/src/wdndds/idl/compute.idl` 把 `ComputeReply` 5 个 string
+  字段改成 `sequence<octet>`（无界 bytes）+ 用 vendored fastddsgen
+  重新生成 `computePubSubTypes.{cxx,hpp,ipp}` + wdndds cshim
+  rebuild（`bootstrap_wdndds_native.sh`，~20s）+ 主进程 / worker
+  Python 侧用 `bytes` 代替 `str` 走 wire。**治本**：根治 255 字节限制，
+  LAN peer + local 自动支持任意大小 payload。需 wdndds 仓库 review
+  节奏配合，独立排期。
 
 ### 内存模型：主进程 RSS 稳态 ~300 MB（修复后）
 
