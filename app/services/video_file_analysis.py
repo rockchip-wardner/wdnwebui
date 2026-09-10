@@ -1192,6 +1192,10 @@ class VideoFileAnalysisService:
         # 串联等死）。worker 重启 = 30s init 成本，但根治"LLM 队列 N"
         # 队列积压。成功调用一次重置回 0。
         self._consecutive_timeouts = 0
+        # v0.15: infer duration telemetry —— 60s 窗口 p95 告警
+        # deque(maxlen=200) 约 3-4 分钟 1fps VFA 滚动窗口
+        self._infer_durations: deque = deque(maxlen=_INFER_TELEMETRY_MAXLEN)
+        self._last_telemetry_check_ts: float = 0.0
         self._started_at = 0.0
         self._finished_at = 0.0
 
@@ -2576,7 +2580,13 @@ class VideoFileAnalysisService:
           慢路径聚集 (例如: 多人同时跑 / NPU 抢占 / 队列调度), 让运维
           在 timeout 真的开始报错前就能看到
         - 不影响任何 service 模块, 仅 +1 dict append + period LOG
+
+        防御性: 兼容 v0.15 之前启动的旧 instance (那时 __init__ 没
+        初始化 telemetry 字段), 静默跳过 telemetry 即可, 避免
+        AttributeError 把每个 _call_llm 调用都崩掉。
         """
+        if not hasattr(self, "_infer_durations"):
+            return
         self._infer_durations.append(elapsed_sec)
         now = time.time()
         if (now - self._last_telemetry_check_ts) < _INFER_TELEMETRY_WINDOW_SEC:

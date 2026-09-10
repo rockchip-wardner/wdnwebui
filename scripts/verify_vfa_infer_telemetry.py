@@ -214,6 +214,26 @@ def test_skip_check_when_too_few_samples():
         log.removeHandler(handler)
 
 
+def test_defensive_compat_with_old_instance():
+    """防御性: 旧 instance (v0.15 之前启动, __init__ 没初始化 telemetry 字段) 调用
+    _record_infer_duration 静默 no-op, 不抛 AttributeError。
+
+    这是 v0.15 修的"运行中服务不需 restart"合约的核心: 单例被创建时
+    没 _infer_durations 字段, 但 _call_llm 仍能正常调 telemetry 方法
+    (仅 telemetry 不可用, 不影响 VFA 主流程)。
+    """
+    from video_file_analysis import VideoFileAnalysisService
+    svc = VideoFileAnalysisService.__new__(VideoFileAnalysisService)
+    # 不调 __init__, 模拟 v0.15 之前启动的旧 instance: 没 _infer_durations
+    assert not hasattr(svc, "_infer_durations")
+    assert not hasattr(svc, "_last_telemetry_check_ts")
+    # _call_llm 6 个 return 路径调 _record_infer_duration 都不应抛异常
+    for _ in range(20):
+        svc._record_infer_duration(0.5)  # 任意值, 都应静默返回
+    # 仍然没 _infer_durations (方法 no-op, 没创建 deque)
+    assert not hasattr(svc, "_infer_durations")
+
+
 # ----------------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------------
@@ -227,6 +247,7 @@ TESTS = [
     test_60s_throttle,
     test_deque_maxlen_eviction,
     test_skip_check_when_too_few_samples,
+    test_defensive_compat_with_old_instance,
 ]
 
 
