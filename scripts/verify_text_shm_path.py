@@ -333,6 +333,70 @@ def test_scene_frame_docstring_has_total_char_constraint():
     )
 
 
+
+def test_looks_like_schema_echo_unit():
+    """_looks_like_schema_echo 直接单测: 用户报告的样本必须 flag,
+    合法自然语言描述必须 pass。
+
+    配套 fix Qwen3-VL-4B 在 RKNN3 上的 schema-echo 退化 (用户 VFA
+    prompt 是字段名拼接, 模型 echo 回来)。_looks_garbled 漏判
+    (Latin 各 1 次 + 空格分隔 CJK), 这个 detector 补位。
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from video_file_analysis import _looks_like_schema_echo
+
+    # 用户报告样本: 必 flag
+    assert _looks_like_schema_echo("scene 小区入口 actors action objects text") is True, (
+        "FAIL: 用户报告的 schema-echo 样本未被检测"
+    )
+    # 略变体: 仍要 flag
+    assert _looks_like_schema_echo("text scene objects action actors") is True
+    assert _looks_like_schema_echo("note scene objects action actors text") is True
+
+    # 合法自然语言: 必 pass (即使含 1-2 个字段名作为普通词)
+    assert _looks_like_schema_echo(
+        "画面里几个人在厨房做饭, 切菜煮汤。暖色调灯光。"
+    ) is False, "合法描述不应误判"
+    assert _looks_like_schema_echo(
+        "户外街道, 行人走过。远处有车辆。注意观察。"
+    ) is False
+    # 单字段名作为词: pass (阈值 ≥3)
+    assert _looks_like_schema_echo("scene here is a nice view") is False
+    assert _looks_like_schema_echo("动作: 跑步; 对象: 球; 场景: 球场") is False
+
+
+def test_split_scene_frame_result_drops_schema_echo():
+    """_split_scene_frame_result Path 1: SceneFrame 实例的 text 命中
+    schema-echo → 返回 (None, "") 走"本帧分析失败"占位 (与 garbled 同路径)。
+
+    集成测试: 构造 SceneFrame(text=schema-echo 样本, 其它字段=default),
+    调 _split_scene_frame_result, 断言 structured=None 且 text="",
+    模拟前端 event 流程不会渲染 echo 内容。
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from video_file_analysis import (
+        _get_scene_frame_cls,
+        _split_scene_frame_result,
+    )
+    SceneFrame = _get_scene_frame_cls()
+
+    # 用户报告样本 (整段当 text, 其它 default)
+    echoed = SceneFrame(
+        text="scene 小区入口 actors action objects text",
+        scene="",
+        actors=[],
+        action="",
+        objects=[],
+        note=None,
+    )
+    structured, text = _split_scene_frame_result(echoed)
+    assert structured is None, (
+        f"FAIL: schema-echo 应被静默丢弃 (structured=None), "
+        f"got structured={structured}"
+    )
+    assert text == "", f"FAIL: schema-echo 应返回空 text, got {text!r}"
+
+
 # ----------------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------------
@@ -419,6 +483,8 @@ TESTS = [
     test_worker_infer_handler_reads_is_remote_payload,
     test_schema_parse_failed_branch_skips_raw_text_when_text_path_set,
     test_scene_frame_docstring_has_total_char_constraint,
+    test_looks_like_schema_echo_unit,
+    test_split_scene_frame_result_drops_schema_echo,
 ]
 
 

@@ -292,6 +292,33 @@ def _looks_garbled(text: str) -> bool:
     return False
 
 
+# SceneFrame 6 个字段名。合法 SceneFrame.text 是自然语言描述, 含
+# ≥3 个字段名 (Qwen3-VL-4B 在 RKNN3 上 echo schema hint) 即 schema-echo。
+_SCENE_FRAME_FIELD_NAMES = ("scene", "actors", "action", "objects", "text", "note")
+
+
+def _looks_like_schema_echo(text: str) -> bool:
+    """检测 schema-echo 退化输出 (Qwen3-VL-4B RKNN3 概率性故障)。
+
+    典型样本: ``"scene 小区入口 actors action objects text"`` —— 用户
+    VFA prompt 是字段名拼接的退化输入, 模型 echo 回来。``_looks_garbled``
+    漏判 (Latin 字段名每个仅 1 次 + 空格分隔 CJK), 显示成有效 text →
+    前端把 echo 当描述渲染。这里 word-boundary 检测 ≥3 个 SceneFrame
+    字段名即视为 echo 静默丢弃走"本帧分析失败"占位, 与 garbled 同路径。
+    """
+    if not text or len(text) < 10:
+        return False
+    text_lower = text.lower()
+    import re as _re_schema_echo
+    found = 0
+    for name in _SCENE_FRAME_FIELD_NAMES:
+        if _re_schema_echo.search(rf"\b{_re_schema_echo.escape(name)}\b", text_lower):
+            found += 1
+            if found >= 3:
+                return True
+    return False
+
+
 def _split_scene_frame_result(result) -> tuple:
     """把 ``_call_llm(generating=SceneFrame)`` 的返回值拆成
     ``(structured_dict, text)``：
@@ -337,6 +364,15 @@ def _split_scene_frame_result(result) -> tuple:
                     len(text),
                 )
                 # 与 VTD 行为对齐：返回空 text，原始 raw_text 仅写入日志
+                return None, ""
+            # schema-echo (Qwen3-VL-4B RKNN3 把 schema hint 字段名 echo 回来)
+            # _looks_garbled 漏判 (Latin 各 1 次 + 空格分隔), 这里 word-boundary
+            # 检测 ≥3 个 SceneFrame 字段名即视为 echo 静默丢弃
+            if _looks_like_schema_echo(text):
+                LOG.warning(
+                    "vfa: SceneFrame text 命中 schema-echo (≥3 字段名), 静默丢弃: %r",
+                    text[:80],
+                )
                 return None, ""
             # structured 只放 5 个过滤字段（不含 text，避免与顶层 text 重复）
             structured = {
