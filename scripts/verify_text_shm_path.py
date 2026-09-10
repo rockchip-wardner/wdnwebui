@@ -397,6 +397,64 @@ def test_split_scene_frame_result_drops_schema_echo():
     assert text == "", f"FAIL: schema-echo 应返回空 text, got {text!r}"
 
 
+
+def test_scene_frame_docstring_has_negative_example():
+    """SceneFrame class docstring 必须含 ❌ 反例 (schema-echo 防御,
+    v0.15 上层 prompt 模板改进)。
+
+    配套 005cc90 (schema-echo detector 静默丢弃) + SceneFrame docstring
+    总字数约束 (5d986b7)。SDK 把 class docstring 注入 prompt 末尾作
+    schema hint —— 反例样本 (用户报告的 "scene 小区入口 actors action
+    objects text") 必须出现在样, model 才有机会在自约束前看到反例,
+    降低 schema-echo 概率。
+
+    真机量化: 反例上线后, 跑一晚 VFA 看 journalctl 命中 schema-echo
+    频率是否下降 (005cc90 的 LOG.warning 计数)。
+    """
+    import ast as _ast
+    tree = _ast.parse(open("app/services/video_file_analysis.py").read())
+
+    scene_cls = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == "_build_scene_frame_schema":
+            for child in _ast.walk(node):
+                if isinstance(child, _ast.ClassDef) and child.name == "SceneFrame":
+                    scene_cls = child
+                    break
+            break
+    assert scene_cls is not None, "SceneFrame class 没找到"
+
+    docstring = _ast.get_docstring(scene_cls)
+    assert docstring is not None, "SceneFrame class docstring 为空"
+
+    # 1. 必须有 ❌ 反例 section 标识
+    assert "反例" in docstring, (
+        "FAIL: SceneFrame docstring 没含 ❌ 反例 section (上层 prompt "
+        "模板改进失败, model 无反例可学, schema-echo detector 兜底频率会高)"
+    )
+
+    # 2. 反例必须含用户报告的 echo 样本 (让 model 看到具体不要做什么)
+    assert "scene 小区入口 actors action objects text" in docstring, (
+        "FAIL: ❌ 反例 section 没含用户报告的具体 echo 样本, 防御效果弱"
+    )
+
+    # 3. 反例必须明确禁止 (让 model 知道这是禁止的, 不是允许的)
+    assert "严禁" in docstring or "不要" in docstring, (
+        "FAIL: ❌ 反例 section 缺少明确的禁止措辞 (model 可能误读为允许)"
+    )
+
+    # 4. 必须有正向兜底指导 (告诉 model 当 image 难描述时该怎么做)
+    # 宁可空字段 ("scene": "") / 模糊描述 ("画面模糊难以辨认") 比 echo 好
+    has_fallback_guidance = any(
+        kw in docstring
+        for kw in ("宁可空字段", "画面模糊", "宁可", "模糊")
+    )
+    assert has_fallback_guidance, (
+        "FAIL: ❌ 反例 section 缺正向兜底指导, model 真遇到难图时仍会 echo。"
+        "应加 '宁可空字段' / '画面模糊难以辨认' 等提示"
+    )
+
+
 # ----------------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------------
@@ -485,6 +543,7 @@ TESTS = [
     test_scene_frame_docstring_has_total_char_constraint,
     test_looks_like_schema_echo_unit,
     test_split_scene_frame_result_drops_schema_echo,
+    test_scene_frame_docstring_has_negative_example,
 ]
 
 

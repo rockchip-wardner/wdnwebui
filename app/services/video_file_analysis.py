@@ -166,6 +166,19 @@ def _build_scene_frame_schema():
         节省 ~30% 体积，但保守起见按 ≤ 200B 预算。每个字段都在上面
         max_length 范围内，5 字段自然落在 150 字以内。
 
+        **❌ 反例（schema-echo 防御，v0.15）**：Qwen3-VL-4B RKNN3 首
+        token 不稳定时（约 ~46% schema-echo 概率，5c33fb3 提到的）
+        偶发把字段名本身当 JSON 值 echo 出来。**严禁**按下方反例输出：
+
+          ``{"text": "scene 小区入口 actors action objects text", "scene": "", ...}``
+
+        ↑ 字段名 (scene/actors/action/objects/text) 本身被当 value，
+        完全没描述画面内容 —— 这是错误输出。text 字段必须是真正
+        描述画面的自然语言（30-80 字中文，含场景/动作/物体），不是
+        字段名拼接。即使 image 难描述时也必须给出有意义的描述，
+        宁可空字段 ("scene": ""，"text": "画面模糊难以辨认") 也
+        不要把字段名当 value 填充。
+
         text 仍承担反查模糊匹配（``?text=...``）的主来源 —— 80 字足够
         覆盖"含场景、人物动作、关键物体"的简洁描述。
         """
