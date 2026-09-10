@@ -559,12 +559,13 @@ def info_handler(state: dict, model_id: str,
         # Native vision-model resolutions loaded into the session.
         # Empty until the worker reaches ``running`` for a vision
         # model (text-only / TTS models report ``[]``). The main
-        # process caches this per ``ModelInstance`` and surfaces it
-        # via ``GET /api/video-detection/available-vision-sizes`` so
-        # the 音视频描述 page dropdown is data-driven, not
-        # hardcoded. See ``_resolve_available_image_sizes`` for the
-        # resolution rules (single-element for legacy single-file
-        # installs; ``[384, 768]`` when both variants are present).
+        # process caches this per ``ModelInstance`` and consumes it
+        # in ``WdnaiDetector`` for backend ``_pick_letterbox_size``
+        # (auto-pick when ``image_size is None``) and strict
+        # validation when the caller pins a specific size. See
+        # ``_resolve_available_image_sizes`` for the resolution
+        # rules (single-element for legacy single-file installs;
+        # ``[384, 768]`` when both variants are present).
         "available_image_sizes": _resolve_available_image_sizes(
             state.get("session")),
         # v0.8: provenance for the main process's boot probe — used

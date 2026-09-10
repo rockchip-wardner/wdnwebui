@@ -934,9 +934,10 @@ class ModelInstance:
             # Vision-model native sizes loaded into this instance.
             # Empty for non-vision backends; vision backends report at
             # least ``[384]`` (legacy single-resolution) or
-            # ``[384, 768]`` (full multi-resolution install). Surfaced
-            # to the 音视频描述 page's ``#vd-detect-size`` dropdown
-            # via ``GET /api/video-detection/available-vision-sizes``.
+            # ``[384, 768]`` (full multi-resolution install). Consumed
+            # by ``WdnaiDetector`` for backend ``_pick_letterbox_size``
+            # (auto-pick when ``image_size is None``) and strict
+            # validation when the caller pins a specific size.
             "available_image_sizes": list(self.available_image_sizes),
             "_source":            self._source,
             "_peer_guid":         self._peer_guid,
