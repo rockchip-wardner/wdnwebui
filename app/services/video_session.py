@@ -38,7 +38,7 @@ class VideoSession:
     STATE_EOF = "eof"
     STATE_ERROR = "error"
 
-    FRAME_QUEUE_MAX = 1
+    FRAME_QUEUE_MAX = 8
     JPEG_QUALITY = 75
 
     _EOF = object()
