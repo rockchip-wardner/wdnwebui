@@ -287,6 +287,52 @@ def test_worker_infer_handler_reads_is_remote_payload():
         "(LAN peer protocol contract)")
 
 
+
+def test_scene_frame_docstring_has_total_char_constraint():
+    """_build_scene_frame_schema 生成的 SceneFrame class docstring 必须含
+    总字数约束 (wire-safe 防护, 配套方案A text_path guard)。
+
+    SDK 把 @Generable class docstring 当 schema hint 注入 prompt 末尾。
+    无此约束时 model 自由发挥会输出 100+ 字 scene description → 5 字段
+    JSON-encoded 超 200B → 触发 /dev/shm path-list (方案A 兜底) 或直接
+    FastCDR 截断 (修复前)。约束 docstring 强制 model 自约束输出 ≤ 200B,
+    减少 SHM 兜底频率。
+    """
+    import ast as _ast
+    import re as _re
+    tree = _ast.parse(open("app/services/video_file_analysis.py").read())
+
+    build_fn = next(
+        (n for n in _ast.walk(tree)
+         if isinstance(n, _ast.FunctionDef) and n.name == "_build_scene_frame_schema"),
+        None,
+    )
+    assert build_fn is not None, "_build_scene_frame_schema 函数没找到"
+
+    scene_cls = next(
+        (n for n in _ast.walk(build_fn)
+         if isinstance(n, _ast.ClassDef) and n.name == "SceneFrame"),
+        None,
+    )
+    assert scene_cls is not None, "SceneFrame class 没找到"
+
+    docstring = _ast.get_docstring(scene_cls)
+    assert docstring is not None, "SceneFrame class docstring 为空"
+    assert "总字数" in docstring, (
+        "FAIL: SceneFrame docstring 没提总字数约束 (model 无 hint 自约束, "
+        "5 字段 JSON-encoded 易超 200B 触发 wire 截断 / SHM 兜底)"
+    )
+    m = _re.search(r"总字数.{0,20}?(\d+)\s*字", docstring)
+    assert m is not None, (
+        "FAIL: SceneFrame docstring 含 总字数 但没数字约束 (例: '≤ 150 字')"
+    )
+    budget = int(m.group(1))
+    assert budget <= 200, (
+        f"FAIL: 总字数约束 {budget} 字过大, JSON-encoded 后可能超 "
+        f"FastCDR 255B (按 5 字段 × max_length 估算 + 30% JSON overhead)"
+    )
+
+
 # ----------------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------------
@@ -372,6 +418,7 @@ TESTS = [
     test_proxy_payload_contains_is_remote_field,
     test_worker_infer_handler_reads_is_remote_payload,
     test_schema_parse_failed_branch_skips_raw_text_when_text_path_set,
+    test_scene_frame_docstring_has_total_char_constraint,
 ]
 
 

@@ -158,6 +158,14 @@ def _build_scene_frame_schema():
           - text:    ≤80 字（比改前 ~30-100 字略缩，drift 窗口减小）
           - note:    ≤30 字
 
+        **总字数约束（v0.15 wire 安全）**：5 字段 JSON-encoded 后总长度
+        ≤ ~200B，留 55B 余量在 FastCDR ComputeReply.text 255B 硬截断
+        内（参考 compute_worker.py text SHM path-list 阈值 200B）——
+        减少触发 /dev/shm path-list 兜底频率，常规 inline 走 wire。
+        实际渲染时 SDK 用 ``str(dict)``（不是 ``json.dumps(indent=2)``）
+        节省 ~30% 体积，但保守起见按 ≤ 200B 预算。每个字段都在上面
+        max_length 范围内，5 字段自然落在 150 字以内。
+
         text 仍承担反查模糊匹配（``?text=...``）的主来源 —— 80 字足够
         覆盖"含场景、人物动作、关键物体"的简洁描述。
         """
