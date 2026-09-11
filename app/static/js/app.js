@@ -7904,13 +7904,13 @@ function vcsRenderMultiGroups(groups, text, topK, threshold) {
     const src = li.dataset.src || "";
     li.addEventListener("click", () => {
       if (!src) { vcsShowError("该视频无本地文件（微信入库），无法播放/取帧"); return; }
-      vcsPlaySegment(Number(li.dataset.mi), src);
+      vcsPlaySegment(h, { source: src, miIndex: Number(li.dataset.mi) });
     });
     li.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         if (!src) { vcsShowError("该视频无本地文件，无法播放/取帧"); return; }
-        vcsPlaySegment(Number(li.dataset.mi), src);
+        vcsPlaySegment(h, { source: src, miIndex: Number(li.dataset.mi) });
       }
     });
     const thumb = li.querySelector(".vcs-thumb");
@@ -7928,7 +7928,7 @@ function vcsRenderMultiGroups(groups, text, topK, threshold) {
 }
 
 /** 勾选检索入口：score+多组渲染复用单视频播放器 ——
- * ``vcsPlaySegment(idx, srcOverride)`` 的 srcOverride 位索选定 video
+ * ``vcsPlaySegment(hit, opts)`` 的 ``opts.source`` 位索选定 video
  * 的 source_path（多视频场景下不再读 VCS.snap.source）。 */
 
 
@@ -7971,7 +7971,7 @@ function vcsRenderHits(hits, query) {
     const badgeCls = aboveTh ? "vcs-badge vcs-badge-ok" : "vcs-badge vcs-badge-low";
     const badgeTxt = aboveTh ? "达标" : "低于阈值";
     return (
-      '<li class="vcs-card' + (aboveTh ? "" : " vcs-card-low") + '" data-i="' + i + '" role="button" tabindex="0">' +
+      '<li class="vcs-card' + (aboveTh ? "" : " vcs-card-low") + '" data-mi="' + i + '" role="button" tabindex="0">' +
         '<div class="vcs-thumb" data-thumb-t="' + t0 + '">缩略图</div>' +
         '<div class="vcs-card-info">' +
           '<span class="vcs-card-time">' + vcsEsc(t) + "</span>" +
@@ -7982,12 +7982,16 @@ function vcsRenderHits(hits, query) {
       "</li>"
     );
   }).join("");
-  Array.from(list.children).forEach((li) => {
-    li.addEventListener("click", () => vcsPlaySegment(Number(li.dataset.i)));
+  Array.from(list.children).forEach((li, i) => {
+    const h = hits[i];
+    if (!h) return;
+    li.addEventListener("click", () => vcsPlaySegment(h, {
+      source: srcBase, fps: fpsBase, miIndex: i,
+    }));
     li.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        vcsPlaySegment(Number(li.dataset.i));
+        vcsPlaySegment(h, { source: srcBase, fps: fpsBase, miIndex: i });
       }
     });
     // 懒加载缩略图：从源视频取 start_time 对应帧
@@ -8022,16 +8026,33 @@ function vcsEsc(s) {
 }
 
 /* ------------------------- 播放器（WS 帧流） ----------------------- */
-function vcsPlaySegment(idx, srcOverride) {
-  const hits = (VCS.snap && VCS.snap.hits) || [];
-  const h = (typeof idx === "number") ? hits[idx] : idx;
-  if (!h) return;
-  const source = srcOverride || (VCS.snap && VCS.snap.source) || "";
+/**
+ * 播放命中片段。
+ *
+ * @param {object} hit  片段对象。单视频路径：VCS.snap.hits[i]；
+ *                      多视频路径（缓存勾选）：multi.hits[i]。
+ *                      不再由播放器去 VCS.snap.hits 查 —— 多视频检索
+ *                      不更新 VCS.snap，旧版读到 undefined 或脏 hit，
+ *                      表现为点不动 / 播错段。
+ * @param {object} [opts]
+ * @param {string} [opts.source]   覆盖 VCS.snap.source（多视频用条目 source_path）。
+ * @param {number} [opts.fps]      帧率；缺省从 VCS.snap.fps 取（多视频无 fps 字段时 fallback 25）。
+ * @param {number} [opts.miIndex]  命中卡片 data-mi 索引，用于 active 高亮
+ *                                  （多视频 children 混合，children 索引法失效）。
+ */
+function vcsPlaySegment(hit, opts) {
+  opts = opts || {};
+  if (!hit) return;
+  const source = opts.source || (VCS.snap && VCS.snap.source) || "";
   if (!source) { vcsShowError("缺少视频源路径，无法播放"); return; }
-  const start = Number(h.start_time) || 0;
-  const end = Number(h.end_time) || start + 1;
+  const start = Number(hit.start_time) || 0;
+  const end = Number(hit.end_time) || start + 1;
   const dur = Math.max(0.5, end - start);
-  VCS.seg = { source, start, end, dur, title: vcsFormatTime(start) + "–" + vcsFormatTime(end) };
+  const fps = Number(opts.fps)
+    || (VCS.snap && Number(VCS.snap.fps))
+    || 25;
+  VCS.seg = { source, start, end, dur, fps,
+              title: vcsFormatTime(start) + "–" + vcsFormatTime(end) };
   VCS.playing = true;
   VCS.playPaused = false;
   VCS.ended = false;
@@ -8047,9 +8068,11 @@ function vcsPlaySegment(idx, srcOverride) {
   if (bar) bar.style.width = "0%";
   const timeEl = vcsEl("vcs-player-time");
   if (timeEl) timeEl.textContent = vcsFormatTime(start) + " / " + vcsFormatTime(end);
-  Array.from((vcsEl("vcs-results-list") || {}).children || []).forEach((li, i) => {
-    li.classList.toggle("active", i === idx);
-  });
+  if (typeof opts.miIndex === "number") {
+    document.querySelectorAll("#vcs-results-list li[data-mi]").forEach((li) => {
+      li.classList.toggle("active", Number(li.dataset.mi) === opts.miIndex);
+    });
+  }
   vcsSyncCanvasSize();
   vcsOpenPlayWs(source, start, end);
   if (typeof DemoGuard !== "undefined") {
