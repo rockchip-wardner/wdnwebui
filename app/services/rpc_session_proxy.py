@@ -741,6 +741,10 @@ class _RpcSessionProxy:
     def start_matched_sampler(self, interval_s: float = 5.0) -> None:
         """启动 daemon 线程,周期性 LOG matched_count (5s 默认),用于
         排查 cshim discovery race 时看 SEDP 状态演化。仅第一次调用生效。
+
+        日志级别 = DEBUG —— 排查时需手动
+            ``logging.getLogger("app.services.rpc_session_proxy").setLevel(logging.DEBUG)``
+        才看得到。默认 INFO 下不会刷屏。生产默认不调用,排查用时手动启用。
         """
         if getattr(self, "_sampler_started", False):
             return
@@ -750,7 +754,7 @@ class _RpcSessionProxy:
             while True:
                 try:
                     mc = self._matched_count()
-                    LOG.info(
+                    LOG.debug(
                         "rpc-proxy[%s] MATCHED_SAMPLE: matched_count=%d "
                         "(call_active=%s)",
                         self._model_id, mc,
@@ -762,7 +766,7 @@ class _RpcSessionProxy:
                 _thr.Event().wait(timeout=interval_s)
         _thr.Thread(target=_loop, name=f"rpc-match-sampler-{self._model_id}",
                     daemon=True).start()
-        LOG.info(
+        LOG.debug(
             "rpc-proxy[%s] MATCHED_SAMPLE started (interval=%.1fs)",
             self._model_id, interval_s,
         )
@@ -1358,13 +1362,10 @@ def make_rpc_session_proxy(rpc_client, model_id: str, _svc=None,
     proxy = _RpcSessionProxy(rpc_client, model_id, _svc=_svc,
                              on_client_recreated=on_client_recreated,
                              is_remote=is_remote)
-    # 诊断 (v0.13): 启动 matched_count 周期 sampler,排查 cshim discovery race
-    # 时能直接看 SEDP 状态演化 (matched_count 从 0 → 1 表示 worker writer
-    # 已被本机 reader 看见)。
-    try:
-        proxy.start_matched_sampler(interval_s=5.0)
-    except Exception as e:  # noqa: BLE001
-        LOG.debug("make_rpc_session_proxy: start_matched_sampler failed: %s", e)
+    # 诊断 (v0.13) sampler 默认不启动 — 每实例每 5s 一条 INFO log,
+    # 多实例叠加刷屏严重。排查 cshim discovery race 时手动:
+    #     proxy.start_matched_sampler(interval_s=5.0)
+    # (启动后 log 仍为 DEBUG 级,需调 logger 级别才可见。)
     return proxy
 
 
