@@ -42,6 +42,7 @@ from app.services.video_content_search import (
     _probe_video_meta,
     _read_chunk_frames,
     _write_frames_to_shm,
+    compute_slices,
 )
 from app.services.wechat_video_cache import file_md5, get_video_cache
 
@@ -470,8 +471,13 @@ class WechatVideoManager:
                 f"视频时长 {_fmt_ts(duration_s)} 超过上限 "
                 f"{_fmt_ts(max_seconds)}，请裁剪后重新发送")
         step = _CHUNK_SECONDS - _CHUNK_OVERLAP_SECONDS
-        total = max(1, int((max(0.0, duration_s - _CHUNK_OVERLAP_SECONDS))
-                           // step) + 1)
+        # 段数必须与下方 while 循环实际遍历的段数**严格一致** —— 与 VCS
+        # 提取 worker 共用 ``compute_slices``（按帧号模拟循环终止语义）。
+        # 此前用解析公式 ``(duration - overlap) // step + 1``，不能整除时
+        # 多算 1 段（19s / 4s-1s → 算 7 段、实际 6 段），"段数不足"会被
+        # 误判成"有切片失败"并触发部分成功分支的空 failures 崩溃。
+        total = max(1, compute_slices(
+            fps, duration_s, _CHUNK_SECONDS, _CHUNK_OVERLAP_SECONDS))
         if self._superseded(user_id, seq):
             _LOG.info("wechat video: %s superseded after download — "
                       "dropped silently", entry.filename)
@@ -612,14 +618,18 @@ class WechatVideoManager:
         else:
             # ---- 部分成功：警告播报让用户明确感知不完整；不入缓存、
             #      不删文件（保留现场，重发可重试失败段）。
+            # failures 为空而段数不足（时长边界 / supersede 前 break 等）
+            # 时不能裸取 failures[0]（IndexError 会让整条管线 failed）。
+            first_failure = (failures[0] if failures
+                            else "部分切片未提取（时长边界或解码截断）")
             _LOG.warning("wechat video: %s ready with %d/%d segments "
                          "(%d chunk failures, first: %s)",
                          entry.filename, n_hits_src, total,
-                         len(failures), failures[0])
+                         len(failures), first_failure)
             self._notify(
                 user_id,
                 f"⚠️ 视频 {entry.filename} 分析完成（{n_hits_src}/{total} 段），"
-                f"有 {len(failures)} 段提取失败（{failures[0]}），"
+                f"有 {len(failures)} 段提取失败（{first_failure}），"
                 f"相关内容可能不完整；如需完整分析请重新发送视频重试。")
 
     # ------------------------------------------------------------ shutdown

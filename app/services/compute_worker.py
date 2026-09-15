@@ -1020,12 +1020,39 @@ def chat_run_handler(state: dict, payload: dict) -> dict:
     return {"status": "chat_started"}
 
 
+def _clear_backend_kv(backend) -> None:
+    """显式清理 backend 的 C 侧 KV cache（chat 轮次之间）。
+
+    wdnai ``LLMSession.reset()`` 取 ``self._backend.rknn_llm``，但
+    TextBackend（chat 链路的唯一 backend）的实例属性名是 ``self.rknn``
+    —— reset 对 text 恒为 no-op，导致 agent 循环 / 多轮对话之间 KV
+    历史累积（真机实测：第二轮把第一轮的输出一起续写出来，并生成
+    ``<|im_start|>user`` / ``<|im_end|>`` 等 chatml 标记，经 GGUF
+    tokenizer 的字面 decode 泄漏到最终回复）。
+
+    这里按 backend 的真实属性名兜底清一次（``rknn`` 优先 —— 见
+    ``wdnai/backends/text.py``；``rknn_llm`` 兜底 —— 其它 backend）。
+    SDK 侧 ``reset()`` 修好后两者并存不冲突。
+    """
+    for attr in ("rknn", "rknn_llm"):
+        obj = getattr(backend, attr, None)
+        if obj is not None and hasattr(obj, "clear_kvcache"):
+            try:
+                obj.clear_kvcache()
+            except Exception as e:  # noqa: BLE001
+                LOG.warning(
+                    "chat_run: clear_kvcache via backend.%s failed: %s",
+                    attr, e)
+            return
+
+
 def _chat_run_loop(state: dict) -> None:
     sess = state.get("session")
     chat = state.get("chat") or {}
     try:
         from app.services.chat_runner import (
-            build_chatml_prompt, count_tokens, split_thinking, trim_history,
+            build_chatml_prompt, count_tokens, sanitize_chat_output,
+            split_thinking, trim_history,
         )
         backend = getattr(sess, "_backend", None)
         if backend is None:
@@ -1112,6 +1139,9 @@ def _chat_run_loop(state: dict) -> None:
                 _publish_chat_snapshot()
 
         sess.reset()
+        # LLMSession.reset() 对 TextBackend 是 no-op（属性名不匹配）——
+        # 显式兜底清 C 侧 KV，避免 agent 循环 / 多轮之间历史累积。
+        _clear_backend_kv(backend)
         _publish_chat_snapshot()
         register_observer(sink, _on_delta)
         t0 = time.time()
@@ -1131,6 +1161,16 @@ def _chat_run_loop(state: dict) -> None:
         finally:
             unregister_observer(sink)
         elapsed = round(time.time() - t0, 2)
+
+        # 诊断日志（截断）：raw output 与 prompt 对照定位 chatml 标记
+        # 泄漏 / 多轮续写类问题 —— 只靠 prompt_head 无法判断模型到底
+        # 生成了什么。
+        LOG.info("chat_run: prompt_len=%d prompt=%r", len(prompt), prompt[:1200])
+        LOG.info("chat_run: raw_output_len=%d raw_output=%r",
+                 len(full_text), full_text[:1200])
+        # 清理模型越界生成的 chatml 标记 / 截断自造的下一回合
+        # （KV 未清时的续写产物；详见 chat_runner.sanitize_chat_output）。
+        full_text = sanitize_chat_output(full_text)
 
         # ---- 切 thinking / answer + 解析 tool_call（仅 answer 段）----
         # 先切 thinking：避免模型思考过程中输出 ``{"name":...}`` 等 JSON

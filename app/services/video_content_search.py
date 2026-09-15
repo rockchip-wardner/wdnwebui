@@ -104,6 +104,45 @@ def _score_hits(qvec: np.ndarray, index: List[dict], sim_threshold: float,
     return out, meta
 
 
+def compute_slices(fps: float, duration_s: float, chunk_seconds: int,
+                   overlap_seconds: int) -> int:
+    """按 chunk 参数计算切片总数，与 ``_worker_loop`` 的终止语义完全一致。
+
+    遍历 start 序列（步进 = chunk_seconds - overlap_seconds），每片按
+    1 秒/帧采样帧号、剔除超出总帧数的帧；空片即停；end_time（= start +
+    实际帧数）达到或超过时长即停。重叠残片不计入。
+
+    VCS 提取 worker 与微信视频管线（``wechat_video_manager``）共用 ——
+    ``total`` 必须等于 worker 实际遍历的段数：此前微信侧用解析公式
+    ``(duration - overlap) // step + 1``，在不能整除时**多算 1 段**
+    （19s / chunk=4 / overlap=1 → 算 7 段、实际 6 段），"段数不足"
+    被误判成"有切片失败"，部分成功分支对空 ``failures`` 取
+    ``failures[0]`` 抛 IndexError，整条管线 failed。
+    """
+    total_frames = int(duration_s * fps)
+    if fps <= 0 or total_frames <= 0:
+        return 0
+    step = chunk_seconds - overlap_seconds
+    if step <= 0:
+        return 0
+    n = 0
+    start = 0.0
+    while start < duration_s:
+        frame_numbers = [
+            int(round((start + j) * fps))
+            for j in range(chunk_seconds)
+        ]
+        frame_numbers = [fn for fn in frame_numbers if 0 <= fn < total_frames]
+        if not frame_numbers:
+            break
+        end_time = start + len(frame_numbers)
+        n += 1
+        start += step
+        if end_time >= duration_s:
+            break
+    return n
+
+
 def _probe_video_meta(source: str) -> Optional[dict]:
     """用 PyAV 探测 fps / 总帧数 / 时长。失败返回 None。
 
@@ -662,34 +701,10 @@ class VideoContentSearchService:
     # 后台 worker：切片 + embedding
     # ------------------------------------------------------------------ #
     def _compute_slices(self, fps: float, duration_s: float) -> int:
-        """按 chunk 参数计算切片总数，与 ``_worker_loop`` 的终止语义完全一致：
-
-        遍历 start 序列（步进 = chunk_seconds - overlap），每片按 1 秒/帧
-        采样帧号、剔除超出总帧数的帧；空片即停；end_time（= start + 实际
-        帧数）达到或超过时长即停。重叠残片不计入。
-        """
-        total_frames = int(duration_s * fps)
-        if fps <= 0 or total_frames <= 0:
-            return 0
-        step = self._chunk_seconds - self._chunk_overlap_seconds
-        if step <= 0:
-            return 0
-        n = 0
-        start = 0.0
-        while start < duration_s:
-            frame_numbers = [
-                int(round((start + j) * fps))
-                for j in range(self._chunk_seconds)
-            ]
-            frame_numbers = [fn for fn in frame_numbers if 0 <= fn < total_frames]
-            if not frame_numbers:
-                break
-            end_time = start + len(frame_numbers)
-            n += 1
-            start += step
-            if end_time >= duration_s:
-                break
-        return n
+        """按 chunk 参数计算切片总数 —— 转调公共 ``compute_slices``
+        （与 ``_worker_loop`` 终止语义一致，微信管线共用同一实现）。"""
+        return compute_slices(fps, duration_s, self._chunk_seconds,
+                              self._chunk_overlap_seconds)
 
     def _worker_loop(self) -> None:
         try:

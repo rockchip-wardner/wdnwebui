@@ -19,6 +19,34 @@ _TOOL_CALL_INSTRUCTION = (
 )
 
 
+_CHATML_STRAY_RE = re.compile(r"<\|im_end\|>")
+
+
+def sanitize_chat_output(text: str) -> str:
+    """清理模型越界生成的 ChatML 标记，并截断自造的"下一回合"。
+
+    wdnai 的 GGUF tokenizer 只把 eos/pad + multimodal 占位符注册为
+    special token —— ``<|im_start|>`` / ``<think>`` / ``</think>`` 不在
+    其中，``decode(skip_special_tokens=True)`` 跳不过去，模型一旦生成
+    这些 token 就会以**字面文本**泄漏到最终回复（真机实测：微信视频
+    检索回复里出现大量 ``<|im_start|>user`` / ``<|im_end|>`` 等）。
+
+    触发这类越界生成的上游原因是 C 侧 KV cache 在轮次间未清理
+    （见 ``compute_worker._clear_backend_kv``），模型看到上一轮历史后
+    续写出新的回合。修复后正常单轮输出**不应**含 ``<|im_start|>``，
+    因此：从首个 ``<|im_start|>`` 起整段丢弃（其后内容是模型幻觉的
+    新回合，不可信），再删掉残留的 ``<|im_end|>``。
+
+    ``<think>`` / ``</think>`` **刻意保留** —— 上层 ``split_thinking``
+    依赖它们做思维链切分。
+    """
+    idx = text.find("<|im_start|>")
+    if idx >= 0:
+        text = text[:idx]
+    text = _CHATML_STRAY_RE.sub("", text)
+    return text.strip()
+
+
 def split_thinking(text: str) -> Tuple[str, str]:
     """把 ``text`` 切成 ``(thinking, answer)``。
 
