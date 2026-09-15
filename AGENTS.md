@@ -2148,7 +2148,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     中被覆盖的任务按 seq 判定自动跳过。
    - 管线：SDK CDN 下载（`Wechat.download_message()` 同步透传，120s
      上限）→ 落盘 `uploads/wechat_videos/<uid>/` → PyAV 探测 → 逐片
-     **6s 片 / 1s 重叠** embedding（复用 VCS 底层函数 `_probe_video_meta`
+     **4s 片 / 1s 重叠** embedding（复用 VCS 底层函数 `_probe_video_meta`
      / `_read_chunk_frames` / `_write_frames_to_shm` / `_cosine_similarity`
      + `get_session("swcap_video_retrieval")`，SHM 帧传递 + timeout 重试
      与 UI 页同款）→ ready。
@@ -2191,7 +2191,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     `(md5, embedding_model, chunk_seconds, chunk_overlap_seconds)`
     定位条目 —— UI 检索页的 chunk/overlap 是用户可选的
     （3-6s / 1-2s），不同参数的索引时间窗与帧数完全不同，混用会
-    时间戳错位。微信管线传固定 6/1；VCS 传用户选值；同视频不同
+    时间戳错位。微信管线传固定 4/1；VCS 传用户选值；同视频不同
     参数是**独立条目**（各自占 LRU 槽，命中互不干扰）。
 * **VCS 页接入缓存（v0.12.1）**：视频内容检索页与微信管线共享同一
   张表 + 同一单例：
@@ -2269,7 +2269,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   `downloading` / `no_video`，状态即合法业务结果而非错误，模型自由
   组织回复。真正的执行失败（会话缺失等）抛错走失败回喂。
   检索参数：query 内部截断 50 字；top_k=5（模型可调 1-10）；
-  sim_threshold 固定 0.5 **不暴露给模型**，`min_results=3` 兜底启用
+  sim_threshold 固定 0.4 **不暴露给模型**，`min_results=3` 兜底启用
   —— 全低于阈值时返回最接近片段 + `all_below_threshold` / `hint`
   质量信号，由模型谨慎表述"未找到高度匹配的内容"。阈值不暴露的
   原因：模型对余弦分数无语义感知（盲调），且兜底已保证非空。

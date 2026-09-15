@@ -19,8 +19,8 @@
   ``_write_frames_to_shm`` / ``_cosine_similarity``），维护独立的多
   用户注册表；UI 页互不干扰。
 
-切片参数：6s 片 / 1s 重叠（独立于 UI 页默认值）。检索：threshold
-0.5 固定 + 兜底返回最接近的 3 段并标记 ``all_below_threshold``，
+切片参数：4s 片 / 1s 重叠（与 VCS 页默认值对齐）。检索：threshold
+0.4 固定 + 兜底返回最接近的 3 段并标记 ``all_below_threshold``，
 质量信号透出给 LLM 自行表述。
 """
 from __future__ import annotations
@@ -47,9 +47,9 @@ from app.services.wechat_video_cache import file_md5, get_video_cache
 
 _LOG = logging.getLogger("wechat_video_manager")
 
-_CHUNK_SECONDS = 6
+_CHUNK_SECONDS = 4
 _CHUNK_OVERLAP_SECONDS = 1
-_SIM_THRESHOLD = 0.5
+_SIM_THRESHOLD = 0.4
 _FALLBACK_MIN_RESULTS = 3
 _SEARCH_TOP_K = 5
 _DOWNLOAD_RETRIES = 3
