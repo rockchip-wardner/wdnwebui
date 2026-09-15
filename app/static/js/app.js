@@ -8347,7 +8347,7 @@ async function vcsQuery() {
   const text = (vcsEl("vcs-text")?.value || "").trim();
   if (!text) { vcsShowError("请输入检索问题"); return; }
   if (vcsQueryAbort) return;  // 已在检索中，防重复点击
-  const threshold = Number(vcsEl("vcs-threshold")?.value || 0.5);
+  const threshold = Number(vcsEl("vcs-threshold")?.value || 0.4);
   const topK = Number(vcsEl("vcs-top-k")?.value || 10);
   const btn = vcsEl("vcs-query");
   const meta = vcsEl("vcs-query-meta");
