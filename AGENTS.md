@@ -1497,7 +1497,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     chunk_idx, fps, vec}]`。逐片推进 `slices_embedded` 并 WS 广播
     `progress`。`_probe_video_meta` 用 PyAV 探测 fps / 总帧数 / 时长。
   - **检索**：`embed_text` 编码查询 → 遍历索引算余弦相似度 → 阈值
-    过滤（默认 `sim_threshold=0.5`）+ `top_k`（默认 10）截断。索引为
+    过滤（默认 `sim_threshold=0.4`）+ `top_k`（默认 10）截断。索引为
     空时直接返回空命中。
   - **`iter_segment_jpeg(source, start_s, end_s, paced=...)`**：按播放
     顺序生成区间内每帧 JPEG（PyAV seek 到 keyframe + 顺序 decode +

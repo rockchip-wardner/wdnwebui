@@ -112,7 +112,7 @@ async def query_multi(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail="entries 不能为空")
 
     try:
-        sim_threshold = float(payload.get("sim_threshold", 0.5))
+        sim_threshold = float(payload.get("sim_threshold", 0.4))
         top_k = int(payload.get("top_k", 10))
         min_results = int(payload.get("min_results", 0) or 0)
     except (TypeError, ValueError):
@@ -304,7 +304,7 @@ async def query_video(payload: dict) -> dict:
     text = (payload.get("text") or "").strip()
     debug = bool(payload.get("debug", False))
     try:
-        sim_threshold = float(payload.get("sim_threshold", 0.5))
+        sim_threshold = float(payload.get("sim_threshold", 0.4))
         top_k = int(payload.get("top_k", 10))
         # 默认 0 = 严格模式，没有达到阈值的片段就返回空。
         # 设为 N>0 时启用 fallback：阈值过滤完后无命中时，
