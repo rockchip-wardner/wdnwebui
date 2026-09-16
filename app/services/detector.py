@@ -2730,10 +2730,6 @@ class WdnaiDetector:
                     "vtl_timing: frame_pos=%d fps=%.2f video_ts=%.3f source=%s",
                     frame_pos, _fps, _video_ts, _video_ts_source,
                 )
-                LOG.info(
-                    "vtl_timing: frame_pos=%d fps=%.2f video_ts=%.3f source=%s",
-                    frame_pos, _fps, _video_ts, _video_ts_source,
-                )
             except Exception as _e:  # noqa: BLE001
                 LOG.warning(
                     "vtl_timing failed: %s: %s", type(_e).__name__, _e
