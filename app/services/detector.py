@@ -523,10 +523,10 @@ class DetectorEvent:
     id: int
     frame_pos: int
     ts: float
-    video_ts: float = 0.0
     prompt: str
     text: str
     level: Optional[str] = None
+    video_ts: float = 0.0
     attachment_count: int = 0
     tool_call: Optional[str] = None
     bbox: Optional[list] = None
