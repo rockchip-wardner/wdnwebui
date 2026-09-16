@@ -2720,9 +2720,6 @@ function vtlOpenFrameModal(ev) {
     tsEl.textContent = (ts != null) ? fmtEventTime(ts) : "--";
   }
 
-  const lvlEl = document.getElementById("vtl-frame-modal-level");
-  if (lvlEl) lvlEl.textContent = ev.level || "--";
-
   const textEl = document.getElementById("vtl-frame-modal-text");
   if (textEl) textEl.textContent = (ev.text && String(ev.text).trim()) || "(空)";
 
