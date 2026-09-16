@@ -1140,6 +1140,20 @@ class _RpcSessionProxy:
                     "raw_result_data=%r — falling back to _ProxyResult",
                     self._model_id, type(e).__name__, e, result_data,
                 )
+        # LocatorDoc 重建 —— 不重建的话 detector 端
+        # ``isinstance(result, LocatorDoc)`` 永假 → raw markup 落
+        # VLMDoc 分支当 text 写,事件历史变错误条目。
+        if gen_name == "LocatorDoc" and isinstance(result_data, dict):
+            try:
+                from app.services.detector import _get_grounding_doc_cls
+                LocatorDoc = _get_grounding_doc_cls()
+                return LocatorDoc.model_validate(result_data)
+            except Exception as e:  # noqa: BLE001
+                LOG.error(
+                    "rpc-proxy[%s]: LocatorDoc reconstruct failed (%s: %s) — "
+                    "raw_result_data=%r — falling back to _ProxyResult",
+                    self._model_id, type(e).__name__, e, result_data,
+                )
 
         # ------------------------------------------------------------------ #
         # 诊断 (v0.13): 把 worker 端写入的 schema_parse_failed marker 透传     #

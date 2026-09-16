@@ -2187,6 +2187,768 @@ function initVideoTargetDetection() {
 }
 
 /* ------------------------------------------------------------------ *
+ *  视频目标定位 page (LocateAnything-3b grounding 演示)               *
+ * ------------------------------------------------------------------ *
+ *   - API 前缀 `/api/video-target-localization/*`                      *
+ *   - 后端 detector 直接走 `session.respond(generating=LocatorDoc)`   *
+ *     结构化输出拿 `boxes: List[BoundingBox]` (0–1000 归一化) +       *
+ *     `text` + `level`，**不**挂任何 `@Callable` 工具                  *
+ *   - 后端 detector 实例独立 (`get_localizer_detector()`)，与 VD / VTD  *
+ *     互不干扰                                                          *
+ *   - 事件：`ev.tool_call === "grounding"` 用于识别多 bbox 定位事件;  *
+ *     每事件附 `frame_b64` 整帧 + `boxes[].bbox` 像素坐标 + `label`   *
+ *     + `crop_b64` 单独裁图                                            *
+ *   - 视觉定位页**不**暴露模型选择 / 尺寸选择（LocateAnything 是单    *
+ *     448×448 单变体，单 capability），POST body 只含 `{prompt,        *
+ *     every_n}` 两字段                                                  *
+ *   - 历史列表项画 bbox overlay（canvas 叠加在原图缩略图上）+ 双击弹   *
+ *     `#vtl-frame-modal` 大图预览                                       *
+ * ------------------------------------------------------------------ */
+
+// 20-color RGB palette — reversed BGR of locate_image.py:135-156
+// (mirrors ``CATEGORY_PALETTE`` in C++ demo main.cc:251-256).
+// Order matters: first seen label gets palette[0], second gets [1], etc.
+// Used by vtlLabelColor (stable hash binding) and drawVtlBoxes.
+const vtlPaletteRGB = [
+  [255, 56, 56],   [255, 157, 151], [255, 112, 31],  [255, 178, 29],
+  [207, 210, 49],  [72, 249, 10],   [146, 204, 23],  [61, 219, 134],
+  [26, 147, 52],   [0, 212, 187],   [44, 153, 168],  [0, 194, 255],
+  [52, 69, 147],   [100, 115, 255], [78, 55, 230],   [255, 30, 175],
+  [182, 33, 158],  [255, 172, 199], [196, 187, 145], [156, 156, 156],
+];
+
+// Stable hash-based label → palette index binding.
+// Same label always maps to same color (e.g. "person" → palette[3]).
+// Empty label falls through to index 0.
+function vtlLabelColor(label) {
+  if (!label || typeof label !== "string") return vtlPaletteRGB[0];
+  let h = 0;
+  for (let i = 0; i < label.length; i++) {
+    h = h * 31 + label.charCodeAt(i);
+  }
+  const idx = Math.abs(h) % vtlPaletteRGB.length;
+  return vtlPaletteRGB[idx];
+}
+
+const VTL = {
+  ws: null,
+  wsRetry: 0,
+  wsTimer: null,
+  blobUrl: null,
+  lastSnap: null,
+  detectorSnap: null,
+  source: "",
+  prompt: "",
+  everyN: 30,
+  lastEventId: 0,
+};
+const VTLDetector = {
+  events: [],
+  renderedIds: new Set(),
+  eventNodes: new Map(),
+  MAX_EVENTS: 200,
+  MAX_RENDERED: 50,
+  palette: vtlPaletteRGB,
+};
+
+function setVtlOverlay(text, isError) {
+  const el = document.getElementById("vtl-overlay");
+  if (!el) return;
+  el.textContent = text || "";
+  el.classList.toggle("error", !!isError);
+  el.style.display = text ? "" : "none";
+}
+
+function setVtlMeta(snap) {
+  const el = document.getElementById("vtl-meta");
+  if (!el) return;
+  const parts = [];
+  if (snap.width && snap.height) parts.push(snap.width + "x" + snap.height);
+  if (snap.fps) parts.push(fmtNum(snap.fps, 2) + " fps");
+  if (snap.frame_pos != null) parts.push("帧 " + snap.frame_pos);
+  if (snap.is_live) parts.push("LIVE");
+  if (snap.state) parts.push("[" + snap.state + "]");
+  el.textContent = parts.join(" · ") || "--";
+  VTL.lastSnap = snap;
+  if (typeof DemoGuard !== "undefined") {
+    DemoGuard.report("video-target-localization", {
+      session: VTL.lastSnap,
+      detector: VTL.detectorSnap,
+    });
+  }
+}
+
+function setVtlProgress(snap) {
+  const el = document.getElementById("vtl-progress");
+  if (!el) return;
+  el.classList.toggle("live", !!snap.is_live);
+  el.style.width = snap.is_live ? "100%" : "0%";
+}
+
+async function drawVtlFrame(jpgBytes) {
+  const canvas = document.getElementById("vtl-canvas");
+  if (!canvas || !jpgBytes || !jpgBytes.byteLength) return;
+  const blob = new Blob([jpgBytes], { type: "image/jpeg" });
+  if (VTL.blobUrl) URL.revokeObjectURL(VTL.blobUrl);
+  VTL.blobUrl = URL.createObjectURL(blob);
+  const img = new Image();
+  await new Promise((resolve, reject) => {
+    img.onload = resolve;
+    img.onerror = reject;
+    img.src = VTL.blobUrl;
+  });
+  const ctx = canvas.getContext("2d");
+  canvas.width = img.naturalWidth || canvas.width;
+  canvas.height = img.naturalHeight || canvas.height;
+  ctx.drawImage(img, 0, 0);
+}
+
+function connectVtlWs() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${proto}//${location.host}${API_PREFIX}/video-target-localization/ws`;
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  VTL.ws = ws;
+
+  ws.onopen = () => {
+    VTL.wsRetry = 0;
+    setVtlOverlay("", false);
+  };
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data === "string") {
+      let snap;
+      try { snap = JSON.parse(ev.data); } catch (_) { return; }
+      if (snap.type === "eof") {
+        setVtlOverlay("文件已结束 (EOF)，点 播放 可恢复", true);
+      } else if (snap.type === "error") {
+        setVtlOverlay("WS 错误: " + (snap.detail || ""), true);
+      } else if (snap.type === "event") {
+        addVtlEvent(snap);
+        showVtlEventBadge(snap);
+        return;
+      } else if (snap.type === "status" && snap.detector) {
+        updateVtlDetectorStatus(snap.detector);
+      }
+      setVtlMeta(snap);
+      setVtlProgress(snap);
+      refreshVtlButtons(snap.state);
+      const payload = document.getElementById("data-video-target-localization");
+      if (payload) payload.textContent = JSON.stringify(snap, null, 2);
+      return;
+    }
+    try {
+      await drawVtlFrame(new Uint8Array(ev.data));
+      setVtlOverlay("", false);
+    } catch (e) {
+      setVtlOverlay("帧渲染失败: " + e, true);
+    }
+  };
+  ws.onclose = () => {
+    VTL.ws = null;
+    const wait = Math.min(5000, 500 * Math.pow(2, VTL.wsRetry++));
+    VTL.wsTimer = setTimeout(connectVtlWs, wait);
+  };
+  ws.onerror = () => {
+    try { ws.close(); } catch (_) {}
+  };
+}
+
+async function vtlOpen(payload) {
+  const r = await fetch(API_PREFIX + "/video-target-localization/open", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => "");
+    throw new Error("HTTP " + r.status + " " + detail);
+  }
+  return r.json();
+}
+
+async function vtlAction(action) {
+  const r = await fetch(API_PREFIX + "/video-target-localization/control", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action }),
+  });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+async function vtlStatus() {
+  const r = await fetch(API_PREFIX + "/video-target-localization", { cache: "no-store" });
+  if (!r.ok) return null;
+  const snap = await r.json();
+  setVtlMeta(snap);
+  setVtlProgress(snap);
+  refreshVtlButtons(snap.state);
+  const loopEl = document.getElementById("vtl-loop");
+  if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
+  const payload = document.getElementById("data-video-target-localization");
+  if (payload) payload.textContent = JSON.stringify(snap, null, 2);
+  return snap;
+}
+
+async function vtlClose() {
+  const r = await fetch(API_PREFIX + "/video-target-localization/close", { method: "POST" });
+  return r.ok ? r.json() : null;
+}
+
+function refreshVtlButtons(state) {
+  const playBtn = document.getElementById("vtl-play");
+  const pauseBtn = document.getElementById("vtl-pause");
+  const stopBtn = document.getElementById("vtl-stop");
+  if (!playBtn || !pauseBtn || !stopBtn) return;
+  const active = state === "playing" || state === "paused" || state === "eof";
+  stopBtn.disabled = !active;
+  if (state === "playing") {
+    playBtn.disabled = true;
+    pauseBtn.disabled = false;
+  } else if (state === "paused") {
+    playBtn.disabled = false;
+    pauseBtn.disabled = true;
+  } else {
+    playBtn.disabled = !active;
+    pauseBtn.disabled = !active;
+  }
+}
+
+// vtlRenderHistoryItem: draw the full frame onto the overlay canvas,
+// then call drawVtlBoxes to overlay all bbox rectangles + labels.
+// Used both for the history list (small) and the frame modal (full size).
+async function vtlRenderHistoryItem(canvas, frameImg, boxes, palette) {
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const w = frameImg.naturalWidth || frameImg.width || canvas.width;
+  const h = frameImg.naturalHeight || frameImg.height || canvas.height;
+  canvas.width = w;
+  canvas.height = h;
+  ctx.clearRect(0, 0, w, h);
+  try {
+    ctx.drawImage(frameImg, 0, 0, w, h);
+  } catch (_) { /* ignore draw errors */ }
+  drawVtlBoxes(canvas, boxes || [], palette || vtlPaletteRGB);
+}
+
+// drawVtlBoxes: paint each box's rectangle + label tag at the top.
+// Boxes arrive as `[{label, bbox:[x1,y1,x2,y2], ...}, ...]` (already
+// in pixel coords from the backend). Empty array → canvas just shows
+// the frame.
+function drawVtlBoxes(canvasEl, boxes, palette) {
+  if (!canvasEl || !boxes || !boxes.length) return;
+  const ctx = canvasEl.getContext("2d");
+  if (!ctx) return;
+  ctx.lineWidth = 3;
+  ctx.font = "13px sans-serif";
+  ctx.textBaseline = "bottom";
+  for (const box of boxes) {
+    const label = (box && box.label) ? String(box.label) : "";
+    const bb = (box && Array.isArray(box.bbox)) ? box.bbox : null;
+    if (!bb || bb.length !== 4) continue;
+    const [x1, y1, x2, y2] = bb;
+    const w = Math.max(1, x2 - x1);
+    const h = Math.max(1, y2 - y1);
+    const [r, g, b] = vtlLabelColor(label);
+    ctx.strokeStyle = `rgb(${r},${g},${b})`;
+    ctx.strokeRect(x1 + 0.5, y1 + 0.5, w, h);
+    if (label) {
+      const tag = label;
+      const metrics = ctx.measureText(tag);
+      const tagW = Math.ceil(metrics.width) + 8;
+      const tagH = 16;
+      const tagX = Math.max(0, x1);
+      const tagY = Math.max(0, y1 - tagH);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(tagX, tagY, tagW, tagH);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(tag, tagX + 4, tagY + tagH - 3);
+    }
+  }
+}
+
+// Build one <li> element for the history list.
+// Layout:
+//   <li class="vd-event">
+//     <div class="vd-event-meta">ts · 帧 pos · #id</div>
+//     <div class="vtl-crop-thumb-wrap">
+//       <img class="vtl-crop-thumb" />           <!-- frame_b64 -->
+//       <canvas class="vtl-crop-overlay" />      <!-- bbox overlay -->
+//     </div>
+//     <div class="vtl-event-meta">
+//       <span class="vtl-event-bbox-label" /> ... <!-- one per box -->
+//       <span class="vd-event-text"> …text… </span>
+//       <span class="vtl-dblclick-hint">双击查看</span>
+//     </div>
+//   </li>
+function buildVtlEventLi(ev, isLatest) {
+  const li = document.createElement("li");
+  li.className = "vd-event" + (isLatest ? " latest" : "");
+  li.dataset.evId = String(ev.id);
+
+  const meta = document.createElement("div");
+  meta.className = "vd-event-meta";
+  const tsSpan = document.createElement("span");
+  tsSpan.textContent = fmtEventTime(ev.ts);
+  const fpSpan = document.createElement("span");
+  fpSpan.textContent = "帧 " + (ev.frame_pos ?? "?");
+  const tag = document.createElement("span");
+  tag.className = "tag";
+  tag.textContent = "#" + ev.id;
+  meta.appendChild(tsSpan);
+  meta.appendChild(fpSpan);
+  meta.appendChild(tag);
+  li.appendChild(meta);
+
+  const boxes = Array.isArray(ev.boxes) ? ev.boxes : [];
+
+  // 缩略图 + bbox overlay canvas
+  if (ev.frame_b64) {
+    const wrap = document.createElement("div");
+    wrap.className = "vtl-crop-thumb-wrap vtl-event-frame";
+    wrap.title = "双击查看大图";
+
+    const img = document.createElement("img");
+    img.className = "vtl-crop-thumb";
+    img.alt = "定位帧";
+    img.src = "data:image/jpeg;base64," + ev.frame_b64;
+
+    const overlay = document.createElement("canvas");
+    overlay.className = "vtl-crop-overlay";
+
+    wrap.appendChild(img);
+    wrap.appendChild(overlay);
+    li.appendChild(wrap);
+
+    // Wait for image load, then draw frame + bbox overlay.
+    img.addEventListener("load", () => {
+      vtlRenderHistoryItem(overlay, img, boxes, VTLDetector.palette);
+    });
+    // 双击打开 modal
+    wrap.addEventListener("dblclick", () => vtlOpenFrameModal(ev));
+  }
+
+    if (boxes.length > 0) {
+    const counts = {};
+    for (const box of boxes) {
+      const label = box.label || "(未命名)";
+      counts[label] = (counts[label] || 0) + 1;
+    }
+    const parts = [`定位到 ${boxes.length} 个目标`];
+    for (const [label, count] of Object.entries(counts)) {
+      parts.push(`"${label}" 数量：${count}`);
+    }
+    const summary = document.createElement("div");
+    summary.className = "vtl-event-summary";
+    summary.textContent = parts.join("; ");
+    li.appendChild(summary);
+  }
+
+  // 双击提示
+  const dblHint = document.createElement("span");
+  dblHint.className = "vtl-dblclick-hint";
+  dblHint.textContent = "双击查看";
+  li.appendChild(dblHint);
+
+  // li 整体也支持双击（兜底：点缩略图之外也触发 modal）
+  li.addEventListener("dblclick", () => vtlOpenFrameModal(ev));
+
+  return li;
+}
+
+function trimVtlEventList(list) {
+  while (VTLDetector.renderedIds.size > VTLDetector.MAX_RENDERED) {
+    const oldestId = list.lastElementChild
+      ? Number(list.lastElementChild.dataset.evId)
+      : null;
+    if (oldestId == null || Number.isNaN(oldestId)) break;
+    const node = VTLDetector.eventNodes.get(oldestId);
+    if (node) {
+      try { node.remove(); } catch (_) { /* ignore */ }
+    }
+    VTLDetector.eventNodes.delete(oldestId);
+    VTLDetector.renderedIds.delete(oldestId);
+  }
+}
+
+function renderVtlEventList() {
+  const list = document.getElementById("vtl-event-list");
+  const count = document.getElementById("vtl-events-count");
+  if (!list || !count) return;
+  count.textContent = VTLDetector.events.length + " 条";
+  list.innerHTML = "";
+  VTLDetector.renderedIds.clear();
+  VTLDetector.eventNodes.clear();
+  if (VTLDetector.events.length === 0) {
+    list.innerHTML =
+      '<li class="vd-event-empty">尚未定位到目标，启动定位后结果显示在这里。</li>';
+    return;
+  }
+  const slice = VTLDetector.events.slice(0, VTLDetector.MAX_RENDERED);
+  for (const ev of slice) {
+    const li = buildVtlEventLi(ev, ev === slice[0]);
+    list.appendChild(li);
+    VTLDetector.renderedIds.add(ev.id);
+    VTLDetector.eventNodes.set(ev.id, li);
+  }
+}
+
+function appendVtlEventLi(ev) {
+  const list = document.getElementById("vtl-event-list");
+  if (!list) return;
+  const emptyLi = list.querySelector(".vd-event-empty");
+  if (emptyLi) {
+    list.innerHTML = "";
+    VTLDetector.renderedIds.clear();
+    VTLDetector.eventNodes.clear();
+  }
+  const prevLatest = list.querySelector(".vd-event.latest");
+  if (prevLatest) prevLatest.classList.remove("latest");
+  const li = buildVtlEventLi(ev, true);
+  list.insertBefore(li, list.firstChild);
+  VTLDetector.renderedIds.add(ev.id);
+  VTLDetector.eventNodes.set(ev.id, li);
+  trimVtlEventList(list);
+}
+
+function addVtlEvent(ev) {
+  VTLDetector.events.unshift(ev);
+  if (VTLDetector.events.length > VTLDetector.MAX_EVENTS) {
+    VTLDetector.events.length = VTLDetector.MAX_EVENTS;
+  }
+  VTL.lastEventId = ev.id;
+  appendVtlEventLi(ev);
+  const count = document.getElementById("vtl-events-count");
+  if (count) count.textContent = VTLDetector.events.length + " 条";
+}
+
+let vtlBadgeHideTimer = null;
+function showVtlEventBadge(ev) {
+  const badge = document.getElementById("vtl-event-badge");
+  const text = document.getElementById("vtl-event-badge-text");
+  if (!badge || !text) return;
+  const boxes = Array.isArray(ev.boxes) ? ev.boxes : [];
+  let raw;
+  if (boxes.length === 0) {
+    raw = "未定位到目标";
+  } else {
+    const labelSummary = boxes.slice(0, 3).map((b) => b.label || "?").join("、");
+    raw = boxes.length <= 3
+      ? `定位到 ${boxes.length} 个: ${labelSummary}`
+      : `定位到 ${boxes.length} 个: ${labelSummary}…`;
+  }
+  text.textContent = raw;
+  badge.classList.remove("hidden");
+  badge.style.animation = "none";
+  badge.offsetHeight;
+  badge.style.animation = "";
+  if (vtlBadgeHideTimer) clearTimeout(vtlBadgeHideTimer);
+  vtlBadgeHideTimer = setTimeout(() => badge.classList.add("hidden"), 6000);
+}
+
+// 双击历史项 → 弹出 #vtl-frame-modal 大图预览。
+// 写入 frame_b64 到 <img> + frame_pos / ts / level / text / boxes 列表。
+function vtlOpenFrameModal(ev) {
+  if (!ev) return;
+  const modal = document.getElementById("vtl-frame-modal");
+  if (!modal) return;
+  modal.classList.remove("hidden");
+
+  const boxes = Array.isArray(ev.boxes) ? ev.boxes : [];
+
+  const imgEl = document.getElementById("vtl-frame-modal-img");
+  if (imgEl) {
+    imgEl.onload = null;
+    imgEl.src = ev.frame_b64
+      ? "data:image/jpeg;base64," + ev.frame_b64
+      : "";
+    imgEl.onload = () => {
+      const wrap = imgEl.parentElement;
+      if (!wrap) return;
+      let overlay = wrap.querySelector("canvas.vfa-frame-modal-img-overlay");
+      if (!overlay) {
+        overlay = document.createElement("canvas");
+        overlay.className = "vfa-frame-modal-img-overlay";
+        wrap.appendChild(overlay);
+      }
+      vtlRenderHistoryItem(overlay, imgEl, boxes, VTLDetector.palette);
+    };
+  }
+
+  const fpEl = document.getElementById("vtl-frame-modal-frame-pos");
+  if (fpEl) fpEl.textContent = ev.frame_pos != null ? String(ev.frame_pos) : "--";
+
+  const tsEl = document.getElementById("vtl-frame-modal-ts");
+  if (tsEl) tsEl.textContent = ev.ts ? fmtEventTime(ev.ts) : "--";
+
+  const lvlEl = document.getElementById("vtl-frame-modal-level");
+  if (lvlEl) lvlEl.textContent = ev.level || "--";
+
+  const textEl = document.getElementById("vtl-frame-modal-text");
+  if (textEl) textEl.textContent = (ev.text && String(ev.text).trim()) || "(空)";
+
+  const boxesEl = document.getElementById("vtl-frame-modal-boxes");
+  if (boxesEl) {
+    boxesEl.innerHTML = "";
+    if (boxes.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "vtl-frame-modal-box-row";
+      empty.textContent = "尚未定位到目标";
+      boxesEl.appendChild(empty);
+    } else {
+      for (const box of boxes) {
+        const row = document.createElement("div");
+        row.className = "vtl-frame-modal-box-row";
+        const [r, g, b] = vtlLabelColor(box.label || "");
+        const swatch = document.createElement("span");
+        swatch.style.cssText = `display:inline-block;width:10px;height:10px;background:rgb(${r},${g},${b});margin-right:6px;border-radius:2px;vertical-align:middle;`;
+        const labelSpan = document.createElement("strong");
+        labelSpan.textContent = box.label || "(未命名)";
+        const bb = Array.isArray(box.bbox) ? box.bbox : [0, 0, 0, 0];
+        row.appendChild(swatch);
+        row.appendChild(labelSpan);
+        row.appendChild(
+          document.createTextNode(` @ [${bb[0]}, ${bb[1]}, ${bb[2]}, ${bb[3]}]`),
+        );
+        boxesEl.appendChild(row);
+      }
+    }
+  }
+}
+
+function closeVtlFrameModal() {
+  const modal = document.getElementById("vtl-frame-modal");
+  if (modal) modal.classList.add("hidden");
+  const imgEl = document.getElementById("vtl-frame-modal-img");
+  if (imgEl) {
+    imgEl.src = "";
+    imgEl.onload = null;
+  }
+}
+
+function updateVtlDetectorStatus(snap) {
+  const statusEl = document.getElementById("vtl-detector-status");
+  const startBtn = document.getElementById("vtl-detector-start");
+  const stopBtn  = document.getElementById("vtl-detector-stop");
+  if (!snap || !statusEl) return;
+  if (!snap.available) {
+    statusEl.textContent = "不可用: " + (snap.init_error || "wdnai 未安装");
+  } else if (snap.init_error) {
+    statusEl.textContent = "模型加载失败: " + snap.init_error;
+  } else if (snap.enabled && snap.session_ready) {
+    statusEl.textContent =
+      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size} · 视觉定位`;
+  } else if (snap.enabled) {
+    statusEl.textContent =
+      `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
+  } else if (snap.session_ready) {
+    statusEl.textContent = "已加载";
+  } else {
+    statusEl.textContent = "已安装但未启动";
+  }
+  if (startBtn) startBtn.disabled = !snap.available || !!snap.enabled;
+  if (stopBtn)  stopBtn.disabled  = !snap.enabled;
+  VTL.detectorSnap = snap;
+  if (typeof DemoGuard !== "undefined") {
+    DemoGuard.report("video-target-localization", {
+      session: VTL.lastSnap,
+      detector: VTL.detectorSnap,
+    });
+  }
+}
+
+async function refreshVtlDetector() {
+  try {
+    const r = await fetch(API_PREFIX + "/video-target-localization/events");
+    if (!r.ok) return null;
+    const data = await r.json();
+    updateVtlDetectorStatus(data.snapshot || {});
+    if (VTLDetector.events.length === 0 && Array.isArray(data.events)) {
+      VTLDetector.events = data.events.slice();
+      renderVtlEventList();
+    }
+    return data;
+  } catch (_) { return null; }
+}
+
+async function vtlDetectorStart() {
+  const promptEl = document.getElementById("vtl-prompt");
+  const everyEl  = document.getElementById("vtl-every-n");
+  const prompt = (promptEl?.value || "").trim();
+  const every_n = parseInt(everyEl?.value || "30", 10);
+  if (!prompt) {
+    setVtlOverlay("请先填写定位提示词", true);
+    return;
+  }
+  if (!Number.isFinite(every_n) || every_n < 1) {
+    setVtlOverlay("每隔帧数值非法", true);
+    return;
+  }
+  VTL.prompt = prompt;
+  VTL.everyN = every_n;
+  try {
+    // 本页**不**传 image_size / model_id — LocateAnything 视觉固定
+    // 448×448 单变体，且 capability swcap_grounding 当前只有 1 个
+    // preset，picker 无意义（后端 schema 直接拒收这俩字段）。
+    const r = await fetch(API_PREFIX + "/video-target-localization/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, every_n }),
+    });
+    if (!r.ok) {
+      const detail = await r.text().catch(() => "");
+      setVtlOverlay("启动定位失败: " + detail, true);
+      return;
+    }
+    const snap = await r.json();
+    updateVtlDetectorStatus(snap);
+    setVtlOverlay("", false);
+  } catch (e) {
+    setVtlOverlay("启动定位失败: " + e.message, true);
+  }
+}
+
+async function vtlDetectorStop() {
+  try {
+    const r = await fetch(API_PREFIX + "/video-target-localization/prompt/stop", { method: "POST" });
+    if (r.ok) updateVtlDetectorStatus(await r.json());
+  } catch (e) {
+    setVtlOverlay("停止定位失败: " + e.message, true);
+  }
+}
+
+async function vtlEventsClear() {
+  try {
+    await fetch(API_PREFIX + "/video-target-localization/events/clear", { method: "POST" });
+    VTLDetector.events = [];
+    VTLDetector.renderedIds.clear();
+    VTLDetector.eventNodes.clear();
+    renderVtlEventList();
+  } catch (_) {}
+}
+
+function initVideoTargetLocalization() {
+  if (window.__vtlInit) return;
+  window.__vtlInit = true;
+
+  const sourceEl = document.getElementById("vtl-source");
+  const loopEl   = document.getElementById("vtl-loop");
+  const openBtn = document.getElementById("vtl-open");
+  const closeBtn = document.getElementById("vtl-close");
+  const browseBtn = document.getElementById("vtl-browse");
+  const playBtn = document.getElementById("vtl-play");
+  const pauseBtn = document.getElementById("vtl-pause");
+  const stopBtn = document.getElementById("vtl-stop");
+  if (sourceEl) VTL.source = sourceEl.value || "";
+
+  if (openBtn) {
+    openBtn.addEventListener("click", async () => {
+      const src = (sourceEl?.value || "").trim();
+      if (!src) {
+        setVtlOverlay("请先填写视频源", true);
+        return;
+      }
+      openBtn.disabled = true;
+      setVtlOverlay("正在打开 " + src + " …", false);
+      try {
+        const snap = await vtlOpen({
+          source: src,
+          loop: !!(loopEl && loopEl.checked),
+        });
+        setVtlMeta(snap);
+        setVtlProgress(snap);
+        if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
+      } catch (e) {
+        setVtlOverlay("打开失败: " + e.message, true);
+      } finally {
+        openBtn.disabled = false;
+      }
+    });
+  }
+
+  // Browse button: open the same server-side file picker modal as the
+  // description page, but route the picked path back into #vtl-source.
+  if (browseBtn) {
+    browseBtn.addEventListener("click", () => {
+      VdFsModal._sourceTarget = sourceEl;
+      VdFsModal.open("");
+    });
+    // Esc 关闭 picker
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        const m = document.getElementById("vd-modal");
+        if (!m.classList.contains("hidden")) VdFsModal.close();
+      }
+    });
+  }
+
+  if (closeBtn) {
+    closeBtn.addEventListener("click", async () => {
+      try { await vtlClose(); } catch (_) {}
+      setVtlOverlay("已关闭", false);
+    });
+  }
+
+  if (playBtn) {
+    playBtn.addEventListener("click", async () => {
+      try {
+        const r = await vtlAction("play");
+        await vtlStatus();
+        if (r && r.ok === false) setVtlOverlay("播放失败: " + (r.reason || r.state), true);
+        else setVtlOverlay("", false);
+      } catch (e) { setVtlOverlay("播放失败: " + e.message, true); }
+    });
+  }
+  if (pauseBtn) {
+    pauseBtn.addEventListener("click", async () => {
+      try {
+        const r = await vtlAction("pause");
+        await vtlStatus();
+        if (r && r.ok === false) setVtlOverlay("暂停失败: " + (r.reason || r.state), true);
+        else setVtlOverlay("", false);
+      } catch (e) { setVtlOverlay("暂停失败: " + e.message, true); }
+    });
+  }
+  if (stopBtn) {
+    stopBtn.addEventListener("click", async () => {
+      try {
+        const r = await vtlAction("stop");
+        await vtlStatus();
+        if (r && r.ok === false) setVtlOverlay("停止失败: " + (r.reason || r.state), true);
+        else setVtlOverlay("已停止", false);
+      } catch (e) { setVtlOverlay("停止失败: " + e.message, true); }
+    });
+  }
+
+  const detStartBtn = document.getElementById("vtl-detector-start");
+  const detStopBtn  = document.getElementById("vtl-detector-stop");
+  const evClearBtn  = document.getElementById("vtl-events-clear");
+  if (detStartBtn) detStartBtn.addEventListener("click", vtlDetectorStart);
+  if (detStopBtn)  detStopBtn.addEventListener("click",  vtlDetectorStop);
+  if (evClearBtn)  evClearBtn.addEventListener("click",  vtlEventsClear);
+
+  // 关闭 modal 按钮 + 点遮罩关闭
+  const modalCloseBtn = document.getElementById("vtl-frame-modal-close");
+  const modal = document.getElementById("vtl-frame-modal");
+  if (modalCloseBtn) modalCloseBtn.addEventListener("click", closeVtlFrameModal);
+  if (modal) {
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) closeVtlFrameModal();
+    });
+  }
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      const m = document.getElementById("vtl-frame-modal");
+      if (m && !m.classList.contains("hidden")) closeVtlFrameModal();
+    }
+  });
+
+  refreshVtlDetector();
+  if (!VTL.ws && !VTL.wsTimer) connectVtlWs();
+}
+
+/* ------------------------------------------------------------------ *
  *  system logs page (journalctl-backed)                              *
  * ------------------------------------------------------------------ */
 const Logs = {
@@ -3043,6 +3805,13 @@ async function loadPageData(name) {
     return;
   }
 
+  if (name === "video-target-localization") {
+    initVideoTargetLocalization();
+    await vtlStatus();
+    await refreshVtlDetector();
+    return;
+  }
+
   if (name === "video-file-analysis") {
     VFA.init();
     return;
@@ -3201,6 +3970,24 @@ const DemoGuard = {
         ]);
       },
     },
+    "video-target-localization": {
+      // 视频目标定位页：复用 _ACTIVE_STATES 判定 session 是否还在跑
+      // (开 / 播 / 暂停 / eof) + detector.enabled 判定定位循环是否还在跑。
+      // 两个数据点直接从 VTL 模块的全局状态取（与其它 page 略有差异：
+      // 这里直接读 VTL.lastSnap / VTL.detectorSnap，因为本模块在
+      // setVtlMeta / updateVtlDetectorStatus 里也是写到这两个字段)。
+      active() {
+        const sess = VTL.lastSnap;
+        const det = VTL.detectorSnap;
+        return (sess && this._ACTIVE_STATES.includes(sess.state))
+            || (det && det.enabled === true);
+      },
+      async stop() {
+        // best-effort sequential — failures are silent
+        try { await fetch(API_PREFIX + "/video-target-localization/prompt/stop", { method: "POST" }); } catch (_) {}
+        try { await fetch(API_PREFIX + "/video-target-localization/close",       { method: "POST" }); } catch (_) {}
+      },
+    },
     "video-file-analysis": {
       // VFA 后台三阶段：opening → running → summarizing → done。
       // 综述阶段还要继续推 WS 占着 / 调 LLM，离开必须停。
@@ -3267,6 +4054,10 @@ const DemoGuard = {
         [API_PREFIX + "/video-target-detection/close",       "POST"],
         [API_PREFIX + "/video-target-detection/prompt/stop", "POST"],
       ],
+      "video-target-localization": [
+        [API_PREFIX + "/video-target-localization/close",       "POST"],
+        [API_PREFIX + "/video-target-localization/prompt/stop", "POST"],
+      ],
       "video-file-analysis": [[API_PREFIX + "/video-file-analysis/stop", "POST"]],
       "tts": [[API_PREFIX + "/tts/stop", "POST"]],
       "video-content-search": [[API_PREFIX + "/video-content-search/extract/stop", "POST"]],
@@ -3287,11 +4078,12 @@ const DemoGuard = {
   async confirmLeave(fromPage) {
     if (!this.isActive(fromPage)) return "stop";
     const labels = {
-      "video-detection":        "音视频描述",
-      "video-target-detection": "视频目标检测",
-      "video-content-search":   "视频内容检索",
-      "video-file-analysis":    "视频文件分析",
-      "tts":                    "语音生成",
+      "video-detection":          "音视频描述",
+      "video-target-detection":   "视频目标检测",
+      "video-target-localization":"视频目标定位",
+      "video-content-search":     "视频内容检索",
+      "video-file-analysis":      "视频文件分析",
+      "tts":                      "语音生成",
     };
     const name = labels[fromPage] || fromPage;
     return new Promise((resolve) => {

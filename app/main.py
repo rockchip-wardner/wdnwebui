@@ -40,12 +40,13 @@ from app.api import (
     video_detection,
     video_file_analysis,
     video_target_detection,
+    video_target_localization,
     wechat,
 )
 from app.services.audio_analysis import get_service as get_audio_analysis_service
 from app.services.compute_registry import get_registry
 from app.services.config import get_config
-from app.services.detector import get_detector, get_target_detector
+from app.services.detector import get_detector, get_target_detector, get_localizer_detector
 from app.services.text_chat import close_chat, get_chat_service
 from app.services.tts_session import get_session as get_tts_session
 from app.services.video_content_search import get_service as get_vcs_service
@@ -107,6 +108,7 @@ def create_app() -> FastAPI:
     app.include_router(tts.router, prefix="/api")
     app.include_router(compute.router, prefix="/api")
     app.include_router(video_target_detection.router, prefix="/api")
+    app.include_router(video_target_localization.router, prefix="/api")
     app.include_router(video_content_search.router, prefix="/api")
     app.include_router(wechat.router, prefix="/api")
     app.include_router(text_chat.router, prefix="/api")
@@ -143,6 +145,14 @@ def create_app() -> FastAPI:
             frame, frame_pos
         )
     )
+    # Same for the video-target-localization page — third detector
+    # instance with its own prompt / history (uses locate-anything
+    # visual grounding model, swcap_grounding capability).
+    get_session().add_frame_sink(
+        lambda frame, frame_pos: get_localizer_detector().submit_frame(
+            frame, frame_pos
+        )
+    )
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -173,6 +183,11 @@ def create_app() -> FastAPI:
             pass
         try:
             get_target_detector().close()
+        except Exception:
+            pass
+        # Free the locate-anything RKNN session if one was ever built.
+        try:
+            get_localizer_detector().close()
         except Exception:
             pass
         # Free the Qwen3-TTS RKNN sessions if any were built.

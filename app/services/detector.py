@@ -67,6 +67,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_VLM_DOC_TEXT_DESC = "用中文一句话描述画面中的场景、主体（人/物）、动作和环境。"
 DEFAULT_VLM_DOC_LEVEL_DESC = "严重程度标签：正常 / 警告 / 危险。"
 DEFAULT_TARGET_DOC_DESC_DESC = "对目标框内内容的一句话中文描述。"
+DEFAULT_LOCATOR_DOC_DESC = "一句话中文描述本次定位结果（含类别与位置概要）。"
 
 # 历史：TargetDoc 早期是 4 个独立 float field（x1 / y1 / x2 / y2） + desc。
 # 真机 Qwen3-VL-4B 在 768×768 变体上约 30% 概率把坐标输出成 0-1 范围
@@ -83,6 +84,11 @@ DEFAULT_TARGET_DOC_DESC_DESC = "对目标框内内容的一句话中文描述。
 # 作为兜底（兼容老 worker 进程或 schema 未生效的瞬态窗口），把任何
 # 0-1 范围 bbox ×1000 升到 0-1000。
 TARGET_DOC_SCHEMA_VERSION = 2
+# LocatorDoc — 视频目标定位页 schema。结构升级时 +1 让 ``_SCHEMA_CACHE`` 强制
+# miss + rebuild,避免 reload 后 worker 端 model_dump 出的新字段主进程用老 class
+# model_validate 触发 silent fallback。``v1`` 初始版:boxes(List[BoundingBox])
+# + text(str) + level(Literal["Normal","Warning"])。
+LOCATOR_DOC_SCHEMA_VERSION = 1
 
 
 _WDNAI_IMPORT_ERROR = ""
@@ -91,6 +97,29 @@ _WDNAI_IMPORT_ERROR = ""
 # eagerly, and a missing wheel on dev boxes would otherwise crash app startup
 # even for users who never touch the detection panel.
 _WDNAI_CACHE: dict = {}
+
+# ``wdnai.grounding`` 是 pure-python (无 RKNN native deps),可在模块加载
+# 时安全 import —— 这样 ``LocatorDoc`` schema 的 ``boxes: List[BoundingBox]``
+# 类型注解能在模块 globals 命名空间里被 pydantic forward-ref 解析器找到。
+# 放在模块级而不是 ``_build_grounding_doc_class`` 函数内的原因是
+# ``@Generable`` 装饰器用 caller frame globals 解析 forward ref; 函数
+# 内的 ``from ... import ... as _BoundingBox`` 创建的本地变量不在
+# globals 里,会让 pydantic v2 抛 ``PydanticUserError: ... not fully
+# defined``。把它放到模块 globals 就能在 schema build 时正常解析。
+from typing import Literal as _Literal  # noqa: F401  (for forward-ref in LocatorDoc.level)
+from typing import List as _List  # noqa: F401  (for forward-ref in LocatorDoc.boxes)
+try:
+    from wdnai.grounding import BoundingBox as _BoundingBox  # noqa: F401
+    from wdnai.grounding import GroundingResult as _GroundingResult  # noqa: F401
+    _WDNAI_GROUNDING_OK = True
+except Exception as _e:  # noqa: BLE001
+    # 兜底:wdnai.grounding 缺失时(SDK wheel 没装/版本不匹配)让 schema
+    # 仍能 build —— 把 ``boxes`` 退化为 ``dict``,模型端 JSON-Schema
+    # 提示照常生成;真机 SDK 装好后再用真实 ``BoundingBox``。
+    _BoundingBox = dict  # type: ignore[assignment,misc]
+    _GroundingResult = None  # type: ignore[assignment,misc]
+    _WDNAI_GROUNDING_OK = False
+    _WDNAI_GROUNDING_ERR = str(_e)
 
 import logging
 LOG = logging.getLogger("detector")
@@ -288,6 +317,7 @@ def _load_app_prompts(app_key: str, schema_cls: str) -> dict[str, str]:
     defaults = {
         ("video_detection", "VLMDoc"): {"text": DEFAULT_VLM_DOC_TEXT_DESC, "level": DEFAULT_VLM_DOC_LEVEL_DESC},
         ("video_target_detection", "TargetDoc"): {"desc": DEFAULT_TARGET_DOC_DESC_DESC},
+        ("video_target_localization", "LocatorDoc"): {"desc": DEFAULT_LOCATOR_DOC_DESC},
     }
     for field, default_desc in defaults.get((app_key, schema_cls), {}).items():
         user_val = schema_block.get(field)
@@ -388,6 +418,85 @@ def _get_target_doc_cls():
     return cls
 
 
+# --------------------------------------------------------------------------- #
+# LocatorDoc —— 视频目标定位页 structured-output schema                        #
+# --------------------------------------------------------------------------- #
+# 视觉定位 (grounding) 模型输出：boxes: List[BoundingBox] + text(str) +
+# level(Literal["Normal","Warning"])。一个事件可携带多个 bbox(多目标)，
+# 整帧 base64 JPEG 附在事件 JSON,前端用原图 + bbox overlay 渲染。
+#
+# 字段语义对照:
+#   - ``boxes`` —— 模型从 ``<box>`` 标记解析出的 ROI 列表,每个 bbox 是
+#     ``BoundingBox(label, x1, y1, x2, y2)`` 0–1000 归一化坐标。
+#   - ``text`` —— 模型回显的原始 grounding 文本(含 ``<ref>``/``<box>`` 标记)。
+#   - ``level`` —— "Normal" / "Warning" 二选一。
+#
+# 与 ``TargetDoc`` 同源:继承 ``pydantic.BaseModel`` 而非 ``LMOutput`` —— 避
+# 免 ``attachment: List[Attachment]`` 字段污染 ``model_json_schema()``,否则
+# SDK 的 ``_safe_schema`` 返回空串,模型看不到字段语义。
+def _build_grounding_doc_class(desc_desc: str):
+    """Build the ``LocatorDoc`` schema lazily, once wdnai is importable.
+
+    ``desc_desc`` —— 用户在「系统配置 → App 提示词模板」覆盖的
+    ``desc`` 字段 ``Field(description=...)`` 文本;缺失时回退到
+    ``DEFAULT_LOCATOR_DOC_DESC``。``boxes`` 字段的 description 是协议
+    级格式规约("``BoundingBox`` 列表,每个 0–1000 归一化 4 坐标"),
+    与 ``TargetDoc.bbox`` 一致保持 hardcoded 不开放给配置。
+
+    **不能带 class docstring** —— pydantic 把 docstring 渲染到
+    ``model_json_schema()`` 的顶层 ``description`` 字段,模型会把它当成
+    数据字段包到 ``{"description": {...}}`` 里(详见 ``_build_target_doc_class``
+    注释)。
+
+    类型注解 ``boxes: List[BoundingBox]`` / ``level: Literal[...]`` 引用
+    模块 globals 里的 ``_BoundingBox`` (``wdnai.grounding.BoundingBox``) 和
+    ``_Literal`` (``typing.Literal``) —— pydantic 的 forward-ref resolver 用
+    caller frame globals 找类型名,所以这些名字必须出现在模块 globals 命名
+    空间里(``_BoundingBox`` 在模块顶部 import,``Literal`` 来自 typing
+    标准库)。
+    """
+    from typing import List as _List
+
+    _, _, _, _, _, Generable, Field, _, _, _ = _load_wdnai()
+
+    from pydantic import BaseModel as _PydBaseModel
+
+    @Generable
+    class LocatorDoc(_PydBaseModel):
+        boxes: "_List[_BoundingBox]" = Field(
+            description=(
+                "定位结果列表,每个元素是 ``BoundingBox(label, x1, y1, x2, y2)`` "
+                "0–1000 归一化坐标(x1/y1 左上角,x2/y2 右下角)。"
+            ),
+        )
+        text: str = Field(
+            description=(
+                "模型回显的原始 grounding 文本(含 ``<ref>label</ref><box>(x1,y1,x2,y2)</box>`` 标记)。"
+            ),
+        )
+        level: "_Literal['Normal', 'Warning']" = Field(
+            default="Normal",
+            description="事件等级标签;常规观察为 ``Normal``,异常/风险提示为 ``Warning``。",
+        )
+
+    return LocatorDoc
+
+
+def _get_grounding_doc_cls():
+    """缓存 + 解析 ``LocatorDoc`` schema 类。"""
+    descs = _load_app_prompts("video_target_localization", "LocatorDoc")
+    cache_key = (
+        "LocatorDoc", LOCATOR_DOC_SCHEMA_VERSION,
+        tuple(sorted(descs.items())),
+    )
+    cached = _SCHEMA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    cls = _build_grounding_doc_class(descs["desc"])
+    _SCHEMA_CACHE[cache_key] = cls
+    return cls
+
+
 @dataclass
 class DetectorEvent:
     """Public-facing event payload pushed to WS subscribers.
@@ -425,11 +534,21 @@ class DetectorEvent:
     crop_h: Optional[int] = None
     desc: Optional[str] = None
     # ``True`` when the tool that produced this event is a pure
-    # side-effect (e.g. ``tts_alert`` 播完了就是播完了，不再需要模型
+    # side-effect (e.g. ``tts_alert`` 播完了就是播完了，不再再让模型
     # wrap-up). detector 看到 ``tool_ev.consume_iteration`` 时直接跳出
     # multi-iter 循环，不再把 "你刚说了 X" 的 transcript 喂回下一轮
     # 避免模型退化到复读用户的提示词。
     consume_iteration: bool = False
+    # 视频目标定位页 (LocatorDoc) 专用字段。一帧一事件，事件内 ``boxes``
+    # 是本次定位到的全部目标 bbox 列表(可能为空 —— "未检测到")；
+    # ``frame_b64`` + ``frame_w`` + ``frame_h`` 是整帧 JPEG base64,前端
+    # 用原图 + bbox overlay 渲染(避免逐 box 多次 base64 编码传输)。
+    # ``text`` 字段沿用历史展示路径 —— "label1 @ [x1,y1,x2,y2];
+    # label2 @ [...]" 形式(或空列表时 "未定位到目标")。
+    boxes: Optional[list] = None
+    frame_b64: Optional[str] = None
+    frame_w: Optional[int] = None
+    frame_h: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -447,6 +566,10 @@ class DetectorEvent:
             "crop_h":           self.crop_h,
             "desc":             self.desc,
             "consume_iteration": self.consume_iteration,
+            "boxes":            self.boxes,
+            "frame_b64":        self.frame_b64,
+            "frame_w":          self.frame_w,
+            "frame_h":          self.frame_h,
         }
 
 
@@ -1040,26 +1163,78 @@ class WdnaiDetector:
         ok, *_ = _load_wdnai()
         return ok
 
+# ------------------------------------------------------------------ #
+    def _required_capability(self) -> str:
+        """Return the ``ComputeRegistry`` capability this detector needs.
+
+        Capability 分流规则(M4 起多 capability schema 共存):
+
+        * ``LocatorDoc`` —— 视频目标定位页 —— 走 ``swcap_grounding``
+          (LocateAnything-3b 视觉定位模型)。判别靠 schema 类名,LocatorDoc
+          在 ``_get_grounding_doc_cls`` 创建后 ``__name__`` 不变,稳定性靠
+          schema-version 在 ``_SCHEMA_CACHE`` 强制 rebuild 兜底。
+        * 其它 (``VLMDoc`` / ``TargetDoc``) —— 走 ``swcap_video_describe``
+          (qwen3-vl-4b / qwen3.5-vl-4b 通用 VLM),默认分支覆盖两个老
+          detector 单例。
+
+        调用方:
+          * ``snapshot()`` — 按本页 schema 决定查哪个 capability,避免
+            视频目标定位页在 user 已加载 ``swcap_grounding`` 但未加载
+            ``swcap_video_describe`` 时,被错误地标"功能未启用:
+            swcap_video_describe"。
+          * ``start()`` — 同样的 capability 校验,503 透传。
+
+        返回常量字符串;**绝不**触网 / 触 NPU —— 纯 schema-class 查表,
+        调用安全 (snapshot 1Hz WS / 页面加载 / ``start()`` 三处共用)。
+
+        **Factory 解析细节**:``__init__`` 把 ``generating_cls`` 原样存
+        进 ``self._generating_cls``(``_get_target_doc_cls`` /
+        ``_get_grounding_doc_cls`` 工厂函数,**不**立即调,或 ``None``)。
+        ``start()`` 会先 resolve 成真类再 capability 校验,但 ``snapshot()``
+        在 ``start()`` 之前就会被 1Hz WS / 页面加载触发 —— 直接读
+        ``self._generating_cls.__name__`` 拿到 ``"_get_grounding_doc_cls"``
+        而非 ``"LocatorDoc"``,命中不到目标分支,bug 依旧。这里在读
+        ``__name__`` 前先调一次工厂拿到真类(失败兜底 ``None``,默认
+        走 swcap_video_describe)。
+        """
+        cls = self._generating_cls
+        if callable(cls) and not isinstance(cls, type):
+            try:
+                cls = cls()
+            except Exception:  # noqa: BLE001
+                cls = None
+        if getattr(cls, "__name__", "") == "LocatorDoc":
+            return "swcap_grounding"
+        return "swcap_video_describe"
+
+    # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
         from app.services.compute_registry import get_registry
         registry = get_registry()
+        capability = self._required_capability()
         try:
-            sess = registry.get_session("swcap_video_describe")
+            sess = registry.get_session(capability)
             session_ready = sess is not None
             session_error = ""
         except RuntimeError as e:
             sess = None
             session_ready = False
             session_error = str(e)
-        # Query the running ``swcap_video_describe`` instance for its
-        # loaded vision-model native sizes — never hardcode [384, 768]
-        # on the client. Filter by capability instead of model_id so
-        # any future VLM preset (qwen3.5-vl-4b etc.) is picked up
-        # automatically. Empty list when the worker hasn't reported
-        # yet (model not loaded, network probe failure, missing
-        # capability).
+        # Query the running VLM instance for its loaded vision-model
+        # native sizes — never hardcode [384, 768] on the client.
+        # Filter by capability instead of model_id so any future VLM
+        # preset (qwen3.5-vl-4b etc.) is picked up automatically.
+        # Empty list when the worker hasn't reported yet (model not
+        # loaded, network probe failure, missing capability).
+        #
+        # ``available_image_sizes`` 是 ``swcap_video_describe`` VLM 概
+        # 念(只有 VLM 实例会上报);视频目标定位页走 ``swcap_grounding``
+        # —— 该 capability 实例不暴露 ``available_image_sizes`` 字段,
+        # 即使循环也会落空。直接按 capability != swcap_video_describe
+        # 短路,``available_sizes`` 留空数组,前端下拉框按现有契约显示
+        # 空状态。
         available_sizes: List[int] = []
-        if sess is not None:
+        if capability == "swcap_video_describe" and sess is not None:
             try:
                 for inst in registry.list_with_source():
                     caps = inst.get("capability_types") or []
@@ -1189,26 +1364,16 @@ class WdnaiDetector:
             if not reg.has(key):
                 raise ValueError(f"未知工具: {key!r}")
             tool_keys.append(key)
-        # 业务级校验：算力是否就绪。这一步失败 → 503 / RuntimeError，
-        # 前端能区分"功能未启用"和"运行时错误"。
-        from app.services.compute_registry import get_registry
-        try:
-            get_registry().get_session("swcap_video_describe")
-        except RuntimeError as e:
-            raise RuntimeError(str(e))
-        # 工具依赖的 capability 校验（双层防护第二层）
-        for key in tool_keys:
-            spec = reg.get(key)
-            if spec.requires_capability:
-                try:
-                    get_registry().get_session(spec.requires_capability)
-                except RuntimeError as e:
-                    raise RuntimeError(str(e)) from e
         # Build the structured-output class now (lazy) so that any
         # import failure surfaces here instead of inside the worker.
         # 该 detector 实例的 schema 在 ``__init__`` 时记录，未指定
         # 时回退到 ``VLMDoc``（音视频描述页）。视频目标检测页实例会
-        # 显式传 ``TargetDoc`` 进来。
+        # 显式传 ``TargetDoc`` / ``LocatorDoc`` 进来。
+        #
+        # **注意**:schema 解析放在 capability 校验**之前** —— 不同
+        # schema 对应不同 capability（``VLMDoc``/``TargetDoc`` 走
+        # ``swcap_video_describe``,``LocatorDoc`` 走 ``swcap_grounding``),
+        # 必须先知道 schema class 才能选正确 capability。
         if self._generating_cls is None:
             self._generating_cls = _get_vlm_doc_cls()
         elif callable(self._generating_cls) and not isinstance(self._generating_cls, type):
@@ -1226,6 +1391,29 @@ class WdnaiDetector:
             raise ValueError(
                 f"generating_cls 解析后不是类: {self._generating_cls!r}"
             )
+        # 业务级校验：算力是否就绪。这一步失败 → 503 / RuntimeError，
+        # 前端能区分"功能未启用"和"运行时错误"。
+        #
+        # **多 capability schema 分流**(M4 引入):
+        # ``VLMDoc`` / ``TargetDoc`` 走 ``swcap_video_describe``,
+        # ``LocatorDoc`` 走 ``swcap_grounding`` (LocateAnything-3b
+        # 视觉定位模型)。通过 ``self._required_capability()`` 查表 ——
+        # 与 ``snapshot()`` 同源,保证 1Hz WS 状态帧 + POST /prompt
+        # 503 详情使用同一 capability 字符串,前端不会看到前后矛盾的
+        # "功能未启用: ..."。
+        from app.services.compute_registry import get_registry
+        try:
+            get_registry().get_session(self._required_capability())
+        except RuntimeError as e:
+            raise RuntimeError(str(e))
+        # 工具依赖的 capability 校验（双层防护第二层）
+        for key in tool_keys:
+            spec = reg.get(key)
+            if spec.requires_capability:
+                try:
+                    get_registry().get_session(spec.requires_capability)
+                except RuntimeError as e:
+                    raise RuntimeError(str(e)) from e
         with self._lock:
             self._enabled = True
             self._prompt = prompt
@@ -1373,18 +1561,23 @@ class WdnaiDetector:
             "raw_text_first": "",
         }
         _t0_infer = time.monotonic()
+        # Per-frame capability must route through _required_capability() —
+        # hardcoding "swcap_video_describe" leaks that string into LocatorDoc
+        # disabled-events (text="(功能未启用: swcap_video_describe)") which the
+        # user sees in the VTL events history.
+        _required_cap = self._required_capability()
         try:
             from app.services.compute_registry import get_registry
             _registry = get_registry()
             if self._chosen_model_id:
                 sess = _registry.get_session_for_model(
-                    "swcap_video_describe", self._chosen_model_id)
+                    _required_cap, self._chosen_model_id)
             else:
-                sess = _registry.get_session("swcap_video_describe")
+                sess = _registry.get_session(_required_cap)
         except RuntimeError as e:
             LOG.warning(
-                "frame infer: capability disabled (swcap_video_describe): %s",
-                e,
+                "frame infer: capability disabled (%s): %s",
+                _required_cap, e,
             )
             _diag_rec.update(
                 it_infer_ms=(time.monotonic() - _t0_infer) * 1000.0,
@@ -1421,6 +1614,11 @@ class WdnaiDetector:
                 generating_cls = _get_vlm_doc_cls()
             TargetDoc = (
                 _get_target_doc_cls()
+                if generating_cls is not _get_vlm_doc_cls()
+                else None
+            )
+            LocatorDoc = (
+                _get_grounding_doc_cls()
                 if generating_cls is not _get_vlm_doc_cls()
                 else None
             )
@@ -1672,6 +1870,42 @@ class WdnaiDetector:
                         target_ev.crop_h or 0,
                     )
                     exit_reason = "target_doc"
+                    break
+
+                # ---- LocatorDoc branch (grounding multi-bbox) ---------------
+                # 视频目标定位页：模型返回 ``LocatorDoc`` (``boxes`` +
+                # ``text`` + ``level``)。detector 把整帧 base64 JPEG +
+                # 每个 box 的裁切 base64 写进事件,前端用原图 + bbox
+                # overlay 渲染。
+                #
+                # dispatch 同时支持本模块的 ``LocatorDoc`` 和 SDK 的
+                # ``GroundingResult``(后者 ``LMOutput`` 子类,字段形
+                # 状一致;SDK fallback 路径可能直接返回它)。duck-typed
+                # `_build_grounding_event` 内部同时接受两者。
+                #
+                # 顺序:LocatorDoc(本模块 pydantic class,严格匹配在前)
+                # → _GroundingResult(SDK fallback class,守卫
+                # `_GroundingResult is not None` 兼容 dev box 没装
+                # wdnai.grounding 的场景)。
+                _locator_match = (
+                    (LocatorDoc is not None and isinstance(result, LocatorDoc))
+                    or (_GroundingResult is not None and isinstance(result, _GroundingResult))
+                )
+                if _locator_match:
+                    locator_ev = self._build_grounding_event(
+                        result, frame_bgr, prompt,
+                    )
+                    events.append(locator_ev)
+                    LOG.info(
+                        "frame iter %d: grounding boxes=%d frame=%dx%d "
+                        "level=%s",
+                        i + 1,
+                        len(locator_ev.boxes or []),
+                        locator_ev.frame_w or 0,
+                        locator_ev.frame_h or 0,
+                        locator_ev.level,
+                    )
+                    exit_reason = "grounding_doc"
                     break
 
                 # ---- VLMDoc branch (default) ------------------------------
@@ -2057,6 +2291,209 @@ class WdnaiDetector:
         )
 
     # ------------------------------------------------------------------ #
+    def _build_grounding_event(
+        self,
+        result,
+        frame_bgr: "np.ndarray",
+        prompt: str,
+    ) -> DetectorEvent:
+        """把 ``LocatorDoc`` (或 SDK ``GroundingResult``) 实例 + 原帧包成
+        ``DetectorEvent``。
+
+        与 ``_build_target_event`` 同样 duck-type 接受 duck-typed
+        ``.boxes`` / ``.text`` / ``.level`` 字段,同时支持本模块的
+        ``LocatorDoc`` 和 SDK 的 ``GroundingResult``(真机 worker
+        ``sess.respond(generating=...)`` 返回的实例就是前者,但 SDK
+        内部 schema 校验也可能 fallback 到后者)。
+
+        行为约定:
+
+        * ``boxes`` —— duck-type 读 ``result.boxes`` 列表(可空)。
+          0-1000 归一化坐标 → 乘以原图 ``w`` / ``h`` 转到像素后按
+          ``int(round(...))`` + clamp 到 ``[0, dim]``。每个 box
+          单独裁原图 + JPEG q=85 编码 + base64 → ``boxes[i].crop_b64``。
+        * ``frame_b64`` —— 整帧 JPEG q=85 + base64,前端用原图 + bbox
+          overlay 渲染(整帧一张避免逐 box 多次 base64 传输)。
+        * ``event.text`` —— "label1 @ [x1,y1,x2,y2]; label2 @ [...]"
+          拼接形式(空列表时为 ``"未定位到目标"``)。
+        * ``event.tool_call = "grounding"`` —— 前端用此判别"多 bbox
+          定位事件"(与 ``target_detection`` 单框 + crop 区分)。
+        * ``event.level`` —— ``result.level`` 直接透传,空 boxes 时
+          兜底为 ``"warning"`` 让前端能区分"未检测到"和"成功检测"。
+
+        **返回 ``DetectorEvent`` 总有值**(不返回 ``None``)——"未检测
+        到"语义写 ``boxes=[]`` + ``level="warning"``,让前端在历史
+        列表里看得到这一帧的"空状态",避免和"模型崩了"混淆。
+        """
+        import base64
+
+        import cv2
+
+        h, w = (0, 0)
+        if frame_bgr is not None and getattr(frame_bgr, "ndim", 0) >= 2:
+            h, w = frame_bgr.shape[:2]
+
+        # ---- 1) 整帧 base64 --------------------------------------------
+        frame_b64 = ""
+        if frame_bgr is not None and frame_bgr.size > 0:
+            try:
+                ok_full, buf_full = cv2.imencode(
+                    ".jpg", frame_bgr,
+                    [cv2.IMWRITE_JPEG_QUALITY, 85],
+                )
+                if ok_full:
+                    frame_b64 = base64.b64encode(
+                        buf_full.tobytes(),
+                    ).decode("ascii")
+            except Exception as e:  # noqa: BLE001
+                LOG.warning(
+                    "grounding_event: full-frame JPEG encode failed: %s", e,
+                )
+                frame_b64 = ""
+
+        # ---- 2) 每个 box 裁 + base64 ----------------------------------
+        raw_boxes = []
+        try:
+            raw_boxes = list(getattr(result, "boxes", []) or [])
+        except Exception:  # noqa: BLE001
+            raw_boxes = []
+        # 防御兜底：SDK structured parse 偶尔返回 ``boxes=[]`` 但 ``text``
+        # 里仍带 ``<ref>/<box>`` 标记(raw-text fallback / schema parse
+        # miss),此时用 ``wdnai.utils._parse_locate_output`` 直接从文本
+        # 重新解析。导入放在函数体内,dev box 没装 wdnai 时也不会 crash。
+        if not raw_boxes:
+            _text_attr = str(getattr(result, "text", "") or "")
+            if "<box>" in _text_attr:
+                try:
+                    from wdnai.utils import _parse_locate_output
+                    _parsed_boxes, _ = _parse_locate_output(_text_attr)
+                    raw_boxes = list(_parsed_boxes or [])
+                except Exception as _parse_e:  # noqa: BLE001
+                    LOG.debug(
+                        "grounding_event: _parse_locate_output fallback "
+                        "failed: %s",
+                        _parse_e,
+                    )
+                    raw_boxes = []
+
+        out_boxes: list = []
+        for box in raw_boxes:
+            # 兼容 ``BoundingBox`` 实例 (pydantic model) 与 dict 形态
+            if hasattr(box, "x1"):
+                try:
+                    x1f = float(box.x1)
+                    y1f = float(box.y1)
+                    x2f = float(box.x2)
+                    y2f = float(box.y2)
+                except Exception:  # noqa: BLE001
+                    continue
+                label = str(getattr(box, "label", "") or "")
+            elif isinstance(box, dict):
+                try:
+                    x1f = float(box.get("x1", 0))
+                    y1f = float(box.get("y1", 0))
+                    x2f = float(box.get("x2", 0))
+                    y2f = float(box.get("y2", 0))
+                except Exception:  # noqa: BLE001
+                    continue
+                label = str(box.get("label", "") or "")
+            else:
+                continue
+            # BoundingBox 坐标是 letterbox 输入空间 (448×448) 的 0-1000
+            # 归一化值,不能直接乘到原图尺寸 — 必走 unletterbox。
+            try:
+                from wdnai.utils import LetterboxMeta, unletterbox_bbox
+                _m_scale = 448.0 / max(h, w)
+                _m_ch = int(round(h * _m_scale))
+                _m_cw = int(round(w * _m_scale))
+                meta = LetterboxMeta(
+                    size=448, orig_h=h, orig_w=w,
+                    scale=_m_scale, content_h=_m_ch, content_w=_m_cw,
+                    pad_top=(448 - _m_ch) // 2,
+                    pad_left=(448 - _m_cw) // 2,
+                )
+                ux1f, uy1f, ux2f, uy2f = unletterbox_bbox(
+                    [x1f, y1f, x2f, y2f], meta, clamp=True,
+                )
+            except Exception as _ul_e:  # noqa: BLE001
+                LOG.warning(
+                    "grounding_event: unletterbox failed (using naive scale): %s",
+                    _ul_e,
+                )
+                ux1f, uy1f, ux2f, uy2f = (
+                    x1f / 1000.0 * w, y1f / 1000.0 * h,
+                    x2f / 1000.0 * w, y2f / 1000.0 * h,
+                )
+            px1 = int(round(ux1f))
+            px2 = int(round(ux2f))
+            py1 = int(round(uy1f))
+            py2 = int(round(uy2f))
+            if px1 > px2:
+                px1, px2 = px2, px1
+            if py1 > py2:
+                py1, py2 = py2, py1
+            crop_b64, crop_w, crop_h = "", 0, 0
+            if (
+                frame_bgr is not None
+                and frame_bgr.size > 0
+                and (px2 - px1) > 0
+                and (py2 - py1) > 0
+            ):
+                crop = frame_bgr[py1:py2, px1:px2]
+                try:
+                    ok, buf = cv2.imencode(
+                        ".jpg", crop,
+                        [cv2.IMWRITE_JPEG_QUALITY, 85],
+                    )
+                    if ok:
+                        crop_b64 = base64.b64encode(
+                            buf.tobytes(),
+                        ).decode("ascii")
+                        crop_w = crop.shape[1]
+                        crop_h = crop.shape[0]
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning(
+                        "grounding_event: crop JPEG encode failed "
+                        "(label=%r): %s", label, e,
+                    )
+            out_boxes.append({
+                "label":    label,
+                "bbox":     [px1, py1, px2, py2],
+                "crop_b64": crop_b64,
+                "crop_w":   crop_w,
+                "crop_h":   crop_h,
+            })
+
+        # ---- 3) text 拼接 + level 透传 ---------------------------------
+        if out_boxes:
+            counts = {}
+            for b in out_boxes:
+                label = b.get("label", "") or "(未命名)"
+                counts[label] = counts.get(label, 0) + 1
+            parts = [f"定位到 {len(out_boxes)} 个目标"]
+            for label, count in counts.items():
+                parts.append(f'"{label}" 数量：{count}')
+            text = "; ".join(parts)
+        else:
+            text = "未定位到目标"
+
+        level = getattr(result, "level", None)
+        if not out_boxes:
+            level = level or "warning"
+
+        return DetectorEvent(
+            id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
+            text=text,
+            level=level,
+            attachment_count=0,
+            tool_call="grounding",
+            boxes=out_boxes,
+            frame_b64=frame_b64,
+            frame_w=int(w) if w else 0,
+            frame_h=int(h) if h else 0,
+        )
+
+    # ------------------------------------------------------------------ #
     def _get_tool_call_max_iters(self) -> int:
         """读 ``config.jsonc["compute"]["tool_call_max_iters"]``。
 
@@ -2281,6 +2718,7 @@ class WdnaiDetector:
 
 _detector: Optional[WdnaiDetector] = None
 _target_detector: Optional[WdnaiDetector] = None
+_localizer_detector: Optional[WdnaiDetector] = None
 _detector_lock = threading.Lock()
 
 
@@ -2314,3 +2752,25 @@ def get_target_detector() -> WdnaiDetector:
         if _target_detector is None:
             _target_detector = WdnaiDetector(generating_cls=_get_target_doc_cls)
         return _target_detector
+
+
+def get_localizer_detector() -> WdnaiDetector:
+    """视频目标定位页（``LocatorDoc`` 多 bbox + 整帧 base64）后端 detector 单例。
+
+    第 3 个 ``WdnaiDetector`` 单例,挂 ``LocatorDoc`` schema
+    （``boxes: List[BoundingBox]`` + ``text`` + ``level``）。事件可携带
+    多个 bbox,整帧 JPEG 附在 ``frame_b64`` 字段,前端用原图 + bbox
+    overlay 渲染。
+
+    与音视频描述 / 视频目标检测走同一条 ``WdnaiDetector`` 类路径,
+    状态独立（prompt / 事件历史 / frame_count 各自维护）。factory 传
+    ``_get_grounding_doc_cls`` 可调用对象,``start()`` 时 lazy resolve 为
+    真正的 class —— 与 ``get_target_detector`` 同构。
+    """
+    global _localizer_detector
+    with _detector_lock:
+        if _localizer_detector is None:
+            _localizer_detector = WdnaiDetector(
+                generating_cls=_get_grounding_doc_cls,
+            )
+        return _localizer_detector

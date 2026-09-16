@@ -20,6 +20,7 @@ from . import (
     video_detection,
     video_file_analysis,
     video_target_detection,
+    video_target_localization,
     wechat,
 )
 
@@ -38,5 +39,6 @@ __all__ = [
     "video_detection",
     "video_file_analysis",
     "video_target_detection",
+    "video_target_localization",
     "wechat",
 ]

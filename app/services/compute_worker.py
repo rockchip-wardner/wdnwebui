@@ -1690,7 +1690,10 @@ def infer_handler(state: dict, payload: dict) -> dict:
         tool_call_name = type(result).__name__ if not isinstance(result, str) else None
         is_tool_instance = (
             tool_call_name is not None
-            and tool_call_name not in {"str", "TTSResult", "VLMDoc", "TargetDoc"}
+            and tool_call_name not in {
+                "str", "TTSResult", "VLMDoc", "TargetDoc",
+                "LocatorDoc", "GroundingResult",
+            }
             and hasattr(result, "model_dump")
             and not isinstance(result, (str, bytes))
         )
@@ -1847,7 +1850,10 @@ def infer_handler(state: dict, payload: dict) -> dict:
         # so reply stays JSON-serializable.
         result_data_dict: Optional[dict] = None
         if (not is_tool_instance
-                and type(result).__name__ in {"VLMDoc", "TargetDoc", "TTSResult"}):
+                and type(result).__name__ in {
+                    "VLMDoc", "TargetDoc", "TTSResult",
+                    "LocatorDoc", "GroundingResult",
+                }):
             try:
                 _dump = result.model_dump()
                 if isinstance(_dump, dict):
@@ -1871,13 +1877,17 @@ def infer_handler(state: dict, payload: dict) -> dict:
         # ------------------------------------------------------------------ #
         if (not is_tool_instance
                 and _diag_generating is not None
-                and type(result).__name__ not in {"VLMDoc", "TargetDoc", "TTSResult"}):
+                and type(result).__name__ not in {
+                    "VLMDoc", "TargetDoc", "TTSResult",
+                    "LocatorDoc", "GroundingResult",
+                }):
             _raw_text_for_log = (
                 text if isinstance(text, str) else str(result)[:500]
             )
             LOG.error(
                 "infer_handler[%s]: SCHEMA PARSE FAILED — gen=%r but "
-                "result_type=%s (expected VLMDoc/TargetDoc/TTSResult).",
+                "result_type=%s (expected VLMDoc/TargetDoc/TTSResult/"
+                "LocatorDoc/GroundingResult).",
                 _req_id, _diag_generating, type(result).__name__,
             )
             # raw_text 独立多行 LOG：%r 会把 \n 转成 \\n，多行 JSON 全挤
