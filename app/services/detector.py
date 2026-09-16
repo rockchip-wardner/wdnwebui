@@ -2693,8 +2693,19 @@ class WdnaiDetector:
             _infer_ms = (time.monotonic() - _t0_infer) * 1000.0
             _video_ts = 0.0
             try:
-                _fps = float(get_session().snapshot().get("fps") or 0)
-                if _fps > 0 and frame_pos >= 0:
+                _sess_snap = get_session().snapshot()
+                _fps = float(_sess_snap.get("fps") or 0)
+                if _fps <= 0 and not _sess_snap.get("is_live"):
+                    import cv2 as _cv2
+                    _src = _sess_snap.get("source") or ""
+                    if _src.startswith("/"):
+                        _probe = _cv2.VideoCapture(_src)
+                        if _probe.isOpened():
+                            _fps = float(_probe.get(_cv2.CAP_PROP_FPS) or 0) or 0
+                        _probe.release()
+                if _fps <= 0:
+                    _fps = 25.0
+                if frame_pos >= 0:
                     _video_ts = float(frame_pos) / _fps
             except Exception:  # noqa: BLE001
                 pass
