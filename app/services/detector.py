@@ -2306,6 +2306,7 @@ class WdnaiDetector:
         result,
         frame_bgr: "np.ndarray",
         prompt: str,
+        frame_pos: int = -1,
     ) -> Optional[DetectorEvent]:
         """把 ``LocatorDoc`` (或 SDK ``GroundingResult``) 实例 + 原帧包成
         ``DetectorEvent``。
