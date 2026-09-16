@@ -1513,7 +1513,7 @@ class WdnaiDetector:
                 pass
 
     # ------------------------------------------------------------------ #
-    def _infer_sync(self, frame_bgr: "np.ndarray", prompt: str) -> List[DetectorEvent]:
+    def _infer_sync(self, frame_bgr: "np.ndarray", prompt: str, frame_pos: int = -1) -> List[DetectorEvent]:
         """Run a multi-turn tool loop on one frame; return a list of events.
 
         每帧开头 ``sess.reset()`` 清一次 KV cache（保留原帧间隔离语
@@ -1896,7 +1896,7 @@ class WdnaiDetector:
                 )
                 if _locator_match:
                     locator_ev = self._build_grounding_event(
-                        result, frame_bgr, prompt,
+                        result, frame_bgr, prompt, frame_pos,
                     )
                     if locator_ev is None:
                         # 未定位到目标 — 跳过该帧,不写 _events。
@@ -2478,8 +2478,10 @@ class WdnaiDetector:
         # ---- 3) text 拼接 + level 透传 ---------------------------------
         if not out_boxes:
             LOG.info(
-                "grounding_event: no boxes detected — skip event (frame will "
-                "not appear in history)",
+                "grounding_event: no boxes detected (frame_pos=%d, prompt=%r) "
+                "— skip event (frame will not appear in history)",
+                frame_pos,
+                (prompt or "")[:60],
             )
             return None
 
