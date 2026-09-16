@@ -1898,6 +1898,13 @@ class WdnaiDetector:
                     locator_ev = self._build_grounding_event(
                         result, frame_bgr, prompt,
                     )
+                    if locator_ev is None:
+                        # 未定位到目标 — 跳过该帧,不写 _events。
+                        # 注:这里仍 break 跳出 iter 循环(模型本轮
+                        # 已出 LocatorDoc,不再继续 tool loop);只是
+                        # 本帧不产生 event。
+                        exit_reason = "grounding_no_boxes"
+                        break
                     events.append(locator_ev)
                     LOG.info(
                         "frame iter %d: grounding boxes=%d frame=%dx%d "
@@ -2299,7 +2306,7 @@ class WdnaiDetector:
         result,
         frame_bgr: "np.ndarray",
         prompt: str,
-    ) -> DetectorEvent:
+    ) -> Optional[DetectorEvent]:
         """把 ``LocatorDoc`` (或 SDK ``GroundingResult``) 实例 + 原帧包成
         ``DetectorEvent``。
 
@@ -2318,15 +2325,15 @@ class WdnaiDetector:
         * ``frame_b64`` —— 整帧 JPEG q=85 + base64,前端用原图 + bbox
           overlay 渲染(整帧一张避免逐 box 多次 base64 传输)。
         * ``event.text`` —— "label1 @ [x1,y1,x2,y2]; label2 @ [...]"
-          拼接形式(空列表时为 ``"未定位到目标"``)。
+          拼接形式。
         * ``event.tool_call = "grounding"`` —— 前端用此判别"多 bbox
           定位事件"(与 ``target_detection`` 单框 + crop 区分)。
-        * ``event.level`` —— ``result.level`` 直接透传,空 boxes 时
-          兜底为 ``"warning"`` 让前端能区分"未检测到"和"成功检测"。
 
-        **返回 ``DetectorEvent`` 总有值**(不返回 ``None``)——"未检测
-        到"语义写 ``boxes=[]`` + ``level="warning"``,让前端在历史
-        列表里看得到这一帧的"空状态",避免和"模型崩了"混淆。
+        **返回 ``None``** 时表示该帧未定位到任何目标 —— 调用方
+        ``_infer_sync`` 收到 None 跳过,不写 ``_events`` 不广播,
+        历史列表不会显示这一帧。"模型崩了"与"未检测到"的区分
+        在调用方:前者 ``_infer_sync`` 整 iter 失败(走 except
+        路径),后者正常返回 0 boxes。
         """
         import base64
 
@@ -2468,21 +2475,23 @@ class WdnaiDetector:
             })
 
         # ---- 3) text 拼接 + level 透传 ---------------------------------
-        if out_boxes:
-            counts = {}
-            for b in out_boxes:
-                label = b.get("label", "") or "(未命名)"
-                counts[label] = counts.get(label, 0) + 1
-            parts = [f"定位到 {len(out_boxes)} 个目标"]
-            for label, count in counts.items():
-                parts.append(f'"{label}" 数量：{count}')
-            text = "; ".join(parts)
-        else:
-            text = "未定位到目标"
+        if not out_boxes:
+            LOG.info(
+                "grounding_event: no boxes detected — skip event (frame will "
+                "not appear in history)",
+            )
+            return None
+
+        counts = {}
+        for b in out_boxes:
+            label = b.get("label", "") or "(未命名)"
+            counts[label] = counts.get(label, 0) + 1
+        parts = [f"定位到 {len(out_boxes)} 个目标"]
+        for label, count in counts.items():
+            parts.append(f'"{label}" 数量：{count}')
+        text = "; ".join(parts)
 
         level = getattr(result, "level", None)
-        if not out_boxes:
-            level = level or "warning"
 
         return DetectorEvent(
             id=-1, frame_pos=-1, ts=time.time(), prompt=prompt,
