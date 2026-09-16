@@ -523,6 +523,7 @@ class DetectorEvent:
     id: int
     frame_pos: int
     ts: float
+    video_ts: float = 0.0
     prompt: str
     text: str
     level: Optional[str] = None
@@ -552,9 +553,10 @@ class DetectorEvent:
 
     def to_dict(self) -> dict:
         return {
-"id":               self.id,
+            "id":               self.id,
             "frame_pos":        self.frame_pos,
             "ts":               self.ts,
+            "video_ts":         self.video_ts,
             "prompt":           self.prompt,
             "text":             self.text,
             "level":            self.level,
@@ -2714,6 +2716,7 @@ class WdnaiDetector:
                     ev.id = self._next_event_id
                     ev.frame_pos = frame_pos
                     ev.ts = _video_ts
+                    ev.video_ts = _video_ts
                     self._next_event_id += 1
                     self._events.append(ev)
                     self._latest = ev.to_dict()

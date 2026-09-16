@@ -2522,7 +2522,9 @@ function buildVtlEventLi(ev, isLatest) {
   const meta = document.createElement("div");
   meta.className = "vd-event-meta";
   const tsSpan = document.createElement("span");
-  tsSpan.textContent = fmtEventTime(ev.ts);
+  tsSpan.textContent = fmtEventTime(
+    ev.video_ts != null ? ev.video_ts : ev.ts
+  );
   const fpSpan = document.createElement("span");
   fpSpan.textContent = "帧 " + (ev.frame_pos ?? "?");
   const tag = document.createElement("span");
@@ -2712,7 +2714,11 @@ function vtlOpenFrameModal(ev) {
   if (fpEl) fpEl.textContent = ev.frame_pos != null ? String(ev.frame_pos) : "--";
 
   const tsEl = document.getElementById("vtl-frame-modal-ts");
-  if (tsEl) tsEl.textContent = ev.ts ? fmtEventTime(ev.ts) : "--";
+  if (tsEl) {
+    const ts = (ev.video_ts != null && ev.video_ts >= 0)
+      ? ev.video_ts : ev.ts;
+    tsEl.textContent = (ts != null) ? fmtEventTime(ts) : "--";
+  }
 
   const lvlEl = document.getElementById("vtl-frame-modal-level");
   if (lvlEl) lvlEl.textContent = ev.level || "--";
