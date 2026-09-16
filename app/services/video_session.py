@@ -137,6 +137,17 @@ class VideoSession:
             self._width = cap.width
             self._height = cap.height
             self._fps = float(getattr(cap, "fps", 0.0) or 0.0)
+            if self._fps <= 0 and not self._is_live:
+                try:
+                    import cv2
+                    _probe = cv2.VideoCapture(source)
+                    if _probe.isOpened():
+                        self._fps = float(_probe.get(cv2.CAP_PROP_FPS) or 0.0) or 0.0
+                    _probe.release()
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._fps <= 0:
+                self._fps = 25.0
             self._state = self.STATE_PLAYING
 
         # Reset events AFTER teardown but BEFORE the new thread spins up,
