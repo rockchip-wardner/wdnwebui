@@ -2219,17 +2219,17 @@ const vtlPaletteRGB = [
   [182, 33, 158],  [255, 172, 199], [196, 187, 145], [156, 156, 156],
 ];
 
-// Stable hash-based label → palette index binding.
-// Same label always maps to same color (e.g. "person" → palette[3]).
-// Empty label falls through to index 0.
+// 首次出现顺序分配 label → 调色板 index,避免 hash 撞色;前 20 个不同
+// 类别一定有不同色,21+ 循环复用。
+const vtlLabelColorMap = new Map();
 function vtlLabelColor(label) {
-  if (!label || typeof label !== "string") return vtlPaletteRGB[0];
-  let h = 0;
-  for (let i = 0; i < label.length; i++) {
-    h = h * 31 + label.charCodeAt(i);
+  const key = (label && typeof label === "string") ? label : "__empty__";
+  if (!vtlLabelColorMap.has(key)) {
+    vtlLabelColorMap.set(key, vtlLabelColorMap.size);
   }
-  const idx = Math.abs(h) % vtlPaletteRGB.length;
-  return vtlPaletteRGB[idx];
+  return vtlPaletteRGB[
+    vtlLabelColorMap.get(key) % vtlPaletteRGB.length
+  ];
 }
 
 const VTL = {
