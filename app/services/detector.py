@@ -2694,6 +2694,7 @@ class WdnaiDetector:
                 continue
             _infer_ms = (time.monotonic() - _t0_infer) * 1000.0
             _video_ts = 0.0
+            _video_ts_source = "default"
             try:
                 _sess_snap = get_session().snapshot()
                 _fps = float(_sess_snap.get("fps") or 0)
@@ -2703,14 +2704,39 @@ class WdnaiDetector:
                     if _src.startswith("/"):
                         _probe = _cv2.VideoCapture(_src)
                         if _probe.isOpened():
-                            _fps = float(_probe.get(_cv2.CAP_PROP_FPS) or 0) or 0
+                            _fps = float(
+                                _probe.get(_cv2.CAP_PROP_FPS) or 0
+                            ) or 0
+                            if _fps > 0:
+                                _video_ts_source = "cv2"
                         _probe.release()
                 if _fps <= 0:
                     _fps = 25.0
+                    if _video_ts_source == "default":
+                        _video_ts_source = "fallback-25"
                 if frame_pos >= 0:
                     _video_ts = float(frame_pos) / _fps
-            except Exception:  # noqa: BLE001
-                pass
+                else:
+                    _video_ts_source = "frame_pos<0"
+                # 安全网:如果 video_ts 仍然 0 (fps=0 兜底都失败),
+                # 用 session 从打开到现在的 wall clock 时间当 fallback
+                if _video_ts <= 0:
+                    _started = _sess_snap.get("last_frame_ts") or 0
+                    if _started > 0:
+                        _video_ts = time.time() - _started
+                        _video_ts_source = "wall-clock"
+                LOG.info(
+                    "vtl_timing: frame_pos=%d fps=%.2f video_ts=%.3f source=%s",
+                    frame_pos, _fps, _video_ts, _video_ts_source,
+                )
+                LOG.info(
+                    "vtl_timing: frame_pos=%d fps=%.2f video_ts=%.3f source=%s",
+                    frame_pos, _fps, _video_ts, _video_ts_source,
+                )
+            except Exception as _e:  # noqa: BLE001
+                LOG.warning(
+                    "vtl_timing failed: %s: %s", type(_e).__name__, _e
+                )
             with self._events_lock:
                 for ev in events:
                     ev.id = self._next_event_id
