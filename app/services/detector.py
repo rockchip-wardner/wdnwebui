@@ -50,6 +50,7 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 from app.services.config import get_config
+from app.services.video_session import get_session
 
 
 # 诊断 (v0.13): client 端 (detector) 引用 _RpcSessionProxy 的内部 _ProxyResult
