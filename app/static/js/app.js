@@ -2243,6 +2243,8 @@ const VTL = {
   prompt: "",
   everyN: 30,
   lastEventId: 0,
+  liveBoxes: null,
+  liveBoxesUntil: 0,
 };
 const VTLDetector = {
   events: [],
@@ -2303,6 +2305,10 @@ async function drawVtlFrame(jpgBytes) {
   canvas.width = img.naturalWidth || canvas.width;
   canvas.height = img.naturalHeight || canvas.height;
   ctx.drawImage(img, 0, 0);
+  if (VTL.liveBoxes && VTL.liveBoxes.length
+      && Date.now() < VTL.liveBoxesUntil) {
+    drawVtlBoxes(canvas, VTL.liveBoxes, VTLDetector.palette);
+  }
 }
 
 function connectVtlWs() {
@@ -2327,6 +2333,8 @@ function connectVtlWs() {
       } else if (snap.type === "event") {
         addVtlEvent(snap);
         showVtlEventBadge(snap);
+        VTL.liveBoxes = (snap.boxes && snap.boxes.length) ? snap.boxes : null;
+        VTL.liveBoxesUntil = Date.now() + 4000;
         return;
       } else if (snap.type === "status" && snap.detector) {
         updateVtlDetectorStatus(snap.detector);
