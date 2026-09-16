@@ -2243,8 +2243,9 @@ const VTL = {
   prompt: "",
   everyN: 30,
   lastEventId: 0,
-  liveBoxes: null,
-  liveBoxesUntil: 0,
+  frozenFrameUrl: null,
+  frozenBoxes: null,
+  frozenUntil: 0,
 };
 const VTLDetector = {
   events: [],
@@ -2291,7 +2292,26 @@ function setVtlProgress(snap) {
 
 async function drawVtlFrame(jpgBytes) {
   const canvas = document.getElementById("vtl-canvas");
-  if (!canvas || !jpgBytes || !jpgBytes.byteLength) return;
+  if (!canvas) return;
+  // 事件到来后把被检测的那一帧冻结 2s，期间不画实时流 —— 避免 bbox
+  // 落在延迟的当前帧上。
+  if (VTL.frozenUntil > Date.now() && VTL.frozenFrameUrl) {
+    const img = new Image();
+    await new Promise((resolve) => {
+      img.onload = resolve;
+      img.onerror = resolve;
+      img.src = VTL.frozenFrameUrl;
+    });
+    const ctx = canvas.getContext("2d");
+    canvas.width = img.naturalWidth || canvas.width;
+    canvas.height = img.naturalHeight || canvas.height;
+    ctx.drawImage(img, 0, 0);
+    if (VTL.frozenBoxes && VTL.frozenBoxes.length) {
+      drawVtlBoxes(canvas, VTL.frozenBoxes, VTLDetector.palette);
+    }
+    return;
+  }
+  if (!jpgBytes || !jpgBytes.byteLength) return;
   const blob = new Blob([jpgBytes], { type: "image/jpeg" });
   if (VTL.blobUrl) URL.revokeObjectURL(VTL.blobUrl);
   VTL.blobUrl = URL.createObjectURL(blob);
@@ -2305,10 +2325,6 @@ async function drawVtlFrame(jpgBytes) {
   canvas.width = img.naturalWidth || canvas.width;
   canvas.height = img.naturalHeight || canvas.height;
   ctx.drawImage(img, 0, 0);
-  if (VTL.liveBoxes && VTL.liveBoxes.length
-      && Date.now() < VTL.liveBoxesUntil) {
-    drawVtlBoxes(canvas, VTL.liveBoxes, VTLDetector.palette);
-  }
 }
 
 function connectVtlWs() {
@@ -2333,8 +2349,14 @@ function connectVtlWs() {
       } else if (snap.type === "event") {
         addVtlEvent(snap);
         showVtlEventBadge(snap);
-        VTL.liveBoxes = (snap.boxes && snap.boxes.length) ? snap.boxes : null;
-        VTL.liveBoxesUntil = Date.now() + 4000;
+        if (snap.frame_b64) {
+          if (VTL.frozenFrameUrl) URL.revokeObjectURL(VTL.frozenFrameUrl);
+          VTL.frozenFrameUrl =
+            "data:image/jpeg;base64," + snap.frame_b64;
+          VTL.frozenBoxes =
+            (snap.boxes && snap.boxes.length) ? snap.boxes : null;
+          VTL.frozenUntil = Date.now() + 2000;
+        }
         return;
       } else if (snap.type === "status" && snap.detector) {
         updateVtlDetectorStatus(snap.detector);
