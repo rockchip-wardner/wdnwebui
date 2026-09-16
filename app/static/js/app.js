@@ -1105,13 +1105,15 @@ const VdFsModal = {
 /* ------------------------------------------------------------------ *
  *  VLM detection (wdnai) — prompt + event history + overlay            *
  * ------------------------------------------------------------------ */
-function fmtEventTime(ts) {
-  if (!ts) return "--";
-  try {
-    const d = new Date(ts * 1000);
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  } catch (_) { return "--"; }
+function fmtEventTime(seconds) {
+  if (seconds == null || !isFinite(seconds) || seconds < 0) return "--";
+  const pad = (n, w) => String(n).padStart(w, "0");
+  const total = Math.floor(seconds);
+  const ms = Math.floor((seconds - total) * 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return `${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)}:${pad(ms, 3)}`;
 }
 
 function addVdEvent(ev) {

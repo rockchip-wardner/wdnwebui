@@ -2691,10 +2691,18 @@ class WdnaiDetector:
                 )
                 continue
             _infer_ms = (time.monotonic() - _t0_infer) * 1000.0
+            _video_ts = 0.0
+            try:
+                _fps = float(get_session().snapshot().get("fps") or 0)
+                if _fps > 0 and frame_pos >= 0:
+                    _video_ts = float(frame_pos) / _fps
+            except Exception:  # noqa: BLE001
+                pass
             with self._events_lock:
                 for ev in events:
                     ev.id = self._next_event_id
                     ev.frame_pos = frame_pos
+                    ev.ts = _video_ts
                     self._next_event_id += 1
                     self._events.append(ev)
                     self._latest = ev.to_dict()
