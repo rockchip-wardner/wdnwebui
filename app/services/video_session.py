@@ -461,20 +461,13 @@ class VideoSession:
             # 立即察觉)。
             sinks = self._current_sinks()
             if sinks:
+                # 共用上面 ``jpg`` 字节 —— 重复 cv2.imencode 每帧 ~15-25ms,
+                # 实时流 + detector 用同帧同内容,质量共用 JPEG_QUALITY。
                 try:
-                    ok_evt, buf_evt = cv2.imencode(
-                        ".jpg", frame,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), 85],
-                    )
-                    if ok_evt:
-                        frame_b64_for_detector = base64.b64encode(
-                            buf_evt.tobytes(),
-                        ).decode("ascii")
-                    else:
-                        frame_b64_for_detector = ""
+                    frame_b64_for_detector = base64.b64encode(jpg).decode("ascii")
                 except Exception as _enc_e:  # noqa: BLE001
                     LOG.debug(
-                        "video_session: detector frame_b64 pre-encode "
+                        "video_session: detector frame_b64 base64 encode "
                         "failed: %s", _enc_e,
                     )
                     frame_b64_for_detector = ""

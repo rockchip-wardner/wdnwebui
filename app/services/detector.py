@@ -2343,10 +2343,13 @@ class WdnaiDetector:
 
         * ``boxes`` —— duck-type 读 ``result.boxes`` 列表(可空)。
           0-1000 归一化坐标 → 乘以原图 ``w`` / ``h`` 转到像素后按
-          ``int(round(...))`` + clamp 到 ``[0, dim]``。每个 box
-          单独裁原图 + JPEG q=85 编码 + base64 → ``boxes[i].crop_b64``。
-        * ``frame_b64`` —— 整帧 JPEG q=85 + base64,前端用原图 + bbox
-          overlay 渲染(整帧一张避免逐 box 多次 base64 传输)。
+          ``int(round(...))`` + clamp 到 ``[0, dim]``,填到 ``boxes[i].bbox``。
+          ``boxes[i].crop_b64`` / ``crop_w`` / ``crop_h`` **故意留空**:VTL
+          前端只画 bbox + label,真用 crop 缩略图的是 TargetDoc 路径
+          (见 ``_build_target_event``)。
+        * ``frame_b64`` —— 整帧 JPEG + base64(quality 跟实时流共用
+          ``VideoSession.JPEG_QUALITY``),前端用原图 + bbox overlay
+          渲染(整帧一张避免逐 box 多次 base64 传输)。
         * ``event.text`` —— "label1 @ [x1,y1,x2,y2]; label2 @ [...]"
           拼接形式。
         * ``event.tool_call = "grounding"`` —— 前端用此判别"多 bbox
@@ -2358,22 +2361,25 @@ class WdnaiDetector:
         在调用方:前者 ``_infer_sync`` 整 iter 失败(走 except
         路径),后者正常返回 0 boxes。
         """
-        import base64
-
-        import cv2
-
         h, w = (0, 0)
         if frame_bgr is not None and getattr(frame_bgr, "ndim", 0) >= 2:
             h, w = frame_bgr.shape[:2]
 
         # ---- 1) 整帧 base64 (预编码,来自 _decode_loop 线程) -----------
-        # 跨线程契约:整帧 JPEG q85 + base64 已在 ``VideoSession._decode_loop``
+        # 跨线程契约:整帧 JPEG + base64 已在 ``VideoSession._decode_loop``
         # 完成,经 ``_item_q`` → ``worker_loop`` → ``_infer_sync`` 传进来。切勿
         # 在这里再跑 ``cv2.imencode``,否则会重新把每事件 ~30-50ms 阻塞
         # 拉回主进程 worker_loop, 抵消优化。
         frame_b64 = frame_b64 or ""
 
-        # ---- 2) 每个 box 裁 + base64 ----------------------------------
+        # ---- 2) 每个 box: 仅做坐标反变换 → 像素 bbox --------------------
+        # ``box.crop_b64`` 故意留空 —— VTL 前端 ``drawVtlBoxes`` / 历史缩略图
+        # 只消费 ``box.label`` + ``box.bbox``(用整帧 ``frame_b64`` 做底图),
+        # 不读单 box 裁切图。每 box 一次 cv2.imencode + base64 在 worker_loop
+        # 同步阻塞 ~30-100ms(1-5 box),把 detector 单例消费 _item_q 的节拍
+        # 拖慢到实时流的两倍,产生可见卡顿。TargetDoc 路径 ``event.crop_b64``
+        # 仍保留(单框 + 前端 ``tool_call==='target_detection'`` 真消费 crop),
+        # 见 ``_build_target_event``。
         raw_boxes = []
         try:
             raw_boxes = list(getattr(result, "boxes", []) or [])
@@ -2454,36 +2460,9 @@ class WdnaiDetector:
                 px1, px2 = px2, px1
             if py1 > py2:
                 py1, py2 = py2, py1
-            crop_b64, crop_w, crop_h = "", 0, 0
-            if (
-                frame_bgr is not None
-                and frame_bgr.size > 0
-                and (px2 - px1) > 0
-                and (py2 - py1) > 0
-            ):
-                crop = frame_bgr[py1:py2, px1:px2]
-                try:
-                    ok, buf = cv2.imencode(
-                        ".jpg", crop,
-                        [cv2.IMWRITE_JPEG_QUALITY, 85],
-                    )
-                    if ok:
-                        crop_b64 = base64.b64encode(
-                            buf.tobytes(),
-                        ).decode("ascii")
-                        crop_w = crop.shape[1]
-                        crop_h = crop.shape[0]
-                except Exception as e:  # noqa: BLE001
-                    LOG.warning(
-                        "grounding_event: crop JPEG encode failed "
-                        "(label=%r): %s", label, e,
-                    )
             out_boxes.append({
-                "label":    label,
-                "bbox":     [px1, py1, px2, py2],
-                "crop_b64": crop_b64,
-                "crop_w":   crop_w,
-                "crop_h":   crop_h,
+                "label": label,
+                "bbox":  [px1, py1, px2, py2],
             })
 
         # ---- 3) text 拼接 + level 透传 ---------------------------------

@@ -242,10 +242,10 @@ async def stream_ws(ws: WebSocket) -> None:
       - Binary:    raw JPEG bytes for one frame
       - JSON text: {"type":"eof"} when a file source reaches end
       - JSON text: {"type":"event", ...detector event...} when ``LocatorDoc``
-                   fires (event.boxes 是 ``[{label, bbox, crop_b64,
-                   crop_w, crop_h}, ...]`` 多框列表 + event.frame_b64 是
-                   整帧 base64 JPEG + event.frame_w / event.frame_h 是整帧
-                   像素尺寸 + event.text 是模型对整张图的描述文本)。
+                   fires (event.boxes 是 ``[{label, bbox}, ...]`` 多框列表
+                   像素坐标 + event.frame_b64 是整帧 base64 JPEG +
+                   event.frame_w / event.frame_h 是整帧像素尺寸 +
+                   event.text 是模型对整张图的描述文本)。
     """
     await ws.accept()
     session = get_session()
