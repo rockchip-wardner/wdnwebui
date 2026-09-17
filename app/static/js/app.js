@@ -2981,6 +2981,122 @@ function initVideoTargetLocalization() {
 
   refreshVtlDetector();
   if (!VTL.ws && !VTL.wsTimer) connectVtlWs();
+  initVtlPromptRows();
+}
+
+/* ------------------------------------------------------------------ *
+ *  vtl prompt row management (Todo 4)                                *
+ * ------------------------------------------------------------------ */
+const VTL_PROMPT_CONST = {
+  MAX_ROWS: 20,
+  MIN_ROWS: 1,
+  DEFAULT_PREFIX: "找出所有符合以下描述的对象：",
+  SEPARATOR: "</c>",
+};
+
+function initVtlPromptRows() {
+  if (window.__vtlPromptRowsInited) return;
+  window.__vtlPromptRowsInited = true;
+
+  const addBtn = document.getElementById("vtl-prompt-add");
+  const rowsEl = document.getElementById("vtl-prompt-rows");
+  if (!addBtn || !rowsEl) return;
+
+  // Event delegation: one click listener handles all current + future remove buttons.
+  rowsEl.addEventListener("click", (e) => {
+    const btn = e.target.closest(".vtl-prompt-row-remove");
+    if (!btn) return;
+    const row = btn.closest(".vtl-prompt-row");
+    if (!row) return;
+    vtlPromptRemoveRow(row);
+  });
+
+  addBtn.addEventListener("click", () => vtlPromptAddRow());
+
+  // Initial state — page already has 1 row from HTML, just sync the counters.
+  vtlPromptRenumber();
+  vtlPromptUpdateAddBtn();
+}
+
+function vtlPromptAddRow(focus = true) {
+  const rowsEl = document.getElementById("vtl-prompt-rows");
+  if (!rowsEl) return;
+  if (rowsEl.children.length >= VTL_PROMPT_CONST.MAX_ROWS) return;
+
+  const row = document.createElement("div");
+  row.className = "vtl-prompt-row";  // starts collapsed (grid-template-rows: 0fr, opacity: 0)
+  row.innerHTML = `
+    <div class="vtl-prompt-row-inner">
+      <span class="vtl-prompt-row-num"></span>
+      <input type="text" class="vtl-prompt-row-input surv-input" maxlength="200" spellcheck="false" />
+      <button type="button" class="vtl-prompt-row-remove vd-btn vd-btn-mini" title="删除该行" aria-label="删除该行">\u2212</button>
+    </div>
+  `;
+  rowsEl.appendChild(row);
+
+  // Force layout flush so the browser registers the initial collapsed state, then swap to open
+  // to trigger the transition.
+  void row.offsetHeight;
+  requestAnimationFrame(() => row.classList.add("is-open"));
+
+  const input = row.querySelector(".vtl-prompt-row-input");
+  if (focus && input) input.focus();
+
+  vtlPromptRenumber();
+  vtlPromptUpdateAddBtn();
+}
+
+function vtlPromptRemoveRow(rowEl) {
+  if (!rowEl) return;
+  const rowsEl = document.getElementById("vtl-prompt-rows");
+  if (!rowsEl) return;
+  if (rowsEl.children.length <= VTL_PROMPT_CONST.MIN_ROWS) return;
+
+  // Trigger collapse animation, then remove on transitionend (with timeout fallback).
+  rowEl.classList.remove("is-open");
+  const cleanup = () => {
+    if (rowEl.parentNode) rowEl.parentNode.removeChild(rowEl);
+    vtlPromptRenumber();
+    vtlPromptUpdateAddBtn();
+  };
+  let fired = false;
+  const onEnd = () => { if (!fired) { fired = true; cleanup(); } };
+  rowEl.addEventListener("transitionend", onEnd, { once: true });
+  setTimeout(onEnd, 220);  // Fallback if transitionend never fires
+}
+
+function vtlPromptRenumber() {
+  const rowsEl = document.getElementById("vtl-prompt-rows");
+  if (!rowsEl) return;
+  const nums = rowsEl.querySelectorAll(".vtl-prompt-row-num");
+  nums.forEach((n, i) => { n.textContent = String(i + 1); });
+}
+
+function vtlPromptUpdateAddBtn() {
+  const rowsEl = document.getElementById("vtl-prompt-rows");
+  const addBtn = document.getElementById("vtl-prompt-add");
+  const hint   = document.getElementById("vtl-prompt-hint");
+  if (!rowsEl || !addBtn) return;
+  const n = rowsEl.children.length;
+  addBtn.disabled = n >= VTL_PROMPT_CONST.MAX_ROWS;
+  if (hint) hint.textContent = n + " / " + VTL_PROMPT_CONST.MAX_ROWS;
+
+  // Also gate the remove buttons: disable the "\u2212" on every row when only 1 row remains.
+  const removes = rowsEl.querySelectorAll(".vtl-prompt-row-remove");
+  const atMin = n <= VTL_PROMPT_CONST.MIN_ROWS;
+  removes.forEach((b) => { b.disabled = atMin; });
+}
+
+function vtlPromptCollectItems() {
+  const rowsEl = document.getElementById("vtl-prompt-rows");
+  if (!rowsEl) return [];
+  const inputs = rowsEl.querySelectorAll(".vtl-prompt-row-input");
+  const items = [];
+  inputs.forEach((inp) => {
+    const v = (inp.value || "").trim();
+    if (v) items.push(v);
+  });
+  return items;
 }
 
 /* ------------------------------------------------------------------ *
