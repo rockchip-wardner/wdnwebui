@@ -3028,7 +3028,7 @@ function vtlPromptAddRow(focus = true) {
   row.innerHTML = `
     <div class="vtl-prompt-row-inner">
       <span class="vtl-prompt-row-num"></span>
-      <input type="text" class="vtl-prompt-row-input surv-input" maxlength="200" spellcheck="false" />
+      <input type="text" class="vtl-prompt-row-input surv-input" maxlength="200" spellcheck="false" placeholder="穿着红衬衫的人" />
       <button type="button" class="vtl-prompt-row-remove vd-btn vd-btn-mini" title="删除该行" aria-label="删除该行">\u2212</button>
     </div>
   `;
