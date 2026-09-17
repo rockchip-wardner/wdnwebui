@@ -5871,3 +5871,79 @@ html, body {
   margin: 8px 0;
   white-space: pre-wrap;
 }
+
+/* === 视频目标定位 prompt row list (v0.9.1) === */
+.vtl-prompt-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+.vtl-prompt-row {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.18s ease-out, opacity 0.18s ease-out;
+  opacity: 0;
+}
+.vtl-prompt-row.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.vtl-prompt-row-inner {
+  overflow: hidden;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 2rem 1fr 2.4rem;
+  gap: 0.4rem;
+  align-items: center;
+}
+.vtl-prompt-row-num {
+  text-align: right;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-family: var(--mono);
+  padding-right: 0.2rem;
+}
+.vtl-prompt-row-input {
+  width: 100%;
+}
+.vtl-prompt-row-remove {
+  padding: 0.3rem 0.4rem;
+  font-size: 1rem;
+  line-height: 1;
+  color: #dc2626;
+  border-color: #fecaca;
+}
+.vtl-prompt-row-remove:hover:not(:disabled) {
+  background: #fee2e2;
+  border-color: #fca5a5;
+}
+.vtl-prompt-row-remove:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.vtl-prompt-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.vtl-prompt-add {
+  flex: 0 0 auto;
+  border-style: dashed;
+  border-color: var(--border);
+  color: var(--muted);
+}
+.vtl-prompt-add:hover:not(:disabled) {
+  border-style: solid;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.vtl-prompt-add:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.vtl-prompt-hint {
+  font-size: 0.74rem;
+  color: var(--muted);
+  font-family: var(--mono);
+}
