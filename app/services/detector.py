@@ -1451,7 +1451,12 @@ class WdnaiDetector:
         self.stop()
 
     # ------------------------------------------------------------------ #
-    def submit_frame(self, frame_bgr: "np.ndarray", frame_pos: int) -> None:
+    def submit_frame(
+        self,
+        frame_bgr: "np.ndarray",
+        frame_pos: int,
+        frame_b64: str = "",
+    ) -> None:
         with self._lock:
             if not (self._enabled and self._prompt):
                 return
@@ -1465,7 +1470,9 @@ class WdnaiDetector:
         except queue.Empty:
             pass
         try:
-            self._item_q.put_nowait((frame_bgr, frame_pos, prompt))
+            self._item_q.put_nowait(
+                (frame_bgr, frame_pos, prompt, frame_b64),
+            )
         except queue.Full:
             pass
 
@@ -1513,7 +1520,13 @@ class WdnaiDetector:
                 pass
 
     # ------------------------------------------------------------------ #
-    def _infer_sync(self, frame_bgr: "np.ndarray", prompt: str, frame_pos: int = -1) -> List[DetectorEvent]:
+    def _infer_sync(
+        self,
+        frame_bgr: "np.ndarray",
+        prompt: str,
+        frame_pos: int = -1,
+        frame_b64: str = "",
+    ) -> List[DetectorEvent]:
         """Run a multi-turn tool loop on one frame; return a list of events.
 
         每帧开头 ``sess.reset()`` 清一次 KV cache（保留原帧间隔离语
@@ -1896,7 +1909,7 @@ class WdnaiDetector:
                 )
                 if _locator_match:
                     locator_ev = self._build_grounding_event(
-                        result, frame_bgr, prompt, frame_pos,
+                        result, frame_bgr, prompt, frame_pos, frame_b64,
                     )
                     if locator_ev is None:
                         # 未定位到目标 — 跳过该帧,不写 _events。
@@ -2307,6 +2320,7 @@ class WdnaiDetector:
         frame_bgr: "np.ndarray",
         prompt: str,
         frame_pos: int = -1,
+        frame_b64: str = "",
     ) -> Optional[DetectorEvent]:
         """把 ``LocatorDoc`` (或 SDK ``GroundingResult``) 实例 + 原帧包成
         ``DetectorEvent``。
@@ -2344,23 +2358,12 @@ class WdnaiDetector:
         if frame_bgr is not None and getattr(frame_bgr, "ndim", 0) >= 2:
             h, w = frame_bgr.shape[:2]
 
-        # ---- 1) 整帧 base64 --------------------------------------------
-        frame_b64 = ""
-        if frame_bgr is not None and frame_bgr.size > 0:
-            try:
-                ok_full, buf_full = cv2.imencode(
-                    ".jpg", frame_bgr,
-                    [cv2.IMWRITE_JPEG_QUALITY, 85],
-                )
-                if ok_full:
-                    frame_b64 = base64.b64encode(
-                        buf_full.tobytes(),
-                    ).decode("ascii")
-            except Exception as e:  # noqa: BLE001
-                LOG.warning(
-                    "grounding_event: full-frame JPEG encode failed: %s", e,
-                )
-                frame_b64 = ""
+        # ---- 1) 整帧 base64 (预编码,来自 _decode_loop 线程) -----------
+        # 跨线程契约:整帧 JPEG q85 + base64 已在 ``VideoSession._decode_loop``
+        # 完成,经 ``_item_q`` → ``worker_loop`` → ``_infer_sync`` 传进来。切勿
+        # 在这里再跑 ``cv2.imencode``,否则会重新把每事件 ~30-50ms 阻塞
+        # 拉回主进程 worker_loop, 抵消优化。
+        frame_b64 = frame_b64 or ""
 
         # ---- 2) 每个 box 裁 + base64 ----------------------------------
         raw_boxes = []
@@ -2689,10 +2692,14 @@ class WdnaiDetector:
                     self._generating_cls.__name__ if self._generating_cls else "?",
                 )
                 return
-            frame_bgr, frame_pos, prompt = item
+            if len(item) == 4:
+                frame_bgr, frame_pos, prompt, frame_b64 = item
+            else:
+                frame_bgr, frame_pos, prompt = item
+                frame_b64 = ""
             _t0_infer = time.monotonic()
             try:
-                events = self._infer_sync(frame_bgr, prompt)
+                events = self._infer_sync(frame_bgr, prompt, frame_pos, frame_b64)
             except BaseException as e:
                 # 兜底: _infer_sync 内部已经 catch BaseException 写 diag,
                 # 但万一再次冒出,worker_loop 也要保命,不让一次异常永久

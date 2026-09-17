@@ -8,6 +8,7 @@ lazy — the wdnav/AGENTS.md gotcha about non-Rockchip dev boxes still applies
 """
 from __future__ import annotations
 
+import base64
 import logging
 import queue
 import threading
@@ -459,9 +460,29 @@ class VideoSession:
             # 一旦抛错会导致 detector 永远拿不到帧,warning 让上游能
             # 立即察觉)。
             sinks = self._current_sinks()
+            if sinks:
+                try:
+                    ok_evt, buf_evt = cv2.imencode(
+                        ".jpg", frame,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 85],
+                    )
+                    if ok_evt:
+                        frame_b64_for_detector = base64.b64encode(
+                            buf_evt.tobytes(),
+                        ).decode("ascii")
+                    else:
+                        frame_b64_for_detector = ""
+                except Exception as _enc_e:  # noqa: BLE001
+                    LOG.debug(
+                        "video_session: detector frame_b64 pre-encode "
+                        "failed: %s", _enc_e,
+                    )
+                    frame_b64_for_detector = ""
+            else:
+                frame_b64_for_detector = ""
             for sink in sinks:
                 try:
-                    sink(frame, cur_frame_pos)
+                    sink(frame, cur_frame_pos, frame_b64_for_detector)
                 except Exception as e:  # noqa: BLE001
                     LOG.warning(
                         "video_session: frame sink raised (frame_pos=%d): "

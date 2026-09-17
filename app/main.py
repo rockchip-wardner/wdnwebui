@@ -134,23 +134,23 @@ def create_app() -> FastAPI:
     # Wire the detector as a frame sink on the video session so each
     # decoded BGR frame is offered to it (it picks the Nth one).
     get_session().add_frame_sink(
-        lambda frame, frame_pos: get_detector().submit_frame(
-            frame, frame_pos
+        lambda frame, frame_pos, frame_b64: get_detector().submit_frame(
+            frame, frame_pos, frame_b64
         )
     )
     # Same for the video-target-detection page — second detector
     # instance with its own prompt / history.
     get_session().add_frame_sink(
-        lambda frame, frame_pos: get_target_detector().submit_frame(
-            frame, frame_pos
+        lambda frame, frame_pos, frame_b64: get_target_detector().submit_frame(
+            frame, frame_pos, frame_b64
         )
     )
     # Same for the video-target-localization page — third detector
     # instance with its own prompt / history (uses locate-anything
     # visual grounding model, swcap_grounding capability).
     get_session().add_frame_sink(
-        lambda frame, frame_pos: get_localizer_detector().submit_frame(
-            frame, frame_pos
+        lambda frame, frame_pos, frame_b64: get_localizer_detector().submit_frame(
+            frame, frame_pos, frame_b64
         )
     )
 
