@@ -27,6 +27,34 @@ from app.services.video_session import get_session
 router = APIRouter(tags=["video-target-localization"])
 
 
+# --------------------------------------------------------------------- #
+# Locator prompt construction                                            #
+# --------------------------------------------------------------------- #
+DEFAULT_LOCATOR_PROMPT_PREFIX = "找出所有符合以下描述的对象："
+LOCATOR_PROMPT_SEPARATOR = "</c>"
+
+
+def _build_vtl_prompt(items: list) -> str:
+    """Build the canonical locator prompt from a list of raw items.
+
+    Pure function — no I/O, no detector dependency. Returns
+    ``DEFAULT_LOCATOR_PROMPT_PREFIX + LOCATOR_PROMPT_SEPARATOR.join(<non-empty stripped items>)``;
+    raises ``ValueError("至少需要一条非空的定位描述")`` if the filtered
+    list is empty. Non-string items are coerced via ``str(x)`` before
+    stripping.
+    """
+    cleaned: list[str] = []
+    for x in items:
+        if not isinstance(x, str):
+            x = str(x)
+        s = x.strip()
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        raise ValueError("至少需要一条非空的定位描述")
+    return DEFAULT_LOCATOR_PROMPT_PREFIX + LOCATOR_PROMPT_SEPARATOR.join(cleaned)
+
+
 @router.get("/video-target-localization")
 async def get_state() -> dict:
     return get_session().snapshot()
@@ -73,8 +101,28 @@ async def get_prompt() -> dict:
 async def set_prompt(payload: dict) -> dict:
     """Start (or update) target-localization.
 
-    Body: ``{prompt: str, every_n: int}``
-    — ``prompt`` 必填；``every_n`` 选填，默认 30。
+    Body — two **mutually exclusive** shapes:
+
+    1. Legacy ``prompt: str`` (single user-supplied full prompt string).
+       ``{"prompt": str, "every_n": int}`` — ``prompt`` 必填 (non-empty
+       after strip); ``every_n`` 选填，默认 30.
+
+    2. New ``prompts: list[str]`` (raw items; backend owns the join).
+       ``{"prompts": [str, ...], "every_n": int}`` — backend prepends
+       ``DEFAULT_LOCATOR_PROMPT_PREFIX`` ("找出所有符合以下描述的对象：")
+       and joins non-empty stripped items with
+       ``LOCATOR_PROMPT_SEPARATOR`` ("</c>"). All-empty after strip →
+       400 "至少需要一条非空的定位描述" (Decision 13).
+
+    Validation order:
+
+    * ``prompts`` present but not a list → 400 "prompts 必须是字符串列表".
+    * Both ``prompt`` (non-empty after strip) and ``prompts`` (non-empty
+      list) → 400 "prompt 与 prompts 互斥，只能传一个".
+    * ``prompts`` present (any list value, including ``[]``) → built via
+      ``_build_vtl_prompt``; its ``ValueError`` → 400 with that message.
+    * Otherwise fall back to legacy ``prompt``; empty after strip →
+      400 "prompt 不能为空" (preserve legacy message).
 
     本页**不**接受 ``image_size`` —— LocateAnythingBackend 视觉固定
     448×448 单变体，size picker 无意义。
@@ -85,9 +133,34 @@ async def set_prompt(payload: dict) -> dict:
     结构化输出，不再挂任何 ``@Callable`` 工具。
     """
     payload = payload or {}
-    prompt = (payload.get("prompt") or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt 不能为空")
+    legacy_prompt = payload.get("prompt")
+    prompts_list = payload.get("prompts")
+
+    if prompts_list is not None and not isinstance(prompts_list, list):
+        raise HTTPException(
+            status_code=400, detail="prompts 必须是字符串列表",
+        )
+
+    legacy_non_empty = (
+        isinstance(legacy_prompt, str) and legacy_prompt.strip() != ""
+    )
+    prompts_non_empty = isinstance(prompts_list, list) and len(prompts_list) > 0
+
+    if legacy_non_empty and prompts_non_empty:
+        raise HTTPException(
+            status_code=400, detail="prompt 与 prompts 互斥，只能传一个",
+        )
+
+    if prompts_list is not None:
+        try:
+            prompt = _build_vtl_prompt(prompts_list)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        prompt = legacy_prompt.strip() if isinstance(legacy_prompt, str) else ""
+        if not prompt:
+            raise HTTPException(status_code=400, detail="prompt 不能为空")
+
     try:
         every_n = int(payload.get("every_n", 30))
     except (TypeError, ValueError):
