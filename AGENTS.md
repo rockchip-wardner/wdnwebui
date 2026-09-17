@@ -1308,10 +1308,290 @@ Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
   device_name 缺失时 fallback 到 `socket.gethostname()`，保证
   participant_name 永远非空。
 - **重启 4 步 (Q3)**：`POST /api/compute/restart {model}` →
-  ``stop_instance_local(model)`` (unload → RPC shutdown → wait 3s →
-  kill -9) → ``ensure_worker_for_model(model)``（probe → adopt /
-  spawn）。**不**自动 bind —— 重启后 worker 回到 ``not_loaded``，
-  用户需在算力配置页再点"启用" + 选 NPU 才完成 reload。
+   ``stop_instance_local(model)`` (unload → RPC shutdown → wait 3s →
+   kill -9) → ``ensure_worker_for_model(model)``（probe → adopt /
+   spawn）。**不**自动 bind —— 重启后 worker 回到 ``not_loaded``，
+   用户需在算力配置页再点"启用" + 选 NPU 才完成 reload。
+
+## RTSP 卡顿根因（2026-09 海康 NVR 实测，结论已落定）
+
+**用户报告**：「视频目标定位」页打开 RTSP
+`rtsp://admin:admin123@172.16.9.79/cam/realmonitor?channel=1&subtype=1`，
+前 20-40 秒 fps=1-4，之后稳定 25 fps。VLC 同一源流畅。
+
+### 四组对照实验（决定性证据）
+
+| 实验 | 工具 | transport | fps | p50 / p95 / p99 / max | 含义 |
+|---|---|---|---|---|---|
+| A | webui (wdnav via uvicorn) | TCP | 1-4 → 25 | n/a | strace 显示 video-decode 线程在 `wdnav/mpp.py:1119 send_packet` 等 C 端返回 |
+| B | 独立 wdnav 直连 | TCP | **3.9** | 0.2 / 1.3 / 6104 / 12198 ms | 同 pattern，**与 webui 无关** |
+| C | 独立 PyAV 直连（**无 mpp decode**） | UDP | **33.1** | 1269 / 3429 / 3589 / 3629 ms | UDP transport 8.5x 提升；前 25 帧瞬时涌入，后续 40ms 稳态 |
+| D | 独立 wdnav 直连（**有 mpp decode**） | UDP | **6.4** | 0.3 / 1.2 / **6098** / 6293 ms | UDP 修复**不充分** |
+
+### 根因（已锁定）
+
+**wdnav 的 `_send()` (`wdnav/video.py:855-869`) 在 mpp VPU packet queue 满时进入
+BUFFER_FULL → sleep(5ms) → BUFFER_FULL 重试循环**：
+
+```python
+while True:
+    try:
+        self._decoder.send_packet(annexb, pts=pts, eos=False)
+        return True
+    except RuntimeError as e:
+        if _BUFFER_FULL_TOKEN not in str(e):
+            raise
+        # VPU's packet queue is saturated; pull a frame and try
+        # again. If no frame is ready yet (cold start), give the
+        # hardware a brief moment to catch up.
+        frame = self._drain_one_raw(timeout_ms=_DRAIN_TIMEOUT_MS, ...)
+        if frame is not None:
+            self._prefetched = frame
+            return True
+        _t.sleep(0.005)    # 5ms
+```
+
+Test D 显示单帧最大耗时 **6293ms** = **1260 次 BUFFER_FULL → sleep 循环**
+（6293/5 ≈ 1258），p99 = **6098ms** 与 p50 = **0.3ms** 相差 20000 倍。
+demux 是瞬时的（p50=0.3ms），瓶颈在 mpp decoder 端。
+
+### 误判路径（避免重蹈）
+
+| 猜测 | 实测结果 | 原因 |
+|---|---|---|
+| 服务端 cv2.imencode 软编码 1080p 太慢 | imencode=3.5ms | 流实际是 640×480，1080p 假设错误 |
+| 浏览器 canvas 反复重分配 GPU 纹理 | 实际解码线程 fps=3.9 fps | webui CPU 4% 空闲，瓶颈不在前端 |
+| detector (NPU) 抢资源 | sinks=0.2ms | 用户没开 detector |
+| mpp packet queue (extra_buf_count=24) 太小 | `extra_buf_count` 是**输出 frame buffer pool**，不是 packet queue | `cshim_video_decoder.c:228` 调用 `mpp_buffer_group_limit_config` 控制解码器**输出** buffer pool，与 send_packet BUFFER_FULL 无关 |
+
+### RTSP transport 的影响
+
+- **TCP**（默认）：海康 NVR RTSP over TCP 走 libavformat 标准 keepalive
+  (RTCP-RR GET_PARAMETER) 协商路径，前 20-40 秒 ffmpeg 按 server 反馈节
+  奏退避 → 客户端看似「卡顿」。协商完成后稳态 25 fps。
+- **UDP**（`av.open(rtsp_url, options={'rtsp_transport': 'udp'})`）：绕开
+  keepalive 协商，PyAV 直接 demux → **33.1 fps（Test C）**。但 wdnav
+  内部 mpp decoder 仍按 5ms 重试循环处理 BUFFER_FULL → **6.4 fps
+  （Test D）**。
+
+**结论**：UDP transport 是必要非充分条件——它修了 demux 侧的协商慢启动，
+但 mpp decoder 端 BUFFER_FULL 循环仍是上限。**真正修复点在 wdnav SDK
+内部**（`video.py:855-869` 的 5ms 重试逻辑），不在 webui。
+
+### 修复路径
+
+1. **wdnav SDK 内部**：把 BUFFER_FULL 重试 sleep 从 5ms 改为更长（如 50ms，
+   减少总 wait 时间 = sleep 数 × 单次 sleep）；或者改成事件驱动
+   （mpp 解码出帧时唤醒 read0 线程）。需 wdnav 维护者改。
+2. **当前可接受**：告诉用户「RTSP 协商需要 20-40 秒，之后稳定 25 fps」，
+   这是海康 NVR + libavformat 的**已知行为**而非 bug。
+3. **不要做的**：改 `extra_buf_count`（输出 buffer pool，不影响 packet
+   queue）；改 `cv2.imencode`（已经在 3.5ms）；改前端 canvas
+   重分配（webui CPU 4% 空闲，不是瓶颈）。
+
+### 诊断埋点（保留作为运维工具）
+
+`app/services/video_session.py` 加了 `_TIMING_ENABLED` 探针，
+环境变量 `WDNWEBUI_VIDEO_SESSION_TIMING=1` 开启，每 30 帧（≈1.2s）
+输出一行到 LOG.info / stderr / `/tmp/wdnwebui_video_session_timing.log`：
+
+```
+video_session timing: 30 frames in 1.20s (25.0 fps) read0=30.3ms numpy=1.7ms
+imencode=2.7ms sinks=1.8ms put=0.0ms jpg=29KB 640x480 q=0 dropped=0
+live=True frame_pos=175
+```
+
+字段：`read0`（wdnav 单帧）、`numpy`（RGA）、`imencode`（cv2 JPEG）、
+`sinks`（detector）、`put`（queue）、`jpg`（输出体积）、`size`（编码前尺寸）、
+`q`（队列深度）、`dropped`（丢帧计数）、`live`（RTSP 标记）、
+`frame_pos`（解码器位置）。
+
+**默认关闭**（env var unset 时零开销：仅 1 个分支测试），用于：
+- 未来 RTSP / V4L2 卡顿诊断
+- 验证 wdnav SDK 修复后的实际 fps 改善
+- 比较不同 NVR 的 codec 兼容性
+
+**不要做的事**：
+- 不要 commit `/tmp/wdnwebui_video_session_timing.log`（gitignore
+  应该已经排除 `/tmp/`）
+- 不要在生产环境长开（每 30 帧一行 × 多路 = journalctl 噪声）
+- 不要拿这个探针替代 `py-spy` / strace 做深度诊断（这是粗粒度的 stage
+  timing，深挖还是看 Python 栈 + syscall trace）
+
+### 调查时间线（保留供后人参考）
+
+- 2026-09 用户报告「视频目标定位」RTSP 卡顿
+- Test A（strace）：video-decode 线程在 `wdnav/mpp.py:1119 send_packet` 等
+- Test B（独立 wdnav TCP）：3.9 fps → 根因不在 webui
+- Test C（独立 PyAV UDP）：33.1 fps → UDP transport 优势明确
+- Test D（独立 wdnav UDP）：6.4 fps → UDP 不是充分修复
+- 最终根因：`wdnav/video.py:855-869` 的 mpp BUFFER_FULL 重试循环
+
+**wdnav 修复**（如果 SDK 维护者接受）需要改的是：
+
+```python
+# wdnav/video.py:855-869 改为：
+while True:
+    try:
+        self._decoder.send_packet(annexb, pts=pts, eos=False)
+        return True
+    except RuntimeError as e:
+        if _BUFFER_FULL_TOKEN not in str(e):
+            raise
+        frame = self._drain_one_raw(
+            timeout_ms=200,  # 5ms → 200ms, 减少重试次数
+            out_w=out_w, out_h=out_h, out_fmt=out_fmt,
+        )
+        if frame is not None:
+            self._prefetched = frame
+            return True
+        # 不再 sleep,直接 return False 让 read0 上层 backoff
+        # （read0 在 .venv/src/wdnav/src/wdnav/video.py:573 的外层循环
+        # 会重新 demux 拿下一个 packet,自然 backoff）
+        return False
+```
+
+`return False` 让 read0 在 `self._send()` 返回 False 时退出当前循环,
+`read0` 已经在外层 `for raw_packet in self._container.demux(...)` 循环,
+下一个 demux 会自然阻塞等 mpp 解码腾出位置。**单帧 800ms BUFFER_FULL 重试
+变成 0ms**（不 sleep）+ 自然的 demux backoff（demux 等新 packet,
+新 packet 触发 mpp 解码出帧,出帧后 read0 自然返回）。
+
+### 实测补丁效果（2026-09 本地验证 — 部分成功）
+
+**应用**：将 `wdnav/video.py:838` 的 `timeout_ms=_DRAIN_TIMEOUT_MS` (5ms)
+改为硬编码 `40ms`，`:852` 的 `_t.sleep(0.005)` 改为 `_t.sleep(0.040)`。
+**保留**模块级常量 `_DRAIN_TIMEOUT_MS = 5` 不动——它被
+`_drain_one_raw()` 默认参数引用（`cshim_video_decoder.c` 内的
+`rkv_dec_get_frame` 也复用 5ms 作 recv_frame 默认值），缩小
+改动作用域。
+
+**验证**：打开 RTSP `?channel=1&subtype=1`（640×480@25fps 海康），
+打开 `WDNWEBUI_VIDEO_SESSION_TIMING=1` 重跑 timing log。
+
+```
+# Baseline (5ms drain + 5ms sleep, 无 patch)         # Patched (40ms + 40ms)
+#1  7.48s  4.0 fps  read0= 203ms                       #1  7.52s  4.0 fps  read0= 205ms   ← 启动爆发(相同)
+#2 24.54s  1.2 fps  read0= 813ms                       #2 18.51s  1.6 fps  read0= 612ms   ← 改善 ~25%
+#3  0.10s 305.0 fps read0= 0.2ms  ← cache drain       #3  0.13s 226.4 fps read0= 0.3ms   ← cache drain
+#4 18.44s  1.6 fps  read0= 610ms                       #4 18.46s  1.6 fps  read0= 611ms   ← 改善幅度小
+#5 24.54s  1.2 fps  read0= 813ms                       #5 24.58s  1.2 fps  read0= 815ms   ← 没改善!
+#6 12.30s  2.4 fps  read0= 407ms                       #6 24.61s  1.2 fps  read0= 816ms   ← 没改善!
+#7  0.09s 343.1 fps read0= 0.2ms                       #7 12.29s  2.4 fps  read0= 406ms   ← 改善幅度小
+```
+
+**诚实结论：patch 提供部分改善（约 25%），未根治。**
+
+- 中等拥塞窗口：24.54s/813ms → 18.51s/612ms（修复 ~25%）
+- 重度拥塞窗口（24.58s/815ms, 24.61s/816ms）**纹丝不动**
+
+**为什么 patch 没根治**：`_DRAIN_TIMEOUT_MS=5`/`sleep(0.005)` 是
+**症状**而非**根因**。真正卡住的是 mpp VPU **输入 packet queue**（mpp
+内部管理，wdnav Python/C API 都没有暴露设置项）：
+1. wdnav 把 H.264 packet 喂进 mpp 输入队列
+2. consumer 慢时 wdnav 喂包速度 > mpp 解码 + 消费速度
+3. mpp 输入队列满 → `send_packet` 抛 `BUFFER_FULL`
+4. C shim `rkv_dec_put_packet` 内部 retry (`RKV_DEC_RETRY_MAX=100`,
+   1-50ms 指数退避，≈ 5s 上限)
+5. C retry 耗尽返回 -1012 → Python `_send()` 看到 `ret=-1012` 字串含
+   "buffer full" → 外层 retry 继续
+6. nested retry 总耗时 = C 5s 上限 × Python 外层多次 retry，可达 10+ 秒
+
+`_DRAIN_TIMEOUT_MS` 改 40ms 只缩短了 Python 外层 retry 节奏，**没修
+根因**。C shim 1-50ms 退避 + Python 40-40ms 退避 = nested retry 总耗时
+仍 200-800ms（vs baseline 813ms）。
+
+### 第二次尝试：`extra_buf_count=96`（也失败）
+
+**假设**：输出 frame pool（`mpp_buffer_group_limit_config`）满了导致 mpp
+没法继续解码 → 改大 `extra_buf_count` 应该缓解。9 月先做了纯 Python
+改动：把 `MppDecoder.__init__(extra_buf_count=24)` 改成读
+`WDNAV_EXTRA_BUF_COUNT` 环境变量，默认改为 96。不需要 rebuild .so。
+
+**实测**：
+```
+# extra_buf_count=24 (_send() patch only)        # extra_buf_count=96 (this attempt)
+#1  7.52s  4.0 fps  read0= 205ms                   #1  7.51s  4.0 fps  read0= 204.7ms
+#2 18.51s  1.6 fps  read0= 612ms                   #2 18.52s  1.6 fps  read0= 612.3ms
+#3  0.13s 226.4 fps read0= 0.3ms                  #3  0.12s 257.8 fps read0= 0.3ms
+#4 18.46s  1.6 fps  read0= 611ms                   #4 12.31s  2.4 fps  read0= 406.7ms
+#5  0.10s 297.1 fps read0= 0.3ms                  #5  0.09s 331.1 fps read0= 0.2ms
+#6 24.58s  1.2 fps  read0= 815ms                   (same pattern as #24 baseline)
+#7  0.09s 343.1 fps read0= 0.2ms
+#8 24.61s  1.2 fps  read0= 816ms
+#9 12.29s  2.4 fps  read0= 406ms
+#10 6.29s  4.8 fps  read0= 205ms
+#11 12.31s 2.4 fps  read0= 406ms
+```
+
+**逐位相同**——extra_buf_count=96 没改善。**结论**：瓶颈不在输出 frame pool，
+而在 mpp **输入 packet queue**（mpp 内部管理，wdnav 不暴露设置项）。
+
+**为什么 96 没用**：C shim 里 `extra_buf_count` 只控制
+`mpp_buffer_group_limit_config` 的 max size + `handle_info_change` 里
+prime allocation 数量。**不影响** mpp 内部 packet queue size。
+`MPP_DEC_SET_CFG` 只设了 `split_parse`，没有 `MPP_DEC_SET_PKT_GROUP`
+这类设置。
+
+### 第三次尝试：drain-first backpressure（成功 ✅）
+
+`py-spy dump` 抓到 video-decode 线程在 `send_packet
+(wdnav/mpp.py:1143) → _send (wdnav/video.py:829) → read0
+(wdnav/video.py:573)` 栈里，确认是 C shim 的 retry 循环
+（`RKV_DEC_RETRY_MAX=100` × 1-50ms 退避）热点。检查 `read0()`
+（`wdnav/video.py:573-625`）发现流程是 **先 push 再 drain**：
+TCP burst 时 PyAV 一次性回送 30+ 个 packet，`read0` 循环
+全部推给 mpp，input queue 灌爆，触发 retry cascade。
+
+**修复**：把循环改成 **drain-first**——每个 iteration 先
+`_drain_one_raw(timeout_ms=5)` 拉一个 frame 腾出 output pool
+slot，再 `_send(packet)` 推 packet。
+
+第一次实现有个 bug：drain 超时（frame is None）时 return
+`(False, None)`，外层 `_decode_loop`（`app/services/video_session.py:417-440`）
+把它当 EOF 处理杀掉整个解码循环，session 立刻 `state=eof frame_pos=0`。
+改成 drain 超时时 **`continue` for 循环 + `time.sleep(0.001)`**
+（1ms 节流，足够让下一个 demux 拿新 packet），decode loop 继续
+跑。
+
+**实测结果**（开 RTSP 等 35s 看 `/tmp/wdnwebui_video_session_timing.log`）：
+```
+#  1 30f in  1.59s =  18.9 fps | read0=  5.9ms   ← 启动爆发（接受）
+#  2 30f in  1.20s =  25.0 fps | read0= 31.3ms  ← 稳态！
+#  3 30f in  1.20s =  25.0 fps | read0= 32.2ms
+...（35/36 个 windows 都是 24.9-25.2 fps）
+# 36 30f in  1.20s =  25.1 fps | read0= 31.4ms
+```
+
+**完美**：
+- 35/36 windows 稳态 25.0 fps
+- read0 中位 ~31ms（之前 200-800ms）
+- **24s 慢窗口完全消失**
+- mean=24.87 fps，p99 ≈ 25.2 fps
+
+`session state=playing frame_pos=894`（35 秒后），约 25.5 fps。
+
+**为什么 drain-first 有效**：output pool 有空 slot 时 mpp 接受
+新 packet（input queue 不满）→ 解码正常 → 释放 frame。
+之前 send-first 让 mpp 的 input queue 满 + C shim 100 次重试
+每帧 ~800ms。现在 drain-first 让 mpp output pool 始终 ≤ 24
+（每帧 1 in 1 out），input queue 永远 ≤ 1（因为 send_packet 之前
+output pool 已空）。
+
+### 清理（已执行 ✅）
+
+诊断完成、修复生效后，按"冗余+无效"标准清理了 wdnav SDK 的两处改动：
+
+| 改动 | 处理 | 原因 |
+|---|---|---|
+| `_send()` 40ms/40ms patch | ✅ **revert 回 5ms/5ms** | drain-first 在 read0 源头解决了 backpressure，retry 层 5ms vs 40ms 无差异 |
+| `MppDecoder.__init__` `WDNAV_EXTRA_BUF_COUNT` env var | ✅ **revert 回 `int=24` 默认** | 96 没改善（输出 pool 不是瓶颈），env var 是无效实验 |
+
+**保留**：
+- `wdnav/video.py:read0` 的 drain-first backpressure（**核心修复**）
+- `app/services/video_session.py` 诊断埋点（env-gated，env 关闭时零开销）
+
+## TTS (语音生成) page
 
 ## TTS (语音生成) page
 

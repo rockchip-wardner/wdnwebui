@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import queue
+import sys
 import threading
 import time
 from typing import Optional
@@ -25,6 +27,42 @@ except Exception:  # pragma: no cover - platform-specific load failure
 
 
 LOG = logging.getLogger("video_session")
+
+
+# 诊断埋点 (RTSP 卡顿定位) — 默认关闭,零行为变化。
+# 设 `WDNWEBUI_VIDEO_SESSION_TIMING=1` 启动 run.py / uvicorn 后,
+# 解码线程每 30 帧输出 1 行,同时写到 3 个通道:
+#   1) LOG.info               — 标准 logging 通道
+#   2) sys.stderr + 前缀       — 绕过 logging 配置,直接到 stderr
+#   3) /tmp/wdnwebui_video_session_timing.log  — 独立文件
+# 三通道任一可达即可;运维推荐直接 `tail -f` 文件。
+_TIMING_ENABLED = os.getenv("WDNWEBUI_VIDEO_SESSION_TIMING", "0") == "1"
+_TIMING_SAMPLE_WINDOW = 30
+_TIMING_LOG_PATH = "/tmp/wdnwebui_video_session_timing.log"
+_TIMING_FH = None
+
+
+def _timing_open() -> None:
+    global _TIMING_FH
+    if _TIMING_FH is not None:
+        return
+    try:
+        _TIMING_FH = open(_TIMING_LOG_PATH, "a", buffering=1)
+    except OSError:
+        _TIMING_FH = None
+
+
+def _timing_emit(line: str) -> None:
+    LOG.info(line)
+    try:
+        print(f"[VS-TIMING] {line}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    if _TIMING_FH is not None:
+        try:
+            _TIMING_FH.write(line + "\n")
+        except Exception:
+            pass
 
 
 class VideoSession:
@@ -330,6 +368,18 @@ class VideoSession:
         # Fallback pacing state used when PTS / time_base are unavailable.
         interval: float = 0.0
         next_frame_wall: float = 0.0
+        if _TIMING_ENABLED:
+            _t_frames = 0
+            _t_drops = 0
+            _t_acc_read0 = 0.0
+            _t_acc_numpy = 0.0
+            _t_acc_encode = 0.0
+            _t_acc_sinks = 0.0
+            _t_acc_put = 0.0
+            _t_window_start = time.monotonic()
+            _t_size_w = 0
+            _t_size_h = 0
+            _t_jpg_bytes = 0
         while True:
             # Block here whenever _play_event is clear (paused).
             # Returns immediately when play() lifts the event, so resume
@@ -389,7 +439,11 @@ class VideoSession:
                 continue
 
             try:
+                if _TIMING_ENABLED:
+                    _t0_read0 = time.monotonic()
                 ret, frame0 = cap.read0()
+                if _TIMING_ENABLED:
+                    _t_acc_read0 += time.monotonic() - _t0_read0
             except Exception as e:  # pragma: no cover - depends on source
                 self._fail(f"read0() 异常: {e}")
                 return
@@ -434,20 +488,32 @@ class VideoSession:
                 pts = 0
 
             try:
+                if _TIMING_ENABLED:
+                    _t0_numpy = time.monotonic()
                 frame = frame0.numpy()
+                if _TIMING_ENABLED:
+                    _t_acc_numpy += time.monotonic() - _t0_numpy
+                    _t_size_w = int(frame.shape[1])
+                    _t_size_h = int(frame.shape[0])
             except Exception as e:
                 # RGA conversion failure (e.g. unsupported size on this
                 # board). Skip this frame rather than crashing the loop.
                 continue
 
+            if _TIMING_ENABLED:
+                _t0_encode = time.monotonic()
             ok, buf = cv2.imencode(
                 ".jpg",
                 frame,
                 [int(cv2.IMWRITE_JPEG_QUALITY), self.JPEG_QUALITY],
             )
+            if _TIMING_ENABLED:
+                _t_acc_encode += time.monotonic() - _t0_encode
             if not ok:
                 continue
             jpg = bytes(buf)
+            if _TIMING_ENABLED:
+                _t_jpg_bytes = len(jpg)
             with self._lock:
                 self._frame_pos = cap.frame_pos
                 self._last_frame_ts = time.time()
@@ -460,6 +526,8 @@ class VideoSession:
             # 一旦抛错会导致 detector 永远拿不到帧,warning 让上游能
             # 立即察觉)。
             sinks = self._current_sinks()
+            if _TIMING_ENABLED:
+                _t0_sinks = time.monotonic()
             if sinks:
                 # 共用上面 ``jpg`` 字节 —— 重复 cv2.imencode 每帧 ~15-25ms,
                 # 实时流 + detector 用同帧同内容,质量共用 JPEG_QUALITY。
@@ -482,10 +550,15 @@ class VideoSession:
                         "%s: %s — sink will be skipped this frame",
                         cur_frame_pos, type(e).__name__, e,
                     )
+            if _TIMING_ENABLED:
+                _t_acc_sinks += time.monotonic() - _t0_sinks
+                _t0_put = time.monotonic()
             # Drop oldest on overflow — favor low latency over completeness.
             try:
                 self._frame_queue.put_nowait(jpg)
             except queue.Full:
+                if _TIMING_ENABLED:
+                    _t_drops += 1
                 try:
                     self._frame_queue.get_nowait()
                 except queue.Empty:
@@ -493,7 +566,43 @@ class VideoSession:
                 try:
                     self._frame_queue.put_nowait(jpg)
                 except queue.Full:
-                    pass
+                    if _TIMING_ENABLED:
+                        _t_drops += 1
+            if _TIMING_ENABLED:
+                _t_acc_put += time.monotonic() - _t0_put
+                _t_frames += 1
+                if _t_frames >= _TIMING_SAMPLE_WINDOW:
+                    _t_window = time.monotonic() - _t_window_start
+                    _t_fps = _t_frames / _t_window if _t_window > 0 else 0.0
+                    _m_read0 = (_t_acc_read0 / _t_frames) * 1000
+                    _m_numpy = (_t_acc_numpy / _t_frames) * 1000
+                    _m_encode = (_t_acc_encode / _t_frames) * 1000
+                    _m_sinks = (_t_acc_sinks / _t_frames) * 1000
+                    _m_put = (_t_acc_put / _t_frames) * 1000
+                    _line = (
+                        f"video_session timing: {_t_frames} frames in "
+                        f"{_t_window:.2f}s ({_t_fps:.1f} fps) "
+                        f"read0={_m_read0:.1f}ms "
+                        f"numpy={_m_numpy:.1f}ms "
+                        f"imencode={_m_encode:.1f}ms "
+                        f"sinks={_m_sinks:.1f}ms "
+                        f"put={_m_put:.1f}ms "
+                        f"jpg={_t_jpg_bytes // 1024}KB "
+                        f"{_t_size_w}x{_t_size_h} "
+                        f"q={self._frame_queue.qsize()} "
+                        f"dropped={_t_drops} "
+                        f"live={is_live} frame_pos={cur_frame_pos}"
+                    )
+                    _timing_open()
+                    _timing_emit(_line)
+                    _t_frames = 0
+                    _t_drops = 0
+                    _t_acc_read0 = 0.0
+                    _t_acc_numpy = 0.0
+                    _t_acc_encode = 0.0
+                    _t_acc_sinks = 0.0
+                    _t_acc_put = 0.0
+                    _t_window_start = time.monotonic()
 
             # Pacing — PTS-driven when available, else 1/fps, else
             # pass through. Live sources skip pacing (already real-time).
