@@ -2808,28 +2808,28 @@ async function refreshVtlDetector() {
 }
 
 async function vtlDetectorStart() {
-  const promptEl = document.getElementById("vtl-prompt");
-  const everyEl  = document.getElementById("vtl-every-n");
-  const prompt = (promptEl?.value || "").trim();
+  const everyEl = document.getElementById("vtl-every-n");
   const every_n = parseInt(everyEl?.value || "30", 10);
-  if (!prompt) {
-    setVtlOverlay("请先填写定位提示词", true);
+
+  const items = vtlPromptCollectItems();
+  if (items.length === 0) {
+    setVtlOverlay("至少需要一条非空的定位描述", true);
     return;
   }
   if (!Number.isFinite(every_n) || every_n < 1) {
     setVtlOverlay("每隔帧数值非法", true);
     return;
   }
-  VTL.prompt = prompt;
+
+  VTL.prompt = items.join("</c>");   // best-effort mirror of the backend-built prompt
   VTL.everyN = every_n;
   try {
-    // 本页**不**传 image_size / model_id — LocateAnything 视觉固定
-    // 448×448 单变体，且 capability swcap_grounding 当前只有 1 个
-    // preset，picker 无意义（后端 schema 直接拒收这俩字段）。
+    // Send raw `prompts: list[str]` to the backend; backend owns the prefix + separator.
+    // The legacy `prompt: str` field is NOT sent here (mutual exclusivity enforced server-side).
     const r = await fetch(API_PREFIX + "/video-target-localization/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, every_n }),
+      body: JSON.stringify({ prompts: items, every_n }),
     });
     if (!r.ok) {
       const detail = await r.text().catch(() => "");
