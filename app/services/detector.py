@@ -2044,31 +2044,31 @@ class WdnaiDetector:
                 # 不应被命中。命中说明上面三个 break 都漏了。
                 pass
 
-            # 不应到达这里 —— 上面的 tool / TargetDoc / VLMDoc 三个
-            # 分支里只要有一个匹配都会 break。日志埋点，捕获 SDK 返回
-            # result 类型与任何已知分支都不匹配的"第四态"（例如
-            # _ProxyResult 重构后仍不是 VLMDoc/TargetDoc/工具实例）。
-            # 这是用户报告"推理 2 次后停"的核心可疑路径 —— 若该类
-            # 结果反复出现而 multi-iter 循环命中 cap_hit，可能让上层
-            # 误判"推理停"。
-            LOG.warning(
-                "frame iter ?: result type %s fell through ALL branches "
-                "(not tool / not TargetDoc / not %s)",
-                last_result_type or "?",
-                getattr(generating_cls, "__name__", "?")
-                if generating_cls else "?",
-            )
-            _format_raw_text_for_log(last_raw_text, "last_raw_text")
-
-            if exit_reason == "none":
-                exit_reason = (
-                    f"cap_hit(max_iters={effective_max})"
-                )
+                # 不应到达这里 —— 上面的 tool / TargetDoc / VLMDoc 三个
+                # 分支里只要有一个匹配都会 break。日志埋点，捕获 SDK 返回
+                # result 类型与任何已知分支都不匹配的"第四态"（例如
+                # _ProxyResult 重构后仍不是 VLMDoc/TargetDoc/工具实例）。
+                # 这是用户报告"推理 2 次后停"的核心可疑路径 —— 若该类
+                # 结果反复出现而 multi-iter 循环命中 cap_hit，可能让上层
+                # 误判"推理停"。
                 LOG.warning(
-                    "frame infer: loop hit effective_max=%d without schema, "
-                    "final tool still calling — likely runaway model",
-                    effective_max,
+                    "frame iter ?: result type %s fell through ALL branches "
+                    "(not tool / not TargetDoc / not %s)",
+                    last_result_type or "?",
+                    getattr(generating_cls, "__name__", "?")
+                    if generating_cls else "?",
                 )
+                _format_raw_text_for_log(last_raw_text, "last_raw_text")
+
+                if exit_reason == "none":
+                    exit_reason = (
+                        f"cap_hit(max_iters={effective_max})"
+                    )
+                    LOG.warning(
+                        "frame infer: loop hit effective_max=%d without schema, "
+                        "final tool still calling — likely runaway model",
+                        effective_max,
+                    )
 
             # 诊断 (v0.13): 填充 diag record 关键字段并写入 ring buffer。
             _diag_rec.update(

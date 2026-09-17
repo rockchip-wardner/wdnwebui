@@ -1079,12 +1079,12 @@ class _RpcSessionProxy:
         # 会拿到 _ProxyResult 而不是真 schema 实例，触发 detector 端
         # "result not an instance of VLMDoc" 的 warning。预先在这里把
         # 缺失 / 类型异常打出来，避免上游再去反推。
-        if gen_name and gen_name != "TargetDoc" and isinstance(
+        if gen_name and gen_name not in ("TargetDoc", "LocatorDoc") and isinstance(
                 result_data, dict) and result_data:
             LOG.warning(
                 "proxy: gen_name=%s delivered with structured result_data — "
-                "only TargetDoc is reconstructed here; other schema will "
-                "fall through to _ProxyResult (fields=%s)",
+                "TargetDoc and LocatorDoc are reconstructed here; other "
+                "schema will fall through to _ProxyResult (fields=%s)",
                 gen_name, sorted(result_data.keys())[:8],
             )
         # ------------------------------------------------------------------ #
