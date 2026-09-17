@@ -5929,17 +5929,22 @@ html, body {
 }
 .vtl-prompt-add {
   flex: 0 0 auto;
-  border-style: dashed;
-  border-color: var(--border);
-  color: var(--muted);
+  border-style: solid;
+  border-color: var(--accent);
+  background: rgba(59, 130, 246, 0.10);
+  color: var(--accent);
+  font-weight: 500;
 }
 .vtl-prompt-add:hover:not(:disabled) {
-  border-style: solid;
+  background: rgba(59, 130, 246, 0.20);
   border-color: var(--accent);
   color: var(--accent);
 }
 .vtl-prompt-add:disabled {
   opacity: 0.4;
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--border);
   cursor: not-allowed;
 }
 .vtl-prompt-hint {
