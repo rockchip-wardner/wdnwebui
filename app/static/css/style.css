@@ -5925,6 +5925,7 @@ html, body {
 .vtl-prompt-toolbar {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 0.6rem;
 }
 .vtl-prompt-add {
