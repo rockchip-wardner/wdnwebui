@@ -2349,12 +2349,13 @@ function connectVtlWs() {
       } else if (snap.type === "event") {
         addVtlEvent(snap);
         showVtlEventBadge(snap);
-        if (snap.frame_b64) {
+        // 只有定位到目标时才冻结画布 2 秒,让 bbox 与文字提示对得上;
+        // 没有 box 时放过,实时流不被冻,避免画面定格成旧帧。
+        if (snap.frame_b64 && snap.boxes && snap.boxes.length) {
           if (VTL.frozenFrameUrl) URL.revokeObjectURL(VTL.frozenFrameUrl);
           VTL.frozenFrameUrl =
             "data:image/jpeg;base64," + snap.frame_b64;
-          VTL.frozenBoxes =
-            (snap.boxes && snap.boxes.length) ? snap.boxes : null;
+          VTL.frozenBoxes = snap.boxes;
           VTL.frozenUntil = Date.now() + 2000;
         }
         return;
@@ -2662,23 +2663,15 @@ function showVtlEventBadge(ev) {
   const badge = document.getElementById("vtl-event-badge");
   const text = document.getElementById("vtl-event-badge-text");
   if (!badge || !text) return;
-  const boxes = Array.isArray(ev.boxes) ? ev.boxes : [];
-  let raw;
-  if (boxes.length === 0) {
-    raw = "未定位到目标";
-  } else {
-    const labelSummary = boxes.slice(0, 3).map((b) => b.label || "?").join("、");
-    raw = boxes.length <= 3
-      ? `定位到 ${boxes.length} 个: ${labelSummary}`
-      : `定位到 ${boxes.length} 个: ${labelSummary}…`;
-  }
-  text.textContent = raw;
+  // 实时画面上不显示任何文字 — bbox 框本身就是事件反馈,文字
+  // 信息保留在右侧历史列表 + 双击展开 modal 里,避免遮挡视频。
+  text.textContent = "";
   badge.classList.remove("hidden");
   badge.style.animation = "none";
   badge.offsetHeight;
   badge.style.animation = "";
   if (vtlBadgeHideTimer) clearTimeout(vtlBadgeHideTimer);
-  vtlBadgeHideTimer = setTimeout(() => badge.classList.add("hidden"), 6000);
+  vtlBadgeHideTimer = setTimeout(() => badge.classList.add("hidden"), 1500);
 }
 
 // 双击历史项 → 弹出 #vtl-frame-modal 大图预览。

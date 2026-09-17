@@ -1442,6 +1442,14 @@ class WdnaiDetector:
             self._item_q.put_nowait(None)
         except queue.Full:
             pass
+        # 清空残留的 None sentinel 与过期帧,避免下次 start() 新 worker
+        # 立即拿到 None 退出,造成 "启动定位后 worker_loop 0 秒死" 的隐性
+        # 失败 (前后端都不报错但 history / bbox 全无)。
+        try:
+            while True:
+                self._item_q.get_nowait()
+        except queue.Empty:
+            pass
         return self.snapshot()
 
     def close(self) -> None:
