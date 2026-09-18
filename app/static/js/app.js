@@ -2290,25 +2290,39 @@ function setVtlProgress(snap) {
   el.style.width = snap.is_live ? "100%" : "0%";
 }
 
+async function drawVtlFrozenFrame() {
+  // 把被定位的那一帧 + bbox 画到 canvas。两个调用点:
+  //   1. 事件到达瞬间 (onmessage event 分支) —— 消除 5ms 视觉跳变。
+  //   2. 冻结期内每个 binary frame (drawVtlFrame frozen 分支) ——
+  //      保持 canvas 持续刷新,避免浏览器对长期静止的 canvas 做
+  //      渲染管线优先级降级。
+  const canvas = document.getElementById("vtl-canvas");
+  if (!canvas || !VTL.frozenFrameUrl) return;
+  const img = new Image();
+  await new Promise((resolve) => {
+    img.onload = resolve;
+    img.onerror = resolve;
+    img.src = VTL.frozenFrameUrl;
+  });
+  const ctx = canvas.getContext("2d");
+  canvas.width = img.naturalWidth || canvas.width;
+  canvas.height = img.naturalHeight || canvas.height;
+  ctx.drawImage(img, 0, 0);
+  if (VTL.frozenBoxes && VTL.frozenBoxes.length) {
+    drawVtlBoxes(canvas, VTL.frozenBoxes, VTLDetector.palette);
+  }
+}
+
 async function drawVtlFrame(jpgBytes) {
+  // 冻结期内重画冻结帧 (与原始行为一致:canvas 在 2s 冻结期持续刷新,
+  // 避免浏览器渲染管线对长期不写入的 canvas 做优先级降级)。
+  // 事件到达瞬间 drawVtlFrozenFrame 已画过一次,这里把 frozen 期内
+  // 每个 binary frame 都走 frozen 分支再画一次 (image 是 data URL,
+  // load 是同步的,实际 CPU 开销很小)。
   const canvas = document.getElementById("vtl-canvas");
   if (!canvas) return;
-  // 事件到来后把被检测的那一帧冻结 2s，期间不画实时流 —— 避免 bbox
-  // 落在延迟的当前帧上。
   if (VTL.frozenUntil > Date.now() && VTL.frozenFrameUrl) {
-    const img = new Image();
-    await new Promise((resolve) => {
-      img.onload = resolve;
-      img.onerror = resolve;
-      img.src = VTL.frozenFrameUrl;
-    });
-    const ctx = canvas.getContext("2d");
-    canvas.width = img.naturalWidth || canvas.width;
-    canvas.height = img.naturalHeight || canvas.height;
-    ctx.drawImage(img, 0, 0);
-    if (VTL.frozenBoxes && VTL.frozenBoxes.length) {
-      drawVtlBoxes(canvas, VTL.frozenBoxes, VTLDetector.palette);
-    }
+    await drawVtlFrozenFrame();
     return;
   }
   if (!jpgBytes || !jpgBytes.byteLength) return;
@@ -2350,13 +2364,18 @@ function connectVtlWs() {
         addVtlEvent(snap);
         showVtlEventBadge(snap);
         // 只有定位到目标时才冻结画布 2 秒,让 bbox 与文字提示对得上;
-        // 没有 box 时放过,实时流不被冻,避免画面定格成旧帧。
+        // 没有 box 时放过,实时流不被冻。冻结期内 binary frame 由
+        // drawVtlFrame 内部的 frozen 分支重画冻结帧,保持 canvas
+        // 持续刷新 —— 见下方 onmessage 的注释。
         if (snap.frame_b64 && snap.boxes && snap.boxes.length) {
           if (VTL.frozenFrameUrl) URL.revokeObjectURL(VTL.frozenFrameUrl);
           VTL.frozenFrameUrl =
             "data:image/jpeg;base64," + snap.frame_b64;
           VTL.frozenBoxes = snap.boxes;
           VTL.frozenUntil = Date.now() + 2000;
+          // 事件到达瞬间画一次冻结帧 (消除 5ms 视觉跳变),后续 binary
+          // frame 由 drawVtlFrame frozen 分支接力重画冻结帧。
+          await drawVtlFrozenFrame();
         }
         return;
       } else if (snap.type === "status" && snap.detector) {
@@ -2369,6 +2388,9 @@ function connectVtlWs() {
       if (payload) payload.textContent = JSON.stringify(snap, null, 2);
       return;
     }
+    // 冻结期内的 binary frame 由 drawVtlFrame 内部的 frozen 分支
+    // 处理 (重画冻结帧),保证 canvas 在 2s 冻结期内持续刷新 —— 避免
+    // 浏览器对长期静止的 canvas 做渲染管线优先级降级。
     try {
       await drawVtlFrame(new Uint8Array(ev.data));
       setVtlOverlay("", false);

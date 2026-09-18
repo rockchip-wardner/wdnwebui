@@ -848,6 +848,11 @@ html, body {
   height: 100%;
   display: block;
 }
+#vtl-canvas {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+}
 .vd-overlay {
   position: absolute;
   inset: 0;
