@@ -2690,18 +2690,10 @@ function addVtlEvent(ev) {
 
 let vtlBadgeHideTimer = null;
 function showVtlEventBadge(ev) {
+  // bbox 框就是事件反馈; 历史/双击 modal 里有详情, 不弹空文字黑框。
   const badge = document.getElementById("vtl-event-badge");
-  const text = document.getElementById("vtl-event-badge-text");
-  if (!badge || !text) return;
-  // 实时画面上不显示任何文字 — bbox 框本身就是事件反馈,文字
-  // 信息保留在右侧历史列表 + 双击展开 modal 里,避免遮挡视频。
-  text.textContent = "";
-  badge.classList.remove("hidden");
-  badge.style.animation = "none";
-  badge.offsetHeight;
-  badge.style.animation = "";
-  if (vtlBadgeHideTimer) clearTimeout(vtlBadgeHideTimer);
-  vtlBadgeHideTimer = setTimeout(() => badge.classList.add("hidden"), 1500);
+  if (badge) badge.classList.add("hidden");
+  if (vtlBadgeHideTimer) { clearTimeout(vtlBadgeHideTimer); vtlBadgeHideTimer = null; }
 }
 
 // 双击历史项 → 弹出 #vtl-frame-modal 大图预览。
