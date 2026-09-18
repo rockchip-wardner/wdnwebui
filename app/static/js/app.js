@@ -2495,8 +2495,17 @@ function drawVtlBoxes(canvasEl, boxes, palette) {
   if (!canvasEl || !boxes || !boxes.length) return;
   const ctx = canvasEl.getContext("2d");
   if (!ctx) return;
-  ctx.lineWidth = 3;
-  ctx.font = "13px sans-serif";
+  // Scale stroke / font / tag box with canvas natural width so annotations
+  // stay legible on 1080p+ frames. Reference 960px keeps base values for
+  // small thumbnails; cap at 3x to bound 4K/8K overlays.
+  const scale = Math.min(3, Math.max(1, canvasEl.width / 960));
+  const lineW = Math.max(2, Math.round(3 * scale));
+  const fontPx = Math.max(11, Math.round(13 * scale));
+  const tagH = Math.max(14, Math.round(16 * scale));
+  const pad = Math.max(3, Math.round(4 * scale));
+  const textOffset = Math.max(2, Math.round(3 * scale));
+  ctx.lineWidth = lineW;
+  ctx.font = `${fontPx}px sans-serif`;
   ctx.textBaseline = "bottom";
   for (const box of boxes) {
     const label = (box && box.label) ? String(box.label) : "";
@@ -2511,14 +2520,13 @@ function drawVtlBoxes(canvasEl, boxes, palette) {
     if (label) {
       const tag = label;
       const metrics = ctx.measureText(tag);
-      const tagW = Math.ceil(metrics.width) + 8;
-      const tagH = 16;
+      const tagW = Math.ceil(metrics.width) + pad * 2;
       const tagX = Math.max(0, x1);
       const tagY = Math.max(0, y1 - tagH);
       ctx.fillStyle = `rgb(${r},${g},${b})`;
       ctx.fillRect(tagX, tagY, tagW, tagH);
       ctx.fillStyle = "#fff";
-      ctx.fillText(tag, tagX + 4, tagY + tagH - 3);
+      ctx.fillText(tag, tagX + pad, tagY + tagH - textOffset);
     }
   }
 }
