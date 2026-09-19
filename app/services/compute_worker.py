@@ -1385,6 +1385,29 @@ def infer_handler(state: dict, payload: dict) -> dict:
                 # （proxy 侧 is_remote=True 已经切回 base64 JPEG 兜底，
                 #  不会进这一分支）。
                 path = item["data_path"]
+                kind = item.get("kind") or "image"
+                if kind == "audio":
+                    # Audio path-list (mirror of image above): raw PCM
+                    # bytes on tmpfs; open().read() rebuilds byte-exact.
+                    try:
+                        with open(path, "rb") as _f:
+                            raw_audio = _f.read()
+                        attachments.append(AudioAttachment(
+                            raw_audio,
+                            mime_type=item.get("mime_type", "audio/wav"),
+                        ))
+                    except FileNotFoundError:
+                        LOG.warning("infer: data_path %s missing (skipping)", path)
+                    except Exception as _e:
+                        LOG.warning("infer: data_path %s read failed (%s)", path, _e)
+                    finally:
+                        try:
+                            import os as _os
+                            if _os.path.exists(path):
+                                _os.unlink(path)
+                        except OSError:
+                            pass
+                    continue
                 shape = item.get("shape") or [0, 0, 3]
                 dtype = item.get("dtype", "uint8")
                 img = None

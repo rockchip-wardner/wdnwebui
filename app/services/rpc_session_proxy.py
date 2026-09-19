@@ -63,6 +63,15 @@ _VD_SHM_DIR = "/dev/shm"
 _VD_SHM_PREFIX = "wdnwebui_vd_"
 
 
+# Audio path-list (see _bgr_ndarray_to_path for the mirror image
+# path-list rationale). The wdndds ComputeRequest.prompt field is IDL
+# string<65535> and FastCDR's fixed_string truncates anything longer
+# without erroring, so 6 s × 16 kHz × 2 B PCM (~256 KB base64) silently
+# lost ~75% of every chunk, the worker's json.loads fell into the
+# silent except, attachment=[] → OmniBackend.run_text() raised.
+_AA_SHM_PREFIX = "wdnwebui_aa_"
+
+
 # Response-side shm files (mirror of _VD_SHM_*) — worker writes crop /
 # result_data payloads to ``/dev/shm/wdnwebui_cr_*`` and main process
 # reads + unlinks them inside ``_sync_call``. Same boot/atexit sweep
@@ -153,14 +162,53 @@ def _sweep_stale_reply_shm(max_age_seconds: float = 3600.0) -> int:
     return n
 
 
+def _sweep_stale_aa_shm(max_age_seconds: float = 3600.0) -> int:
+    """Remove stale ``/dev/shm/wdnwebui_aa_*.bin`` audio-attachment files.
+
+    Same pattern as :func:`_sweep_stale_vd_shm` — the main process
+    writes raw PCM here for the audio path-list and the worker reads +
+    unlinks. A kill between write/read leaves them behind; boot sweep
+    (1 h max_age) tolerates concurrent boots; atexit sweep
+    (max_age=0) clears leftovers at shutdown.
+    """
+    try:
+        import glob as _glob
+        import os as _os
+        import time as _time
+    except ImportError:
+        return 0
+    n = 0
+    now = _time.time()
+    try:
+        for p in _glob.glob(_os.path.join(_VD_SHM_DIR, f"{_AA_SHM_PREFIX}*.bin")):
+            try:
+                st = _os.stat(p)
+            except OSError:
+                continue
+            if now - st.st_mtime < max_age_seconds:
+                continue
+            try:
+                _os.unlink(p)
+                n += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if n:
+        LOG.info("swept %d stale %s files", n, _AA_SHM_PREFIX)
+    return n
+
+
 try:
     import atexit as _atexit
     _atexit.register(_sweep_stale_vd_shm, 0.0)
     _atexit.register(_sweep_stale_reply_shm, 0.0)
+    _atexit.register(_sweep_stale_aa_shm, 0.0)
 except ImportError:
     pass
 _sweep_stale_vd_shm()  # best-effort sweep on import
 _sweep_stale_reply_shm()  # best-effort sweep on import
+_sweep_stale_aa_shm()  # best-effort sweep on import
 
 
 # Lazy import for cv2 (only used by image-encoding path).
@@ -215,6 +263,33 @@ def _bgr_ndarray_to_path(arr) -> dict:
         "data_path": path,
         "shape": [int(h), int(w), 3],
         "dtype": "uint8",
+    }
+
+
+def _audio_bytes_to_path(audio_bytes, *, mime_type: str = "audio/wav") -> dict:
+    """Write raw audio bytes to ``/dev/shm`` and return a path descriptor.
+
+    Returns ``{"data_path": "<abs path>", "kind": "audio", "mime_type": "..."}``.
+    Worker reads with ``open(path, "rb").read()`` and constructs an
+    ``AudioAttachment`` — byte-exact (no base64, no compression) so the
+    Omni / ASR audio encoder sees the exact PCM the caller sent.
+
+    LAN-peer fallback is handled by the caller
+    (see :meth:`_RpcSessionProxy._encode_attachments`); this function is
+    only invoked for local workers.
+    """
+    import os as _os
+    import uuid as _uuid
+    raw = bytes(audio_bytes)
+    _os.makedirs(_VD_SHM_DIR, exist_ok=True)
+    name = f"{_AA_SHM_PREFIX}{_uuid.uuid4().hex}.bin"
+    path = _os.path.join(_VD_SHM_DIR, name)
+    with open(path, "wb") as _f:
+        _f.write(raw)
+    return {
+        "data_path": path,
+        "kind": "audio",
+        "mime_type": mime_type,
     }
 
 
@@ -1296,14 +1371,18 @@ class _RpcSessionProxy:
                     out.append(item.text)
                     continue
                 if isinstance(item, _WdnaiAudio):
-                    # Audio bytes — wrap with kind so the worker decoder
-                    # routes to the audio branch (otherwise it would be
-                    # mistaken for a base64 image).
-                    out.append({
-                        "data_b64": base64.b64encode(
-                            bytes(item.data)).decode("ascii"),
-                        "kind":     "audio",
-                    })
+                    # Audio: local worker uses /dev/shm path-list;
+                    # LAN peer can't reach our /dev/shm so inline base64.
+                    mime = getattr(item, "mime_type", "audio/wav") or "audio/wav"
+                    if self._is_remote:
+                        out.append({
+                            "data_b64": base64.b64encode(
+                                bytes(item.data)).decode("ascii"),
+                            "kind":     "audio",
+                            "mime_type": mime,
+                        })
+                    else:
+                        out.append(_audio_bytes_to_path(item.data, mime_type=mime))
                     continue
                 # Generic Attachment (custom subclass / duck-typed
                 # _AttachmentProxy from older code paths) — fall back to
@@ -1323,11 +1402,18 @@ class _RpcSessionProxy:
                     if getattr(item, "data", None):
                         kind = getattr(item, "kind", "audio") or "audio"
                         if kind == "audio":
-                            out.append({
-                                "data_b64": base64.b64encode(
-                                    bytes(item.data)).decode("ascii"),
-                                "kind":     "audio",
-                            })
+                            mime = (getattr(item, "mime_type", "audio/wav")
+                                    or "audio/wav")
+                            if self._is_remote:
+                                out.append({
+                                    "data_b64": base64.b64encode(
+                                        bytes(item.data)).decode("ascii"),
+                                    "kind":     "audio",
+                                    "mime_type": mime,
+                                })
+                            else:
+                                out.append(_audio_bytes_to_path(
+                                    item.data, mime_type=mime))
                         else:
                             out.append(base64.b64encode(
                                 bytes(item.data)).decode("ascii"))
@@ -1343,10 +1429,16 @@ class _RpcSessionProxy:
                 continue
             if isinstance(item, (bytes, bytearray)):
                 # 裸 bytes：默认按音频处理（TTS 常见输出 shape）。
-                out.append({
-                    "data_b64": base64.b64encode(bytes(item)).decode("ascii"),
-                    "kind":     "audio",
-                })
+                mime = (getattr(item, "mime_type", "audio/wav")
+                        or "audio/wav")
+                if self._is_remote:
+                    out.append({
+                        "data_b64": base64.b64encode(bytes(item)).decode("ascii"),
+                        "kind":     "audio",
+                        "mime_type": mime,
+                    })
+                else:
+                    out.append(_audio_bytes_to_path(item, mime_type=mime))
                 continue
             if isinstance(item, str):
                 out.append(item)
