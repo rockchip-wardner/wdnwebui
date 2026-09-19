@@ -108,6 +108,24 @@ creation); everything below is verified against the current tree.
   `MODEL_PRESETS` / 相关 spec factory / `_seed_defaults`，由运行时
   自动生成新文件；agent 不要"先编辑 config.jsonc 再 commit 进去"。
 
+## wdndds RPC size limits (v0.7+)
+
+方案B (string<65535> → sequence<octet>) 治本了 IDL 字段级别的截断。
+但 **per-message 仍有 1 MB 硬上限**：
+
+* `wdndds_cshim.cpp:427-428` 显式设 `max_serialized_type_size = 1048576`
+* 与字段类型无关——是整个 CDR 编码后消息的字节数
+* **当前 wdnwebui 调用**（6s 16 kHz mono audio chunk = 192 KB raw → 256 KB envelope）
+  富余 4×；不会撞
+* **如果 `audio_analysis.CHUNK_SECONDS` 调到 ≥ 18 s**（≈ 768 KB envelope）
+  或 **单图 > 1 MB base64 inline** 时会撞
+* 撞的症状是 **loud**（FastCDR serialize 失败，客户端拿到 `{"ok": false, ...}`），
+  不是 v0.7 之前的 silent 截断
+* 详见 wdndds 仓库 `docs/limits.md`；要扩到 4 MB / 16 MB 时
+  同步调 `apply_bounded_resource_limits()` 的 max_total，否则会触发
+  v0.6.0 修过的 RSS 漏问题
+* **当前不动**——6s/12s/18s 都安全，撞了再扩
+
 ## 算力注册中心 — per-model-subprocess RPC (v0.4)
 
 v0.4 重大重构：每个 (npu_index, model_id) 实例现在跑在**独立
