@@ -7396,6 +7396,12 @@ const ImBridge = {
   snapshot: null,
   messages: [],          // most recent first (in + out mixed)
   chatCleared: false,    // true after 清屏: don't re-fill from backend on page re-entry
+  // Smart-follow state: _pendingNewCount tracks messages received while
+  // scrolled away from the bottom (shown via "↓ N 条新消息");
+  // _lastRenderedCount captures messages.length at last render to compute
+  // the diff.
+  _pendingNewCount: 0,
+  _lastRenderedCount: 0,
 
   init() {
     if (this._inited) return;
@@ -7410,6 +7416,11 @@ const ImBridge = {
     $("imb-llm-bridge")?.addEventListener("change", (e) => {
       this._toggleLlmBridge(e.target.checked);
     });
+    $("imb-jump-new")?.addEventListener("click", () => this._jumpToNewMessages());
+    const list = $("imb-conv-list");
+    if (list) {
+      list.addEventListener("scroll", () => this._onConvScroll(), { passive: true });
+    }
     $("imb-text-input")?.addEventListener("keydown", (e) => {
       // Cmd/Ctrl + Enter sends; plain Enter inserts a newline.
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -7520,7 +7531,7 @@ const ImBridge = {
     }
     if (msg.type === "message") {
       this._recordMessage(msg.message);
-      this._renderChat();
+      this._renderChat({ isNewMessageRender: true });
       this._renderKnown();
       return;
     }
@@ -7756,19 +7767,47 @@ const ImBridge = {
     if (this.messages.length > 200) this.messages.length = 200;
   },
 
-  _renderChat() {
+  _renderChat({ isNewMessageRender = false } = {}) {
     const list = document.getElementById("imb-conv-list");
+    const msgs = document.getElementById("imb-conv-msgs");
     const title = document.getElementById("imb-conv-title");
-    if (!list || !title) return;
+    if (!list || !msgs || !title) return;
+
+    // Capture "was user near the bottom?" BEFORE innerHTML reset, otherwise
+    // the reset zeroes scrollTop and the near-bottom check below is meaningless.
+    // The captured value drives both auto-follow (at-bottom) and the
+    // "↓ N 条新消息" button (scrolled-away).
+    const wasNearBottom = this._isNearBottom(list);
+
+    // New-message delta only counts when this render was triggered by an
+    // actual incoming WS message (vs. an initial snapshot / re-fill).
+    // The diff is computed against _lastRenderedCount, which is the
+    // messages.length at the previous successful render — 0 on a fresh init.
+    if (isNewMessageRender) {
+      const newCount = Math.max(
+        0,
+        this.messages.length - this._lastRenderedCount,
+      );
+      if (newCount > 0 && !wasNearBottom) {
+        this._pendingNewCount += newCount;
+      } else if (wasNearBottom) {
+        // User was at the bottom → consuming the new messages directly.
+        this._pendingNewCount = 0;
+      }
+    }
+
     if (!this.messages.length) {
       title.textContent = "消息记录";
-      list.innerHTML = `
+      msgs.innerHTML = `
         <div class="page-placeholder imb-empty">
           <div class="page-placeholder-text">
             登录后会话与消息会出现在这里。<br/>
             发送默认发给本机 user_id（用于测试 round-trip）。
           </div>
         </div>`;
+      this._updateJumpNewButton();
+      this._lastRenderedCount = 0;
+      this._pendingNewCount = 0;
       return;
     }
     // Show all messages (any user) — the sender is locked to the bot's
@@ -7792,27 +7831,55 @@ const ImBridge = {
       return self ? `消息记录（发送目标：${this._esc(self)}）` : "消息记录";
     })();
     title.textContent = header;
-    // Capture scroll position before rebuilding (innerHTML reset resets it);
-    // pass it so the smart-follow can restore it when not near the bottom.
-    const prevScrollTop = list.scrollTop;
-    list.innerHTML = `<ul class="imb-conv-ul">${rows.join("")}</ul>`;
-    this._scrollChatToBottomIfNear(list, prevScrollTop);
+    msgs.innerHTML = `<ul class="imb-conv-ul">${rows.join("")}</ul>`;
+
+    if (wasNearBottom || this._lastRenderedCount === 0) {
+      // First-ever render (lastRenderedCount=0) — always start at the
+      // bottom so the user sees the latest message, mirroring standard
+      // chat UIs. Subsequent renders follow smart-follow rules.
+      list.scrollTop = list.scrollHeight;
+    }
+    this._updateJumpNewButton();
+    this._lastRenderedCount = this.messages.length;
   },
 
   // Threshold (px) below the bottom: if the user is scrolled within this
-  // distance of the bottom, keep auto-following new messages down. If they
-  // scrolled up to read history, don't yank the view back down.
+  // distance of the bottom, treat them as "following the tail".
   _CHAT_BOTTOM_TOLERANCE: 40,
 
-  _scrollChatToBottomIfNear(list, prevScrollTop) {
-    if (!list) return;
-    const nearBottom =
-      list.scrollHeight - list.scrollTop - list.clientHeight <=
+  _isNearBottom(list) {
+    if (!list) return true;
+    return list.scrollHeight - list.scrollTop - list.clientHeight <=
       this._CHAT_BOTTOM_TOLERANCE;
-    if (nearBottom) {
-      list.scrollTop = list.scrollHeight;
-    } else if (typeof prevScrollTop === "number") {
-      list.scrollTop = prevScrollTop;
+  },
+
+  _onConvScroll() {
+    const list = document.getElementById("imb-conv-list");
+    if (!list) return;
+    if (this._isNearBottom(list)) {
+      // User just caught up to the tail → drop the badge.
+      this._pendingNewCount = 0;
+      this._updateJumpNewButton();
+    }
+  },
+
+  _jumpToNewMessages() {
+    const list = document.getElementById("imb-conv-list");
+    if (!list) return;
+    list.scrollTop = list.scrollHeight;
+    this._pendingNewCount = 0;
+    this._updateJumpNewButton();
+  },
+
+  _updateJumpNewButton() {
+    const btn = document.getElementById("imb-jump-new");
+    const count = document.getElementById("imb-jump-new-count");
+    if (!btn || !count) return;
+    if (this._pendingNewCount > 0) {
+      btn.classList.remove("hidden");
+      count.textContent = `${this._pendingNewCount} 条新消息`;
+    } else {
+      btn.classList.add("hidden");
     }
   },
 

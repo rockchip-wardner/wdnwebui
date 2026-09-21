@@ -4015,8 +4015,10 @@ html, body {
   flex: 0 0 auto;
 }
 .imb-conv-list {
+  /* min-height:0 让 flex 子项在父容器被压缩时能正常收缩，
+   * 触发 overflow-y:auto 滚动而不是溢出卡片覆盖 composer。 */
   flex: 1 1 auto;
-  min-height: 320px; /* reasonable floor; normally flex fills remaining card space */
+  min-height: 0;
   overflow-y: auto;
   background: #f9fafb;
   border: 1px solid var(--border);
@@ -4100,6 +4102,49 @@ html, body {
 .imb-empty .page-placeholder-text {
   text-align: center;
   color: var(--muted);
+}
+
+/* ---------- "有 N 条新消息" 浮动按钮 ---------- */
+/* 浮在 .imb-conv-list 右下角；JS 在用户向上滚读历史时切换 .hidden。 */
+.imb-conv-list {
+  position: relative;
+}
+.imb-jump-new {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--accent, #2563eb);
+  border: 1px solid color-mix(in srgb, var(--accent, #2563eb) 80%, #000);
+  border-radius: 999px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  user-select: none;
+  transition: opacity 120ms ease, transform 120ms ease;
+  z-index: 2;
+}
+.imb-jump-new:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.22);
+}
+.imb-jump-new:active {
+  transform: translateY(0);
+}
+.imb-jump-new.hidden {
+  display: none;
+}
+.imb-jump-new-arrow {
+  font-size: 14px;
+  line-height: 1;
+}
+.imb-jump-new-count {
+  line-height: 1;
 }
 
 /* ---------- text-chat (文本对话) page ---------- */

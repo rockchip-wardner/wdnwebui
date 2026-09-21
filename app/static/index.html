@@ -558,12 +558,19 @@
               <div class="imb-conv">
                 <div class="imb-conv-title" id="imb-conv-title">消息记录</div>
                 <div class="imb-conv-list" id="imb-conv-list">
-                  <div class="page-placeholder imb-empty">
-                    <div class="page-placeholder-text">
-                      登录后会话与消息会出现在这里。<br/>
-                      发送默认发给本机 user_id（用于测试 round-trip）。
+                  <div class="imb-conv-msgs" id="imb-conv-msgs">
+                    <div class="page-placeholder imb-empty">
+                      <div class="page-placeholder-text">
+                        登录后会话与消息会出现在这里。<br/>
+                        发送默认发给本机 user_id（用于测试 round-trip）。
+                      </div>
                     </div>
                   </div>
+                  <button class="imb-jump-new hidden" id="imb-jump-new" type="button"
+                          title="跳到最新消息">
+                    <span class="imb-jump-new-arrow">↓</span>
+                    <span class="imb-jump-new-count" id="imb-jump-new-count">0 条新消息</span>
+                  </button>
                 </div>
               </div>
 
