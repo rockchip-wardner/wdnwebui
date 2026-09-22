@@ -891,6 +891,13 @@ class ModelInstance:
     rpc_session_proxy: Any = None
     _svc: Any = None                            # wdndds Service handle; needed for full cleanup in stop_instance_local
     _probe_thread: Optional[threading.Thread] = None
+    # 串行化 probe 的 .call() 与 teardown 的 destroy；否则 cshim Requester
+    # 在 C 层 UAF → SIGSEGV。AGENTS "destroy 拿 requester._lock"。
+    _probe_lock: threading.RLock = field(default_factory=threading.RLock)
+    # probe 的 in-flight ``r`` 失效计数器。unload/stop 自增；probe 调用
+    # 前快照、调用后比对，变了就跳过 status 写回。修算力配置页 disable
+    # 按钮 flicker（probe 陈旧 r 覆盖 unload 乐观写的 "not_loaded"）。
+    _probe_gen: int = 0
     _logged_running: bool = False
     # Provenance / discovery
     _source: str = "spawned"                    # "spawned" | "adopted_local" | "adopted" | "unavailable"
@@ -2164,11 +2171,17 @@ class ComputeRegistry:
                 # load_handler 立即返回 {"status": "loading"} + npu_index
                 # (实际 init 在 worker 后台线程跑,~50-90s)。所以这里只需
                 # 等 RPC round-trip + cshim discovery grace,5 秒足够。
-                # 240s 旧值浪费且一旦超时浪费一整个 init cycle。
-                r = rpc_client.call(
-                    {"action": "load", "npu_index": npu_index},
-                    timeout_ms=5_000,
-                )
+                with inst._probe_lock:
+                    if rpc_client is None or inst.rpc_client is not rpc_client:
+                        return
+                    LOG.debug(
+                        "compute_registry: _run_load.call load model=%s "
+                        "npu=%d thread=%s",
+                        inst.model_id, npu_index, threading.get_ident())
+                    r = rpc_client.call(
+                        {"action": "load", "npu_index": npu_index},
+                        timeout_ms=5_000,
+                    )
                 data = (r or {}).get("data") or {}
                 if not (r or {}).get("ok"):
                     err_msg = (r or {}).get("error") or "RPC failed"
@@ -2283,6 +2296,11 @@ class ComputeRegistry:
                               f" (rc={rc})" if rc is not None else "")
             finally:
                 inst._bind_inflight = False
+                LOG.debug(
+                    "compute_registry: _run_load done model=%s npu=%d "
+                    "final_status=%s thread=%s",
+                    inst.model_id, npu_index, inst.status,
+                    threading.get_ident())
 
         threading.Thread(target=_run_load, daemon=True,
                          name=f"compute-bind-{inst.model_id}").start()
@@ -2304,15 +2322,28 @@ class ComputeRegistry:
         the next registry stop. The worker process (``inst.proc``) is
         preserved — re-enable rebuilds the Service via
         :meth:`_setup_rpc_client` in :meth:`bind_instance`.
+
+        v0.15 (compute_disable flicker fix): 两个协同防御避免 disable
+        期间 算力配置页 toggle 抖动 关闭→开启→关闭：
+        (1) 发 RPC 前乐观写 ``status="not_loaded"`` —— 1Hz 轮询在
+        RPC 期间（500-1000ms）也看到一致状态；
+        (2) ``_probe_gen += 1`` —— 失效 probe in-flight 的陈旧 ``r``，
+        避免覆盖乐观写。
         """
         inst = self._find_by_model(model_id)
         if inst is None:
             return
+        inst._probe_gen += 1  # 失效 in-flight probe 的 r
         if inst.rpc_client is not None:
+            with self._lock:
+                inst.status = "not_loaded"  # 乐观写,RPC 完成前保持
             try:
                 # unload_handler 立即返回 {"status": "unloaded"}。5s 足够。
-                inst.rpc_client.call(
-                    {"action": "unload"}, timeout_ms=5_000)
+                with inst._probe_lock:
+                    if inst.rpc_client is None:
+                        return
+                    inst.rpc_client.call(
+                        {"action": "unload"}, timeout_ms=5_000)
             except Exception as e:  # noqa: BLE001
                 LOG.warning("unload %s RPC failed: %s", model_id, e)
         with self._lock:
@@ -2337,12 +2368,18 @@ class ComputeRegistry:
         Raises ``RuntimeError`` if the instance is adopted (proc is
         None) — the caller (API layer) turns this into HTTP 403.
         """
+        t0 = time.time()
         inst = self._find_by_model(model_id)
         if inst is None:
             raise RuntimeError(f"{model_id} 不在 registry")
         if inst._source == "adopted":
             raise RuntimeError(
                 f"{model_id} 是远端 peer 提供的 service，本机无权停止")
+        inst._probe_gen += 1  # 同 unload_instance 理由
+        LOG.debug(
+            "compute_registry: stop_instance_local enter model=%s "
+            "source=%s thread=%s",
+            model_id, inst._source, threading.get_ident())
         try:
             self.unload_instance(model_id)
         except Exception as e:  # noqa: BLE001
@@ -2368,31 +2405,33 @@ class ComputeRegistry:
                 inst.rpc_session_proxy.close()
         except Exception:
             pass
+        # Defensive: ``unload_instance`` already cleared these; the
+        # locks below mirror _teardown_rpc_client in case of partial state.
         try:
-            if inst.rpc_client is not None:
-                inst.rpc_client.destroy()
+            with inst._probe_lock:
+                if inst.rpc_client is not None:
+                    inst.rpc_client.destroy()
+                    inst.rpc_client = None
         except Exception:
             pass
-        # Tear down the per-worker wdndds Service and remove it from
-        # the Hub's tracking dict. Without this, each enable→restart
-        # cycle leaks one Service (which pins DataReader + DataWriter
-        # + payload pool = ~60 MB of RSS in the main process), plus
-        # the dead Python Requester object stays in ``svc._requesters``
-        # holding its ``_c_keepalive_id`` slot forever.
         svc = getattr(inst, "_svc", None)
         if svc is not None:
             try:
-                svc_name = svc.name
-                hub = self._hub
-                if hub is not None:
-                    hub.destroy_service(svc_name)
+                with inst._probe_lock:
+                    svc_name = svc.name
+                    hub = self._hub
+                    if hub is not None:
+                        hub.destroy_service(svc_name)
+                inst._svc = None
             except Exception as e:  # noqa: BLE001
                 LOG.warning("stop: hub.destroy_service(%s) raised: %s",
                             model_id, e)
-            inst._svc = None
         with self._lock:
             self._instances.pop(inst.key, None)
-        LOG.info("stopped local worker for %s", model_id)
+        LOG.info(
+            "compute_registry: stop_instance_local exit model=%s "
+            "elapsed=%.2fs thread=%s",
+            model_id, time.time() - t0, threading.get_ident())
 
     def restart_instance_local(self, model_id: str) -> None:
         """Spawned-only 4-step restart (Q3 spec):
@@ -2501,6 +2540,10 @@ class ComputeRegistry:
         insts we keep the standard service name — there is no per-worker
         PID for a remote peer.
         """
+        LOG.debug(
+            "compute_registry: _setup_rpc_client enter model=%s "
+            "source=%s thread=%s",
+            inst.model_id, inst._source, threading.get_ident())
         hub = self._hub_or_raise()
         if inst._source == "spawned" and inst.proc is not None and inst.proc.pid:
             service_name = (
@@ -2574,33 +2617,46 @@ class ComputeRegistry:
 
         rpc = inst.rpc_client
         svc = getattr(inst, "_svc", None)
+        LOG.debug(
+            "compute_registry: _teardown_rpc_client enter model=%s "
+            "rpc_client=%s svc=%s source=%s thread=%s",
+            inst.model_id, rpc is not None, svc is not None,
+            inst._source, threading.get_ident())
         if rpc is not None:
-            try:
-                rpc.destroy()
-            except Exception as e:  # noqa: BLE001
-                LOG.debug("teardown[%s]: rpc_client.destroy raised: %s",
-                          inst.model_id, e)
-            # Drop the dead Requester from the Service's tracking list
-            # BEFORE tearing down the Service, so the Service's
-            # ``_requesters`` list goes to 0 (or stays at 0 if we're
-            # about to destroy the Service entirely).
-            if svc is not None:
-                try:
-                    svc.remove_requester(rpc)
-                except Exception as e:  # noqa: BLE001
-                    LOG.debug("teardown[%s]: svc.remove_requester raised: %s",
-                              inst.model_id, e)
+            # Clear Python handle BEFORE cshim destroy so any thread
+            # that passed the rpc_client truthy check sees AttributeError
+            # instead of deref'ing a freed cshim _native. The C-level
+            # UAF is closed by inst._probe_lock below.
             inst.rpc_client = None
+            with inst._probe_lock:
+                try:
+                    rpc.destroy()
+                except Exception as e:  # noqa: BLE001
+                    LOG.debug("teardown[%s]: rpc_client.destroy raised: %s",
+                              inst.model_id, e)
+                # Drop the dead Requester from the Service's tracking list
+                # BEFORE tearing down the Service, so the Service's
+                # ``_requesters`` list goes to 0 (or stays at 0 if we're
+                # about to destroy the Service entirely).
+                if svc is not None:
+                    try:
+                        svc.remove_requester(rpc)
+                    except Exception as e:  # noqa: BLE001
+                        LOG.debug("teardown[%s]: svc.remove_requester raised: %s",
+                                  inst.model_id, e)
 
         if svc is not None and inst._source != "adopted":
-            try:
-                svc_name = svc.name
-                hub = self._hub
-                if hub is not None:
-                    hub.destroy_service(svc_name)
-            except Exception as e:  # noqa: BLE001
-                LOG.warning("teardown[%s]: hub.destroy_service raised: %s",
-                            inst.model_id, e)
+            # Same lock for Service destroy: prevents probe mid-call
+            # from racing with Service.destroy → Requester.destroy.
+            with inst._probe_lock:
+                try:
+                    svc_name = svc.name
+                    hub = self._hub
+                    if hub is not None:
+                        hub.destroy_service(svc_name)
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning("teardown[%s]: hub.destroy_service raised: %s",
+                                inst.model_id, e)
             inst._svc = None
         elif svc is not None:
             # adopted (LAN peer): keep Service; just clear our handle
@@ -2609,6 +2665,11 @@ class ComputeRegistry:
             inst._svc = None
 
         inst.llm_session = None
+        LOG.debug(
+            "compute_registry: _teardown_rpc_client exit model=%s "
+            "rpc_client=%s svc=%s thread=%s",
+            inst.model_id, inst.rpc_client is not None,
+            inst._svc is not None, threading.get_ident())
 
     def _probe_service(self, model_id: str) -> Optional[dict]:
         """Short-timeout RPC ``info`` probe on ``wdndds/rpc/<model_id>``.
@@ -3252,6 +3313,10 @@ class ComputeRegistry:
         a worker sit in ``not_loaded`` until the user binds an NPU
         via the compute-config page (which can be arbitrarily late).
         """
+        LOG.debug(
+            "compute_registry: _probe_instance enter model=%s source=%s "
+            "status=%s thread=%s",
+            inst.model_id, inst._source, inst.status, threading.get_ident())
         consecutive_failures = 0
         try:
             while True:
@@ -3293,78 +3358,90 @@ class ComputeRegistry:
 
                 # Probe worker.
                 if inst.rpc_client is not None:
-                    try:
-                        r = inst.rpc_client.call(
-                            {"action": "info"}, timeout_ms=5000)
-                    except Exception as e:
-                        consecutive_failures += 1
-                        LOG.warning("info call failed for %s (%d): %s",
-                                   inst.model_id, consecutive_failures, e)
-                        # BrokenPipe 后 cshim 端 endpoint 已坏;重建 RpcClient
-                        # 让 cshim 重新走 endpoint 发现,可能命中别的健康 peer。
-                        old_svc = getattr(inst, "_svc", None)
-                        old_client = inst.rpc_client
+                    gen_at_call = inst._probe_gen  # 见 _probe_gen 注释
+                    with inst._probe_lock:
+                        if inst.rpc_client is None:
+                            continue
                         try:
-                            old_client.destroy()
-                        except Exception:
-                            pass
-                        # Drop the dead Requester from the Service's
-                        # tracking list BEFORE re-allocating, otherwise
-                        # ``Service._requesters`` grows unbounded on
-                        # every consecutive-failure rebuild and the
-                        # wedged cshim handle stays pinned in memory.
-                        if old_svc is not None:
+                            r = inst.rpc_client.call(
+                                {"action": "info"}, timeout_ms=5000)
+                        except Exception as e:
+                            consecutive_failures += 1
+                            LOG.warning("info call failed for %s (%d): %s",
+                                       inst.model_id, consecutive_failures, e)
+                            # BrokenPipe 后 cshim 端 endpoint 已坏;重建 RpcClient
+                            # 让 cshim 重新走 endpoint 发现,可能命中别的健康 peer。
+                            old_svc = getattr(inst, "_svc", None)
+                            old_client = inst.rpc_client
                             try:
-                                old_svc.remove_requester(old_client)
+                                old_client.destroy()
                             except Exception:
                                 pass
-                        # v0.14.3: also destroy the old Service so the
-                        # cshim payload pool doesn't pin in hub._services
-                        # on every consecutive-failure rebuild. The new
-                        # ``_setup_rpc_client`` call will create a fresh
-                        # Service with the same name. adopted (LAN peer)
-                        # is excluded — see _teardown_rpc_client for why.
-                        if old_svc is not None and inst._source != "adopted":
+                            # Drop the dead Requester from the Service's
+                            # tracking list BEFORE re-allocating, otherwise
+                            # ``Service._requesters`` grows unbounded on
+                            # every consecutive-failure rebuild and the
+                            # wedged cshim handle stays pinned in memory.
+                            if old_svc is not None:
+                                try:
+                                    old_svc.remove_requester(old_client)
+                                except Exception:
+                                    pass
+                            # v0.14.3: also destroy the old Service so the
+                            # cshim payload pool doesn't pin in hub._services
+                            # on every consecutive-failure rebuild. The new
+                            # ``_setup_rpc_client`` call will create a fresh
+                            # Service with the same name. adopted (LAN peer)
+                            # is excluded — see _teardown_rpc_client for why.
+                            if old_svc is not None and inst._source != "adopted":
+                                try:
+                                    svc_name = old_svc.name
+                                    hub = self._hub
+                                    if hub is not None:
+                                        hub.destroy_service(svc_name)
+                                except Exception as svc_e:  # noqa: BLE001
+                                    LOG.warning(
+                                        "probe-rebuild: hub.destroy_service"
+                                        "(%s) raised: %s",
+                                        inst.model_id, svc_e)
                             try:
-                                svc_name = old_svc.name
-                                hub = self._hub
-                                if hub is not None:
-                                    hub.destroy_service(svc_name)
-                            except Exception as svc_e:  # noqa: BLE001
+                                self._setup_rpc_client(inst)
+                                LOG.info("rebuilt rpc_client for %s after "
+                                         "%d consecutive failures",
+                                         inst.model_id, consecutive_failures)
+                            except Exception as setup_e:
+                                LOG.warning("rpc_client rebuild failed for "
+                                            "%s: %s",
+                                            inst.model_id, setup_e)
+                            # For adopted (远端 peer): after several consecutive
+                            # failures we conclude the peer is gone. adopted_local
+                            # 跟 spawned 一样不算（它们是本机孤儿，不存在 "peer
+                            # 失联" 的概念）。
+                            if (inst._source == "adopted"
+                                    and consecutive_failures >= _PEER_LOST_CONSECUTIVE_FAILURES
+                                    and inst.status != "error"):
+                                with self._lock:
+                                    inst.status = "error"
+                                    inst.error = "peer 已失联"
                                 LOG.warning(
-                                    "probe-rebuild: hub.destroy_service"
-                                    "(%s) raised: %s",
-                                    inst.model_id, svc_e)
-                        try:
-                            self._setup_rpc_client(inst)
-                            LOG.info("rebuilt rpc_client for %s after "
-                                     "%d consecutive failures",
-                                     inst.model_id, consecutive_failures)
-                        except Exception as setup_e:
-                            LOG.warning("rpc_client rebuild failed for "
-                                        "%s: %s",
-                                        inst.model_id, setup_e)
-                        # For adopted (远端 peer): after several consecutive
-                        # failures we conclude the peer is gone. adopted_local
-                        # 跟 spawned 一样不算（它们是本机孤儿，不存在 "peer
-                        # 失联" 的概念）。
-                        if (inst._source == "adopted"
-                                and consecutive_failures >= _PEER_LOST_CONSECUTIVE_FAILURES
-                                and inst.status != "error"):
-                            with self._lock:
-                                inst.status = "error"
-                                inst.error = "peer 已失联"
-                            LOG.warning(
-                                "adopted peer %s lost (consecutive "
-                                "RPC failures=%d)",
-                                inst.model_id, consecutive_failures)
-                        time.sleep(2.0)
-                        continue
+                                    "adopted peer %s lost (consecutive "
+                                    "RPC failures=%d)",
+                                    inst.model_id, consecutive_failures)
+                            time.sleep(2.0)
+                            continue
                     if not r.get("ok"):
                         consecutive_failures += 1
                         time.sleep(1.0)
                         continue
                     consecutive_failures = 0
+                    # 失效检测:unload/stop 在我们 in-flight 期间 bump 了 gen,
+                    # ``r`` 陈旧,跳过 status 写回（保留 unload 乐观写的 "not_loaded"）。
+                    if inst._probe_gen != gen_at_call:
+                        LOG.debug(
+                            "compute_registry: _probe_instance %s "
+                            "skipping stale r (gen %d→%d during in-flight)",
+                            inst.model_id, gen_at_call, inst._probe_gen)
+                        continue
                     data = r.get("data") or {}
                     worker_status = data.get("status", "not_loaded")
                     # 每轮都把 worker 报告的 model_dir 缓存到实例上——
@@ -3454,6 +3531,11 @@ class ComputeRegistry:
             with self._lock:
                 inst.status = "error"
                 inst.error = f"probe crashed: {type(e).__name__}: {e}"
+        finally:
+            LOG.debug(
+                "compute_registry: _probe_instance exit model=%s "
+                "final_status=%s thread=%s",
+                inst.model_id, inst.status, threading.get_ident())
 
     def _persist(self) -> None:
         """No-op stub kept for backward compat with older call sites.
