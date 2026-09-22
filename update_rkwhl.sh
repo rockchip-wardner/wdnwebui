@@ -22,7 +22,21 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_SRC="$SCRIPT_DIR/.venv/src"
-PIP_TARGET=".venv/bin/python -m pip"
+
+# 必须先 activate venv：wdndds._build.py / wdnav._build_wdnav.py 在
+# 重建 .so 过程中可能 spawn 子进程调用 `python` / `pip`；未 activate
+# 时这些子进程会回退到系统 python（尤其 sudo / 非交互 shell 场景），
+# 导致 whl 装到系统 site-packages 而非 .venv，并触发 Debian PEP 668
+# "externally-managed-environment" 报错。activate 后 `python` 锁定到
+# venv，`python -m pip` 走 venv site-packages，路径可预测。
+if [ ! -f "$SCRIPT_DIR/.venv/bin/activate" ]; then
+    echo "ERROR: 未找到 $SCRIPT_DIR/.venv/bin/activate，请先创建虚拟环境" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/.venv/bin/activate"
+
+PIP_TARGET="python -m pip"
 FORCE="${UPDATE_RKWHL_FORCE_REBUILD:-0}"
 
 update_pkg() {
