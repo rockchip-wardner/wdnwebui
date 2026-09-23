@@ -5,10 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>守望者系统演示</title>
   <link rel="stylesheet" href="/static/css/style.css" />
+  <link rel="stylesheet" href="/static/css/apps.css" />
+  <link rel="stylesheet" href="/static/css/sidebar.css" />
+  <link rel="stylesheet" href="/static/css/back-home.css" />
 </head>
 <body>
   <div class="layout">
     <aside class="sidebar">
+      <nav class="nav">
+      <a href="#system-monitor"  data-page="system-monitor"  class="nav-item nav-item--icon" data-icon="◉" title="系统信息" aria-label="系统信息">系统信息</a>
+      <a href="#base-config"     data-page="base-config"     class="nav-item nav-item--icon" data-icon="⚙" title="系统配置" aria-label="系统配置">系统配置</a>
+      <a href="#compute-config"  data-page="compute-config"  class="nav-item nav-item--icon" data-icon="⚡" title="算力配置" aria-label="算力配置">算力配置</a>
+      <a href="#discovery"       data-page="discovery"       class="nav-item nav-item--icon" data-icon="☷" title="注册发现" aria-label="注册发现">注册发现</a>
+      <a href="#im-bridge"       data-page="im-bridge"       class="nav-item nav-item--icon" data-icon="⇄" title="应用对接" aria-label="应用对接">应用对接</a>
+      <a href="#system-logs"     data-page="system-logs"     class="nav-item nav-item--icon" data-icon="☰" title="系统日志" aria-label="系统日志">系统日志</a>
+      </nav>
+
       <div class="brand">
         <span class="brand-title">守望者系统演示</span>
         <div class="brand-meta" tabindex="0" aria-label="组件版本">
@@ -30,23 +42,6 @@
           </div>
         </div>
       </div>
-      <nav class="nav">
-      <div class="nav-section-label">应用演示</div>
-      <a href="#video-detection"      data-page="video-detection"      class="nav-item nav-item--demo" data-icon="▶">音视频描述</a>
-      <a href="#video-target-detection" data-page="video-target-detection" class="nav-item nav-item--demo" data-icon="◎">视频目标检测</a>
-      <a href="#video-target-localization" data-page="video-target-localization" class="nav-item nav-item--demo" data-icon="⌖">视频目标定位</a>
-      <a href="#video-content-search" data-page="video-content-search" class="nav-item nav-item--demo" data-icon="⌕">视频内容检索</a>
-      <a href="#video-file-analysis"  data-page="video-file-analysis"  class="nav-item nav-item--demo" data-icon="⏏">视频文件分析</a>
-      <a href="#tts"                  data-page="tts"                  class="nav-item nav-item--demo" data-icon="♪">语音生成</a>
-      <a href="#text-chat"            data-page="text-chat"            class="nav-item nav-item--demo" data-icon="✎">文本对话</a>
-      <hr class="nav-divider" />
-      <a href="#system-monitor"  data-page="system-monitor"  class="nav-item">系统信息</a>
-      <a href="#base-config"     data-page="base-config"     class="nav-item">系统配置</a>
-      <a href="#compute-config"  data-page="compute-config"  class="nav-item">算力配置</a>
-      <a href="#discovery"       data-page="discovery"       class="nav-item">注册发现</a>
-      <a href="#im-bridge"       data-page="im-bridge"       class="nav-item">应用对接</a>
-      <a href="#system-logs"     data-page="system-logs"     class="nav-item">系统日志</a>
-      </nav>
 
       <div class="sidebar-foot">
         <button class="power-btn" id="power-btn" type="button"
@@ -131,7 +126,40 @@
         </span>
       </div>
 
-      <section id="page-system-monitor"  class="page" data-page="system-monitor">
+      <section id="page-apps" class="page" data-page="apps">
+        <div class="apps-grid">
+          <a href="#video-detection" class="app-card" data-page="video-detection">
+            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <h2 class="app-card-title">音视频描述</h2>
+          </a>
+          <a href="#video-target-detection" class="app-card" data-page="video-target-detection">
+            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <h2 class="app-card-title">视频目标检测</h2>
+          </a>
+          <a href="#video-target-localization" class="app-card" data-page="video-target-localization">
+            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <h2 class="app-card-title">视频目标定位</h2>
+          </a>
+          <a href="#video-content-search" class="app-card" data-page="video-content-search">
+            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <h2 class="app-card-title">视频内容检索</h2>
+          </a>
+          <a href="#video-file-analysis" class="app-card" data-page="video-file-analysis">
+            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <h2 class="app-card-title">视频文件分析</h2>
+          </a>
+          <a href="#tts" class="app-card" data-page="tts">
+            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <h2 class="app-card-title">语音生成</h2>
+          </a>
+          <a href="#text-chat" class="app-card" data-page="text-chat">
+            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <h2 class="app-card-title">文本对话</h2>
+          </a>
+        </div>
+      </section>
+
+      <section id="page-system-monitor"  class="page hidden" data-page="system-monitor">
         <header class="page-header">
           <h2>系统信息</h2>
           <div class="header-meta">
@@ -1684,5 +1712,7 @@
   </div>
 
   <script src="/static/js/app.js?v=59" defer></script>
+  <script src="/static/js/base.js" defer></script>
+  <script src="/static/js/apps.js" defer></script>
 </body>
 </html>

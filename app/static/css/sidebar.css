@@ -1,0 +1,90 @@
+/* sidebar.css — 侧栏 hover 折叠 + nav 图标 */
+
+.sidebar {
+  /* 240 × 0.85 = 204px */
+  width: 204px;
+  transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.sidebar.collapsed {
+  width: 64px;
+}
+
+/* brand 与 sidebar-foot：收起时不可见，展开时延迟到 width 完成再渐入 */
+.sidebar > .brand {
+  border-bottom: none;
+  padding-bottom: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.sidebar > .brand,
+.sidebar > .sidebar-foot {
+  transition: opacity 0.2s 0.3s;
+}
+
+.sidebar.collapsed > .brand,
+.sidebar.collapsed > .sidebar-foot {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0s 0s;
+}
+
+/* nav 始终可见：HTML 顺序 nav → brand → foot，nav 距 sidebar 顶 0px */
+.sidebar > .nav {
+  transition: opacity 0.2s ease;
+}
+
+.sidebar.collapsed > .nav {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* nav-item 固定高度 44px 让展开 / 收起位置一致 */
+.nav-item {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  box-sizing: border-box;
+}
+
+/* nav-item--icon：渲染 data-icon 属性作为前缀图标。
+ * font-size 切换延迟到 width transition 完成才生效，避免中间帧换行。 */
+.nav-item--icon {
+  position: relative;
+  transition: font-size 0s 0.3s;
+}
+
+.nav-item--icon::before {
+  content: attr(data-icon);
+  display: inline-block;
+  width: 1.5em;
+  margin-right: 0.6rem;
+  text-align: center;
+  font-size: 1rem;
+  opacity: 0.9;
+  font-style: normal;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.sidebar.collapsed .nav-item--icon {
+  padding-left: 0.75rem;
+  padding-right: 0.75rem;
+  font-size: 0;
+  justify-content: center;
+  transition: font-size 0s 0s;
+}
+
+.sidebar.collapsed .nav-item--icon::before {
+  margin-right: 0;
+  font-size: 1.25rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .sidebar > .brand,
+  .sidebar > .nav,
+  .sidebar > .sidebar-foot {
+    transition: none;
+  }
+}

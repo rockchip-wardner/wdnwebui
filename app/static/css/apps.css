@@ -1,0 +1,91 @@
+/* apps.css — 新首页（page-apps）样式
+ * 27 寸 4K macOS 默认（2560×1440）下最佳观看效果 */
+
+.page-apps {
+  padding: 32px 48px;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.apps-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 32px;
+  max-width: 2560px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+@media (max-width: 2048px) {
+  .apps-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 1280px) {
+  .apps-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.app-card {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  border-radius: 12px;
+  overflow: hidden;
+  background: transparent;
+  cursor: pointer;
+}
+
+.app-card-placeholder {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #f0f0f3;
+  border: 2px dashed #c8c8d0;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #9090a0;
+  font-size: 14px;
+  font-family: system-ui, -apple-system, sans-serif;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow: hidden;
+}
+
+.app-card:hover .app-card-placeholder {
+  transform: scale(1.03);
+}
+
+.app-card-title {
+  font-size: 48px;
+  font-weight: 600;
+  margin: 16px 0 0;
+  padding: 0 8px;
+  transition: color 0.2s ease;
+  text-align: left;
+  color: #111827;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+.app-card:hover .app-card-title {
+  color: #2563eb;
+}
+
+.app-card:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-card-placeholder,
+  .app-card-title {
+    transition: none;
+  }
+  .app-card:hover .app-card-placeholder {
+    transform: none;
+  }
+}
