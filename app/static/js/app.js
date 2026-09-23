@@ -1607,7 +1607,7 @@ function initVideoDetection() {
 }
 
 /* ------------------------------------------------------------------ *
- * 视频目标检测 (Video Target Detection) — TargetDoc 结构化输出           *
+ * 视频目标监控 (Video Target Detection) — TargetDoc 结构化输出           *
  * ------------------------------------------------------------------ *
  * 与音视频描述页 (`VD`) 结构一致；区别：                               *
  *   - API 前缀 `/api/video-target-detection/*`                         *
@@ -2086,7 +2086,7 @@ async function vtdEventsClear() {
   } catch (_) {}
 }
 
-// 视频目标检测页不再有工具集合概念 —— 模型直接返回
+// 视频目标监控页不再有工具集合概念 —— 模型直接返回
 // `TargetDoc` (x1, y1, x2, y2 + desc) 结构化输出，不挂任何
 // `@Callable` 工具。因此 ``vtdCollectEnabledTools`` / ``vtdLoadTools``
 // / ``renderVtdTools`` / ``updateVtdToolsSummary`` 已删除，原本调用
@@ -2184,7 +2184,7 @@ function initVideoTargetDetection() {
   if (evClearBtn)  evClearBtn.addEventListener("click",  vtdEventsClear);
 
   refreshVtdDetector();
-  // 视频目标检测页不再有工具集合概念，因此不再调用 ``vtdLoadTools()``。
+  // 视频目标监控页不再有工具集合概念，因此不再调用 ``vtdLoadTools()``。
   if (!VTD.ws && !VTD.wsTimer) connectVtdWs();
 }
 
@@ -4094,7 +4094,7 @@ function currentPage() {
 }
 
 /* ------------------------------------------------------------------ *
- *  DemoGuard: 演示页 (音视频描述 / 视频目标检测 / 视频内容检索 /     *
+ *  DemoGuard: 演示页 (音视频描述 / 视频目标监控 / 视频内容检索 /     *
  *  语音生成) 离开时的"必须关闭后台"守卫。                              *
  * ------------------------------------------------------------------ *
  *  三处入口：                                                          *
@@ -4245,7 +4245,7 @@ const DemoGuard = {
     if (!this.isActive(fromPage)) return "stop";
     const labels = {
       "video-detection":          "音视频描述",
-      "video-target-detection":   "视频目标检测",
+      "video-target-detection":   "视频目标监控",
       "video-target-localization":"视频目标定位",
       "video-content-search":     "视频内容检索",
       "video-file-analysis":      "视频文件分析",

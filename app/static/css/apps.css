@@ -11,7 +11,7 @@
 .apps-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 32px;
+  gap: 38.4px;
   max-width: 2560px;
   margin: 0 auto;
   width: 100%;
@@ -37,35 +37,45 @@
   overflow: hidden;
   background: transparent;
   cursor: pointer;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 首页暂时隐藏视频内容检索卡片（恢复只需移除此条） */
+.app-card[data-page="video-content-search"] {
+  display: none;
+}
+
+.app-card:hover {
+  transform: scale(1.03);
 }
 
 .app-card-placeholder {
+  position: relative;
   width: 100%;
   aspect-ratio: 16 / 9;
   background: #f0f0f3;
   border: 2px dashed #c8c8d0;
   border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #9090a0;
-  font-size: 14px;
-  font-family: system-ui, -apple-system, sans-serif;
-  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   overflow: hidden;
 }
 
-.app-card:hover .app-card-placeholder {
-  transform: scale(1.03);
+.app-card-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 1;
+  pointer-events: none;
 }
 
 .app-card-title {
   font-size: 48px;
   font-weight: 600;
-  margin: 16px 0 0;
+  margin: 8px 0 0;
   padding: 0 8px;
   transition: color 0.2s ease;
-  text-align: left;
+  text-align: center;
   color: #111827;
   word-break: keep-all;
   overflow-wrap: break-word;
@@ -81,11 +91,15 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .app-card-placeholder,
-  .app-card-title {
+  .app-card,
+  .app-card-title,
+  .app-card-video {
     transition: none;
   }
-  .app-card:hover .app-card-placeholder {
+  .app-card:hover {
     transform: none;
+  }
+  .app-card-video {
+    display: none;
   }
 }

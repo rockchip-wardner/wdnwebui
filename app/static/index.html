@@ -67,7 +67,7 @@
 
       <nav class="nav">
       <a href="#video-detection"          data-page="video-detection"            class="nav-item nav-item--icon" title="音视频描述" aria-label="音视频描述"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-play"/></svg><span class="nav-text">音视频描述</span></a>
-      <a href="#video-target-detection"   data-page="video-target-detection"     class="nav-item nav-item--icon" title="视频目标检测" aria-label="视频目标检测"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-bullseye"/></svg><span class="nav-text">视频目标检测</span></a>
+      <a href="#video-target-detection"   data-page="video-target-detection"     class="nav-item nav-item--icon" title="视频目标监控" aria-label="视频目标监控"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-bullseye"/></svg><span class="nav-text">视频目标监控</span></a>
       <a href="#video-target-localization" data-page="video-target-localization" class="nav-item nav-item--icon" title="视频目标定位" aria-label="视频目标定位"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-target"/></svg><span class="nav-text">视频目标定位</span></a>
       <a href="#video-content-search"     data-page="video-content-search"       class="nav-item nav-item--icon" title="视频内容检索" aria-label="视频内容检索"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-search"/></svg><span class="nav-text">视频内容检索</span></a>
       <a href="#video-file-analysis"      data-page="video-file-analysis"        class="nav-item nav-item--icon" title="视频文件分析" aria-label="视频文件分析"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-export"/></svg><span class="nav-text">视频文件分析</span></a>
@@ -190,31 +190,49 @@
       <section id="page-apps" class="page" data-page="apps">
         <div class="apps-grid">
           <a href="#video-detection" class="app-card" data-page="video-detection">
-            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <div class="app-card-placeholder">
+              <video class="app-card-video" autoplay muted playsinline preload="metadata" loop
+                     src="/static/videos/audio-video-description.mp4" aria-hidden="true"></video>
+            </div>
             <h2 class="app-card-title">音视频描述</h2>
           </a>
           <a href="#video-target-detection" class="app-card" data-page="video-target-detection">
-            <div class="app-card-placeholder"><span>截图待添加</span></div>
-            <h2 class="app-card-title">视频目标检测</h2>
+            <div class="app-card-placeholder">
+              <video class="app-card-video" autoplay muted playsinline preload="metadata" loop
+                     src="/static/videos/video-target-detection.mp4" aria-hidden="true"></video>
+            </div>
+            <h2 class="app-card-title">视频目标监控</h2>
           </a>
           <a href="#video-target-localization" class="app-card" data-page="video-target-localization">
-            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <div class="app-card-placeholder">
+              <video class="app-card-video" autoplay muted playsinline preload="metadata" loop
+                     src="/static/videos/video-target-localization.mp4" aria-hidden="true"></video>
+            </div>
             <h2 class="app-card-title">视频目标定位</h2>
           </a>
           <a href="#video-content-search" class="app-card" data-page="video-content-search">
-            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <div class="app-card-placeholder"></div>
             <h2 class="app-card-title">视频内容检索</h2>
           </a>
           <a href="#video-file-analysis" class="app-card" data-page="video-file-analysis">
-            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <div class="app-card-placeholder">
+              <video class="app-card-video" autoplay muted playsinline preload="metadata" loop
+                     src="/static/videos/video-file-analysis.mp4" aria-hidden="true"></video>
+            </div>
             <h2 class="app-card-title">视频文件分析</h2>
           </a>
           <a href="#tts" class="app-card" data-page="tts">
-            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <div class="app-card-placeholder">
+              <video class="app-card-video" autoplay muted playsinline preload="metadata" loop
+                     src="/static/videos/tts.mp4" aria-hidden="true"></video>
+            </div>
             <h2 class="app-card-title">语音生成</h2>
           </a>
           <a href="#text-chat" class="app-card" data-page="text-chat">
-            <div class="app-card-placeholder"><span>截图待添加</span></div>
+            <div class="app-card-placeholder">
+              <video class="app-card-video" autoplay muted playsinline preload="metadata" loop
+                     src="/static/videos/text-chat.mp4" aria-hidden="true"></video>
+            </div>
             <h2 class="app-card-title">文本对话</h2>
           </a>
         </div>
@@ -479,7 +497,7 @@
                 <textarea id="bc-prompts-vd-level" class="bc-input bc-textarea" rows="2" maxlength="4096"></textarea>
               </div>
             </div>
-            <h4>视频目标检测 (TargetDoc)</h4>
+            <h4>视频目标监控 (TargetDoc)</h4>
             <div class="bc-field">
               <label class="bc-label" for="bc-prompts-vtd-desc">desc 描述</label>
               <textarea id="bc-prompts-vtd-desc" class="bc-input bc-textarea" rows="3" maxlength="4096"></textarea>
@@ -852,7 +870,7 @@
 
       <section id="page-video-target-detection" class="page hidden" data-page="video-target-detection">
         <header class="page-header">
-          <h2>视频目标检测</h2>
+          <h2>视频目标监控</h2>
           <button class="refresh-btn" data-refresh>刷新</button>
         </header>
 

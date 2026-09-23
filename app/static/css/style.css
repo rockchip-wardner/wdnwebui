@@ -1160,7 +1160,7 @@ html, body {
   text-align: right;
 }
 
-/* 模型选择下拉框 — 三个消费者页面 (音视频描述 / 视频目标检测 /
+/* 模型选择下拉框 — 三个消费者页面 (音视频描述 / 视频目标监控 /
    音频理解) 共享同一控件:从 GET /api/compute/instances-by-capability
    拉 running 实例列表填充;空值 "自动" 走服务端 auto-pick。 */
 .vd-model-pick-row {
@@ -2422,7 +2422,7 @@ html, body {
  * 这种坑爹情况一眼能看出来。 */
 .cc-model.is-running { border-color: #16a34a; }
 /* ready_lazy: 进程已起、模型未加载 —— 浅蓝边，提醒用户"实例就绪但未加载"。
-   首次推理（视频检测/视频目标检测/...）触发实际 LLMSession init。 */
+   首次推理（视频检测/视频目标监控/...）触发实际 LLMSession init。 */
 .cc-model.is-ready-lazy {
   border-color: #38bdf8;
   background: rgba(56, 189, 248, 0.04);
@@ -3547,9 +3547,9 @@ html, body {
   display: none;        /* 一行 4 个时省空间，desc 保留在 hint 里 */
 }
 
-/* ---------- tools (音视频描述 + 视频目标检测) ---------- */
+/* ---------- tools (音视频描述 + 视频目标监控) ---------- */
 
-/* ---- 视频目标检测 TargetDoc 事件 —— 浮动窗 + 历史缩略图 ---- */
+/* ---- 视频目标监控 TargetDoc 事件 —— 浮动窗 + 历史缩略图 ---- */
 .vtd-crop-popup {
   position: absolute;
   right: 16px;

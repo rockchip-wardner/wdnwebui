@@ -23,6 +23,10 @@ output.wav
 .*.swp
 .*.swo
 
+# 仓库根临时目录（开发期素材 / 未成品，不入仓）
+/tmp/
+.tmp/
+
 # opencode-ai CLI 工具依赖（与项目无关）
 package.json
 package-lock.json
