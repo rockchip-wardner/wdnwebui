@@ -12,13 +12,74 @@
 <body>
   <div class="layout">
     <aside class="sidebar">
+      <!-- SVG sprite（13 个 nav-icon，统一 viewBox 24×24，颜色继承 currentColor） -->
+      <svg class="icon-sprite" aria-hidden="true" focusable="false">
+        <symbol id="i-app-play" viewBox="0 0 24 24"><path d="M5 3v18l16-9z"/></symbol>
+        <symbol id="i-app-bullseye" viewBox="0 0 24 24">
+          <path d="M12 1a11 11 0 100 22 11 11 0 000-22zm0 4a7 7 0 110 14 7 7 0 010-14zm0 3a4 4 0 110 8 4 4 0 010-8zm0 3a1 1 0 110 2 1 1 0 010-2z"/>
+        </symbol>
+        <symbol id="i-app-target" viewBox="0 0 24 24">
+          <path d="M12 2v3M12 19v3M2 12h3M19 12h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="12" cy="12" r="7" fill="none" stroke="currentColor" stroke-width="2"/>
+          <circle cx="12" cy="12" r="2.5"/>
+        </symbol>
+        <symbol id="i-app-search" viewBox="0 0 24 24">
+          <circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="2"/>
+          <path d="M15.5 15.5L21 21" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+        </symbol>
+        <symbol id="i-app-export" viewBox="0 0 24 24">
+          <path d="M12 4v11M7 9l5-5 5 5"/>
+          <path d="M4 17h16v3H4z"/>
+        </symbol>
+        <symbol id="i-app-mic" viewBox="0 0 24 24">
+          <rect x="9" y="2" width="6" height="12" rx="3"/>
+          <path d="M5 12c0 4 3 7 7 7s7-3 7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <path d="M12 19v4M8 23h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </symbol>
+        <symbol id="i-app-chat" viewBox="0 0 24 24">
+          <path d="M3 4h18v14H8l-5 4z"/>
+        </symbol>
+        <symbol id="i-sys-info" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/>
+          <path d="M12 12l4-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="12" cy="12" r="1.5"/>
+        </symbol>
+        <symbol id="i-sys-config" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a6.983 6.983 0 010 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.957 6.957 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.902 6.902 0 01-.22-.127c-.325-.196-.72-.257-1.075-.124l-1.217.456a1.125 1.125 0 01-1.37-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.429-.992a6.992 6.992 0 010-.254c.008-.378-.137-.75-.43-.992l-1.003-.827a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </symbol>
+        <symbol id="i-sys-compute" viewBox="0 0 24 24">
+          <path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/>
+        </symbol>
+        <symbol id="i-sys-discovery" viewBox="0 0 24 24">
+          <circle cx="6" cy="6" r="2.5"/>
+          <circle cx="18" cy="6" r="2.5"/>
+          <circle cx="12" cy="18" r="2.5"/>
+          <path d="M8 6h8M7.5 7.5l4 9M16.5 7.5l-4 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </symbol>
+        <symbol id="i-sys-bridge" viewBox="0 0 24 24">
+          <path d="M3 8h14M14 5l3 3-3 3M21 16H7M7 13l-3 3 3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </symbol>
+        <symbol id="i-sys-logs" viewBox="0 0 24 24">
+          <path d="M4 6h16M4 12h16M4 18h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </symbol>
+      </svg>
+
       <nav class="nav">
-      <a href="#system-monitor"  data-page="system-monitor"  class="nav-item nav-item--icon" data-icon="◉" title="系统信息" aria-label="系统信息">系统信息</a>
-      <a href="#base-config"     data-page="base-config"     class="nav-item nav-item--icon" data-icon="⚙" title="系统配置" aria-label="系统配置">系统配置</a>
-      <a href="#compute-config"  data-page="compute-config"  class="nav-item nav-item--icon" data-icon="⚡" title="算力配置" aria-label="算力配置">算力配置</a>
-      <a href="#discovery"       data-page="discovery"       class="nav-item nav-item--icon" data-icon="☷" title="注册发现" aria-label="注册发现">注册发现</a>
-      <a href="#im-bridge"       data-page="im-bridge"       class="nav-item nav-item--icon" data-icon="⇄" title="应用对接" aria-label="应用对接">应用对接</a>
-      <a href="#system-logs"     data-page="system-logs"     class="nav-item nav-item--icon" data-icon="☰" title="系统日志" aria-label="系统日志">系统日志</a>
+      <a href="#video-detection"          data-page="video-detection"            class="nav-item nav-item--icon" title="音视频描述" aria-label="音视频描述"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-play"/></svg><span class="nav-text">音视频描述</span></a>
+      <a href="#video-target-detection"   data-page="video-target-detection"     class="nav-item nav-item--icon" title="视频目标检测" aria-label="视频目标检测"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-bullseye"/></svg><span class="nav-text">视频目标检测</span></a>
+      <a href="#video-target-localization" data-page="video-target-localization" class="nav-item nav-item--icon" title="视频目标定位" aria-label="视频目标定位"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-target"/></svg><span class="nav-text">视频目标定位</span></a>
+      <a href="#video-content-search"     data-page="video-content-search"       class="nav-item nav-item--icon" title="视频内容检索" aria-label="视频内容检索"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-search"/></svg><span class="nav-text">视频内容检索</span></a>
+      <a href="#video-file-analysis"      data-page="video-file-analysis"        class="nav-item nav-item--icon" title="视频文件分析" aria-label="视频文件分析"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-export"/></svg><span class="nav-text">视频文件分析</span></a>
+      <a href="#tts"                      data-page="tts"                        class="nav-item nav-item--icon" title="语音生成" aria-label="语音生成"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-mic"/></svg><span class="nav-text">语音生成</span></a>
+      <a href="#text-chat"                data-page="text-chat"                  class="nav-item nav-item--icon" title="文本对话" aria-label="文本对话"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-chat"/></svg><span class="nav-text">文本对话</span></a>
+      <hr class="nav-divider" />
+      <a href="#system-monitor"  data-page="system-monitor"  class="nav-item nav-item--icon" title="系统信息" aria-label="系统信息"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-info"/></svg><span class="nav-text">系统信息</span></a>
+      <a href="#base-config"     data-page="base-config"     class="nav-item nav-item--icon" title="系统配置" aria-label="系统配置"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-config"/></svg><span class="nav-text">系统配置</span></a>
+      <a href="#compute-config"  data-page="compute-config"  class="nav-item nav-item--icon" title="算力配置" aria-label="算力配置"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-compute"/></svg><span class="nav-text">算力配置</span></a>
+      <a href="#discovery"       data-page="discovery"       class="nav-item nav-item--icon" title="注册发现" aria-label="注册发现"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-discovery"/></svg><span class="nav-text">注册发现</span></a>
+      <a href="#im-bridge"       data-page="im-bridge"       class="nav-item nav-item--icon" title="应用对接" aria-label="应用对接"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-bridge"/></svg><span class="nav-text">应用对接</span></a>
+      <a href="#system-logs"     data-page="system-logs"     class="nav-item nav-item--icon" title="系统日志" aria-label="系统日志"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-logs"/></svg><span class="nav-text">系统日志</span></a>
       </nav>
 
       <div class="brand">

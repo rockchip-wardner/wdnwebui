@@ -47,37 +47,47 @@
   box-sizing: border-box;
 }
 
-/* nav-item--icon：渲染 data-icon 属性作为前缀图标。
- * font-size 切换延迟到 width transition 完成才生效，避免中间帧换行。 */
+/* nav-item--icon：内嵌 SVG 图标（sprite 定义见 index.html 顶部） */
 .nav-item--icon {
   position: relative;
-  transition: font-size 0s 0.3s;
 }
 
-.nav-item--icon::before {
-  content: attr(data-icon);
-  display: inline-block;
-  width: 1.5em;
+/* SVG sprite 仅供 <use> 引用，自身不可见 */
+.icon-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.nav-item--icon > .nav-icon {
+  width: 20px;
+  height: 20px;
   margin-right: 0.6rem;
-  text-align: center;
-  font-size: 1rem;
-  opacity: 0.9;
-  font-style: normal;
   flex-shrink: 0;
-  line-height: 1;
+  color: var(--sidebar-fg, #d1d5db);
+  fill: currentColor;
+}
+
+/* 文字收起时塌缩；展开延迟到 sidebar width 完成 */
+.nav-item--icon > .nav-text {
+  white-space: nowrap;
+  overflow: hidden;
+  max-width: 200px;
+  opacity: 1;
+  transition: max-width 0s 0.3s, opacity 0.2s 0.15s;
+}
+
+.sidebar.collapsed .nav-text {
+  max-width: 0;
+  opacity: 0;
+  transition: max-width 0s 0s, opacity 0s 0s;
 }
 
 .sidebar.collapsed .nav-item--icon {
   padding-left: 0.75rem;
   padding-right: 0.75rem;
-  font-size: 0;
   justify-content: center;
-  transition: font-size 0s 0s;
-}
-
-.sidebar.collapsed .nav-item--icon::before {
-  margin-right: 0;
-  font-size: 1.25rem;
 }
 
 @media (prefers-reduced-motion: reduce) {
