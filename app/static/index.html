@@ -12,32 +12,13 @@
 <body>
   <div class="layout">
     <aside class="sidebar">
-      <!-- SVG sprite（13 个 nav-icon，统一 viewBox 24×24，颜色继承 currentColor） -->
+      <!-- SVG sprite（7 个 nav-icon：1 个应用 + 6 个系统，统一 viewBox 24×24，颜色继承 currentColor） -->
       <svg class="icon-sprite" aria-hidden="true" focusable="false">
-        <symbol id="i-app-play" viewBox="0 0 24 24"><path d="M5 3v18l16-9z"/></symbol>
-        <symbol id="i-app-bullseye" viewBox="0 0 24 24">
-          <path d="M12 1a11 11 0 100 22 11 11 0 000-22zm0 4a7 7 0 110 14 7 7 0 010-14zm0 3a4 4 0 110 8 4 4 0 010-8zm0 3a1 1 0 110 2 1 1 0 010-2z"/>
-        </symbol>
-        <symbol id="i-app-target" viewBox="0 0 24 24">
-          <path d="M12 2v3M12 19v3M2 12h3M19 12h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          <circle cx="12" cy="12" r="7" fill="none" stroke="currentColor" stroke-width="2"/>
-          <circle cx="12" cy="12" r="2.5"/>
-        </symbol>
-        <symbol id="i-app-search" viewBox="0 0 24 24">
-          <circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="2"/>
-          <path d="M15.5 15.5L21 21" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
-        </symbol>
-        <symbol id="i-app-export" viewBox="0 0 24 24">
-          <path d="M12 4v11M7 9l5-5 5 5"/>
-          <path d="M4 17h16v3H4z"/>
-        </symbol>
-        <symbol id="i-app-mic" viewBox="0 0 24 24">
-          <rect x="9" y="2" width="6" height="12" rx="3"/>
-          <path d="M5 12c0 4 3 7 7 7s7-3 7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          <path d="M12 19v4M8 23h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-        </symbol>
-        <symbol id="i-app-chat" viewBox="0 0 24 24">
-          <path d="M3 4h18v14H8l-5 4z"/>
+        <symbol id="i-app-list" viewBox="0 0 24 24">
+          <path d="M4 6h16M4 12h16M4 18h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="20" cy="6" r="1.2" fill="currentColor"/>
+          <circle cx="20" cy="12" r="1.2" fill="currentColor"/>
+          <circle cx="18" cy="18" r="1.2" fill="currentColor"/>
         </symbol>
         <symbol id="i-sys-info" viewBox="0 0 24 24">
           <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/>
@@ -66,13 +47,7 @@
       </svg>
 
       <nav class="nav">
-      <a href="#video-detection"          data-page="video-detection"            class="nav-item nav-item--icon" title="音视频描述" aria-label="音视频描述"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-play"/></svg><span class="nav-text">音视频描述</span></a>
-      <a href="#video-target-detection"   data-page="video-target-detection"     class="nav-item nav-item--icon" title="视频目标监控" aria-label="视频目标监控"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-bullseye"/></svg><span class="nav-text">视频目标监控</span></a>
-      <a href="#video-target-localization" data-page="video-target-localization" class="nav-item nav-item--icon" title="视频目标定位" aria-label="视频目标定位"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-target"/></svg><span class="nav-text">视频目标定位</span></a>
-      <a href="#video-content-search"     data-page="video-content-search"       class="nav-item nav-item--icon" title="视频内容检索" aria-label="视频内容检索"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-search"/></svg><span class="nav-text">视频内容检索</span></a>
-      <a href="#video-file-analysis"      data-page="video-file-analysis"        class="nav-item nav-item--icon" title="视频文件分析" aria-label="视频文件分析"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-export"/></svg><span class="nav-text">视频文件分析</span></a>
-      <a href="#tts"                      data-page="tts"                        class="nav-item nav-item--icon" title="语音生成" aria-label="语音生成"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-mic"/></svg><span class="nav-text">语音生成</span></a>
-      <a href="#text-chat"                data-page="text-chat"                  class="nav-item nav-item--icon" title="文本对话" aria-label="文本对话"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-chat"/></svg><span class="nav-text">文本对话</span></a>
+      <a href="#apps" data-page="apps" class="nav-item nav-item--icon" title="应用列表" aria-label="应用列表"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-list"/></svg><span class="nav-text">应用列表</span></a>
       <hr class="nav-divider" />
       <a href="#system-monitor"  data-page="system-monitor"  class="nav-item nav-item--icon" title="系统信息" aria-label="系统信息"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-info"/></svg><span class="nav-text">系统信息</span></a>
       <a href="#base-config"     data-page="base-config"     class="nav-item nav-item--icon" title="系统配置" aria-label="系统配置"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-config"/></svg><span class="nav-text">系统配置</span></a>
@@ -199,7 +174,7 @@
           <a href="#video-target-detection" class="app-card" data-page="video-target-detection">
             <div class="app-card-placeholder">
               <video class="app-card-video" autoplay muted playsinline preload="metadata" loop
-                     src="/static/videos/video-target-detection.mp4" aria-hidden="true"></video>
+                     src="/static/videos/video-target-monitor.mp4" aria-hidden="true"></video>
             </div>
             <h2 class="app-card-title">视频目标监控</h2>
           </a>
