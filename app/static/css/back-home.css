@@ -30,6 +30,20 @@
   outline-offset: 2px;
 }
 
+/* "退出应用" 红框变体 —— 当前页活跃时由 base.js 切换 data-mode */
+.back-home-btn[data-mode="exit"] {
+  border-color: #ef4444;
+  color: #b91c1c;
+}
+.back-home-btn[data-mode="exit"]:hover {
+  background: #fef2f2;
+  border-color: #b91c1c;
+  color: #7f1d1d;
+}
+.back-home-btn[data-mode="exit"]:focus-visible {
+  outline-color: #ef4444;
+}
+
 .back-home-icon {
   font-size: 14px;
   display: inline-block;

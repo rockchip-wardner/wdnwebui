@@ -1428,6 +1428,15 @@ html, body {
   z-index: 60;
 }
 .dg-modal.hidden { display: none; }
+
+/* Modal 打开期间屏蔽 nav-item / app-card / 退出应用按钮 —— 防用户在 confirm 期间二次触发 */
+body.dg-modal-open .nav-item,
+body.dg-modal-open .app-card,
+body.dg-modal-open .back-home-btn {
+  pointer-events: none;
+  opacity: 0.6;
+  cursor: not-allowed;
+}
 .dg-modal-card {
   background: #fff;
   border-radius: 8px;

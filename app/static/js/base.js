@@ -50,41 +50,106 @@
     });
   }
 
-  /* 3. 注入「返回首页」按钮到所有非首页 */
+  /* 3. 注入"返回首页 / 退出应用"按钮到 demo 页（DemoGuard._registry 内）；
+   *    6 个系统设置页不再注入（UI 已删除）。文案按 _activeApp 切换：
+   *      当前页活跃 + 后端在跑 → "退出应用"（红框变体）；否则 "返回首页"。
+   */
   function _injectBackHome() {
-    document
-      .querySelectorAll(".page:not(#page-apps) .page-header")
-      .forEach((header) => {
-        if (header.querySelector(".back-home-btn")) return;
+    document.querySelectorAll(".back-home-btn").forEach((btn) => btn.remove());
+    if (typeof DemoGuard === "undefined") return;
 
-        /* 没有 .header-meta 时创建，把非标题子元素移进去；
-         * 让 page-header 保持 2 个 flex 项目（h2 + meta），
-         * space-between 对齐：h2 左 / meta 右，refresh 不再跑到中间。 */
-        let meta = header.querySelector(".header-meta");
-        if (!meta) {
-          meta = document.createElement("div");
-          meta.className = "header-meta";
-          Array.from(header.children).forEach((child) => {
-            if (!child.matches("h1, h2, h3, h4, h5")) meta.appendChild(child);
-          });
-          header.appendChild(meta);
-        }
+    DemoGuard._demoPages().forEach((page) => {
+      const pageEl = document.getElementById("page-" + page);
+      if (!pageEl) return;
+      const header = pageEl.querySelector(".page-header");
+      if (!header || header.querySelector(".back-home-btn")) return;
 
-        const back = document.createElement("a");
-        back.href = "#/";
-        back.className = "back-home-btn";
-        back.setAttribute("role", "button");
-        back.setAttribute("aria-label", "返回首页");
-        back.innerHTML =
-          '<span class="back-home-icon" aria-hidden="true">←</span> 返回首页';
-        meta.appendChild(back);
+      let meta = header.querySelector(".header-meta");
+      if (!meta) {
+        meta = document.createElement("div");
+        meta.className = "header-meta";
+        Array.from(header.children).forEach((child) => {
+          if (!child.matches("h1, h2, h3, h4, h5")) meta.appendChild(child);
+        });
+        header.appendChild(meta);
+      }
+
+      const back = document.createElement("a");
+      back.href = "#/";
+      back.className = "back-home-btn";
+      back.setAttribute("role", "button");
+      back.setAttribute("aria-label", "返回首页");
+      back.innerHTML =
+        '<span class="back-home-icon" aria-hidden="true">←</span> 返回首页';
+      meta.appendChild(back);
+
+      back.addEventListener("click", async (e) => {
+        if (typeof DemoGuard === "undefined") return;
+        if (!DemoGuard._isDemoPage(currentPage())) return;
+        if (!DemoGuard.isActive(currentPage())) return;
+        e.preventDefault();
+        const cur = currentPage();
+        await DemoGuard.stopAndClear(cur);
+        DemoGuard._keptPages.delete(cur);
+        DemoGuard._activeApp = null;
+        location.hash = "#/";
       });
+    });
+  }
+
+  /* 4. 应用面板按钮（sidebar 左上 .nav-item[data-page="apps"]）：
+   *    无活跃应用 → #/ ；有活跃应用 → 跳回该应用页。
+   */
+  function _wireAppsPanel() {
+    const appsNav = document.querySelector('.nav-item[data-page="apps"]');
+    if (!appsNav) return;
+    appsNav.addEventListener("click", (e) => {
+      if (typeof DemoGuard === "undefined") return;
+      e.preventDefault();
+      DemoGuard._refreshActive();
+      const target = DemoGuard._activeApp || "apps";
+      if (currentPage() === target) return;
+      location.hash = "#" + target;
+    });
+  }
+
+  /* 5. 退出应用 / 返回首页按钮文字 + data-mode 切换 */
+  function _updateBackHomeLabels() {
+    if (typeof DemoGuard === "undefined") return;
+    const cur = currentPage();
+    const isDemo = DemoGuard._isDemoPage(cur);
+    const active = DemoGuard.isActive(cur);
+    document.querySelectorAll(".back-home-btn").forEach((btn) => {
+      if (isDemo && active) {
+        btn.dataset.mode = "exit";
+        btn.setAttribute("aria-label", "退出应用");
+        btn.innerHTML =
+          '<span class="back-home-icon" aria-hidden="true">⏏</span> 退出应用';
+      } else if (btn.dataset.mode === "exit") {
+        btn.dataset.mode = "";
+        btn.setAttribute("aria-label", "返回首页");
+        btn.innerHTML =
+          '<span class="back-home-icon" aria-hidden="true">←</span> 返回首页';
+      }
+    });
   }
 
   function _onReady() {
     _initSidebar();
     _injectBackHome();
+    _wireAppsPanel();
+    _updateBackHomeLabels();
   }
+
+  window.addEventListener("hashchange", () => {
+    if (typeof DemoGuard === "undefined") return;
+    DemoGuard._refreshActive();
+    _updateBackHomeLabels();
+  });
+
+  window.addEventListener("demoguard:active-change", () => {
+    _updateBackHomeLabels();
+  });
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", _onReady);

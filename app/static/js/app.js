@@ -4105,6 +4105,17 @@ function currentPage() {
  * ------------------------------------------------------------------ */
 const DemoGuard = {
   _ACTIVE_STATES: ["opening", "playing", "paused", "eof"],
+  // 中文显示名（弹窗文案 / label 按钮用）。集中定义，避免 confirmLeave 与
+  // _confirmLeaveStopOnly 各自维护一份。
+  _labels: {
+    "video-detection":          "音视频描述",
+    "video-target-detection":   "视频目标监控",
+    "video-target-localization":"视频目标定位",
+    "video-content-search":     "视频内容检索",
+    "video-file-analysis":      "视频文件分析",
+    "tts":                      "语音生成",
+    "text-chat":                "文本对话",
+  },
 
   // 每页：判定 + 关闭（await 版，给 in-app 导航用）
   _registry: {
@@ -4192,14 +4203,52 @@ const DemoGuard = {
         } catch (_) { /* beforeunload path: best-effort */ }
       },
     },
+    "text-chat": {
+      // busy=true 即视为在跑（与 tts 同一组判定）
+      active(snap = {}) {
+        const s = snap.session || {};
+        return !!(s.busy === true || s.running === true ||
+                  s.state === "loading" || s.state === "running");
+      },
+      async stop() {
+        try {
+          await fetch(API_PREFIX + "/text-chat/stop", { method: "POST" });
+        } catch (_) { /* beforeunload path: best-effort */ }
+      },
+    },
   },
 
   // 各页模块主动 push 最新快照
   _cache: {},
   // 用户在导航弹窗里选了"保持后台运行"的页面 —— hashchange 兜底不要把它们 stop
   _keptPages: new Set(),
+  // 当前唯一活跃的应用（_registry 内的 key）；驱动"应用面板"智能跳转与退出应用按钮文案
+  _activeApp: null,
   report(page, snap) {
     this._cache[page] = snap || {};
+    this._refreshActive();
+  },
+
+  _demoPages() { return Object.keys(this._registry); },
+  _isDemoPage(p) {
+    return Object.prototype.hasOwnProperty.call(this._registry, p);
+  },
+  /** 扫 _registry 取第一个活跃页，更新 _activeApp；状态翻转时发 demoguard:active-change */
+  _refreshActive() {
+    let active = null;
+    for (const p of this._demoPages()) {
+      if (this.isActive(p)) { active = p; break; }
+    }
+    const prev = this._activeApp;
+    this._activeApp = active;
+    if (prev !== active) {
+      try {
+        window.dispatchEvent(new CustomEvent("demoguard:active-change", {
+          detail: { active, previous: prev },
+        }));
+      } catch (_) { /* old browser → ignore */ }
+    }
+    return active;
   },
 
   isActive(page) {
@@ -4227,6 +4276,7 @@ const DemoGuard = {
       "video-file-analysis": [[API_PREFIX + "/video-file-analysis/stop", "POST"]],
       "tts": [[API_PREFIX + "/tts/stop", "POST"]],
       "video-content-search": [[API_PREFIX + "/video-content-search/extract/stop", "POST"]],
+      "text-chat": [[API_PREFIX + "/text-chat/stop", "POST"]],
     };
     const urls = map[page] || [];
     const body = new Blob(["{}"], { type: "application/json" });
@@ -4243,15 +4293,7 @@ const DemoGuard = {
 
   async confirmLeave(fromPage) {
     if (!this.isActive(fromPage)) return "stop";
-    const labels = {
-      "video-detection":          "音视频描述",
-      "video-target-detection":   "视频目标监控",
-      "video-target-localization":"视频目标定位",
-      "video-content-search":     "视频内容检索",
-      "video-file-analysis":      "视频文件分析",
-      "tts":                      "语音生成",
-    };
-    const name = labels[fromPage] || fromPage;
+    const name = this._labels[fromPage] || fromPage;
     return new Promise((resolve) => {
       const modal = document.getElementById("dg-modal");
       const msgEl = document.getElementById("dg-modal-msg");
@@ -4259,6 +4301,7 @@ const DemoGuard = {
       const btnKeep = document.getElementById("dg-btn-keep");
       const btnCancel = document.getElementById("dg-btn-cancel");
       msgEl.textContent = `【${name}】后台正在运行。离开此页面将自动停止当前任务并释放算力。`;
+      btnKeep.style.display = "";
       modal.classList.remove("hidden");
       function cleanup() {
         modal.classList.add("hidden");
@@ -4266,6 +4309,7 @@ const DemoGuard = {
         btnKeep.removeEventListener("click", onKeep);
         btnCancel.removeEventListener("click", onCancel);
         modal.removeEventListener("click", onBg);
+        document.body.classList.remove("dg-modal-open");
       }
       function onStop()  { cleanup(); resolve("stop"); }
       function onKeep()  { cleanup(); resolve("keep"); }
@@ -4275,7 +4319,67 @@ const DemoGuard = {
       btnKeep.addEventListener("click", onKeep);
       btnCancel.addEventListener("click", onCancel);
       modal.addEventListener("click", onBg);
+      document.body.classList.add("dg-modal-open");
     });
+  },
+
+  /**
+   * 应用 → 应用切换：弹 2 按钮 modal（取消 / 停止并离开），隐藏"保持后台运行"
+   * resolve(true)=确认停止  resolve(false)=取消
+   */
+  async _confirmLeaveStopOnly(activePage) {
+    const name = this._labels[activePage] || activePage;
+    return new Promise((resolve) => {
+      const modal = document.getElementById("dg-modal");
+      const msgEl = document.getElementById("dg-modal-msg");
+      const btnStop = document.getElementById("dg-btn-stop");
+      const btnKeep = document.getElementById("dg-btn-keep");
+      const btnCancel = document.getElementById("dg-btn-cancel");
+      btnKeep.style.display = "none";
+      msgEl.textContent =
+        `【${name}】后台正在运行。打开其它应用将自动停止当前任务并释放算力。`;
+      modal.classList.remove("hidden");
+      function cleanup() {
+        modal.classList.add("hidden");
+        btnKeep.style.display = "";
+        btnStop.removeEventListener("click", onStop);
+        btnCancel.removeEventListener("click", onCancel);
+        modal.removeEventListener("click", onBg);
+        document.body.classList.remove("dg-modal-open");
+      }
+      function onStop()   { cleanup(); resolve(true); }
+      function onCancel() { cleanup(); resolve(false); }
+      function onBg(e)    { if (e.target === modal) onCancel(); }
+      btnStop.addEventListener("click", onStop);
+      btnCancel.addEventListener("click", onCancel);
+      modal.addEventListener("click", onBg);
+      document.body.classList.add("dg-modal-open");
+    });
+  },
+
+  /**
+   * 统一导航拦截入口（nav-item / app-card / 退出应用 / 应用面板均委托于此）
+   *   - 同页 / 无效目标 → no-op
+   *   - 有活跃 + 目标 demo 或 apps → 弹 2 按钮 modal（必须 stop）
+   *   - 有活跃 + 目标设置页 → 静默 keep（不弹框）
+   *   - 无活跃 → 直接 navigate
+   */
+  async navigate(from, to) {
+    if (!to || to === from) return "no-op";
+    this._refreshActive();
+    const active = this._activeApp;
+    const targetIsDemo = this._isDemoPage(to);
+    if (active && (targetIsDemo || to === "apps")) {
+      const ok = await this._confirmLeaveStopOnly(active);
+      if (!ok) return "no-op";
+      await this.stopAndClear(active);
+      this._keptPages.delete(active);
+      this._activeApp = null;
+    } else if (active && !targetIsDemo) {
+      this._keptPages.add(active);
+    }
+    location.hash = "#" + to;
+    return "ok";
   },
 
   // stop 后清理缓存，避免兜底 hashchange 监听把同一组 POST 再发一遍
@@ -4291,19 +4395,21 @@ document.querySelectorAll(".nav-item").forEach(a => {
     const target = a.dataset.page;
     const cur = currentPage();
     if (!target || target === cur) return;
-    if (!DemoGuard.isActive(cur)) return;
-    const decision = await DemoGuard.confirmLeave(cur);
-    if (decision === "cancel") {
-      e.preventDefault();
-      return;
-    }
+    // 应用面板按钮（data-page="apps"）由 base.js 独占处理；这里跳过避免双 handler 抢跑
+    if (target === "apps") return;
     e.preventDefault();
-    if (decision === "stop") {
-      await DemoGuard.stopAndClear(cur);
-    } else if (decision === "keep") {
-      DemoGuard._keptPages.add(cur);
-    }
-    location.hash = "#" + target;
+    await DemoGuard.navigate(cur, target);
+  });
+});
+
+// 首页 .app-card 也走统一拦截 —— 从 apps 页开新应用，如有后台在跑需先 stop
+document.querySelectorAll(".app-card").forEach(a => {
+  a.addEventListener("click", async (e) => {
+    const target = a.dataset.page;
+    const cur = currentPage();
+    if (!target || target === cur) return;
+    e.preventDefault();
+    await DemoGuard.navigate(cur, target);
   });
 });
 
@@ -8192,6 +8298,9 @@ const TextChat = {
   _applySnapshot(snap) {
     if (!snap) return;
     this.snapshot = Object.assign({}, this.snapshot || {}, snap);
+    if (typeof DemoGuard !== "undefined") {
+      DemoGuard.report("text-chat", { session: this.snapshot });
+    }
     this._renderState();
   },
 
