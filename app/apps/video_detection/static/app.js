@@ -860,4 +860,62 @@ function initVideoDetection() {
 
 initVideoDetection();
 
+// ------------------------------------------------------------------ *
+// 应用向导模式 API — wizard 框架 finish 时调用
+// 契约:opts 字段由 wizard.json 的 steps[].fields[].id 派生(去 app-id 前缀 + camelCase):
+//   vd-source       → opts.source
+//   vd-loop         → opts.loop
+//   vd-prompt       → opts.prompt
+//   vd-detect-size  → opts.detectSize
+//   vd-audio-prompt → opts.audioPrompt
+// 空字段不触发对应启动动作;失败抛 Error("WizardSnapshotError:<code>:<detail>")
+//   * open_source_failed    → wizard 回 source 步骤
+//   * detector_start_failed → wizard 弹"启动失败"提示
+//   * audio_start_failed    → wizard 弹"启动失败"提示
+// ------------------------------------------------------------------ *
+window.ImApp_vd = window.ImApp_vd || {};
+window.ImApp_vd.applyWizardSnapshot = async function (opts) {
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el != null) el.value = v; };
+  const setChk = (id, v) => { const el = document.getElementById(id); if (el != null) el.checked = !!v; };
+
+  // 1. 写回非空字段到表单(留给用户回看 + 应用自有 init 也用得到)
+  if (opts.source)      setVal("vd-source", opts.source);
+  if (opts.loop != null) setChk("vd-loop", opts.loop);
+  if (opts.prompt)      setVal("vd-prompt", opts.prompt);
+  if (opts.detectSize)  setVal("vd-detect-size", opts.detectSize);
+  if (opts.audioPrompt) setVal("vd-audio-prompt", opts.audioPrompt);
+
+  const result = { source_opened: false, detector_started: false, audio_started: false };
+
+  // 2. 打开视频源(仅 source 非空)
+  if (opts.source) {
+    try {
+      await vdOpen({ source: opts.source, loop: !!opts.loop });
+      result.source_opened = true;
+    } catch (e) {
+      throw new Error("WizardSnapshotError:open_source_failed:" + (e?.message || e));
+    }
+  }
+
+  // 3. 启动检测(仅 prompt 非空)— 模拟点击原应用页面的"启动检测"按钮
+  if (opts.prompt) {
+    const btn = document.getElementById("vd-detector-start");
+    if (btn) {
+      try { btn.click(); result.detector_started = true; }
+      catch (e) { throw new Error("WizardSnapshotError:detector_start_failed:" + (e?.message || e)); }
+    }
+  }
+
+  // 4. 启动音频理解(仅 audioPrompt 非空)
+  if (opts.audioPrompt) {
+    const btn = document.getElementById("vd-audio-start");
+    if (btn) {
+      try { btn.click(); result.audio_started = true; }
+      catch (e) { throw new Error("WizardSnapshotError:audio_start_failed:" + (e?.message || e)); }
+    }
+  }
+
+  return result;
+};
+
 })();

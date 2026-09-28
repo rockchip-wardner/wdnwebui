@@ -1,0 +1,39 @@
+{
+  "enabled": true,
+  "wizard_title": "音视频描述快速配置",
+  "swcap_to_model": {
+    "swcap_video_describe":   { "npu_index": 0, "model_id": "qwen3.5-vl-4b" },
+    "swcap_audio_understand": { "npu_index": 1, "model_id": "qwen2.5-omni-3b" }
+  },
+  "open_source_button": "vd-open",
+  "start_buttons": ["vd-detector-start", "vd-audio-start"],
+  "steps": [
+    { "id": "env",    "title": "运行环境检查",           "kind": "env_check" },
+    { "id": "source", "title": "视频源",                 "kind": "form",
+      "fields": [
+        { "id": "vd-source", "ui_key": "source", "label": "视频源 URL / 路径" },
+        { "id": "vd-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox" }
+      ]
+    },
+    { "id": "detect", "title": "检测提示词 + 检测尺寸",  "kind": "form",
+      "fields": [
+        { "id": "vd-prompt",      "ui_key": "prompt",     "label": "检测提示词", "type": "textarea",
+          "placeholder": "例:用中文简洁描述画面,包括场景、人物、动作和环境。" },
+        { "id": "vd-detect-size", "ui_key": "detectSize", "label": "检测尺寸",   "type": "select",
+          "options": [
+            { "value": "auto", "label": "自动选择",     "selected": true },
+            { "value": "384",  "label": "384x384 (更快)" },
+            { "value": "768",  "label": "768x768 (更准)" }
+          ]
+        }
+      ]
+    },
+    { "id": "audio",  "title": "音频理解提示词",          "kind": "form",
+      "fields": [
+        { "id": "vd-audio-prompt", "ui_key": "audioPrompt", "label": "音频理解提示词", "type": "textarea",
+          "placeholder": "例:请转写这段音频里的人在说什么 / 描述音频中的环境音" }
+      ]
+    },
+    { "id": "finish", "title": "完成配置",                "kind": "finish" }
+  ]
+}
