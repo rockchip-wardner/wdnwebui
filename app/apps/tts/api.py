@@ -106,14 +106,14 @@ async def tts_history() -> dict:
 async def tts_output(path: str) -> FileResponse:
     """Stream the WAV the most recent (or any historical) run wrote.
 
-    Constrained to the service's own ``uploads/`` directory so this
-    endpoint can't be turned into an arbitrary-file proxy. The path is
-    canonicalised and must resolve under ``app/services/uploads/``."""
+    Constrained to the card's ``uploads/`` directory so this endpoint
+    can't be turned into an arbitrary-file proxy. The path is
+    canonicalised and must resolve under ``app/uploads/tts/``."""
     if not path:
         raise HTTPException(status_code=400, detail="path 必填")
 
-    uploads_root = (Path(__file__).resolve().parent.parent /
-                    "services" / "uploads").resolve()
+    from app.core.uploads import get_card_uploads_root
+    uploads_root = get_card_uploads_root("tts").resolve()
     target = Path(path).resolve()
     try:
         target.relative_to(uploads_root)

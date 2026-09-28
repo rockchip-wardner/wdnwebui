@@ -838,10 +838,10 @@ class TtsSession:
         return self.snapshot()
 
     def _default_output_path(self) -> Path:
-        here = Path(__file__).resolve().parent
-        up = here / "uploads"
-        up.mkdir(parents=True, exist_ok=True)
-        return up / f"tts-{int(time.time())}.wav"
+        # 写盘路径用 core helper 统一:``app/uploads/tts/``(共享约定)。
+        # 跟 ``api.tts_output`` 的 ``uploads_root`` 校验对齐。
+        from app.core.uploads import get_card_uploads_root
+        return get_card_uploads_root("tts") / f"tts-{int(time.time())}.wav"
 
     def stop(self) -> dict:
         with self._lock:
