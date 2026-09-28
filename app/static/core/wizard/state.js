@@ -376,6 +376,8 @@
   // Finish — applyWizardSnapshot + wait for models running
   // ------------------------------------------------------------------ #
   async function _finish(state) {
+    window._dbg_finish_called = (window._dbg_finish_called || 0) + 1;
+    window._dbg_finish_state = state ? "alive" : "null";
     const { app, cfg } = state;
     _captureValues(cfg, state);
 
@@ -396,6 +398,7 @@
       window._wd_wizard_state_values = JSON.parse(JSON.stringify(state.values));
       window._wd_wizard_cfg_first_step = JSON.stringify(cfg.steps[0]).slice(0, 200);
       window._wd_wizard_cfg_source = JSON.stringify(cfg.steps.find(s => s.id === "source") || {}).slice(0, 500);
+      window._dbg_finish_opts_keys = Object.keys(opts);
     } catch (_) {}
 
     // 2. wait for models running (if swcap_to_model 声明了)

@@ -75,12 +75,12 @@
 (也可以插在 `display_order` 之前,顺序不重要;只要存在此字段,wizard 框架就会挂载)
 
 ### 1.3 改 `app/apps/video_detection/static/app.js`(末尾追加)
-在 IIFE 末尾(已有 `window.ImApp_vd = ...` 暴露的代码块附近)加:
+在 IIFE 末尾加(全局名固定 `ImApp_<app.id 去掉 hyphen>`—— wizard 按这个约定查找):
 ```js
 // ---------- 应用向导模式 API ----------
 // wizard 框架在 finish 时调;空字段不触发对应启动动作
-window.ImApp_vd = window.ImApp_vd || {};
-window.ImApp_vd.applyWizardSnapshot = async function (opts) {
+window.ImApp_video_detection = window.ImApp_video_detection || {};
+window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
   const result = { source_opened: false, detector_started: false, audio_started: false };
   const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
   const setChk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };

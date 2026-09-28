@@ -862,7 +862,7 @@ initVideoDetection();
 
 // ------------------------------------------------------------------ *
 // 应用向导模式 API — wizard 框架 finish 时调用
-// 契约:opts 字段由 wizard.json 的 steps[].fields[].id 派生(去 app-id 前缀 + camelCase):
+// 契约:opts 字段由 wizard.json 的 steps[].fields[].id 派生(显式 ui_key 决定):
 //   vd-source       → opts.source
 //   vd-loop         → opts.loop
 //   vd-prompt       → opts.prompt
@@ -872,9 +872,11 @@ initVideoDetection();
 //   * open_source_failed    → wizard 回 source 步骤
 //   * detector_start_failed → wizard 弹"启动失败"提示
 //   * audio_start_failed    → wizard 弹"启动失败"提示
+// 全局名固定为 ImApp_<app_id 去掉 hyphen>—— wizard 按这个约定查找,
+//   后续 7 张卡片向导统一沿用同约定(ImApp_video_target_detection 等)。
 // ------------------------------------------------------------------ *
-window.ImApp_vd = window.ImApp_vd || {};
-window.ImApp_vd.applyWizardSnapshot = async function (opts) {
+window.ImApp_video_detection = window.ImApp_video_detection || {};
+window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
   const setVal = (id, v) => { const el = document.getElementById(id); if (el != null) el.value = v; };
   const setChk = (id, v) => { const el = document.getElementById(id); if (el != null) el.checked = !!v; };
 

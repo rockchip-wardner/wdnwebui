@@ -200,8 +200,8 @@ rm -rf app/apps/<app>/  # 删前先备份
 
 每个应用在自己的 `static/app.js` 里:
 ```js
-window.ImApp_vd = window.ImApp_vd || {};
-Object.assign(window.ImApp_vd, {
+window.ImApp_video_detection = window.ImApp_video_detection || {};
+Object.assign(window.ImApp_video_detection, {
   /**
    * wizard 完成时由框架调用。
    * @param {Object} opts - 来自 wizard 收集的字段值(已是 camelCase)
