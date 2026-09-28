@@ -1,12 +1,13 @@
 (function () {
   "use strict";
   const API_PREFIX = "/api";
-  // core helpers (fmtNum, fmtEventTime, sanitizeEventText, loadModelPick) via app/static/core/*.js
+  // core helpers (fmtNum, fmtEventTime, sanitizeEventText, loadModelPick, vtlPaletteRGB, vtlLabelColor) via app/static/core/*.js
   const fmtNum = window.fmtNum;
   const fmtEventTime = window.fmtEventTime;
   const sanitizeEventText = window.sanitizeEventText;
-  // ...
   const loadModelPick = window.loadModelPick;
+  const vtlPaletteRGB = window.vtlPaletteRGB;
+  const vtlLabelColor = window.vtlLabelColor;
 
 const VTD = {
   ws: null,
@@ -580,28 +581,6 @@ function initVideoTargetDetection() {
  *   - 历史列表项画 bbox overlay（canvas 叠加在原图缩略图上）+ 双击弹   *
  *     `#vtl-frame-modal` 大图预览                                       *
  * ------------------------------------------------------------------ */
-
-  // ...
-const vtlPaletteRGB = [
-  [255, 56, 56],   [255, 157, 151], [255, 112, 31],  [255, 178, 29],
-  [207, 210, 49],  [72, 249, 10],   [146, 204, 23],  [61, 219, 134],
-  [26, 147, 52],   [0, 212, 187],   [44, 153, 168],  [0, 194, 255],
-  [52, 69, 147],   [100, 115, 255], [78, 55, 230],   [255, 30, 175],
-  [182, 33, 158],  [255, 172, 199], [196, 187, 145], [156, 156, 156],
-];
-
-  // ...
-const vtlLabelColorMap = new Map();
-function vtlLabelColor(label) {
-  const key = (label && typeof label === "string") ? label : "__empty__";
-  if (!vtlLabelColorMap.has(key)) {
-    vtlLabelColorMap.set(key, vtlLabelColorMap.size);
-  }
-  return vtlPaletteRGB[
-    vtlLabelColorMap.get(key) % vtlPaletteRGB.length
-  ];
-}
-
 
 initVideoTargetDetection();
 

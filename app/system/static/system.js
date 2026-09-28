@@ -3979,11 +3979,8 @@ if (SYSTEM_PAGES.has(currentPage())) {
 
 if (typeof fetchVersion === "function") fetchVersion();
 
-// Note: PowerMenu.init() / ConfigMenu.init() / CoprocessorMenu.init() are
-// already auto-invoked by the legacy app.js module-level code (see lines
-// 1639, 1771, 1959 in this file — the trailing `PowerMenu.init();` etc.
-// invocations that came along with each module in old_app.js). We do NOT
-// call them again here to avoid double-binding click handlers (which used
-// to cause the popover to instantly open-then-close on a single click).
+// Sidebar 底栏 popover 互相排他(TTS 卡片需要引用)—— TTS 在 defer 加载后
+// 找到 ``window.SystemMenus`` 即把三菜单的 .open() wrap 上 "打开前先关别人"。
+window.SystemMenus = { PowerMenu, ConfigMenu, CoprocessorMenu };
 
 })();

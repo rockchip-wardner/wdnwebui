@@ -1,9 +1,11 @@
 (function () {
   "use strict";
   const API_PREFIX = "/api";
-  // window.fmtNum / window.fmtEventTime 由 app/static/core/format-utils.js 暴露
+  // core helpers (fmtNum, fmtEventTime, vtlPaletteRGB, vtlLabelColor) via app/static/core/*.js
   const fmtNum = window.fmtNum;
   const fmtEventTime = window.fmtEventTime;
+  const vtlPaletteRGB = window.vtlPaletteRGB;
+  const vtlLabelColor = window.vtlLabelColor;
 
 const VTL = {
   ws: null,

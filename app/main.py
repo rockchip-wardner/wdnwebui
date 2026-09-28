@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -139,6 +140,23 @@ def create_app() -> FastAPI:
     model_path = (base or {}).get("model_path")
     if isinstance(model_path, str) and model_path.strip():
         os.environ["WDNAI_MODELS_DIR"] = model_path
+
+    # Best-effort: 板载 ES8388 codec Speaker PA 默认 mute,TTS 启动时
+    # aplay 写出 PCM 但听不到声音。boot 时 un-mute ES8388 的 Speaker
+    # control(失败不影响其它路径)。
+    try:
+        for cmd in (
+            ["amixer", "-c", "1", "sset", "Speaker", "on"],
+            ["amixer", "sset", "Speaker", "on"],
+        ):
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=2.0, check=False,
+            )
+            break
+    except Exception:                   # noqa: BLE001
+        pass
 
     app = FastAPI(
         title="wdnwebui",

@@ -720,5 +720,6 @@
   <script src="/static/core/fs-modal.js" defer></script>
   <script src="/static/core/model-pick.js" defer></script>
   <script src="/static/core/format-utils.js" defer></script>
+  <script src="/static/core/vtl-palette.js" defer></script>
 </body>
 </html>

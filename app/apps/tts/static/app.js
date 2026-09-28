@@ -595,10 +595,10 @@ const TTS = {
 
 TTS.init();
 
-/* The popovers share the same sidebar-foot anchor and would stack on
- * top of each other if more than one were visible. For each pair, wrap
- * the left-hand menu's .open() so it closes the right-hand one before
- * showing itself. */
+/* Sidebar 底栏 popover 互相排他 —— 共享 system.js 的 PowerMenu / ConfigMenu /
+ * CoprocessorMenu (挂在 ``window.SystemMenus``)。system.js defer 加载顺序
+ * 早于本 IIFE,引用全局是安全的。system.js 未加载时静默 no-op(罕见的离线
+ * 场景)。 */
 function _wrapOpenToCloseOther(menu, other) {
   const orig = menu.open.bind(menu);
   menu.open = function () {
@@ -606,10 +606,14 @@ function _wrapOpenToCloseOther(menu, other) {
     orig();
   };
 }
-const _menus = [PowerMenu, ConfigMenu, CoprocessorMenu];
+const _menus = window.SystemMenus
+  ? [window.SystemMenus.PowerMenu,
+     window.SystemMenus.ConfigMenu,
+     window.SystemMenus.CoprocessorMenu]
+  : [];
 for (const a of _menus) {
   for (const b of _menus) {
-    if (a !== b) _wrapOpenToCloseOther(a, b);
+    if (a !== b && a && b) _wrapOpenToCloseOther(a, b);
   }
 }
 
@@ -629,8 +633,6 @@ async function showRootWarning() {
   } catch (_) { /* network down at boot — skip silently */ }
 }
 showRootWarning();
-
-fetchVersion();
 
   // ...
 

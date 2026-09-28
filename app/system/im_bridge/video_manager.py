@@ -41,7 +41,7 @@ from app.core.video.utils import (
     _write_frames_to_shm,
     compute_slices,
 )
-from app.system.im_bridge.video_cache import file_md5, get_video_cache
+from app.core.video.cache import file_md5, get_video_cache
 
 _LOG = logging.getLogger("wechat_video_manager")
 

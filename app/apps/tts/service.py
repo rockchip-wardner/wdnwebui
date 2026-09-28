@@ -64,6 +64,24 @@ class AplayWriter:
                  volume: float = 0.5, device: str = "plughw:1,0") -> None:
         self._volume = float(volume)
         self._alive = True
+        # Best-effort: 板载 ES8388 codec 的 ``Speaker`` PA 默认 mute,
+        # 用户首次启用 TTS 时听不到声音。play_to 启动 aplay 前 un-mute。
+        # ``-c 1`` 选 ES8388 板载 codec(``amixer sset`` 在 default card
+        # 上无 Speaker control)。失败不影响正常路径(其它 codec 不一定
+        # 有该 control)。
+        for cmd in (
+            ["amixer", "-c", "1", "sset", "Speaker", "on"],
+            ["amixer", "sset", "Speaker", "on"],
+        ):
+            try:
+                subprocess.run(
+                    cmd,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=2.0, check=False,
+                )
+                break  # 第一个成功的就用
+            except Exception as exc:                   # noqa: BLE001
+                LOG.debug("aplay-writer: amixer un-mute Speaker failed: %s", exc)
         cmd = ["aplay", "-t", "raw", "-f", "FLOAT_LE",
                "-r", str(sample_rate), "-c", str(channels)]
         if device:
