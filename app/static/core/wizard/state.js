@@ -154,10 +154,10 @@
         for (let i = 0; i < MAX_RETRY; i++) {
           const ok = await doBringUp();
           if (ok) {
-            status.textContent = "✓ 已开启";
-            // 重新探测
-            state.envCheck = await _probeEnv(cfg, state.app);
-            _renderEnvStep(body, foot, cfg, stepDef, state);
+            // 启动指令已成功发出(后端 200),模型后台加载中。立即放行
+            // 到下一步,不阻塞用户填字段。finish 步骤会再等 running。
+            status.textContent = "✓ 已开启(后台加载中,可继续下一步)";
+            setTimeout(() => stepForward(), 600); // 短延时让用户看到状态
             return;
           }
           retryCount++;
@@ -519,21 +519,38 @@
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (!r.ok) return false;
       const data = await r.json();
-      // 1. 停非必需
+      // 1. 停非必需(后端契约 DELETE + JSON {model};按 capability 是否被 swcap_to_model 命中判断)
       for (const inst of (data.instances || [])) {
         const caps = inst.capability_types || [];
         const isNeeded = caps.some((c) => cfg.swcap_to_model[c]);
-        if (!isNeeded && inst.status === "running" && inst.id) {
-          await fetch(`/api/compute/instances/${encodeURIComponent(inst.id)}/stop`, { method: "POST" });
+        // running / loading 状态的实例才需要停(其他状态后端会拒)
+        if (!isNeeded && (inst.status === "running" || inst.status === "loading")) {
+          const modelId = inst.model_id;
+          if (!modelId) continue;
+          const dr = await fetch("/api/compute/instances", {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model: modelId }),
+          });
+          if (!dr.ok) {
+            console.warn("[wizard-state] stop", modelId, "→ HTTP", dr.status,
+                         await dr.text().catch(() => ""));
+            return false;
+          }
         }
       }
-      // 2. 启必需
+      // 2. 启必需(后端契约 POST + JSON {model, npu_index})
       for (const [cap, m] of Object.entries(cfg.swcap_to_model)) {
-        await fetch(`/api/compute/instances`, {
+        const sr = await fetch("/api/compute/instances", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "start", model_id: m.model_id, npu_index: m.npu_index }),
+          body: JSON.stringify({ model: m.model_id, npu_index: m.npu_index }),
         });
+        if (!sr.ok) {
+          console.warn("[wizard-state] start", m.model_id, "→ HTTP", sr.status,
+                       await sr.text().catch(() => ""));
+          return false;
+        }
       }
       return true;
     } catch (e) {
