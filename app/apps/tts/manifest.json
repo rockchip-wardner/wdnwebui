@@ -1,0 +1,58 @@
+{
+  "id": "tts",
+  "title": "语音生成",
+  "category": "audio",
+  "description": "中文文本转语音 (Qwen3-TTS)",
+  "version": "0.1.0",
+  "preview_video": "/static/apps/tts/preview.mp4",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_audio_tts"
+  ],
+  "hardware_capabilities": [
+    "hwcap_audio_output"
+  ],
+  "backend": {
+    "module": "app.apps.tts",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/tts/template.html",
+    "js": [
+      "/static/apps/tts/app.js"
+    ],
+    "css": [
+      "/static/apps/tts/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "session.busy",
+      "session.running",
+      "session.state"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/tts/stop"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/tts/stop"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "",
+    "editable_fields": [],
+    "prompt_template": ""
+  },
+  "requires_core": [
+    "compute.registry"
+  ],
+  "uploads_dir": "uploads/tts",
+  "display_order": 4
+}

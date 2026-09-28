@@ -30,7 +30,6 @@ Pass criteria:
 Uses urllib.request only — no third-party deps (per spec).
 """
 import json
-import os
 import subprocess
 import sys
 import time

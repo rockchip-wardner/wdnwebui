@@ -1,0 +1,168 @@
+      <section id="page-video-detection" class="page hidden" data-page="video-detection">
+        <header class="page-header">
+          <h2>音视频描述</h2>
+          <button class="refresh-btn" data-refresh>刷新</button>
+        </header>
+
+        <div class="vd-layout">
+          <div class="vd-stage-col">
+            <div class="vd-stage">
+              <canvas id="vd-canvas" width="960" height="540"></canvas>
+              <div class="vd-overlay" id="vd-overlay"></div>
+              <div class="vd-event-badge hidden" id="vd-event-badge">
+                <span class="vd-event-badge-text" id="vd-event-badge-text"></span>
+              </div>
+            </div>
+
+            <div class="vd-controls">
+              <button id="vd-play"  class="vd-btn">▶ 播放</button>
+              <button id="vd-pause" class="vd-btn">⏸ 暂停</button>
+              <button id="vd-stop"  class="vd-btn">⏹ 停止</button>
+              <span class="vd-spacer"></span>
+              <span class="vd-meta" id="vd-meta">--</span>
+            </div>
+
+            <div class="vd-progress">
+              <div class="vd-progress-bar" id="vd-progress"></div>
+            </div>
+          </div>
+
+          <aside class="vd-side">
+            <form class="surv-form" id="vd-form" autocomplete="off" onsubmit="return false;">
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>视频源</h3>
+                </header>
+                <div class="surv-field">
+                  <div class="surv-input-row">
+                    <input type="text" id="vd-source" class="surv-input"
+                           placeholder="网络流或本地文件/文件夹" spellcheck="false" />
+                    <button type="button" class="vd-btn" id="vd-browse">浏览…</button>
+                  </div>
+                  <div class="vd-actions-row">
+                    <button type="button" class="vd-btn vd-btn-primary" id="vd-open">打开</button>
+                    <button type="button" class="vd-btn" id="vd-close">关闭</button>
+                    <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
+                      <input type="checkbox" id="vd-loop" />
+                      <span>循环播放</span>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section class="surv-form-section vd-grow">
+                <header class="surv-form-head">
+                  <h3>检测提示词</h3>
+                  <span class="surv-hint" id="vd-detector-status">未启动</span>
+                </header>
+                <div class="surv-field">
+                  <div class="vd-model-pick-row">
+                    <label class="vd-detector-label">模型
+                      <select id="vd-model-pick" class="surv-input vd-model-pick"
+                              data-capability="swcap_video_describe">
+                        <option value="">自动 (本机优先)</option>
+                      </select>
+                    </label>
+                  </div>
+                  <textarea id="vd-prompt" class="surv-input surv-textarea"
+                            placeholder="例如：检测画面中是否有人进入，或描述图中发生的事件"></textarea>
+                  <div class="vd-detector-row">
+                    <label class="vd-detector-label">
+                      隔
+                      <input type="number" id="vd-every-n" min="1" max="600" step="1" value="30" />
+                      帧
+                    </label>
+                    <button type="button" class="vd-btn vd-btn-primary" id="vd-detector-start">启动检测</button>
+                    <button type="button" class="vd-btn" id="vd-detector-stop" disabled>停止检测</button>
+                  </div>
+                </div>
+              </section>
+
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>检测尺寸</h3>
+                </header>
+                <div class="surv-field">
+                  <label class="surv-input-split">
+                    <select id="vd-detect-size" class="surv-input">
+                      <option value="auto" selected>自动选择</option>
+                      <option value="384">384x384 (更快)</option>
+                      <option value="768">768x768 (更准)</option>
+                    </select>
+                  </label>
+                </div>
+              </section>
+
+              <section class="surv-form-section vd-audio-block">
+                <header class="surv-form-head">
+                  <h3>音频理解 <small>· Qwen2.5-Omni-3B</small></h3>
+                  <span class="surv-hint" id="vd-audio-status">未启动</span>
+                </header>
+                <div class="surv-field">
+                  <div class="vd-audio-hint">
+                    当前视频源：<code id="vd-audio-source">—</code>
+                  </div>
+                  <div class="vd-model-pick-row">
+                    <label class="vd-detector-label">模型
+                      <select id="vd-audio-model-pick" class="surv-input vd-model-pick"
+                              data-capability="swcap_audio_understand">
+                        <option value="">自动 (本机优先)</option>
+                      </select>
+                    </label>
+                  </div>
+                  <textarea id="vd-audio-prompt" class="surv-input surv-textarea"
+                            placeholder="例：请转写这段音频里的人在说什么 / 描述音频中的环境音"></textarea>
+                  <div class="vd-detector-row">
+                    <button type="button" class="vd-btn vd-btn-primary"
+                            id="vd-audio-start">分析音频</button>
+                    <button type="button" class="vd-btn"
+                            id="vd-audio-stop" disabled>停止</button>
+                  </div>
+                  <div class="vd-audio-meta" id="vd-audio-progress"></div>
+                </div>
+              </section>
+
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>工具</h3>
+                  <span class="surv-hint" id="vd-tools-summary">未启用</span>
+                </header>
+                <div class="surv-field">
+                  <div id="vd-tools-list" class="vd-tools-list">
+                    <div class="vd-tools-empty">加载中…</div>
+                  </div>
+                </div>
+              </section>
+            </form>
+          </aside>
+        </div>
+
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>检测事件历史</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="vd-events-count">0 条</span>
+            <button id="vd-events-clear" class="vd-btn">清空</button>
+          </header>
+          <ol class="vd-event-list" id="vd-event-list">
+            <li class="vd-event-empty">尚未检测到事件，启动检测后结果显示在这里。</li>
+          </ol>
+        </section>
+
+        <section class="vd-section vd-audio-section">
+          <header class="vd-section-head">
+            <h3>音频段落分析</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="vd-audio-events-count">0 段</span>
+            <button id="vd-audio-events-clear" class="vd-btn">清空</button>
+          </header>
+          <ol class="vd-audio-events" id="vd-audio-events">
+            <li class="vd-audio-empty">启动音频分析后，按 6 秒切片逐段推理，结果显示在这里。</li>
+          </ol>
+        </section>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-detection"></pre>
+        </details>
+      </section>

@@ -1,0 +1,138 @@
+      <section id="page-video-target-localization" class="page hidden" data-page="video-target-localization">
+        <header class="page-header">
+          <h2>视频目标定位</h2>
+          <button class="refresh-btn" data-refresh>刷新</button>
+        </header>
+
+        <div class="vd-layout">
+          <div class="vd-stage-col">
+            <div class="vd-stage">
+              <canvas id="vtl-canvas" width="960" height="540"></canvas>
+              <div class="vd-overlay" id="vtl-overlay"></div>
+              <div class="vd-event-badge hidden" id="vtl-event-badge">
+                <span class="vd-event-badge-text" id="vtl-event-badge-text"></span>
+              </div>
+            </div>
+
+            <div class="vd-controls">
+              <button id="vtl-play"  class="vd-btn">▶ 播放</button>
+              <button id="vtl-pause" class="vd-btn">⏸ 暂停</button>
+              <button id="vtl-stop"  class="vd-btn">⏹ 停止</button>
+              <span class="vd-spacer"></span>
+              <span class="vd-meta" id="vtl-meta">--</span>
+            </div>
+
+            <div class="vd-progress">
+              <div class="vd-progress-bar" id="vtl-progress"></div>
+            </div>
+          </div>
+
+          <aside class="vd-side">
+            <form class="surv-form" id="vtl-form" autocomplete="off" onsubmit="return false;">
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>视频源</h3>
+                </header>
+                <div class="surv-field">
+                  <div class="surv-input-row">
+                    <input type="text" id="vtl-source" class="surv-input"
+                           placeholder="网络流或本地文件/文件夹" spellcheck="false" />
+                    <button type="button" class="vd-btn" id="vtl-browse">浏览…</button>
+                  </div>
+                  <div class="vd-actions-row">
+                    <button type="button" class="vd-btn vd-btn-primary" id="vtl-open">打开</button>
+                    <button type="button" class="vd-btn" id="vtl-close">关闭</button>
+                    <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
+                      <input type="checkbox" id="vtl-loop" />
+                      <span>循环播放</span>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section class="surv-form-section vd-grow">
+                <header class="surv-form-head">
+                  <h3>定位提示词</h3>
+                  <span class="surv-hint" id="vtl-detector-status">未启动</span>
+                </header>
+                <div class="surv-field">
+                  <div id="vtl-prompt-rows" class="vtl-prompt-rows">
+                    <div class="vtl-prompt-row is-open">
+                      <div class="vtl-prompt-row-inner">
+                        <span class="vtl-prompt-row-num">1</span>
+                        <input type="text" class="vtl-prompt-row-input surv-input" maxlength="200" spellcheck="false" placeholder="例如：穿着红衬衫的人" />
+                        <button type="button" class="vtl-prompt-row-remove vd-btn vd-btn-mini" title="删除该行" aria-label="删除该行">−</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="vtl-prompt-toolbar">
+                    <button type="button" class="vtl-prompt-add vd-btn" id="vtl-prompt-add">+ 添加输入框</button>
+                    <span class="vtl-prompt-hint" id="vtl-prompt-hint">1 / 20</span>
+                  </div>
+                  <div class="vd-detector-row">
+                    <label class="vd-detector-label">
+                      隔
+                      <input type="number" id="vtl-every-n" min="1" max="600" step="1" value="30" />
+                      帧
+                    </label>
+                    <button type="button" class="vd-btn vd-btn-primary" id="vtl-detector-start">启动定位</button>
+                    <button type="button" class="vd-btn" id="vtl-detector-stop" disabled>停止定位</button>
+                  </div>
+                </div>
+              </section>
+            </form>
+          </aside>
+        </div>
+
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>定位事件历史</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="vtl-events-count">0 条</span>
+            <button id="vtl-events-clear" class="vd-btn">清空</button>
+          </header>
+          <ol class="vd-event-list" id="vtl-event-list">
+            <li class="vd-event-empty">尚未定位到目标，启动定位后结果显示在这里。</li>
+          </ol>
+        </section>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-target-localization"></pre>
+        </details>
+      </section>
+
+      <div id="vtl-frame-modal" class="vfa-frame-modal hidden" role="dialog" aria-modal="true" aria-label="定位事件帧预览">
+        <div class="vfa-frame-modal-card">
+          <div class="vfa-frame-modal-head">
+            <div class="vfa-frame-modal-title">
+              <span class="vfa-frame-modal-title-main">定位帧</span>
+            </div>
+            <button class="vfa-frame-modal-close" id="vtl-frame-modal-close" aria-label="关闭">×</button>
+          </div>
+          <div class="vfa-frame-modal-body">
+            <div class="vfa-frame-modal-img-wrap">
+              <img class="vfa-frame-modal-img" id="vtl-frame-modal-img" alt="" />
+            </div>
+            <div class="vfa-frame-modal-info" id="vtl-frame-modal-meta">
+              <div class="vfa-frame-modal-info-row">
+                <span class="vfa-frame-modal-info-label">帧位置</span>
+                <span id="vtl-frame-modal-frame-pos">--</span>
+              </div>
+              <div class="vfa-frame-modal-info-row">
+                <span class="vfa-frame-modal-info-label">时间戳</span>
+                <span id="vtl-frame-modal-ts">--</span>
+              </div>
+              <div class="vfa-frame-modal-info-row vfa-frame-modal-info-text-wrap">
+                <span class="vfa-frame-modal-info-label">模型输出</span>
+                <div class="vfa-frame-modal-info-text" id="vtl-frame-modal-text">--</div>
+              </div>
+              <div class="vfa-frame-modal-info-row vfa-frame-modal-info-text-wrap">
+                <span class="vfa-frame-modal-info-label">目标框</span>
+                <div class="vfa-frame-modal-info-text" id="vtl-frame-modal-boxes"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+

@@ -16,7 +16,6 @@ import asyncio
 import logging
 import os
 import sys
-import threading
 import time
 from collections import deque
 from unittest.mock import MagicMock, patch

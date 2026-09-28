@@ -1,0 +1,132 @@
+      <section id="page-video-file-analysis" class="page hidden" data-page="video-file-analysis">
+        <header class="page-header">
+          <h2>视频文件分析</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="vfa-status">就绪</span>
+            <button class="refresh-btn" id="vfa-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div id="vfa-error-banner" class="vfa-error-banner hidden" role="alert">
+          <span class="vfa-error-icon" aria-hidden="true">⚠</span>
+          <span class="vfa-error-text" id="vfa-error-text"></span>
+          <button class="vfa-error-close" id="vfa-error-close" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <section class="vfa-progress" id="vfa-progress" data-state="idle" aria-label="分析进度">
+          <div class="vfa-progress-info">
+            <span class="vfa-progress-phase" id="vfa-progress-phase">未启动</span>
+            <span class="vfa-progress-meta" id="vfa-progress-meta">--</span>
+            <span class="vfa-progress-count" id="vfa-progress-count">
+              <span id="vfa-progress-count-now">0</span><span class="vfa-progress-count-unit">%</span>
+            </span>
+          </div>
+          <div class="vfa-progress-track-wrap">
+            <div class="vfa-progress-track" id="vfa-progress-track" style="--p: 0%;">
+              <div class="vfa-progress-fill" id="vfa-progress-analyze"></div>
+              <div class="vfa-progress-thumb" id="vfa-progress-thumb"></div>
+            </div>
+          </div>
+        </section>
+
+        <div class="vfa-layout">
+          <form class="surv-form" id="vfa-form" autocomplete="off" onsubmit="return false;">
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>视频源</h3>
+                <span class="surv-hint">设备端本地文件</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-input-row">
+                  <input type="text" id="vfa-source" class="surv-input"
+                         placeholder="例如 /userdata/clips/sample.mp4" spellcheck="false" />
+                  <button type="button" class="vd-btn" id="vfa-browse">浏览…</button>
+                </div>
+                <div class="vd-actions-row">
+                  <span class="vd-meta" id="vfa-source-meta">尚未选择</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section vd-grow">
+              <header class="surv-form-head">
+                <h3>分析要求</h3>
+                <span class="surv-hint">将作为 VLM 推理的提示词</span>
+              </header>
+              <div class="surv-field">
+                <textarea id="vfa-prompt" class="surv-input surv-textarea"
+                          placeholder="例如：请对整段视频进行内容总结，给出主题、关键事件与时间线"></textarea>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>采样</h3>
+                <span class="surv-hint">每隔多少帧抽取一次进行分析</span>
+              </header>
+              <div class="surv-field">
+                <label class="vd-detector-label">
+                  隔
+                  <input type="number" id="vfa-every-n" min="1" max="600" step="1" value="60" />
+                  帧
+                </label>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>操作</h3>
+                <span class="surv-hint" id="vfa-runtime">未启动</span>
+              </header>
+              <div class="surv-field vd-actions-row">
+                <button type="button" class="vd-btn vd-btn-primary" id="vfa-start">开始分析</button>
+                <button type="button" class="vd-btn" id="vfa-stop" disabled>停止</button>
+                <button type="button" class="vd-btn" id="vfa-clear">清空记录</button>
+              </div>
+            </section>
+          </form>
+
+          <aside class="vd-side vfa-result-col">
+            <section class="surv-form-section vfa-summary-section">
+              <header class="surv-form-head">
+                <h3>综述</h3>
+                <span class="surv-hint" id="vfa-summary-meta">尚无综述</span>
+              </header>
+              <div class="vfa-summary-box" id="vfa-summary-box">
+                <div class="vfa-summary-empty" id="vfa-summary-empty">
+                  全文件分析完成后，VLM 综述将在此处呈现。
+                </div>
+                <div class="vfa-summary-text hidden" id="vfa-summary-text"></div>
+              </div>
+            </section>
+
+            <section class="vfa-history">
+              <header class="vd-section-head">
+                <h3>历史分析</h3>
+                <span class="vd-spacer"></span>
+                <span class="vd-meta" id="vfa-history-count">0 条</span>
+                <button class="vd-btn" id="vfa-history-refresh">刷新</button>
+              </header>
+              <ol class="vfa-history-list" id="vfa-history-list">
+                <li class="vfa-history-empty">暂无历史分析记录。每次分析完成或中途停止后会自动落盘。</li>
+              </ol>
+            </section>
+          </aside>
+        </div>
+
+        <details class="vfa-events-section" id="vfa-events-details" open>
+          <summary class="vfa-events-summary">
+            <span class="vfa-events-summary-title">逐帧分析</span>
+            <span class="vfa-events-summary-count" id="vfa-events-count">0 条</span>
+          </summary>
+          <ol class="vfa-event-list" id="vfa-event-list">
+            <li class="vfa-event-empty">尚未开始分析。</li>
+          </ol>
+        </details>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-file-analysis"></pre>
+        </details>
+      </section>
+

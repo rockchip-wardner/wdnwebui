@@ -1,16 +1,17 @@
-"""FastAPI application factory."""
+"""FastAPI application factory — plugin-driven (v0.4)."""
+from __future__ import annotations
+
+import html
+import json
 import logging
 import os
 import threading
 from pathlib import Path
 
-# uvicorn's default ``LOGGING_CONFIG`` does not configure the root
-# logger — only its own ``uvicorn`` / ``uvicorn.error`` / ``uvicorn.access``
-# channels. Without this, every ``LOG.info(...)`` from app.services.*
-# / app.api.* is silently swallowed (Python's default root level is
-# WARNING with no handlers). Symptom: clicking "开始提取" produced
-# no log output at all. Keep this near the top of the module so it
-# runs for both ``run.py`` and direct ``uvicorn app.main:app``.
+# uvicorn's default LOGGING_CONFIG does not configure the root logger, so
+# every ``LOG.info(...)`` from app.core.* / app.apps.* / app.system.* is
+# silently swallowed without this. Keep this near the top of the module so
+# it runs for both ``run.py`` and direct ``uvicorn app.main:app``.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -18,221 +19,238 @@ logging.basicConfig(
 )
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
 
 from app import __version__
-from app.api import (
-    audio_analysis,
-    compute,
-    config,
-    coprocessor,
-    power,
-    system_logs,
-    system_monitor,
-    text_chat,
-    tts,
-    versions,
-    video_content_search,
-    video_detection,
-    video_file_analysis,
-    video_target_detection,
-    video_target_localization,
-    wechat,
+from app.core.config import get_config
+from app.core.manifest import (
+    CardManifest,
+    discover as discover_cards,
 )
-from app.services.audio_analysis import get_service as get_audio_analysis_service
-from app.services.compute_registry import get_registry
-from app.services.config import get_config
-from app.services.detector import get_detector, get_target_detector, get_localizer_detector
-from app.services.text_chat import close_chat, get_chat_service
-from app.services.tts_session import get_session as get_tts_session
-from app.services.video_content_search import get_service as get_vcs_service
-from app.services.video_file_analysis import get_service as get_vfa_service
-from app.services.video_session import get_session
-from app.services.wechat import close_wechat, get_wechat
+from app.core.compute.registry import get_registry
+
+LOG = logging.getLogger("app.main")
 
 STATIC_DIR = Path(__file__).parent / "static"
+INDEX_TEMPLATE_PATH = STATIC_DIR / "index.html.template"
 
 
-class NoCacheStaticMiddleware(BaseHTTPMiddleware):
-    """Dev: keep /static/ fresh so JS changes don't get hidden behind
-    the browser cache. The reload watcher only sees Python edits, so
-    without this the user keeps running stale app.js / style.css after
-    a static edit unless they hard-refresh."""
+# --------------------------------------------------------------------------- #
+# HTML assembly                                                               #
+# --------------------------------------------------------------------------- #
+def _assemble_index_html(manifests: list[CardManifest]) -> str:
+    """Build the index.html response by injecting card sections + manifests.
 
-    async def dispatch(self, request: Request, call_next):
-        response: Response = await call_next(request)
-        if request.url.path.startswith("/static/"):
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
-            response.headers["Expires"] = "0"
-        return response
+    The template has two types of placeholders:
+      - ``{% card_slot "<page_id>" %}`` — replaced with that card's
+        ``static/template.html`` content.
+      - ``{{ card_css_links }}`` — replaced with one ``<link>`` per
+        card's CSS file.
+      - ``{{ app_manifests }}`` — replaced with the JSON dump of
+        ``window.__APP_MANIFESTS__`` (card metadata for the front-end).
 
+    Cards in ``status != "ok"`` are still rendered (their page
+    exists) but flagged in ``__APP_MANIFESTS__`` so the UI can show
+    a placeholder for the broken bits.
+    """
+    template = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8")
 
-def create_app() -> FastAPI:
-    app = FastAPI(
-        title="wdnwebui",
-        version=__version__,
-        description="wdnwebui service",
+    # 1. card_slot injection
+    for m in manifests:
+        token = '{% card_slot "' + m.id + '" %}'
+        if token not in template:
+            LOG.warning("[%s] no {{card_slot}} placeholder in index.html.template", m.id)
+            continue
+        template_path = m.static_dir / "template.html" if m.static_dir else None
+        if template_path and template_path.is_file():
+            content = template_path.read_text(encoding="utf-8")
+            # Strip any leading whitespace so the section is at the right indent
+            content = content.lstrip()
+            template = template.replace(token, content, 1)
+        else:
+            # Empty section placeholder if template.html missing
+            placeholder = (
+                f'<section id="page-{m.id}" class="page hidden" data-page="{m.id}">'
+                f'<header class="page-header"><h2>{html.escape(m.title)}</h2></header>'
+                f'<div class="placeholder-card"><p>本应用的页面模板未提供。</p></div>'
+                f'</section>'
+            )
+            template = template.replace(token, placeholder, 1)
+            LOG.warning("[%s] template.html missing — injected empty placeholder", m.id)
+
+    # 2. CSS link tags (8-A: all card CSS loaded eagerly at boot)
+    css_links: list[str] = []
+    for m in manifests:
+        for url in m.frontend_css:
+            css_links.append(
+                f'  <link rel="stylesheet" href="{html.escape(url)}" />'
+            )
+    template = template.replace(
+        "{{ card_css_links }}",
+        "\n".join(css_links) if css_links else "  <!-- no card CSS -->",
     )
 
-    app.add_middleware(NoCacheStaticMiddleware)
+    # 3. Manifests JSON for window.__APP_MANIFESTS__
+    manifests_data = {
+        "cards": [_manifest_to_dict(m) for m in manifests],
+    }
+    manifests_json = json.dumps(manifests_data, ensure_ascii=False)
+    template = template.replace("{{ app_manifests }}", manifests_json)
 
-    # Resolve the on-disk config.jsonc path early so it shows up in the
-    # /health endpoint and the UI's config popover can render its
-    # absolute path. Missing files are tolerated — they read as {}.
+    return template
+
+
+def _manifest_to_dict(m: CardManifest) -> dict:
+    """Build the per-card dict that gets serialized to the front-end."""
+    return {
+        "id": m.id,
+        "title": m.title,
+        "preview_video": m.preview_video,
+        "software_capabilities": m.software_capabilities,
+        "hardware_capabilities": m.hardware_capabilities,
+        "frontend": {
+            "template": m.raw["frontend"]["template"],
+            "js": m.frontend_js,
+            "css": m.frontend_css,
+        },
+        "demo_guard": {
+            "active_state_keys": m.demo_guard_active_state_keys,
+            "stop_endpoints": m.demo_guard_stop_endpoints,
+            "stop_sync_endpoints": m.demo_guard_stop_sync_endpoints,
+        },
+        "prompts": m.raw["prompts"],
+        "status": m.status,
+        "errors": m.errors,
+        "hidden": m.hidden,
+        "display_order": m.display_order,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# FastAPI factory                                                             #
+# --------------------------------------------------------------------------- #
+def create_app() -> FastAPI:
     cfg = get_config()
 
-    # Propagate WDNAI_MODELS_DIR from config.jsonc so downstream SDKs
-    # (wdnai's `_models_root()`) pick up the configured model root
-    # without each consumer having to read config separately. Setting
-    # it before any LLMSession is built means the SDK reads the right
-    # path on its first lookup. Done once at app boot — a runtime
-    # config change requires a restart to take effect (the detector
-    # already loaded an LLMSession by then).
+    # Propagate WDNAI_MODELS_DIR from config so downstream SDKs pick up
+    # the configured model root before any LLMSession is built.
     base = cfg.get_section("base", {})
     model_path = (base or {}).get("model_path")
     if isinstance(model_path, str) and model_path.strip():
         os.environ["WDNAI_MODELS_DIR"] = model_path
 
-    app.include_router(system_monitor.router, prefix="/api")
-    app.include_router(video_detection.router, prefix="/api")
-    app.include_router(video_file_analysis.router, prefix="/api")
-    app.include_router(system_logs.router, prefix="/api")
-    app.include_router(power.router, prefix="/api")
-    app.include_router(config.router, prefix="/api")
-    app.include_router(coprocessor.router, prefix="/api")
-    app.include_router(tts.router, prefix="/api")
-    app.include_router(compute.router, prefix="/api")
-    app.include_router(video_target_detection.router, prefix="/api")
-    app.include_router(video_target_localization.router, prefix="/api")
-    app.include_router(video_content_search.router, prefix="/api")
-    app.include_router(wechat.router, prefix="/api")
-    app.include_router(text_chat.router, prefix="/api")
-    app.include_router(audio_analysis.router, prefix="/api")
-    app.include_router(versions.router, prefix="/api")
+    app = FastAPI(
+        title="wdnwebui",
+        version=__version__,
+        description="wdnwebui service (plugin-driven frontend)",
+    )
 
-    # Boot：按 config.compute.services 列表为每条 model 做 spawn →
-    # 失败 fallback peer adopt。worker 起来后只注册 DDS endpoint，不 build
-    # LLMSession；用户随后在算力配置页选 NPU 触发 RPC load 完成绑定。
-    #
-    # **必须在 daemon thread 里跑** —— 同步调用会阻塞 ``create_app()``
-    # 返回 → uvicorn 无法 bind 8000 → 浏览器 GET / hang 直到整个 boot
-    # 跑完（冷启动无 worker 时 ``_probe_service`` 的 3 × 5s race-recovery
-    # 重试 + spawn 子进程冷启都能吃几十秒）。挪到后台后：页面立即出，
-    # boot 在后台慢慢跑，前端 1Hz 轮询 /api/compute 自动反映每个
-    # model 的真实状态。
+    # 1. Discover cards (manifest scan + validation)
+    manifests = discover_cards()
+    LOG.info(
+        "discovered %d card(s): %s",
+        len(manifests),
+        ", ".join(m.id for m in manifests),
+    )
+    for m in manifests:
+        if m.errors:
+            for e in m.errors:
+                LOG.error("[%s] %s", m.id, e)
+
+    # 2. Mount each card's API + register shutdown
+    for m in manifests:
+        try:
+            from app.core.manifest import call_register_api
+            call_register_api(m, app)
+        except Exception as e:  # noqa: BLE001
+            LOG.exception("[%s] register_api failed: %s", m.id, e)
+            m.errors.append(f"register_api failed: {e}")
+            m.status = "fatal"
+
+    # 3. Mount system pages (manual; not plugin-driven)
+    from app.system import register_all as system_register_all
+    system_register_all(app)
+
+    # 4. boot_compute_services — daemon thread (kept from v0.4 architecture)
     threading.Thread(
         target=get_registry().boot_compute_services,
         name="compute-boot",
         daemon=True,
     ).start()
 
-    # Wire the detector as a frame sink on the video session so each
-    # decoded BGR frame is offered to it (it picks the Nth one).
-    get_session().add_frame_sink(
-        lambda frame, frame_pos, frame_b64: get_detector().submit_frame(
-            frame, frame_pos, frame_b64
-        )
-    )
-    # Same for the video-target-detection page — second detector
-    # instance with its own prompt / history.
-    get_session().add_frame_sink(
-        lambda frame, frame_pos, frame_b64: get_target_detector().submit_frame(
-            frame, frame_pos, frame_b64
-        )
-    )
-    # Same for the video-target-localization page — third detector
-    # instance with its own prompt / history (uses locate-anything
-    # visual grounding model, swcap_grounding capability).
-    get_session().add_frame_sink(
-        lambda frame, frame_pos, frame_b64: get_localizer_detector().submit_frame(
-            frame, frame_pos, frame_b64
-        )
-    )
+    # 5. Mount per-card static dirs at /static/apps/<id>
+    for m in manifests:
+        if not m.static_dir or not m.static_dir.is_dir():
+            continue
+        try:
+            app.mount(
+                f"/static/apps/{m.id}",
+                StaticFiles(directory=str(m.static_dir)),
+                name=f"static-apps-{m.id}",
+            )
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("[%s] failed to mount static dir: %s", m.id, e)
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    # 6. Mount framework-level static at /static/core + /static/system + /static
+    core_static = STATIC_DIR / "core"
+    if core_static.is_dir():
+        app.mount(
+            "/static/core",
+            StaticFiles(directory=str(core_static)),
+            name="static-core",
+        )
+    # System pages have their own static dir (not plugin-driven)
+    system_static = Path(__file__).parent / "system" / "static"
+    if system_static.is_dir():
+        app.mount(
+            "/static/system",
+            StaticFiles(directory=str(system_static)),
+            name="static-system",
+        )
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(STATIC_DIR)),
+        name="static-app",
+    )
 
     @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+    async def index() -> Response:
+        # Re-assemble on every request to pick up manifest changes during
+        # hot-reload. Cheap enough for the ~30 cards case.
+        return Response(
+            content=_assemble_index_html(discover_cards()),
+            media_type="text/html; charset=utf-8",
+        )
 
     @app.get("/health")
     async def health() -> dict:
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "version": __version__,
+            "cards": [m.id for m in manifests],
+            "version_status": {m.id: m.status for m in manifests},
+        }
 
     @app.on_event("shutdown")
     async def _on_shutdown():
-        # Close the main process's wdndds Hub. Compute workers are
-        # independent OS processes and are intentionally NOT killed
-        # here — they may outlive this web process, be restarted by
-        # systemd, or be required by a peer. (stop_all_local is NOT
-        # called by close_all; if a graceful shutdown of spawned
-        # workers is desired, call it explicitly.)
+        # Card shutdown handlers
+        for m in manifests:
+            if not m.backend_register_shutdown:
+                continue
+            try:
+                from app.core.manifest import shutdown_callbacks
+                for manifest, fn in shutdown_callbacks():
+                    if manifest.id == m.id:
+                        try:
+                            fn()
+                        except Exception as e:  # noqa: BLE001
+                            LOG.warning("[%s] shutdown: %s", m.id, e)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("[%s] shutdown import: %s", m.id, e)
+        # Compute registry cleanup
         try:
             get_registry().close_all()
-        except Exception:
-            pass
-        # Free the RKNN session handle if one was ever built.
-        try:
-            get_detector().close()
-        except Exception:
-            pass
-        try:
-            get_target_detector().close()
-        except Exception:
-            pass
-        # Free the locate-anything RKNN session if one was ever built.
-        try:
-            get_localizer_detector().close()
-        except Exception:
-            pass
-        # Free the Qwen3-TTS RKNN sessions if any were built.
-        try:
-            get_tts_session().close()
-        except Exception:
-            pass
-        # Stop the video-file-analysis worker (releases its
-        # wdnav.VideoCapture and joins the decode / infer threads).
-        try:
-            get_vfa_service().close()
-        except Exception:
-            pass
-        # Stop the video-content-search mock worker thread.
-        try:
-            get_vcs_service().close()
-        except Exception:
-            pass
-        # Stop the WeChat bot manager (cancels its poller, closes the
-        # underlying wdndds.Wechat which owns the long-poll task).
-        try:
-            close_wechat()
-        except Exception:
-            pass
-        # Stop the wechat video manager (extraction worker thread).
-        try:
-            from app.services.wechat_video_manager import (
-                close_wechat_video_manager,
-            )
-            close_wechat_video_manager()
-        except Exception:
-            pass
-        # Stop the text-chat service worker thread (singleton lives in
-        # app.services.text_chat; the underlying LLMSession is owned by
-        # the ComputeRegistry and was already closed by close_all()).
-        try:
-            close_chat()
-        except Exception:
-            pass
-        # Stop the audio-analysis worker (releases its PyAV container +
-        # joins the decode / infer threads). The underlying LLMSession
-        # is owned by ComputeRegistry and was already closed by
-        # close_all() above.
-        try:
-            get_audio_analysis_service().close()
         except Exception:
             pass
 

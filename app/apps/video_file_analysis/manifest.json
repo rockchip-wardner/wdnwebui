@@ -1,0 +1,67 @@
+{
+  "id": "video-file-analysis",
+  "title": "视频文件分析",
+  "category": "video",
+  "description": "上传视频文件 → 周期性 VLM 描述 → 阶段汇总 + 全文检索",
+  "version": "0.1.0",
+  "preview_video": "/static/apps/video-file-analysis/preview.mp4",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_video_describe",
+    "swcap_video_retrieval"
+  ],
+  "hardware_capabilities": [
+    "hwcap_video_input"
+  ],
+  "backend": {
+    "module": "app.apps.video_file_analysis",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/video-file-analysis/template.html",
+    "js": [
+      "/static/apps/video-file-analysis/app.js"
+    ],
+    "css": [
+      "/static/apps/video-file-analysis/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "session.state"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-file-analysis/stop"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-file-analysis/stop"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "VLMDoc",
+    "editable_fields": [
+      {
+        "name": "text",
+        "label": "VLMDoc.text 字段描述"
+      },
+      {
+        "name": "level",
+        "label": "VLMDoc.level 字段描述"
+      }
+    ],
+    "prompt_template": "请用中文描述视频中正在发生的事件。"
+  },
+  "requires_core": [
+    "compute.registry",
+    "video.session"
+  ],
+  "uploads_dir": "uploads/video_file_analysis",
+  "display_order": 5
+}

@@ -1,0 +1,88 @@
+      <section id="page-tts" class="page hidden" data-page="tts">
+        <header class="page-header">
+          <h2>语音生成</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="tts-status-line">--</span>
+            <button class="refresh-btn" id="tts-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div id="tts-unavailable" class="tts-banner tts-banner-error hidden">
+          <span class="tts-banner-icon" aria-hidden="true">⚠</span>
+          <span class="tts-banner-text">
+            语音生成不可用：<span id="tts-unavailable-reason">--</span>
+          </span>
+        </div>
+
+        <div class="tts-stage">
+          <textarea id="tts-text" class="tts-text" rows="4"
+                    placeholder="请输入要合成的文本，例如：你好，这是一个语音合成测试。"></textarea>
+
+          <div class="tts-controls">
+            <label class="tts-field">
+              <span class="tts-label">声音</span>
+              <select id="tts-ref-speaker" class="tts-select">
+                <option value="girl_base">girl_base（默认）</option>
+                <option value="ahu">ahu</option>
+              </select>
+            </label>
+            <label class="tts-field">
+              <span class="tts-label">语种</span>
+              <select id="tts-language" class="tts-select">
+                <option value="auto">auto</option>
+                <option value="chinese">chinese</option>
+                <option value="english">english</option>
+                <option value="japanese">japanese</option>
+                <option value="korean">korean</option>
+              </select>
+            </label>
+            <label class="tts-field tts-volume">
+              <span class="tts-label">音量 <span id="tts-volume-value">10%</span></span>
+              <input type="range" id="tts-volume" min="0" max="100" step="5" value="10" />
+            </label>
+            <label class="tts-field">
+              <span class="tts-label">播放到</span>
+              <div class="tts-playto" role="radiogroup" aria-label="播放目标">
+                <label class="tts-playto-opt">
+                  <input type="radio" name="tts-play-to" value="device" />
+                  <span>设备</span>
+                </label>
+                <label class="tts-playto-opt">
+                  <input type="radio" name="tts-play-to" value="browser" checked />
+                  <span>浏览器</span>
+                </label>
+                <label class="tts-playto-opt">
+                  <input type="radio" name="tts-play-to" value="both" />
+                  <span>两者</span>
+                </label>
+              </div>
+            </label>
+            <span class="vd-spacer"></span>
+            <button id="tts-start" class="vd-btn vd-btn-primary">开始生成</button>
+            <button id="tts-stop"  class="vd-btn" disabled>停止</button>
+          </div>
+
+          <div class="tts-meta" id="tts-meta">未开始</div>
+          <div class="tts-audio-row hidden" id="tts-audio-row">
+            <span class="tts-audio-chip" id="tts-audio-chip">浏览器音频待启动</span>
+            <audio id="tts-audio" class="hidden" preload="auto" controls></audio>
+          </div>
+        </div>
+
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>生成记录</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="tts-history-count">0 条</span>
+          </header>
+          <ol class="vd-event-list" id="tts-history-list">
+            <li class="vd-event-empty">尚无生成记录，启动合成后结果显示在这里。</li>
+          </ol>
+        </section>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-tts"></pre>
+        </details>
+      </section>
+

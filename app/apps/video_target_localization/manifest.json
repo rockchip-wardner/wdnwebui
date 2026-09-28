@@ -1,0 +1,72 @@
+{
+  "id": "video-target-localization",
+  "title": "视频目标定位",
+  "category": "video",
+  "description": "给定文本描述，定位图像中目标区域 (LocateAnything-3B 视觉定位模型)",
+  "version": "0.1.0",
+  "preview_video": "/static/apps/video-target-localization/preview.mp4",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_grounding"
+  ],
+  "hardware_capabilities": [
+    "hwcap_video_input"
+  ],
+  "backend": {
+    "module": "app.apps.video_target_localization",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/video-target-localization/template.html",
+    "js": [
+      "/static/apps/video-target-localization/app.js"
+    ],
+    "css": [
+      "/static/apps/video-target-localization/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "session.state",
+      "detector.enabled"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-target-localization/close"
+      },
+      {
+        "method": "POST",
+        "path": "/api/video-target-localization/prompt/stop"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-target-localization/close"
+      },
+      {
+        "method": "POST",
+        "path": "/api/video-target-localization/prompt/stop"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "LocatorDoc",
+    "editable_fields": [
+      {
+        "name": "desc",
+        "label": "LocatorDoc.desc 字段描述"
+      }
+    ],
+    "prompt_template": "请在画面中定位以下目标。"
+  },
+  "requires_core": [
+    "compute.registry",
+    "llm.detector_base",
+    "video.session"
+  ],
+  "uploads_dir": "uploads/video_target_localization",
+  "display_order": 3
+}

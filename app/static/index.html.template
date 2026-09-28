@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>守望者系统演示</title>
+  <link rel="stylesheet" href="/static/core/framework.css" />
+  
+  
+  
+  {{ card_css_links }}
+  <script>
+    window.__APP_MANIFESTS__ = {{ app_manifests }};
+  </script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <!-- SVG sprite（7 个 nav-icon：1 个应用 + 6 个系统，统一 viewBox 24×24，颜色继承 currentColor） -->
+      <svg class="icon-sprite" aria-hidden="true" focusable="false">
+        <symbol id="i-app-list" viewBox="0 0 24 24">
+          <path d="M4 6h16M4 12h16M4 18h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="20" cy="6" r="1.2" fill="currentColor"/>
+          <circle cx="20" cy="12" r="1.2" fill="currentColor"/>
+          <circle cx="18" cy="18" r="1.2" fill="currentColor"/>
+        </symbol>
+        <symbol id="i-sys-info" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/>
+          <path d="M12 12l4-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="12" cy="12" r="1.5"/>
+        </symbol>
+        <symbol id="i-sys-config" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a6.983 6.983 0 010 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.957 6.957 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.902 6.902 0 01-.22-.127c-.325-.196-.72-.257-1.075-.124l-1.217.456a1.125 1.125 0 01-1.37-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.429-.992a6.992 6.992 0 010-.254c.008-.378-.137-.75-.43-.992l-1.003-.827a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </symbol>
+        <symbol id="i-sys-compute" viewBox="0 0 24 24">
+          <path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/>
+        </symbol>
+        <symbol id="i-sys-discovery" viewBox="0 0 24 24">
+          <circle cx="6" cy="6" r="2.5"/>
+          <circle cx="18" cy="6" r="2.5"/>
+          <circle cx="12" cy="18" r="2.5"/>
+          <path d="M8 6h8M7.5 7.5l4 9M16.5 7.5l-4 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </symbol>
+        <symbol id="i-sys-bridge" viewBox="0 0 24 24">
+          <path d="M3 8h14M14 5l3 3-3 3M21 16H7M7 13l-3 3 3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </symbol>
+        <symbol id="i-sys-logs" viewBox="0 0 24 24">
+          <path d="M4 6h16M4 12h16M4 18h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </symbol>
+      </svg>
+
+      <nav class="nav">
+      <a href="#apps" data-page="apps" class="nav-item nav-item--icon" title="应用面板" aria-label="应用面板"><svg class="nav-icon" aria-hidden="true"><use href="#i-app-list"/></svg><span class="nav-text">应用面板</span></a>
+      <hr class="nav-divider" />
+      <a href="#system-monitor"  data-page="system-monitor"  class="nav-item nav-item--icon" title="系统信息" aria-label="系统信息"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-info"/></svg><span class="nav-text">系统信息</span></a>
+      <a href="#base-config"     data-page="base-config"     class="nav-item nav-item--icon" title="系统配置" aria-label="系统配置"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-config"/></svg><span class="nav-text">系统配置</span></a>
+      <a href="#compute-config"  data-page="compute-config"  class="nav-item nav-item--icon" title="算力配置" aria-label="算力配置"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-compute"/></svg><span class="nav-text">算力配置</span></a>
+      <a href="#discovery"       data-page="discovery"       class="nav-item nav-item--icon" title="注册发现" aria-label="注册发现"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-discovery"/></svg><span class="nav-text">注册发现</span></a>
+      <a href="#im-bridge"       data-page="im-bridge"       class="nav-item nav-item--icon" title="应用对接" aria-label="应用对接"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-bridge"/></svg><span class="nav-text">应用对接</span></a>
+      <a href="#system-logs"     data-page="system-logs"     class="nav-item nav-item--icon" title="系统日志" aria-label="系统日志"><svg class="nav-icon" aria-hidden="true"><use href="#i-sys-logs"/></svg><span class="nav-text">系统日志</span></a>
+      </nav>
+
+      <div class="brand">
+        <span class="brand-title">守望者系统演示</span>
+        <div class="brand-meta" tabindex="0" aria-label="组件版本">
+          <span class="brand-subtitle">Wardner</span>
+          <span class="brand-version" id="brand-version">v0.7.0</span>
+          <div class="brand-components" id="brand-components" role="tooltip">
+            <div class="brand-component-row">
+              <span class="brand-component-name">wdnai</span>
+              <span class="brand-component-version" data-component="wdnai">—</span>
+            </div>
+            <div class="brand-component-row">
+              <span class="brand-component-name">wdnav</span>
+              <span class="brand-component-version" data-component="wdnav">—</span>
+            </div>
+            <div class="brand-component-row">
+              <span class="brand-component-name">wdndds</span>
+              <span class="brand-component-version" data-component="wdndds">—</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-foot">
+        <button class="power-btn" id="power-btn" type="button"
+                title="电源操作" aria-label="电源操作" aria-haspopup="dialog">
+          <span class="power-btn-icon" aria-hidden="true">⏻</span>
+        </button>
+        <button class="config-btn" id="config-btn" type="button"
+                title="配置管理" aria-label="配置管理" aria-haspopup="dialog">
+          <span class="config-btn-icon" aria-hidden="true">⚙</span>
+        </button>
+        <button class="coprocessor-btn" id="coprocessor-btn" type="button"
+                title="协处理器管理" aria-label="协处理器管理" aria-haspopup="dialog">
+          <span class="coprocessor-btn-icon" aria-hidden="true">⚒</span>
+        </button>
+
+        <div id="power-popover" class="power-popover hidden" role="dialog" aria-label="电源操作">
+          <div class="power-popover-head">
+            <span class="power-popover-title">电源操作</span>
+            <button class="power-popover-close" id="power-popover-close" type="button"
+                    aria-label="关闭">×</button>
+          </div>
+          <div class="power-popover-body">
+            <button class="power-popover-action" data-action="shutdown" type="button">
+              <span class="power-popover-icon" aria-hidden="true">⏻</span>
+              <span class="power-popover-label">关机</span>
+            </button>
+            <button class="power-popover-action" data-action="reboot" type="button">
+              <span class="power-popover-icon" aria-hidden="true">↻</span>
+              <span class="power-popover-label">重启</span>
+            </button>
+          </div>
+          <div class="power-popover-foot" id="power-popover-status">点击操作前请确认</div>
+        </div>
+
+        <div id="config-popover" class="config-popover hidden" role="dialog" aria-label="配置管理">
+          <div class="config-popover-head">
+            <span class="config-popover-title">配置管理</span>
+            <button class="config-popover-close" id="config-popover-close" type="button"
+                    aria-label="关闭">×</button>
+          </div>
+          <div class="config-popover-body">
+            <button class="config-popover-action" data-config-action="export" type="button">
+              <span class="config-popover-icon" aria-hidden="true">⤓</span>
+              <span class="config-popover-label">导出配置</span>
+            </button>
+            <button class="config-popover-action" data-config-action="import" type="button">
+              <span class="config-popover-icon" aria-hidden="true">⤒</span>
+              <span class="config-popover-label">导入配置</span>
+            </button>
+          </div>
+          <div class="config-popover-foot" id="config-popover-foot">
+            <span class="config-popover-path" id="config-popover-path">--</span>
+            <span class="config-popover-status" id="config-popover-status"></span>
+          </div>
+          <input id="config-file-input" type="file" accept="application/json,.json"
+                 class="hidden" />
+        </div>
+
+        <div id="coprocessor-popover" class="coprocessor-popover hidden" role="dialog" aria-label="协处理器管理">
+          <div class="coprocessor-popover-head">
+            <span class="coprocessor-popover-title">协处理器管理</span>
+            <button class="coprocessor-popover-close" id="coprocessor-popover-close" type="button"
+                    aria-label="关闭">×</button>
+          </div>
+          <div class="coprocessor-popover-body">
+            <button class="coprocessor-popover-action" data-coprocessor-action="restart" type="button">
+              <span class="coprocessor-popover-icon" aria-hidden="true">↻</span>
+              <span class="coprocessor-popover-label">重启所有协处理器</span>
+            </button>
+          </div>
+          <div class="coprocessor-popover-foot" id="coprocessor-popover-foot">点击操作前请确认</div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div id="root-warning" class="root-warning hidden" role="alert">
+        <span class="root-warning-icon" aria-hidden="true">⚠</span>
+        <span class="root-warning-text">
+          当前服务未以 <strong>root</strong> 身份运行，电源控制（关机 / 重启）功能将受限或不可用。请使用
+          <code>sudo python run.py</code> 启动服务后再使用本系统。
+        </span>
+      </div>
+
+      <section id="page-apps" class="page" data-page="apps">
+        <div class="apps-grid" id="apps-grid">
+          <!-- Populated by /static/core/framework.js from window.__APP_MANIFESTS__.cards -->
+        </div>
+      </section>
+
+      <section id="page-system-monitor"  class="page hidden" data-page="system-monitor">
+        <header class="page-header">
+          <h2>系统信息</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="system-monitor-time"></span>
+            <button class="refresh-btn" data-refresh>刷新</button>
+          </div>
+        </header>
+
+        <div class="metric-grid">
+          <div class="metric-card" id="card-cpu">
+            <div class="metric-head">
+              <span class="metric-label">CPU 占用</span>
+              <span class="metric-value" id="cpu-percent">--</span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="cpu-bar"></div></div>
+            <div class="metric-sub" id="cpu-meta"></div>
+            <div class="core-grid" id="cpu-cores"></div>
+          </div>
+
+          <div class="metric-card" id="card-mem">
+            <div class="metric-head">
+              <span class="metric-label">内存占用</span>
+              <span class="metric-value" id="mem-percent">--</span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="mem-bar"></div></div>
+            <div class="metric-sub" id="mem-meta"></div>
+          </div>
+
+          <div class="metric-card" id="card-disk">
+            <div class="metric-head">
+              <span class="metric-label">磁盘剩余</span>
+              <span class="metric-value" id="disk-percent">--</span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="disk-bar"></div></div>
+            <div class="metric-sub" id="disk-meta"></div>
+          </div>
+        </div>
+
+        <section class="thermal-section">
+          <header class="section-header">
+            <h3>温控温度</h3>
+            <span class="badge" id="thermal-badge">--</span>
+            <span class="thermal-scale" aria-hidden="true">
+              <span class="thermal-scale-tick" style="left:0%">−40°</span>
+              <span class="thermal-scale-tick" style="left:36.4%">0°</span>
+              <span class="thermal-scale-tick" style="left:100%">85°</span>
+            </span>
+          </header>
+          <div class="thermal-range-info">
+            <span>工规范围 −40°C ~ 85°C</span>
+            <span>&lt; 0°C 低温告警 · 70°C 黄 · 80°C 橙 · ≥ 85°C 红</span>
+          </div>
+          <div id="thermal-message" class="npu-message hidden"></div>
+          <div class="thermal-grid" id="thermal-grid">
+            <div class="thermal-empty">加载中…</div>
+          </div>
+        </section>
+
+        <section class="npu-section">
+          <header class="section-header">
+            <h3>算力卡信息</h3>
+            <span class="badge" id="npu-badge">--</span>
+          </header>
+          <div id="npu-message" class="npu-message hidden"></div>
+          <div class="npu-grid" id="npu-grid">
+            <div class="npu-empty">加载中…</div>
+          </div>
+          <details class="raw-output">
+            <summary>完整 JSON</summary>
+            <pre id="npu-raw"></pre>
+          </details>
+        </section>
+
+        <section class="worker-section">
+          <header class="section-header">
+            <h3>Worker 进程</h3>
+            <span class="badge" id="worker-badge">--</span>
+          </header>
+          <div id="worker-message" class="npu-message hidden"></div>
+          <div class="worker-table-wrap">
+            <table class="worker-table">
+              <thead>
+                <tr>
+                  <th>PID</th>
+                  <th>PPID</th>
+                  <th>comm</th>
+                  <th>model</th>
+                  <th>状态</th>
+                  <th>RSS</th>
+                  <th>启动时间</th>
+                </tr>
+              </thead>
+              <tbody id="worker-tbody">
+                <tr class="worker-empty"><td colspan="7">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <details class="raw-output">
+            <summary>完整 JSON</summary>
+            <pre id="worker-raw"></pre>
+          </details>
+        </section>
+
+        <section class="daemon-section">
+          <header class="section-header">
+            <h3>在网设备（FastDDS SIMPLE discovery）</h3>
+            <span class="badge" id="discovery-badge">--</span>
+          </header>
+          <div id="discovery-message" class="npu-message hidden"></div>
+          <div class="daemon-table-wrap">
+            <table class="daemon-table">
+              <thead>
+                <tr>
+                  <th>项</th>
+                  <th>值</th>
+                </tr>
+              </thead>
+              <tbody id="discovery-tbody">
+                <tr class="daemon-empty"><td colspan="2">加载中…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <h4 style="margin-top:1rem;font-size:0.95rem;">已发现 peer</h4>
+          <div class="daemon-table-wrap">
+            <table class="daemon-table">
+              <thead>
+                <tr>
+                  <th>GUID</th>
+                  <th>名称</th>
+                  <th>IP</th>
+                  <th>发现时间</th>
+                </tr>
+              </thead>
+              <tbody id="discovery-peers-tbody">
+                <tr class="daemon-empty"><td colspan="4">暂无 peer</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <details class="raw-output">
+            <summary>完整 JSON</summary>
+            <pre id="discovery-raw"></pre>
+          </details>
+        </section>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-system-monitor"></pre>
+        </details>
+      </section>
+
+      <section id="page-base-config" class="page hidden" data-page="base-config">
+        <header class="page-header">
+          <h2>系统配置</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="base-config-path">--</span>
+            <button class="refresh-btn" id="base-config-refresh">刷新</button>
+          </div>
+        </header>
+
+        <form class="bc-form" id="base-config-form" autocomplete="off">
+          <section class="bc-section" id="bc-section-base">
+            <header class="bc-section-head">
+              <h3>基础配置</h3>
+            </header>
+
+            <div class="bc-kv-row">
+              <div class="bc-kv-label">设备名</div>
+              <div class="bc-kv-value">
+                <span class="bc-kv-input-wrap">
+                  <input type="text" id="bc-device-name" name="device_name"
+                         class="bc-input"
+                         placeholder="例如 aB3kQ9xZ"
+                         spellcheck="false"
+                         autocomplete="off"
+                         maxlength="64" />
+                </span>
+                <span class="bc-hint">网络中注册发现的名字</span>
+              </div>
+            </div>
+
+            <div class="bc-kv-row">
+              <div class="bc-kv-label">模型目录</div>
+              <div class="bc-kv-value">
+                <span class="bc-kv-input-wrap">
+                  <input type="text" id="bc-model-path" name="model_path"
+                         class="bc-input"
+                         placeholder="/userdata/models/"
+                         spellcheck="false" />
+                  <span class="bc-status" id="bc-model-path-status">--</span>
+                </span>
+                <span class="bc-hint">RKNN 模型权重存放的绝对路径 (以 / 开头)</span>
+              </div>
+            </div>
+
+            <div class="bc-kv-row">
+              <div class="bc-kv-label">资源目录</div>
+              <div class="bc-kv-value">
+                <span class="bc-kv-input-wrap">
+                  <input type="text" id="bc-resource-dir" name="resource_dir"
+                         class="bc-input"
+                         placeholder="/userdata"
+                         spellcheck="false" />
+                  <span class="bc-status" id="bc-resource-dir-status">--</span>
+                </span>
+                <span class="bc-hint">视频检测"浏览设备"将以该目录为根 (绝对路径，以 / 开头)</span>
+              </div>
+            </div>
+
+            <div class="bc-kv-row bc-kv-row--hw" id="bc-hw-caps-section">
+              <div class="bc-kv-label">硬件能力 (HW)</div>
+              <div class="bc-kv-value">
+                <div class="bc-hw-caps-list" id="bc-hw-caps-list">
+                  <div class="bc-status">加载中…</div>
+                </div>
+                <span class="bc-hint">本机对外公开的硬件能力；与"注册发现"页同步。取消勾选会从 <code>config.jsonc["base"]["hardware_capabilities"]</code> 写入 <code>false</code>；保存后立即生效。</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="bc-section" id="bc-section-compute-services">
+            <header class="bc-section-head">
+              <h3>算力实例列表</h3>
+            </header>
+            <div class="bc-cs-table-wrap">
+              <table class="bc-cs-table">
+                <thead>
+                  <tr>
+                    <th class="bc-cs-col-name">name</th>
+                    <th class="bc-cs-col-label">label</th>
+                    <th class="bc-cs-col-autostart">autostart</th>
+                    <th class="bc-cs-col-device">device</th>
+                  </tr>
+                </thead>
+                <tbody id="bc-cs-tbody">
+                  <!-- rows dynamically rendered by Base.loadServices() -->
+                </tbody>
+              </table>
+            </div>
+            <div class="bc-meta">
+              <span class="bc-hint"><code>autostart</code> 三选一：<code>disabled</code>（默认手动启）/ <code>enabled</code>（boot spawn+bind）/ <code>hidden</code>（算力配置页不显示）；<code>device</code> 三选一：<code>0</code> 主控 / <code>1</code> 182x#0 / <code>2</code> 182x#1（仅作为 UI radio 默认 + autostart 启动时的 NPU hint，不是硬绑）。</span>
+            </div>
+          </section>
+
+          <section class="bc-section" id="bc-section-app-prompts">
+            <header class="bc-section-head">
+              <h3>App 提示词模板</h3>
+            </header>
+            <h4>音视频描述 (VLMDoc)</h4>
+            <div class="bc-fields-row">
+              <div class="bc-field">
+                <label class="bc-label" for="bc-prompts-vd-text">text 描述</label>
+                <textarea id="bc-prompts-vd-text" class="bc-input bc-textarea" rows="2" maxlength="4096"></textarea>
+              </div>
+              <div class="bc-field">
+                <label class="bc-label" for="bc-prompts-vd-level">level 描述</label>
+                <textarea id="bc-prompts-vd-level" class="bc-input bc-textarea" rows="2" maxlength="4096"></textarea>
+              </div>
+            </div>
+            <h4>视频目标监控 (TargetDoc)</h4>
+            <div class="bc-field">
+              <label class="bc-label" for="bc-prompts-vtd-desc">desc 描述</label>
+              <textarea id="bc-prompts-vtd-desc" class="bc-input bc-textarea" rows="3" maxlength="4096"></textarea>
+            </div>
+            <div class="bc-prompts-actions">
+              <span class="vd-spacer"></span>
+              <button type="button" class="vd-btn" id="bc-prompts-reset">还原默认</button>
+            </div>
+          </section>
+
+          <div class="bc-actions">
+            <span class="vd-spacer"></span>
+            <button type="button" class="vd-btn" id="bc-reload">放弃修改</button>
+            <button type="submit" class="vd-btn vd-btn-primary" id="bc-save">保存配置</button>
+          </div>
+          <div class="bc-foot" id="bc-foot"></div>
+        </form>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-base-config"></pre>
+        </details>
+      </section>
+
+      <section id="page-compute-config" class="page hidden" data-page="compute-config">
+        <header class="page-header">
+          <h2>算力配置</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="cc-collected-at">--</span>
+            <button class="refresh-btn" id="cc-refresh">刷新</button>
+            <button class="vd-btn" id="cc-stop-all">全部停止</button>
+          </div>
+        </header>
+
+        <div class="cc-mem-strip" id="cc-mem-strip">
+          <div class="cc-mem-empty">加载中…</div>
+        </div>
+
+        <div class="cc-banner-stack" id="cc-banner-stack"></div>
+        <div class="cc-grid">
+          <div class="cc-col cc-col-local">
+            <header class="cc-col-head">
+              <h3>本地算力</h3>
+              <span class="cc-col-hint">本机 spawn 的 compute_worker 进程（PID 可见）</span>
+            </header>
+            <div class="cc-services" id="cc-local-cards"></div>
+          </div>
+          <div class="cc-divider" aria-hidden="true"></div>
+          <div class="cc-col cc-col-peer">
+            <header class="cc-col-head">
+              <h3>网络算力</h3>
+              <span class="cc-col-hint">按远端设备分组（&lt;设备名&gt;@&lt;IP&gt;），每框内 4 张卡片；只读，不可启用 / 停用 / 重启</span>
+            </header>
+            <div class="cc-services cc-services-peer" id="cc-peer-cards">
+              <div class="cc-peer-empty" id="cc-peer-empty">
+                <div class="cc-peer-empty-text">
+                  尚未发现 LAN 上的 peer compute worker。<br/>
+                  确认其他设备已启动 compute_worker 进程后等待约 5 秒，或刷新本页。
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cc-foot" id="cc-foot"></div>
+      </section>
+
+      <section id="page-discovery" class="page hidden" data-page="discovery">
+        <header class="page-header">
+          <h2>注册发现</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="discovery-collected-at">--</span>
+            <button class="refresh-btn" id="discovery-refresh">刷新</button>
+          </div>
+        </header>
+
+        <section class="discovery-pane" data-pane="hw">
+          <header class="discovery-pane-head">
+            <h3>硬件能力 (HW)</h3>
+            <span class="discovery-pane-hint" id="discovery-hw-hint">--</span>
+            <div class="discovery-pane-actions">
+              <button class="vd-btn" id="discovery-hw-enable-all">全部启用</button>
+              <button class="vd-btn" id="discovery-hw-disable-all">全部禁用</button>
+              <button class="vd-btn vd-btn-primary" id="discovery-hw-save">保存修改</button>
+            </div>
+          </header>
+          <div class="discovery-summary" id="discovery-hw-summary"></div>
+          <div class="discovery-list" id="discovery-hw-list"></div>
+        </section>
+
+        <section class="discovery-pane" data-pane="sw">
+          <header class="discovery-pane-head">
+            <h3>软件能力 (SW)</h3>
+            <span class="discovery-pane-hint" id="discovery-sw-hint">--</span>
+          </header>
+          <div class="discovery-summary" id="discovery-sw-summary"></div>
+          <div class="discovery-list" id="discovery-list">
+            <div class="page-placeholder">
+              <div class="page-placeholder-icon" aria-hidden="true">⌖</div>
+              <div class="page-placeholder-title">等待算力实例</div>
+              <div class="page-placeholder-text">
+                启用 算力配置 中的实例后，这里会列出对应的能力。
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section id="page-im-bridge" class="page hidden" data-page="im-bridge">
+        <header class="page-header">
+          <h2>应用对接</h2>
+          <span class="page-header-sub">微信机器人（iLink）</span>
+        </header>
+
+        <div class="imb-grid">
+          <!-- ============== 登录面板 ============== -->
+          <section class="imb-card imb-card--login">
+            <header class="imb-card-head">
+              <h3>登录</h3>
+              <span class="imb-status" id="imb-status-badge" data-state="idle">未登录</span>
+            </header>
+
+            <div class="imb-card-body">
+              <dl class="imb-meta">
+                <dt>凭证路径</dt>
+                <dd id="imb-cred-path">--</dd>
+                <dt>user_id</dt>
+                <dd id="imb-user-id">--</dd>
+                <dt>long-poll</dt>
+                <dd id="imb-running">--</dd>
+                <dt>SDK</dt>
+                <dd id="imb-runtime">--</dd>
+              </dl>
+
+              <div class="imb-qr-wrap" id="imb-qr-wrap">
+                <div class="imb-qr-stage" id="imb-qr-stage"></div>
+                <div class="imb-qr-hint" id="imb-qr-hint">点击「登录」开始扫码</div>
+              </div>
+
+              <div class="imb-actions">
+                <button class="vd-btn" id="imb-login-btn"   type="button">登录</button>
+                <button class="vd-btn" id="imb-cancel-btn"  type="button" disabled>取消扫码</button>
+                <button class="vd-btn imb-btn--danger" id="imb-logout-btn" type="button" disabled>退出登录</button>
+                <span class="imb-error" id="imb-error"></span>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============== 调试收发 ============== -->
+          <section class="imb-card imb-card--chat">
+            <header class="imb-card-head">
+              <h3>调试收发</h3>
+              <span class="imb-meta-inline" id="imb-known-count">已知 0 人</span>
+            </header>
+
+            <div class="imb-card-body imb-card-body--chat">
+              <div class="imb-bridge-row">
+                <label class="imb-bridge-label" for="imb-llm-bridge">
+                  <input type="checkbox" id="imb-llm-bridge" />
+                  对接文字对话模型
+                </label>
+                <span class="imb-bridge-hint" id="imb-llm-bridge-hint"></span>
+              </div>
+
+              <div class="imb-conv">
+                <div class="imb-conv-title" id="imb-conv-title">消息记录</div>
+                <div class="imb-conv-list" id="imb-conv-list">
+                  <div class="imb-conv-msgs" id="imb-conv-msgs">
+                    <div class="page-placeholder imb-empty">
+                      <div class="page-placeholder-text">
+                        登录后会话与消息会出现在这里。<br/>
+                        发送默认发给本机 user_id（用于测试 round-trip）。
+                      </div>
+                    </div>
+                  </div>
+                  <button class="imb-jump-new hidden" id="imb-jump-new" type="button"
+                          title="跳到最新消息">
+                    <span class="imb-jump-new-arrow">↓</span>
+                    <span class="imb-jump-new-count" id="imb-jump-new-count">0 条新消息</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="imb-composer">
+                <textarea class="imb-textarea" id="imb-text-input" rows="2"
+                          placeholder="输入文本，Cmd/Ctrl + Enter 发送"></textarea>
+                <div class="imb-composer-actions">
+                  <button class="vd-btn" id="imb-send-btn"  type="button" disabled>发送</button>
+                  <button class="vd-btn" id="imb-clear-btn" type="button">清屏</button>
+                  <button class="vd-btn" id="imb-history-btn" type="button">历史</button>
+                  <span class="imb-status-inline" id="imb-chat-status"></span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- vendored QR encoder (~6KB) — 只 im-bridge 用到 -->
+        <script src="/static/core/qrcode.js"></script>
+      </section>
+
+      {% card_slot "video-detection" %}
+      {% card_slot "audio-analysis" %}
+
+      {% card_slot "video-target-detection" %}
+      {% card_slot "video-target-localization" %}
+      {% card_slot "video-content-search" %}
+      {% card_slot "video-file-analysis" %}
+      {% card_slot "tts" %}
+      {% card_slot "text-chat" %}
+      <section id="page-system-logs"     class="page hidden" data-page="system-logs">
+        <header class="page-header">
+          <h2>系统日志</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="system-logs-status">--</span>
+            <button class="refresh-btn" id="system-logs-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div class="logs-toolbar">
+          <label class="logs-field">
+            <span>服务单元</span>
+            <select id="logs-unit" class="logs-select">
+              <option value="">全部</option>
+            </select>
+          </label>
+          <label class="logs-field">
+            <span>最低等级</span>
+            <select id="logs-priority" class="logs-select">
+              <option value="">全部</option>
+              <option value="emerg">emerg</option>
+              <option value="alert">alert</option>
+              <option value="crit">crit</option>
+              <option value="err">err</option>
+              <option value="warning">warning</option>
+              <option value="notice">notice</option>
+              <option value="info">info</option>
+              <option value="debug">debug</option>
+            </select>
+          </label>
+          <label class="logs-field">
+            <span>行数</span>
+            <input type="number" id="logs-lines" class="logs-input" min="1" max="2000" step="50" value="100" />
+          </label>
+          <label class="logs-toggle">
+            <input type="checkbox" id="logs-follow" />
+            <span>追踪新日志 (-f)</span>
+          </label>
+          <span class="vd-spacer"></span>
+          <span class="logs-counter" id="logs-counter">0 条</span>
+          <button class="vd-btn" id="logs-clear">清屏</button>
+        </div>
+
+        <div class="logs-stage">
+          <ol class="logs-list" id="logs-list"></ol>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-system-logs"></pre>
+        </details>
+      </section>
+
+      </main>
+  </div>
+
+  <!-- DemoGuard: 演示页离开确认 modal（三按钮） -->
+  <div id="dg-modal" class="dg-modal hidden" role="dialog" aria-modal="true" aria-label="离开确认">
+    <div class="dg-modal-card">
+      <div class="dg-modal-head">
+        <span class="dg-modal-title" id="dg-modal-title">后台任务运行中</span>
+      </div>
+      <div class="dg-modal-body">
+        <p id="dg-modal-msg"></p>
+      </div>
+      <div class="dg-modal-foot">
+        <button class="vd-btn" id="dg-btn-cancel">取消</button>
+        <button class="vd-btn dg-btn-keep" id="dg-btn-keep">保持后台运行</button>
+        <button class="vd-btn vd-btn-primary" id="dg-btn-stop">停止并离开</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/system/system.js" defer></script>
+  <script src="/static/core/framework.js" defer></script>
+  <script src="/static/core/fs-modal.js" defer></script>
+  <script src="/static/core/model-pick.js" defer></script>
+  <script src="/static/core/format-utils.js" defer></script>
+</body>
+</html>

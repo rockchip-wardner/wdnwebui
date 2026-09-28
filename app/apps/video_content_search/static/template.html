@@ -1,0 +1,301 @@
+      <section id="page-video-content-search" class="page hidden" data-page="video-content-search">
+        <header class="page-header">
+          <h2>视频内容检索</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="vcs-status">就绪</span>
+            <button class="refresh-btn" id="vcs-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div id="vcs-error-banner" class="vfa-error-banner hidden" role="alert">
+          <span class="vfa-error-icon" aria-hidden="true">⚠</span>
+          <span class="vfa-error-text" id="vcs-error-text"></span>
+          <button class="vfa-error-close" id="vcs-error-close" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <div class="vcs-layout">
+          <!-- 左控制台 -->
+          <form class="surv-form" id="vcs-form" autocomplete="off" onsubmit="return false;">
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>视频源</h3>
+                <span class="surv-hint">设备端本地文件</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-input-row">
+                  <input type="text" id="vcs-source" class="surv-input"
+                         placeholder="例如 /userdata/clips/sample.mp4" spellcheck="false" />
+                  <button type="button" class="vd-btn" id="vcs-browse">浏览…</button>
+                </div>
+                <div class="vd-actions-row">
+                  <span class="vd-meta" id="vcs-source-meta">尚未选择</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>切片参数</h3>
+                <span class="surv-hint">切片 embedding 窗口</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-detect-row">
+                  <label class="surv-input-split">
+                    <span>切片时长</span>
+                    <select id="vcs-chunk-seconds" class="surv-input">
+                      <option value="3">3 秒</option>
+                      <option value="4" selected>4 秒</option>
+                      <option value="5">5 秒</option>
+                      <option value="6">6 秒</option>
+                    </select>
+                  </label>
+                  <label class="surv-input-split">
+                    <span>重叠</span>
+                    <select id="vcs-chunk-overlap" class="surv-input">
+                      <option value="1" selected>1 秒</option>
+                      <option value="2">2 秒</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>操作</h3>
+                <span class="surv-hint" id="vcs-runtime">未启动</span>
+              </header>
+              <div class="surv-field">
+                <div class="vd-actions-row">
+                  <button type="button" class="vd-btn vd-btn-primary" id="vcs-start">开始提取</button>
+                  <button type="button" class="vd-btn" id="vcs-stop" disabled>停止</button>
+                </div>
+                <div class="vcs-progress" id="vcs-progress" hidden>
+                  <div class="vcs-progress-meta">
+                    <span id="vcs-progress-label">已嵌入 0/0 切片</span>
+                    <span id="vcs-progress-pct">0%</span>
+                  </div>
+                  <div class="vcs-track">
+                    <div class="vcs-track-fill" id="vcs-progress-fill"></div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>已缓存视频</h3>
+                <span class="surv-hint">历史分析结果</span>
+              </header>
+              <div class="surv-field">
+                <div class="vcs-cache-window" id="vcs-cache-window">
+                  <div class="vcs-cache-head">
+                    <span>已缓存视频 (<span id="vcs-cache-count">0</span>)</span>
+                    <div class="vcs-cache-actions">
+                      <button type="button" class="vcs-cache-clear" id="vcs-clear-cache"
+                              title="一键删除全部已缓存的视频分析结果（含微信渠道条目；清空后重发/重选视频需重新分析）">清空缓存</button>
+                      <button type="button" class="vcs-cache-refresh" id="vcs-cache-refresh"
+                              title="刷新缓存列表" tabindex="-1">⭘</button>
+                    </div>
+                  </div>
+                  <div class="vcs-cache-rows" id="vcs-cache-rows"></div>
+                  <div class="vcs-cache-empty" id="vcs-cache-empty">
+                    加载中…
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section vd-grow">
+              <header class="surv-form-head">
+                <h3>检索问题</h3>
+                <span class="surv-hint">最多 50 字</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-detect-row">
+                   <label class="surv-input-split">
+                     <span>匹配阈值 (0–1.0)</span>
+                     <input type="number" id="vcs-threshold" class="surv-input"
+                            min="0" max="1" step="0.01" value="0.40" />
+                   </label>
+                  <label class="surv-input-split">
+                    <span>检索上限 (1–10)</span>
+                    <input type="number" id="vcs-top-k" class="surv-input"
+                           min="1" max="10" step="1" value="10" />
+                  </label>
+                </div>
+                <div class="vcs-ta-wrap">
+                  <textarea id="vcs-text" class="surv-input surv-textarea" maxlength="50"
+                            placeholder="例如：有人在搬箱子 / 货车驶入 / 穿红色衣服的人"></textarea>
+                  <span class="vcs-ta-count" id="vcs-ta-count">0 / 50</span>
+                </div>
+                <label class="vcs-lenient-row">
+                  <input type="checkbox" id="vcs-lenient" />
+                  <span>宽松匹配（所有选中视频合计无命中时，全局补回最接近的 top-<span id="vcs-lenient-k">10</span> 条，无视阈值，标"低于阈值"）</span>
+                </label>
+                <div class="vd-actions-row">
+                  <button type="button" class="vd-btn vd-btn-primary" id="vcs-query" disabled>检索</button>
+                  <span class="vd-meta" id="vcs-query-meta"></span>
+                </div>
+              </div>
+            </section>
+          </form>
+
+          <!-- 右工作区 -->
+          <div class="vd-stage-col">
+            <div class="vd-stage">
+              <canvas id="vcs-canvas" width="960" height="540"></canvas>
+              <div class="vd-overlay" id="vcs-overlay">选择视频并开始提取，检索后点击命中片段在此播放</div>
+            </div>
+
+            <div class="vd-controls">
+              <button id="vcs-play"     class="vd-btn" disabled>▶ 播放</button>
+              <button id="vcs-pause"    class="vd-btn" disabled>⏸ 暂停</button>
+              <button id="vcs-stop-play" class="vd-btn" disabled>⏹ 停止</button>
+              <span class="vd-meta" id="vcs-player-tag">未播放</span>
+              <span class="vd-spacer"></span>
+              <span class="vd-meta" id="vcs-player-time">--</span>
+            </div>
+            <div class="vd-progress">
+              <div class="vd-progress-bar" id="vcs-player-progress"></div>
+            </div>
+
+            <section class="vcs-results">
+              <header class="vd-section-head">
+                <h3>命中结果</h3>
+                <span class="vd-spacer"></span>
+                <span class="vd-meta" id="vcs-results-count">0 条</span>
+                <button class="vd-btn" id="vcs-results-clear">清空</button>
+              </header>
+              <ol class="vcs-results-list" id="vcs-results-list">
+                <li class="vcs-results-empty">完成提取后输入问题检索，命中片段显示在这里。</li>
+              </ol>
+            </section>
+          </div>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-content-search"></pre>
+        </details>
+      </section>
+
+      <div id="vfa-query" class="vfa-query hidden" role="dialog" aria-modal="true">
+        <div class="vfa-query-card">
+          <div class="vfa-query-head">
+            <div class="vfa-query-title">
+              <span class="vfa-query-title-main">反查</span>
+              <span class="vfa-query-title-sub" id="vfa-query-source">--</span>
+            </div>
+            <button class="vfa-query-close" id="vfa-query-close" aria-label="关闭">×</button>
+          </div>
+
+          <div class="vfa-query-form">
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">场景</label>
+              <select class="vfa-query-select" id="vfa-query-scene">
+                <option value="">不限</option>
+              </select>
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">人物</label>
+              <div class="vfa-query-chips" id="vfa-query-actors">
+                <span class="vfa-query-empty">（加载中…）</span>
+              </div>
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">物体</label>
+              <div class="vfa-query-chips" id="vfa-query-objects">
+                <span class="vfa-query-empty">（加载中…）</span>
+              </div>
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">动作</label>
+              <div class="vfa-query-chips" id="vfa-query-actions">
+                <span class="vfa-query-empty">（加载中…）</span>
+              </div>
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">精准匹配 <span class="vfa-query-hint">（完整字符串）</span></label>
+              <input type="text" class="vfa-query-input" id="vfa-query-exact"
+                     placeholder="完整匹配查询字符串（如：出租车 / 雨天 / 穿红衣）" />
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">模糊搜索 <span class="vfa-query-hint">（n-gram 跨字段）</span></label>
+              <input type="text" class="vfa-query-input" id="vfa-query-q"
+                     placeholder="切 2-gram 模糊匹配（如：雨天 / 穿红衣 / 门岗）" />
+            </div>
+            <div class="vfa-query-row">
+              <label class="vfa-query-label">
+                时间范围
+                <span class="vfa-query-hint" id="vfa-query-range-hint">（共 00:00）</span>
+              </label>
+              <div class="vfa-query-range">
+                <input type="text" inputmode="numeric"
+                       class="vfa-query-input vfa-query-range-min" id="vfa-query-time-min"
+                       placeholder="起始 (00:00:00)" autocomplete="off" />
+                <span class="vfa-query-range-sep">~</span>
+                <input type="text" inputmode="numeric"
+                       class="vfa-query-input vfa-query-range-max" id="vfa-query-time-max"
+                       placeholder="结束 (00:01:13)" autocomplete="off" />
+              </div>
+              <div class="vfa-query-clamp-notice hidden" id="vfa-query-clamp-notice"
+                   role="status" aria-live="polite">
+                <span class="vfa-query-clamp-icon" aria-hidden="true">ⓘ</span>
+                <span id="vfa-query-clamp-text"></span>
+              </div>
+            </div>
+            <div class="vfa-query-actions">
+              <button class="vd-btn" id="vfa-query-clear">清空筛选</button>
+              <button class="vd-btn vd-btn-primary" id="vfa-query-run">反查</button>
+            </div>
+          </div>
+
+          <div class="vfa-query-results">
+            <div class="vfa-query-summary" id="vfa-query-summary">选择筛选条件后点击「反查」</div>
+            <ol class="vfa-query-list" id="vfa-query-list"></ol>
+          </div>
+        </div>
+      </div>
+
+      <div id="vfa-frame-modal" class="vfa-frame-modal hidden" role="dialog" aria-modal="true" aria-label="原始帧预览">
+        <div class="vfa-frame-modal-card">
+          <div class="vfa-frame-modal-head">
+            <div class="vfa-frame-modal-title">
+              <span class="vfa-frame-modal-title-main">原始帧</span>
+              <span class="vfa-frame-modal-title-sub" id="vfa-frame-modal-meta">--</span>
+            </div>
+            <button class="vfa-frame-modal-close" id="vfa-frame-modal-close" aria-label="关闭">×</button>
+          </div>
+          <div class="vfa-frame-modal-body">
+            <div class="vfa-frame-modal-img-wrap" id="vfa-frame-modal-img-wrap">
+              <div class="vfa-frame-modal-loading" id="vfa-frame-modal-loading">从原始视频取帧中…</div>
+              <img class="vfa-frame-modal-img hidden" id="vfa-frame-modal-img" alt="" />
+            </div>
+            <div class="vfa-frame-modal-info">
+              <div class="vfa-frame-modal-info-row">
+                <span class="vfa-frame-modal-info-label">帧位置</span>
+                <span id="vfa-frame-modal-frame-pos">--</span>
+              </div>
+              <div class="vfa-frame-modal-info-row">
+                <span class="vfa-frame-modal-info-label">该帧时间戳</span>
+                <span id="vfa-frame-modal-timestamp">--</span>
+              </div>
+              <div class="vfa-frame-modal-info-row">
+                <span class="vfa-frame-modal-info-label">原始视频</span>
+                <span class="vfa-frame-modal-info-source" id="vfa-frame-modal-source">--</span>
+              </div>
+              <div class="vfa-frame-modal-info-row vfa-frame-modal-info-text-wrap">
+                <span class="vfa-frame-modal-info-label">画面描述</span>
+                <div class="vfa-frame-modal-info-text" id="vfa-frame-modal-text">--</div>
+              </div>
+              <div class="vfa-frame-modal-info-row vfa-frame-modal-info-text-wrap">
+                <span class="vfa-frame-modal-info-label">结构化</span>
+                <div class="vfa-frame-modal-info-text" id="vfa-frame-modal-structured">--</div>
+              </div>
+            </div>
+          </div>
+          <div class="vfa-frame-modal-error hidden" id="vfa-frame-modal-error"></div>
+        </div>
+      </div>
+

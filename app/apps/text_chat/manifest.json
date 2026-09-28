@@ -1,0 +1,56 @@
+{
+  "id": "text-chat",
+  "title": "文本对话",
+  "category": "chat",
+  "description": "通用大语言模型对话，支持多轮上下文",
+  "version": "0.1.0",
+  "preview_video": "/static/apps/text-chat/preview.mp4",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_text_chat"
+  ],
+  "hardware_capabilities": [],
+  "backend": {
+    "module": "app.apps.text_chat",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/text-chat/template.html",
+    "js": [
+      "/static/apps/text-chat/app.js"
+    ],
+    "css": [
+      "/static/apps/text-chat/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "session.busy",
+      "session.running",
+      "session.state"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/text-chat/stop"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/text-chat/stop"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "",
+    "editable_fields": [],
+    "prompt_template": ""
+  },
+  "requires_core": [
+    "compute.registry"
+  ],
+  "uploads_dir": "uploads/text_chat",
+  "display_order": 6
+}

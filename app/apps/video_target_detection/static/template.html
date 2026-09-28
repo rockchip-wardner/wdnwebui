@@ -1,0 +1,116 @@
+      <section id="page-video-target-detection" class="page hidden" data-page="video-target-detection">
+        <header class="page-header">
+          <h2>视频目标监控</h2>
+          <button class="refresh-btn" data-refresh>刷新</button>
+        </header>
+
+        <div class="vd-layout">
+          <div class="vd-stage-col">
+            <div class="vd-stage">
+              <canvas id="vtd-canvas" width="960" height="540"></canvas>
+              <div class="vd-overlay" id="vtd-overlay"></div>
+              <div class="vd-event-badge hidden" id="vtd-event-badge">
+                <span class="vd-event-badge-text" id="vtd-event-badge-text"></span>
+              </div>
+            </div>
+
+            <div class="vd-controls">
+              <button id="vtd-play"  class="vd-btn">▶ 播放</button>
+              <button id="vtd-pause" class="vd-btn">⏸ 暂停</button>
+              <button id="vtd-stop"  class="vd-btn">⏹ 停止</button>
+              <span class="vd-spacer"></span>
+              <span class="vd-meta" id="vtd-meta">--</span>
+            </div>
+
+            <div class="vd-progress">
+              <div class="vd-progress-bar" id="vtd-progress"></div>
+            </div>
+          </div>
+
+          <aside class="vd-side">
+            <form class="surv-form" id="vtd-form" autocomplete="off" onsubmit="return false;">
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>视频源</h3>
+                </header>
+                <div class="surv-field">
+                  <div class="surv-input-row">
+                    <input type="text" id="vtd-source" class="surv-input"
+                           placeholder="网络流或本地文件/文件夹" spellcheck="false" />
+                    <button type="button" class="vd-btn" id="vtd-browse">浏览…</button>
+                  </div>
+                  <div class="vd-actions-row">
+                    <button type="button" class="vd-btn vd-btn-primary" id="vtd-open">打开</button>
+                    <button type="button" class="vd-btn" id="vtd-close">关闭</button>
+                    <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
+                      <input type="checkbox" id="vtd-loop" />
+                      <span>循环播放</span>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section class="surv-form-section vd-grow">
+                <header class="surv-form-head">
+                  <h3>检测提示词</h3>
+                  <span class="surv-hint" id="vtd-detector-status">未启动</span>
+                </header>
+                <div class="surv-field">
+                  <div class="vd-model-pick-row">
+                    <label class="vd-detector-label">模型
+                      <select id="vtd-model-pick" class="surv-input vd-model-pick"
+                              data-capability="swcap_video_describe">
+                        <option value="">自动 (本机优先)</option>
+                      </select>
+                    </label>
+                  </div>
+                  <textarea id="vtd-prompt" class="surv-input surv-textarea"
+                            placeholder="例如：描述画面中需要标注的目标位置，直接返回 0–1000 归一化 ROI 坐标 x1,y1,x2,y2 和该 ROI 内的描述文本"></textarea>
+                  <div class="vd-detector-row">
+                    <label class="vd-detector-label">
+                      隔
+                      <input type="number" id="vtd-every-n" min="1" max="600" step="1" value="30" />
+                      帧
+                    </label>
+                    <button type="button" class="vd-btn vd-btn-primary" id="vtd-detector-start">启动检测</button>
+                    <button type="button" class="vd-btn" id="vtd-detector-stop" disabled>停止检测</button>
+                  </div>
+                </div>
+              </section>
+
+              <section class="surv-form-section">
+                <header class="surv-form-head">
+                  <h3>检测尺寸</h3>
+                </header>
+                <div class="surv-field">
+                  <label class="surv-input-split">
+                    <select id="vtd-detect-size" class="surv-input">
+                      <option value="auto" selected>自动选择</option>
+                      <option value="384">384x384 (更快)</option>
+                      <option value="768">768x768 (更准)</option>
+                    </select>
+                  </label>
+                </div>
+              </section>
+            </form>
+          </aside>
+        </div>
+
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>检测事件历史</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="vtd-events-count">0 条</span>
+            <button id="vtd-events-clear" class="vd-btn">清空</button>
+          </header>
+          <ol class="vd-event-list" id="vtd-event-list">
+            <li class="vd-event-empty">尚未检测到目标，启动检测后结果显示在这里。</li>
+          </ol>
+        </section>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-video-target-detection"></pre>
+        </details>
+      </section>
+

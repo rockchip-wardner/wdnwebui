@@ -1,0 +1,58 @@
+{
+  "id": "video-content-search",
+  "title": "视频内容检索",
+  "category": "video",
+  "description": "上传视频 → 自动切片 embedding → 文本查询命中段落",
+  "version": "0.1.0",
+  "preview_video": "",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_video_retrieval"
+  ],
+  "hardware_capabilities": [
+    "hwcap_video_input"
+  ],
+  "backend": {
+    "module": "app.apps.video_content_search",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/video-content-search/template.html",
+    "js": [
+      "/static/apps/video-content-search/app.js"
+    ],
+    "css": [
+      "/static/apps/video-content-search/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "vcs.state",
+      "vcs.playing"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-content-search/extract/stop"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-content-search/extract/stop"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "",
+    "editable_fields": [],
+    "prompt_template": ""
+  },
+  "requires_core": [
+    "compute.registry",
+    "video.utils"
+  ],
+  "uploads_dir": "uploads/video_content_search",
+  "display_order": 7
+}

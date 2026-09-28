@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 
 # Import the worker helpers (no NPU required — just helpers)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app", "services"))

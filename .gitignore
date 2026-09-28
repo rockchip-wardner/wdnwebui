@@ -27,6 +27,9 @@ output.wav
 /tmp/
 .tmp/
 
+# 进程 crash dump（uvicorn SIGSEGV 生成的可执行 core 文件,1GB+ ELF）
+/core
+
 # opencode-ai CLI 工具依赖（与项目无关）
 package.json
 package-lock.json

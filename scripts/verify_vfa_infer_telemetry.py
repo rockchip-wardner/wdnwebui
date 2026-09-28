@@ -19,7 +19,6 @@ import io
 import logging
 import os
 import sys
-import time
 from collections import deque
 
 # 与 verify_text_shm_path.py 同样套路: 只 import 我们要测的 helper
