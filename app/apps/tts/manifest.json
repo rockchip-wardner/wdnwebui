@@ -54,5 +54,6 @@
     "compute.registry"
   ],
   "uploads_dir": "uploads/tts",
-  "display_order": 4
+  "display_order": 4,
+  "wizard_config": "wizard.json"
 }

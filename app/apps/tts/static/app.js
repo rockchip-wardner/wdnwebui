@@ -2353,4 +2353,40 @@ const Discovery = {
 
 TTS.init();
 
+// ------------------------------------------------------------------ *
+// 应用向导模式 API — wizard 框架 finish 时调用
+// 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
+//   tts-text     → opts.text
+//   tts-play-to  → opts.playTo("browser" | "device" | "both")
+// 文本非空 → 写回 #tts-text 并模拟点 #tts-start(同应用页面原有的
+// "开始生成"按钮 — 复用其内部对 /api/tts/start 的调用 + play_to
+// 合成完成后自动试听逻辑,避免本文件重写 payload 装配)。
+// 播放目标变更 → 同步勾选对应 radio(应用页面 onStart 内部读
+// `input[name=tts-play-to]:checked`)。
+// 全局名约定 ImApp_<app.id 去掉 hyphen>。
+// ------------------------------------------------------------------ *
+window.ImApp_tts = window.ImApp_tts || {};
+window.ImApp_tts.applyWizardSnapshot = async function (opts) {
+  const result = { text_filled: false, started: false };
+  if (opts.text) {
+    const textEl = document.getElementById("tts-text");
+    if (textEl) textEl.value = opts.text;
+    result.text_filled = true;
+  }
+  if (opts.playTo) {
+    document.querySelectorAll('input[name="tts-play-to"]').forEach((r) => {
+      r.checked = (r.value === opts.playTo);
+    });
+  }
+  // 文本非空 → 模拟点"开始生成"(启动合成 + 试听)
+  if (opts.text) {
+    const btn = document.getElementById("tts-start");
+    if (btn) {
+      try { btn.click(); result.started = true; }
+      catch (e) { throw new Error("WizardSnapshotError:tts_start_failed:" + (e?.message || e)); }
+    }
+  }
+  return result;
+};
+
 })();
