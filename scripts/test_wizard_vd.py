@@ -43,12 +43,13 @@ def main():
         # ============================================================ #
         print("\n=== T1: 首次打开 ===")
         page.goto(URL, wait_until="domcontentloaded")
-        # 等 wizard DOM 出现(framework.js 异步加载 + tryMount 异步)
+        # 等 wizard DOM + stepper 都渲染(framework.js 异步加载 + tryMount 异步)
         try:
             page.wait_for_selector(".wd-wizard-section", timeout=10000)
+            page.wait_for_selector(".wd-wizard-step-dot", timeout=5000)
         except Exception:
             page.screenshot(path="/tmp/wizard_t1_fail.png", full_page=True)
-            fail("T1: 10s 内未出现 .wd-wizard-section")
+            fail("T1: 10s 内未出现 .wd-wizard-section 或 step-dot")
 
         # 验证步骤指示器
         dots = page.locator(".wd-wizard-step-dot")
