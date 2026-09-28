@@ -584,4 +584,47 @@ function initVideoTargetDetection() {
 
 initVideoTargetDetection();
 
+// ------------------------------------------------------------------ *
+// 应用向导模式 API — wizard 框架 finish 时调用
+// 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
+//   vtd-source       → opts.source
+//   vtd-loop         → opts.loop
+//   vtd-prompt       → opts.prompt
+//   vtd-detect-size  → opts.detectSize
+// source 非空 → 写回 #vtd-source 并调 vtdOpen;prompt 非空 → 模拟
+// 点 #vtd-detector-start。空字段不触发对应动作。
+// 全局名约定 ImApp_<app.id 去掉 hyphen>。
+// ------------------------------------------------------------------ *
+window.ImApp_video_target_detection = window.ImApp_video_target_detection || {};
+window.ImApp_video_target_detection.applyWizardSnapshot = async function (opts) {
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el != null) el.value = v; };
+  const setChk = (id, v) => { const el = document.getElementById(id); if (el != null) el.checked = !!v; };
+
+  if (opts.source)      setVal("vtd-source", opts.source);
+  if (opts.loop != null) setChk("vtd-loop", opts.loop);
+  if (opts.prompt)      setVal("vtd-prompt", opts.prompt);
+  if (opts.detectSize)  setVal("vtd-detect-size", opts.detectSize);
+
+  const result = { source_opened: false, detector_started: false };
+
+  if (opts.source) {
+    try {
+      await vtdOpen({ source: opts.source, loop: !!opts.loop });
+      result.source_opened = true;
+    } catch (e) {
+      throw new Error("WizardSnapshotError:open_source_failed:" + (e?.message || e));
+    }
+  }
+
+  if (opts.prompt) {
+    const btn = document.getElementById("vtd-detector-start");
+    if (btn) {
+      try { btn.click(); result.detector_started = true; }
+      catch (e) { throw new Error("WizardSnapshotError:detector_start_failed:" + (e?.message || e)); }
+    }
+  }
+
+  return result;
+};
+
 })();

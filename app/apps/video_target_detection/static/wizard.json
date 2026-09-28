@@ -1,0 +1,32 @@
+{
+  "enabled": true,
+  "wizard_title": "视频目标监控快速配置",
+  "swcap_to_model": {
+    "swcap_video_describe": { "npu_index": 0, "model_id": "qwen3.5-vl-4b" }
+  },
+  "open_source_button": "vtd-open",
+  "start_buttons": ["vtd-detector-start"],
+  "steps": [
+    { "id": "env",    "title": "运行环境检查",           "kind": "env_check" },
+    { "id": "source", "title": "视频源",                 "kind": "form",
+      "fields": [
+        { "id": "vtd-source", "ui_key": "source", "label": "视频源 URL / 路径" },
+        { "id": "vtd-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox" }
+      ]
+    },
+    { "id": "detect", "title": "检测提示词 + 检测尺寸",  "kind": "form",
+      "fields": [
+        { "id": "vtd-prompt",      "ui_key": "prompt",     "label": "检测提示词", "type": "textarea",
+          "placeholder": "例:请检测画面中是否有需要关注的目标" },
+        { "id": "vtd-detect-size", "ui_key": "detectSize", "label": "检测尺寸",   "type": "select",
+          "options": [
+            { "value": "auto", "label": "自动选择",     "selected": true },
+            { "value": "384",  "label": "384x384 (更快)" },
+            { "value": "768",  "label": "768x768 (更准)" }
+          ]
+        }
+      ]
+    },
+    { "id": "finish", "title": "完成配置",                "kind": "finish" }
+  ]
+}
