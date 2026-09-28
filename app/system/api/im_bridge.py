@@ -161,7 +161,7 @@ async def wechat_ws(ws: WebSocket) -> None:
     except Exception:
         return
 
-    mgr.register_subscriber(queue)
+    mgr.register_subscriber(asyncio.get_running_loop(), queue)
 
     async def _relay() -> None:
         try:

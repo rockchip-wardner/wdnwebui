@@ -3925,9 +3925,12 @@ const SYSTEM_PAGE_LOADERS = {
   // im-bridge 是系统配置页(应用对接 / 微信机器人 = 同一页)。原本在
   // app/apps/im_bridge/ 作为卡片加载,v0.4 整理后归到 system/ —— 单独
   // 静态文件,首次进入页面时按需加载并 init。
+  // v0.4 回归:loader 必须 ensureWs(),否则 WS 不建、server broadcast
+  // 找不到 subscriber,登录按钮 click 后卡"正在向微信申请二维码"。
   "im-bridge": () => {
     if (typeof ImBridge !== "undefined" && ImBridge.init) {
       ImBridge.init();
+      ImBridge.ensureWs();
       return;
     }
     const s = document.createElement("script");
@@ -3936,6 +3939,7 @@ const SYSTEM_PAGE_LOADERS = {
     s.onload = () => {
       if (typeof ImBridge !== "undefined" && ImBridge.init) {
         ImBridge.init();
+        ImBridge.ensureWs();
       }
     };
     document.head.appendChild(s);

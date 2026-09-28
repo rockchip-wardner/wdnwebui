@@ -49,7 +49,9 @@ class _WechatManager:
         self._llm_bridge = get_llm_bridge()
 
         self._subs_lock = threading.Lock()
-        self._subs: list[asyncio.Queue] = []
+        # ``(loop, queue)`` pairs — see :meth:`_broadcast` for why we store
+        # the loop ref alongside the queue.
+        self._subs: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
 
         # State-diff cache: what we last pushed to subscribers. Used to
         # avoid emitting the same snapshot twice.
@@ -70,38 +72,58 @@ class _WechatManager:
         self._poller_thread.start()
 
     # ------------------------------------------------------------- WS
-    def register_subscriber(self, queue: asyncio.Queue) -> None:
+    def register_subscriber(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue,
+    ) -> None:
         with self._subs_lock:
-            self._subs.append(queue)
+            self._subs.append((loop, queue))
 
     def unregister_subscriber(self, queue: asyncio.Queue) -> None:
         with self._subs_lock:
             try:
-                self._subs.remove(queue)
+                self._subs[:] = [
+                    (lq, q) for (lq, q) in self._subs if q is not queue
+                ]
             except ValueError:
                 pass
 
     def _broadcast(self, payload: dict) -> None:
         """Push ``payload`` to all subscribers (thread-safe).
 
-        Runs on whichever thread the caller is on — usually the wechat-bot
-        loop thread (callbacks) or the poller thread. Each subscriber
-        queue is an :class:`asyncio.Queue` owned by the FastAPI event
-        loop; we use ``put_nowait`` and drop the oldest item on overflow
-        to keep the publisher non-blocking.
+        ``asyncio.Queue`` is not thread-safe — calling ``put_nowait``
+        from the wechat-bot loop thread or the poller thread corrupts
+        the queue and the WS relay task silently never drains new
+        frames. Schedule the put via ``loop.call_soon_threadsafe`` so
+        it runs on the subscriber's own loop thread.
         """
         with self._subs_lock:
-            queues = list(self._subs)
-        if not queues:
+            pairs = list(self._subs)
+        if not pairs:
             return
-        for q in queues:
+        for loop, q in pairs:
             try:
                 if q.full():
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                q.put_nowait(payload)
+                    # Drop-oldest + put must both run on the loop thread.
+                    def _drain_then_put(
+                        _q: asyncio.Queue, _payload: dict,
+                    ) -> None:
+                        try:
+                            _q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        try:
+                            _q.put_nowait(_payload)
+                        except asyncio.QueueFull:
+                            pass
+                    loop.call_soon_threadsafe(
+                        _drain_then_put, q, payload,
+                    )
+                else:
+                    loop.call_soon_threadsafe(q.put_nowait, payload)
+            except RuntimeError as exc:
+                _wechat_log(f"broadcast skipped (loop closed): {exc!r}")
             except Exception as exc:  # noqa: BLE001
                 _wechat_log(f"broadcast failed: {exc!r}")
 

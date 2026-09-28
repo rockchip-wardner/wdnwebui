@@ -2,7 +2,7 @@
   "use strict";
   const API_PREFIX = "/api";
 
-const ImBridge = {
+window.ImBridge = {
   ws: null,
   wsRetry: 0,
   wsTimer: null,
@@ -660,6 +660,7 @@ const ImBridge = {
  *  WS 帧协议：                                                        *
  *    snapshot / state / user_echo / thinking / answer /               *
  *    done / stopped / error                                           *
+ * ------------------------------------------------------------------ */
 
 ImBridge.init();
 

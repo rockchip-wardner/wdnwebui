@@ -39,7 +39,10 @@ import numpy as np
 from app.core.video.utils import (
     _read_chunk_frames,
     _write_frames_to_shm,
+    cleanup_shm_session as _cleanup_shm_session,
     compute_slices,
+    cosine_similarity as _cosine_similarity,
+    probe_video_meta as _probe_video_meta,
 )
 from app.core.video.cache import file_md5, get_video_cache
 

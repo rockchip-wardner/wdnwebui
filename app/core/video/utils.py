@@ -1,7 +1,8 @@
 """Shared video utility helpers (extracted from video_content_search).
 
-These three private helpers were originally ``_cosine_similarity`` /
-``_probe_video_meta`` / ``_cleanup_shm_session`` living inside
+Originally the private helpers ``_cosine_similarity`` /
+``_probe_video_meta`` / ``_cleanup_shm_session`` /
+``_read_chunk_frames`` / ``_write_frames_to_shm`` lived inside
 ``app/services/video_content_search.py``. Both ``video_content_search``
 and ``im_bridge`` consumed them — a pre-existing cross-coupling that the
 zero-coupling rule prohibits. They've been moved here so either card can
@@ -19,6 +20,9 @@ from typing import List, Optional
 import numpy as np
 
 LOG = logging.getLogger("core.video.utils")
+
+# Qwen3-VL-Embedding-2B 的 vision 输入固定 576×576。
+_VISION_SIZE = 576
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
