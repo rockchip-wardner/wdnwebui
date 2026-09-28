@@ -572,4 +572,27 @@ const TextChat = {
 
 TextChat.init();
 
+// ------------------------------------------------------------------ *
+// 应用向导模式 API — wizard 框架 finish 时调用
+// 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
+//   tc-prompt  → opts.prompt
+// 空字段不触发对应动作(wizard 框架已校验);prompt 非空时把内容
+// 写回 #text-chat-input,**不**自动 send——text_chat 是用户主动发
+// 消息型应用,wizard 只负责"配置预填"。
+// 全局名约定 ImApp_<app.id 去掉 hyphen>—— wizard 按此查找。
+// ------------------------------------------------------------------ *
+window.ImApp_text_chat = window.ImApp_text_chat || {};
+window.ImApp_text_chat.applyWizardSnapshot = async function (opts) {
+  const result = { prompt_filled: false };
+  if (opts.prompt) {
+    const input = document.getElementById("text-chat-input");
+    if (input) {
+      input.value = opts.prompt;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      result.prompt_filled = true;
+    }
+  }
+  return result;
+};
+
 })();

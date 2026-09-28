@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+  "wizard_title": "文本对话快速配置",
+  "swcap_to_model": {
+    "swcap_text_chat": { "npu_index": 0, "model_id": "qwen3.5-vl-4b" }
+  },
+  "open_source_button": "",
+  "start_buttons": [],
+  "steps": [
+    { "id": "env",    "title": "运行环境检查",   "kind": "env_check" },
+    { "id": "prompt", "title": "首次提问",       "kind": "form",
+      "fields": [
+        { "id": "tc-prompt", "ui_key": "prompt", "label": "首次提问", "type": "textarea",
+          "placeholder": "例:请用一段话介绍你自己" }
+      ]
+    },
+    { "id": "finish", "title": "完成配置",        "kind": "finish" }
+  ]
+}
