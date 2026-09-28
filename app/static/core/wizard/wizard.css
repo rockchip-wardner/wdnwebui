@@ -1,0 +1,295 @@
+/* 应用向导模式视觉规范
+ * 命名空间前缀 .wd-wizard-* —— 零耦合硬要求,不与任何应用 css 类名重叠
+ * 强制浅色(不跟系统主题走),max-width 1024px,移动端 <1024px 自动收缩
+ */
+
+.wd-wizard-section {
+  /* wizard 容器根节点 — 水平居中,顶部 padding 让 sidebar 不遮 */
+  background: #ffffff;
+  color: #111827;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  padding: 80px 56px 64px;
+  margin: 0 auto;
+  max-width: 1024px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* 顶部 head */
+.wd-wizard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 32px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #e5e7eb;
+}
+.wd-wizard-title {
+  font-size: 24px;
+  font-weight: 600;
+  margin: 0;
+  color: #111827;
+}
+.wd-wizard-exit-btn {
+  background: transparent;
+  border: 1px solid #d1d5db;
+  color: #374151;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.wd-wizard-exit-btn:hover { background: #f3f4f6; }
+
+/* 步骤指示器 */
+.wd-wizard-stepper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 40px;
+  flex-wrap: wrap;
+}
+.wd-wizard-step-dot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 4px;
+  border-radius: 20px;
+  font-size: 13px;
+  transition: background 0.2s;
+}
+.wd-wizard-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #d1d5db;
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 12px;
+}
+.wd-wizard-step-lbl {
+  color: #6b7280;
+  font-weight: 500;
+}
+.wd-wizard-step-done .wd-wizard-step-num { background: #10b981; }
+.wd-wizard-step-done .wd-wizard-step-lbl { color: #047857; }
+.wd-wizard-step-active {
+  background: #eff6ff;
+}
+.wd-wizard-step-active .wd-wizard-step-num { background: #2563eb; }
+.wd-wizard-step-active .wd-wizard-step-lbl { color: #2563eb; font-weight: 600; }
+.wd-wizard-step-sep {
+  width: 24px;
+  height: 1px;
+  background: #d1d5db;
+  flex-shrink: 0;
+}
+
+/* body 容器 */
+.wd-wizard-body {
+  margin-bottom: 32px;
+}
+
+/* 步骤标题 */
+.wd-wizard-step-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #111827;
+  margin: 0 0 20px 0;
+  text-align: left;
+}
+
+/* env_check 卡片 */
+.wd-wizard-env-card {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px 24px;
+  margin-bottom: 16px;
+}
+.wd-wizard-env-card h3 {
+  font-size: 15px;
+  font-weight: 600;
+  color: #374151;
+  margin: 0 0 12px 0;
+}
+.wd-wizard-env-row {
+  padding: 6px 0;
+  font-size: 14px;
+  color: #047857;
+  font-family: "SF Mono", Consolas, Monaco, monospace;
+}
+.wd-wizard-env-row.wd-wizard-env-fail { color: #b91c1c; }
+.wd-wizard-env-error {
+  margin-top: 12px;
+  padding: 8px 12px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.wd-wizard-env-bring-status {
+  margin-top: 12px;
+  font-size: 13px;
+  color: #6b7280;
+  min-height: 18px;
+}
+
+/* form */
+.wd-wizard-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.wd-wizard-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wd-wizard-field-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #374151;
+}
+.wd-wizard-input,
+.wd-wizard-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 14px;
+  color: #111827;
+  background: #ffffff;
+  transition: border-color 0.15s;
+  font-family: inherit;
+}
+.wd-wizard-form textarea {
+  min-height: 80px;
+  resize: vertical;
+}
+.wd-wizard-input:focus,
+.wd-wizard-form textarea:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+}
+.wd-wizard-checkbox {
+  width: auto;
+  margin-right: 6px;
+}
+
+/* finish summary */
+.wd-wizard-summary {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+  font-size: 14px;
+}
+.wd-wizard-summary-row {
+  display: flex;
+  padding: 4px 0;
+  gap: 12px;
+}
+.wd-wizard-summary-row > span:first-child {
+  color: #6b7280;
+  min-width: 140px;
+}
+.wd-wizard-summary-val {
+  color: #111827;
+  word-break: break-all;
+}
+.wd-wizard-finish-error {
+  margin-top: 16px;
+  padding: 10px 14px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  border-radius: 6px;
+  font-size: 13px;
+  min-height: 18px;
+}
+
+/* footer buttons */
+.wd-wizard-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  padding-top: 20px;
+  border-top: 1px solid #e5e7eb;
+}
+.wd-wizard-skip-btn {
+  background: transparent;
+  border: 1px solid #d1d5db;
+  color: #6b7280;
+  padding: 8px 18px;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  margin-right: auto; /* 推到最左 */
+}
+.wd-wizard-skip-btn:hover {
+  background: #f3f4f6;
+  color: #374151;
+}
+.wd-wizard-primary-btn {
+  background: #2563eb;
+  border: 1px solid #2563eb;
+  color: #ffffff;
+  padding: 8px 22px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.wd-wizard-primary-btn:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+.wd-wizard-primary-btn:disabled {
+  background: #93c5fd;
+  border-color: #93c5fd;
+  cursor: not-allowed;
+}
+
+/* 移动端响应式 */
+@media (max-width: 1023px) {
+  .wd-wizard-section {
+    padding: 32px 16px 48px;
+    max-width: 100vw;
+    font-size: 14px;
+  }
+  .wd-wizard-title {
+    font-size: 20px;
+  }
+  .wd-wizard-stepper {
+    gap: 4px;
+    margin-bottom: 28px;
+  }
+  .wd-wizard-step-dot {
+    padding: 2px 6px 2px 2px;
+    font-size: 11px;
+  }
+  .wd-wizard-step-num {
+    width: 20px;
+    height: 20px;
+    font-size: 11px;
+  }
+  .wd-wizard-step-sep {
+    width: 8px;
+  }
+  .wd-wizard-step-lbl {
+    /* 移动端只显示数字 + 当前步骤标题 */
+  }
+  .wd-wizard-step-todo .wd-wizard-step-lbl { display: none; }
+}

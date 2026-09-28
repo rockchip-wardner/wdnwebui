@@ -125,6 +125,9 @@ def _manifest_to_dict(m: CardManifest) -> dict:
         "errors": m.errors,
         "hidden": m.hidden,
         "display_order": m.display_order,
+        # 应用层声明的向导配置文件路径(通常是 "wizard.json",
+        # 与 manifest.json 同目录);缺失 → framework tryMount 零开销跳过。
+        "wizard_config": str(m.raw.get("wizard_config", "")).strip(),
     }
 
 

@@ -202,6 +202,11 @@
       try {
         await chain;
         DemoGuard._loadedApps.add(page);
+        // v0.4 向导模式:挂载 wizard(读 m.wizard_config;缺失 → 零开销跳过)。
+        // 不维护"已注册 wizard 应用"清单,完全 manifest 字段驱动。
+        if (window.WizardRegistry?.tryMount) {
+          window.WizardRegistry.tryMount(m);
+        }
       } catch (e) {
         console.error("[router] failed to load card JS:", e);
       } finally {
