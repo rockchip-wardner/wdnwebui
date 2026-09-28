@@ -891,4 +891,45 @@ function vtlPromptCollectItems() {
 
 initVideoTargetLocalization();
 
+// ------------------------------------------------------------------ *
+// 应用向导模式 API — wizard 框架 finish 时调用
+// 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
+//   vtl-source  → opts.source
+//   vtl-loop    → opts.loop
+//   vtl-prompt  → opts.prompt
+// source 非空 → 写回 #vtl-source 并调 vtlOpen;prompt 非空 → 模拟
+// 点 #vtl-detector-start。空字段不触发对应动作。
+// 全局名约定 ImApp_<app.id 去掉 hyphen>。
+// ------------------------------------------------------------------ *
+window.ImApp_video_target_localization = window.ImApp_video_target_localization || {};
+window.ImApp_video_target_localization.applyWizardSnapshot = async function (opts) {
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el != null) el.value = v; };
+  const setChk = (id, v) => { const el = document.getElementById(id); if (el != null) el.checked = !!v; };
+
+  if (opts.source)      setVal("vtl-source", opts.source);
+  if (opts.loop != null) setChk("vtl-loop", opts.loop);
+  if (opts.prompt)      setVal("vtl-prompt", opts.prompt);
+
+  const result = { source_opened: false, detector_started: false };
+
+  if (opts.source) {
+    try {
+      await vtlOpen({ source: opts.source, loop: !!opts.loop });
+      result.source_opened = true;
+    } catch (e) {
+      throw new Error("WizardSnapshotError:open_source_failed:" + (e?.message || e));
+    }
+  }
+
+  if (opts.prompt) {
+    const btn = document.getElementById("vtl-detector-start");
+    if (btn) {
+      try { btn.click(); result.detector_started = true; }
+      catch (e) { throw new Error("WizardSnapshotError:detector_start_failed:" + (e?.message || e)); }
+    }
+  }
+
+  return result;
+};
+
 })();

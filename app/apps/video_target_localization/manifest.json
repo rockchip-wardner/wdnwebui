@@ -68,5 +68,6 @@
     "video.session"
   ],
   "uploads_dir": "uploads/video_target_localization",
-  "display_order": 3
+  "display_order": 3,
+  "wizard_config": "wizard.json"
 }

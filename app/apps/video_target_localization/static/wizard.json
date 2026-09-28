@@ -1,0 +1,25 @@
+{
+  "enabled": true,
+  "wizard_title": "视频目标定位快速配置",
+  "swcap_to_model": {
+    "swcap_grounding": { "npu_index": 0, "model_id": "LocateAnything-3b" }
+  },
+  "open_source_button": "vtl-open",
+  "start_buttons": ["vtl-detector-start"],
+  "steps": [
+    { "id": "env",    "title": "运行环境检查",     "kind": "env_check" },
+    { "id": "source", "title": "视频源",           "kind": "form",
+      "fields": [
+        { "id": "vtl-source", "ui_key": "source", "label": "视频源 URL / 路径" },
+        { "id": "vtl-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox" }
+      ]
+    },
+    { "id": "ground", "title": "定位提示词",       "kind": "form",
+      "fields": [
+        { "id": "vtl-prompt", "ui_key": "prompt", "label": "定位目标描述", "type": "textarea",
+          "placeholder": "例:穿着红衬衫的人" }
+      ]
+    },
+    { "id": "finish", "title": "完成配置",          "kind": "finish" }
+  ]
+}
