@@ -62,10 +62,6 @@
     const title = cfg.wizard_title || app.title;
     const head = _ce("div", WIZARD_NS + "head");
     head.appendChild(_ce("h2", WIZARD_NS + "title", title));
-    const exitBtn = _ce("button", WIZARD_NS + "exit-btn", "向导模式");
-    exitBtn.title = "返回向导重入向导模式";
-    exitBtn.addEventListener("click", () => unmount()); // 重入入口:先 unmount,外部 ROUTER 再触发 tryMount
-    head.appendChild(exitBtn);
     container.appendChild(head);
 
     const stepper = _ce("div", WIZARD_NS + "stepper");
