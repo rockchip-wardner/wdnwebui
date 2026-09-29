@@ -1,12 +1,14 @@
 # AGENTS.md
 
-Compact guide for OpenCode sessions in this repo.
+Compact guide for OpenCode sessions in this repo. **Current version: 0.4.0** (见 `app/__init__.py`)。
 
 ## What this repo is
 
 Python web service (`wdnwebui`) exposing RK-platform hardware / model SDKs
-(`wdnav`, `wdnai`) over HTTP via FastAPI. Brand-new repo (no commits yet at
-creation); everything below is verified against the current tree.
+(`wdnav`, `wdnai`) over HTTP via FastAPI. v0.4 起采用**卡片插件架构**:
+每个应用是 `app/apps/<card_id>/` 下独立文件夹,自带 `manifest.json` +
+后端 `api.py` + 前端 `static/`(template.html / app.js / app.css /
+wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
 
 ## Stack at a glance
 
@@ -27,15 +29,16 @@ creation); everything below is verified against the current tree.
 2. 必须通过wdnav调用mpp和rga，做编解码和图片缩放、格式转换等操作，不得直接调用或者通过其他库进行软编解和格式转换、resize等操作。
 3. 必须通过wdndds做发现和注册服务。
 4. **LLMSession 必须从 `ComputeRegistry` 取，禁止各业务模块自建**。视频检测
-   / 语音生成 / 视频监控等服务只能通过
-   `get_registry().get_session("<capability>")` 拿到 session；
-   找不到对应 capability 就抛 `RuntimeError("功能未启用: <capability>")`，
-   由调用方决定如何向上层报告（视频监控选择静默 error 返回，不阻塞 16 路
-   解码；视频检测 / 语音生成选择 raise，由 HTTP 层 502 透传给前端）。
+   / 视频目标检测 / 视频目标定位 / 视频内容检索 / 视频文件分析 / 文本对话 /
+   语音生成等服务只能通过
+   `get_registry().get_session("<capability>")` 拿到 session;
+   找不到对应 capability 就抛 `RuntimeError("功能未启用: <capability>")`,
+   由 HTTP 层 502 透传给前端。(v0.4 起原 16 路视频监控**已下线**,作为
+   视频能力的一部分整合进微信视频检索管线,见 `app/system/im_bridge/video_manager.py`。)
 实例集合在 算力配置 页配置，存到 `config.jsonc["compute"]["instances"]`，
     `run.py` 启动时**逐个 spawn 独立 compute_worker 子进程**（不阻塞 UI）。
 5. **所有演示页（音视频描述 / 视频目标检测 / 视频内容检索 / 语音生成）
-   离开时必须主动关闭后台运行**。`app/static/js/app.js` 的 `DemoGuard`
+   离开时必须主动关闭后台运行**。`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` 的 `DemoGuard`
    统一负责：
    * in-app 导航（点击 sidebar）：若当前页后台在跑（解码
      `state ∈ {opening, playing, paused, eof}` 或 detector `enabled=true`，
@@ -84,9 +87,336 @@ creation); everything below is verified against the current tree.
    LOG.info），看起来无害但违反本原则——业务级语义理解放在 worker
    端会导致：(a) worker 必须知道 calling context（哪条业务线 /
    哪个 schema）才能决定要不要做这步；(b) 一份代码处理多种模型
-   时归一化阈值互相干扰；(c) detach 进程不能 reload，bug fix 必须
-   restart worker（50s+ LLMSession 重启）。当前归一化已挪到主
-   进程 `_normalize_bbox_to_0_1000`，worker 端模型输出原样透传。
+   时归一化阈值互相干扰;(c) detach 进程不能 reload,bug fix 必须
+   restart worker(50s+ LLMSession 重启)。当前归一化已挪到主
+   进程 `_normalize_bbox_to_0_1000`,worker 端模型输出原样透传。
+
+## App 插件系统 (v0.4 卡片架构)
+
+v0.4 起,wdnwebui 走**卡片插件架构**——新增应用不再需要改 `app/main.py`
+或 `app/api/__init__.py`,只需在 `app/apps/<card_id>/` 下放一个完整目录。
+
+### 默认 UI 形态:应用面板 (`#apps`)
+
+v0.4 启动后默认进入**应用面板**(`#apps`),而非之前的某个具体应用。
+该页是一个卡片网格(grid),由 `app/static/core/framework.js:renderAppPanel()`
+读取 `window.__APP_MANIFESTS__.cards` 渲染:
+- 顺序按 `manifest.display_order` 升序(小→上左);缺省值 `9999`,
+  相同 `display_order` 时按 id 字典序兜底。
+- `status === "ok"` 才显示;`status === "fatal"` / `template_missing`
+  的卡片不会出现在网格(直接 `#/<id>` URL 仍可访问)。
+- `hidden: true` 的卡片从网格消失但代码 / API / 静态资源 / 直接 URL
+  都仍可用,用于"先下线 / 等版本升级"的过渡期 —— 比 `remove_card.py`
+  安全,反序列化时想恢复只需把 `hidden` 置 `false`。
+- 8 张卡片都从同一份 `__APP_MANIFESTS__` JSON 渲染,该 JSON 由后端
+  `_assemble_index_html()` 在每次 `/` 请求时动态拼装 ——
+  `/static/index.html.template` 里 3 个占位符:`{% card_slot "<id>" %}`
+  (替换为各 app 的 `static/template.html` 片段)、`{{ card_css_links }}`
+  (拼装各 app 的 `<link rel="stylesheet">`)、`{{ app_manifests }}`
+  (替换为 JSON dump)。
+
+### 侧栏 7 项(左 nav)
+
+| `#hash` | 显示名 | 来源 |
+|---|---|---|
+| `#apps` | 应用面板 | 内嵌在 `index.html.template`(默认 landing) |
+| `#system-monitor` | 系统信息 | `app/system/api/system_monitor.py` |
+| `#base-config` | 系统配置 | `app/system/api/config.py` |
+| `#compute-config` | 算力配置 | `app/system/api/compute.py` |
+| `#discovery` | 注册发现 | `app/system/api/system_monitor.py` (DDS 心跳) |
+| `#im-bridge` | 应用对接(微信桥接) | `app/system/api/im_bridge.py` |
+| `#system-logs` | 系统日志 | `app/system/api/system_logs.py` |
+
+`#/<card_id>`(8 张卡片)不在侧栏,在 `#apps` 网格里点入。
+
+### Back-home 按钮
+
+每个 demo 卡片(manifest 含 `demo_guard` 块)页面顶栏自动注入
+`< 返回首页` 按钮(`injectBackHomeButtons()`),点击先调
+`DemoGuard.stopAndClear(currentPage())` 再切回 `#apps`。
+
+### 卡片目录模板
+
+```
+app/apps/<card_id>/
+├── manifest.json     # 插件声明(必填)
+├── api.py            # FastAPI router(必填)
+├── service.py        # 单例状态机 + 业务逻辑(必填,如有后端)
+├── __init__.py       # register_api(app) / register_shutdown()(必填)
+└── static/
+    ├── template.html # <section id="page-<card_id>"> 片段
+    ├── app.js        # window.ImApp_<card_id> 模块
+    ├── app.css       # 该 app 私有样式
+    ├── preview.mp4   # 应用卡片预览(可选)
+    └── wizard.json   # 向导配置;存在则启用 wizard 模式(可选)
+```
+
+### manifest.json 字段
+
+见 `app/core/manifest.py` 的 `CardManifest` dataclass。关键字段:
+
+| 字段 | 必填 | 含义 |
+|---|---|---|
+| `id` | ✓ | 全局唯一(`a-z0-9-`)。同时也作为 sidebar / static / wizard 命名空间。 |
+| `title` | ✓ | UI 显示名 |
+| `category` | ✓ | 应用分组:`video` / `chat` / `audio` |
+| `software_capabilities` | ✓ | 引用 `MODEL_PRESETS` 的 `swcap_*` 列表 |
+| `hardware_capabilities` | | 引用 `HARDWARE_CAPABILITIES` 的 `hwcap_*` |
+| `backend.module` | ✓ | Python 模块路径,默认 `app.apps.<id>` |
+| `backend.register_api` / `register_shutdown` | ✓ | 入口函数名 |
+| `frontend.template` / `frontend.js` / `frontend.css` | | 资源 URL(相对 `/static/apps/<id>/`) |
+| `prompts.schema_class` | | wdnai schema class 名(`VLMDoc` / `TargetDoc` / `LocatorDoc` 等) |
+| `prompts.editable_fields` | | 暴露给用户在 系统配置 → App 提示词模板 编辑的字段 |
+| `prompts.prompt_template` | | 应用预设默认 prompt(用户可覆盖) |
+| `requires_core` | | 核心依赖列表;启动时校验 import 可用性 |
+| `demo_guard.active_state_keys` | | DemoGuard 判定"页面在跑后台"的字段路径 |
+| `demo_guard.stop_endpoints` | | 用户确认离开时调用的 stop 接口 |
+| `wizard_config` | | 静态文件名(如 `"wizard.json"`);存在则启用 wizard |
+| `display_order` | | `#apps` 网格排序(升序,小→上左,缺省 `9999`,相同按 id 字典序) |
+| `hidden` | | `true` 时从 `#apps` 网格消失(代码/API/直接 URL 仍可用) |
+
+### 启动期装载流程 (`app/main.py:create_app()`)
+
+1. `discover_cards()` 扫描 `app/apps/*/manifest.json`,逐条校验后返回
+   `List[CardManifest]`(校验失败 → 卡片标 `status="fatal"` 但不阻断其他)。
+2. 对每张卡片调 `register_api(m, app)`(来自 `app/core/manifest.py`)→
+   `importlib.import_module(m.backend.module)` → 调 `register_api(app)`
+   `app.include_router(router, prefix="/api/<id>")`。
+3. 调 `register_shutdown()` 注册 app 关闭时的清理 hook。
+4. `app.mount("/static/apps/<id>", StaticFiles(...))` 装载每张卡的静态资源。
+5. `_assemble_index_html(discover_cards())` 读 `app/static/index.html.template`,
+   按 `display_order` 拼装每张卡的 `<template>` 片段、`app.js` `<script>`、
+   `app.css` `<link>`,输出最终 `index.html`(动态路径,运行内存)。
+6. 调 `system_register_all(app)` 装载系统级 API(算力配置、配置、监控、
+   im_bridge、power、coprocessor、versions、fs_browser、system_logs)。
+7. **不**直接注册 surveillance(已下线,见 im_bridge 章节)。
+
+### 零耦合铁律(`app/apps/__init__.py` 强制)
+
+- 卡片**只能** import `app.core.*`;**禁止** import `app.system.*` 或
+  跨卡片 import。违规会导致循环依赖 + 系统模块被卡片挟持。
+- 系统模块不依赖卡片(im_bridge 用 `app.system.im_bridge.video_search`
+  注册 `VideoSearch` 工具到 `app.core.tools.registry`,不依赖任何卡片)。
+- **例外**:`app.system.im_bridge` 在 `register_all` 时主动调
+  `get_tool_registry().register(... VideoSearch ...)`,把微信视频检索
+  工具装入全局注册中心 —— 这是允许的单向注入(im_bridge → core tools)。
+
+### 当前卡片清单(v0.4.0)
+
+| `id` | capability | 后端入口 |
+|---|---|---|
+| `audio-analysis` | `swcap_audio_understand` | `app.apps.audio_analysis` |
+| `text-chat` | `swcap_text_chat` | `app.apps.text_chat` |
+| `tts` | `swcap_audio_tts` | `app.apps.tts` |
+| `video-content-search` | `swcap_video_retrieval` | `app.apps.video_content_search` |
+| `video-detection` | `swcap_video_describe` | `app.apps.video_detection` (+ `tts_alert` 工具) |
+| `video-file-analysis` | `swcap_video_describe` | `app.apps.video_file_analysis` |
+| `video-target-detection` | `swcap_video_describe` | `app.apps.video_target_detection` (TargetDoc) |
+| `video-target-localization` | `swcap_grounding` | `app.apps.video_target_localization` (LocatorDoc) |
+
+新增卡片示例(如加一个"图像 OCR"应用):只需 `mkdir app/apps/ocr && 写 manifest.json + api.py + service.py + __init__.py + static/`,`display_order` 自动出现在侧栏,**不动** `app/main.py` 或任何 core 模块。
+
+## Wizard 框架(v0.4 起统一应用入口)
+
+v0.4 起,6 个演示页(`text-chat` / `tts` / `video-detection` /
+`video-file-analysis` / `video-target-detection` / `video-target-localization`)
+新增"向导模式"——**每次**进入页面时,framework 自动挂载该 app 的
+wizard(`wizard.json` 驱动),引导用户从空白走到可运行状态
+(env_check → form → finish)。点 完成配置 后 wizard 调用 app 的
+`applyWizardSnapshot(opts)` 并 unmount;用户离开页面再回来时,因
+`wizard:unmounted` 事件 framework 清掉 `_loadedApps`,wizard 会再次弹出
+(localStorage 持久化字段值,不会让用户重填)。
+
+> **未实现"只在首次进入时弹出"**:曾计划只对第一次访问显示 wizard,
+> 但用户实测反馈"刷新就丢失引导,记不清配置路径"反而更麻烦 —— v0.4
+> 改为每次都挂载 + localStorage 保留已填值。如果未来要"完成过一次就不
+> 再弹",需要 (a) wizard 完成时 `localStorage.setItem(<key>.dismissed, 1)`,
+> (b) tryMount 检测到该 key 直接 skip。前者已经在 `_finish` 后隐式存在,
+> 加 (b) 即可,无需改 framework。
+
+### 框架组件
+
+| 文件 | 职责 |
+|---|---|
+| `app/static/core/wizard/state.js` | IIFE。导出 `window.WizardState = {mount, unmount, stepForward, skip}`。管理 stepper / env-check / form / finish 步骤状态机。监听 hashchange,在用户切走时自动 unmount。 |
+| `app/static/core/wizard/registry.js` | 通用挂载入口 `window.WizardRegistry.{tryMount, unmount}`。读 `manifest.wizard_config` 路径加载 wizard.json,然后调 `WizardState.mount(app, cfg)`。**零硬编码**:不知道任何具体 app,只跟 wizard.json schema 打交道。 |
+| `app/static/core/wizard/wizard.css` | wizard 容器 / stepper / env-row 样式 |
+| `app/apps/<id>/static/wizard.json` | 应用向导配置(swcap_to_model + steps + fields) |
+
+### wizard.json schema
+
+```jsonc
+{
+  "enabled": true,                       // 总开关;false 时按钮隐藏
+  "wizard_title": "音视频描述快速配置",  // wizard 弹窗标题
+  "swcap_to_model": {                    // 应用所需 capability → 目标 model + NPU
+    "swcap_video_describe": {"npu_index": 0, "model_id": "qwen3-vl-4b"}
+  },
+  "open_source_button": "vd-open",       // 触发"打开源"按钮的 id(用于在 wizard 完成后自动填源)
+  "upload_endpoint": "/api/video-detection/upload",  // 拖放上传目标
+  "start_buttons": ["vd-detector-start"],  // wizard 完成时自动 focus 的启动按钮
+  "localStorage_key": "wdnwebui.wizard.<id>.values",  // (可选) 覆盖默认 key
+  "steps": [
+    {"id": "env",    "title": "运行环境检查", "kind": "env_check"},
+    {"id": "source", "title": "视频源",       "kind": "form", "fields": [...]},
+    {"id": "ground", "title": "定位提示词",   "kind": "form", "fields": [...]},
+    {"id": "finish", "title": "完成配置",      "kind": "finish"}
+  ]
+}
+```
+
+`kind` 取值:
+- `env_check` — 拉 `/api/compute` 检查 `manifest.software_capabilities`
+  对应 capability 是否在本机运行;只有本机算力(spawned / adopted_local)
+  算"已启用",peer adopted 即使 running 也算"未启用"(见"本机算力语义栈")。
+  检查通过 → ✓;未通过 → ✗ + "一键开启所需模型" 按钮(调
+  `_wizardBringUpModels`)。
+- `form` — 通用表单步骤;`fields[]` 每项 `{id, ui_key, label, type?, default?, ...}`,
+  支持 `type: "checkbox"` / `"text"` / `"prompt_rows"`(`prompt_rows` 是
+  v0.14 加的多行输入,见 `ca7bc64`)。每次 step 切换 / 字段 blur 时
+  `_captureValues` 自动把当前值写 `localStorage`。
+- `finish` — 收尾步骤,显示摘要 + 等模型 running(`_waitForModelsRunning`
+  轮询 `/api/compute` 至所有 `swcap_to_model` 的 model_id 变 running 或 90s 超时)。
+  完成后调 `applyWizardSnapshot` 并 unmount。
+
+### 应用页契约:`applyWizardSnapshot(opts)`
+
+wizard 完成(`_finish`)后,`state.js` 调
+`window.ImApp_<id-with-underscores>.applyWizardSnapshot(opts)`。
+**6 个有 wizard 的 app 都必须实现**这个 hook:
+
+```js
+window.ImApp_video_detection = window.ImApp_video_detection || {};
+window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
+  // opts: wizard.json form fields 的 camelCase 映射;
+  //   来源是 field.ui_key(camelCase 形式) → field.id(kebab-case)。
+  //   例如 {"source": "rtsp://...", "loop": true}
+  //
+  // 通常做:
+  //   1) 把 opts 字段填到 DOM input / 调用现有 setter
+  //   2) 触发 start_buttons[0] 自动 click
+  //   3) 返回 Promise(throw → wizard 回退到 source 步骤)
+};
+```
+
+未实现 `applyWizardSnapshot` 的 app:wizard 完成时只是 unmount,应用页
+不会跑出 demo 页(`console.warn`)。这是 wizard 设计上的"安全降级" —— 让
+应用层**可选**地接入自动启动,但不强制。
+
+### `_wizardBringUpModels` 全局入口
+
+`app/static/core/wizard/state.js` 暴露 `window._wizardBringUpModels(cfg)`,
+供 env-check 步骤的"一键开启"按钮调用。三步流程:
+
+1. **停非必需**(本机 spawned / adopted_local;**跳过 adopted 远端 peer**):
+   `instance._source !== "adopted"` 的 running / loading 实例,如果其
+   capability 不在 `cfg.swcap_to_model` 中 → DELETE `/api/compute/instances`。
+2. **启必需**:`swcap_to_model` 的每条 → POST `/api/compute/instances
+   {model, npu_index}`(allow_adopt=False,peer adopted → server 403 兜底)。
+3. 返回 `true` 表示启动指令已发,后台加载中;false 表示失败(env_check 步骤
+   会 retry 2 次 + confirm 兜底)。
+
+### `wizard:unmounted` 事件 + 重新挂载
+
+`state.js:unmount()` 末尾 dispatch `window` 上的 `wizard:unmounted` 事件
+(detail `{appId, action:"unmount"}`)。`framework.js:232` 监听该事件,
+从 `DemoGuard._loadedApps` 删对应项 —— 否则下次再点同一应用卡片时
+ROUTER 看到 `_loadedApps.has(page)` 为 true 直接跳过 `_loadCardJS`,
+wizard 永远不会再挂载。
+
+### 应用页启用 wizard 模式
+
+应用页(`app/apps/<id>/`)启用 wizard 仅需两步,**无需改 framework.js**:
+
+1. 加 `static/wizard.json`(schema 见上)
+2. `manifest.json` 加 `"wizard_config": "wizard.json"` 字段
+3. (可选) 在 `<section id="page-<id>">` 顶栏加"向导模式"按钮:
+   `<button class="wizard-mode-btn" data-wizard-mode data-page-id="<id>">向导模式</button>`
+   —— framework **不**自动注入该按钮,各 app 的 `template.html` 写明即可;
+   重新打开 wizard 的"开关"实际是 framework 在 `_loadedApps` 删除后下次
+   navigate 自动触发,按钮只是"用户手动重开"的可视入口。
+
+挂载时机:`framework.js:_loadCardJS` 在 app JS 全部 `await load` 完成后
+调 `WizardRegistry.tryMount(manifest)`。`enabled: false` 或 wizard.json
+缺失 → 静默跳过。
+
+### 强保证:framework 零耦合
+
+`state.js` / `registry.js` / `wizard.css` **不引用任何** `app/static/apps/`
+或具体 app 的 DOM id(除通用的 `WIZARD_NS`-前缀 CSS class 命名空间)。
+新增 app 加 wizard.json 即可使用,**不动 framework 代码**。
+
+## 本机算力语义栈(v0.4 修复)
+
+wdnwebui 是多板 LAN 集群部署形态:每块板子独立 NPU,通过 wdndds DDS
+互相发现彼此的 compute_worker 子进程。本机启动一个模型后,DDS 可能从
+peer 也收到同名服务 —— 此时 `_instances` 同时持有:
+
+- `spawned`        本次 boot 由本机 Popen 起的 worker
+- `adopted_local`  本机孤儿(uvicorn reload 残留);同 hostname 探到
+- `adopted`        LAN peer worker,通过 DDS 收到(主机名不同)
+- `unavailable`    全 LAN 都没回应
+
+三层一致语义:用户禁/启/查询的目标永远是**本机算力**(spawned /
+adopted_local);peer adopted 即使 running 也算"远端板子的资源,本机未启"。
+此约定由 commit **`94f4637`** 一并落地,三处纵深防御:
+
+### Layer 1 — wizard client(`app/static/core/wizard/state.js`)
+
+| 函数 | 过滤 |
+|---|---|
+| `_wizardBringUpModels` | DELETE/POST 都跳 `inst._source === "adopted"` |
+| `_probeEnv` | 只把 `spawned` / `adopted_local` running 算 `runningCaps`,peer adopted running 不算本机已开启 |
+| `_waitForModelsRunning` | 同 `_probeEnv`,对称 |
+
+### Layer 2 — server(`app/system/api/compute.py`)
+
+- `DELETE /api/compute/instances` 拒 adopted → **HTTP 403**,detail 明确
+  提示"请到目标板子上点禁用,或在本机启动一个新实例后删除本地副本"。
+- 即使 client Layer 1 漏掉,server 也兜底拒绝;前端按钮 disable 也是
+  Layer 1 兜底,server 兜底是最后防线。
+- `POST /api/compute/instances {model, npu_index}` 同样对 adopted 拒
+  bind → 403,鼓励用户在本机 spawn 新实例。
+
+### Layer 3 — compute registry(`app/core/compute/registry.py`)
+
+`_find_by_model(model_id)` 同 model_id 多 source 时:
+
+```python
+def _find_by_model(self, model_id):
+    with self._lock:
+        adopted = None
+        for inst in self._instances.values():
+            if inst.model_id != model_id:
+                continue
+            if inst._source in ("spawned", "adopted_local"):
+                return inst  # 本机优先
+            adopted = adopted or inst  # 远端 fallback
+        return adopted
+```
+
+行为对照:
+
+| 本机 spawned | peer adopted | 旧行为 | 新行为 |
+|---|---|---|---|
+| not_loaded | running | DELETE → 403(误以为本机关不掉) | DELETE → 200(卸载本机 spawned) |
+| running | running | DELETE → 200 | DELETE → 200 |
+| not_loaded | not_loaded | DELETE → 404 | DELETE → 404 |
+
+三层一致后:用户操作"禁用 / 启用 / 探测"的 target 永远在本机;peer
+adopted 仅作 fallback(用户主动选择)。
+
+### 回归脚本
+
+| 测试 | 文件 | 检查点 |
+|---|---|---|
+| Layer 1+2 | `scripts/verify_wizard_bringup_skip_adopted.py` | 2/2 |
+| Layer 1 UI | `scripts/verify_probe_env_local_only.py` | 5/5 |
+| Layer 3 | `scripts/verify_find_by_model_priority.py` | 10/10 |
+| 全量 wizard | `scripts/smoke_wizard_all.py` | 6/6 |
+
+如果将来 peer adopted 也算"已就绪"(如多板共享算力场景),三层都得
+放宽;别只改一处 —— 前端看到 ✓ 但 server 仍 403 会让用户迷惑。
 
 ## 修改守则
 
@@ -94,11 +424,12 @@ creation); everything below is verified against the current tree.
 跑真实测试每个关联的功能项是否都正常。
 
 - 改动只触及目标功能及其直接依赖，不顺手 refactor 无关代码。
-- 公共功能改动（`app/services/compute_registry.py`、LLM 会话栈、
-  `app/services/detector.py` / `video_session.py` / `surveillance.py`
-  等共享 service、`wdndds` cshim、`wdnai._librknn` shim 等被多个
-  调用方共享的模块）必须跑所有关联功能的真实测试（不止单元测试），
+- 公共功能改动（`app/core/compute/registry.py`、LLM 会话栈、
+  `app/core/llm/detector_base.py` / `app/core/video/session.py`、
+  任何 `app/core/**` 共享 service、`wdndds` cshim、`wdnai._librknn` shim
+  等被多个调用方共享的模块）必须跑所有关联功能的真实测试（不止单元测试），
   不允许"测试跳过"或"代码改对了就行"。
+  (原 surveillance 已下线,见"App 插件系统"段落的"零耦合铁律")
 - 失败 → 修到全通过再交；提交前在 PR/commit message 列出跑了哪些
   feature 的 smoke test + 结果。
 - **`config.jsonc` 不得 commit** —— 设备级运行时配置，由
@@ -139,11 +470,11 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   `libwdndds_cshim.so`。运行时链接系统 `libfastrtps2.9` /
   `libfastcdr1`（apt install libfastrtps-dev libfastcdr-dev）。
 * **每个 model = 1 个 compute_worker 进程**。`ComputeRegistry.start
-`     ` 在主进程 spawn 一个 `python app/services/compute_worker.py
+`     ` 在主进程 spawn 一个 `python app/core/compute/worker.py
        --model <id> --npu <k>` 子进程（**子进程默认不加载模型** —
        等首次 RPC 到达时再 lazy `LLMSession(model=spec, npu=k)`）。
 * **主进程持 RpcClient**：`get_registry().get_session(cap)` 返回
-  `app/services/rpc_session_proxy.RpcSessionProxy`，内部转发
+  `app/core/compute/proxy.RpcSessionProxy`(原 `app/services/rpc_session_proxy.RpcSessionProxy`),内部转发
   `reset()` / `respond()` 到 worker 的 `wdndds/rpc/<model_id>` service
   topic，再从 `<service_name>/reply` shared reply topic 拿回 JSON reply。
   业务侧（detector / tts / vfa / text_chat）调用方式**不变**
@@ -528,42 +859,113 @@ deps + native lib vendoring.
 
 ```
 wdnwebui/
-├── run.py                          # entry point — uvicorn.run("app.main:app", ...)
-├── bootstrap_wdndds_native.sh      # wdndds .so build (apt + stub + pip; unconditional rebuild since v0.6.1)
+├── run.py                              # uvicorn.run("app.main:app", 0.0.0.0:8000, reload)
+├── bootstrap_wdndds_native.sh          # wdndds .so build (apt + stub + pip; since v0.6.1)
 ├── app/
-│   ├── __init__.py       # __version__ = "0.3.0"
-│   ├── main.py           # create_app() factory + module-level `app`
-│   ├── api/
-│   │   ├── __init__.py   # imports submodules so include_router sees them
-│   │   ├── power.py
-│   │   ├── surveillance.py     # 16-channel REST + WS endpoints
-│   │   ├── system_logs.py
-│   │   ├── system_monitor.py   # CPU/mem/NPU + sysfs thermal zones → 系统信息 page
-│   │   └── video_detection.py   # REST + WebSocket frame stream + detector
-│   ├── services/
-│   │   ├── surveillance.py      # 16 channels sharing ONE LLMSession via a worker thread
-│   │   ├── video_session.py     # VideoCapture + decode thread + JPEG queue
-│   │   ├── detector.py          # wdnai VLM wrapper + worker thread
-│   │   └── uploads/             # local-file upload staging (gitignored)
+│   ├── __init__.py                     # __version__ = "0.4.0" (single source)
+│   ├── main.py                         # create_app() — discover_cards + register APIs + boot_compute
+│   │
+│   ├── core/                           # 共享内核(原 app/services/*)
+│   │   ├── manifest.py                 # 插件清单加载 + 校验 (v0.4 重构)
+│   │   ├── config.py                   # ConfigStore (config.jsonc 原子读写)
+│   │   ├── uploads.py                  # 公共 uploads 路径管理
+│   │   ├── compute/
+│   │   │   ├── registry.py             # ComputeRegistry — 见"算力注册中心"章节
+│   │   │   ├── worker.py               # compute_worker.py 子进程实现
+│   │   │   ├── proxy.py                # RpcSessionProxy — 主进程→worker RPC 客户端
+│   │   │   └── jsonc.py                # 注释保留的 JSON 读写
+│   │   ├── chat/                       # 文本对话核心
+│   │   │   ├── agent.py                # run_chat_with_tools 主进程工具循环
+│   │   │   ├── runner.py               # worker 端 chat_run 上下文管理
+│   │   │   ├── stream.py               # C 回调注入流式增量(避免 GIL 抢)
+│   │   │   └── serial.py               # 进程级 RLock: 串行化所有 chat_run
+│   │   ├── llm/
+│   │   │   └── detector_base.py        # WdnaiDetector 基类 + VLMDoc/TargetDoc/LocatorDoc
+│   │   ├── video/                      # 视频通用
+│   │   │   ├── session.py              # 单源 VideoSession (VideoCapture + decode 线程)
+│   │   │   ├── utils.py                # PyAV 探测 / 取帧 / 切片
+│   │   │   └── cache.py                # VCS + 微信共享的 LanceDB 索引缓存
+│   │   └── tools/
+│   │       └── registry.py             # 全局 @Callable 工具注册中心
+│   │
+│   ├── apps/                           # 8 个独立 app 卡片(v0.4 重构)
+│   │   ├── audio_analysis/             # 音频理解(嵌入音视频描述页)
+│   │   ├── text_chat/                  # 文本对话 (swcap_text_chat)
+│   │   ├── tts/                        # 语音生成 (swcap_audio_tts)
+│   │   ├── video_content_search/       # 视频内容检索 (swcap_video_retrieval)
+│   │   ├── video_detection/            # 音视频描述 (+ tts_alert 工具)
+│   │   ├── video_file_analysis/        # 视频文件分析 (VFA)
+│   │   ├── video_target_detection/     # 视频目标检测 (TargetDoc)
+│   │   └── video_target_localization/  # 视频目标定位 (LocatorDoc)
+│   │   # 每个 app 下固定结构:
+│   │   #   ├── manifest.json           # 插件声明
+│   │   #   ├── api.py                  # FastAPI router
+│   │   #   ├── service.py              # 单例状态机 + 业务逻辑
+│   │   #   ├── __init__.py             # register_api / register_shutdown 入口
+│   │   #   └── static/
+│   │   #       ├── template.html       # <section id="page-<id>"> 片段
+│   │   #       ├── app.js              # ImApp_<id> 模块(WS + DOM)
+│   │   #       ├── app.css             # 该 app 私有样式
+│   │   #       └── wizard.json         # (可选) 向导配置;支持则启用 wizard 模式
+│   │
+│   ├── system/                         # 系统级(非插件,平台 UI)
+│   │   ├── __init__.py                 # register_all — 手动装载系统 router
+│   │   ├── api/                        # 系统 API(挂 /api/* 前缀)
+│   │   │   ├── compute.py              # 算力注册中心 REST: instances / config / capabilities
+│   │   │   ├── config.py               # 配置读写 + app-prompts
+│   │   │   ├── coprocessor.py          # 协处理器 / NPU 探测
+│   │   │   ├── fs_browser.py           # 服务端文件浏览器(各 app 共用)
+│   │   │   ├── im_bridge.py            # /api/wechat/* 应用对接
+│   │   │   ├── power.py                # 重启 / 关机
+│   │   │   ├── system_logs.py          # journalctl → WS
+│   │   │   ├── system_monitor.py       # CPU / 内存 / NPU / thermal zones
+│   │   │   └── versions.py             # 组件版本探测
+│   │   ├── im_bridge/                  # 微信桥接实现
+│   │   │   ├── bot.py                  # Wechat 类(同步门面 + daemon thread)
+│   │   │   ├── llm.py                  # LLM bridge(微信 ↔ qwen3-4b)
+│   │   │   ├── video_manager.py        # 微信视频分流 → embedding 索引
+│   │   │   ├── video_search.py         # VideoSearch @Callable 工具
+│   │   │   ├── video_cache.py          # LanceDB 缓存 (md5 + 切片参数 key)
+│   │   │   └── service_wechat.py       # 单例 + WS broadcaster
+│   │   └── static/                     # 系统前端(非插件部分)
+│   │       ├── im_bridge/              # 应用对接页面模块
+│   │       └── system.js               # 系统页通用前端
+│   │
 │   └── static/
-│       ├── index.html           # single-page UI
-│       ├── css/style.css
-│       └── js/app.js            # WebSocket + Canvas + event UI
-├── requirements.txt      # web deps + opencv-python-headless + python-multipart
-├── .gitignore            # excludes .venv/, __pycache__/, .env, uploads/, etc.
-└── .venv/                # editable installs of wdnav, wdnai live under .venv/src/
+│       ├── index.html.template         # 构建模板 — 见 core/manifest.py:_assemble_index_html
+│       ├── core/                       # 框架核心 JS / CSS
+│       │   ├── framework.{js,css}      # 路由 + DemoGuard + 各 ImApp_<id> 装配
+│       │   ├── fs-modal.js             # 服务端文件浏览器模态
+│       │   ├── model-pick.js           # 算力配置页模型选择
+│       │   ├── qrcode.js               # (vendored) 二维码渲染
+│       │   ├── vtl-palette.js          # 视频目标定位调色板
+│       │   ├── format-utils.js         # 时间/字节 格式化
+│       │   └── wizard/                 # 向导框架
+│       │       ├── state.js            # WizardState IIFE:mount/unmount/step/env_check/form/finish
+│       │       ├── registry.js         # WizardRegistry.tryMount(manifest) / unmount()
+│       │       └── wizard.css
+│       └── apps/<id>/                  # 各 app 自带静态(从 manifest.json frontend 装载)
+├── requirements.txt                    # web deps + opencv-python-headless + python-multipart + av + lancedb
+├── config.jsonc                        # 设备级运行时配置(GITIGNORED — 不要 commit)
+├── .gitignore                          # 排除 .venv/, __pycache__/, uploads/, lancedb/, *.jsonc
+└── .venv/                              # editable installs of wdnav, wdnai, wdndds
 ```
 
-`app/__init__.py` owns the single version string; bump it there when the
-service version changes.
+**版本号唯一源**:`app/__init__.py` 的 `__version__`。改服务版本只改这一处。
+
+**零耦合规则**(`app/apps/__init__.py` 强制):
+- 卡片(`app/apps/<id>/`)只能 import `app.core.*`,禁止跨卡片 import,也禁止 import `app.system.*`。
+- 系统(`app.system`)与 core 双向允许(compute / config / video cache / tool registry 都是 core),但不依赖任何 `app.apps.*`。
+- 共享资源:视频缓存(`app/core/video/cache.py`)、LLM 工具注册(`app/core/tools/registry.py`)、算力注册中心(`app/core/compute/registry.py`)全部由 core 提供,各卡片走各自入口(例如 video_content_search + wechat_video_manager 都用 `get_video_cache()` 单例)。
 
 ## Video detection page
 
 The `#page-video-detection` section is wired to:
 
-- **Backend** (`app/api/video_detection.py`):
+- **Backend** (`app/apps/video_detection/api.py`):
   - `POST /api/video-detection/upload` — multipart file upload; saves to
-    `app/services/uploads/<uuid><ext>` and returns `{upload_id, path, …}`.
+    `app/uploads/<card_id>/<uuid><ext>` (默认 `/userdata/test/tmp` 由
+    `app/apps/video_detection/api.py:UPLOAD_DIR` 控制),returns `{upload_id, path, …}`.
   - `POST /api/video-detection/open` `{source: str}` — opens via
     `wdnav.VideoCapture`, starts decode thread, returns snapshot.
   - `POST /api/video-detection/control` `{action: "play"|"pause"|"stop"}`.
@@ -585,7 +987,7 @@ The `#page-video-detection` section is wired to:
     emits `{"type":"eof"}` once when a file source reaches end;
     emits `{"type":"event", id, frame_pos, ts, prompt, text}` for each
     VLM detection result.
-- **Service** (`app/services/video_session.py`):
+- **Service** (`app/core/video/session.py`):
   - One `VideoSession` singleton, one `wdnav.VideoCapture`, one decode
     `Thread`. Latest-frame-only queue (`maxsize=1`) — drops oldest on
     overflow to keep latency low.
@@ -594,7 +996,7 @@ The `#page-video-detection` section is wired to:
   - Lazy `from wdnav import VideoCapture` at module top (still behind the
     `try/except` from `wdnav/__init__.py`); never imports `wdnav.video`
     explicitly.
-- **Service** (`app/services/detector.py`):
+- **Service** (`app/core/llm/detector_base.py`):
   - `WdnaiDetector` singleton. Wraps `wdnai.LLMSession` with
     `SystemLanguageModel.qwen3_vl_4b()` (configurable via
     `WDNAI_MODELS_DIR`).
@@ -624,7 +1026,7 @@ The `#page-video-detection` section is wired to:
   - History is an in-memory deque (max 200). Events carry `id`, `frame_pos`,
     `ts`, `prompt`, `text`.
   - On app shutdown, `close()` releases the RKNN session handle.
-- **Frontend** (`app/static/js/app.js` + `#page-video-detection` markup):
+- **Frontend** (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` + `#page-video-detection` markup):
   - Address input + "浏览设备…" button (opens server-side file picker
     modal) + "打开" / "关闭" buttons. The picker modal drives
     `/api/video-detection/fs` and writes the **device's** absolute path
@@ -674,7 +1076,7 @@ if mel.shape[1] >= n_frame:
 
 ### 切片策略（硬切片 + 时间戳列表）
 
-`app/services/audio_analysis.py`：
+`app/apps/audio_analysis/service.py`：
 
 * **PyAV 抽音**：从当前视频源 `av.open` → `container.streams.audio[0]` →
   `av.AudioResampler(format="s16", layout="mono", rate=16000)` →
@@ -713,7 +1115,7 @@ class AudioEvent:
 * `_LEGACY_CAPABILITY_TYPE_RENAMES` 加 `"audio_understand" → "swcap_audio_understand"`，
   兼容老 config.jsonc。
 
-### API 端点（`app/api/audio_analysis.py`）
+### API 端点（`app/apps/audio_analysis/api.py`）
 
 | Method | Path | 用途 |
 |---|---|---|
@@ -726,7 +1128,7 @@ class AudioEvent:
 
 错误码与 detector / VFA 对齐：502 + `RuntimeError("功能未启用: swcap_audio_understand")`。
 
-### 前端模块（`app/static/js/app.js`）
+### 前端模块（`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)`）
 
 * `AudioAnalysis` 模块（仿 `VDDetector` 写法）：
   * `init()` 绑定 start / stop / clear；`ensureWs()` 指数退避重连（上限 30s）。
@@ -774,7 +1176,15 @@ class AudioEvent:
 * **不做二次聚合**：60 秒以上音频不会自动生成"综述"；如未来需要，
   加一段独立的 LLM 调用（建议复用 `swcap_text_chat` 的 qwen3-4b）。
 
-## Surveillance page (视频监控)
+## Surveillance page (视频监控) — **已下线（v0.4 重构）**
+
+> **本节描述的是 v0.4 之前的 16 路 4×4 网格监控页面;v0.4 起已下线。**
+> 视频能力整合进微信视频检索管线 (`app/system/im_bridge/video_manager.py`)
+> 与 视频内容检索页 (`app/apps/video_content_search/`)。
+>
+> 以下内容作为**历史决策记录**保留 —— 16 路共享一个 LLMSession(避免 16×3.5 GB)
+> 的设计仍有参考价值。当前不需要在 v0.4 复现该页面;若未来要重建,
+> 本节可作为设计起点。
 
 The `#page-surveillance` section (sits **above** 视频检测 in the sidebar)
 shows 16 monitoring cells in a 4x4 grid. Each cell runs its own
@@ -788,7 +1198,7 @@ RKNN contexts total ~3.5 GB resident; spinning up 16 would need
 A single ``_InferenceWorker`` thread serialises all VLM calls into the
 shared session — see "Resource budget" below.
 
-* **Service** (`app/services/surveillance.py`):
+* **Service** (`(surveillance 已下线; 详见 im-bridge 的 video_manager)`):
   - ``SurveillanceManager`` singleton (lazy), owns 16 ``Channel``
     instances plus the shared ``_InferenceWorker``.
   - Each ``Channel`` carries its own config (name / source / prompt /
@@ -841,7 +1251,7 @@ shared session — see "Resource budget" below.
   - Packets use the wdnav wire format
     ``<type_byte:u8><pts_us:u64 LE><payload>`` with
     ``0x00 DELTA | 0x01 KEY | 0x02 HEADER (avcC) | 0xFF EOS`` (matches
-    ``wdnav.encoder._WebSocketSink`` and ``app/static/js/app.js``'s
+    ``wdnav.encoder._WebSocketSink`` and ``app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)``'s
     ``avccCodecString()``).
   - Each ``Channel`` exposes a thread-safe subscriber queue +
     ``threading.Event`` pair for the H.264 stream and another for the
@@ -869,10 +1279,10 @@ shared session — see "Resource budget" below.
     uvicorn accepts it as a vanilla client WS upgrade).
   - ``WS     /api/surveillance/{id}/stream``  — server pushes the H.264 wire
     format to the browser; the WebCodecs ``VideoDecoder`` (in
-    ``app/static/js/app.js``) consumes the same payload directly.
+    ``app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)``) consumes the same payload directly.
   - ``WS     /api/surveillance/{id}/thumb``   — server pushes JPEG thumbnails
     at ~5 fps.
-* **Frontend** (`app/static/js/app.js` ``Surveillance`` module +
+* **Frontend** (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` ``Surveillance`` module +
   ``#page-surveillance`` markup):
   - 4x4 grid of ``<canvas>`` cells; each subscribes to
     ``/api/surveillance/<id>/thumb`` while the channel is running.
@@ -941,7 +1351,7 @@ holds it in memory. The file is seeded with a `base` section at
 
 - **JSONC, not JSON** — the on-disk file is JSONC (JSON with `//`
   line comments and `/* ... */` block comments), parsed via the
-  ``json5`` library through ``app/services/jsonc.py``. **User-written
+  ``json5`` library through ``app/core/compute/jsonc.py``. **User-written
   comments are accepted on read but discarded on write**: any save
   through ``PUT /api/config/...`` or ``POST /api/config/import``
   emits a freshly formatted JSONC file with no comments. Hand-edited
@@ -954,7 +1364,7 @@ holds it in memory. The file is seeded with a `base` section at
 - **Where it lives** — resolved from `WDNWEBUI_CONFIG` env var when
   `run.py` starts (set by `--config /path/to/config.jsonc`); if unset,
   defaults to `<repo>/config.jsonc`. Always absolute.
-- **Read-write** — `app/services/config.py` `ConfigStore` is a lazy
+- **Read-write** — `app/core/config.py` `ConfigStore` is a lazy
   singleton (`get_config()`) with an in-memory dict guarded by an
   `RLock`. Missing files / non-object payloads all collapse to `{}`.
 - **Atomic writes** — `replace()` / `set_section()` write a sibling
@@ -962,7 +1372,7 @@ holds it in memory. The file is seeded with a `base` section at
   can't corrupt the file. Output goes through
   :func:`app.services.jsonc.dump_jsonc` (quoted keys, trailing commas,
   UTF-8 native).
-- **Whole-file endpoints** (`app/api/config.py`):
+- **Whole-file endpoints** (`app/system/api/config.py`):
   - `GET  /api/config`        — `{path, data}` (current snapshot).
   - `GET  /api/config/export` — `FileResponse` of the on-disk file
     (downloads as `config.jsonc`). If the file doesn't exist yet,
@@ -978,7 +1388,7 @@ holds it in memory. The file is seeded with a `base` section at
   key without disturbing siblings. Other sections (e.g. a future
   `power`) stay intact across `base` edits.
 - **`base` section** (Pydantic model `BaseConfig` in
-  `app/api/config.py`) currently has two fields:
+  `app/system/api/config.py`) currently has two fields:
   - `device_name` — human-readable device identifier. The default is
     generated lazily on the first `GET /api/config/base` after a
     missing/empty value (random 8-char alphanumeric, mixed case + digits,
@@ -998,7 +1408,7 @@ holds it in memory. The file is seeded with a `base` section at
   power popover are mutually exclusive (opening one closes the other
   — they share the same anchor and would otherwise stack).
 - **Base config page** — second sidebar entry (`#base-config`),
-  driven by the `Base` module in `app/static/js/app.js`. GETs the
+  driven by the `Base` module in `app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)`. GETs the
   `base` section on entry, PUTs on submit; "放弃修改" re-fetches.
   Services downstream (e.g. the detector's model loader) read
   `get_config().get_section("base")["model_path"]` lazily, not at
@@ -1067,12 +1477,12 @@ v0.11 起从 `compute.app_prompts` 挪到独立 `app` section（顶层
   - `video_target_detection.TargetDoc.desc` — 视频目标检测页
     `desc` 字段描述。
 * **`TargetDoc.x1/y1/x2/y2` 刻意不做配置** —— 4 个 bbox 坐标字段的
-  description 写死在 `_build_target_doc_class()` (`app/services/detector.py`)
+  description 写死在 `_build_target_doc_class()` (`app/core/llm/detector_base.py`)
   函数体里，是协议层 0–1000 归一化坐标格式说明，与模型对「画哪里」
   的理解无关，开 UI 编辑只会让用户误改协议格式。`_SCHEMA_CACHE`
   的 cache key 也只覆盖可配字段 (`desc`) 的 description，硬编码坐标
   字面量不进 cache（也不在 `_load_app_prompts` 返回值里）。
-* **默认值在 `app/services/detector.py` 模块顶层常量**
+* **默认值在 `app/core/llm/detector_base.py` 模块顶层常量**
   (`DEFAULT_VLM_DOC_TEXT_DESC` / `DEFAULT_VLM_DOC_LEVEL_DESC` /
   `DEFAULT_TARGET_DOC_DESC_DESC`)，简体中文一句话。
 * **空值兜底** —— 配置里字段缺失或空字符串 fallback 到默认常量，
@@ -1080,27 +1490,27 @@ v0.11 起从 `compute.app_prompts` 挪到独立 `app` section（顶层
   `AppPromptsConfig.field_validator` 兜底拒绝空字段 (422)。
 * **修改提示词后重启检测后生效** —— detector 实例的 schema class 在
   `start()` 时 build 一次，cached 在模块级 `_SCHEMA_CACHE`
-  (`app/services/detector.py`)；UI 上方有 hint `#bc-prompts-hint`
+  (`app/core/llm/detector_base.py`)；UI 上方有 hint `#bc-prompts-hint`
   提示用户保存后必须停止 + 重新启动检测循环。
-* **API** (`app/api/config.py`)：
+* **API** (`app/system/api/config.py`)：
   - `GET  /api/config/app-prompts` — 返回当前生效值（缺字段用默认补）。
   - `PUT  /api/config/app-prompts` — 全量替换；`AppPromptsConfig`
     校验每个字段非空 + strip 后落盘。
 * **UI 入口** —— 系统配置页 (`#base-config`) 下新增
-  `#bc-section-app-prompts` 子区块（`app/static/index.html`）：
+  `#bc-section-app-prompts` 子区块（`app/static/index.html.template`）：
   音视频描述 (VLMDoc) 两条 textarea + 视频目标检测 (TargetDoc) 一条
-  textarea + 保存/放弃修改按钮。`Base` 模块 (`app/static/js/app.js`)
+  textarea + 保存/放弃修改按钮。`Base` 模块 (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)`)
   的 `loadPrompts()` / `savePrompts()` / `resetPrompts()` 负责
   GET/PUT 三件套。
 * **添加新 app 的提示词步骤**：
-  1. `app/api/config.py` 里定义 `<Schema>Prompts(BaseModel)`，加 field
+  1. `app/system/api/config.py` 里定义 `<Schema>Prompts(BaseModel)`，加 field
      description；`AppPromptsConfig` 加同名嵌套字段并配
      `field_validator`。
-  2. `app/services/detector.py` `_load_app_prompts()` 的 `defaults`
+  2. `app/core/llm/detector_base.py` `_load_app_prompts()` 的 `defaults`
      映射表追加 `(<app_key>, <schema_cls>)` 条目 + 默认常量。
-  3. `app/static/index.html` 的 `#bc-section-app-prompts` 内追加
+  3. `app/static/index.html.template` 的 `#bc-section-app-prompts` 内追加
      一组 `<h4>` + `<textarea>` 控件。
-  4. `app/static/js/app.js` `Base.loadPrompts()` /
+  4. `app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` `Base.loadPrompts()` /
      `savePrompts()` 里追加对应字段读写 + `addEventListener`
      绑定。
 * **Schema cache 行为** — `_SCHEMA_CACHE: dict[tuple, type] = {}`
@@ -1126,7 +1536,7 @@ v0.11 起从 `compute.app_prompts` 挪到独立 `app` section（顶层
 
 ## System logs page
 
-The `#page-system-logs` section is wired to `app/api/system_logs.py`,
+The `#page-system-logs` section is wired to `app/system/api/system_logs.py`,
 which shells out to `journalctl` and pipes JSON-lines back:
 
 - `GET /api/system-logs/units` — service list (running / failed /
@@ -1141,7 +1551,7 @@ which shells out to `journalctl` and pipes JSON-lines back:
   `{"type":"line","entry":{...}}`; auto-terminates after 30 minutes
   per connection; pings every 15 s so idle proxies don't reap.
 
-Frontend (`app/static/js/app.js` `Logs` module): filter toolbar (unit +
+Frontend (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` `Logs` module): filter toolbar (unit +
   priority + lines + follow-tail checkbox + clear), `<ol>` list of color-coded
   log rows on a dark stage, auto-scroll only when the user is parked at
   the bottom (so scrolling up to inspect an older line doesn't get yanked).
@@ -1409,7 +1819,7 @@ demux 是瞬时的（p50=0.3ms），瓶颈在 mpp decoder 端。
 
 ### 诊断埋点（保留作为运维工具）
 
-`app/services/video_session.py` 加了 `_TIMING_ENABLED` 探针，
+`app/core/video/session.py` 加了 `_TIMING_ENABLED` 探针，
 环境变量 `WDNWEBUI_VIDEO_SESSION_TIMING=1` 开启，每 30 帧（≈1.2s）
 输出一行到 LOG.info / stderr / `/tmp/wdnwebui_video_session_timing.log`：
 
@@ -1566,7 +1976,7 @@ TCP burst 时 PyAV 一次性回送 30+ 个 packet，`read0` 循环
 slot，再 `_send(packet)` 推 packet。
 
 第一次实现有个 bug：drain 超时（frame is None）时 return
-`(False, None)`，外层 `_decode_loop`（`app/services/video_session.py:417-440`）
+`(False, None)`，外层 `_decode_loop`（`app/core/video/session.py:417-440`）
 把它当 EOF 处理杀掉整个解码循环，session 立刻 `state=eof frame_pos=0`。
 改成 drain 超时时 **`continue` for 循环 + `time.sleep(0.001)`**
 （1ms 节流，足够让下一个 demux 拿新 packet），decode loop 继续
@@ -1607,7 +2017,7 @@ output pool 已空）。
 
 **保留**：
 - `wdnav/video.py:read0` 的 drain-first backpressure（**核心修复**）
-- `app/services/video_session.py` 诊断埋点（env-gated，env 关闭时零开销）
+- `app/core/video/session.py` 诊断埋点（env-gated，env 关闭时零开销）
 
 ## TTS (语音生成) page
 
@@ -1626,7 +2036,7 @@ are all documented in
 ``.venv/src/wdnai/src/wdnai/models/README.md`` and
 ``.venv/src/wdnai/src/wdnai/backends/tts.py``.
 
-* **Service** (`app/services/tts_session.py`):
+* **Service** (`app/apps/tts/service.py`):
   - ``TtsSession`` singleton, lazy-imports wdnai at first use so a
     non-RK dev box still boots (just reports ``state="unavailable"``).
   - State machine mirrors ``VideoSession``/``WdnaiDetector``:
@@ -1639,7 +2049,7 @@ are all documented in
     thread is still draining.
   - Output history is an in-memory deque (max 50). Each entry:
     ``{ts, text, language, speaker, output, size, audio_sec, frames}``.
-* **Endpoints** (`app/api/tts.py`):
+* **Endpoints** (`app/apps/tts/api.py`):
   - ``POST /api/tts/start`` ``{text, language, speaker, ref_speaker,
     volume, instruct, no_play, non_streaming_mode, output}`` — kicks
     off a synthesis. Refuses with 503 if a run is in flight.
@@ -1650,9 +2060,9 @@ are all documented in
   - ``GET  /api/tts/history`` — list of recent output WAVs.
   - ``WS   /api/tts/ws`` — pushes the snapshot on every state /
     frames / error change. Auto-reconnect with exponential backoff
-    is handled on the client side (``app/static/js/app.js``
+    is handled on the client side (``app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)``
     ``TTS.ensureWs``).
-* **Frontend** (``app/static/index.html`` + ``#page-tts`` markup):
+* **Frontend** (``app/static/index.html.template`` + ``#page-tts`` markup):
   - Sidebar entry ``语音生成`` sits between ``视频检测`` and
     ``系统日志`` (mutually exclusive with other pages — the sidebar
     just toggles the ``.hidden`` class on each ``.page``).
@@ -1694,7 +2104,7 @@ RIFF header by hand.
 批量 VLM 分析 —— 给定本地文件 / RTSP / RTMP / 摄像头，VLM 按 `every_n`
 帧采样输出结构化 `SceneFrame`，文件走完后跑一次 Apollo 三段式综述。
 
-* **Service** (`app/services/video_file_analysis.py`):
+* **Service** (`app/apps/video_file_analysis/service.py`):
   - `VideoFileAnalysisService` 单例（`get_service()`）。状态机
     `idle → opening → running → summarizing → done`，`stopped` / `error` 是
     旁支终态。
@@ -1719,10 +2129,11 @@ RIFF header by hand.
     （`max_new_tokens=400`）。每完成一个 chunk 广播 `state` 进度，
     前端用 `summary_progress: [done, total]` 显示 N/M。
   - **持久化**：每次 `start()` 分配新 `run_id`（uuid4 hex），结束 / 停止 /
-    出错都原子写到 `app/services/vfa_runs/<run_id>.json`（mp temp + os.replace）。
+    出错都原子写到 `app/apps/video_file_analysis/vfa_runs/<run_id>.json`(mp temp + os.replace;
+    也可由 `VFA_RUNS_DIR` 环境变量覆盖)。
     JSON 含 `events[]` + `summary` + `fps` + `total_frames`。**老 run 没
     `fps` 字段时** `list_runs` 走 PyAV 探测自愈并回填。
-* **API** (`app/api/video_file_analysis.py`):
+* **API** (`app/apps/video_file_analysis/api.py`):
   - `GET  /api/video-file-analysis`             — 当前快照（state / 总帧 /
     进度 / 综述 / available / init_error）。
   - `GET  /api/video-file-analysis/events`      — per-frame events + summary。
@@ -1741,7 +2152,7 @@ RIFF header by hand.
   - `GET  /api/video-file-analysis/runs/{run_id}/frame/{frame_pos}` —
     从原始视频取指定帧的 JPEG（PyAV v4l2m2m seek + wdnav read0 fallback）。
   - `WS   /api/video-file-analysis/ws`          — server-push `{type:"event"|"summary"|"state"|"hello"}`。
-* **前端** (`app/static/js/app.js` `VFA` 模块 + `#page-video-file-analysis`):
+* **前端** (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` `VFA` 模块 + `#page-video-file-analysis`):
   - 顶部进度条 + 阶段标签（`未启动 / 正在打开 / 分析中 / 生成综述中 / 已完成 /
     已停止 / 错误`），状态色随 `data-state` 切换；分析中显示"已读 N/M · 已
     分析 X/Y · LLM 队列 Z"。
@@ -1778,7 +2189,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 帧流播放。状态机 `idle → extracting → ready`，`stopped` / `error` 是
 旁支终态。
 
-* **Service** (`app/services/video_content_search.py`)：
+* **Service** (`app/apps/video_content_search/service.py`)：
   - `VideoContentSearchService` 单例（`get_service()`）。
   - **LLMSession 必须从 ComputeRegistry 取** —— `get_session("swcap_video_retrieval")`，
     复用 qwen3-vl-embedding-2b 实例；找不到 capability 抛
@@ -1801,7 +2212,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     顺序生成区间内每帧 JPEG（PyAV seek 到 keyframe + 顺序 decode +
     cv2 编码）；`paced=True` 时按源视频 fps 节流（**绝对时钟对齐**，
     sleep 补偿编码耗时，帧间隔精确 = 1/fps，缺失回退 `fallback_fps=25`）。
-* **API** (`app/api/video_content_search.py`)：
+* **API** (`app/apps/video_content_search/api.py`)：
   - `GET  /api/video-content-search` — 快照（state / 进度 / query /
     hits / fps / source_exists）。
   - `POST /api/video-content-search/open` `{source}` — 选单个视频文件。
@@ -1825,7 +2236,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     非法 source / `end<=start` 直接 1008。
   - `GET  /api/video-content-search/frame?source=&t=` — PyAV seek 到
     `t` 秒附近取帧 JPEG（命中卡片缩略图），失败 404。
-* **前端** (`app/static/js/app.js` `VCS` 模块 + `#page-video-content-search`)：
+* **前端** (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` `VCS` 模块 + `#page-video-content-search`)：
   - 左侧表单：视频源（"浏览…"复用 `VdFsModal._sourceTarget` 机制）+
     切片档位（3/4/5/6s，重叠 1/2s）+ 提取按钮；中间进度条 + 阶段标签。
   - 右侧命中结果列表（相似度降序，每条带开始/结束时间），点卡片 →
@@ -1835,7 +2246,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     （`VCS.snap.fps` 算总帧数）、暂停/恢复/停止/播完重播。
   - `DemoGuard` 注册 `video-content-search`，离开页面 confirm + 停
     play WS + sendBeacon 兜底，与其它演示页一致。
-* **ComputeRegistry preset**（`app/services/compute_registry.py`）：
+* **ComputeRegistry preset**（`app/core/compute/registry.py`）：
   - `MODEL_PRESETS["qwen3-vl-embedding-2b"]`：`capability_types=
     ["swcap_video_retrieval"]`，`memory_estimate_mb=2000`，
     `estimated_init_seconds=30`。`kind="embedding"` 的 probe /
@@ -1859,7 +2270,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 `sink.text` 增量收进 chat state。主进程 `chat_poll` 轮询拉增量（~150ms
 粒度），`on_delta` 喂给 `_ThinkingRouter` 流式切分 thinking / answer。
 
-* **Backend** (`app/api/text_chat.py`):
+* **Backend** (`app/apps/text_chat/api.py`):
   - `GET /api/text-chat` — snapshot：state / busy / error / history_count /
     history_tokens / context_limit / max_new_tokens / current_request_id /
     last_result。
@@ -1873,7 +2284,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - `WS /api/text-chat/ws` — server-push 流式 token + 状态变更；连接后立即
     推 `{type:"snapshot", snapshot:...}` hydrate。
 
-* **Service** (`app/services/text_chat.py`):
+* **Service** (`app/apps/text_chat/service.py`):
   - `_TextChatManager` 单例（`get_chat_service()`，lazy）；状态机
     `idle → loading → running → done/error/stopped`，与 wdnwebui
     其它服务风格一致。
@@ -1886,7 +2297,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     `chat_runner.split_thinking` 兜底切一次（处理 token 边界切碎等极端情况）。
   - 单 daemon worker thread（`text-chat-worker`）串行消费 `request_queue`；
     `chat_run` 同步阻塞在 RPC 轮询里，每轮检查 `_worker_stop_event`。
-  - **上下文管理在 worker 端**（`app/services/chat_runner.py`）：
+  - **上下文管理在 worker 端**（`app/core/chat/runner.py`）：
     `trim_history` 用真实 tokenizer 从最新往回累计每条消息 token，超
     `context_limit - reserve` 就裁掉更早的（滚动窗口）；reserve =
     `min(max_new_tokens, context_limit // 8)`（自适应输出预留，小 context
@@ -1905,13 +2316,13 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     WS handler 在主 event loop 里 `await queue.get()` drain；observer
     也走同一条路径，避免第二条 channel。
 
-* **Worker 端 chat 通道**（`app/services/compute_worker.py`）：
+* **Worker 端 chat 通道**（`app/core/compute/worker.py`）：
   - `chat_run` action：校验 session loaded + 无并发 chat；把 history/text/
     context_limit/max_new_tokens 存进 `state["chat"]`，起后台线程
     `_chat_run_loop`，pump 线程立即返回 `{"status":"chat_started"}`（对齐
     `load_handler` 的后台线程模式，避免长推理占住 cshim pump 线程）。
   - `_chat_run_loop`：`chat_runner.trim_history` 精确裁剪 → 拼 ChatML →
-    `sess.reset()` → **注册 C 回调 observer**（`app/services/chat_stream.py`，
+    `sess.reset()` → **注册 C 回调 observer**（`app/core/chat/stream.py`，
     见下）把 `sink.text` 增量 append 到 `state["chat"]["deltas"]` →
     `_backend.run(prompt, keep_history=0, enable_thinking=True)` → done
     （text / elapsed_sec / prompt_tokens / answer_tokens）。
@@ -1929,7 +2340,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - `_build_session` 已支持 qwen3-4b（`max_context_len=16384` +
     `with_options(max_new_tokens=2048, keep_history=1, enable_thinking=True)`）。
 
-* **流式采集 = C 回调注入**（`app/services/chat_stream.py`）：
+* **流式采集 = C 回调注入**（`app/core/chat/stream.py`）：
   - **不能靠独立线程轮询 `sink.text`** —— `_backend.run` 的 `session_run`
     是同步阻塞的 C 调用，解码回调持有 GIL 逐批执行，并行轮询线程抢不到
     GIL，`deltas` 恒为空（真机实测：状态走到 done 但前端无任何回复）。
@@ -1963,7 +2374,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   - `register_observer(sink, cb)` / `unregister_observer(sink)`：全局 dict
     key=`id(sink)`，`_chat_run_loop` 在 run 前后注册/注销。
 
-* **Proxy**（`app/services/rpc_session_proxy.py`）：
+* **Proxy**（`app/core/compute/proxy.py`）：
   - `chat_run(history, text, *, context_limit, max_new_tokens, on_delta,
     stop_event, poll_interval_ms=150, timeout_ms=300000,
     tool_names=None)` — 同步阻塞，发
@@ -1973,7 +2384,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     `TimeoutError`。
   - `chat_stop()` — RPC `chat_stop`。
 
-* **ComputeRegistry** preset（`app/services/compute_registry.py:136-164`）：
+* **ComputeRegistry** preset（`app/core/compute/registry.py:136-164`）：
   - 新增 `MODEL_PRESETS["qwen3-4b"]`：`capability_types=["swcap_text_chat"]`，
     `memory_estimate_mb=4950`，`estimated_init_seconds=60`。
   - `_qwen3_4b_spec()` 工厂用 `dataclasses.replace(spec, max_context_len=16384)`
@@ -1983,7 +2394,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     `replace`。
   - `_init_session_subprocess` 子进程硬编码分支加 `elif model_id == 'qwen3-4b'`。
 * **ComputeRegistry 配置 — `locate-anything` grounding preset**
-  （`app/services/compute_registry.py`）：纯图像输入 + 文本输出（0–1000
+  （`app/core/compute/registry.py`）：纯图像输入 + 文本输出（0–1000
   归一化 bbox + 描述），与 VLM 共用同款文件布局（`rknn_llm_path` +
   `rknn_vision_path` + `embed_path` + `tokenizer_path`），但绑定到
   `LocateAnything` backend（`wdnai.backends.locate_anything.LocateAnythingBackend`）。
@@ -2000,7 +2411,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     返回裸 spec，仅供算力配置页 / 启动预检的形态占位用，真实
     `LLMSession(model=spec, npu=K)` init 仍会报缺文件。
 
-* **Frontend** (`app/static/index.html` + `app/static/js/app.js` + `style.css`)：
+* **Frontend** (`app/static/index.html.template` + `app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` + `style.css`)：
   - 左栏 demo 区第 5 项 `<a data-page="text-chat" data-icon="✎">文本对话</a>`，
     排在 `#tts` 之后。
   - `<section id="page-text-chat">`：复用 `.imb-card` / `.imb-conv` /
@@ -2047,12 +2458,12 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 | Default bind host / port              | `run.py` `main()`                                        |
 | Public SDK dependency                 | Re-run the two `pip install -e` lines above              |
 | Anything that needs a new endpoint    | Add a route inside `create_app()` in `app/main.py`        |
-| Added/removed a model preset          | `MODEL_PRESETS` in `app/services/compute_registry.py` + `register` the new capability in the same table; update `app/static/index.html` and `app/static/js/app.js` only if the UI needs new model cards |
-| `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
-| Schema hint prompts (`VLMDoc.text`/`level`, `TargetDoc.desc`) | `app.prompts.<app_key>.<schema_cls>.<field>` in `config.jsonc`; UI under 系统配置 → App 提示词模板 section. `TargetDoc.x1/y1/x2/y2` stay hardcoded in `_build_target_doc_class` (`app/services/detector.py`) — protocol-level 0–1000 归一化坐标格式说明，刻意不开 UI 编辑 |
+| Added/removed a model preset          | `MODEL_PRESETS` in `app/core/compute/registry.py` + `register` the new capability in the same table; update `app/static/index.html.template` and `app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` only if the UI needs new model cards |
+| `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/system/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
+| Schema hint prompts (`VLMDoc.text`/`level`, `TargetDoc.desc`) | `app.prompts.<app_key>.<schema_cls>.<field>` in `config.jsonc`; UI under 系统配置 → App 提示词模板 section. `TargetDoc.x1/y1/x2/y2` stay hardcoded in `_build_target_doc_class` (`app/core/llm/detector_base.py`) — protocol-level 0–1000 归一化坐标格式说明，刻意不开 UI 编辑 |
 ## Tools (音视频检测页工具)
 
-`app/services/tools/` 装的是给音视频描述页 (`WdnaiDetector` 走
+`app/core/tools/` 装的是给音视频描述页 (`WdnaiDetector` 走
 `VLMDoc` schema 时) 用的 wdnai ``@Callable`` 工具集合，**不**进入
 视频监控 (16 路) — 那条通路有自己的 surveillance manager，工具
 语义不同，这一轮不动。
@@ -2061,12 +2472,12 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   ``text`` / ``language`` / ``ref_speaker``，``TtsSession.start``
   触发本机播放。能力门控
   ``requires_capability="swcap_audio_tts"``。
-  工具注册中心 ``app/services/tools/registry.py`` 中
+  工具注册中心 ``app/core/tools/registry.py`` 中
   ``get_tool_registry()`` 启动时只挂载 ``tts_alert`` 一条。
 
 * **页面归属**：
   - ``tts_alert`` 暴露面：**音视频描述页**（``ALLOWED_TOOLS =
-    ("tts_alert",)`` 在 ``app/api/video_detection.py``）+ **chat 链路**
+    ("tts_alert",)`` 在 ``app/apps/video_detection/api.py``）+ **chat 链路**
     （web 文本对话 / 微信桥接，经 capability 过滤后自动纳入，
     见下方 "Chat 工具调用 (chat-agent)" 章节）。
   - ``video_search`` 暴露面：仅 **chat 链路**（微信视频检索场景，
@@ -2077,9 +2488,9 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 * **历史下线 — ``target_detection`` 工具**：原本是给 **视频目标
   检测页** 用的 ``@Callable``，模型给出 0–1000 归一化 bbox + ROI
   描述，后端裁切 + JPEG 编码 + base64 内嵌。本版本已**完全下线**：
-  - 工具文件 ``app/services/tools/target_detection.py`` 已删除；
+  - 工具文件 ``app/core/tools/target_detection.py`` 已删除；
   - 注册表不再有 ``target_detection`` 项；
-  - ``app/api/video_target_detection.py`` 不再有
+  - ``app/apps/video_target_detection/api.py`` 不再有
     ``ALLOWED_TOOLS`` 常量与 ``/video-target-detection/tools``
     端点（视频目标检测页没有"工具集合"概念）；
   - 替代实现见下方 "TargetDoc 结构化输出"段。
@@ -2109,7 +2520,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 ## Chat 工具调用 (chat-agent)
 
 web 文本对话与微信桥接共用 ``run_chat_with_tools()`
-（``app/services/chat_agent.py``）：模型发起 tool_call 后在**主进程**
+（``app/core/chat/agent.py``）：模型发起 tool_call 后在**主进程**
 实例化并执行 @Callable，wrap-up / 回喂继续推理，直到给出自然语言
 回答或达到循环上限。done 帧带最终 ``tool_call`` / ``tool_call_args``
 + ``steps[]``（每次执行的 args/outcome/error 明细）；
@@ -2157,7 +2568,7 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
   识别并返回主进程执行（capability 校验必然抛错 → 失败回喂自然告知）。
   完全编造的工具名 dispatch 校验失败，当纯文本。
 * **新增一个工具的三步流程（零框架改动）**：
-  1. ``app/services/tools/<tool>.py`` 定义 ``@WdnaiCallable`` 类 +
+  1. ``app/core/tools/<tool>.py`` 定义 ``@WdnaiCallable`` 类 +
      ``__call__(self, frame_bgr, ctx)``（纯文本场景 frame 传 None）；
   2. ``get_tool_registry()`` 里 ``register(...)`` 一行（需 NPU 算力的
      标注 ``requires_capability``）;
@@ -2181,7 +2592,7 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
 结构化输出时**直接**给出 ROI 坐标 + 描述文本，不需要再跑工具
 链路。
 
-* **Schema 定义** (``app/services/detector.py``)：
+* **Schema 定义** (``app/core/llm/detector_base.py``)：
   ```python
   @Generable
   class TargetDoc(BaseModel):
@@ -2277,7 +2688,7 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
 **权衡**：失去"rknn3 native abort 子进程隔离"保护 —— 但 AGENTS.md
 里记载的 `std::terminate()` 现象**仅在非 RK 开发板 / 算力配置错的板
 子**上见过，真机 RK3588 极少发生。旧版 `_init_session_subprocess`
-完整函数**保留**在 `app/services/compute_registry.py:756+`（当前不
+完整函数**保留**在 `app/core/compute/registry.py:756+`（当前不
 调用），将来真机若出现 abort，可以把 `_run_one` 改回原路径（恢复
 双 init）或加 fallback 策略。
 
@@ -2292,20 +2703,20 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
 
 `#page-im-bridge` 拆成两块：左侧登录面板 + 右侧调试收发对话
 （user_id 下拉 + 文本框 + 消息列表）。底层走 [`wechatbot-sdk` 0.3.0](https://www.wechatbot.dev/zh/python)，
-但调用入口是 `app/services/wechat_bot.py` 里本地 `Wechat` 类（v0.5+
+但调用入口是 `app/system/im_bridge/bot.py` 里本地 `Wechat` 类（v0.5+
 从 `wdndds.Wechat` 内联过来）的**同步门面**（自带 daemon-thread
 asyncio loop），不是直接 `await` SDK。`wechatbot-sdk` 是 wdnwebui
 的**直接**依赖（`requirements.txt`），不再是 wdndds 的 transitive
 依赖 —— wdndds 0.4 已移除 `Wechat` 模块。
 
-* **服务** (`app/services/wechat.py` + `app/services/wechat_bot.py`)：
-  - `Wechat` 类（`app/services/wechat_bot.py`）—— 同步门面，持有
+* **服务** (`app/system/im_bridge/service_wechat.py` + `app/system/im_bridge/bot.py`)：
+  - `Wechat` 类（`app/system/im_bridge/bot.py`）—— 同步门面，持有
     `wechatbot.WeChatBot` + 私有 asyncio loop + daemon thread。
     暴露与原 `wdndds.Wechat` 一致的 API（`start_login` / `cancel_login` /
     `logout` / `send_text` / `register_message_handler` /
     `login_status` / `recent_messages` / `known_users` /
     `check_runtime`）。
-  - 单例 `_WechatManager`（`app/services/wechat.py`，lazy，
+  - 单例 `_WechatManager`（`app/system/im_bridge/service_wechat.py`，lazy，
     ``get_wechat()``），内部持一个 `wechat_bot.Wechat` 实例。
   - 后台线程 1Hz 轮询 `login_status()`，状态变化时 push 给 WS 订阅者；
     新入站消息通过 `register_message_handler` 立即触发推送，不等下一轮。
@@ -2315,7 +2726,7 @@ asyncio loop），不是直接 `await` SDK。`wechatbot-sdk` 是 wdnwebui
   - ``close_wechat()`` 用于 app shutdown；如果 manager 从未被创建过
     （用户从来没进过 im-bridge 页面）则是 no-op，避免空跑 daemon loop。
 
-* **API** (`app/api/wechat.py`)：
+* **API** (`app/system/api/im_bridge.py`)：
 
   | Method | Path | 用途 |
   |---|---|---|
@@ -2333,7 +2744,7 @@ asyncio loop），不是直接 `await` SDK。`wechatbot-sdk` 是 wdnwebui
   - WS 握手后**立刻**推一帧 `{"type":"snapshot", "snapshot":...}` 让客户端
     无需额外 GET 也能 hydrate。
 
-* **前端** (`app/static/js/app.js` `ImBridge` 模块 + `#page-im-bridge`):
+* **前端** (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` `ImBridge` 模块 + `#page-im-bridge`):
   - 左侧：登录按钮 / 取消 / 退出 + 凭证路径 + user_id + long-poll 状态
     + SDK 版本 + QR `<svg>` 渲染（vendored Kazuhiko Arase
     `qrcode-generator` 1.4.4，MIT，文件 `app/static/js/qrcode.js`，**不**
@@ -2384,7 +2795,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
 （qwen3-4b）推理 → 把回答（只回 answer，不含 thinking）通过
 `Wechat.send_text` 发回给该微信用户，实现微信上的多轮文本对话。
 
-* **Service** (`app/services/wechat_llm.py`)：
+* **Service** (`app/system/im_bridge/llm.py`)：
   - `_LlmBridge` 单例（`get_llm_bridge()`），由 `_WechatManager` 持有并
     在 `_handle_incoming` 里转发 `handle_incoming(msg)`。
   - **开关内存态**：`_enabled` 不落盘（重启即关）。`available()` 通过
@@ -2412,13 +2823,13 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   语义：开启时消息流完全交给「用户微信消息 → LLM → 自动回复」闭环，避免
   手动消息未进模型上下文造成上下文错乱。
 
-* **API**（`app/api/wechat.py`）：
+* **API**（`app/system/api/im_bridge.py`）：
   - `POST /api/wechat/llm-bridge` `{enabled}` —— 开/关桥接；未加载 LLM 时
     开启 → 409；返回 `{ok, snapshot, llm_bridge}`。
   - `GET /api/wechat` snapshot 增加 `llm_bridge: {enabled, available,
     busy, active_sessions}`（`available` 供前端置灰）。
 
-* **前端**（`app/static/index.html` + `app.js` `ImBridge`）：
+* **前端**（`app/static/index.html.template` + `app.js` `ImBridge`）：
   - 调试收发卡片顶部一行：checkbox + 提示。`available=false` → checkbox
     disabled + 红字提示「文本对话模型未启用，请在算力配置页加载 qwen3-4b」；
     `enabled` + `busy` → 「已对接，生成中…」。
@@ -2440,7 +2851,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   协议行为。``wechat_llm.handle_incoming`` 对 video 消息毫秒级分流到
   ``wechat_video_manager.enqueue_video()``（纯内存入队，CDN 下载在
   后台线程，不阻塞回调）；LLM 只暴露同步查询型工具。
-* **管理器**（`app/services/wechat_video_manager.py` 单例）：
+* **管理器**（`app/system/im_bridge/video_manager.py` 单例）：
   - **单槽注册表** `{user_id: VideoEntry}` —— 每用户仅保留最新 1 个
     视频，新视频到达即覆盖旧的（删落盘文件 + 释放旧索引）；串行队列
     中被覆盖的任务按 seq 判定自动跳过。
@@ -2467,12 +2878,12 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
      首个失败原因，让用户明确感知不完整；不入缓存、不删文件（重发
      可重试失败段）。播报格式对命中 / 全成功完全一致。
    - shutdown hook `close_wechat_video_manager()` 在 main.py 注册。
-* **LanceDB 分析结果缓存**（`app/services/wechat_video_cache.py`，
+* **LanceDB 分析结果缓存**（`app/system/im_bridge/video_cache.py`，
   v0.12）：key = 视频文件本地 md5；value = 切片 embedding 索引，
   **一行一片**（表 `wechat_video_index`：md5 / chunk_idx / 时间窗 /
   `vec` FixedSizeList(2048,float32) / filename / duration / 切片参数 /
   embedding_model / analyzed_at）。数据目录
-  `app/services/uploads/lancedb/`（uploads/ 已 gitignore）。要点：
+  `app/uploads/lancedb/`（uploads/ 已 gitignore）。要点：
   - **embedding_model 隔离**：每行记录产生向量的模型 id；模型换代后
     旧缓存自动失配（lookup 按 md5 + embedding_model 过滤查不到），
     不会拿旧向量硬算余弦。
@@ -2561,7 +2972,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     **微信条目不进 web 界面**。`lookup`/命中短路/LRU/`clear`（全清
     含微信条目，用户决策）不变 —— 跨入口命中复用保持（表共享、
     展示隔离）。同 md5 同参数两渠道互覆（save 幂等语义，检索等价）。
-* **VideoSearch 工具**（`app/services/tools/video_search.py`，
+* **VideoSearch 工具**（`app/core/tools/video_search.py`，
   `requires_capability="swcap_video_retrieval"`）：**无调用时机限制**
   的四态结果型返回 —— `ok`（命中片段）/ `extracting`（附实时进度）/
   `downloading` / `no_video`，状态即合法业务结果而非错误，模型自由
