@@ -4,7 +4,7 @@ Drives TTS inference through the v2 ``LLMSession.respond`` API; the
 service owns the per-call state machine, history, broadcaster, and
 WAV file I/O. ``model_dir`` resolution is the same as the SDK's
 TTSBackend (env var → ``$WDNAI_MODELS_DIR/Qwen3-TTS`` →
-``/userdata/models/Qwen3-TTS``); the layout is documented in
+``<default_models_root>/Qwen3-TTS``); the layout is documented in
 ``wdnai/models/README.md``.
 """
 from __future__ import annotations
@@ -459,7 +459,11 @@ class TtsSession:
         env = os.environ.get("TTS_MODEL_DIR")
         if env:
             return Path(env)
-        root = os.environ.get("WDNAI_MODELS_DIR", "/userdata/models")
+        # Fall back to ``default_models_root()`` so off-device hosts
+        # without ``/userdata/models`` still find the model dir under
+        # ``/mnt/oem/models`` or ``<HOME>/models``.
+        from app.core.config import default_models_root
+        root = os.environ.get("WDNAI_MODELS_DIR", str(default_models_root()))
         return Path(root) / "Qwen3-TTS"
 
     @staticmethod
@@ -838,10 +842,14 @@ class TtsSession:
         return self.snapshot()
 
     def _default_output_path(self) -> Path:
-        # 写盘路径用 core helper 统一:``app/uploads/tts/``(共享约定)。
-        # 跟 ``api.tts_output`` 的 ``uploads_root`` 校验对齐。
-        from app.core.uploads import get_card_uploads_root
-        return get_card_uploads_root("tts") / f"tts-{int(time.time())}.wav"
+        # TTS 生成的 WAV 落到 config 资源目录的 ``tts`` 子目录下(典型
+        # 设备端 ``/userdata/test/tts``,off-device ``<HOME>/test/tts``),
+        # 不要走 ``get_card_uploads_root('tts')``(那个在 emmc 上的 repo
+        # 内,emmc 寿命扛不住频繁写)。解析走
+        # :func:`app.core.uploads.get_tts_output_root`,跟
+        # ``api.tts_output`` 的路径校验同源。
+        from app.core.uploads import get_tts_output_root
+        return get_tts_output_root() / f"tts-{int(time.time())}.wav"
 
     def stop(self) -> dict:
         with self._lock:

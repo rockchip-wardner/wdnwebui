@@ -2102,10 +2102,22 @@ def router(service_name: str, payload: Any, state: dict,
 # Main — wdndds cshim Hub as RPC server                                      #
 # --------------------------------------------------------------------------- #
 def _config_path() -> str:
-    """Resolve config.jsonc path from WDNWEBUI_CONFIG env var, defaulting
-    to the repo root config.jsonc."""
-    import os
-    return os.environ.get('WDNWEBUI_CONFIG') or '/userdata/wdnwebui/config.jsonc'
+    """Resolve config.jsonc path.
+
+    Priority mirrors :func:`app.core.config._resolve_config_path`:
+
+    1. ``WDNWEBUI_CONFIG`` env var (the main process always sets this
+       when spawning a worker, so this is the common case).
+    2. The main-process default — same computation, so the worker
+       and the spawning parent agree even if the env was dropped.
+
+    Note: we deliberately do NOT keep a hardcoded ``/userdata/...``
+    fallback here; on off-device hosts ``/userdata`` is not mounted,
+    and the worker should agree with the main process rather than
+    silently diverging to a non-existent path.
+    """
+    from app.core.config import _resolve_config_path as _main_resolve
+    return os.environ.get('WDNWEBUI_CONFIG') or str(_main_resolve())
 
 
 def main() -> int:
@@ -2165,7 +2177,10 @@ def main() -> int:
     # Resolve model_dir for the info reply (don't fail if missing).
     model_dir = None
     try:
-        base_dir = os.environ.get("WDNAI_MODELS_DIR", "/userdata/models/")
+        # Match the main process's ``default_models_root()`` priority so
+        # off-device workers don't pin to a non-existent ``/userdata/models``.
+        from app.core.config import default_models_root
+        base_dir = os.environ.get("WDNAI_MODELS_DIR", f"{default_models_root()}/")
         from app.core.compute.registry import MODEL_PRESETS
         preset = MODEL_PRESETS.get(model_id)
         if preset:

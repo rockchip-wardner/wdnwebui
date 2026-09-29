@@ -59,6 +59,144 @@ def _random_device_name() -> str:
     )
 
 
+# Models-root candidates in priority order.
+#   1. /userdata/models  — Rockchip device default (post-install layout)
+#   2. /mnt/oem/models   — factory pre-loaded boards that ship models
+#                          under the OEM partition instead of /userdata
+#   3. <HOME>/models     — last-resort fallback for off-device
+#                          deployments (dev workstation, CI, container
+#                          without either mount). <HOME> here is the
+#                          user's home **before** sudo (see
+#                          :func:`_user_home`).
+# The first candidate that is actually a directory wins. Operators are
+# expected to populate whichever root applies for their setup; this
+# helper does NOT auto-create the directory because creating an empty
+# ``models/`` tree without weights in it is just clutter.
+_MODEL_ROOT_CANDIDATES: tuple[Path, ...] = (
+    Path("/userdata/models"),
+    Path("/mnt/oem/models"),
+)
+
+
+def _user_home() -> Path:
+    """Return the HOME directory of the user **before** sudo.
+
+    ``Path.home()`` follows ``$HOME``, which under ``sudo`` typically
+    points at the target user (``/root`` when running ``sudo -H`` /
+    ``sudo -i``). That breaks the off-device fallback path:
+    ``<HOME>/models`` would land in ``/root/models`` instead of the
+    operator's actual home, even though they're the one who runs the
+    server (just elevated to root for emmc access).
+
+    Detection: when ``SUDO_USER`` is set in env (set by sudo for the
+    duration of the elevated process), look up that user's home in
+    NSS via :func:`pwd.getpwnam`. Falls back to :meth:`Path.home` if
+    ``SUDO_USER`` is unset (no elevation) or the user can't be
+    resolved (rare, e.g. user deleted from /etc/passwd).
+
+    Cheap; called from :func:`default_models_root` and
+    :func:`default_resource_root` once per config seed. No caching
+    needed.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            import pwd as _pwd
+            return Path(_pwd.getpwnam(sudo_user).pw_dir)
+        except (KeyError, ImportError):
+            # User no longer in NSS, or pwd module unavailable
+            # (Windows?). Either way, fall through to $HOME.
+            pass
+    return Path.home()
+
+
+def default_models_root() -> Path:
+    """Return the first existing entry of :data:`_MODEL_ROOT_CANDIDATES`,
+    falling back to ``<HOME>/models`` if none exist.
+
+    This is the basis for ``base.model_path``; the trailing ``/`` is
+    appended by the caller (``default_base_paths``) so the result
+    matches the historical JSON shape. Pure (no I/O beyond ``is_dir()``).
+
+    ``<HOME>`` is resolved via :func:`_user_home` — when running under
+    ``sudo``, that's the *original* user's home (``/home/<user>``),
+    not ``/root``.
+    """
+    for cand in _MODEL_ROOT_CANDIDATES:
+        if cand.is_dir():
+            return cand
+    return _user_home() / "models"
+
+
+def default_resource_root() -> Path:
+    """Resolve and create the asset root.
+
+    On-device (``/userdata`` mounted): returns ``/userdata/assets``.
+    Off-device (dev / CI): returns ``<HOME>/assets``.
+
+    The directory is auto-created (``parents=True, exist_ok=True``) so
+    wizard uploads and TTS output have a writable destination after a
+    fresh boot. ``OSError`` is silently swallowed: a read-only
+    filesystem or container without write access should not crash the
+    import graph; the first actual write attempt will surface a
+    meaningful error.
+
+    Sub-tree (created lazily as needed):
+
+        ``<assets>/uploads``  — wizard video uploads (shared by the 3
+                                 video apps; same filename overwrites)
+        ``<assets>/tts``       — TTS-generated audio (read by the
+                                 ``/api/tts/output`` endpoint)
+
+    Naming history: was ``.../test`` until v0.x; the resource dir was
+    then briefly called ``.../upload`` (just the leaf), but the current
+    layout uses ``assets`` as the parent and per-purpose second-level
+    subdirs (``uploads/``, ``tts/``) so the root name reflects the
+    broader role of "device-side assets directory".
+    """
+    if Path("/userdata").is_dir():
+        root = Path("/userdata/assets")
+    else:
+        root = _user_home() / "assets"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Read-only fs / permission denied / container quirk — let the
+        # first real write attempt surface the real error.
+        pass
+    return root
+
+
+def default_base_paths() -> dict[str, str]:
+    """Return the on-disk ``base.model_path`` / ``base.resource_dir``
+    defaults as strings, suitable for JSONC serialization.
+
+    Resolves via :func:`default_models_root` and
+    :func:`default_resource_root` so:
+
+    * ``model_path`` follows the priority
+      ``/userdata/models/`` → ``/mnt/oem/models/`` → ``<HOME>/models/``.
+    * ``resource_dir`` is always ``<resolved_root>/assets`` — either
+      ``/userdata/assets`` on device or ``<HOME>/assets`` off-device.
+      Per-purpose subdirs (``uploads/``, ``tts/``) live under it.
+
+    Imported by both :class:`ConfigStore._seed_defaults` (first-run
+    template written to ``config.jsonc`` on disk) and
+    ``app/system/api/config.py:_BASE_DEFAULTS`` (lazy fill on
+    ``GET /api/config/base``); both call sites get the same answer, so
+    the two config-generation paths cannot drift.
+
+    Pure (the resource-dir ``mkdir`` is performed by
+    :func:`default_resource_root` when the helpers are actually
+    invoked — typically at module import time of the config API
+    module, which is fine since ``exist_ok=True`` makes it idempotent).
+    """
+    return {
+        "model_path":   f"{default_models_root()}/",
+        "resource_dir": str(default_resource_root()),
+    }
+
+
 class ConfigStore:
     """In-memory cache of a JSON-object config file."""
 
@@ -162,11 +300,12 @@ class ConfigStore:
                 }
                 for model_id, preset in MODEL_PRESETS.items()
             ]
+            _base_defaults = default_base_paths()
             self._data = {
                 "base": {
                     "device_name":          _random_device_name(),
-                    "model_path":            "/userdata/models/",
-                    "resource_dir":          "/userdata",
+                    "model_path":            _base_defaults["model_path"],
+                    "resource_dir":          _base_defaults["resource_dir"],
                     "hardware_capabilities": _hardware_capability_default_state(),
                 },
                 "compute": {

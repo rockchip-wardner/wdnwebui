@@ -27,7 +27,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
-from app.core.config import get_config
+from app.core.config import default_base_paths, get_config
 from app.core.compute.jsonc import parse_jsonc
 
 
@@ -69,8 +69,11 @@ def _random_device_name() -> str:
 
 _BASE_DEFAULTS: dict[str, Any] = {
     "device_name": "",  # filled lazily by _generate_missing_defaults()
-    "model_path": "/userdata/models/",
-    "resource_dir": "/userdata",
+    # model_path / resource_dir come from app.core.config.default_base_paths
+    # so off-device deployments (no /userdata on host) fall back to the
+    # current user's HOME directory — see that helper's docstring for the
+    # exact substitution rules.
+    **default_base_paths(),
 }
 
 
