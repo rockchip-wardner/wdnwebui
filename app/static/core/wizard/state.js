@@ -744,8 +744,17 @@
       if (pageSection) pageSection.classList.remove("hidden");
     }
     _active = null;
-    // 通知 registry 卸载(允许外部重新 tryMount)
-    try { window.dispatchEvent(new CustomEvent("wizard:unmounted", { detail: { appId: app.id } })); } catch (_) {}
+    // 让 ROUTER 下次再点同一应用时重新触发 _loadCardJS / tryMount。
+    // ROUTER._loadCardJS 内部检查 DemoGuard._loadedApps.has(page),命中就
+    // 跳过 → wizard 永不重挂。unmount 时把 app 从已加载集合中清出即可。
+    try {
+      // DemoGuard 是 framework.js 内的闭包,通过 window 上的 DemoGuard
+      // 公开引用拿不到(framework 用 IIFE 不挂全局);改成 dispatch 一个
+      // 自定义事件让 framework.js 监听,清掉 _loadedApps 条目。
+      window.dispatchEvent(new CustomEvent("wizard:unmounted", {
+        detail: { appId: app.id, action: "unmount" },
+      }));
+    } catch (_) {}
   }
 
   window.WizardState = { mount, unmount, stepForward, skip };

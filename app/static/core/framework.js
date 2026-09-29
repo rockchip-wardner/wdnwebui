@@ -215,6 +215,16 @@
     },
   };
 
+  // 向导模式卸载时清掉 _loadedApps 条目 — 否则下次再点同一应用卡片时,
+  // ROUTER 看到 _loadedApps.has(page) 为 true 直接跳过 _loadCardJS,
+  // wizard 永远不会再挂载。wizard.js 在 unmount() 时 dispatch 此事件。
+  window.addEventListener("wizard:unmounted", (e) => {
+    const appId = e?.detail?.appId;
+    if (appId && DemoGuard._loadedApps?.has?.(appId)) {
+      DemoGuard._loadedApps.delete(appId);
+    }
+  });
+
   window.ROUTER = ROUTER;
 
   // ─────────────────────────────────────────────────────────────────────
