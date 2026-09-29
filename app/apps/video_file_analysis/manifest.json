@@ -7,8 +7,7 @@
   "preview_video": "/static/apps/video-file-analysis/preview.mp4",
   "preview_image": "",
   "software_capabilities": [
-    "swcap_video_describe",
-    "swcap_video_retrieval"
+    "swcap_video_describe"
   ],
   "hardware_capabilities": [
     "hwcap_video_input"
