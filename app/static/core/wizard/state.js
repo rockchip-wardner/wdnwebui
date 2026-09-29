@@ -430,10 +430,20 @@
           const moveCanvasToWizard = () => {
             const canvas = document.getElementById(canvasId);
             if (!canvas || canvas.parentNode === canvasWrap) return;
+            // 搬之前先记下 canvas 的原 parent,unmount() 时搬回 — 否则
+            // wizard 容器销毁时(已被 move 进去的 canvas 一并销毁)会导致
+            // 应用页面视频画面变黑(后端仍在解码 + ws 仍在推帧)。
+            const originalParent = canvas.parentNode;
             // 把 canvas 搬到 wrap 顶部,移除拖放区
             canvasWrap.appendChild(canvas);
             if (cfg.upload_endpoint && dropZone.parentNode === canvasWrap) {
               canvasWrap.removeChild(dropZone);
+            }
+            // 记录到 _active,unmount() 时还原。
+            // (同一 canvas 多次 move 时,以最近一次的 originalParent 为准 —
+            // 但实际上 moveCanvasToWizard 已被 early-return 守过,只走一次)
+            if (_active) {
+              _active.movedCanvas = { canvas, originalParent };
             }
           };
           openBtn.addEventListener("click", () => {
@@ -729,9 +739,21 @@
 
   function unmount(silent) {
     if (!_active) return;
-    const { app, container, intervals, _onNavAway } = _active;
+    const { app, container, intervals, _onNavAway, movedCanvas } = _active;
     intervals.forEach(clearInterval);
     if (_onNavAway) window.removeEventListener("hashchange", _onNavAway);
+    // 还原被 move 进 canvas-wrap 的 canvas 元素 — 否则 wizard 容器销毁
+    // 时会一并删掉 canvas,应用页 video 区域变黑(后端解码 + ws 推帧都
+    // 还在继续,只是 drawVdFrame / drawVtlFrame 找不到 canvas 了)。
+    // 原 parent 通常是 page section 里的 <div class="vd-stage">,append
+    // 回去即可(wizard 已 unmount,canvasWrap 即将被销毁)。
+    if (movedCanvas && movedCanvas.canvas && movedCanvas.originalParent) {
+      try {
+        movedCanvas.originalParent.appendChild(movedCanvas.canvas);
+      } catch (e) {
+        // parent 已不在 DOM(用户切了 page)— 忽略,后端会自然停
+      }
+    }
     // 彻底移除 wizard DOM(下次 mount 重建,避免残留 class)
     if (container && container.parentNode) {
       container.parentNode.removeChild(container);
