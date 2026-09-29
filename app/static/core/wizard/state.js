@@ -338,13 +338,16 @@
           // 找到它(节点对象没变,只是父节点换了)— 不重写 ws 推帧逻辑。
           // canvas 元素 id 推导规则:open_source_button 去掉 -open 加 -canvas。
           const canvasId = cfg.open_source_button.replace(/-open$/, "-canvas");
+          // canvas-wrap 容器预先创建,放在 actions-row 后面,
+          // 这样点"打开"搬 canvas 时位置确定;canvasWrap 引用由闭包共享
+          const canvasWrap = _ce("div", WIZARD_NS + "canvas-wrap");
+          wrap.appendChild(actions);     // 先 actions
+          wrap.appendChild(canvasWrap); // 再 canvas,贴"打开 / 关闭"下方
+
           const moveCanvasToWizard = () => {
             const canvas = document.getElementById(canvasId);
-            const wizardContainer = _active?.container;
-            if (canvas && wizardContainer && canvas.parentNode !== wizardContainer) {
-              const canvasWrap = _ce("div", WIZARD_NS + "canvas-wrap");
+            if (canvas && canvas.parentNode !== canvasWrap) {
               canvasWrap.appendChild(canvas);
-              wizardContainer.appendChild(canvasWrap);
             }
           };
           openBtn.addEventListener("click", () => {
@@ -381,7 +384,8 @@
           });
           actions.appendChild(openBtn);
           actions.appendChild(closeBtn);
-          wrap.appendChild(actions);
+          // wrap.appendChild(actions) 已经在 line 380 处先于 canvasWrap 调过;
+          // 这里不再重复(appendChild 移动语义在同父节点下是 no-op,但代码重复)
         }
       } else {
         wrap.appendChild(el);
