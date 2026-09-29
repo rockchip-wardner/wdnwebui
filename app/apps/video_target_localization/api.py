@@ -17,14 +17,30 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    File,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 
 from app.core.llm.detector_base import get_localizer_detector
 from app.core.video.session import get_session
 
 
 router = APIRouter(tags=["video-target-localization"])
+
+# 向导模式拖放上传的视频文件落地目录 — 与音视频描述页共用 ``/userdata
+# /test/tmp``(用户指定设备端目录;不在仓库内,不在 git)。子目录按 app id
+# 隔离,避免不同 app 上传的文件互相覆盖。
+UPLOAD_DIR = Path("/userdata/test/tmp/video_target_localization")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # --------------------------------------------------------------------- #
@@ -58,6 +74,38 @@ def _build_vtl_prompt(items: list) -> str:
 @router.get("/")
 async def get_state() -> dict:
     return get_session().snapshot()
+
+
+@router.post("/upload")
+async def upload_video(file: UploadFile = File(...)) -> dict:
+    """向导模式拖放上传:写到 UPLOAD_DIR,返回 server 路径。
+
+    wizard.json 的 upload_endpoint 字段会让向导在没播放时显示拖放区,
+    拖动视频文件落到此处 → POST 本端点 → 拿到 {path: ...} → 自动
+    vtl-open 触发解码。结构对齐 ``app/apps/video_detection/api.py::
+    upload_video``(同一套契约,前端无需感知 app 差异)。
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="empty filename")
+    ext = Path(file.filename).suffix or ".bin"
+    upload_id = uuid.uuid4().hex
+    dest = UPLOAD_DIR / f"{upload_id}{ext}"
+    try:
+        with dest.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"write failed: {e}")
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
+    return {
+        "upload_id": upload_id,
+        "path": str(dest),
+        "name": file.filename,
+        "size": dest.stat().st_size,
+    }
 
 
 @router.post("/open")

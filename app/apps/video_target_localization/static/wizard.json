@@ -5,6 +5,7 @@
     "swcap_grounding": { "npu_index": 0, "model_id": "LocateAnything-3b" }
   },
   "open_source_button": "vtl-open",
+  "upload_endpoint": "/api/video-target-localization/upload",
   "start_buttons": ["vtl-detector-start"],
   "steps": [
     { "id": "env",    "title": "运行环境检查",     "kind": "env_check" },
