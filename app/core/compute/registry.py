@@ -2750,12 +2750,23 @@ class ComputeRegistry:
 
     def _find_by_model(self, model_id: str) -> Optional[ModelInstance]:
         """Look up a registered instance by model_id (key changes after
-        bind so we can't just key-index)."""
+        bind so we can't just key-index).
+
+        本机实例(spawned / adopted_local)优先于远端 adopted — 同
+        model_id 可能并存一条本机 + 一条 adopted(本机先 spawn 后,
+        DDS 又从 peer 收到同名服务),用户禁/启操作的目标一定是本机
+        那个;返回 adopted 会触发 Layer 2 的 403,误以为禁不掉本机的
+        模型。fallback 到 adopted 仅在没有任何本机实例时。
+        """
         with self._lock:
+            adopted = None
             for inst in self._instances.values():
-                if inst.model_id == model_id:
+                if inst.model_id != model_id:
+                    continue
+                if inst._source in ("spawned", "adopted_local"):
                     return inst
-        return None
+                adopted = adopted or inst
+            return adopted
 
     def list_with_source(self) -> list[dict]:
         """UI-friendly snapshot of every catalog model's current state.

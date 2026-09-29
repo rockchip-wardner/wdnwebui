@@ -340,6 +340,22 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
     if inst is None:
         raise HTTPException(
             status_code=404, detail=f"{req.model} 不在 registry")
+    # 安全护栏:adopted 来自其他板子的 DDS peer worker,本机无权限
+    # 启停(每块板子只能管理自己的本地算力)。若允许 DELETE,后端会
+    # 通过 RPC 通知对端 worker 卸载 LLMSession,误关其他板子的 NPU
+    # 显存 — 这是 wizard 一键开启的早期严重 bug 留下的纵深防御。
+    # spawned / adopted_local(本机)继续原逻辑。
+    if inst._source == "adopted":
+        peer_label = (inst._peer_name
+                      or (inst._peer_guid or "")[:8]
+                      or "远端 peer")
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"不能通过网络删除 {req.model}(来自 {peer_label});"
+                f"请到目标板子上点禁用,或在本机启动一个新实例后删除本地副本。"
+            ),
+        )
     try:
         reg.unload_instance(req.model)
     except RuntimeError as e:

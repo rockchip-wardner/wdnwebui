@@ -185,7 +185,11 @@
     const hwRequired = (app.software_capabilities || []).length > 0
       ? (app.hardware_capabilities || [])
       : (app.hardware_capabilities || []);
-    // SW: 拉 /api/compute 看 running instances 是否覆盖 manifest.software_capabilities
+    // SW: 拉 /api/compute 看本机 running instances 是否覆盖 manifest.software_capabilities。
+    // 只算本机算力(spawned / adopted_local):peer adopted 是远端板子的
+    // NPU,本机未"开启";误把它算进 running 会让用户在未启本地算力
+    // 时看到 ✓,与同文件 _wizardBringUpModels 跳过 adopted 的语义不对称
+    // —— 后者正确防误关 peer 模型,前者却让 UI 显示误导。
     let swMissing = [];
     let runningCaps = new Set();
     try {
@@ -193,7 +197,7 @@
       if (r.ok) {
         const data = await r.json();
         for (const inst of (data.instances || [])) {
-          if (inst.status === "running") {
+          if (inst.status === "running" && inst._source !== "adopted") {
             for (const c of (inst.capability_types || [])) runningCaps.add(c);
           }
         }
@@ -764,9 +768,11 @@
         const r = await fetch("/api/compute", { cache: "no-store" });
         if (r.ok) {
           const data = await r.json();
+          // 只算本机算力(spawned / adopted_local),peer adopted 不算 —— 与
+          // _probeEnv 一致;_wizardBringUpModels 已保证 POST 成功 = 本机就绪。
           const running = new Set(
             (data.instances || [])
-              .filter((i) => i.status === "running")
+              .filter((i) => i.status === "running" && i._source !== "adopted")
               .map((i) => i.model_id)
           );
           if (targets.every((m) => running.has(m))) return;
@@ -904,6 +910,13 @@
       const data = await r.json();
       // 1. 停非必需(后端契约 DELETE + JSON {model};按 capability 是否被 swcap_to_model 命中判断)
       for (const inst of (data.instances || [])) {
+        // 安全护栏:_source === "adopted" 是从远端 peer 通过 DDS adopt
+        // 来的算力实例(其他板子 spawn 的 worker),本机无权限启停 —
+        // 跳过整个循环,不动 DELETE 也不动任何字段。Peer 实例的 NPU
+        // 显存 / worker 进程状态完全由对端机器控制,跨板操作是严重
+        // 错误(wizard 一键开启曾因缺失此护栏误关 peer 模型)。
+        // spawned / adopted_local(本机)继续走原逻辑。
+        if (inst._source === "adopted") continue;
         const caps = inst.capability_types || [];
         const isNeeded = caps.some((c) => cfg.swcap_to_model[c]);
         // running / loading 状态的实例才需要停(其他状态后端会拒)
