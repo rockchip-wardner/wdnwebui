@@ -210,6 +210,25 @@
     };
   }
 
+  // 构造 toggle switch 元素(checkbox type)— 抽出来便于 source row 内复用
+  function _buildToggle(field, state) {
+    const cur = state.values[field.id];
+    const defaultChecked = (cur != null) ? !!cur : !!field.default;
+    const toggleLbl = _ce("label", WIZARD_NS + "toggle");
+    toggleLbl.dataset.fieldId = field.id;
+    const cbInput = _ce("input", WIZARD_NS + "toggle-input");
+    cbInput.type = "checkbox";
+    cbInput.checked = defaultChecked;
+    const track = _ce("span", WIZARD_NS + "toggle-track");
+    const knob = _ce("span", WIZARD_NS + "toggle-knob");
+    track.appendChild(knob);
+    const toggleText = _ce("span", WIZARD_NS + "toggle-text", field.label || field.id);
+    toggleLbl.appendChild(cbInput);
+    toggleLbl.appendChild(track);
+    toggleLbl.appendChild(toggleText);
+    return toggleLbl;
+  }
+
   function _renderFormStep(body, foot, cfg, stepDef, state) {
     body.innerHTML = "";
     const titleEl = _ce("h3", WIZARD_NS + "step-title", stepDef.title);
@@ -217,7 +236,21 @@
     const form = _ce("div", WIZARD_NS + "form");
     body.appendChild(form);
 
+    // 找出"会被 inline 进 source 行"的 loop toggle(同 stepDef 内 -loop
+    // 字段),避免后续 forEach 重复渲染
+    const inlineLoopFieldId = (() => {
+      const hasSource = (stepDef.fields || []).some(f =>
+        f.type !== "checkbox" && /-source$/.test(f.id));
+      if (!hasSource) return null;
+      const loopField = (stepDef.fields || []).find(f =>
+        f.type === "checkbox" && /-loop$/.test(f.id));
+      return loopField ? loopField.id : null;
+    })();
+
     (stepDef.fields || []).forEach((field) => {
+      // 已经 inline 进 source 行的 loop 字段 → 跳过独立渲染
+      if (field.id === inlineLoopFieldId) return;
+
       const wrap = _ce("div", WIZARD_NS + "field");
       const lbl = _ce("label", WIZARD_NS + "field-label", field.label || field.id);
       wrap.appendChild(lbl);
@@ -235,22 +268,7 @@
           if (cur != null) el.value = cur;
           break;
         case "checkbox":
-          // toggle switch 容器(<label> 内嵌 checkbox input + 视觉 track +
-          // 字段 label),click label 自动 toggle inner input。dataset.fieldId
-          // 设在外层 label,内部 input 也设一份(future-proof 给 capture 逻辑)
-          const defaultChecked = (cur != null) ? !!cur : !!field.default;
-          const toggleLbl = _ce("label", WIZARD_NS + "toggle");
-          const cbInput = _ce("input", WIZARD_NS + "toggle-input");
-          cbInput.type = "checkbox";
-          cbInput.checked = defaultChecked;
-          const track = _ce("span", WIZARD_NS + "toggle-track");
-          const knob = _ce("span", WIZARD_NS + "toggle-knob");
-          track.appendChild(knob);
-          const toggleText = _ce("span", WIZARD_NS + "toggle-text", field.label || field.id);
-          toggleLbl.appendChild(cbInput);
-          toggleLbl.appendChild(track);
-          toggleLbl.appendChild(toggleText);
-          el = toggleLbl;
+          el = _buildToggle(field, state);
           break;
         case "select":
           el = _ce("select", WIZARD_NS + "input");
@@ -270,15 +288,20 @@
           if (field.placeholder) el.placeholder = field.placeholder;
           if (cur != null) el.value = cur;
       }
-      el.dataset.fieldId = field.id;
-      // 视频源字段(text 类型且 id 以 -source 结尾)自动追加"浏览…"按钮,
-      // click → 调全局 VdFsModal(框架层 fs-modal.js 的兼容 alias,所有
-      // 视频类应用共用)把 wizard 的 input 作为目标 + 打开文件浏览
-      if (field.type !== "textarea" && field.type !== "number"
+      // toggle / 复合容器(已经设了 data-field-id)无需再设
+      if (!el.dataset.fieldId) el.dataset.fieldId = field.id;
+      // 视频源字段(text 类型且 id 以 -source 结尾)自动追加"浏览…"按钮
+      // + 同 stepDef 内 -loop toggle 移到 source input 与 browse 之间
+      const isSource = field.type !== "textarea" && field.type !== "number"
           && field.type !== "checkbox" && field.type !== "select"
-          && /-source$/.test(field.id) && window.VdFsModal) {
+          && /-source$/.test(field.id);
+      if (isSource && window.VdFsModal) {
         const row = _ce("div", WIZARD_NS + "input-row");
         row.appendChild(el);
+        if (inlineLoopFieldId) {
+          const loopField = (stepDef.fields || []).find(f => f.id === inlineLoopFieldId);
+          if (loopField) row.appendChild(_buildToggle(loopField, state));
+        }
         const browseBtn = _ce("button", WIZARD_NS + "browse-btn", "浏览…");
         browseBtn.type = "button";
         browseBtn.title = "选择本地文件或目录";
