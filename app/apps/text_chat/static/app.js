@@ -317,12 +317,12 @@ const TextChat = {
     const li = document.createElement("li");
     li.className = "imb-msg imb-msg--in";
     li.dataset.role = "assistant";
-    // thinking 默认**展开**显示（不再默认折叠），用户一眼就能看见
-    // 思考过程；点 summary 可折叠。
+    // thinking 默认**折叠**(无 open 属性 → <details> 原生行为隐藏 body),
+    // 用户点 summary 展开;流式累积也不再自动展开。
     li.innerHTML = `
       <span class="imb-msg-meta">模型 · ${ts}</span>
-      <details class="text-chat-thinking" data-collapsed="false" open>
-        <summary>思考过程（点击折叠）</summary>
+      <details class="text-chat-thinking">
+        <summary>思考过程（点击展开）</summary>
         <div class="text-chat-thinking-body" data-role="thinking-body"></div>
       </details>
       <div class="imb-msg-body text-chat-answer" data-role="answer-body"></div>
@@ -347,12 +347,8 @@ const TextChat = {
     if (!p || !p.thinkingEl) return;
     p.thinkingBuf += delta;
     p.thinkingEl.textContent = p.thinkingBuf;
-    // expand thinking details once there's content (so user sees live updates)
-    const li = p.assistantLi;
-    const details = li?.querySelector(".text-chat-thinking");
-    if (details && p.thinkingBuf.length > 0 && !details.hasAttribute("open")) {
-      details.setAttribute("open", "");
-    }
+    // thinking 默认折叠 — 流式累积不自动展开,避免抢戏;
+    // 用户想看时点 summary 展开即可。
     this._scrollToBottom();
   },
 
@@ -386,8 +382,9 @@ const TextChat = {
       if (p.thinkingEl) p.thinkingEl.textContent = info.thinking;
       const details = p.assistantLi.querySelector(".text-chat-thinking");
       if (details) {
-        if (info.thinking) details.setAttribute("open", "");
-        else details.hidden = true;
+        // 默认折叠 — 即使 done frame 含 thinking 也不自动展开;
+        // 没 thinking 时整个 details 隐藏,折叠与否无关紧要。
+        if (!info.thinking) details.hidden = true;
       }
     }
     if (typeof info.answer === "string") {
