@@ -371,6 +371,12 @@
   font-size: 13px;
   min-height: 18px;
 }
+/* 模型已就绪时 _waitForModelsRunning 不写 status,errBox 一直空 — 空
+   状态下不再渲染红框(避免误导用户"是不是出错了");有内容(加载
+   提示 / 错误信息)时正常显示。 */
+.wd-wizard-finish-error:empty {
+  display: none;
+}
 
 /* footer buttons */
 .wd-wizard-foot {
