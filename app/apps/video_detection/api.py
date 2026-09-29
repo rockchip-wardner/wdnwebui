@@ -25,7 +25,10 @@ router = APIRouter(tags=["video-detection"])
 # 在这里暴露 —— 该页面是面向「描述+提醒」场景的固定工具集。
 ALLOWED_TOOLS = ("tts_alert",)
 
-UPLOAD_DIR = Path(__file__).resolve().parent.parent / "services" / "uploads"
+# 向导模式拖放上传的视频文件落地目录 — 用户指定 `/userdata/test/tmp`。
+# 设备端目录(系统默认 `/userdata` 是 resource_dir),不在仓库内,不进 git。
+# 此目录不存在会自动创建(permissions=True)。
+UPLOAD_DIR = Path("/userdata/test/tmp")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
