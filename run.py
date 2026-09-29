@@ -17,7 +17,7 @@ from pathlib import Path
 import uvicorn
 
 from app import __version__
-from app.services.config import get_config
+from app.core.config import get_config
 
 
 def _ensure_wdndds_native_path() -> None:
