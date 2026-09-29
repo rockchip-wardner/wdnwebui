@@ -2237,6 +2237,19 @@ def main() -> int:
     )
     hub.start()
 
+    # 内置 @Callable 工具注册:与主进程共用同一份 registry 真源
+    # (详见 app/core/tools/_builtins.py)。chat_run / infer 路径的
+    # _resolve_tool_classes / parse_classes 都靠这个 registry 查工具
+    # class —— 主进程只在 uvicorn 里注册,worker 子进程必须自己注册
+    # 否则 chat_run(tools=['VideoSearch']) 走到 worker 端查不到类,
+    # prompt 缺工具 schema → 模型 hallucinate "模拟调用"。
+    try:
+        from app.core.tools.registry import get_tool_registry
+        from app.core.tools._builtins import register_builtin_tools
+        register_builtin_tools(get_tool_registry())
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("worker: register_builtin_tools failed: %s", e)
+
 # Per-worker LAN 流式 fallback：Writer 跑在独立 DomainParticipant 上，
     # 让 cshim publisher 线程不与 RPC replier 的 reply publish 共享——
     # 共享 pump 在长文本 reply 上仍会卡（前一个 commit 解决了一类），

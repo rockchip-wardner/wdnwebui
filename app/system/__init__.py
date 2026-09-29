@@ -51,21 +51,17 @@ def register_all(app: FastAPI) -> None:
     # video_search @Callable 工具归 im-bridge 所有(零耦合),随系统模块
     # 一同注册到 tool registry。原本在 ``apps/im_bridge/__init__.py``
     # 的 register_api 里,卡→系统迁移时一起搬过来。
+    #
+    # 走 ``app.core.tools._builtins.register_builtin_tools()`` —— 与
+    # compute_worker 子进程共用同一份"真源",避免 worker 端
+    # ``_resolve_tool_classes(['VideoSearch'])`` 查不到类 → prompt
+    # 缺工具 schema → 模型 hallucinate "假装在调用" 的破事
+    # (issue: 应用对接 / im-bridge 视频检索在 c219e71 后输出正常 →
+    # v0.4 重构后仅返回 "我将模拟调用工具" 的假答案)。
     try:
         from app.core.tools.registry import get_tool_registry
-        from app.system.im_bridge.video_search import VideoSearch
-        get_tool_registry().register(
-            key="video_search",
-            name="视频内容检索",
-            description=(
-                "在用户最新发送的视频中按文字描述检索相关片段,"
-                "返回命中时间段与相似度;依赖视频已完成后台分析"
-                "(收到视频后自动进行)。"
-            ),
-            requires_capability="swcap_video_retrieval",
-            tool_class=VideoSearch,
-            icon="🎬",
-        )
+        from app.core.tools._builtins import register_builtin_tools
+        register_builtin_tools(get_tool_registry())
     except Exception as e:
         import logging
         logging.getLogger("app.system").warning(

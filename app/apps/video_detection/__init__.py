@@ -75,18 +75,11 @@ def register_api(app: FastAPI) -> None:
     LOG.info("video_detection: API mounted at /api/video-detection")
     try:
         from app.core.tools.registry import get_tool_registry
-        from app.apps.video_detection.tts_alert import TtsAlert
-        get_tool_registry().register(
-            key="tts_alert",
-            name="语音提醒",
-            description=(
-                "语音提醒工具：检测到需要立即提醒的场景时调用，"
-                "传入提醒文本，将通过 Qwen3-TTS 在本机播放。"
-            ),
-            requires_capability="swcap_audio_tts",
-            tool_class=TtsAlert,
-            icon="🔊",
-        )
+        # 走 _builtins 共用注册函数,与 compute_worker 子进程共享
+        # registry 真源:worker 端 _resolve_tool_classes(['TtsAlert'])
+        # 否则查不到类 → 提示词缺工具 schema。详见 app/core/tools/_builtins.py。
+        from app.core.tools._builtins import register_builtin_tools
+        register_builtin_tools(get_tool_registry())
         LOG.info("video_detection: registered tool 'tts_alert'")
     except Exception as e:
         LOG.warning("video_detection: tts_alert registration failed: %s", e)

@@ -2461,6 +2461,7 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
 | Added/removed a model preset          | `MODEL_PRESETS` in `app/core/compute/registry.py` + `register` the new capability in the same table; update `app/static/index.html.template` and `app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` only if the UI needs new model cards |
 | `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/system/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
 | Schema hint prompts (`VLMDoc.text`/`level`, `TargetDoc.desc`) | `app.prompts.<app_key>.<schema_cls>.<field>` in `config.jsonc`; UI under 系统配置 → App 提示词模板 section. `TargetDoc.x1/y1/x2/y2` stay hardcoded in `_build_target_doc_class` (`app/core/llm/detector_base.py`) — protocol-level 0–1000 归一化坐标格式说明，刻意不开 UI 编辑 |
+| Built-in `@Callable` 工具（`VideoSearch` / `TtsAlert` 等）注册点 | 集中在 `app/core/tools/_builtins.py::register_builtin_tools()`。**主进程**和**compute_worker 子进程**各自在启动时调一次（主进程在 `app/system/__init__.py:register_all()` 与卡片 `register_api()`；worker 在 `app/core/compute/worker.py:main()` 末尾 `hub.start()` 之后）。**不能只放在主进程** — worker 端 `_resolve_tool_classes()` / `parse_classes` 都靠本地 registry 查类，缺类就静默 `WARNING unknown tool name ... skipping`，prompt 缺工具 schema，模型就会"假装在调用"工具(hallucinate)。详见下方"工具注册双进程陷阱"。 |
 ## Tools (音视频检测页工具)
 
 `app/core/tools/` 装的是给音视频描述页 (`WdnaiDetector` 走
@@ -2516,6 +2517,49 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
   工具调用 + 返回按 prose 格式写进下一轮 prompt（不是 JSON，避免
   模型复读），由 detector 内部维护。视频目标检测页无工具，循环
   天然只跑一轮就跳出。
+
+### 工具注册双进程陷阱（v0.4 重构回归）
+
+``app.core.tools.registry`` 是**进程级**单例（`_registry` 模块变量）。
+v0.4 重构后两个内置工具的注册点散在不同地方：
+
+* ``app/system/__init__.py:register_all()`` → 注册 ``VideoSearch``
+  （im-bridge 拥有）
+* ``app/apps/video_detection/__init__.py:register_api()`` → 注册
+  ``tts_alert`` （音视频描述页拥有）
+
+这两处只在**主进程** uvicorn 里跑 —— ``compute_worker`` 子进程是
+独立 Python 进程，registry 启动为空**且再也不会被填充**，除非
+worker 自己显式 import 工具类。
+
+**故障链路** (2026-09 真机实测复现)：
+1. 主进程 ``resolve_available_tool_names()`` 返 ``["VideoSearch"]``
+   给 chat_run payload
+2. proxy 端 ``RpcSessionProxy.chat_run(..., tools=['VideoSearch'])``
+   发到 worker
+3. worker 端 ``_resolve_tool_classes(['VideoSearch'])`` 在自己**空**
+   的 registry 里查不到 → ``LOG.warning("unknown tool name 'VideoSearch'
+   — skipping")``
+4. ``tool_specs = None`` → ``build_chatml_prompt(...)`` 出来的 prompt
+   完全没有工具 schema（实测从正常的 ~1100 字符缩到 192 字符）
+5. 模型看不到 ``VideoSearch`` 描述，按"普通问答"作答 → 输出
+   ``<think>...我将调用VideoSearch工具...</think>`` + 一段
+   假想的"模拟调用"输出，**完全不产生** ``<tool_call>``{}`` 标签
+6. 同样 ``parse_classes=[]`` → 即使模型真按格式吐了 JSON 也无人解析
+7. 用户最终看到 "我将模拟调用工具并提供答案" 的假回答
+
+**修法** (``app/core/tools/_builtins.py::register_builtin_tools()``)：
+集中所有内置工具注册到单一函数，主进程 + worker 各自在启动时调一次。
+**新增内置工具时在 ``_REGISTRARS`` 列表追加 ``(label, register_fn)``
+一行**；主进程 ``register_all`` 与 worker ``main()`` 已有现成调用点。
+
+主进程调用栈：
+* ``app/system/__init__.py:register_all()`` (im-bridge VideoSearch)
+* ``app/apps/video_detection/__init__.py:register_api()`` (tts_alert)
+
+Worker 调用栈：
+* ``app/core/compute/worker.py:main()`` 在 ``Hub.start()`` 之后调一次
+  （早于任何 ``chat_run`` / ``infer`` RPC 请求到达）
 
 ## Chat 工具调用 (chat-agent)
 
