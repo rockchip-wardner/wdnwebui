@@ -331,6 +331,22 @@
           const actions = _ce("div", WIZARD_NS + "source-actions");
           const openBtn = _ce("button", WIZARD_NS + "source-action-btn", "打开");
           openBtn.type = "button";
+          // 点击"打开"后,wizard 容器内需要展示视频。应用页面的 canvas 元素
+          // (id 形如 <prefix>-canvas,如 vd-canvas / vtd-canvas / vtl-canvas)
+          // 在 page section 内、被 wizard hidden;点击"打开"时把 canvas 元素
+          // 直接挪到 wizard 容器内,后续 ws callback 通过 getElementById 仍能
+          // 找到它(节点对象没变,只是父节点换了)— 不重写 ws 推帧逻辑。
+          // canvas 元素 id 推导规则:open_source_button 去掉 -open 加 -canvas。
+          const canvasId = cfg.open_source_button.replace(/-open$/, "-canvas");
+          const moveCanvasToWizard = () => {
+            const canvas = document.getElementById(canvasId);
+            const wizardContainer = _active?.container;
+            if (canvas && wizardContainer && canvas.parentNode !== wizardContainer) {
+              const canvasWrap = _ce("div", WIZARD_NS + "canvas-wrap");
+              canvasWrap.appendChild(canvas);
+              wizardContainer.appendChild(canvasWrap);
+            }
+          };
           openBtn.addEventListener("click", () => {
             try {
               const srcEl = document.getElementById(field.id);
@@ -339,6 +355,9 @@
               if (srcEl) srcEl.value = el.value || "";
               if (loopEl) loopEl.checked = readLoopChecked();
               document.getElementById(cfg.open_source_button)?.click();
+              // 等 vd-open 的同步逻辑跑完再搬(下一帧前 canvas 已在 wizard 内,
+              // ws 推过来的 jpg 直接画到 wizard 内的 canvas)
+              moveCanvasToWizard();
             } catch (e) {
               console.warn("[wizard-state] open failed:", e);
             }
@@ -348,6 +367,14 @@
           closeBtn.addEventListener("click", () => {
             try {
               document.getElementById(closeId)?.click();
+              // 把 canvas 搬回 page section,让应用页面再次显式拥有
+              const canvas = document.getElementById(canvasId);
+              const pageSection = document.getElementById("page-" + app.id);
+              if (canvas && pageSection) {
+                const stage = pageSection.querySelector(".vd-stage, .vtd-stage, .vtl-stage")
+                  || pageSection;
+                stage.insertBefore(canvas, stage.firstChild);
+              }
             } catch (e) {
               console.warn("[wizard-state] close failed:", e);
             }

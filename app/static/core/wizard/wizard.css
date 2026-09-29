@@ -280,6 +280,23 @@
   background: #e5e7eb;
 }
 
+/* 视频 canvas 容器(wizard 内显示)— 居中、圆角、深色背景 */
+.wd-wizard-canvas-wrap {
+  margin-top: 16px;
+  background: #000000;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 240px;
+}
+.wd-wizard-canvas-wrap canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
 /* finish summary */
 .wd-wizard-summary {
   background: #f9fafb;
