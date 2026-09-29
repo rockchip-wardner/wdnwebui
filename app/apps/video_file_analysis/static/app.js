@@ -1258,4 +1258,39 @@ function initVideoFileAnalysis() {
 
 initVideoFileAnalysis();
 
+
+// ------------------------------------------------------------------ *
+//  应用向导模式 API — wizard 框架 finish 时调用
+// 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
+//   vfa-source  → opts.source
+//   vfa-prompt  → opts.prompt
+//   vfa-every-n → opts.everyN
+// source 非空 → 写回 #vfa-source;prompt 非空 → 写回 #vfa-prompt;
+// everyN 非空 → 写回 #vfa-every-n;都填完后调 #vfa-start 按钮
+// (vfaStart 已经做三字段校验 + fetch /open,直接复用)。
+// 空字段不触发对应动作(用户可在应用页面再编辑)。
+// 全局名约定 ImApp_<app.id 去掉 hyphen>。
+// ------------------------------------------------------------------ *
+window.ImApp_video_file_analysis = window.ImApp_video_file_analysis || {};
+window.ImApp_video_file_analysis.applyWizardSnapshot = async function (opts) {
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el != null) el.value = v; };
+
+  if (opts.source) setVal("vfa-source", opts.source);
+  if (opts.prompt) setVal("vfa-prompt", opts.prompt);
+  if (opts.everyN != null && opts.everyN !== "") setVal("vfa-every-n", String(opts.everyN));
+
+  // 三个字段全填了才触发开始分析(任一为空留给用户在应用页面补)
+  if (!opts.source || !opts.prompt || opts.everyN == null || opts.everyN === "") {
+    return { source_set: !!opts.source, prompt_set: !!opts.prompt, everyN_set: false, started: false };
+  }
+
+  const btn = document.getElementById("vfa-start");
+  if (btn) {
+    try { btn.click(); }
+    catch (e) { throw new Error("WizardSnapshotError:vfa_start_failed:" + (e?.message || e)); }
+    return { source_set: true, prompt_set: true, everyN_set: true, started: true };
+  }
+  return { source_set: true, prompt_set: true, everyN_set: true, started: false };
+};
+
 })();
