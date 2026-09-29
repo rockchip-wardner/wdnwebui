@@ -98,8 +98,16 @@ def main():
 
         # 填一个 video source
         page.fill("input[data-field-id='vd-source']", "rtsp://test.local/stream")
-        # 勾 loop
-        page.check("input[type=checkbox][data-field-id='vd-loop']")
+        # loop 默认已勾选(toggle UI 自带 default=true);不需手动 click
+        # 验证 loop toggle 状态(确认默认勾选生效)
+        loop_checked = page.evaluate("""
+          (() => {
+            const cb = document.querySelector('.wd-wizard-toggle-input');
+            return cb ? cb.checked : null;
+          })()
+        """)
+        if loop_checked is not True:
+            fail(f"T9: loop toggle 默认应勾选,实际 {loop_checked!r}")
         page.wait_for_timeout(100)
 
         # 点跳过向导
@@ -146,9 +154,14 @@ def main():
         source_val = page.input_value("input[type=text][data-field-id='vd-source']")
         if source_val != "rtsp://test.local/stream":
             fail(f"T10: 预填值 '{source_val}',期望 'rtsp://test.local/stream'")
-        loop_checked = page.is_checked("input[type=checkbox][data-field-id='vd-loop']")
+        loop_checked = page.evaluate("""
+          (() => {
+            const cb = document.querySelector('.wd-wizard-toggle-input');
+            return cb ? cb.checked : null;
+          })()
+        """)
         if not loop_checked:
-            fail("T10: loop 未预填勾选")
+            fail(f"T10: loop 未预填勾选(实际 {loop_checked!r})")
         ok("T10: 预填正确(source + loop)")
 
         # ============================================================ #
@@ -157,8 +170,13 @@ def main():
         print("\n=== T5: 完成配置 → applyWizardSnapshot ===")
         # 当前在 source,继续往下
         page.fill("input[data-field-id='vd-source']", "/tmp/test.mp4")
-        # 不勾 loop
-        page.uncheck("input[type=checkbox][data-field-id='vd-loop']")
+        # 不勾 loop(toggle 默认勾选,显式切到 unchecked)
+        page.evaluate("""
+          (() => {
+            const cb = document.querySelector('.wd-wizard-toggle-input');
+            if (cb && cb.checked) cb.click();
+          })()
+        """)
         page.wait_for_timeout(100)
         # 验证 input 真的有 data-field-id
         dbg = page.evaluate("""

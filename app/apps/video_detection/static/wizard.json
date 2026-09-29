@@ -12,7 +12,7 @@
     { "id": "source", "title": "视频源",                 "kind": "form",
       "fields": [
         { "id": "vd-source", "ui_key": "source", "label": "视频源 URL / 路径" },
-        { "id": "vd-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox" }
+        { "id": "vd-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox", "default": true }
       ]
     },
     { "id": "detect", "title": "检测提示词 + 检测尺寸",  "kind": "form",

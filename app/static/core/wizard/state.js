@@ -235,9 +235,22 @@
           if (cur != null) el.value = cur;
           break;
         case "checkbox":
-          el = _ce("input", WIZARD_NS + "checkbox");
-          el.type = "checkbox";
-          el.checked = !!cur;
+          // toggle switch 容器(<label> 内嵌 checkbox input + 视觉 track +
+          // 字段 label),click label 自动 toggle inner input。dataset.fieldId
+          // 设在外层 label,内部 input 也设一份(future-proof 给 capture 逻辑)
+          const defaultChecked = (cur != null) ? !!cur : !!field.default;
+          const toggleLbl = _ce("label", WIZARD_NS + "toggle");
+          const cbInput = _ce("input", WIZARD_NS + "toggle-input");
+          cbInput.type = "checkbox";
+          cbInput.checked = defaultChecked;
+          const track = _ce("span", WIZARD_NS + "toggle-track");
+          const knob = _ce("span", WIZARD_NS + "toggle-knob");
+          track.appendChild(knob);
+          const toggleText = _ce("span", WIZARD_NS + "toggle-text", field.label || field.id);
+          toggleLbl.appendChild(cbInput);
+          toggleLbl.appendChild(track);
+          toggleLbl.appendChild(toggleText);
+          el = toggleLbl;
           break;
         case "select":
           el = _ce("select", WIZARD_NS + "input");
@@ -355,9 +368,17 @@
     const body = _q("#" + WIZARD_NS + "body");
     body.querySelectorAll("[data-field-id]").forEach((el) => {
       const fid = el.dataset.fieldId;
-      if (el.type === "checkbox") state.values[fid] = el.checked;
-      else if (el.value !== "") state.values[fid] = el.value;
-      else delete state.values[fid];
+      // toggle 容器(<label> 包 checkbox input)与普通 input 兼容:
+      // 先找内嵌 checkbox,有就以 checked 读;否则按 element value 读
+      const innerCb = el.matches?.('input[type="checkbox"]')
+        ? el : el.querySelector?.('input[type="checkbox"]');
+      if (innerCb) {
+        state.values[fid] = innerCb.checked;
+      } else if (el.value !== "") {
+        state.values[fid] = el.value;
+      } else {
+        delete state.values[fid];
+      }
     });
     _lsSave(state.app.id, cfg, state.values);
     // debug hook for test/e2e visibility(零开销,生产环境无副作用)
@@ -381,7 +402,7 @@
   function stepForward() {
     if (!_active) return;
     const { cfg } = _active;
-    _captureValues(cfg, _active);
+    _captureValues(cfg, _active);   // 先 capture 当前步骤 body
     _gotoStep(_active.currentStep + 1);
   }
 

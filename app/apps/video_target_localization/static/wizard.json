@@ -11,7 +11,7 @@
     { "id": "source", "title": "视频源",           "kind": "form",
       "fields": [
         { "id": "vtl-source", "ui_key": "source", "label": "视频源 URL / 路径" },
-        { "id": "vtl-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox" }
+        { "id": "vtl-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox", "default": true }
       ]
     },
     { "id": "ground", "title": "定位提示词",       "kind": "form",
