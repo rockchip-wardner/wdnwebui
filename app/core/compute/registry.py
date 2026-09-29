@@ -603,7 +603,7 @@ MODEL_PRESETS: dict[str, dict] = {
         # Qwen3.5-VL-4B 多模态模型（kind="vlm"，image-in/text-out）。
         # 同时声明 swcap_text_chat + swcap_video_describe —— VLM-mode
         # RKNN 既能做纯文本推理也能消费视觉 token，所以文本对话页 +
-        # 视频描述页（detector / VFA / audio_analysis 等）都能用它。
+        # 视频描述页（detector / VAS / audio_analysis 等）都能用它。
         # 与 qwen3-vl-4b 共用 swcap_video_describe capability；算力
         # 配置页同一 capability 内互斥（先加载的赢）。
         "label":            "[VLLM]视觉文字多模态v3.5",
@@ -3576,7 +3576,7 @@ class ComputeRegistry:
 
         **本机优先**：多实例可用时（如 LAN 上两台板都加载了同一
         embedding），优先返回本机 ``spawned`` / ``adopted_local``
-        实例 —— 视频类消费方（VCS / wechat_video_manager）走
+        实例 —— 视频类消费方（VAS_SEARCH / wechat_video_manager）走
         ``/dev/shm`` path-list 传帧，跨机Worker 读不到本机 tmpfs，
         命中远端实例会逐片 imread 失败；同时本机 NPU 推理延迟也远低
         于 LAN RPC。无本机 running 时才退回 LAN peer（远端 wire
@@ -3726,7 +3726,7 @@ def get_registry() -> ComputeRegistry:
 # In the v0.4 per-subprocess RPC refactor the call lock is no longer needed     #
 # in the main process (server-side lock in compute_worker serializes per       #
 # instance). This module-level lock is kept so existing call sites             #
-# (video_file_analysis.py, video_content_search.py, audio_analysis.py) keep    #
+# (video_analysis_search.py, video_search.py, audio_analysis.py) keep    #
 # compiling. It is a no-op in practice because nothing else in the main        #
 # process ever acquires it.                                                    #
 # --------------------------------------------------------------------------- #

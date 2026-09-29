@@ -18,9 +18,9 @@ import os
 import sys
 
 # Import the worker helpers (no NPU required — just helpers)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app", "services"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from compute_worker import (  # noqa: E402
+from app.core.compute.worker import (  # noqa: E402
     _write_reply_payload_to_shm,
     _REPLY_SHM_DIR,
     _REPLY_SHM_PREFIX,
@@ -236,7 +236,7 @@ def test_proxy_payload_contains_is_remote_field():
     实例需要 stub 大量依赖。直接 grep 源码确保契约不被破坏。
     """
     import ast as _ast
-    with open("app/services/rpc_session_proxy.py") as f:
+    with open("app/core/compute/proxy.py") as f:
         tree = _ast.parse(f.read())
     found_payload_build = False
     for node in _ast.walk(tree):
@@ -265,7 +265,7 @@ def test_worker_infer_handler_reads_is_remote_payload():
     ``payload.get(\"is_remote\"`` 或 ``payload[\"is_remote\"`` 的引用。
     """
     import ast as _ast
-    with open("app/services/compute_worker.py") as f:
+    with open("app/core/compute/worker.py") as f:
         tree = _ast.parse(f.read())
     found_read = False
     for node in _ast.walk(tree):
@@ -299,7 +299,7 @@ def test_scene_frame_docstring_has_total_char_constraint():
     """
     import ast as _ast
     import re as _re
-    tree = _ast.parse(open("app/services/video_file_analysis.py").read())
+    tree = _ast.parse(open("app/apps/video_analysis_search/service.py").read())
 
     build_fn = next(
         (n for n in _ast.walk(tree)
@@ -342,7 +342,7 @@ def test_looks_like_schema_echo_unit():
     (Latin 各 1 次 + 空格分隔 CJK), 这个 detector 补位。
     """
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from video_file_analysis import _looks_like_schema_echo
+    from app.apps.video_analysis_search.service import _looks_like_schema_echo
 
     # 用户报告样本: 必 flag
     assert _looks_like_schema_echo("scene 小区入口 actors action objects text") is True, (
@@ -373,7 +373,7 @@ def test_split_scene_frame_result_drops_schema_echo():
     模拟前端 event 流程不会渲染 echo 内容。
     """
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from video_file_analysis import (
+    from app.apps.video_analysis_search.service import (
         _get_scene_frame_cls,
         _split_scene_frame_result,
     )
@@ -411,7 +411,7 @@ def test_scene_frame_docstring_has_negative_example():
     频率是否下降 (005cc90 的 LOG.warning 计数)。
     """
     import ast as _ast
-    tree = _ast.parse(open("app/services/video_file_analysis.py").read())
+    tree = _ast.parse(open("app/apps/video_analysis_search/service.py").read())
 
     scene_cls = None
     for node in _ast.walk(tree):
@@ -469,7 +469,7 @@ def test_schema_parse_failed_branch_skips_raw_text_when_text_path_set():
     父 if 条件里出现 "text_path" not in reply Compare 节点。
     """
     import ast as _ast
-    tree = _ast.parse(open("app/services/compute_worker.py").read())
+    tree = _ast.parse(open("app/core/compute/worker.py").read())
 
     raw_text_assignment = None
     for node in _ast.walk(tree):

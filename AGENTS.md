@@ -57,6 +57,30 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    浏览器崩溃、某些移动浏览器会丢弃 beacon）；AGENTS 不做超出此限制
    的承诺。若可靠性要求更高，需要服务端按 session TTL / 心跳
    自动回收 —— 不在本期范围。
+
+   **卡片 JS 生命周期 —— `_loadedApps` 与 `_wizardMounted` 解耦**
+   （`app/static/core/framework.js`）：framework 用 `DemoGuard._loadedApps`
+   记忆"卡片 app.js 已注入 DOM"，`showPage` 命中即跳过 `_loadCardJS`。
+   向导 `unmount()`（用户切走 / 跳过 / `onNavAway`）会 dispatch
+   `wizard:unmounted`。**曾经的写法**是它直接删 `_loadedApps`，于是切回
+   该页时 framework 重新 `document.head.appendChild(<script>)` → 卡片
+   IIFE **重跑**：新闭包 + 复用 DOM →（a）所有 `addEventListener` 在旧
+   元素上**重复累积**（实测：点一次「清空缓存」弹出 N 个 `confirm`，需
+   确认 N 次）；（b）模块级内存标志（`VAS_SEARCH._progressForceIdle` /
+   `VAS._clearedRun` / `VAS_SEARCH.initialized` 等）全部归零 → 清空过的
+   进度条在 WS 快照重放时复活 100%、反查按钮闪烁（用户实测）。
+
+   现改为**两个独立集合**：`_loadedApps`（JS 已加载，**只增不减**）+
+   `_wizardMounted`（向导当前挂载）。`wizard:unmounted` 只
+   `_wizardMounted.delete(appId)`；`showPage` 对"JS 已加载但向导未挂"
+   的页只调 `WizardRegistry.tryMount(m)`（**不重注 `<script>`**）并
+   `_wizardMounted.add(page)`。效果：卡片 IIFE 永不重跑（监听器不累积、
+   内存标志不丢），而"跳过向导后再进入会重弹向导"的语义保持不变
+   （unmount 清标记 → 切回 `tryMount` 重挂）。
+   **改路由 / 新增卡片页时勿再让 `wizard:unmounted` 触碰
+   `_loadedApps`**。诊断：DevTools `getEventListeners(el).click.length`
+   应在多次切页后恒为 1（CDP `DOMDebugger.getEventListeners` 同理）。
+
 6. **worker 进程是薄 RPC server，类云端 AI 调用语义**。
    `compute_worker.py` / `compute_worker_lazy.py` 进程只负责：
    * 接收 prompt / attachment / generating schema / tools 参数；
@@ -208,9 +232,8 @@ app/apps/<card_id>/
 | `audio-analysis` | `swcap_audio_understand` | `app.apps.audio_analysis` |
 | `text-chat` | `swcap_text_chat` | `app.apps.text_chat` |
 | `tts` | `swcap_audio_tts` | `app.apps.tts` |
-| `video-content-search` | `swcap_video_retrieval` | `app.apps.video_content_search` |
+| `video-analysis-search` | `swcap_video_describe` + `swcap_video_retrieval` | `app.apps.video_analysis_search`（分析 + 检索双路由） |
 | `video-detection` | `swcap_video_describe` | `app.apps.video_detection` (+ `tts_alert` 工具) |
-| `video-file-analysis` | `swcap_video_describe` | `app.apps.video_file_analysis` |
 | `video-target-detection` | `swcap_video_describe` | `app.apps.video_target_detection` (TargetDoc) |
 | `video-target-localization` | `swcap_grounding` | `app.apps.video_target_localization` (LocatorDoc) |
 
@@ -547,7 +570,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   `_probe_instance` daemon 线程周期性 RPC `info` 同步 worker
   状态（`not_loaded` / `loading` / `running` / `error`）。
 * **`get_session_call_lock()` 留作 no-op 兼容旧调用点**
-  （仅 `video_file_analysis.py` 还在 import）。
+  （仅 `video_analysis_search.py` 还在 import）。
 
 ### 已知约束 / 待完善
 
@@ -578,7 +601,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   把 > 200 字节的 payload 写**本机** tmpfs、主进程**同机** `/dev/shm` 读回，
   绕开限制。跨机 LAN peer（`_source == "adopted"`，主机 hostname 不同）
   时 worker 写到本机 tmpfs、主进程读不到 → 之前 `FileNotFoundError`
-  + VFA 拿到空 `_raw.text` → 占位事件（"不崩但功能全废"）。
+  + VAS 拿到空 `_raw.text` → 占位事件（"不崩但功能全废"）。
   v0.8.30 的 `get_session` 本机优先 / `embed_video` path-list
   无 is_remote 守卫同源（见"get_session 本机优先"段）。
 
@@ -586,7 +609,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   payload 加 `is_remote: self._is_remote`；worker `infer_handler` 读到
   `True` 时 4 个 SHM 路由块（`crop_b64` / `result_data` / `structured` /
   `text`）全部 drop + per-worker 进程一次性 WARNING log。consumer
-  fallback：VFA Path 1 garbage → "本帧分析失败"占位 / TargetDoc 从
+  fallback：VAS Path 1 garbage → "本帧分析失败"占位 / TargetDoc 从
   `frame_bgr` 重裁 / detector 走 `_ProxyResult._raw` 默认值。同机
   （`_is_remote=False`，默认）行为完全不变。smoke：
   `scripts/verify_text_shm_path.py` 11/11 pass。
@@ -608,7 +631,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   LAN peer + local 自动支持任意大小 payload。需 wdndds 仓库 review
   节奏配合，独立排期。
 
-* **VFA per-frame timeout 方案B (10s → 15s, 配套 wire RPC 10s → 15s)**:
+* **VAS per-frame timeout 方案B (10s → 15s, 配套 wire RPC 10s → 15s)**:
   - 5c33fb3 设 5s → 后续 10s 都覆盖 qwen3.5-vl-4b schema-echo 健康路径
   - 但线上仍偶发 `(推理失败：超时 10s SDK 未响应)`, 真机 NPU 暂忙 /
     prefill 长 / 其他并发偷 NPU 让单次跑 10-12s
@@ -617,7 +640,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   - 下一步: telemetry (commit cd74486 加的 _record_infer_duration 60s
     窗口 p95 告警) 收一晚真实 p50/p95/p99 数据决定 15s 是否够, 不够
     再调 (但若 ≥ 30s 就要查 NPU / 长 context 真因, 不应再加 timeout)
-  - 真机 VFA 服务需 restart 才能让新默认值生效
+  - 真机 VAS 服务需 restart 才能让新默认值生效
 
 ### 内存模型：主进程 RSS 稳态 ~300 MB（修复后）
 
@@ -892,9 +915,8 @@ wdnwebui/
 │   │   ├── audio_analysis/             # 音频理解(嵌入音视频描述页)
 │   │   ├── text_chat/                  # 文本对话 (swcap_text_chat)
 │   │   ├── tts/                        # 语音生成 (swcap_audio_tts)
-│   │   ├── video_content_search/       # 视频内容检索 (swcap_video_retrieval)
+│   │   ├── video_analysis_search/      # 视频分析检索 (swcap_video_describe + swcap_video_retrieval)
 │   │   ├── video_detection/            # 音视频描述 (+ tts_alert 工具)
-│   │   ├── video_file_analysis/        # 视频文件分析 (VFA)
 │   │   ├── video_target_detection/     # 视频目标检测 (TargetDoc)
 │   │   └── video_target_localization/  # 视频目标定位 (LocatorDoc)
 │   │   # 每个 app 下固定结构:
@@ -956,7 +978,7 @@ wdnwebui/
 **零耦合规则**(`app/apps/__init__.py` 强制):
 - 卡片(`app/apps/<id>/`)只能 import `app.core.*`,禁止跨卡片 import,也禁止 import `app.system.*`。
 - 系统(`app.system`)与 core 双向允许(compute / config / video cache / tool registry 都是 core),但不依赖任何 `app.apps.*`。
-- 共享资源:视频缓存(`app/core/video/cache.py`)、LLM 工具注册(`app/core/tools/registry.py`)、算力注册中心(`app/core/compute/registry.py`)全部由 core 提供,各卡片走各自入口(例如 video_content_search + wechat_video_manager 都用 `get_video_cache()` 单例)。
+- 共享资源:视频缓存(`app/core/video/cache.py`)、LLM 工具注册(`app/core/tools/registry.py`)、算力注册中心(`app/core/compute/registry.py`)全部由 core 提供,各卡片走各自入口(例如 video_analysis_search + wechat_video_manager 都用 `get_video_cache()` 单例)。
 
 ## Video detection page
 
@@ -1129,7 +1151,7 @@ class AudioEvent:
 | `POST` | `/api/audio-analysis/events/clear`  | 清空内存事件 |
 | `WS`   | `/api/audio-analysis/ws`            | server-push `{type:"hello"|"event"|"progress"|"state"}` |
 
-错误码与 detector / VFA 对齐：502 + `RuntimeError("功能未启用: swcap_audio_understand")`。
+错误码与 detector / VAS 对齐：502 + `RuntimeError("功能未启用: swcap_audio_understand")`。
 
 ### 前端模块（`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)`）
 
@@ -1163,7 +1185,7 @@ class AudioEvent:
 | omni init | ~ 50s | 两个 rknn + embed；倒计时同其它 preset |
 | 60s 音频切片 | 10 段 × ~ 1s | 单线程串行 ≈ 10s 总耗时 |
 | 与 qwen3-vl-4b 共存 | ~ 6 GB | OK；与 qwen3-4b 同时跑超 8 GB |
-| NPU 互斥 | 进程级 `_llm_session_call_lock` 串行 | 与 detector / VFA / text_chat 共享同一把锁 |
+| NPU 互斥 | 进程级 `_llm_session_call_lock` 串行 | 与 detector / VAS / text_chat 共享同一把锁 |
 
 `_check_npu_memory_budget()`（`compute_registry.py`）自动纳入 omni preset
 校验；同卡内存超限在 `boot_compute_services` 时被拒绝。
@@ -1175,7 +1197,7 @@ class AudioEvent:
 * **极短音频**（< 6s）：整段算一段，shape 1 (n=300) 或 shape 0 (n=600)
   补零处理（omni 内部行为）。
 * **超时熔断**：单段 SDK 卡死没有 timeout；上层若需要可包一层
-  `asyncio.wait_for(...)`，但当前按 detector / VFA 现有风格不做。
+  `asyncio.wait_for(...)`，但当前按 detector / VAS 现有风格不做。
 * **不做二次聚合**：60 秒以上音频不会自动生成"综述"；如未来需要，
   加一段独立的 LLM 调用（建议复用 `swcap_text_chat` 的 qwen3-4b）。
 
@@ -1183,7 +1205,7 @@ class AudioEvent:
 
 > **本节描述的是 v0.4 之前的 16 路 4×4 网格监控页面;v0.4 起已下线。**
 > 视频能力整合进微信视频检索管线 (`app/system/im_bridge/video_manager.py`)
-> 与 视频内容检索页 (`app/apps/video_content_search/`)。
+> 与 视频分析检索页 (`app/apps/video_analysis_search/`)。
 >
 > 以下内容作为**历史决策记录**保留 —— 16 路共享一个 LLMSession(避免 16×3.5 GB)
 > 的设计仍有参考价值。当前不需要在 v0.4 复现该页面;若未来要重建,
@@ -1373,7 +1395,7 @@ holds it in memory. The file is seeded with a `base` section at
 - **Atomic writes** — `replace()` / `set_section()` write a sibling
   temp file and `os.replace()`-s into place so a crash mid-write
   can't corrupt the file. Output goes through
-  :func:`app.services.jsonc.dump_jsonc` (quoted keys, trailing commas,
+  :func:`app.core.compute.jsonc.dump_jsonc` (quoted keys, trailing commas,
   UTF-8 native).
 - **Whole-file endpoints** (`app/system/api/config.py`):
   - `GET  /api/config`        — `{path, data}` (current snapshot).
@@ -2101,14 +2123,13 @@ to taste.
 format-3; for inspection, use ``soundfile.read(...)`` or parse the
 RIFF header by hand.
 
-## Video file analysis (视频文件分析) page
+## Video analysis search (视频分析检索) page
 
-`#page-video-file-analysis` 是演示页第 4 项（`⏏` 图标），提供整段视频的
-批量 VLM 分析 —— 给定本地文件 / RTSP / RTMP / 摄像头，VLM 按 `every_n`
-帧采样输出结构化 `SceneFrame`，文件走完后跑一次 Apollo 三段式综述。
+`#page-video-analysis-search`（卡片 id `video-analysis-search`，`app/apps/video_analysis_search/`）
+是演示页第 4 项，**一张卡片承载两种能力**（页面顶部 checkbox 勾选，可同时开）：
 
-* **Service** (`app/apps/video_file_analysis/service.py`):
-  - `VideoFileAnalysisService` 单例（`get_service()`）。状态机
+* **Service** (`app/apps/video_analysis_search/service.py`):
+  - `VideoAnalysisSearchService` 单例（`get_service()`）。状态机
     `idle → opening → running → summarizing → done`，`stopped` / `error` 是
     旁支终态。
   - **独立 `wdnav.VideoCapture`** —— 不挂 `VideoSession.add_frame_sink`，避免
@@ -2116,10 +2137,10 @@ RIFF header by hand.
   - **LLMSession 必须从 ComputeRegistry 取** —— `get_session("swcap_video_describe")`，
     复用 `qwen3-vl-4b` 实例；找不到 capability 抛 `RuntimeError("功能未启用: ...")`，
     HTTP 502 透传。
-  - **进程级 `_llm_session_call_lock`**：detector 与 VFA 共享同一 LLMSession；
+  - **进程级 `_llm_session_call_lock`**：detector 与 VAS 共享同一 LLMSession；
     `reset() + respond(...)` 不是线程安全的，必须 `with lock:` 包住。锁不绑
     capability —— VLM 端所有消费者串行化，TTS 用另一组 session 互不干扰。
-    `app.services.compute_registry.get_session_call_lock()` 暴露锁对象。
+    `app.core.compute.registry.get_session_call_lock()` 暴露锁对象。
   - **decode / infer pipeline 反压**：`_decode_loop` 用 `queue.Queue(maxsize=1)`
     + `threading.Event` 做 backpressure —— 采样时等 `_worker_ready`，worker
     拿走样本立即 set；避免新样本覆盖尚未处理的旧样本。
@@ -2132,73 +2153,70 @@ RIFF header by hand.
     （`max_new_tokens=400`）。每完成一个 chunk 广播 `state` 进度，
     前端用 `summary_progress: [done, total]` 显示 N/M。
   - **持久化**：每次 `start()` 分配新 `run_id`（uuid4 hex），结束 / 停止 /
-    出错都原子写到 `app/apps/video_file_analysis/vfa_runs/<run_id>.json`(mp temp + os.replace;
-    也可由 `VFA_RUNS_DIR` 环境变量覆盖)。
+    出错都落盘到 LanceDB（`app/core/video/cache.py` 的 `kind='analysis'`
+    行，`WechatVideoCache.save_analysis` / `list_analysis`）。
     JSON 含 `events[]` + `summary` + `fps` + `total_frames`。**老 run 没
     `fps` 字段时** `list_runs` 走 PyAV 探测自愈并回填。
-* **API** (`app/apps/video_file_analysis/api.py`):
-  - `GET  /api/video-file-analysis`             — 当前快照（state / 总帧 /
+* **API** (`app/apps/video_analysis_search/api.py`):
+  - `GET  /api/video-analysis-search`             — 当前快照（state / 总帧 /
     进度 / 综述 / available / init_error）。
-  - `GET  /api/video-file-analysis/events`      — per-frame events + summary。
-  - `POST /api/video-file-analysis/open` `{source, prompt, every_n}` —
+  - `GET  /api/video-analysis-search/events`      — per-frame events + summary。
+  - `POST /api/video-analysis-search/open` `{source, prompt, every_n}` —
     启动一次；400 source/prompt/every_n 校验失败；503 wdnai 不可用 / 功能未启用。
-  - `POST /api/video-file-analysis/stop`        — 用户中途停止（不出综述）。
-  - `POST /api/video-file-analysis/close`       — 彻底关闭。
-  - `POST /api/video-file-analysis/events/clear` — 清空内存 events + summary。
-  - `GET  /api/video-file-analysis/runs`        — 历史 run 列表（按 finished_at 倒序）。
-  - `GET  /api/video-file-analysis/runs/{run_id}` — 加载历史 run 到内存。
-  - `DELETE /api/video-file-analysis/runs/{run_id}` — 删盘上 JSON。
-  - `GET  /api/video-file-analysis/runs/{run_id}/facets` — scene/actor/object/action
+  - `POST /api/video-analysis-search/stop`        — 用户中途停止（不出综述）。
+  - `POST /api/video-analysis-search/close`       — 彻底关闭。
+  - `POST /api/video-analysis-search/events/clear` — 清空内存 events + summary。
+  - `GET  /api/video-analysis-search/runs`        — 历史 run 列表（按 finished_at 倒序）。
+  - `GET  /api/video-analysis-search/runs/{run_id}` — 加载历史 run 到内存。
+  - `DELETE /api/video-analysis-search/runs/{run_id}` — 删盘上 JSON。
+  - `GET  /api/video-analysis-search/runs/{run_id}/facets` — scene/actor/object/action
     去重集合（前端反查 chip 候选）。
-  - `GET  /api/video-file-analysis/runs/{run_id}/query?scene=&actor=&object=&action=&exact=&q=&frame_min=&frame_max=&limit=` —
+  - `GET  /api/video-analysis-search/runs/{run_id}/query?scene=&actor=&object=&action=&exact=&q=&frame_min=&frame_max=&limit=` —
     反查：多维 AND 过滤 + 两种搜索模式（`exact` > `q` 互斥）。
-  - `GET  /api/video-file-analysis/runs/{run_id}/frame/{frame_pos}` —
+  - `GET  /api/video-analysis-search/runs/{run_id}/frame/{frame_pos}` —
     从原始视频取指定帧的 JPEG（PyAV v4l2m2m seek + wdnav read0 fallback）。
-  - `WS   /api/video-file-analysis/ws`          — server-push `{type:"event"|"summary"|"state"|"hello"}`。
-* **前端** (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` `VFA` 模块 + `#page-video-file-analysis`):
+  - `WS   /api/video-analysis-search/ws`          — server-push `{type:"event"|"summary"|"state"|"hello"}`。
+* **前端** (`app/apps/video_analysis_search/static/app.js` `VAS` 模块 + `#page-video-analysis-search`):
   - 顶部进度条 + 阶段标签（`未启动 / 正在打开 / 分析中 / 生成综述中 / 已完成 /
     已停止 / 错误`），状态色随 `data-state` 切换；分析中显示"已读 N/M · 已
     分析 X/Y · LLM 队列 Z"。
   - 左侧表单：视频源（"浏览…"复用 `VdFsModal._sourceTarget = sourceEl` 机制，
-    current 项目已有，写路径回到 `#vfa-source`）+ 分析要求 textarea + 隔 N
+    current 项目已有，写路径回到 `#vcs-source`）+ 分析要求 textarea + 隔 N
     帧采样输入 + 开始 / 停止 / 清空记录按钮。
-  - 右侧 `vd-side vfa-result-col`：综述框 + 历史分析列表（每条带状态徽章 +
-    `加载 / 反查 / 删除` 三个 `vda-action-btn` 横排，删除用 `margin-left:auto`
-    推到最右避免误点）。
+  - 右侧综述框 + 历史分析列表（每条带状态徽章 + `加载 / 反查 / 删除`
+    三个按钮横排，删除用 `margin-left:auto` 推到最右避免误点）。
   - 下方 `<details open>` 逐帧分析列表（默认折叠，新事件抵达时只 push、
     不自动滚动；run 终态自动折叠腾出空间给综述）。
-  - **反查 modal** (`#vfa-query`)：场景下拉 + 人物/物体/动作 chip 多选 +
+  - **反查 modal** (`#vas-query`)：场景下拉 + 人物/物体/动作 chip 多选 +
     精准匹配 / 模糊搜索 二选一 + 时间范围 `HH:MM:SS`（on-blur 校验，
     超总时长自动截断 + 提示）。结果 list 显示 frame_pos / 时间戳 / 结构化 tag
-    / 高亮 `<mark>`。点击结果 → **取帧 modal** (`#vfa-frame-modal`)：从原
+    / 高亮 `<mark>`。点击结果 → **取帧 modal** (`#vas-frame-modal`)：从原
     视频取对应帧 JPEG + 显示 frame_pos / fps / 该帧时间戳 / 画面描述 / 结构化。
   - 取帧路径：PyAV v4l2m2m `avformat_seek_file` 跳到 keyframe + 顺序 decode 到
     target（实测比 wdnav read0 从头顺序读快 ~150x），失败 fallback 到 wdnav。
-* **DemoGuard 注册**：VFA 是演示页第 4 项，离开时弹 confirm 并 POST `/stop`；
+* **DemoGuard 注册**：VAS 是演示页第 4 项，离开时弹 confirm 并 POST `/stop`；
   `active()` 判定 `state ∈ {opening, running, summarizing}`；`stopSync` 走
   `sendBeacon(/stop, POST)` 兜底。`beforeunload` 期间 JS 不能保证送达，最
-  终兜底依赖服务端的 `get_vfa_service().close()` on shutdown。
+  终兜底依赖服务端的 `get_service().close()` on shutdown。
 * **资源预算**：与 detector 共用同一 qwen3-vl-4b 实例（~3.5 GB），典型一次
-  VFA 分析 200 帧约 200s（every_n=60 × 1s/inference）。长视频（>10 分钟）
+  VAS 分析 200 帧约 200s（every_n=60 × 1s/inference）。长视频（>10 分钟）
   建议 every_n ≥ 60。
 * **依赖**：`requirements.txt` 加 `av>=11.0.0`（PyAV，硬取帧走 `v4l2m2m` 后端
   + `avformat_seek_file`）；`wdnav.VideoCapture` 已在内部 SDK 提供。
 
-## Video content search (视频内容检索) page
+### 检索侧
 
-`#page-video-content-search`（侧栏演示项，`⌕` 图标）暴露
-Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时间窗
-切片 → 每片 embedding → 文本余弦检索出命中片段 → 点命中卡片用真实
-帧流播放。状态机 `idle → extracting → ready`，`stopped` / `error` 是
-旁支终态。
+选一个本地视频文件 → 按时间窗切片 → 每片 embedding → 文本余弦检索出
+命中片段 → 点命中卡片用真实帧流播放。状态机
+`idle → extracting → ready`，`stopped` / `error` 是旁支终态。
 
-* **Service** (`app/apps/video_content_search/service.py`)：
-  - `VideoContentSearchService` 单例（`get_service()`）。
+* **Service** (`app/core/video/search.py`)：
+  - `VideoSearchService` 单例（`get_service()`）。
   - **LLMSession 必须从 ComputeRegistry 取** —— `get_session("swcap_video_retrieval")`，
     复用 qwen3-vl-embedding-2b 实例；找不到 capability 抛
     `RuntimeError("功能未启用: ...")`，HTTP 503 透传。`start_extract`
     加预检 `_ensure_session()`，不用等 worker 探测才报错。
-  - **进程级 `_llm_session_call_lock`**：与 detector / VFA 共用同一套锁，
+  - **进程级 `_llm_session_call_lock`**：与 detector / VAS 共用同一套锁，
     `embed_text` / `embed_video` 的 `reset() + respond` 类推理必须
     `with lock:` 包住（embedding 的 `embed_*` 也是 NPU 推理，同样要
     与 VLM 端串行化）。
@@ -2215,39 +2233,39 @@ Qwen3-VL-Embedding-2B 检索 embedding：选一个本地视频文件 → 按时�
     顺序生成区间内每帧 JPEG（PyAV seek 到 keyframe + 顺序 decode +
     cv2 编码）；`paced=True` 时按源视频 fps 节流（**绝对时钟对齐**，
     sleep 补偿编码耗时，帧间隔精确 = 1/fps，缺失回退 `fallback_fps=25`）。
-* **API** (`app/apps/video_content_search/api.py`)：
-  - `GET  /api/video-content-search` — 快照（state / 进度 / query /
+* **API** (`app/apps/video_analysis_search/search_api.py`)：
+  - `GET  /api/video-analysis-search` — 快照（state / 进度 / query /
     hits / fps / source_exists）。
-  - `POST /api/video-content-search/open` `{source}` — 选单个视频文件。
-  - `POST /api/video-content-search/extract` `{chunk_seconds,
+  - `POST /api/video-analysis-search/open` `{source}` — 选单个视频文件。
+  - `POST /api/video-analysis-search/extract` `{chunk_seconds,
     chunk_overlap_seconds}` — 开始切片 embedding；chunk_seconds ∈
     {3,4,5,6}、overlap ∈ {1,2}（Pydantic/service 校验，非法 400）；
     实例未启用 503。
-  - `POST /api/video-content-search/extract/stop` — 中途停止（退回 idle）。
-  - `POST /api/video-content-search/query` `{text, sim_threshold,
+  - `POST /api/video-analysis-search/extract/stop` — 中途停止（退回 idle）。
+  - `POST /api/video-analysis-search/query` `{text, sim_threshold,
     top_k}` — 文本检索；`embed_text` 同步 NPU 推理挪
     `run_in_executor` + **35s 超时**（SDK 卡死返 504，不阻塞 event
-    loop；对齐 VFA 做法）。
-  - `WS   /api/video-content-search/ws` — server→client：`hello`
+    loop；对齐 VAS 做法）。
+  - `WS   /api/video-analysis-search/ws` — server→client：`hello`
     （连接即发快照）/ `progress`（embedded, total）/ `state`。
-  - `WS   /api/video-content-search/play` — 播放命中片段：客户端首条
+  - `WS   /api/video-analysis-search/play` — 播放命中片段：客户端首条
     JSON `{source, start, end}` → 服务端 daemon 线程跑
     `iter_segment_jpeg(..., paced=True)` 推二进制 JPEG 帧；客户端
     `{"action":"pause"}` / `{"action":"resume"}` 控制（
     `threading.Event`，pause 时阻塞 reader）；播完 `{"type":"eof"}`、
     出错 `{"type":"error"}`；断开连接即停线程。首条参数 10s 超时，
     非法 source / `end<=start` 直接 1008。
-  - `GET  /api/video-content-search/frame?source=&t=` — PyAV seek 到
+  - `GET  /api/video-analysis-search/frame?source=&t=` — PyAV seek 到
     `t` 秒附近取帧 JPEG（命中卡片缩略图），失败 404。
-* **前端** (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` `VCS` 模块 + `#page-video-content-search`)：
+* **前端** (`app/apps/video_analysis_search/static/app.js` `VAS_SEARCH` 模块 + `#page-video-analysis-search`)：
   - 左侧表单：视频源（"浏览…"复用 `VdFsModal._sourceTarget` 机制）+
     切片档位（3/4/5/6s，重叠 1/2s）+ 提取按钮；中间进度条 + 阶段标签。
   - 右侧命中结果列表（相似度降序，每条带开始/结束时间），点卡片 →
     `vcsPlaySegment` 连 play WS 真实帧播放：等比 contain 填满播放
     窗口（`vcsSyncCanvasSize` 把 canvas 像素同步为 `.vd-stage` 显示
     尺寸，消除元素级黑边）、进度条按已收帧数/总帧数实时推进
-    （`VCS.snap.fps` 算总帧数）、暂停/恢复/停止/播完重播。
-  - `DemoGuard` 注册 `video-content-search`，离开页面 confirm + 停
+    （`VAS_SEARCH.snap.fps` 算总帧数）、暂停/恢复/停止/播完重播。
+  - `DemoGuard` 注册 `video-analysis-search`，离开页面 confirm + 停
     play WS + sendBeacon 兜底，与其它演示页一致。
 * **ComputeRegistry preset**（`app/core/compute/registry.py`）：
   - `MODEL_PRESETS["qwen3-vl-embedding-2b"]`：`capability_types=
@@ -2693,7 +2711,7 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
 * **工具列表已并入算力配置页 RK3588 列**：原 ``#page-tools`` 页面与
   ``GET /api/tools`` 端点都已移除；工具元数据现通过
   ``GET /api/compute`` snapshot 的 ``tools`` 字段返回（懒导入
-  ``app.services.tools``，避免在 compute 模块加载时触发 wdnai 装饰器）。
+  ``app.core.tools``，避免在 compute 模块加载时触发 wdnai 装饰器）。
   RK3588 列只读展示：默认全部"已启用"badge，依赖 capability
   未启用时切到"不可用"红色 badge；该列不允许手动 toggle 工具，
   仅作为状态展示。音视频描述页 / 视频目标检测页各自的 per-detector
@@ -2904,7 +2922,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     中被覆盖的任务按 seq 判定自动跳过。
    - 管线：SDK CDN 下载（`Wechat.download_message()` 同步透传，120s
      上限）→ 落盘 `uploads/wechat_videos/<uid>/` → PyAV 探测 → 逐片
-     **4s 片 / 1s 重叠** embedding（复用 VCS 底层函数 `_probe_video_meta`
+     **4s 片 / 1s 重叠** embedding（复用 VAS_SEARCH 底层函数 `_probe_video_meta`
      / `_read_chunk_frames` / `_write_frames_to_shm` / `_cosine_similarity`
      + `get_session("swcap_video_retrieval")`，SHM 帧传递 + timeout 重试
      与 UI 页同款）→ ready。
@@ -2947,11 +2965,11 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     `(md5, embedding_model, chunk_seconds, chunk_overlap_seconds)`
     定位条目 —— UI 检索页的 chunk/overlap 是用户可选的
     （3-6s / 1-2s），不同参数的索引时间窗与帧数完全不同，混用会
-    时间戳错位。微信管线传固定 4/1；VCS 传用户选值；同视频不同
+    时间戳错位。微信管线传固定 4/1；VAS_SEARCH 传用户选值；同视频不同
     参数是**独立条目**（各自占 LRU 槽，命中互不干扰）。
-* **VCS 页接入缓存（v0.12.1）**：视频内容检索页与微信管线共享同一
+* **VAS_SEARCH 页接入缓存（v0.12.1）**：视频内容检索页与微信管线共享同一
   张表 + 同一单例：
-  - `VideoContentSearchService.start_extract` 参数校验通过后算
+  - `VideoSearchService.start_extract` 参数校验通过后算
     md5（本地文件直接流式算，无需下载）→ `lookup(...)` 命中即
     还原 index（`video_path` 换绑为当前 source basename，帧接口
     走当前源）→ state 秒级 READY（广播 state，前端进度条直接
@@ -2959,21 +2977,49 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   - `_worker_loop` 收尾 `slices_embedded >= slices_total`（全成功
     语义与微信一致）→ `cache.save(...)`；部分成功不存（与微信
     决策一致，重跑可补全）。
-  - **$json "清空缓存"按钮**（`#vcs-clear-cache`，视频源 input 行）→
-    `confirm()`（含 `cache/stats` 返回的条数提示）→
-    `POST /api/video-content-search/cache/clear` → 幂等
-    `{videos_cleared}`；`GET .../cache/stats` 返回
-    `{enabled, max_entries, videos, rows}` 给确认框展示。内存中
-    当前索引不受影响（缓存是持久备份层）。
+   - **"清空缓存"按钮**（`#vcs-clear-cache`，缓存窗口 head）→
+     `confirm()`（含 `cache/stats` 返回的条数提示）→
+     `POST /api/video-analysis-search/search/cache/clear` → 幂等
+     `{videos_cleared}`；`GET .../cache/stats` 返回
+     `{enabled, max_entries, videos, rows}` 给确认框展示。**同时作废
+     当前会话的内存索引**（端点随后调 `get_service().reset_session()`：
+     停提取 worker + `_state→idle` + 清 `_index` / `_md5` / 切片计数 +
+     广播 idle）—— 否则持久缓存虽删、前端 `vasStartSearch` 仍会看到
+     `state=ready` 短路跳过 `start_extract`，表现为"进度条直接满格 +
+     历史无新条目"（用户实测）。保留 `_source`，可重新点开始提取。
+     **注意**：清空 LanceDB 是全表删除（含微信条目），会话 reset 只
+     针对 VAS_SEARCH 单例（微信 `wechat_video_manager` 用自己的
+     VideoEntry，不共用这个单例，不受影响）。
+   - **"清空检索结果"按钮**（`#vcs-results-clear`）→
+     `POST /search/query/clear` → `clear_query()`：清 `_query` / `_hits`
+     **并把 `_state` 从 `ready` 复位为 `idle`（清零切片计数）**，
+     `_index` 保留供重查。原因：进度条完全由快照 `state`/`slices_*`
+     渲染，`ready` 会在任何一次快照重放（WS 重连 / 卡片 JS 重载 /
+     切页返回）时把进度条刷回 100%（用户实测："清空后切页再切回进度条
+     复活"）。复位 idle 后前端进度条走 `prog.hidden=true`（**直接隐藏**，
+     非停在 0%）。前端 `vcsResetProgress()` 的 `_progressForceIdle`
+     内存标志保留作即时反馈，且 `vasStartSearch` 的 `ready+同源` 短路
+     额外加了 `!_progressForceIdle` 守卫（防旧 ready 快照刷回后误短路）。
+   - **分析侧"清空"对称语义**（`#vas-clear`）→
+     `POST /analysis/events/clear` → `VideoAnalysisSearchService.clear()`：
+     清 `_events` / `_summary` **并在非运行态下把 `_state` 置 `idle` +
+     清 `_run_id`**（`opening`/`running`/`summarizing` 时只清数据，兑现
+     api docstring"运行中的分析不会被中断"），随后广播新快照。清
+     `_run_id` 让前端 `vasUpdateButtons` 的 `doneRun`（依赖
+     `VAS.snap.run_id`）自然为 null → 反查按钮正确置灰、不再依赖
+     `VAS._clearedRun` 内存标志；进度条也因 `state=idle` 隐藏。否则与
+     检索侧旧 bug 同型：清空后切页往返，后端 done 快照让进度条复活
+     100% + 反查按钮变亮闪烁（用户实测）。WS handler 的
+     `if new_run_id and ...`（`api.py`）对空 `run_id` 安全跳过。
   - **schema v0.12.2 加列 `source_path`**（入库时的本地视频路径）：
-    微信路径固定存 `""` 占位（分析完删文件，无可取帧），VCS 传
+    微信路径固定存 `""` 占位（分析完删文件，无可取帧），VAS_SEARCH 传
     `self._source`；`_migrate_add_source_path` 用 lancedb 0.34
     `add_columns({"source_path": "''"})`（SQL-dict 形状，持久化）
     幂等补列，失败兜底 drop + 新 schema 重建（缓存可再生，旧条目
     frame 置灰不影响检索）。
-* **VCS 勾选双路径（v0.12.2）**：缓存窗口让已分析视频可被直接勾选
+* **VAS_SEARCH 勾选双路径（v0.12.2）**：缓存窗口让已分析视频可被直接勾选
   检索，无需重新上传/提取：
-  - **窗口/数据**：`GET /api/video-content-search/cache/list`
+  - **窗口/数据**：`GET /api/video-analysis-search/cache/list`
     （`cache.list_videos()`：`[{md5, filename, source_path, chunk/
     overlap, slices, duration_s, analyzed_at}]`，按 analyzed_at 真
     倒序）渲染 `#vcs-cache-window`（max-height 滚动）—— 每行=
@@ -3013,7 +3059,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     `os.path.isfile` 校验）—— 移走/删除的旧文件条目仍可纯文本
     检索（时间段 + 相似度）。
   - **渠道隔离（v0.12.3）**：`source_path` 双语义兼作渠道判别 ——
-    微信管线固定 `""` 占位、web（VCS）恒存真实本地路径（均不随
+    微信管线固定 `""` 占位、web（VAS_SEARCH）恒存真实本地路径（均不随
     文件存亡漂移）。`cache/list`（web 窗口/勾选/行删除的数据源）
     调 `list_videos(channel="web")` → 只出 `source_path != ''` 条目；
     **微信条目不进 web 界面**。`lookup`/命中短路/LRU/`clear`（全清
@@ -3146,7 +3192,7 @@ XML profile 路径：`$XDG_RUNTIME_DIR/wdndds_default_profile.xml`
 * **get_session 本机优先（v0.8.30）**：`ComputeRegistry.get_session`
   同 capability 多实例 running 时按 `spawned` / `adopted_local` 优先
   于 `adopted`（LAN peer）选择。原因：视频类消费方
-  （VCS / wechat_video_manager）用 `/dev/shm` path-list 传帧，
+  （VAS_SEARCH / wechat_video_manager）用 `/dev/shm` path-list 传帧，
   **远端 worker 读不到本机 tmpfs** —— 命中远端实例会逐片
   `cv2.imread exists=False` read操作全灭；
   `rpc_session_proxy.embed_video` 的 path-list分支**没有**

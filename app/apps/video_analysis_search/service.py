@@ -3,17 +3,17 @@
 设计要点：
 
 * **独立于 ``VideoSession``** —— 视频监控 / 音视频描述 各有各的
-  capture 生命周期，VFA 跑批量分析时不该把它们的视频源也抢走。
+  capture 生命周期，VAS 跑批量分析时不该把它们的视频源也抢走。
   所以这里自己持有一个 ``wdnav.VideoCapture``（懒加载 + 独立
   decode 线程），不挂 ``VideoSession.add_frame_sink``。
 * **LLMSession 不归本服务所有** —— 严格走 ``ComputeRegistry``
   的 ``swcap_video_describe`` capability，遵守设计原则 1。多个消费者
-  （detector + VFA）共用同一 session，所有 ``session.respond``
+  （detector + VAS）共用同一 session，所有 ``session.respond``
   前后用 ``ComputeRegistry.get_session_call_lock()`` 串行化。
 * **每 N 帧调一次 VLM**，把结果写到 ``self._events`` 里持久化；
   全文件走完后跑一次综述（reset + 单次 respond，prompt 包含
   所有 per-frame 文本）。事件本身不含帧字节，"回查视频文件取帧"
-  走 ``GET /api/video-file-analysis/frame/{frame_pos}`` 重新
+  走 ``GET /api/video-analysis-search/frame/{frame_pos}`` 重新
   解码源文件（仅 file 源；live 源取帧拒绝）。
 * **wdnai 懒加载**：同 detector，只有 ``start()`` 才碰
   ``Attachment`` / ``LLMSession``，避免 web 启动时 segfault。
@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -41,12 +42,13 @@ except Exception:  # pragma: no cover - platform-specific load failure
     _WdnavVideoCapture = None
 
 
-LOG = logging.getLogger("vfa_service")
+LOG = logging.getLogger("vas_service")
 
 
-# 持久化目录：默认 ``app/services/vfa_runs/``，可用 ``VFA_RUNS_DIR``
-# 环境变量覆盖（部署到只读目录或共享存储时改）。
-_DEFAULT_RUNS_DIR = Path(__file__).resolve().parent / "vfa_runs"
+# run 持久化真源从 ``app/apps/video_analysis_search/vas_runs/*.json`` 迁到
+# LanceDB（``app/core/video/cache`` 表的 ``kind='analysis'`` 行）—— 见
+# ``WechatVideoCache.save_analysis`` / ``list_analysis``。旧 JSON 目录
+# 不再使用（升级时手工清空即可）。
 
 
 def _probe_total_frames(source: str) -> int:
@@ -125,7 +127,7 @@ def _build_scene_frame_schema():
     自由发挥时还会把 schema 例子里的 ``<30-100字描述>`` 占位符抄回去当
     输出（"乱码"现象）。继承 BaseModel 让 SDK 拿到完整 JSON Schema
     （含 ``properties.required.description``），模型遵循率显著提升。
-    VFA 不消费 ``attachment`` 槽（TTS 才用），改基类零下游破坏。
+    VAS 不消费 ``attachment`` 槽（TTS 才用），改基类零下游破坏。
     """
     from typing import List, Optional
     from wdnai import Generable, Field
@@ -314,7 +316,7 @@ def _looks_like_schema_echo(text: str) -> bool:
     """检测 schema-echo 退化输出 (Qwen3-VL-4B RKNN3 概率性故障)。
 
     典型样本: ``"scene 小区入口 actors action objects text"`` —— 用户
-    VFA prompt 是字段名拼接的退化输入, 模型 echo 回来。``_looks_garbled``
+    VAS prompt 是字段名拼接的退化输入, 模型 echo 回来。``_looks_garbled``
     漏判 (Latin 字段名每个仅 1 次 + 空格分隔 CJK), 显示成有效 text →
     前端把 echo 当描述渲染。这里 word-boundary 检测 ≥3 个 SceneFrame
     字段名即视为 echo 静默丢弃走"本帧分析失败"占位, 与 garbled 同路径。
@@ -353,7 +355,7 @@ def _split_scene_frame_result(result) -> tuple:
 
     **与 VTD (WdnaiDetector) 的行为对齐**：VTD 走 ``detector.py:_infer_sync``
     对 SDK Path 5 兜底返回的 ``str`` 走 ``getattr(str, "text", "")`` 时拿到
-    空串（str 无 ``text`` 属性），**等同于静默丢弃**。VFA 原本把 raw
+    空串（str 无 ``text`` 属性），**等同于静默丢弃**。VAS 原本把 raw
     text 塞给 ``_sanitize_text`` 再传给前端，但真正的 CJK+Latin token
     salad 既不能 regex 也不能 sanitize 修复 —— 用户看到"乱码"。
     现统一行为：检测到 garbage 时返回 ``(None, "")``，由 _infer_one
@@ -441,15 +443,18 @@ def _split_scene_frame_result(result) -> tuple:
                                 result.setdefault(_kn, _kv)
                 except Exception:
                     pass
-            # v0.10 修复：worker 的 model_dump reply 把 SceneFrame 字段
-            # 塞进 reply["structured"]（rpc_session_proxy 直透成
-            # _ProxyResult._raw["structured"]）。Path 2 拿到 result 后
-            # 把 structured 子字典的字段提升到顶层，让 _normalize_structured
-            # 按 scene/actors/action/objects/note 正常归一化。
-            _struct_vfa = result.get("structured")
-            if isinstance(_struct_vfa, dict) and _struct_vfa:
-                for _kn, _kv in _struct_vfa.items():
-                    result.setdefault(_kn, _kv)
+            # worker 端 ``SceneFrame.model_dump()`` 经
+            # ``result_data_path``（/dev/shm）回主进程 → ``_decode_reply_shm``
+            # 还原成 ``_raw["result_data"]``；``_call_llm`` 又把
+            # ``_ProxyResult._raw`` 直接当 result 返回 → 结构化字段嵌在
+            # ``result["result_data"]`` 下。旧实现只查 ``result["structured"]``
+            # （历史键名）→ 漏掉 result_data → scene/actors/action/objects
+            # 全丢（前端显示 null，只剩 text）。
+            for _key_vfa in ("structured", "result_data"):
+                _struct_vfa = result.get(_key_vfa)
+                if isinstance(_struct_vfa, dict) and _struct_vfa:
+                    for _kn, _kv in _struct_vfa.items():
+                        result.setdefault(_kn, _kv)
             structured = _normalize_structured(result)
             text = _text_from_dict(result)
             # dict 路径同样需要 _looks_garbled 兜底：SDK Path 5 在 JSON
@@ -476,7 +481,7 @@ def _split_scene_frame_result(result) -> tuple:
 def _text_from_dict(obj: dict) -> str:
     """从 dict 里抽一个 fallback 文本。
 
-    优先取 ``text`` 字段（VFA SceneFrame 的主描述字段，承担反查模
+    优先取 ``text`` 字段（VAS SceneFrame 的主描述字段，承担反查模
     糊匹配来源），其次取第一个长字符串值。
 
     **字段顺序无关性**：SceneFrame schema 重排后 ``text`` 不再是 dict
@@ -496,6 +501,59 @@ def _text_from_dict(obj: dict) -> str:
     return " ".join(str(v) for v in (obj or {}).values() if v)
 
 
+_KV_LINE_RE = re.compile(
+    r"^\s*[-*•]?\s*\**\s*(scene|actors|action|objects|text|note)\s*\**\s*[:：]\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _split_kv_items(val: str) -> List[str]:
+    """把 ``行人、骑车人`` / ``a, b`` / ``[a, b]`` 拆成列表。"""
+    v = (val or "").strip().strip("[]")
+    parts = re.split(r"[、,，;；/|]", v)
+    return [p.strip().strip('"').strip("'").strip() for p in parts if p.strip()]
+
+
+def _parse_kv_lines(text: str) -> Optional[dict]:
+    """解析模型输出的行式 ``key: value``（YAML-ish，非 JSON）。
+
+    典型：``scene: 城市街道\\nactors: 行人、骑车人\\n...`` —— 字段其实
+    齐全，旧实现只认 JSON + markdown ``#`` 标题 → 落 raw text（前端
+    显示整段原文）。这里要求 **≥2 个字段名且至少 1 个非空值** 才认：
+      ① 单行偶然含 ``scene:`` 的普通描述不误吞；
+      ② 值全空的 schema-echo（如 ``scene:\\nactors:``）不当作有效结构化
+         —— 交给 ``_looks_like_schema_echo`` 静默丢弃。
+
+    ``text`` 字段单独放在 ``_text``（``_normalize_structured`` 不认该键），
+    由 Path 3 取出当事件描述，避免前端显示整段原文。
+    """
+    if not text:
+        return None
+    found: dict = {}
+    for line in text.splitlines():
+        m = _KV_LINE_RE.match(line)
+        if not m:
+            continue
+        key = m.group(1).lower()
+        if key in found:
+            continue
+        found[key] = m.group(2).strip()
+    if len(found) < 2:
+        return None
+    if not any(v for k, v in found.items() if k != "text"):
+        return None
+    out: dict = {
+        "scene":   found.get("scene", ""),
+        "actors":  _split_kv_items(found.get("actors", "")),
+        "action":  found.get("action", ""),
+        "objects": _split_kv_items(found.get("objects", "")),
+        "note":    found.get("note") or None,
+    }
+    if found.get("text"):
+        out["_text"] = found["text"]
+    return out
+
+
 def _parse_structured_from_str(text: str) -> Optional[dict]:
     """str 兜底：从模型输出里 parse 出结构化字段。
 
@@ -508,6 +566,11 @@ def _parse_structured_from_str(text: str) -> Optional[dict]:
     先试 JSON parse，再 regex 抽取。
     """
     if not text or not text.startswith("{"):
+        # 模型的 ``scene: xxx\nactors: xxx`` 行式输出（YAML-ish，
+        # 非 JSON）字段其实齐全，先试行式解析；失败再走 markdown/regex。
+        _kv = _parse_kv_lines(text)
+        if _kv is not None:
+            return _kv
         return _regex_extract_structured(text)
     # 找第一个完整 {...} 块（可能嵌套）
     import json, re
@@ -1153,16 +1216,19 @@ FINAL_MAX_NEW_TOKENS           = 280     # pass 2 最终综述硬控输出（v0.
 #   NPU 暂忙 / prefill 长 / 其他并发偷 NPU 都会让单次跑 > 10s)
 # - wire RPC 层同步对齐到 15s (rpc_session_proxy._call_resilient),
 #   避免 wire 先于 Python 触底留下 "discovery_pending" 误报
-# - 兜底不变: _on_call_timeout ≥2 次连续 timeout → worker restart
-# - 下一步: telemetry (verify_vfa_infer_telemetry.py 已加) 收一晚数据
-#   决定 15s 是否够, 不够再调 (但若需 ≥ 30s 就要查 NPU / 长 context 真因)
-_INFER_TIMEOUT_SEC             = 15.0
+# - 兜底不变: _on_call_timeout ≥2 次连续 timeout → worker restart + 重绑
+# - 2026-09: 15s → 20s。真机发现 SceneFrame schema 未注册到 worker 时
+#   模型无 schema hint → 输出乱码且 decode 拖到 ~18s（正常结构化输出应
+#   1-3s）。20s 给足余量；配套 wire RPC 15_000 → 20_000
+#   (rpc_session_proxy.respond)，避免 wire 先触底留下 "discovery_pending"
+#   误报。若需 ≥ 30s 就要查 NPU / 长 context 真因, 不应再加 timeout。
+_INFER_TIMEOUT_SEC             = 20.0
 
 # 60s 窗口 infer telemetry —— 让运维看到真实慢路径分布, 后续 v0.16+
 # 可基于 p95 数据细化 timeout / 调度 / NPU 预算. 不影响任何 service 模块.
 _INFER_TELEMETRY_WINDOW_SEC     = 60.0   # 检查窗口
 _INFER_TELEMETRY_P95_WARN_SEC   = 4.5    # 接近 _INFER_TIMEOUT_SEC 15 的一半, 提前预警
-_INFER_TELEMETRY_MAXLEN         = 200    # deque 上限, ~3-4 分钟滚动窗口 (1fps VFA)
+_INFER_TELEMETRY_MAXLEN         = 200    # deque 上限, ~3-4 分钟滚动窗口 (1fps VAS)
 
 # 慢路径 per-call timeout 上限（秒）。per-frame 走默认 5s 守住
 # "快速发现 hang"；以下三条已知耗时 > 5s，调用方显式传对应上限避免
@@ -1208,7 +1274,7 @@ FINAL_SUMMARY_PROMPT = (
 # --------------------------------------------------------------------------- #
 # 主服务
 # --------------------------------------------------------------------------- #
-class VideoFileAnalysisService:
+class VideoAnalysisSearchService:
     """单实例 + 单次分析任务。再开新一轮要先 ``close()``。
 
     状态机：
@@ -1253,8 +1319,10 @@ class VideoFileAnalysisService:
         # 串联等死）。worker 重启 = 30s init 成本，但根治"LLM 队列 N"
         # 队列积压。成功调用一次重置回 0。
         self._consecutive_timeouts = 0
+        # 本 run 是否已自动重启过 worker（防抖：单 run 最多 1 次）
+        self._auto_restarted = False
         # v0.15: infer duration telemetry —— 60s 窗口 p95 告警
-        # deque(maxlen=200) 约 3-4 分钟 1fps VFA 滚动窗口
+        # deque(maxlen=200) 约 3-4 分钟 1fps VAS 滚动窗口
         self._infer_durations: deque = deque(maxlen=_INFER_TELEMETRY_MAXLEN)
         self._last_telemetry_check_ts: float = 0.0
         self._started_at = 0.0
@@ -1270,12 +1338,21 @@ class VideoFileAnalysisService:
         self._summary_progress = (0, 0)
 
         # 持久化：每次 ``start()`` 分配一个 run_id；状态变更（done /
-        # stopped / error / 新一轮挤掉旧 run）时把当前快照写盘。
+        # stopped / error / 新一轮挤掉旧 run）时把当前快照写入 LanceDB
+        # （``kind='analysis'`` 行）。
         self._run_id: str = ""
-        self._runs_dir: Path = Path(
-            os.environ.get("VFA_RUNS_DIR") or str(_DEFAULT_RUNS_DIR)
-        )
-        self._persist_lock = threading.Lock()
+        # 分析缓存键成分：md5（源文件本地 md5；live 流为空 → 不改
+        # 用伪 md5，保证 live run 也能进历史列表）+ prompt_hash（用户
+        # 原始"分析要求"的 sha256 前 16 位）。与 every_n 一起构成逐帧
+        # 分析缓存的命中键 —— 逐帧结果由 prompt 问出，换 prompt 必须
+        # 重新逐帧（正确性）。
+        self._md5: str = ""
+        self._prompt_hash: str = ""
+        # 本次 run 是否为"分析缓存命中恢复"（逐帧结果来自缓存，
+        # 只有综述是新跑的）。命中恢复的 run 在非 done 终态（stop /
+        # error）**不写库** —— 否则会把缓存行的 state 覆盖成 stopped，
+        # 导致下次 lookup_analysis（只命中 done）失配、逐帧白分析。
+        self._from_cache: bool = False
 
         # Apollo 风格场景检测 —— decode 线程每帧调用 _update_scene_detection
         # 累积 HSV 直方图，BHATTACHARYYA 距离超阈值的帧号写入 _scene_boundaries。
@@ -1339,7 +1416,7 @@ class VideoFileAnalysisService:
                 "finished_at":   self._finished_at,
                 # run 标识：每次 start() 重新分配 (uuid.uuid4().hex)，供
                 # WS handler 跨多次连续分析（同一 WS 连接不重连）区分事件
-                # id 空间 —— 见 api/video_file_analysis.py vfa_ws 的
+                # id 空间 —— 见 api/video_analysis_search.py vfa_ws 的
                 # last_run_id / last_event_id 重置逻辑。
                 "run_id":        self._run_id,
             }
@@ -1359,6 +1436,18 @@ class VideoFileAnalysisService:
         with self._lock:
             self._summary = ""
             self._summary_ts = 0.0
+            # 仅当不在运行态时复位 state / run_id（api docstring 承诺
+            # "运行中的分析不会被中断" —— 运行中清空只清数据、不打断）。
+            # 否则前端只能靠内存标志（_progressForceIdle / _clearedRun）
+            # 对抗后端 done 快照，卡片 JS 重载（切页往返）即失效，表现为
+            # 清空后从别的页面切回进度条复活 100% + 反查按钮变亮。
+            # run_id 清空后 WS handler 用 `if new_run_id and ...` 跳过，
+            # 不会误重置 event id 空间（events 已清空）。
+            if self._state not in (self.STATE_OPENING, self.STATE_RUNNING,
+                                   self.STATE_SUMMARIZING):
+                self._state = self.STATE_IDLE
+                self._run_id = ""
+        self._broadcast({"type": "state", **self.snapshot()})
 
     # ------------------------------------------------------------------ #
     # 控制
@@ -1414,6 +1503,35 @@ class VideoFileAnalysisService:
         except RuntimeError as e:
             raise RuntimeError(str(e)) from e
 
+        # 分析缓存：md5（源文件本地字节）+ prompt_hash（本次"分析
+        # 要求"）→ every_n 组成命中键。命中 → 跳过 decode / 采样 / 逐帧
+        # VLM，直接恢复逐帧结果 + 场景边界并重跑综述。
+        #
+        # 注：``prompt`` 此处已追加了 SceneFrame schema hint（确定性派生），
+        # 因此基于它算 prompt_hash 与"用户原始输入"一一对应且稳定。
+        is_live = "://" in source or source.startswith("/dev/video")
+        md5 = ""
+        if not is_live and os.path.isfile(source):
+            try:
+                from app.core.video.cache import file_md5
+                md5 = file_md5(source)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("vfa: md5 计算失败（本次不查缓存）%s: %s",
+                            source, e)
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+        if md5:
+            from app.core.video.cache import get_video_cache
+            cache = get_video_cache()
+            entry = (cache.lookup_analysis(md5, every_n, prompt_hash)
+                     if cache is not None else None)
+            if entry:
+                LOG.info("vfa: 分析缓存命中 md5=%s every_n=%d (%d 帧) — "
+                         "跳过逐帧，直接生成综述",
+                         md5[:12], every_n, len(entry.get("events") or []))
+                return self._start_from_cache(
+                    entry, source=source, prompt=prompt, every_n=every_n,
+                    md5=md5, prompt_hash=prompt_hash)
+
         # 同一服务串行：若还在跑，先强制收尾（不抛错）。同时把上一
         # 轮的快照落盘（run_id 不同），避免被覆盖丢失。
         if self._state in (self.STATE_RUNNING, self.STATE_OPENING,
@@ -1431,6 +1549,14 @@ class VideoFileAnalysisService:
                 "://" in source or source.startswith("/dev/video")
             )
             self._started_at = time.time()
+            # 把本帧算好的 md5 / prompt_hash 落到实例字段。
+            # 旧实现只在 ``_start_from_cache``（缓存命中路径）赋值 —— 正常
+            # 逐帧路径从没赋过 → ``_persist`` 用 ``self._md5 or
+            # f"live-{run_id}"`` 永远落 ``live-*`` 伪 md5 + 空 prompt_hash：
+            # ① 每次分析新建一行（历史列表按 md5 聚合 → 同视频多行）；
+            # ② lookup_analysis 用真实文件 md5 永远查不到 → 分析缓存完全失效。
+            self._md5 = md5
+            self._prompt_hash = prompt_hash
 
         try:
             cap = _WdnavVideoCapture(source, timeout=10.0)
@@ -1486,6 +1612,105 @@ class VideoFileAnalysisService:
         self._worker_thread.start()
         return self.snapshot()
 
+    def _start_from_cache(self, entry: dict, *, source: str, prompt: str,
+                          every_n: int, md5: str, prompt_hash: str) -> dict:
+        """缓存命中路径：恢复逐帧结果 + 场景边界，只跑综述。
+
+        **跳过** decode / 采样 / 逐帧 VLM 三段（昂贵的 NPU 逐帧推理），
+        直接从 LanceDB 恢复 ``events`` + ``scene_boundaries`` 进入
+        ``STATE_SUMMARIZING``；综述完成时 ``_persist`` 覆盖同一缓存行
+        （run_id 复用缓存行的 → 幂等，不产生重复历史条目）。
+        """
+        if self._state in (self.STATE_RUNNING, self.STATE_OPENING,
+                           self.STATE_DONE, self.STATE_STOPPED,
+                           self.STATE_ERROR, self.STATE_SUMMARIZING):
+            self._teardown(reason="restart", persist=True)
+        self._reset_state()
+
+        run_id = str(entry.get("run_id") or uuid.uuid4().hex)
+        with self._lock:
+            self._run_id = run_id
+            self._md5 = md5
+            self._prompt_hash = prompt_hash
+            self._state = self.STATE_SUMMARIZING
+            self._source = source
+            self._prompt = prompt
+            self._every_n = every_n
+            self._is_live = False
+            self._started_at = time.time()
+            self._error = ""
+            self._from_cache = True
+
+        # 恢复逐帧 events（顺带清洗 actors 列表，与 load_run 一致）
+        evs: List[FrameEvent] = []
+        max_id = 0
+        for raw in entry.get("events") or []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                fe = FrameEvent(
+                    id=int(raw.get("id", 0)),
+                    frame_pos=int(raw.get("frame_pos", 0)),
+                    ts=float(raw.get("ts", 0.0)),
+                    text=str(raw.get("text", "")),
+                    structured=raw.get("structured"),
+                )
+            except Exception:
+                continue
+            evs.append(fe)
+            if fe.id > max_id:
+                max_id = fe.id
+        with self._events_lock:
+            self._events.clear()
+            for fe in evs:
+                if fe.structured and isinstance(fe.structured.get("actors"),
+                                                list):
+                    fe.structured["actors"] = _sanitize_actors(
+                        fe.structured["actors"])
+                self._events.append(fe)
+            self._next_event_id = max_id + 1
+
+        # 恢复场景边界（否则综述退化为固定 15 帧切块）
+        with self._scenes_lock:
+            self._scene_boundaries.clear()
+            for b in entry.get("scene_boundaries") or []:
+                try:
+                    self._scene_boundaries.append(int(b))
+                except (TypeError, ValueError):
+                    pass
+            self._last_scene_hist = None
+
+        with self._lock:
+            self._sampled = len(evs)
+            self._analyzed = len(evs)
+            self._frame_pos = max((e.frame_pos for e in evs), default=0)
+
+        self._broadcast({
+            "type": "cached",
+            "frames": len(evs),
+            "run_id": run_id,
+            "message": (f"已从缓存加载 {len(evs)} 帧逐帧结果，"
+                        f"正在生成综述…"),
+        })
+        self._broadcast({"type": "state", **self.snapshot()})
+
+        self._stop_event.clear()
+        self._worker_thread = threading.Thread(
+            target=self._summary_only_loop,
+            name="vfa-summary",
+            daemon=True,
+        )
+        self._worker_thread.start()
+        return self.snapshot()
+
+    def _summary_only_loop(self) -> None:
+        """缓存命中路径的 worker：只跑综述（无 decode / 逐帧线程）。"""
+        try:
+            self._run_summary()
+        except Exception as e:  # pragma: no cover
+            LOG.error("vfa: 缓存命中综述失败: %s", e)
+            self._fail(f"综述失败: {e}")
+
     def stop(self) -> dict:
         """立即停 —— 不出综述，state='stopped'。"""
         with self._lock:
@@ -1524,19 +1749,10 @@ class VideoFileAnalysisService:
                 pass
 
     # ------------------------------------------------------------------ #
-    # 持久化：runs_dir/<run_id>.json
+    # 持久化：LanceDB（wechat_video_cache 的 kind='analysis' 行）
     # ------------------------------------------------------------------ #
-    def _runs_path(self, run_id: str) -> Path:
-        return self._runs_dir / f"{run_id}.json"
-
-    def _ensure_runs_dir(self) -> None:
-        try:
-            self._runs_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:  # pragma: no cover - permission / disk
-            LOG.warning("vfa runs dir mkdir failed (%s): %s", self._runs_dir, e)
-
     def _maybe_persist(self) -> None:
-        """在没有 run_id 或 state 仍为 idle 时跳过；其余都落盘。"""
+        """在没有 run_id 或 state 仍为 idle 时跳过；其余都落库。"""
         with self._lock:
             run_id = self._run_id
             state = self._state
@@ -1549,17 +1765,29 @@ class VideoFileAnalysisService:
         except Exception as e:  # pragma: no cover - disk
             LOG.warning("vfa persist failed (%s): %s", run_id, e)
 
-    def _persist(self) -> Optional[Path]:
-        """把当前快照写到 runs_dir/<run_id>.json，原子 rename。"""
+    def _persist(self) -> bool:
+        """把当前快照写入 LanceDB（``kind='analysis'`` 行，幂等覆盖）。
+
+        分析缓存键 = ``(md5, every_n, prompt_hash)``；同一 run 重复 persist
+        （done 后 summary 更新、stop 后状态变更）会覆盖同一行，不产生重复。
+
+        **live 流**没有本地文件 → md5 用 ``live-<run_id>`` 伪值：依然进
+        历史列表（可见 run 记录），但不可能被其它 live 流命中复用。这是
+        刻意的 —— live 流内容每次不同，复用毫无意义。
+        """
         with self._lock:
             run_id = self._run_id
             if not run_id:
-                return None
+                return False
+            md5 = self._md5 or f"live-{run_id}"
+            every_n = self._every_n
+            prompt = self._prompt
+            prompt_hash = self._prompt_hash
             payload = {
                 "run_id":      run_id,
                 "source":      self._source,
-                "prompt":      self._prompt,
-                "every_n":     self._every_n,
+                "prompt":      prompt,
+                "every_n":     every_n,
                 "is_live":     self._is_live,
                 "state":       self._state,
                 "error":       self._error,
@@ -1568,158 +1796,142 @@ class VideoFileAnalysisService:
                 "summary":     self._summary,
                 "summary_ts":  self._summary_ts,
                 # 帧率用于反查界面计算"该帧时间戳"：frame_pos / fps = 绝对秒。
-                # 老 run（升级前落盘）没这个字段，load_run_meta 读不到时 fallback 0。
                 "fps":         self._fps,
+                "total_frames": self._total_frames,
             }
+            summary = self._summary
+            dirty_count = self._dirty_count
+            source = self._source
+            fps = self._fps
+            total_frames = self._total_frames
+            from_cache = self._from_cache
+            state = self._state
+        # 缓存命中恢复的 run：逐帧来自缓存（已完整），非 done 终态不写库
+        # —— 避免 stop / error 把缓存行 state 覆盖掉导致后续失配。
+        if from_cache and state != "done":
+            return False
         with self._events_lock:
-            payload["events"] = [ev.to_dict() for ev in self._events]
+            events = [ev.to_dict() for ev in self._events]
+        with self._scenes_lock:
+            boundaries = list(self._scene_boundaries)
+        payload["events"] = events
+        payload["scene_boundaries"] = boundaries
 
-        self._ensure_runs_dir()
-        path = self._runs_path(run_id)
-        tmp = path.with_suffix(".json.tmp")
-        with self._persist_lock:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        return path
+        from app.core.video.cache import get_video_cache
+        cache = get_video_cache()
+        if cache is None:
+            return False
+
+        duration_s = 0.0
+        if fps and total_frames:
+            duration_s = float(total_frames) / float(fps)
+        filename = os.path.basename(source) if source else ""
+        return cache.save_analysis(
+            md5=md5, every_n=every_n, prompt=prompt,
+            prompt_hash=prompt_hash, run_id=run_id, events=events,
+            scene_boundaries=boundaries, summary=summary,
+            meta={"filename": filename, "source_path": source,
+                  "duration_s": duration_s, "fps": fps,
+                  "dirty_count": dirty_count},
+            payload=payload,
+        )
 
     def list_runs(self) -> List[dict]:
-        """扫描 runs_dir，按 mtime 倒序返回摘要列表。损坏的 JSON 跳过。
+        """从 LanceDB 取分析历史（按 finished_at / started_at 倒序）。
 
-        自愈机制：老 run（升级前落盘）JSON 里没 fps / total_frames 字段，
-        列表里读出来都是 0 —— 前端"反查"界面的"帧范围"会显示"总帧数未知"。
-        这里在 list 阶段对缺失字段探测一次（PyAV 直接读源文件元数据），
-        探测成功后**回填到 JSON**（atomic rename，复用 _persist_lock 防并发），
-        下次 list_runs 不再探测。**对所有 list_runs 调用方透明**（历史列表、
-        查询 modal 入口等），不需要前端改。
+        响应结构与旧的 JSON 扫描版**完全一致**（前端零改动）：每条含
+        run_id / source / prompt / every_n / state / started_at /
+        finished_at / events_count / has_summary / path / total_frames / fps。
+        ``total_frames`` / ``started_at`` / ``finished_at`` 从行内
+        ``meta_json``（完整 payload）取 —— 新 run 一定有值，不再需要
+        PyAV 自愈探测。
         """
-        import os
-        self._ensure_runs_dir()
+        from app.core.video.cache import get_video_cache
+        cache = get_video_cache()
+        if cache is None:
+            return []
         out: List[dict] = []
-        for path in self._runs_dir.glob("*.json"):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            evs = data.get("events") or []
-            source = data.get("source", "")
-            entry = {
-                "run_id":       data.get("run_id") or path.stem,
-                "source":       source,
-                "prompt":       data.get("prompt", ""),
-                "every_n":      data.get("every_n", 30),
-                "state":        data.get("state", "unknown"),
-                "started_at":   data.get("started_at", 0.0),
-                "finished_at":  data.get("finished_at", 0.0),
-                "events_count": len(evs) if isinstance(evs, list) else 0,
-                "has_summary":  bool(data.get("summary")),
-                "path":         str(path),
-                # 给"反查"界面"帧范围"做提示用：显示总帧数 + 总时长，让用户
-                # 直观感受文件大小、避免乱填超出范围的 frame_min/max。
-                # 老 run（升级前落盘）没这俩字段，fallback 0 —— 前端会显示
-                # "总帧数未知"。下方"自愈"逻辑会在这次 list 时探测并回填 JSON。
-                "total_frames": int(data.get("total_frames") or 0),
-                "fps":          float(data.get("fps") or 0.0),
-            }
-            out.append(entry)
-
-            # 自愈：老 run 缺 fps / total_frames 时探测一次 + 写回 JSON
-            if (not entry["total_frames"] or not entry["fps"]) and source:
-                probed = self._probe_source_meta(source)
-                if probed:
-                    if not entry["total_frames"] and probed["total_frames"] > 0:
-                        entry["total_frames"] = probed["total_frames"]
-                    if not entry["fps"] and probed["fps"] > 0:
-                        entry["fps"] = probed["fps"]
-                    if (probed["total_frames"] > 0 or probed["fps"] > 0):
-                        self._backfill_run_meta(
-                            path, data,
-                            total_frames=probed["total_frames"],
-                            fps=probed["fps"],
-                        )
+        for a in cache.list_analysis():
+            payload = a.get("payload") or {}
+            out.append({
+                "run_id":       a["run_id"],
+                "source":       str(payload.get("source") or ""),
+                "prompt":       a.get("prompt") or "",
+                "every_n":      int(a.get("every_n") or 30),
+                "state":        a.get("state") or "unknown",
+                "started_at":   float(payload.get("started_at") or 0.0),
+                "finished_at":  float(payload.get("finished_at") or 0.0),
+                "events_count": int(a.get("frame_count") or 0),
+                "has_summary":  bool(a.get("summary")),
+                "path":         f"lancedb://{a['run_id']}",
+                "total_frames": int(payload.get("total_frames") or 0),
+                "fps":          float(a.get("fps") or 0.0),
+            })
         out.sort(key=lambda r: -(r.get("finished_at") or r.get("started_at") or 0))
         return out
 
-    @staticmethod
-    def _probe_source_meta(source: str) -> Optional[dict]:
-        """用 PyAV 探测源视频的 fps 和总帧数。失败返回 None（不要阻塞 list_runs）。
-
-        不走 wdnav：PyAV 12.x 之后 libavformat 的 demuxer 比 wdnav 自带的轻量很多，
-        只读 metadata 不解码，单个文件 ~50-200ms。10 个 run 第一次 list 也只
-        多 1-2 秒。
-        """
-        if not source or not os.path.isfile(source):
-            return None
-        try:
-            import av
-            with av.open(source, timeout=(2.0, 5.0)) as container:
-                stream = container.streams.video[0]
-                return {
-                    "total_frames": int(stream.frames) if stream.frames else 0,
-                    "fps": float(stream.average_rate) if stream.average_rate else 0.0,
-                }
-        except Exception as e:
-            LOG.debug("vfa: list_runs 探测 %s 失败: %s", source, e)
-            return None
-
-    def _backfill_run_meta(self, path: "Path", data: dict, *,
-                          total_frames: int = 0, fps: float = 0.0) -> None:
-        """把探测到的 fps / total_frames 回填到 JSON（atomic write）。"""
-        if total_frames > 0:
-            data["total_frames"] = total_frames
-        if fps > 0:
-            data["fps"] = fps
-        tmp = path.with_suffix(".json.tmp")
-        try:
-            with self._persist_lock:  # 跟 _persist 共用，防并发写
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                os.replace(tmp, path)
-            LOG.debug("vfa: list_runs 回填 meta: %s total_frames=%d fps=%s",
-                      path.name, total_frames, fps)
-        except Exception as e:
-            LOG.warning("vfa: list_runs 回填 %s 失败（忽略）: %s", path.name, e)
-
     def load_run_meta(self, run_id: str) -> dict:
-        """轻量读 run JSON：只取 source / prompt / every_n / total 等元数据，
-        不解析 events 数组（动辄几千条，全解析浪费 CPU）。
+        """轻量读分析记录元数据：不加载 events 数组（动辄几千条）。
 
         用途：取帧 endpoint 只需知道原始视频路径 + 元信息做展示，
         不需要把整个 run 加载到内存替换当前状态。
         """
-        path = self._runs_path(run_id)
-        if not path.exists():
+        from app.core.video.cache import get_video_cache
+        cache = get_video_cache()
+        entry = cache.get_analysis_by_run_id(run_id) if cache else None
+        if entry is None:
             raise ValueError(f"run not found: {run_id}")
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError(f"corrupt run file: {run_id}")
+        payload = entry.get("payload") or {}
         return {
-            "run_id":       data.get("run_id") or run_id,
-            "source":       data.get("source", ""),
-            "prompt":       data.get("prompt", ""),
-            "every_n":      int(data.get("every_n") or 30),
-            "is_live":      bool(data.get("is_live", False)),
-            "state":        data.get("state", "unknown"),
-            "total_frames": int(data.get("total_frames") or 0),
-            # 老 run（升级前落盘的）没 fps 字段，load 后默认 0，前端 detect 到会
-            # 不显示"该帧时间戳"那行而不是显示 00:00。
-            "fps":          float(data.get("fps") or 0.0),
+            "run_id":       entry.get("run_id") or run_id,
+            "source":       str(payload.get("source") or ""),
+            "prompt":       str(entry.get("prompt") or ""),
+            "every_n":      int(entry.get("every_n") or 30),
+            "is_live":      bool(payload.get("is_live", False)),
+            "state":        str(entry.get("state") or "unknown"),
+            "total_frames": int(payload.get("total_frames") or 0),
+            "fps":          float(entry.get("fps") or 0.0),
         }
 
-    def load_run(self, run_id: str) -> dict:
-        """把指定 run_id 的 JSON 加载到内存（替换当前状态）。"""
-        path = self._runs_path(run_id)
-        if not path.exists():
+    def load_run_events_readonly(self, run_id: str) -> List[dict]:
+        """只读获取历史 run 的事件（不碰 state / 内存 events / 线程 / 广播）。
+
+        反查（facets / query）是纯查询，不能走 ``load_run`` —— 后者末尾会
+        把 ``_state`` 重置为 ``IDLE`` 并广播，导致前端「分析反查」在打开 /
+        关闭一次 modal 后就不可再点。本方法只从 LanceDB 读 events，并复刻
+        ``load_run`` 的 actors 清洗，其余原样返回。
+        """
+        from app.core.video.cache import get_video_cache
+        cache = get_video_cache()
+        entry = cache.get_analysis_by_run_id(run_id) if cache else None
+        if entry is None:
             raise ValueError(f"run not found: {run_id}")
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError(f"corrupt run file: {run_id}")
-        # 先把当前活跃 run（若有）落盘
+        out: List[dict] = []
+        for raw in entry.get("events") or []:
+            if not isinstance(raw, dict):
+                continue
+            ev = dict(raw)
+            s = ev.get("structured")
+            if isinstance(s, dict) and isinstance(s.get("actors"), list):
+                cleaned = _sanitize_actors(s["actors"])
+                if len(cleaned) != len(s["actors"]):
+                    s = dict(s)
+                    s["actors"] = cleaned
+                    ev["structured"] = s
+            out.append(ev)
+        return out
+
+    def load_run(self, run_id: str) -> dict:
+        """把指定 run_id 的分析记录加载到内存（替换当前状态）。"""
+        from app.core.video.cache import get_video_cache
+        cache = get_video_cache()
+        entry = cache.get_analysis_by_run_id(run_id) if cache else None
+        if entry is None:
+            raise ValueError(f"run not found: {run_id}")
+        data = dict(entry.get("payload") or {})
+        data["events"] = entry.get("events") or []
+        data["scene_boundaries"] = entry.get("scene_boundaries") or []
+        # 先把当前活跃 run（若有）落库
         with self._lock:
             prev_state = self._state
         if prev_state != self.STATE_IDLE and self._run_id and self._run_id != run_id:
@@ -1797,6 +2009,15 @@ class VideoFileAnalysisService:
                         fe.structured["actors"] = cleaned
                 self._events.append(fe)
             self._next_event_id = max_id + 1
+        # 恢复场景边界（综述分组依据）—— 不恢复会让综述退化为固定 15 帧切块
+        with self._scenes_lock:
+            self._scene_boundaries.clear()
+            for b in data.get("scene_boundaries") or []:
+                try:
+                    self._scene_boundaries.append(int(b))
+                except (TypeError, ValueError):
+                    pass
+            self._last_scene_hist = None
         # 加载完 → 状态必须是 idle（已脱离任何运行），否则下次 start 会拒
         with self._lock:
             self._state = self.STATE_IDLE
@@ -1805,15 +2026,11 @@ class VideoFileAnalysisService:
         return self.snapshot()
 
     def delete_run(self, run_id: str) -> bool:
-        path = self._runs_path(run_id)
-        if not path.exists():
+        from app.core.video.cache import get_video_cache
+        cache = get_video_cache()
+        if cache is None:
             return False
-        with self._persist_lock:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                return False
-        return True
+        return cache.delete_analysis_by_run_id(run_id) > 0
 
     # ------------------------------------------------------------------ #
     # 内部：reset / teardown / fail
@@ -1829,6 +2046,9 @@ class VideoFileAnalysisService:
             self._summary = ""
             self._summary_ts = 0.0
             self._error = ""
+            self._md5 = ""
+            self._prompt_hash = ""
+            self._from_cache = False
             self._frame_pos = 0
             self._sampled = 0
             self._analyzed = 0
@@ -1838,6 +2058,9 @@ class VideoFileAnalysisService:
             self._height = 0
             self._fps = 0.0
             self._finished_at = 0.0
+        # 每次 run 重置超时计数 + 自动重启防抖（避免跨 run 残留）
+        self._consecutive_timeouts = 0
+        self._auto_restarted = False
         # 清空帧队列 + 重置反压信号，让新 run 的 decode 线程立即可推
         while True:
             try:
@@ -2057,7 +2280,7 @@ class VideoFileAnalysisService:
         #
         # **静默丢弃策略**：仿 VTD ``detector.py:_infer_sync`` 行为——
         # 对 SDK Path 5 兜底返回的 ``str`` 走 ``getattr(str, "text", "")``
-        # 自然拿到空串。VFA 端 ``_split_scene_frame_result`` 检测到
+        # 自然拿到空串。VAS 端 ``_split_scene_frame_result`` 检测到
         # garbage 时返回 ``(None, "")``，本方法构造**空事件 + _dirty=True**：
         #   text="",
         #   structured={"scene":"","actors":[],"action":"","objects":[],
@@ -2582,21 +2805,24 @@ class VideoFileAnalysisService:
     # LLM 调用：LLMSession 来自 registry；session.respond 前后包进程锁
     # ------------------------------------------------------------------ #
     def _on_call_timeout(self) -> None:
-        """每次 _call_llm 触发 60s timeout 时调用。
+        """每次 _call_llm 触发 _INFER_TIMEOUT_SEC 超时时调用。
 
-        连续 ≥2 次 → 触发 ``stop_instance_local(<swcap_video_describe>``)
-        干掉当前承载视频描述推理的 worker 进程 → 35s 内 spawn 新进程 +
-        init LLMSession → 队列里积压的 _call_llm 失败（但 1-2 个 error
-        事件比 5+ 分钟卡死好），之后稳态运行。
+        连续 ≥2 次 → 触发承载 ``swcap_video_describe`` 推理的 worker
+        重启 + **自动重绑回原 NPU**（``restart_and_rebind_instance_local``）
+        → 清掉 wedged 的 C 层，worker 恢复 running 后后续帧继续。
 
-        不再硬编码 ``"qwen3-vl-4b"`` —— 通过 registry 找当前 running
-        的 ``swcap_video_describe`` 实例的 model_id（qwen3-vl-4b 或
-        qwen3.5-vl-4b 都行），按实际加载的模型重启。
+        **防抖** ``_auto_restarted``：单次 run 最多自动重启 1 次 ——
+        重启期间 ~60s 所有帧都会失败，若模型本身持续超时（资源紧张 /
+        模型问题）无限重启会让整个 run 卡死。第 2 次起只 LOG warning，
+        让 run 按正常 error 路径收敛。
 
-        阈值定 ≥2 而非 1：单次 timeout 可能是长 prompt / NPU 短暂忙，
-        不必重启；连续 2 次说明 C 层 rknn3 session 真正 wedged，
-        session_stop() + wait_sec=5 已实测不够，必须靠 worker 重启
-        抹掉 NPU mutex 状态。
+        历史教训：本方法此前调 ``stop_instance_local``（unload → kill -9
+        → 从 registry 移除），但**不** respawn / bind，导致后续
+        ``get_session`` 抛 ``功能未启用``，分析 + 综述全废。
+
+        不再硬编码 ``"qwen3-vl-4b"`` —— 通过 registry 找当前本机 running
+        的 ``swcap_video_describe`` 实例（qwen3-vl-4b 或 qwen3.5-vl-4b
+        都行），按实际加载的模型 + NPU 重启。
         """
         self._consecutive_timeouts += 1
         if self._consecutive_timeouts < 2:
@@ -2605,19 +2831,38 @@ class VideoFileAnalysisService:
             from app.core.compute.registry import get_registry
             registry = get_registry()
             target_model = None
+            target_npu = -1
             for inst in registry.list_with_source():
                 caps = inst.get("capability_types") or []
-                if "swcap_video_describe" in caps and inst.get("status") == "running":
+                src = inst.get("_source") or ""
+                if ("swcap_video_describe" in caps
+                        and inst.get("status") == "running"
+                        and src in ("spawned", "adopted_local")):
                     target_model = inst.get("model_id")
+                    target_npu = inst.get("npu_index")
                     break
-            if not target_model:
-                LOG.warning("vfa: 重启跳过 —— 当前无 running swcap_video_describe 实例")
+            if (not target_model
+                    or not isinstance(target_npu, int)
+                    or target_npu < 0):
+                LOG.warning(
+                    "vfa: 重启跳过 —— 无本机 running swcap_video_describe 实例")
+                self._consecutive_timeouts = 0
+                return
+            if self._auto_restarted:
+                LOG.warning(
+                    "vfa: %d 次连续 _call_llm 超时，但本 run 已自动重启过一次 "
+                    "—— 跳过（避免重启循环）",
+                    self._consecutive_timeouts,
+                )
+                self._consecutive_timeouts = 0
                 return
             LOG.warning(
-                "vfa: %d 次连续 _call_llm 超时，触发 %s worker 重启（清 wedged C 层）",
-                self._consecutive_timeouts, target_model,
+                "vfa: %d 次连续 _call_llm 超时，触发 %s (npu=%d) "
+                "worker 重启 + 重绑（清 wedged C 层）",
+                self._consecutive_timeouts, target_model, target_npu,
             )
-            registry.stop_instance_local(target_model)
+            self._auto_restarted = True
+            registry.restart_and_rebind_instance_local(target_model, target_npu)
         except Exception as ex:
             LOG.error("vfa: worker 重启失败: %s", ex)
         # 重启后新 worker 是 fresh session，counter 清零。
@@ -2635,8 +2880,8 @@ class VideoFileAnalysisService:
         """记录单次 _call_llm 耗时到 200 帧滚动 deque; 60s 窗口 p95 > 4.5s 告警。
 
         设计: 抽样 (而不是每帧) + 周期检查 (而不是 per-frame LOG)。
-        - 200 帧 deque = ~3-4 分钟 (1fps VFA) 滚动, 长窗口更平滑
-        - 60s 节流: 避免 1fps VFA 每帧 1 行 LOG 刷屏
+        - 200 帧 deque = ~3-4 分钟 (1fps VAS) 滚动, 长窗口更平滑
+        - 60s 节流: 避免 1fps VAS 每帧 1 行 LOG 刷屏
         - p95 > 4.5s 阈值 = 接近 _INFER_TIMEOUT_SEC 15s 的一半, 提前预警
           慢路径聚集 (例如: 多人同时跑 / NPU 抢占 / 队列调度), 让运维
           在 timeout 真的开始报错前就能看到
@@ -2695,7 +2940,7 @@ class VideoFileAnalysisService:
         ``BaseModel``（不再是 ``LMOutput``），SDK 拿到完整 JSON Schema，
         schema hint 本身就够强，不再需要手工 prompt 改造。
 
-        **回滚开关** ``VFA_FORCE_JSON_PROMPT=1``：若改动导致填充率反
+        **回滚开关** ``VAS_FORCE_JSON_PROMPT=1``：若改动导致填充率反
         而下降，可设该环境变量恢复旧 prompt 改造（不推荐，仅作为
         紧急回滚口）。
         """
@@ -2756,7 +3001,7 @@ class VideoFileAnalysisService:
         if (
             generating is not None
             and prompt
-            and os.environ.get("VFA_FORCE_JSON_PROMPT") == "1"
+            and os.environ.get("VAS_FORCE_JSON_PROMPT") == "1"
         ):
             prompt = (
                 "**只输出一个 JSON 对象**，必须包含以下字段：\n"
@@ -2953,7 +3198,7 @@ def _interrupt_rknn_session(sess, *, wait_sec: float = 2.0) -> None:
     这里主动 session_stop() 让 C 层几百 ms 内主动退出，session 进入
     可用态。LLMSession + VLM/Text/TTS backend 都有 ``_backend.rknn_llm``
     句柄可调 session_stop()；TTS backend 略有不同（``_backend.talker``）
-    —— 当前 VFA 路径只用 VLM/text backend，这一处覆盖足够。
+    —— 当前 VAS 路径只用 VLM/text backend，这一处覆盖足够。
 
     **v0.10 新增 wait_sec**：session_stop() 是 async signal（不是
     force-kill），C 层只在 kernel 边界检查 stop 标志。RK3588 qwen3-vl-4b
@@ -2988,13 +3233,13 @@ def _interrupt_rknn_session(sess, *, wait_sec: float = 2.0) -> None:
 # --------------------------------------------------------------------------- #
 # Singleton
 # --------------------------------------------------------------------------- #
-_service: Optional[VideoFileAnalysisService] = None
+_service: Optional[VideoAnalysisSearchService] = None
 _service_lock = threading.Lock()
 
 
-def get_service() -> VideoFileAnalysisService:
+def get_service() -> VideoAnalysisSearchService:
     global _service
     with _service_lock:
         if _service is None:
-            _service = VideoFileAnalysisService()
+            _service = VideoAnalysisSearchService()
         return _service

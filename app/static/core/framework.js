@@ -32,6 +32,10 @@
     _keptPages: new Set(),
     _activeApp: null,
     _loadedApps: new Set(),   // pages whose app.js has been loaded
+    _wizardMounted: new Set(),// pages whose wizard is currently mounted。
+                              // 与 _loadedApps 解耦：unmount 只清本标记，
+                              // 卡片 JS 不再重跑 → 事件监听器不累积 / 模块
+                              // 状态不丢（修复 confirm 重复 + 进度条切页复活）
     _loading: {},             // promise per page to dedupe lazy-loads
 
     register(pageId, handlers) {
@@ -183,12 +187,32 @@
       document.querySelectorAll(".nav-item").forEach((n) => {
         n.classList.toggle("active", n.dataset.page === page);
       });
-      if (this.isCardPage(page) && !DemoGuard._loadedApps.has(page)) {
-        this._loadCardJS(page);
+      if (this.isCardPage(page)) {
+        if (!DemoGuard._loadedApps.has(page)) {
+          this._loadCardJS(page);
+        } else if (!DemoGuard._wizardMounted.has(page)
+                   && window.WizardRegistry?.tryMount) {
+          // 卡片 JS 已加载但向导未挂载（用户切走触发了 unmount）→ 只重挂
+          // 向导，**不**重新注入 <script>：否则卡片 IIFE 重跑，复用的 DOM
+          // 上事件监听器累积、模块状态归零（用户实测：清空缓存 confirm
+          // 重复 / 进度条切页复活 / 反查按钮闪烁）。
+          const m = (window.__APP_MANIFESTS__?.cards || [])
+            .find((x) => x.id === page);
+          if (m) {
+            window.WizardRegistry.tryMount(m);
+            DemoGuard._wizardMounted.add(page);
+          }
+        }
       }
       if (DemoGuard._isDemoPage(page)) {
         DemoGuard._refreshActive();
       }
+      // 切换页面后把共享滚动容器复位到顶部（.content 是 overflow-y:auto
+      // 的滚动区；hash 导航不会自动复位，切到长页面时会停在上一页的
+      // 滚动位置）。
+      const scroller = document.querySelector("main.content");
+      if (scroller) scroller.scrollTop = 0;
+      window.scrollTo(0, 0);
     },
 
     async _loadCardJS(page) {
@@ -217,6 +241,7 @@
         // 不维护"已注册 wizard 应用"清单,完全 manifest 字段驱动。
         if (window.WizardRegistry?.tryMount) {
           window.WizardRegistry.tryMount(m);
+          DemoGuard._wizardMounted.add(page);
         }
       } catch (e) {
         console.error("[router] failed to load card JS:", e);
@@ -226,14 +251,15 @@
     },
   };
 
-  // 向导模式卸载时清掉 _loadedApps 条目 — 否则下次再点同一应用卡片时,
-  // ROUTER 看到 _loadedApps.has(page) 为 true 直接跳过 _loadCardJS,
-  // wizard 永远不会再挂载。wizard.js 在 unmount() 时 dispatch 此事件。
+  // 向导卸载时只清 _wizardMounted 标记，**不**动 _loadedApps —— 否则
+  // ROUTER 认为卡片未加载、重新注入 <script>（IIFE 重跑 → 监听器在复用
+  // DOM 上累积、模块状态归零）。下次切回该页时 showPage 看到
+  // _loadedApps.has && !_wizardMounted.has 会只调 tryMount 重挂向导
+  // （"跳过向导后再进入会重弹"的语义保持不变）。wizard.js 在 unmount()
+  // 时 dispatch 此事件。
   window.addEventListener("wizard:unmounted", (e) => {
     const appId = e?.detail?.appId;
-    if (appId && DemoGuard._loadedApps?.has?.(appId)) {
-      DemoGuard._loadedApps.delete(appId);
-    }
+    if (appId) DemoGuard._wizardMounted.delete(appId);
   });
 
   window.ROUTER = ROUTER;
@@ -456,7 +482,7 @@
   // video_detection / video_target_detection / video_target_localization
   // 的 ``session.state`` ∈ {opening, playing, paused, eof};
   // text_chat / tts 的 ``session.state`` ∈ {loading, running};
-  // video_file_analysis / audio_analysis / video_content_search
+  // video_analysis_search / audio_analysis / video_search
   // 的 ``service.state`` / ``vcs.state`` 同样会在跑时落入这套值。
   // 加上 ``running`` / ``loading`` 兼容 video-detection 的 audio 子状态。
   const _ACTIVE_STATE_STRINGS = new Set([

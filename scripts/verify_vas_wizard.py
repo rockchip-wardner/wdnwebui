@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证 视频文件分析 wizard mount + stepForward + applyWizardSnapshot。
+"""验证 视频分析检索 wizard mount + stepForward + applyWizardSnapshot。
 
 不依赖真模型启动(直接 mount wizard,绕过 env)。
 """
@@ -12,7 +12,7 @@ def main():
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
-        page.goto("http://127.0.0.1:8000/#video-file-analysis", wait_until="domcontentloaded", timeout=15000)
+        page.goto("http://127.0.0.1:8000/#video-analysis-search", wait_until="domcontentloaded", timeout=15000)
         page.wait_for_selector(".wd-wizard-section", timeout=8000)
         page.wait_for_timeout(500)
 
@@ -22,11 +22,11 @@ def main():
             sections: document.querySelectorAll('.wd-wizard-section').length,
             dots: document.querySelectorAll('.wd-wizard-step-dot').length,
             title: document.querySelector('.wd-wizard-title')?.textContent,
-            ImApp: typeof window.ImApp_video_file_analysis?.applyWizardSnapshot,
+            ImApp: typeof window.ImApp_video_analysis_search?.applyWizardSnapshot,
         })""")
         print(f"=== 1) wizard mount ===")
         print(f"  {basic}")
-        if basic['sections'] == 1 and basic['dots'] == 5 and basic['ImApp'] == 'function':
+        if basic['sections'] == 1 and basic['dots'] == 7 and basic['ImApp'] == 'function':
             print(f"  ✅ wizard mount OK")
             ok += 1
         else:
@@ -37,7 +37,7 @@ def main():
         page.wait_for_timeout(400)
         s2 = page.evaluate("""() => ({
             stepTitle: document.querySelector('.wd-wizard-step-title')?.textContent,
-            hasSourceInput: !!document.querySelector('[data-field-id="vfa-source"]'),
+            hasSourceInput: !!document.querySelector('[data-field-id="vcs-source"]'),
             hasBrowseBtn: !!document.querySelector('.wd-wizard-browse-btn'),
             stepDotsCount: document.querySelectorAll('.wd-wizard-step-dot').length,
         })""")
@@ -49,12 +49,12 @@ def main():
         else:
             print(f"  ❌ FAIL")
 
-        # 测试 3:跳到 prompt + sample 步骤
+        # 测试 3:prompt 步骤
         page.evaluate("window.WizardState.stepForward()")
         page.wait_for_timeout(300)
         s3a = page.evaluate("""() => ({
             stepTitle: document.querySelector('.wd-wizard-step-title')?.textContent,
-            hasPromptTextarea: !!document.querySelector('[data-field-id="vfa-prompt"]'),
+            hasPromptTextarea: !!document.querySelector('[data-field-id="vas-prompt"]'),
         })""")
         print(f"\n=== 3) prompt step ===")
         print(f"  {s3a}")
@@ -64,11 +64,12 @@ def main():
         else:
             print(f"  ❌ FAIL")
 
+        # 测试 4:sample 步骤
         page.evaluate("window.WizardState.stepForward()")
         page.wait_for_timeout(300)
         s3b = page.evaluate("""() => ({
             stepTitle: document.querySelector('.wd-wizard-step-title')?.textContent,
-            hasEveryNInput: !!document.querySelector('[data-field-id="vfa-every-n"]'),
+            hasEveryNInput: !!document.querySelector('[data-field-id="vas-every-n"]'),
         })""")
         print(f"\n=== 4) sample step ===")
         print(f"  {s3b}")
@@ -78,7 +79,38 @@ def main():
         else:
             print(f"  ❌ FAIL")
 
-        # 测试 5:finish 步骤
+        # 测试 5:search 步骤(检索问题)
+        page.evaluate("window.WizardState.stepForward()")
+        page.wait_for_timeout(300)
+        s3c = page.evaluate("""() => ({
+            stepTitle: document.querySelector('.wd-wizard-step-title')?.textContent,
+            hasSearchTextarea: !!document.querySelector('[data-field-id="vcs-text"]'),
+        })""")
+        print(f"\n=== 5) search step ===")
+        print(f"  {s3c}")
+        if s3c['hasSearchTextarea'] and s3c['stepTitle'] == '检索问题':
+            print(f"  ✅ search 步骤 OK")
+            ok += 1
+        else:
+            print(f"  ❌ FAIL")
+
+        # 测试 6:chunk 步骤(切片参数)
+        page.evaluate("window.WizardState.stepForward()")
+        page.wait_for_timeout(300)
+        s3d = page.evaluate("""() => ({
+            stepTitle: document.querySelector('.wd-wizard-step-title')?.textContent,
+            hasChunkSelect: !!document.querySelector('[data-field-id="vcs-chunk-seconds"]'),
+            hasOverlapSelect: !!document.querySelector('[data-field-id="vcs-chunk-overlap"]'),
+        })""")
+        print(f"\n=== 6) chunk step ===")
+        print(f"  {s3d}")
+        if s3d['hasChunkSelect'] and s3d['hasOverlapSelect'] and s3d['stepTitle'] == '切片参数':
+            print(f"  ✅ chunk 步骤 OK")
+            ok += 1
+        else:
+            print(f"  ❌ FAIL")
+
+        # 测试 7:finish 步骤
         page.evaluate("window.WizardState.stepForward()")
         page.wait_for_timeout(300)
         s4 = page.evaluate("""() => ({
@@ -86,7 +118,7 @@ def main():
             hasFinishBtn: !!document.getElementById('wd-wizard-finish-btn'),
             hasFinishErrorHidden: !!document.getElementById('wd-wizard-finish-error'),
         })""")
-        print(f"\n=== 5) finish step ===")
+        print(f"\n=== 7) finish step ===")
         print(f"  {s4}")
         if s4['hasFinishBtn'] and s4['stepTitle'] == '完成配置':
             print(f"  ✅ finish 步骤 OK")
@@ -94,26 +126,26 @@ def main():
         else:
             print(f"  ❌ FAIL")
 
-        # 测试 6:applyWizardSnapshot(opts) 写值但不点 start(因为缺字段会走 fast-return)
+        # 测试 7:applyWizardSnapshot(opts) 写值但不点 start(因为缺字段会走 fast-return)
         page.evaluate("""(async () => {
                 // 模拟 wizard finish 走 applyWizardSnapshot
                 try { window.WizardState.unmount(); } catch(_) {}
                 const cards = window.__APP_MANIFESTS__?.cards || [];
-                const manifest = cards.find(c => c.id === 'video-file-analysis');
-                await window.WizardState.mount(manifest, {steps:[{kind:'env_check'},{kind:'form',fields:[{id:'vfa-source'}]},{kind:'finish'}]});
+                const manifest = cards.find(c => c.id === 'video-analysis-search');
+                await window.WizardState.mount(manifest, {steps:[{kind:'env_check'},{kind:'form',fields:[{id:'vcs-source'}]},{kind:'finish'}]});
             })()
         """)
         page.wait_for_timeout(800)
         result = page.evaluate("""(async () => {
             // 等页面 DOM 就绪
             await new Promise(r => setTimeout(r, 300));
-            const r = await window.ImApp_video_file_analysis.applyWizardSnapshot({source: '/tmp/test.mp4'});
-            const sourceVal = document.getElementById('vfa-source')?.value;
-            const promptVal = document.getElementById('vfa-prompt')?.value;
-            const everyNVal = document.getElementById('vfa-every-n')?.value;
+            const r = await window.ImApp_video_analysis_search.applyWizardSnapshot({source: '/tmp/test.mp4'});
+            const sourceVal = document.getElementById('vcs-source')?.value;
+            const promptVal = document.getElementById('vas-prompt')?.value;
+            const everyNVal = document.getElementById('vas-every-n')?.value;
             return {result: r, sourceVal, promptVal, everyNVal};
         })""")
-        print(f"\n=== 6) applyWizardSnapshot (仅 source) ===")
+        print(f"\n=== 8) applyWizardSnapshot (仅 source) ===")
         print(f"  {result}")
         # source_set 应为 true,started 应为 false(缺 prompt + everyN)
         if result['result']['source_set'] and not result['result']['started'] and result['sourceVal'] == '/tmp/test.mp4':
@@ -123,8 +155,8 @@ def main():
             print(f"  ❌ FAIL")
 
         browser.close()
-        print(f"\n=== 总结: {ok}/6 ===")
-        if ok == 6:
+        print(f"\n=== 总结: {ok}/8 ===")
+        if ok == 8:
             print("✅ 全部通过")
             return 0
         return 1

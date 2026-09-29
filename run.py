@@ -582,7 +582,7 @@ def main() -> None:
     else:
         config_path = config_path.resolve()
 
-    # Propagate to the app via env so app.services.config picks it up
+    # Propagate to the app via env so app.core.config picks it up
     # before any FastAPI route is hit.
     os.environ["WDNWEBUI_CONFIG"] = str(config_path)
 
@@ -593,7 +593,7 @@ def main() -> None:
     # v0.6: no daemon bootstrap — ComputeRegistry's Hub uses FastDDS
     # SIMPLE discovery (multicast 239.255.0.1:7400).
 
-    # VCS extract over a long source runs 50-75s; uvicorn's default 20s WS
+    # VAS_SEARCH extract over a long source runs 50-75s; uvicorn's default 20s WS
     # ping often times the connection out mid-extract so the progress bar
     # only resyncs on reconnect (visible as a single 0% → 100% jump).
     uvicorn.run(

@@ -556,17 +556,6 @@ const TextChat = {
   },
 };
 
-/* ------------------------------------------------------------------ *
- *  video-content-search page（视频内容检索）                            *
- *                                                                    *
- *  后端本期为 mock（app/services/video_content_search.py）：extract   *
- *  只推进度、query 返回固定命中；后续按 vl_rag_demo 换真实实现时，    *
- *  本模块的归一化层（normalizeHits）和播放器帧源接口保持接缝。        *
- *                                                                    *
- *  协议字段对齐 demo 语义：hits = {video_path, start_time, end_time,  *
- *  chunk_idx, similarity}；query 参数 = {text, sim_threshold, top_k}。*
- * ------------------------------------------------------------------ */
-
 TextChat.init();
 
 // ------------------------------------------------------------------ *

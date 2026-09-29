@@ -11,7 +11,7 @@
 from playwright.sync_api import sync_playwright
 import sys, time
 
-APPS = ["text-chat", "tts", "video-detection", "video-file-analysis", "video-target-detection", "video-target-localization"]
+APPS = ["text-chat", "tts", "video-detection", "video-analysis-search", "video-target-detection", "video-target-localization"]
 
 def main():
     with sync_playwright() as p:

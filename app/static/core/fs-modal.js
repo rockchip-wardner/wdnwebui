@@ -227,17 +227,27 @@
       }
     },
 
+    // 把选中路径写回目标输入框，并补发标准 input/change 事件 —— 浏览
+    // 选文件/目录也是「值变更」，不应绕过监听这两个事件的卡片逻辑
+    // （如视频分析检索页的「路径 ↔ 历史选中」互斥）。
+    _commit(el, p) {
+      if (!el) return;
+      el.value = p;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    },
+
     pickCurrentDir() {
       const btn = document.getElementById("fs-modal-pick-dir");
       const p = btn && btn.dataset.path;
       if (!p) return;
-      if (this._sourceTarget) this._sourceTarget.value = p;
+      this._commit(this._sourceTarget, p);
       this.close();
     },
 
     pickSelectedFile() {
       if (!this.selected) return;
-      if (this._sourceTarget) this._sourceTarget.value = this.selected.path;
+      this._commit(this._sourceTarget, this.selected.path);
       this.close();
     },
   };

@@ -1392,8 +1392,10 @@ async function loadPageData(name) {
     return;
   }
 
-  if (name === "video-file-analysis") {
-    VFA.init();
+  if (name === "video-analysis-search") {
+    if (window.VAS && typeof window.VAS.refresh === "function") {
+      window.VAS.refresh();
+    }
     return;
   }
 
@@ -1419,11 +1421,7 @@ async function loadPageData(name) {
     return;
   }
 
-  if (name === "video-content-search") {
-    VCS.init();
-    if (!VCS.ws && !VCS.wsTimer) connectVcsWs();
-    return;
-  }
+
 
   if (name === "compute-config") {
     ComputeConfigPage.init();

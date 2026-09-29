@@ -1,9 +1,9 @@
-"""视频内容检索：REST + WebSocket。
+"""视频内容检索路由（video_analysis_search 卡片的检索侧）。
 
-后端功能本期为 mock（见 :mod:`app.services.video_content_search`），
-前端先用这套契约跑通完整交互；后续按 vl_rag_demo 实现真实后端时
-只替换 service 内部实现，字段名（``chunk_seconds`` / ``sim_threshold``
-/ ``top_k`` / ``start_time`` 等）保持不变。
+由卡片 ``__init__.py`` 挂载到 ``/api/video-analysis-search/search/*``。
+业务逻辑在 ``app.core.video.search``（遵守卡片零跨卡片 import 规则）。
+字段名（``chunk_seconds`` / ``sim_threshold`` / ``top_k`` / ``start_time``
+等）与前端契约保持不变。
 """
 from __future__ import annotations
 
@@ -16,11 +16,11 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
-from app.apps.video_content_search.service import get_service
+from app.core.video.search import get_service
 
 
 LOG = logging.getLogger(__name__)
-router = APIRouter(tags=["video-content-search"])
+router = APIRouter(tags=["video-analysis-search"])
 
 
 @router.get("/")
@@ -146,7 +146,7 @@ async def query_multi(payload: dict) -> dict:
     if not clean:
         raise HTTPException(status_code=400, detail="entries 里的 md5 均为空")
 
-    from app.apps.video_content_search.service import _score_hits
+    from app.core.video.search import _score_hits
     try:
         # 未启用模型 → RuntimeError → 502（与单视频 query 端点同语义）。
         session = get_service()._ensure_session()
@@ -241,13 +241,16 @@ async def query_multi(payload: dict) -> dict:
 async def clear_cache() -> dict:
     """一键删除 LanceDB 里全部已缓存的视频分析结果。
 
-    幂等：缓存不可用 / 空表都返回 200（videos_cleared=0）。内存中的
-    当前索引不受影响（缓存是持久备份层，页面状态与本次会话延续）。
+    幂等：缓存不可用 / 空表都返回 200（videos_cleared=0）。同时作废
+    当前会话的内存索引（``get_service().reset_session()``）—— 持久缓存
+    已删，会话索引若继续存在，前端 ``start_extract`` 会走 ``state=ready``
+    短路跳过重新提取（表现为"进度条直接满格 + 历史无新条目"）。
     """
     from app.core.video.cache import get_video_cache
     c = get_video_cache()
     cleared = c.clear() if c is not None else 0
-    LOG.info("vcs API: POST /cache/clear → %d entries", cleared)
+    get_service().reset_session()
+    LOG.info("vcs API: POST /cache/clear → %d entries (session reset)", cleared)
     return {"ok": True, "videos_cleared": cleared}
 
 
@@ -385,7 +388,7 @@ async def vcs_play_ws(ws: WebSocket) -> None:
     经 ``loop.call_soon_threadsafe`` 投递到 asyncio 队列；WS 循环 drain。
     断开连接即停线程。暂停用 threading.Event 阻塞取帧循环。
     """
-    from app.apps.video_content_search.service import iter_segment_jpeg
+    from app.core.video.search import iter_segment_jpeg
 
     await ws.accept()
     loop = asyncio.get_event_loop()
@@ -394,6 +397,8 @@ async def vcs_play_ws(ws: WebSocket) -> None:
     pause_event.set()   # 初始 = 未暂停；pause 时 clear()，resume 时 set()
     stop_event = threading.Event()
     thread: Optional[threading.Thread] = None
+    get_task: Optional[asyncio.Future] = None
+    recv_task: Optional[asyncio.Future] = None
 
     def _push_bytes(data: bytes) -> None:
         try:
@@ -409,10 +414,10 @@ async def vcs_play_ws(ws: WebSocket) -> None:
 
     def _reader(source: str, start: float, end: float) -> None:
         try:
-            for jpeg in iter_segment_jpeg(source, start, end, paced=True):
+            for jpeg in iter_segment_jpeg(source, start, end, paced=True,
+                                          pause_event=pause_event):
                 if stop_event.is_set():
                     return
-                pause_event.wait()
                 _push_bytes(jpeg)
             _push_json({"type": "eof"})
         except BaseException as e:
@@ -443,35 +448,50 @@ async def vcs_play_ws(ws: WebSocket) -> None:
         )
         thread.start()
 
+        # 帧队列 + 客户端控制消息**并发**等待：有帧立即发（不等控制，
+        # 保持满帧率）；无帧时（暂停中）也能立刻响应 resume。
+        # 旧实现"发帧后串行等控制"会在每帧叠加超时（帧率被拖慢），
+        # 且超时 continue 会跳过收控制（暂停后收不到 resume）。
+        recv_task = asyncio.ensure_future(ws.receive_json())
         while True:
-            try:
-                item = await asyncio.wait_for(main_q.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-            if isinstance(item, tuple):
-                await ws.send_json(item[1])
-                if item[1].get("type") in ("eof", "error"):
-                    break
-            else:
-                await ws.send_bytes(item)
+            get_task = asyncio.ensure_future(main_q.get())
+            done, _pending = await asyncio.wait(
+                {get_task, recv_task},
+                timeout=1.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if get_task in done:
+                item = get_task.result()
+                if isinstance(item, tuple):
+                    await ws.send_json(item[1])
+                    if item[1].get("type") in ("eof", "error"):
+                        break
+                else:
+                    await ws.send_bytes(item)
+            elif not get_task.done():
+                get_task.cancel()
 
-            # 非阻塞收客户端控制（暂停 / 恢复）
-            try:
-                ctl = await asyncio.wait_for(ws.receive_json(), timeout=0.01)
-                action = ctl.get("action")
+            if recv_task in done:
+                try:
+                    ctl = recv_task.result()
+                except Exception:
+                    break                    # 客户端断开
+                action = (ctl or {}).get("action")
                 if action == "pause":
-                    pause_event.clear()      # 阻塞 reader
+                    pause_event.clear()      # 阻塞 reader（生成器内 wait）
                 elif action == "resume":
-                    pause_event.set()        # 放行 reader
-            except asyncio.TimeoutError:
-                pass
-            except Exception:
-                break
+                    pause_event.set()        # 放行 reader + 重置时钟基准
+                recv_task = asyncio.ensure_future(ws.receive_json())
     except WebSocketDisconnect:
         return
     finally:
+        for _t in (get_task, recv_task):
+            if _t is not None and not _t.done():
+                _t.cancel()
+        # 先放行可能阻塞在 pause_event.wait() 的 reader（clear 会让它永久
+        # 等待），再置 stop_event 让它尽快退出循环。
+        pause_event.set()
         stop_event.set()
-        pause_event.clear()
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
 
@@ -533,7 +553,35 @@ def _seek_frame_jpeg(source: str, t: float) -> Optional[bytes]:
                 )
                 return bytes(buf) if ok else None
     except Exception as e:  # pragma: no cover - defensive
-        LOG.debug("vcs: 取帧 %s t=%s 失败: %s", source, t, e)
+        LOG.debug("vas-search: 取帧 %s t=%s 失败: %s", source, t, e)
     finally:
         container.close()
     return None
+
+
+@router.get("/history")
+async def list_unified_history() -> dict:
+    """统一历史记录（检索缓存 + 分析历史，按视频 md5 聚合）。
+
+    前端「视频分析检索」页的历史列表数据源 —— 一个视频一行，行内
+    ``retrieval`` 是该视频的检索索引档位列表、``analysis`` 是其分析
+    记录列表（含 run_id，供加载 / 反查 / 删除）。按 ``updated_at``
+    倒序；``frame_enabled`` 按源文件是否仍在本机判定（决定能否取帧 /
+    播放）。
+    """
+    from app.core.video.cache import get_video_cache
+    c = get_video_cache()
+    if c is None:
+        return {"enabled": False, "items": []}
+    c.checkout_latest()
+    items = c.list_history_grouped(channel="web")
+    for it in items:
+        sp = it.get("source_path") or ""
+        it["frame_enabled"] = bool(sp and os.path.isfile(sp))
+    return {"enabled": True, "items": items}
+
+
+@router.post("/query/clear")
+async def clear_query() -> dict:
+    """清空最近一次检索结果（query / hits），前端"清空"按钮调用。"""
+    return get_service().clear_query()

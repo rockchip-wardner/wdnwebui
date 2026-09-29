@@ -1,4 +1,4 @@
-"""Smoke test: VFA infer duration telemetry (方案 E, v0.15).
+"""Smoke test: VAS infer duration telemetry (方案 E, v0.15).
 
 验证 _record_infer_duration 方法:
 - 60s 窗口节流 (重复调用 < 60s 不重算)
@@ -6,11 +6,11 @@
 - p95 > 4.5s 触发 WARNING
 - p95 <= 4.5s 不 emit
 - deque 上限生效 (maxlen=200)
-- 与 VFA 其余功能解耦 (只 import _record_infer_duration, 不触发 _call_llm)
+- 与 VAS 其余功能解耦 (只 import _record_infer_duration, 不触发 _call_llm)
 
 Run from repo root:
     source .venv/bin/activate
-    python scripts/verify_vfa_infer_telemetry.py
+    python scripts/verify_vas_infer_telemetry.py
 """
 
 from __future__ import annotations
@@ -25,11 +25,11 @@ from collections import deque
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app", "services"))
 
 # 仅 import 模块常量 + 测试方法 (避免触发 _call_llm / wdnai / compute_registry)
-from video_file_analysis import (  # noqa: E402
+from app.apps.video_analysis_search.service import (  # noqa: E402
     _INFER_TELEMETRY_WINDOW_SEC,
     _INFER_TELEMETRY_P95_WARN_SEC,
     _INFER_TELEMETRY_MAXLEN,
-    VideoFileAnalysisService,
+    VideoAnalysisSearchService,
 )
 
 
@@ -52,10 +52,10 @@ def _make_svc():
     """构造一个最小可用 service (不触发 _call_llm / wdnai)。
 
     不通过 _service 单例 / get_service() (会触发全栈 init), 直接
-    VideoFileAnalysisService.__new__ 绕过 __init__ 然后手动塞
+    VideoAnalysisSearchService.__new__ 绕过 __init__ 然后手动塞
     telemetry 字段. 用于 telemetry 单测.
     """
-    svc = VideoFileAnalysisService.__new__(VideoFileAnalysisService)
+    svc = VideoAnalysisSearchService.__new__(VideoAnalysisSearchService)
     svc._infer_durations = deque(maxlen=_INFER_TELEMETRY_MAXLEN)
     svc._last_telemetry_check_ts = 0.0
     return svc
@@ -79,7 +79,7 @@ def test_p95_calculation_under_threshold():
     log_stream = io.StringIO()
     handler = logging.StreamHandler(log_stream)
     handler.setLevel(logging.WARNING)
-    log = logging.getLogger("vfa_service")
+    log = logging.getLogger("vsa_service")
     log.addHandler(handler)
     try:
         svc = _make_svc()
@@ -100,7 +100,7 @@ def test_p95_calculation_over_threshold():
     log_stream = io.StringIO()
     handler = logging.StreamHandler(log_stream)
     handler.setLevel(logging.WARNING)
-    log = logging.getLogger("vfa_service")
+    log = logging.getLogger("vsa_service")
     log.addHandler(handler)
     try:
         svc = _make_svc()
@@ -130,7 +130,7 @@ def test_p50_p95_p99_exact_values():
     log_stream = io.StringIO()
     handler = logging.StreamHandler(log_stream)
     handler.setLevel(logging.WARNING)
-    log = logging.getLogger("vfa_service")
+    log = logging.getLogger("vsa_service")
     log.addHandler(handler)
     try:
         svc = _make_svc()
@@ -199,7 +199,7 @@ def test_skip_check_when_too_few_samples():
     log_stream = io.StringIO()
     handler = logging.StreamHandler(log_stream)
     handler.setLevel(logging.WARNING)
-    log = logging.getLogger("vfa_service")
+    log = logging.getLogger("vsa_service")
     log.addHandler(handler)
     try:
         svc = _make_svc()
@@ -219,10 +219,10 @@ def test_defensive_compat_with_old_instance():
 
     这是 v0.15 修的"运行中服务不需 restart"合约的核心: 单例被创建时
     没 _infer_durations 字段, 但 _call_llm 仍能正常调 telemetry 方法
-    (仅 telemetry 不可用, 不影响 VFA 主流程)。
+    (仅 telemetry 不可用, 不影响 VAS 主流程)。
     """
-    from video_file_analysis import VideoFileAnalysisService
-    svc = VideoFileAnalysisService.__new__(VideoFileAnalysisService)
+    from app.apps.video_analysis_search.service import VideoAnalysisSearchService
+    svc = VideoAnalysisSearchService.__new__(VideoAnalysisSearchService)
     # 不调 __init__, 模拟 v0.15 之前启动的旧 instance: 没 _infer_durations
     assert not hasattr(svc, "_infer_durations")
     assert not hasattr(svc, "_last_telemetry_check_ts")

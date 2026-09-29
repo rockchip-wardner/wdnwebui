@@ -12,7 +12,7 @@ The cshim wraps each request/reply in a ``{wdndds_reply_suffix,
 data}`` envelope so the client can match replies to in-flight calls.
 
 The proxy preserves the LLMSession surface that detector / tts /
-text_chat / vfa / video_content_search use:
+text_chat / vfa / video_search use:
 
   * ``session.reset()``              → ``RpcClient.call({"action": "reset"})``
   * ``await session.respond(...)``   → ``RpcClient.call({"action": "infer", ...})``
@@ -41,7 +41,7 @@ LOG = logging.getLogger("rpc_session_proxy")
 # ``np.fromfile().reshape()`` 还原 byte-exact。
 #
 # 为什么走 /dev/shm path-list 而不是 base64 inline（参考
-# ``video_content_search._write_frames_to_shm`` 的相同写法）：
+# ``video_search._write_frames_to_shm`` 的相同写法）：
 #   1. **无损**：480×640 单帧 max 像素差从 JPEG q=85 的 96/255 → 0。
 #      VLM 4B 类模型对像素抖动敏感，JPEG 块状 artifact 在 1080p + 768
 #      variant 上会让模型误判 / 输出退化（用户实测报"泰文 / 乱码"）。
@@ -497,7 +497,7 @@ class _RpcSessionProxy:
         Returns the (mutated) ``data`` dict for chaining. If no path
         is present, returns ``data`` unchanged.
 
-        v0.14 加 ``text_path`` 处理 (VFA SceneFrame Path 5 兜底截断):
+        v0.14 加 ``text_path`` 处理 (VAS SceneFrame Path 5 兜底截断):
         当 SDK extract_json 失败返 SceneFrame(text=<raw_text>) 时,
         整段模型原始输出 (5 字段 SceneFrame JSON, ~200-600 字节)
         原本会被 FastCDR 在 ComputeReply.text 255 字节处静默截断。
@@ -506,7 +506,7 @@ class _RpcSessionProxy:
         读回 SHM 内容填 ``data["text"]``, 与 ``crop_path`` /
         ``result_data_path`` / ``structured_path`` 三路同源同款 (都用
         ``_write_reply_payload_to_shm`` 写、``os.unlink`` 回收,
-        FileNotFoundError 走 warning + None fallback)。VFA
+        FileNotFoundError 走 warning + None fallback)。VAS
         ``_split_scene_frame_result`` Path 2 拿到完整 ``_raw["text"]`` 后
         regex 抽 JSON 走智能归一化兜底 (regex 在 truncation 文本上失败,
         但在 SHM 读回的完整文本上能拿到 scene/actors/action/objects/text)。
@@ -521,7 +521,7 @@ class _RpcSessionProxy:
                 LOG.warning(
                     "rpc-proxy[%s]: text_path %s missing (worker may "
                     "have crashed between write and reply) — falling "
-                    "back to None, VFA Path 2 will see empty _raw.text",
+                    "back to None, VAS Path 2 will see empty _raw.text",
                     self._model_id, text_path,
                 )
             except (OSError, UnicodeDecodeError) as e:
@@ -594,7 +594,7 @@ class _RpcSessionProxy:
             data.pop("result_data_path", None)
 
         # Same path-list pattern for SceneFrame's ``structured`` payload
-        # (VFA's `_split_scene_frame_result` reads `_raw["structured"]`
+        # (VAS's `_split_scene_frame_result` reads `_raw["structured"]`
         # in Path 2). Worker routes through /dev/shm when JSON > 100 B.
         structured_path = data.get("structured_path")
         if isinstance(structured_path, str) and structured_path:
@@ -608,7 +608,7 @@ class _RpcSessionProxy:
             except FileNotFoundError:
                 LOG.warning(
                     "rpc-proxy[%s]: structured_path %s missing — "
-                    "VFA Path 2 will see empty _raw.structured",
+                    "VAS Path 2 will see empty _raw.structured",
                     self._model_id, structured_path,
                 )
             except (OSError, ValueError) as e:
@@ -1033,7 +1033,7 @@ class _RpcSessionProxy:
         if isinstance(_image_size, int) and not isinstance(_image_size, bool):
             payload["image_size"] = _image_size
 # infer 路径走 ``_call_resilient``：
-        # wire RPC 超时:infer 走 15s —— 与 video_file_analysis
+        # wire RPC 超时:infer 走 15s —— 与 video_analysis_search
         # ._INFER_TIMEOUT_SEC 对齐 (方案B)。Qwen3.5-VL-4B 在
         # schema-constrained 模式有 ~46% 概率复述 SDK 注入的 schema
         # definition (schema-echo, 详见 commit 5c33fb3), 稳态 5.5-6s,
@@ -1041,7 +1041,7 @@ class _RpcSessionProxy:
         # 5s → 后改 10s → 这次 15s 给 5s 余量。兜底: _on_call_timeout
         # ≥2 次连续 timeout → worker restart。其他 wire RPC (info /
         # reset / chat_stop) 保持 5s 不变。不重试不延后,立即 raise 让上层
-        # (detector / VFA / chat) 走错误处理路径,而不是花 720s 等 worker。
+        # (detector / VAS / chat) 走错误处理路径,而不是花 720s 等 worker。
         reply = self._call_resilient(payload, timeout_ms=15_000,
                                      soft_retries=0, hard_retries=0)
         if not reply.get("ok"):
@@ -1068,7 +1068,7 @@ class _RpcSessionProxy:
         # 写到 /dev/shm 并把 path + size 走 wire 顶替内联 base64 / 大 JSON，
         # 避免 ComputeReply 单 string 字段 255 字节上限触发 FastCDR 截断。
         # 这里把 ``crop_path`` / ``result_data_path`` 还原成原来的内联形式，
-        # 后续 detector / VFA 代码看到的还是 ``crop_b64`` / ``result_data``。
+        # 后续 detector / VAS 代码看到的还是 ``crop_b64`` / ``result_data``。
         data = self._decode_reply_shm(data)
         # 诊断：worker 已经把 reply 发回主进程，记录 data 的 keys / 体积
         # 区分 "worker 算出但 reply 格式坏" vs "正常 reply"
@@ -1248,7 +1248,7 @@ class _RpcSessionProxy:
         )
 
     # ---- Embedding surface (Qwen3-VL-Embedding-2B only) -------------------
-    # ``video_content_search`` service calls session.embed_text / embed_video.
+    # ``video_search`` service calls session.embed_text / embed_video.
     # Unlike ``respond`` (which is async), these are sync wdnai APIs, so we
     # call the proxy's sync path directly via the executor. The cshim RPC
     # worker side picks them up via the new ``embed_text`` / ``embed_video``
@@ -1306,7 +1306,7 @@ class _RpcSessionProxy:
             )
         else:
             # Legacy fallback: keep the old base64 path working for
-            # any other caller that bypasses the VCS service.
+            # any other caller that bypasses the VAS_SEARCH service.
             encoded = []
             for fr in frames_or_paths:
                 if hasattr(fr, "shape") and hasattr(fr, "dtype"):

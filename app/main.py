@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -99,7 +100,41 @@ def _assemble_index_html(manifests: list[CardManifest]) -> str:
     manifests_json = json.dumps(manifests_data, ensure_ascii=False)
     template = template.replace("{{ app_manifests }}", manifests_json)
 
+    # 4. Cache-bust core static assets (?v=<mtime>) — StaticFiles 默认不发
+    # Cache-Control, 浏览器会按 Last-Modified 启发式缓存; 用文件 mtime 作
+    # 版本串使 URL 随改动变化, 避免改前端后需手动硬刷新。
+    core_static = Path(__file__).resolve().parent / "static" / "core"
+
+    def _stamp_asset(match: re.Match) -> str:
+        attr, rel = match.group("attr"), match.group("rel")
+        try:
+            ver = int((core_static / rel).stat().st_mtime)
+        except OSError:
+            return match.group(0)
+        return f'{attr}="/static/core/{rel}?v={ver}"'
+
+    template = _CORE_ASSET_RE.sub(_stamp_asset, template)
+
     return template
+
+
+# 匹配 template 里对 /static/core/** 的 href/src 引用（尚未带 ?v= 的）。
+_CORE_ASSET_RE = re.compile(r'(?P<attr>href|src)="/static/core/(?P<rel>[^"?]+)"')
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """StaticFiles that forces ``Cache-Control: no-cache`` on every response.
+
+    卡片 JS/CSS 没有 URL 版本串，默认的启发式缓存会让前端改动"不生效"
+    （用户看到的是上次缓存的老逻辑）。no-cache **不是** no-store —— 浏览器
+    仍会缓存，但每次请求都带 ETag 回校验，未变 304、变了立即更新，兼顾
+    性能与新鲜度。
+    """
+
+    def file_response(self, *args, **kwargs):  # type: ignore[override]
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
 
 def _manifest_to_dict(m: CardManifest) -> dict:
@@ -201,13 +236,18 @@ def create_app() -> FastAPI:
     ).start()
 
     # 5. Mount per-card static dirs at /static/apps/<id>
+    #    卡片资源（app.js / app.css / template.html）不带 ?v= 版本串，
+    #    StaticFiles 默认也不发 Cache-Control → 浏览器按 Last-Modified
+    #    启发式缓存，改了卡片 JS 后仍用旧副本（症状：点击无反应 / 行为
+    #    与源码不符，只能硬刷新）。挂载时显式发 no-cache：浏览器每次
+    #    带 ETag 回来校验，未变则 304、变了立即拉新，既保性能又不陈旧。
     for m in manifests:
         if not m.static_dir or not m.static_dir.is_dir():
             continue
         try:
             app.mount(
                 f"/static/apps/{m.id}",
-                StaticFiles(directory=str(m.static_dir)),
+                _NoCacheStaticFiles(directory=str(m.static_dir)),
                 name=f"static-apps-{m.id}",
             )
         except Exception as e:  # noqa: BLE001
@@ -242,6 +282,7 @@ def create_app() -> FastAPI:
         return Response(
             content=_assemble_index_html(discover_cards()),
             media_type="text/html; charset=utf-8",
+            headers={"Cache-Control": "no-store, must-revalidate"},
         )
 
     @app.get("/health")

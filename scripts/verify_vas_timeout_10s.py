@@ -1,6 +1,6 @@
 """Smoke test: 验证方案B per-frame timeout 15s (默认) + 10s (显式 override) 真在 SDK 卡死时触发。
 
-VFA 线上报 "(推理失败：超时 15s SDK 未响应)" 概率性出现。
+VAS 线上报 "(推理失败：超时 15s SDK 未响应)" 概率性出现。
 本测试用 mock 模拟 SDK 慢响应, 验证:
 1. SDK > 15s 时 _call_llm 返回 timeout 错误 string (默认 15s 路径生效)
 2. 显式 timeout_sec=10.0 仍 work (per-call override 不被 15s 默认值吞掉)
@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 
-LOG = logging.getLogger("verify_vfa_timeout_10s")
+LOG = logging.getLogger("verify_vas_timeout_10s")
 
 
 # --------------------------------------------------------------------------- #
@@ -78,21 +78,21 @@ def _make_service_stubbed(stub_session):
     """构造一个 stubbed service, 跳过 _interrupt_rknn_session
     防止 C call 真触发 (我们想测的是 Python 层 timeout 行为)。
     """
-    from app.services.video_file_analysis import VideoFileAnalysisService
-    svc = VideoFileAnalysisService.__new__(VideoFileAnalysisService)
+    from app.apps.video_analysis_search.service import VideoAnalysisSearchService
+    svc = VideoAnalysisSearchService.__new__(VideoAnalysisSearchService)
     svc._consecutive_timeouts = 0
     svc._infer_durations = deque(maxlen=200)
     svc._last_telemetry_check_ts = 0.0
     # patches
-    from app.services import video_file_analysis as vfa_mod
-    from app.services import compute_registry as registry_mod
+    from app.apps.video_analysis_search import service as vas_mod
+    from app.core.compute import registry as registry_mod
     patches = [
         patch.object(registry_mod, "get_registry", lambda: MagicMock(
             get_session=lambda c: stub_session
         )),
         patch.object(registry_mod, "get_session_call_lock", lambda: _NoLock()),
-        patch.object(vfa_mod, "_load_wdnai", lambda: (True, lambda *a, **kw: None, "")),
-        patch.object(vfa_mod, "_interrupt_rknn_session", lambda *a, **kw: None),
+        patch.object(vas_mod, "_load_wdnai", lambda: (True, lambda *a, **kw: None, "")),
+        patch.object(vas_mod, "_interrupt_rknn_session", lambda *a, **kw: None),
     ]
     for p in patches:
         p.start()

@@ -14,6 +14,7 @@ env/
 .ruff_cache/
 .DS_Store
 *.log
+app/uploads/
 app/services/uploads/
 app/services/vfa_runs/
 app/static/uploads/

@@ -639,8 +639,7 @@
 
       {% card_slot "video-target-detection" %}
       {% card_slot "video-target-localization" %}
-      {% card_slot "video-content-search" %}
-      {% card_slot "video-file-analysis" %}
+      {% card_slot "video-analysis-search" %}
       {% card_slot "tts" %}
       {% card_slot "text-chat" %}
       <section id="page-system-logs"     class="page hidden" data-page="system-logs">

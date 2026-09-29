@@ -1,9 +1,9 @@
-"""verify_vfa_per_call_timeout.py
+"""verify_vas_per_call_timeout.py
 
-Regression test for vfa_service._call_llm per-call timeout override.
+Regression test for vas_service._call_llm per-call timeout override.
 
 Why: commit 90faa84 tightened the global _INFER_TIMEOUT_SEC to 5s.
-The final-summary / chunk-summary / rescue-batch calls in VFA are
+The final-summary / chunk-summary / rescue-batch calls in VAS are
 legitimately slower than 5s on real hardware (Apollo final summary
 ~25-30s on qwen3-vl-4b per the original 46135b2 commit's own docstring).
 Those calls now pass ``timeout_sec=...`` explicitly so they are not
@@ -23,7 +23,7 @@ This test verifies the contract:
   4. counter / on_call_timeout behavior is unchanged.
 
 Run with:
-    .venv/bin/python scripts/verify_vfa_per_call_timeout.py
+    .venv/bin/python scripts/verify_vas_per_call_timeout.py
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from unittest.mock import patch
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 
-LOG = logging.getLogger("verify_vfa_per_call_timeout")
+LOG = logging.getLogger("verify_vas_per_call_timeout")
 
 
 # --------------------------------------------------------------------------- #
@@ -101,12 +101,12 @@ class _StubRegistry:
 
 
 def _patches_for(registry):
-    from app.services import video_file_analysis as vfa_mod
-    from app.services import compute_registry as registry_mod
+    from app.apps.video_analysis_search import service as vas_mod
+    from app.core.compute import registry as registry_mod
     patches = [
         patch.object(registry_mod, "get_registry", lambda: registry),
         patch.object(registry_mod, "get_session_call_lock", lambda: _NoLock()),
-        patch.object(vfa_mod, "_load_wdnai",
+        patch.object(vas_mod, "_load_wdnai",
                      lambda: (True, lambda *a, **kw: None, "")),
     ]
     for p in patches:
@@ -116,8 +116,8 @@ def _patches_for(registry):
 
 def _make_service():
     from collections import deque
-    from app.services.video_file_analysis import VideoFileAnalysisService
-    svc = VideoFileAnalysisService.__new__(VideoFileAnalysisService)
+    from app.apps.video_analysis_search.service import VideoAnalysisSearchService
+    svc = VideoAnalysisSearchService.__new__(VideoAnalysisSearchService)
     svc._consecutive_timeouts = 0
     # v0.15 telemetry 字段: 测试 stub service 也得初始化, 否则
     # _record_infer_duration 调用会 AttributeError
@@ -135,14 +135,14 @@ def test_per_call_timeout_override_honored():
 
     Verifies: override reaches asyncio.wait_for and t.join.
     """
-    from app.services import video_file_analysis as vfa_mod
+    from app.apps.video_analysis_search import service as vas_mod
 
-    real_timeout = vfa_mod._INFER_TIMEOUT_SEC
-    real_rescue = vfa_mod.RESCUE_TIMEOUT_SEC
-    real_chunk = vfa_mod.CHUNK_TIMEOUT_SEC
-    real_final = vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC
-    vfa_mod._INFER_TIMEOUT_SEC = 5.0
-    vfa_mod.RESCUE_TIMEOUT_SEC = 3.0
+    real_timeout = vas_mod._INFER_TIMEOUT_SEC
+    real_rescue = vas_mod.RESCUE_TIMEOUT_SEC
+    real_chunk = vas_mod.CHUNK_TIMEOUT_SEC
+    real_final = vas_mod.FINAL_SUMMARY_TIMEOUT_SEC
+    vas_mod._INFER_TIMEOUT_SEC = 5.0
+    vas_mod.RESCUE_TIMEOUT_SEC = 3.0
     try:
         sess = _StubSessionSlow(delay=1.0, return_text="ok")
         registry = _StubRegistry(lambda: sess)
@@ -151,7 +151,7 @@ def test_per_call_timeout_override_honored():
             svc = _make_service()
             t0 = time.time()
             result = svc._call_llm(
-                "test", None, timeout_sec=vfa_mod.RESCUE_TIMEOUT_SEC,
+                "test", None, timeout_sec=vas_mod.RESCUE_TIMEOUT_SEC,
             )
             elapsed = time.time() - t0
         finally:
@@ -168,22 +168,22 @@ def test_per_call_timeout_override_honored():
         )
         return True, (result, round(elapsed, 2))
     finally:
-        vfa_mod._INFER_TIMEOUT_SEC = real_timeout
-        vfa_mod.RESCUE_TIMEOUT_SEC = real_rescue
-        vfa_mod.CHUNK_TIMEOUT_SEC = real_chunk
-        vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC = real_final
+        vas_mod._INFER_TIMEOUT_SEC = real_timeout
+        vas_mod.RESCUE_TIMEOUT_SEC = real_rescue
+        vas_mod.CHUNK_TIMEOUT_SEC = real_chunk
+        vas_mod.FINAL_SUMMARY_TIMEOUT_SEC = real_final
 
 
 def test_per_call_timeout_kills_legit_slow_call():
     """A 5s delay must be killed when caller passes ``timeout_sec=2.0``,
     even though the module default is 5s (which would otherwise allow it).
     """
-    from app.services import video_file_analysis as vfa_mod
+    from app.apps.video_analysis_search import service as vas_mod
 
-    real_timeout = vfa_mod._INFER_TIMEOUT_SEC
-    real_rescue = vfa_mod.RESCUE_TIMEOUT_SEC
-    vfa_mod._INFER_TIMEOUT_SEC = 5.0
-    vfa_mod.RESCUE_TIMEOUT_SEC = 2.0
+    real_timeout = vas_mod._INFER_TIMEOUT_SEC
+    real_rescue = vas_mod.RESCUE_TIMEOUT_SEC
+    vas_mod._INFER_TIMEOUT_SEC = 5.0
+    vas_mod.RESCUE_TIMEOUT_SEC = 2.0
     try:
         sess = _StubSessionSlow(delay=5.0)
         registry = _StubRegistry(lambda: sess)
@@ -192,7 +192,7 @@ def test_per_call_timeout_kills_legit_slow_call():
             svc = _make_service()
             t0 = time.time()
             result = svc._call_llm(
-                "test", None, timeout_sec=vfa_mod.RESCUE_TIMEOUT_SEC,
+                "test", None, timeout_sec=vas_mod.RESCUE_TIMEOUT_SEC,
             )
             elapsed = time.time() - t0
         finally:
@@ -210,8 +210,8 @@ def test_per_call_timeout_kills_legit_slow_call():
         )
         return True, (result, round(elapsed, 2))
     finally:
-        vfa_mod._INFER_TIMEOUT_SEC = real_timeout
-        vfa_mod.RESCUE_TIMEOUT_SEC = real_rescue
+        vas_mod._INFER_TIMEOUT_SEC = real_timeout
+        vas_mod.RESCUE_TIMEOUT_SEC = real_rescue
 
 
 def test_no_override_uses_module_default():
@@ -219,10 +219,10 @@ def test_no_override_uses_module_default():
 
     A 1s call completes; a hypothetical 6s call would be killed.
     """
-    from app.services import video_file_analysis as vfa_mod
+    from app.apps.video_analysis_search import service as vas_mod
 
-    real_timeout = vfa_mod._INFER_TIMEOUT_SEC
-    vfa_mod._INFER_TIMEOUT_SEC = 5.0
+    real_timeout = vas_mod._INFER_TIMEOUT_SEC
+    vas_mod._INFER_TIMEOUT_SEC = 5.0
     try:
         sess = _StubSessionSlow(delay=1.0, return_text="per-frame-ok")
         registry = _StubRegistry(lambda: sess)
@@ -244,7 +244,7 @@ def test_no_override_uses_module_default():
         )
         return True, (result, round(elapsed, 2))
     finally:
-        vfa_mod._INFER_TIMEOUT_SEC = real_timeout
+        vas_mod._INFER_TIMEOUT_SEC = real_timeout
 
 
 def test_summary_constants_above_5s():
@@ -254,30 +254,30 @@ def test_summary_constants_above_5s():
     v0.15: per-frame default 5s → 10s (对齐 5c33fb3 wire 10s). Slow-path
     constants (rescue 30s, chunk 30s, final 60s) 必须仍 > per-frame。
     """
-    from app.services import video_file_analysis as vfa_mod
-    per_frame = vfa_mod._INFER_TIMEOUT_SEC
+    from app.apps.video_analysis_search import service as vas_mod
+    per_frame = vas_mod._INFER_TIMEOUT_SEC
     assert per_frame == 15.0, (
         f"FAIL: per-frame default must be 15s (v0.15 方案B 缓解 10-12s 健康慢路径), "
         f"got {per_frame}"
     )
-    assert vfa_mod.RESCUE_TIMEOUT_SEC > per_frame, (
-        f"FAIL: RESCUE_TIMEOUT_SEC={vfa_mod.RESCUE_TIMEOUT_SEC} must "
+    assert vas_mod.RESCUE_TIMEOUT_SEC > per_frame, (
+        f"FAIL: RESCUE_TIMEOUT_SEC={vas_mod.RESCUE_TIMEOUT_SEC} must "
         f"exceed per-frame default {per_frame}s (rescue batch legitimately slow)"
     )
-    assert vfa_mod.CHUNK_TIMEOUT_SEC > per_frame, (
-        f"FAIL: CHUNK_TIMEOUT_SEC={vfa_mod.CHUNK_TIMEOUT_SEC} must "
+    assert vas_mod.CHUNK_TIMEOUT_SEC > per_frame, (
+        f"FAIL: CHUNK_TIMEOUT_SEC={vas_mod.CHUNK_TIMEOUT_SEC} must "
         f"exceed per-frame default {per_frame}s (chunk summary legitimately slow)"
     )
-    assert vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC > per_frame, (
-        f"FAIL: FINAL_SUMMARY_TIMEOUT_SEC={vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC} "
+    assert vas_mod.FINAL_SUMMARY_TIMEOUT_SEC > per_frame, (
+        f"FAIL: FINAL_SUMMARY_TIMEOUT_SEC={vas_mod.FINAL_SUMMARY_TIMEOUT_SEC} "
         f"must exceed per-frame default {per_frame}s "
         f"(Apollo final summary ~25-30s on qwen3-vl-4b)"
     )
     return True, {
         "_INFER_TIMEOUT_SEC":      per_frame,
-        "RESCUE_TIMEOUT_SEC":      vfa_mod.RESCUE_TIMEOUT_SEC,
-        "CHUNK_TIMEOUT_SEC":       vfa_mod.CHUNK_TIMEOUT_SEC,
-        "FINAL_SUMMARY_TIMEOUT_SEC": vfa_mod.FINAL_SUMMARY_TIMEOUT_SEC,
+        "RESCUE_TIMEOUT_SEC":      vas_mod.RESCUE_TIMEOUT_SEC,
+        "CHUNK_TIMEOUT_SEC":       vas_mod.CHUNK_TIMEOUT_SEC,
+        "FINAL_SUMMARY_TIMEOUT_SEC": vas_mod.FINAL_SUMMARY_TIMEOUT_SEC,
     }
 
 

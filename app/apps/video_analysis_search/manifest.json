@@ -1,0 +1,87 @@
+{
+  "id": "video-analysis-search",
+  "title": "视频分析检索",
+  "category": "video",
+  "description": "上传视频文件 → 逐帧 VLM 分析 + 阶段综述 + 语义检索（embedding）",
+  "version": "0.2.0",
+  "preview_video": "/static/apps/video-analysis-search/preview.mp4",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_video_describe",
+    "swcap_video_retrieval"
+  ],
+  "hardware_capabilities": [
+    "hwcap_video_input"
+  ],
+  "backend": {
+    "module": "app.apps.video_analysis_search",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/video-analysis-search/template.html",
+    "js": [
+      "/static/apps/video-analysis-search/app.js"
+    ],
+    "css": [
+      "/static/apps/video-analysis-search/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "analysis.state",
+      "search.state",
+      "busy"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-analysis-search/analysis/close"
+      },
+      {
+        "method": "POST",
+        "path": "/api/video-analysis-search/analysis/stop"
+      },
+      {
+        "method": "POST",
+        "path": "/api/video-analysis-search/search/extract/stop"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-analysis-search/analysis/close"
+      },
+      {
+        "method": "POST",
+        "path": "/api/video-analysis-search/analysis/stop"
+      },
+      {
+        "method": "POST",
+        "path": "/api/video-analysis-search/search/extract/stop"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "VLMDoc",
+    "editable_fields": [
+      {
+        "name": "text",
+        "label": "VLMDoc.text 字段描述"
+      },
+      {
+        "name": "level",
+        "label": "VLMDoc.level 字段描述"
+      }
+    ],
+    "prompt_template": "请用中文描述视频中正在发生的事件。"
+  },
+  "requires_core": [
+    "compute.registry",
+    "video.session",
+    "video.search"
+  ],
+  "uploads_dir": "uploads/video_analysis_search",
+  "display_order": 5,
+  "wizard_config": "wizard.json"
+}

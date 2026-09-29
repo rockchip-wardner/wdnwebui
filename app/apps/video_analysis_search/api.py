@@ -1,4 +1,4 @@
-"""视频文件分析：REST + WebSocket。"""
+"""视频分析检索：REST + WebSocket（分析 + 检索合并卡片）。"""
 from __future__ import annotations
 
 import asyncio
@@ -8,15 +8,22 @@ from typing import Iterator, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
-from app.apps.video_file_analysis.service import LOG, get_service
+from app.apps.video_analysis_search.service import LOG, get_service
 
 
-router = APIRouter(tags=["video-file-analysis"])
+router = APIRouter(tags=["video-analysis-search"])
 
 
+@router.get("")
 @router.get("/")
 async def get_snapshot() -> dict:
-    """当前分析快照（状态 / 进度 / 综述）。"""
+    """当前分析快照（状态 / 进度 / 综述）。
+
+    同时注册 ``""`` 与 ``"/"`` 两个路径：前端 fetch 用的是不带尾斜杠的
+    ``.../analysis``（与其它端点风格一致），旧实现只有 ``"/"`` 会让
+    Starlette 回 307 重定向到 ``.../analysis/``，白白多一次往返，且在
+    某些代理/客户端下重定向会丢 header。
+    """
     return get_service().snapshot()
 
 
@@ -433,14 +440,13 @@ async def query_run(
     前端 UI 通常只让用户填一个。
     """
     try:
-        from app.apps.video_file_analysis.service import get_service
+        from app.apps.video_analysis_search.service import get_service
         svc = get_service()
-        # 走 load_run 让历史 run 进入内存
-        svc.load_run(run_id)
+        # 只读 —— 反查不能走 load_run（后者末尾会把 _state 重置为 IDLE
+        # 并广播，导致前端「分析反查」首次打开后不可再点）。
+        all_events = svc.load_run_events_readonly(run_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-
-    all_events = svc.events()
     # 精准匹配 / 模糊搜索走纯 Python 路径，毫秒级返回。
     # 互斥处理：exact 优先于 q（前端 UI 通常只让用户填一个）。
     effective_exact = (exact or "").strip() if exact else ""
@@ -690,7 +696,9 @@ async def facets_run(run_id: str) -> dict:
     """
     try:
         svc = get_service()
-        svc.load_run(run_id)
+        # 只读 —— facets 是候选下拉的纯查询，走 load_run 会把 state 重置为
+        # IDLE 并广播（前端「分析反查」因此不可再点）。
+        events = svc.load_run_events_readonly(run_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -698,7 +706,7 @@ async def facets_run(run_id: str) -> dict:
     actors: set = set()
     objects: set = set()
     action_counter: dict = {}  # value -> count（按频次排序给前端 chip 排序）
-    for ev in svc.events():
+    for ev in events:
         s = ev.get("structured") or {}
         if s.get("scene"):
             scenes.add(s["scene"])
@@ -771,7 +779,7 @@ async def vfa_ws(ws: WebSocket) -> None:
     # ``_next_event_id`` 重置回 1；WS handler 的 ``last_event_id`` 是闭
     # 包内局部变量，不感知 run 切换会让第二轮所有 ``id > 0`` 的事件被过
     # 滤掉（表现为"第二次开始分析，逐帧结果 + 进度条未刷新"）。
-    # 见 ``video_file_analysis.py:907`` ``_reset_state`` + ``start()``。
+    # 见 ``video_analysis_search.py:907`` ``_reset_state`` + ``start()``。
     last_run_id = ""
     try:
         # 初始快照
@@ -802,7 +810,7 @@ async def vfa_ws(ws: WebSocket) -> None:
             # run 边界检测：state / hello 广播带 ``run_id``，与上次记录
             # 不同即视为新一轮分析开始 —— 重置事件 id 过滤器，让新 run
             # 从 ``id=1`` 起的事件顺利通过。前端 ``vfaStart`` 已经在切到
-            # ``/open`` 前清空 ``VFA.events``，这里不需要补发旧事件。
+            # ``/open`` 前清空 ``VAS.events``，这里不需要补发旧事件。
             if payload.get("type") in ("state", "hello"):
                 new_run_id = payload.get("run_id", "") or ""
                 if new_run_id and new_run_id != last_run_id:

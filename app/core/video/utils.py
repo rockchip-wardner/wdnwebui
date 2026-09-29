@@ -1,9 +1,9 @@
-"""Shared video utility helpers (extracted from video_content_search).
+"""Shared video utility helpers (extracted from video_search).
 
 Originally the private helpers ``_cosine_similarity`` /
 ``_probe_video_meta`` / ``_cleanup_shm_session`` /
 ``_read_chunk_frames`` / ``_write_frames_to_shm`` lived inside
-``app/services/video_content_search.py``. Both ``video_content_search``
+``app/services/video_search.py``. Both ``video_search``
 and ``im_bridge`` consumed them — a pre-existing cross-coupling that the
 zero-coupling rule prohibits. They've been moved here so either card can
 import without touching the other.
@@ -92,7 +92,7 @@ def cleanup_shm_session(shm_session_id: str) -> int:
     return removed
 
 
-# ── Chunking helpers — shared by video_content_search + im_bridge ──
+# ── Chunking helpers — shared by video_search + im_bridge ──
 
 
 def compute_slices(fps: float, duration_s: float, chunk_seconds: int,
@@ -103,7 +103,7 @@ def compute_slices(fps: float, duration_s: float, chunk_seconds: int,
     1 秒/帧采样帧号、剔除超出总帧数的帧；空片即停；end_time（= start +
     实际帧数）达到或超过时长即停。重叠残片不计入。
 
-    VCS 提取 worker 与微信视频管线（``wechat_video_manager``）共用 ——
+    VAS_SEARCH 提取 worker 与微信视频管线（``wechat_video_manager``）共用 ——
     ``total`` 必须等于 worker 实际遍历的段数：此前微信侧用解析公式
     ``(duration - overlap) // step + 1``，在不能整除时**多算 1 段**
     （19s / chunk=4 / overlap=1 → 算 7 段、实际 6 段），"段数不足"
@@ -142,7 +142,7 @@ def _read_chunk_frames(source: str, start_s: float, chunk_seconds: int,
     ``chunk_seconds`` 个等距帧（BGR ndarray），按 demo 语义。
 
     - PyAV ``avformat_seek_file`` 跳到最近的 keyframe，再顺序 decode 到
-      目标时间点 —— 避免从头顺序读全片（与 VFA 取帧同一优化）。
+      目标时间点 —— 避免从头顺序读全片（与 VAS 取帧同一优化）。
     - 每帧缩放到 576×576（embedding 模型 vision 输入）。
     """
     import av

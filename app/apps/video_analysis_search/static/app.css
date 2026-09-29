@@ -1,0 +1,18 @@
+/* video-analysis-search 卡片私有样式（卡片 static/app.css）。 */
+
+/* 历史记录子行控件对齐：检索行与分析行都用 <input type="checkbox">，
+   统一尺寸与间距后两行左边缘严格对齐（分析行早期是 radio，为支持
+   "再点一次取消选中"已改 checkbox）。 */
+.vcs-cache-row > input[type="checkbox"] {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+/* 「分析反查」不可用态。刻意不用 [disabled] —— disabled 元素点击零反馈且
+   title 不弹；这里改成视觉置灰 + 保留点击事件，由 handler 弹出具体原因。 */
+#vas-run-query.is-off {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
