@@ -95,6 +95,17 @@
       try {
         reg.stopSync();
       } catch (_) { /* beforeunload path, best-effort */ }
+      // 发完 stop 立即清掉该 page 的 cache + 刷新 _activeApp。否则
+      // _cache[page] 里的 stale session.state (e.g. "playing") 会让
+      // _refreshActive 把 _activeApp 钉在上一个 demo,影响下游:
+      //   * wireAppsPanel — 应用列表 button 把 stale _activeApp 当目标,
+      //     误把用户带回去 (典型:从 音视频描述 切到 视频目标定位 完成配置
+      //     后,点应用列表 → 跳回 音视频描述 wizard)。
+      //   * updateBackHomeLabels — 错把当前页 back button 标 "退出应用"。
+      // 与 stopAndClear 的语义对齐(异步 stop + 清 cache),只是这里是
+      // 同步 sendBeacon / fetch keepalive 路径,不 await server reply。
+      this._cache[page] = {};
+      this._refreshActive();
     },
 
     async stopAndClear(page) {
