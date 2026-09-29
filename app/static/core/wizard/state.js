@@ -716,18 +716,18 @@
 
     // 监听 hashchange / 自定义 pagechange:用户在 wizard 模式下点 sidebar
     // 切到其他应用 / 系统页面时,自动 unmount 避免 wizard DOM 残留
-    // (原来:切到 #system-monitor 等页面时,#wd-wizard-root-<id>
-    // section 还残留在 wizard DOM 树里,因为 wizard 是 page 的兄弟节点)
+    // silent=true 表示用户已经切走 → unmount 时不显示原 page(用户已经
+    // 不在那个 page 了),仅清理 wizard DOM 与事件 listener
     const onNavAway = () => {
       if (!_active) return;
       const cur = (location.hash || "").replace(/^#\/?/, "").split("/")[0];
-      if (cur !== app.id) unmount();
+      if (cur !== app.id) unmount(true);
     };
     window.addEventListener("hashchange", onNavAway);
     _active._onNavAway = onNavAway;
   }
 
-  function unmount() {
+  function unmount(silent) {
     if (!_active) return;
     const { app, container, intervals, _onNavAway } = _active;
     intervals.forEach(clearInterval);
@@ -736,9 +736,13 @@
     if (container && container.parentNode) {
       container.parentNode.removeChild(container);
     }
-    // 显示原 page
-    const pageSection = document.getElementById("page-" + app.id);
-    if (pageSection) pageSection.classList.remove("hidden");
+    // 显示原 page — 但仅限用户主动跳过/完成 wizard 时(silent=false);
+    // silent=true(hashchange 自动卸载)时不动原 page hidden,因为
+    // ROUTER 已经把原 page 隐藏了,用户切到了别的页面
+    if (!silent) {
+      const pageSection = document.getElementById("page-" + app.id);
+      if (pageSection) pageSection.classList.remove("hidden");
+    }
     _active = null;
     // 通知 registry 卸载(允许外部重新 tryMount)
     try { window.dispatchEvent(new CustomEvent("wizard:unmounted", { detail: { appId: app.id } })); } catch (_) {}
