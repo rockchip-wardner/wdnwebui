@@ -258,7 +258,30 @@
           if (cur != null) el.value = cur;
       }
       el.dataset.fieldId = field.id;
-      wrap.appendChild(el);
+      // 视频源字段(text 类型且 id 以 -source 结尾)自动追加"浏览…"按钮,
+      // click → 调全局 VdFsModal(框架层 fs-modal.js 的兼容 alias,所有
+      // 视频类应用共用)把 wizard 的 input 作为目标 + 打开文件浏览
+      if (field.type !== "textarea" && field.type !== "number"
+          && field.type !== "checkbox" && field.type !== "select"
+          && /-source$/.test(field.id) && window.VdFsModal) {
+        const row = _ce("div", WIZARD_NS + "input-row");
+        row.appendChild(el);
+        const browseBtn = _ce("button", WIZARD_NS + "browse-btn", "浏览…");
+        browseBtn.type = "button";
+        browseBtn.title = "选择本地文件或目录";
+        browseBtn.addEventListener("click", () => {
+          try {
+            window.VdFsModal._sourceTarget = el;
+            window.VdFsModal.open("");
+          } catch (e) {
+            console.warn("[wizard-state] browse failed:", e);
+          }
+        });
+        row.appendChild(browseBtn);
+        wrap.appendChild(row);
+      } else {
+        wrap.appendChild(el);
+      }
       form.appendChild(wrap);
     });
 

@@ -176,6 +176,32 @@
   margin-right: 6px;
 }
 
+/* 视频源 input 行:input + 浏览按钮(flex 排版)*/
+.wd-wizard-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.wd-wizard-input-row .wd-wizard-input {
+  flex: 1;
+  min-width: 0;
+}
+.wd-wizard-browse-btn {
+  flex-shrink: 0;
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  color: #374151;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.wd-wizard-browse-btn:hover {
+  background: #f3f4f6;
+  border-color: #9ca3af;
+}
+
 /* finish summary */
 .wd-wizard-summary {
   background: #f9fafb;
