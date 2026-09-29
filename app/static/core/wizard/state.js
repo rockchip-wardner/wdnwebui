@@ -713,12 +713,25 @@
     };
     _renderShell(container, app, cfg);
     _gotoStep(0);
+
+    // 监听 hashchange / 自定义 pagechange:用户在 wizard 模式下点 sidebar
+    // 切到其他应用 / 系统页面时,自动 unmount 避免 wizard DOM 残留
+    // (原来:切到 #system-monitor 等页面时,#wd-wizard-root-<id>
+    // section 还残留在 wizard DOM 树里,因为 wizard 是 page 的兄弟节点)
+    const onNavAway = () => {
+      if (!_active) return;
+      const cur = (location.hash || "").replace(/^#\/?/, "").split("/")[0];
+      if (cur !== app.id) unmount();
+    };
+    window.addEventListener("hashchange", onNavAway);
+    _active._onNavAway = onNavAway;
   }
 
   function unmount() {
     if (!_active) return;
-    const { app, container, intervals } = _active;
+    const { app, container, intervals, _onNavAway } = _active;
     intervals.forEach(clearInterval);
+    if (_onNavAway) window.removeEventListener("hashchange", _onNavAway);
     // 彻底移除 wizard DOM(下次 mount 重建,避免残留 class)
     if (container && container.parentNode) {
       container.parentNode.removeChild(container);
