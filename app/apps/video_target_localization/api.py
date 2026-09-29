@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import uuid
 from pathlib import Path
 
 from fastapi import (
@@ -31,16 +30,24 @@ from fastapi import (
 )
 
 from app.core.llm.detector_base import get_localizer_detector
+from app.core.config import default_resource_root
 from app.core.video.session import get_session
 
 
 router = APIRouter(tags=["video-target-localization"])
 
-# 向导模式拖放上传的视频文件落地目录 — 与音视频描述页共用 ``/userdata
-# /test/tmp``(用户指定设备端目录;不在仓库内,不在 git)。子目录按 app id
-# 隔离,避免不同 app 上传的文件互相覆盖。
-UPLOAD_DIR = Path("/userdata/test/tmp/video_target_localization")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# 向导模式拖放上传的视频文件落地目录 — 三个视频 app 共用同一目录
+# ``<resource_dir>/uploads``(设备端 ``/userdata/assets/uploads``,off-device
+# ``<HOME>/assets/uploads``)。不再按 app id 分目录,避免每个 app 重复上传
+# 同一份视频占盘;同名文件直接覆盖(``open("wb")`` 截断写)。
+# 路径解析走 :func:`app.core.config.default_resource_root`,
+# 与 ``base.resource_dir`` 写盘真值一致 —— 改前者时这里自动跟着变。
+# mkdir 容错:read-only fs / 权限不够时跳过,首次写文件时再报错。
+UPLOAD_DIR = default_resource_root() / "uploads"
+try:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 
 
 # --------------------------------------------------------------------- #
@@ -78,18 +85,21 @@ async def get_state() -> dict:
 
 @router.post("/upload")
 async def upload_video(file: UploadFile = File(...)) -> dict:
-    """向导模式拖放上传:写到 UPLOAD_DIR,返回 server 路径。
+    """向导模式拖放上传 → 写到 ``UPLOAD_DIR``(三个 app 共用)。
 
-    wizard.json 的 upload_endpoint 字段会让向导在没播放时显示拖放区,
-    拖动视频文件落到此处 → POST 本端点 → 拿到 {path: ...} → 自动
-    vtl-open 触发解码。结构对齐 ``app/apps/video_detection/api.py::
-    upload_video``(同一套契约,前端无需感知 app 差异)。
+    同名文件直接覆盖(``open("wb")`` 截断写)—— 不再生成 UUID 后缀,
+    避免每个 app 重复上传同一份视频占盘。``file.filename`` 先经
+    ``Path(...).name`` 规整,剥掉路径穿越成分,只保留 basename;缺扩展名
+    时补 ``.bin``。
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="empty filename")
-    ext = Path(file.filename).suffix or ".bin"
-    upload_id = uuid.uuid4().hex
-    dest = UPLOAD_DIR / f"{upload_id}{ext}"
+    safe_name = Path(file.filename).name
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if not Path(safe_name).suffix:
+        safe_name = safe_name + ".bin"
+    dest = UPLOAD_DIR / safe_name
     try:
         with dest.open("wb") as f:
             shutil.copyfileobj(file.file, f)
@@ -101,7 +111,6 @@ async def upload_video(file: UploadFile = File(...)) -> dict:
         except Exception:
             pass
     return {
-        "upload_id": upload_id,
         "path": str(dest),
         "name": file.filename,
         "size": dest.stat().st_size,

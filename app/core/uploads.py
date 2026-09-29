@@ -107,3 +107,51 @@ def _validate_card_id(card_id: str) -> None:
         raise ValueError(
             f"card_id {card_id!r} must start with alphanumeric"
         )
+
+
+def get_tts_output_root() -> Path:
+    """Resolve the directory where the TTS service writes generated WAV
+    files. **DO NOT** use :func:`get_card_uploads_root` for TTS — that
+    writes under ``app/uploads/<card_id>/`` which lives on the emmc
+    partition that hosts the wdnwebui repo, and emmc write endurance is
+    a real concern for a service that drops a fresh WAV every few
+    seconds.
+
+    Instead this helper reads ``config['base']['resource_dir']`` at
+    runtime so operators can point TTS output to a non-emmc location
+    (data partition, NFS mount, SD card) without code changes; on a
+    stock Rockchip device that's typically ``/userdata/assets`` (or
+    ``<HOME>/assets`` off-device) which sits on the data partition.
+
+    Path layout: ``<resolved_resource_dir>/tts`` — the ``/tts`` is a
+    second-level subdir under the ``assets`` root, parallel to
+    ``assets/uploads/`` (wizard video uploads) and any future
+    per-purpose subdirs. Keeps generated WAVs out of the user-uploaded
+    video pool so the wizard's file picker doesn't see half-played TTS
+    scratch files.
+
+    Falls back to :func:`app.core.config.default_resource_root` when
+    config has no ``resource_dir`` set yet — covers fresh installs
+    before :py:meth:`ConfigStore._seed_defaults` has had a chance to
+    write. Like :func:`default_resource_root`, ``OSError`` from mkdir
+    (read-only fs, permission denied) is silently swallowed; the first
+    real write attempt will surface a meaningful error.
+
+    Pure runtime function — call it each time you need a fresh Path;
+    cheap (one config read + one mkdir).
+    """
+    from app.core.config import default_resource_root, get_config
+    base = get_config().get_section("base", {}) or {}
+    rd = base.get("resource_dir")
+    if isinstance(rd, str) and rd.strip():
+        root = Path(rd.strip())
+    else:
+        root = default_resource_root()
+    out = root / "tts"
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # read-only fs / permission denied — let first real write
+        # attempt surface the actual error.
+        pass
+    return out

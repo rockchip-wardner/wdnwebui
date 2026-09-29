@@ -9,7 +9,7 @@
     { "id": "source", "title": "视频源",        "kind": "form",
       "fields": [
         { "id": "vfa-source", "ui_key": "source", "label": "视频源 URL / 路径",
-          "placeholder": "例 /userdata/clips/sample.mp4" }
+          "placeholder": "例 /userdata/test/clips/sample.mp4" }
       ]
     },
     { "id": "prompt", "title": "分析要求",      "kind": "form",

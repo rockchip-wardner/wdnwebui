@@ -964,8 +964,11 @@ The `#page-video-detection` section is wired to:
 
 - **Backend** (`app/apps/video_detection/api.py`):
   - `POST /api/video-detection/upload` — multipart file upload; saves to
-    `app/uploads/<card_id>/<uuid><ext>` (默认 `/userdata/test/tmp` 由
-    `app/apps/video_detection/api.py:UPLOAD_DIR` 控制),returns `{upload_id, path, …}`.
+    `<resource_root>/uploads` (`/userdata/assets/uploads` on device,
+    `<HOME>/assets/uploads` off-device;三个视频 app 共用同一目录,由
+    `app/apps/video_detection/api.py:UPLOAD_DIR` 控制)。同名文件直接
+    覆盖(``open("wb")`` 截断写),`file.filename` 经 `Path(...).name`
+    规整后再写,返回 `{path, name, size}`。
   - `POST /api/video-detection/open` `{source: str}` — opens via
     `wdnav.VideoCapture`, starts decode thread, returns snapshot.
   - `POST /api/video-detection/control` `{action: "play"|"pause"|"stop"}`.

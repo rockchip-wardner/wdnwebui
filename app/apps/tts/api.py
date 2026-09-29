@@ -106,14 +106,18 @@ async def tts_history() -> dict:
 async def tts_output(path: str) -> FileResponse:
     """Stream the WAV the most recent (or any historical) run wrote.
 
-    Constrained to the card's ``uploads/`` directory so this endpoint
-    can't be turned into an arbitrary-file proxy. The path is
-    canonicalised and must resolve under ``app/uploads/tts/``."""
+    Constrained to the TTS output directory so this endpoint can't be
+    turned into an arbitrary-file proxy. The path is canonicalised
+    and must resolve under ``<resource_dir>/tts``(典型设备端
+    ``/userdata/test/tts``,off-device ``<HOME>/test/tts``;由
+    :func:`app.core.uploads.get_tts_output_root` 解析,**不**走 repo
+    内的 ``app/uploads/tts/`` —— 那个在 emmc 上,TTS 生成的音频写多了
+    会踩爆 emmc 寿命)。"""
     if not path:
         raise HTTPException(status_code=400, detail="path 必填")
 
-    from app.core.uploads import get_card_uploads_root
-    uploads_root = get_card_uploads_root("tts").resolve()
+    from app.core.uploads import get_tts_output_root
+    uploads_root = get_tts_output_root().resolve()
     target = Path(path).resolve()
     try:
         target.relative_to(uploads_root)

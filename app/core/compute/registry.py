@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-from app.core.config import get_config
+from app.core.config import default_models_root, get_config
 
 
 # --------------------------------------------------------------------------- #
@@ -463,7 +463,8 @@ def _qwen3_vl_embedding_2b_spec():
     不做 token 生成，LLM 走 RKNN3Lite 普通模型路径输出 2048 维归一化
     向量；wdnai 侧 ``EmbeddingBackend`` 暴露 ``embed_text`` /
     ``embed_video``。模型路径走 ``WDNAI_MODELS_DIR``（默认
-    ``/userdata/models/``），与 Qwen3-VL-4B 同款文件布局。
+    见 :func:`app.core.config.default_models_root`，与 Qwen3-VL-4B
+    同款文件布局）。
     """
     from wdnai import SystemLanguageModel
     return SystemLanguageModel.qwen3_vl_embedding()
@@ -1300,10 +1301,16 @@ class ComputeRegistry:
 
     def list_supported_models(self) -> list[dict]:
         base = get_config().get_section("base", {})
+        # Priority: config → env var → on-disk model root chosen by
+        # ``default_models_root`` (/userdata/models → /mnt/oem/models →
+        # <HOME>/models). Keeps this fallback chain in lock-step with
+        # ``ConfigStore._seed_defaults`` so the file-existence probe
+        # below agrees with what a fresh install would write to
+        # config.jsonc.
         model_path = (
             base.get("model_path")
             or os.environ.get("WDNAI_MODELS_DIR")
-            or "/userdata/models/"
+            or f"{default_models_root()}/"
         )
         root = Path(model_path)
         out = []
@@ -1666,9 +1673,10 @@ class ComputeRegistry:
         # v0.4: worker is now at app/core/compute/compute_worker.py (was
         # app/services/compute_worker.py). One extra parent level up.
         env.setdefault("PYTHONPATH", str(Path(__file__).resolve().parents[3]))
-        env.setdefault("WDNAI_MODELS_DIR",
-                       get_config().get_section("base", {}).get(
-                           "model_path", "/userdata/models/"))
+        env.setdefault(
+            "WDNAI_MODELS_DIR",
+            get_config().get_section("base", {}).get(
+                "model_path", f"{default_models_root()}/"))
 
         cmd = [
             sys.executable, "-u",

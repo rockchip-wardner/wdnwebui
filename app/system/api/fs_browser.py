@@ -21,7 +21,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
-from app.core.config import get_config
+from app.core.config import default_resource_root, get_config
 
 
 router = APIRouter(tags=["fs-browser"])
@@ -57,8 +57,11 @@ def _get_fs_root() -> str:
        anything stored in config so a host-side lockdown still wins)。
        向后兼容旧 ``VD_FS_ROOT`` 命名。
     2. ``base.resource_dir`` from ``config.jsonc`` —— 基础配置页指定的
-       资源目录(默认 ``/userdata``)。每次调用实时读,保存即生效。
-    3. Hard fallback ``/userdata``。
+       资源目录(默认 ``<root>/test``,见
+       :func:`app.core.config.default_resource_root`)。每次调用实时读,
+       保存即生效。
+    3. Hard fallback via :func:`app.core.config.default_resource_root`
+       —— on-device: ``/userdata/test``; off-device: ``<HOME>/test``.
     """
     env_root = os.environ.get("FS_FS_ROOT") or os.environ.get("VD_FS_ROOT")
     if env_root:
@@ -67,7 +70,7 @@ def _get_fs_root() -> str:
     rd = base.get("resource_dir")
     if isinstance(rd, str) and rd.strip():
         return rd.strip()
-    return "/userdata"
+    return str(default_resource_root())
 
 
 def _is_within(p: Path, root: Path) -> bool:
