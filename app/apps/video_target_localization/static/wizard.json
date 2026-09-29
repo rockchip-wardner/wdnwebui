@@ -17,7 +17,8 @@
     },
     { "id": "ground", "title": "定位提示词",       "kind": "form",
       "fields": [
-        { "id": "vtl-prompt", "ui_key": "prompt", "label": "定位目标描述", "type": "textarea",
+        { "id": "vtl-prompt-rows", "ui_key": "prompts", "label": "定位目标描述",
+          "type": "prompt_rows", "min_rows": 1, "max_rows": 20,
           "placeholder": "例:穿着红衬衫的人" }
       ]
     },

@@ -894,13 +894,44 @@ initVideoTargetLocalization();
 // ------------------------------------------------------------------ *
 // 应用向导模式 API — wizard 框架 finish 时调用
 // 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
-//   vtl-source  → opts.source
-//   vtl-loop    → opts.loop
-//   vtl-prompt  → opts.prompt
-// source 非空 → 写回 #vtl-source 并调 vtlOpen;prompt 非空 → 模拟
-// 点 #vtl-detector-start。空字段不触发对应动作。
+//   vtl-source       → opts.source
+//   vtl-loop         → opts.loop
+//   vtl-prompt-rows  → opts.prompts (string[] — 与 wizard 的 prompt_rows
+//                                      字段类型对应,每个元素对应应用页
+//                                      一行定位提示词)
+// source 非空 → 写回 #vtl-source 并调 vtlOpen;
+// prompts 数组非空 → 把每个元素写回应用页 #vtl-prompt-rows 的对应
+// 输入框(已有行复用,不足时调 vtlPromptAddRow 补齐),再点
+// #vtl-detector-start。空字段不触发对应动作。
 // 全局名约定 ImApp_<app.id 去掉 hyphen>。
 // ------------------------------------------------------------------ *
+
+// 把 wizard 给的 prompts 数组同步到应用页的 #vtl-prompt-rows:
+//   * 已有行复用(超出值留空)
+//   * 行数不够时调 vtlPromptAddRow 补齐(focus=false 不抢焦点)
+//   * 不删应用页已有的多余空行(用户可在应用页面手动 × 删)
+function _vtlWizardSyncPrompts(prompts) {
+  const rowsEl = document.getElementById("vtl-prompt-rows");
+  if (!rowsEl || !Array.isArray(prompts) || prompts.length === 0) return false;
+  const inputs = () => Array.from(rowsEl.querySelectorAll(".vtl-prompt-row-input"));
+  // 已有行先写值(后续 addRow 后再补 index >= 现有行数 的)
+  const existing = inputs();
+  for (let i = 0; i < prompts.length; i++) {
+    if (i < existing.length) existing[i].value = prompts[i];
+  }
+  // 行数不够 → vtlPromptAddRow 补齐
+  for (let i = existing.length; i < prompts.length; i++) {
+    if (typeof vtlPromptAddRow === "function") {
+      vtlPromptAddRow(false);
+      const after = inputs();
+      if (after[i]) after[i].value = prompts[i];
+    }
+  }
+  if (typeof vtlPromptUpdateAddBtn === "function") vtlPromptUpdateAddBtn();
+  if (typeof vtlPromptRenumber === "function") vtlPromptRenumber();
+  return true;
+}
+
 window.ImApp_video_target_localization = window.ImApp_video_target_localization || {};
 window.ImApp_video_target_localization.applyWizardSnapshot = async function (opts) {
   const setVal = (id, v) => { const el = document.getElementById(id); if (el != null) el.value = v; };
@@ -908,9 +939,15 @@ window.ImApp_video_target_localization.applyWizardSnapshot = async function (opt
 
   if (opts.source)      setVal("vtl-source", opts.source);
   if (opts.loop != null) setChk("vtl-loop", opts.loop);
-  if (opts.prompt)      setVal("vtl-prompt", opts.prompt);
 
-  const result = { source_opened: false, detector_started: false };
+  // prompts:数组(来自 wizard 的 prompt_rows 字段类型),过滤空白后同步
+  let promptsApplied = false;
+  if (Array.isArray(opts.prompts)) {
+    const cleaned = opts.prompts.map((p) => (p || "").trim()).filter((p) => p.length > 0);
+    if (cleaned.length > 0) promptsApplied = _vtlWizardSyncPrompts(cleaned);
+  }
+
+  const result = { source_opened: false, detector_started: false, prompts_applied: promptsApplied };
 
   if (opts.source) {
     try {
@@ -921,7 +958,8 @@ window.ImApp_video_target_localization.applyWizardSnapshot = async function (opt
     }
   }
 
-  if (opts.prompt) {
+  // prompts 写入后再点启动按钮(start handler 读 #vtl-prompt-rows 当前内容)
+  if (promptsApplied) {
     const btn = document.getElementById("vtl-detector-start");
     if (btn) {
       try { btn.click(); result.detector_started = true; }
