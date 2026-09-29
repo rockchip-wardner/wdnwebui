@@ -200,6 +200,20 @@ html, body {
 }
 .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
 
+/* "向导模式"按钮(应用页 page-header 内,刷新按钮左侧)— 蓝色边框视觉区分 */
+.wizard-mode-btn {
+  padding: 0.35rem 0.85rem;
+  border: 1px solid #93c5fd;
+  background: #eff6ff;
+  color: #1d4ed8;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 500;
+  margin-right: 0.5rem;
+}
+.wizard-mode-btn:hover { background: #dbeafe; border-color: #2563eb; }
+
 .placeholder-note {
   background: #fffbeb;
   border: 1px solid #fcd34d;

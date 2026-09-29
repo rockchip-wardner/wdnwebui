@@ -760,6 +760,27 @@
   window.WizardState = { mount, unmount, stepForward, skip };
 
   // ------------------------------------------------------------------ #
+  // window.enterWizardMode(appId) — 应用页面左上角"向导模式"按钮调用入口
+  // 从 window.__APP_MANIFESTS__ 找 manifest,先 unmount 现有 wizard(以防
+  // 重复挂),再调 registry.tryMount 挂新 wizard。若应用未在主页面 manifest
+  // 中(极端情况),仅 console.warn 不抛错。
+  // ------------------------------------------------------------------ #
+  window.enterWizardMode = function (appId) {
+    const cards = (window.__APP_MANIFESTS__ && window.__APP_MANIFESTS__.cards) || [];
+    const manifest = cards.find((c) => c.id === appId);
+    if (!manifest) {
+      console.warn("[wizard-state] enterWizardMode: manifest not found for", appId);
+      return;
+    }
+    try { unmount(); } catch (_) { /* 可能没有挂载,忽略 */ }
+    if (window.WizardRegistry && window.WizardRegistry.tryMount) {
+      window.WizardRegistry.tryMount(manifest);
+    } else {
+      console.warn("[wizard-state] enterWizardMode: WizardRegistry not loaded");
+    }
+  };
+
+  // ------------------------------------------------------------------ #
   // _wizardBringUpModels — 闭包 helper,供 env_check.js / registry.js 引用
   // 真正启停实现放 env_check.js (避免在 state.js 里堆 fetch 业务代码)
   // ------------------------------------------------------------------ #
