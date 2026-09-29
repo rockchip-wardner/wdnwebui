@@ -39,6 +39,18 @@ source "$SCRIPT_DIR/.venv/bin/activate"
 PIP_TARGET="python -m pip"
 FORCE="${UPDATE_RKWHL_FORCE_REBUILD:-0}"
 
+# 先把 wdnwebui 自己的运行时依赖（fastapi / uvicorn / opencv-python-headless /
+# python-multipart / av / gguf / lancedb / pyarrow / psutil 等）按
+# requirements.txt 装好——开发机经常是新克隆的 .venv，requirements.txt
+# 还没执行过；或者上游 bump 了 web 依赖版本。装完再 update SDK，避免 SDK 重装
+# 链上拉不到 web 侧依赖。
+if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+    echo "==> 同步 requirements.txt (wdnwebui 自身依赖)"
+    ( cd "$SCRIPT_DIR" && $PIP_TARGET install -r requirements.txt )
+else
+    echo "==> 未找到 requirements.txt，跳过 web 依赖同步"
+fi
+
 update_pkg() {
     local pkg="$1"
     local repo_url="$2"
