@@ -315,6 +315,47 @@
         });
         row.appendChild(browseBtn);
         wrap.appendChild(row);
+        // 视频源下方追加"打开 / 关闭"按钮行(wizard.json 的 open_source_button
+        // 字段声明应用页面对应的按钮 id;close 按钮 id 按 "*-open → *-close"
+        // 约定推断,避免每个 wizard.json 多写一份)。按钮 click 走应用页面
+        // 原生按钮(应用页面打开按钮已经把 wizard 的 source/loop 写回 +
+        // 调 vdOpen + UI 反馈全套逻辑,wizard 不重写)。
+        if (cfg.open_source_button) {
+          const closeId = cfg.open_source_button.replace(/-open$/, "-close");
+          // 读 wizard 当前 toggle 状态(input 直接读,el 是 wizard source input)
+          const readLoopChecked = () => {
+            if (!inlineLoopFieldId) return false;
+            const tCb = row.querySelector(".wd-wizard-toggle-input");
+            return !!(tCb && tCb.checked);
+          };
+          const actions = _ce("div", WIZARD_NS + "source-actions");
+          const openBtn = _ce("button", WIZARD_NS + "source-action-btn", "打开");
+          openBtn.type = "button";
+          openBtn.addEventListener("click", () => {
+            try {
+              const srcEl = document.getElementById(field.id);
+              const loopEl = inlineLoopFieldId
+                ? document.getElementById(inlineLoopFieldId) : null;
+              if (srcEl) srcEl.value = el.value || "";
+              if (loopEl) loopEl.checked = readLoopChecked();
+              document.getElementById(cfg.open_source_button)?.click();
+            } catch (e) {
+              console.warn("[wizard-state] open failed:", e);
+            }
+          });
+          const closeBtn = _ce("button", WIZARD_NS + "source-action-btn", "关闭");
+          closeBtn.type = "button";
+          closeBtn.addEventListener("click", () => {
+            try {
+              document.getElementById(closeId)?.click();
+            } catch (e) {
+              console.warn("[wizard-state] close failed:", e);
+            }
+          });
+          actions.appendChild(openBtn);
+          actions.appendChild(closeBtn);
+          wrap.appendChild(actions);
+        }
       } else {
         wrap.appendChild(el);
       }

@@ -255,6 +255,31 @@
   border-color: #9ca3af;
 }
 
+/* 视频源 actions row(打开 / 关闭)— 紧贴 input-row 下方,左对齐 */
+.wd-wizard-source-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  align-items: center;
+}
+.wd-wizard-source-action-btn {
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  color: #374151;
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.wd-wizard-source-action-btn:hover {
+  background: #f3f4f6;
+  border-color: #9ca3af;
+}
+.wd-wizard-source-action-btn:active {
+  background: #e5e7eb;
+}
+
 /* finish summary */
 .wd-wizard-summary {
   background: #f9fafb;
