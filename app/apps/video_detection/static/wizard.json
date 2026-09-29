@@ -6,6 +6,7 @@
     "swcap_audio_understand": { "npu_index": 1, "model_id": "qwen2.5-omni-3b" }
   },
   "open_source_button": "vd-open",
+  "upload_endpoint": "/api/video-detection/upload",
   "start_buttons": ["vd-detector-start", "vd-audio-start"],
   "steps": [
     { "id": "env",    "title": "运行环境检查",           "kind": "env_check" },

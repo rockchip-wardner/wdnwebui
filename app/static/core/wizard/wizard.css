@@ -283,19 +283,61 @@
 /* 视频 canvas 容器(wizard 内显示)— 居中、圆角、深色背景 */
 .wd-wizard-canvas-wrap {
   margin-top: 16px;
-  background: #000000;
+  background: #f9fafb;
   border-radius: 8px;
+  border: 2px dashed #d1d5db;
   overflow: hidden;
   display: flex;
   justify-content: center;
   align-items: center;
   min-height: 240px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.wd-wizard-canvas-wrap.wd-wizard-dragover {
+  border-color: #2563eb;
+  background: #eff6ff;
 }
 .wd-wizard-canvas-wrap canvas {
   display: block;
   max-width: 100%;
   height: auto;
+  background: #000000;
 }
+
+/* 拖放区 — 未播放时显示 */
+.wd-wizard-drop-zone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 40px 24px;
+  text-align: center;
+  cursor: pointer;
+  width: 100%;
+  min-height: 240px;
+}
+.wd-wizard-drop-icon {
+  font-size: 48px;
+  opacity: 0.5;
+}
+.wd-wizard-drop-text {
+  font-size: 16px;
+  font-weight: 500;
+  color: #374151;
+}
+.wd-wizard-drop-hint {
+  font-size: 13px;
+  color: #6b7280;
+}
+.wd-wizard-drop-status {
+  font-size: 13px;
+  margin-top: 8px;
+  min-height: 18px;
+}
+.wd-wizard-drop-status-busy { color: #2563eb; }
+.wd-wizard-drop-status-ok   { color: #047857; }
+.wd-wizard-drop-status-err  { color: #b91c1c; }
 
 /* finish summary */
 .wd-wizard-summary {

@@ -344,10 +344,96 @@
           wrap.appendChild(actions);     // 先 actions
           wrap.appendChild(canvasWrap); // 再 canvas,贴"打开 / 关闭"下方
 
+          // 没播放时:显示拖放区(若 cfg.upload_endpoint 声明了上传端点)
+          // 拖动视频文件到此处 → POST 上传 → 把 server 路径写到 source
+          //        input + 自动调 vd-open(VDOpen 把 canvas 搬进 wrap 替换)
+          const dropZone = _ce("div", WIZARD_NS + "drop-zone");
+          const dropIcon = _ce("div", WIZARD_NS + "drop-icon", "📥");
+          const dropText = _ce("div", WIZARD_NS + "drop-text", "拖动文件放到此处");
+          const dropHint = _ce("div", WIZARD_NS + "drop-hint", "或点击「浏览」选择本地视频");
+          dropZone.appendChild(dropIcon);
+          dropZone.appendChild(dropText);
+          dropZone.appendChild(dropHint);
+          const dropStatus = _ce("div", WIZARD_NS + "drop-status");
+          dropZone.appendChild(dropStatus);
+          if (cfg.upload_endpoint) {
+            canvasWrap.appendChild(dropZone);
+
+            const handleUpload = async (file) => {
+              dropStatus.textContent = `正在上传 ${file.name}...`;
+              dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-busy";
+              try {
+                const fd = new FormData();
+                fd.append("file", file);
+                const r = await fetch(cfg.upload_endpoint, { method: "POST", body: fd });
+                if (!r.ok) {
+                  dropStatus.textContent = `上传失败: HTTP ${r.status}`;
+                  dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-err";
+                  return;
+                }
+                const data = await r.json();
+                if (!data.path) {
+                  dropStatus.textContent = `上传失败: 后端未返回 path`;
+                  dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-err";
+                  return;
+                }
+                // 把 server 路径写回 wizard input + 自动触发 vd-open
+                // vd-open click → 后端 vdOpen → ws 推帧 → ws callback
+                // drawVdFrame 通过 canvasId 找到 canvas 画帧(此时 canvas
+                // 还在 page section 内)
+                el.value = data.path;
+                const loopEl = inlineLoopFieldId
+                  ? document.getElementById(inlineLoopFieldId) : null;
+                if (loopEl) loopEl.checked = readLoopChecked();
+                const appSrcEl = document.getElementById(field.id);
+                if (appSrcEl) appSrcEl.value = data.path;
+                document.getElementById(cfg.open_source_button)?.click();
+                // 把 canvas 搬到 wizard 内(替换 drop-zone)
+                moveCanvasToWizard();
+                dropStatus.textContent = `✓ 已上传,加载中...`;
+                dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-ok";
+              } catch (e) {
+                dropStatus.textContent = `上传失败: ${e?.message || e}`;
+                dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-err";
+              }
+            };
+
+            // 拖放视觉反馈
+            canvasWrap.addEventListener("dragover", (e) => {
+              if (!e.dataTransfer?.types?.includes?.("Files")) return;
+              e.preventDefault();
+              canvasWrap.classList.add(WIZARD_NS + "dragover");
+            });
+            canvasWrap.addEventListener("dragleave", () => {
+              canvasWrap.classList.remove(WIZARD_NS + "dragover");
+            });
+            canvasWrap.addEventListener("drop", (e) => {
+              if (!e.dataTransfer?.files?.length) return;
+              e.preventDefault();
+              canvasWrap.classList.remove(WIZARD_NS + "dragover");
+              handleUpload(e.dataTransfer.files[0]);
+            });
+            // 点 dropZone 也触发应用页面的浏览按钮(用户也可以点上传)
+            dropZone.addEventListener("click", (e) => {
+              // 不让 click 冒泡触发 dragover/drop
+              if (e.target === dropZone) {
+                const browseBtn = row.querySelector("." + WIZARD_NS + "browse-btn");
+                browseBtn?.click();
+              }
+            });
+          } else {
+            // 没声明 upload_endpoint,给一个静态 placeholder
+            const noUp = _ce("div", WIZARD_NS + "drop-text", "点击「打开」开始播放");
+            canvasWrap.appendChild(noUp);
+          }
+
           const moveCanvasToWizard = () => {
             const canvas = document.getElementById(canvasId);
-            if (canvas && canvas.parentNode !== canvasWrap) {
-              canvasWrap.appendChild(canvas);
+            if (!canvas || canvas.parentNode === canvasWrap) return;
+            // 把 canvas 搬到 wrap 顶部,移除拖放区
+            canvasWrap.appendChild(canvas);
+            if (cfg.upload_endpoint && dropZone.parentNode === canvasWrap) {
+              canvasWrap.removeChild(dropZone);
             }
           };
           openBtn.addEventListener("click", () => {
