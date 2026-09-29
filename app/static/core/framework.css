@@ -6213,18 +6213,13 @@ body.dg-modal-open .back-home-btn {
 .apps-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 38.4px;
+  gap: 24px;
   max-width: 2560px;
   margin: 0 auto;
   width: 100%;
 }
 
-@media (max-width: 2048px) {
-  .apps-grid {
-    grid-template-columns: repeat(2, 1fr);
-  }
-}
-
+/* 中等宽度（1280-2048）也是一行 3 个；只在窄屏回落到单列避免卡片被挤碎 */
 @media (max-width: 1280px) {
   .apps-grid {
     grid-template-columns: 1fr;
