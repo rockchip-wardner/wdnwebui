@@ -1115,7 +1115,17 @@ html, body {
   border-top: 1px solid var(--border);
   background: #f9fafb;
 }
-.vd-modal-foot .vd-hint { margin: 0; }
+.vd-modal-foot .vd-hint {
+  margin: 0;
+  /* 长文件路径会撑爆 footer 把"选择此文件"按钮挤出视口;用 flex
+     shrink + min-width:0 + ellipsis 单行截断,文件名 hover title 兜底。 */
+  min-width: 0;
+  flex: 0 1 auto;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ---------- detection prompt + history ---------- */
 .vd-section {

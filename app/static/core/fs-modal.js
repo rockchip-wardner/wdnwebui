@@ -106,7 +106,11 @@
 
     setHint(text) {
       const el = document.getElementById("fs-modal-hint");
-      if (el) el.textContent = text || "";
+      if (el) {
+        el.textContent = text || "";
+        // CSS 单行 ellipsis 截断后,鼠标悬停 tooltip 仍可看完整路径。
+        el.title = text || "";
+      }
     },
 
     setPickFileEnabled(on) {
