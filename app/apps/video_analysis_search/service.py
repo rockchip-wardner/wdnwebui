@@ -1419,6 +1419,14 @@ class VideoAnalysisSearchService:
                 # id 空间 —— 见 api/video_analysis_search.py vfa_ws 的
                 # last_run_id / last_event_id 重置逻辑。
                 "run_id":        self._run_id,
+                # 「分析反查」（facets / query 走 LanceDB 纯读盘）是否可用：
+                # **仅完整跑完（done，已 _persist）可反查**。综述生成中
+                # （summarizing，含缓存命中路径）逐帧虽已在库，但综述尚未
+                # 落盘、且此刻「停止」仍可点（会转 stopped）—— 用户要求等
+                # 综述跑完、整个分析流程结束后才允许反查。
+                # 其它（opening / running / stopped / error）：禁止。
+                "queryable": bool(self._run_id)
+                             and self._state == self.STATE_DONE,
             }
 
     def events(self) -> list:
@@ -1618,8 +1626,9 @@ class VideoAnalysisSearchService:
 
         **跳过** decode / 采样 / 逐帧 VLM 三段（昂贵的 NPU 逐帧推理），
         直接从 LanceDB 恢复 ``events`` + ``scene_boundaries`` 进入
-        ``STATE_SUMMARIZING``；综述完成时 ``_persist`` 覆盖同一缓存行
-        （run_id 复用缓存行的 → 幂等，不产生重复历史条目）。
+        ``STATE_SUMMARIZING``；综述完成时 ``_persist`` 按
+        ``(md5, every_n, prompt_hash)`` 幂等覆盖同一缓存行 → 不产生重复
+        历史条目。
         """
         if self._state in (self.STATE_RUNNING, self.STATE_OPENING,
                            self.STATE_DONE, self.STATE_STOPPED,
@@ -1627,7 +1636,12 @@ class VideoAnalysisSearchService:
             self._teardown(reason="restart", persist=True)
         self._reset_state()
 
-        run_id = str(entry.get("run_id") or uuid.uuid4().hex)
+        # 刻意**不复用**缓存行的 run_id —— 复用会让前端按 run_id 判等的
+        # 内存标志（_srcClearedRun 防重复清源 / _clearedRun 排除已清空
+        # run）与新一轮碰撞，导致"第二次命中缓存后视频源不清空""清空后
+        # 重来反查又变灰"。新 run_id 下 _persist 仍按
+        # (md5, every_n, prompt_hash) 幂等覆盖同一缓存行，历史不重复。
+        run_id = uuid.uuid4().hex
         with self._lock:
             self._run_id = run_id
             self._md5 = md5

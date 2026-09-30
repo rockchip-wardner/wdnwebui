@@ -402,9 +402,13 @@ function vasUpdateButtons() {
   const doneRun = (VAS.snap && VAS.snap.run_id
                    && VAS.snap.run_id !== VAS._clearedRun) ? VAS.snap : null;
   const hasQueryTarget = !!(selRun || doneRun);
-  // 反查是分析侧能力：只被分析侧运行态阻塞，不被检索提取(extracting)阻塞。
+  // 反查是分析侧能力，不被检索提取(extracting)阻塞。能否反查由后端
+  // snap.queryable 权威判定 —— 仅"完整跑完 (done)"为 true；综述生成中
+  // (summarizing，含缓存命中路径) 仍为 false（须等综述落盘、流程结束）。
+  // 选中的历史记录(selRun)独立可反查，不受当前 run 状态影响。
+  const queryable = !!(VAS.snap && VAS.snap.queryable) || !!selRun;
   const queryReason = !hasQueryTarget ? "请先选中一条分析记录，或完成一次分析"
-    : vasActive ? "分析进行中，暂不可反查"
+    : !queryable ? "分析进行中，暂不可反查"
     : "";
   const queryBtn = vcsEl("vas-run-query");
   if (queryBtn) {
