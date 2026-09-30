@@ -123,9 +123,8 @@ async def post_wechat_send(payload: SendPayload) -> dict:
 async def post_wechat_llm_bridge(payload: LlmBridgePayload) -> dict:
     """开/关微信文字对话模型桥接。
 
-    开启时 ``swcap_text_chat`` capability 必须可用（任一注册了
-    该 capability 的实例已 running —— ``qwen3-4b`` /
-    ``qwen3.5-vl-4b``）；否则 409。开启后手动
+    开启时 ``swcap_text_chat`` capability 必须可用（[LLM]文字对话v3
+    即 ``qwen3-4b`` 实例已 running）；否则 409。开启后手动
     发送会被 ``/wechat/send`` 拒绝。开关不持久化（内存态，重启即关）。
     """
     mgr = get_wechat()
