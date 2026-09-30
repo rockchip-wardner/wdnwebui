@@ -364,15 +364,21 @@ class _LlmBridge:
         return 16384
 
     def _resolve_tool_names(self) -> list:
-        """列出**当前可用**的 ``@Callable`` class 名（capability 过滤）。
+        """列出**当前可用**的 ``@Callable`` class 名（capability + 渠道过滤）。
 
-        委托 ``resolve_available_tool_names()``：qwen3-tts 未加载时
-        tts_alert 直接从 schema 排除，模型看不到就调不到，避免必败
-        调用。新工具在 tools 包内 register 一行即自动纳入。
+        委托 ``resolve_available_tool_names(channel="chat_wechat")``：
+        qwen3-tts 未加载时 tts_alert 直接从 schema 排除，模型看不到就
+        调不到，避免必败调用；同时 ``channels`` 限定仅 ``chat_wechat``
+        渠道生效的 ``VideoSearch`` 才会被注入 —— VideoSearch 依赖
+        ``ctx.user_id`` 拉对应用户上传的视频索引,本渠道每个 ``user_id``
+        都对应 ``WechatVideoManager`` 里的真实视频条目,功能闭环。
+        web 文本对话（``channel="chat_web"``）拿不到 ``user_id``,所以
+        那边只暴露 ``TtsAlert`` 不暴露 ``VideoSearch``,避免模型误调
+        浪费一轮推理。
         """
         try:
             from app.core.tools.registry import resolve_available_tool_names
-            return resolve_available_tool_names()
+            return resolve_available_tool_names(channel="chat_wechat")
         except Exception as exc:  # noqa: BLE001
             _llm_log(f"resolve_tool_names failed: {exc!r}")
             return []

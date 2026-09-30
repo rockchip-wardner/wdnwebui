@@ -60,6 +60,14 @@ def _register_video_search(registry) -> None:
     Worker 进程 import 该模块会顺道 import ``video_manager``；后者顶
     层只 import 标准库 + wdnai 等基础 SDK，不触发 wdnav/RKNN init，
     安全。
+
+    **渠道限定** (``channels=("chat_wechat",)``):
+    VideoSearch 只对微信聊天桥接渠道（``channel="chat_wechat"``）有
+    意义 —— ``__call__`` 依赖 ``ctx.user_id`` 拉对应用户上传的视频
+    索引。web 文本对话页（``channel="chat_web"``）``user_id`` 始终
+    空，工具必返 ``no_video`` —— 历史上有用户报告模型在 web 端
+    误调 VideoSearch,既浪费一轮推理又污染对话占位。限定渠道后
+    web 端 schema 不再注入此工具,模型无从调用。
     """
     try:
         from app.system.im_bridge.video_search import VideoSearch
@@ -77,6 +85,7 @@ def _register_video_search(registry) -> None:
         requires_capability="swcap_video_retrieval",
         tool_class=VideoSearch,
         icon="🎬",
+        channels=("chat_wechat",),
     )
     _LOG.info("builtins: registered VideoSearch")
 
@@ -88,6 +97,14 @@ def _register_tts_alert(registry) -> None:
     Worker 进程 import 该模块只 import wdnai + 标准库 + 一段文本；
     不触发音视频描述页的 VideoSession / RKNN init。卡片注册路径
     （主进程 ``register_api``）调同一个函数（idempotent）。
+
+    **渠道限定** (``channels=("chat_web", "chat_wechat")``):
+    语音提醒在 web 文本对话与微信聊天桥接两端都有合理用例：
+    用户在 chat 页可以让模型播一句话,在微信侧桥接可以让模型回复
+    完用户后顺便播报关键提醒。detector 音视频描述页的 tts_alert
+    路径不走 chat_run,因此不受 channels 限定影响（detector 直接传
+    ``tools=[TtsAlert]`` 给 ``session.respond``,不走
+    ``resolve_available_tool_names``）。
     """
     try:
         from app.apps.video_detection.tts_alert import TtsAlert
@@ -104,6 +121,7 @@ def _register_tts_alert(registry) -> None:
         requires_capability="swcap_audio_tts",
         tool_class=TtsAlert,
         icon="🔊",
+        channels=("chat_web", "chat_wechat"),
     )
     _LOG.info("builtins: registered TtsAlert")
 
@@ -125,14 +143,26 @@ def register_builtin_tools(registry) -> None:
       进程内多次调用幂等；
     * compute_worker 子进程 — 在 ``_resolve_tool_classes`` 第一次
       调用前（或 ``main()`` 启动早期）调一次，保证 prompt 注入 +
-      输出解析都能在 worker registry 里查到类。
+      输出解析都能在 worker registry 里查到类；
+    * ``get_tool_registry`` 首次调用 — 兜底 reload 后空 registry
+      场景。
+
+    幂等：``_REGISTERED`` 全局 flag + 该 registry 已含任一 builtin
+    key → 跳过。uvicorn reload 时 ``_REGISTERED`` 被重置为 False
+    但 ``_registry`` 是新空对象 → 本函数被 ``get_tool_registry``
+    触发时**重新注册**（这是 reload 修复的关键 —— 否则 reload
+    后 chat 流程拿不到工具，``resolve_available_tool_names`` 返
+    空 list,模型没工具 schema,返空 answer,前端抛
+    "（模型未输出有效内容）"）。
 
     任意一个 ``_REGISTRARS`` 元素 import 失败都不会中断其他注册；
     失败走 ``LOG.warning``（与既有行为一致）。
     """
     global _REGISTERED
     if _REGISTERED:
-        return
+        existing_keys = {s.key for s in registry.list_specs()}
+        if existing_keys & {key for key, _ in _REGISTRARS}:
+            return
     for label, fn in _REGISTRARS:
         try:
             fn(registry)

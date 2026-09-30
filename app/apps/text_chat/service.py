@@ -415,14 +415,18 @@ class _TextChatManager:
             return self.CONTEXT_LIMIT
 
     def _resolve_tool_names(self) -> List[str]:
-        """列出**当前可用**的 ``@Callable`` class 名（capability 过滤）。
+        """列出**当前可用**的 ``@Callable`` class 名（capability + 渠道过滤）。
 
-        委托 ``resolve_available_tool_names()``：requires_capability
-        对应模型未加载的工具直接从 schema 中排除，模型看不到就调不到。
+        委托 ``resolve_available_tool_names(channel="chat_web")``：
+        ``requires_capability`` 对应模型未加载的工具直接从 schema 中
+        排除，模型看不到就调不到；同时工具 ``channels`` 限定只在微信
+        渠道生效的（如 ``VideoSearch`` —— 依赖 ``ctx.user_id`` 关联
+        用户视频,web 端 ``user_id`` 始终空,工具必败）也不会注入,
+        避免模型误调浪费一轮推理。
         """
         try:
             from app.core.tools.registry import resolve_available_tool_names
-            return resolve_available_tool_names()
+            return resolve_available_tool_names(channel="chat_web")
         except Exception as e:  # noqa: BLE001
             _LOG.warning("resolve_tool_names failed: %s", e)
             return []

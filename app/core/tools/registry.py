@@ -47,7 +47,16 @@ from wdnai import Callable as WdnaiCallable
 @dataclass(frozen=True)
 class ToolSpec:
     """对外暴露的元数据。``key`` 是 URL-safe 唯一 id，
-    ``requires_capability`` 为 None 表示不需要 NPU 算力。"""
+    ``requires_capability`` 为 None 表示不需要 NPU 算力。
+
+    ``channels`` 限定工具仅在特定对话渠道可用 —— 缺省空 tuple 表示
+    **所有渠道** 都可用（与原行为兼容）。设置后,只有调用方传
+    ``channel`` 命中其中之一才暴露给 LLM。这是修复 web 文本对话页面
+    误把 ``VideoSearch`` 注入 schema 的关键字段：``VideoSearch`` 只对
+    微信聊天桥接（``channel="chat_wechat"``）有意义,web 端 ``ctx.user_id``
+    始终为空,工具调用必返 ``no_video`` —— 模型拿到无效结果,既浪费
+    一轮推理又污染历史占位。
+    """
     key: str
     name: str
     description: str
@@ -55,6 +64,7 @@ class ToolSpec:
     tool_class: Type
     icon: str = ""
     fields: Tuple[Tuple[str, str], ...] = ()   # (name, description)
+    channels: Tuple[str, ...] = ()             # 空 = 全渠道
 
 
 @dataclass
@@ -89,7 +99,18 @@ class ToolRegistry:
         requires_capability: Optional[str],
         tool_class: Type,
         icon: str = "",
+        channels: Optional[Tuple[str, ...]] = None,
     ) -> None:
+        """注册一个 ``@Callable`` 工具。
+
+        ``channels`` 限定工具暴露面:
+        * ``None`` 或空 tuple —— 所有渠道都可用(与原行为兼容)
+        * 非空 tuple —— 只在调用方传 ``channel`` 命中其中之一时才暴露
+
+        调用方: ``app/core/tools/_builtins.py`` 给每个内置工具标注
+        适用渠道(``chat_web`` / ``chat_wechat``),主进程 + worker 共用
+        同一份真源。
+        """
         spec = ToolSpec(
             key=key,
             name=name,
@@ -98,6 +119,7 @@ class ToolRegistry:
             icon=icon,
             tool_class=tool_class,
             fields=self._extract_fields(tool_class),
+            channels=tuple(channels) if channels else (),
         )
         with self._lock:
             self._tools[key] = spec
@@ -157,6 +179,16 @@ def get_tool_registry() -> ToolRegistry:
     The registry itself is created empty here; cards wire their
     own tools in.
 
+    Built-in ``@Callable`` tools (``VideoSearch`` / ``TtsAlert``) are
+    eagerly registered on first call via ``_builtins.register_builtin_tools``
+    — that's the fix for the reload bug: uvicorn reload re-imports
+    modules → ``_REGISTERED`` resets to False AND ``_registry`` is a
+    fresh empty object. Without auto-register, post-reload chat flows
+    would see an empty registry → ``resolve_available_tool_names`` returns
+    ``[]`` → model has no tool schema → empty answer → im-bridge falls
+    back to "（模型未输出有效内容）". Lazy import here avoids the
+    circular dep ``registry → _builtins → registry``.
+
     Example (in a card's ``api.py`` or ``__init__.py``)::
 
         from app.core.tools.registry import get_tool_registry
@@ -175,16 +207,27 @@ def get_tool_registry() -> ToolRegistry:
     with _registry_lock:
         if _registry is None:
             _registry = ToolRegistry()
+            try:
+                from app.core.tools._builtins import register_builtin_tools
+                register_builtin_tools(_registry)
+            except Exception:
+                pass
         return _registry
 
 
-def resolve_available_tool_names() -> List[str]:
+def resolve_available_tool_names(channel: str = "") -> List[str]:
     """列出**当前可用**工具的 ``@Callable`` class 名（供 chat_run）。
 
     capability 门控：``requires_capability`` 非 None 的工具要求对应
     模型实例已加载（``get_registry().get_session(cap)`` 成功），否则
     从返回列表中排除 —— 模型根本看不到不可用工具的 schema，从源头
     避免调用必败工具。纯软件工具（None）始终可用。
+
+    channel 门控（v0.x 起）:工具 ``spec.channels`` 非空时,只对调用方传
+    来的 ``channel`` 命中其中之一的工具才会出现在返回列表中。空 tuple
+    表示不限渠道(与原行为兼容)。这是 web 文本对话页面不再注入
+    ``VideoSearch`` schema 的核心 —— ``VideoSearch`` 仅 ``chat_wechat``
+    渠道生效(web 端 ``ctx.user_id`` 始终空,工具必返 ``no_video``)。
 
     任何单条失败都不影响其余工具；整体异常回退空列表。
     """
@@ -202,5 +245,8 @@ def resolve_available_tool_names() -> List[str]:
                 get_registry().get_session(cap)
             except Exception:  # noqa: BLE001
                 continue
+        if spec.channels and channel not in spec.channels:
+            # 工具限定暴露面 + 调用方渠道不匹配 → 跳过
+            continue
         out.append(spec.tool_class.__name__)
     return out
