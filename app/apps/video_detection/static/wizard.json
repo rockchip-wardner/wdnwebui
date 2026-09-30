@@ -2,7 +2,7 @@
   "enabled": true,
   "wizard_title": "音视频描述快速配置",
   "swcap_to_model": {
-    "swcap_video_describe":   { "npu_index": 0, "model_id": "qwen3.5-vl-4b" },
+    "swcap_video_describe":   { "npu_index": 0, "model_id": "qwen3-vl-4b" },
     "swcap_audio_understand": { "npu_index": 1, "model_id": "qwen2.5-omni-3b" }
   },
   "open_source_button": "vd-open",
