@@ -1,0 +1,1 @@
+"""audio — 跨卡片共享的音频能力抽象(TTS request schema + session 代理)。"""

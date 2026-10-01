@@ -68,7 +68,7 @@ class TtsAlert:
         except RuntimeError as e:
             raise RuntimeError(str(e)) from e
 
-        from app.apps.tts.service import (
+        from app.core.audio.tts_bridge import (
             PLAY_DEVICE, TTSRequest, get_session,
         )
 

@@ -27,13 +27,12 @@ from typing import Any, Callable, List, Optional
 import numpy as np
 
 
-# --------------------------------------------------------------------------- #
-# Playback target selector
-# --------------------------------------------------------------------------- #
-PLAY_DEVICE = "device"   # SDK live-stream via internal AudioPlayer (orig)
-PLAY_BROWSER = "browser"  # SDK silent; server-side WAV is served to <audio>
-PLAY_BOTH = "both"       # SDK live-stream + WAV served to browser in parallel
-PLAY_TARGETS = (PLAY_DEVICE, PLAY_BROWSER, PLAY_BOTH)
+# 播放目标常量 + TTSRequest 已迁至 app.core.audio.tts_bridge,
+# 此处仅 re-export 以保持旧 import 路径兼容。
+from app.core.audio.tts_bridge import (  # noqa: F401  (re-export)
+    PLAY_DEVICE, PLAY_BROWSER, PLAY_BOTH, PLAY_TARGETS,
+    TTSRequest,
+)
 
 LOG = logging.getLogger("tts_session")
 
@@ -314,41 +313,8 @@ def _assemble_wav(pcm: np.ndarray, sample_rate: int) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
-# Request / snapshot shapes
-# --------------------------------------------------------------------------- #
-@dataclass
-class TTSRequest:
-    """TTS run request. ``volume`` is 0.0–1.0 linear amplitude (matching
-    the upstream ``AudioPlayer``); the web default of 0.1 keeps the
-    played PCM at ~10% on hardware whose mixers default to 100%.
+# TTSRequest 已迁至 app.core.audio.tts_bridge(顶部 re-export)。
 
-    ``play_to`` selects where the synthesised audio is heard:
-
-    * ``"device"``  — SDK streams chunks live through the host's sound
-      card (the original behaviour; requires ALSA + a working
-      ``AudioPlayer`` sink).
-    * ``"browser"`` — SDK runs silently (``no_play=True``); the WAV
-      file written to ``output`` is served via ``GET /api/tts/output``
-      and the web page plays it through a hidden ``<audio>`` element.
-      When a WS client is subscribed to ``audio`` it additionally
-      streams 24 kHz mono float32 PCM chunks live over the WS.
-    * ``"both"``    — SDK streams to the device **and** the chunks
-      are mirrored to the browser over WS **and** the final WAV is
-      served for re-play via ``<audio>``.
-    """
-    text:        str = ""
-    language:    str = "auto"
-    speaker:     str = ""            # SPK_ID entry (serena / ryan / …)
-    ref_speaker: str = "girl_base"   # qwen3tts_speaker_embed.h entry
-    instruct:    str = ""
-    volume:      float = 0.1
-    no_play:     bool = False
-    play_to:     str = PLAY_DEVICE   # one of PLAY_DEVICE / PLAY_BROWSER / PLAY_BOTH
-    output:      str = ""            # absolute path; auto-filled if empty
-    non_streaming_mode: bool = False
-
-
-# --------------------------------------------------------------------------- #
 # Service singleton
 # --------------------------------------------------------------------------- #
 class TtsSession:
