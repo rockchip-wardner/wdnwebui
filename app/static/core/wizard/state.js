@@ -590,7 +590,9 @@
         if (v == null || v === "" || v === false) return;
         hasAny = true;
         const row = _ce("div", WIZARD_NS + "summary-row");
-        row.appendChild(_ce("span", null, (f.label || f.id) + ":"));
+        // 完成配置摘要优先用 summary_label(短标题),否则用 label/form id
+        const summaryLabel = f.summary_label || f.label || f.id;
+        row.appendChild(_ce("span", null, summaryLabel + ":"));
         const val = (f.type === "checkbox") ? "是" : String(v);
         row.appendChild(_ce("span", WIZARD_NS + "summary-val", val));
         summary.appendChild(row);

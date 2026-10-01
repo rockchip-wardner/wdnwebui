@@ -18,8 +18,7 @@
     },
     { "id": "detect", "title": "检测提示词 + 检测尺寸",  "kind": "form",
       "fields": [
-        { "id": "vd-prompt",      "ui_key": "prompt",     "label": "检测提示词", "type": "textarea",
-          "placeholder": "例:用中文简洁描述画面,包括场景、人物、动作和环境。" },
+        { "id": "vd-prompt",      "ui_key": "prompt",     "label": "例:用中文简洁描述画面,包括场景、人物、动作和环境。", "summary_label": "检测提示词", "type": "textarea" },
         { "id": "vd-detect-size", "ui_key": "detectSize", "label": "检测尺寸",   "type": "select",
           "options": [
             { "value": "auto", "label": "自动选择",     "selected": true },
@@ -31,8 +30,7 @@
     },
     { "id": "audio",  "title": "音频理解提示词",          "kind": "form",
       "fields": [
-        { "id": "vd-audio-prompt", "ui_key": "audioPrompt", "label": "音频理解提示词", "type": "textarea",
-          "placeholder": "例:请转写这段音频里的人在说什么 / 描述音频中的环境音" }
+        { "id": "vd-audio-prompt", "ui_key": "audioPrompt", "label": "例:请转写这段音频里的人在说什么 / 描述音频中的环境音", "summary_label": "音频理解提示词", "type": "textarea" }
       ]
     },
     { "id": "finish", "title": "完成配置",                "kind": "finish" }

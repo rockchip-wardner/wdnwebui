@@ -17,8 +17,7 @@
     },
     { "id": "detect", "title": "检测提示词 + 检测尺寸",  "kind": "form",
       "fields": [
-        { "id": "vtd-prompt",      "ui_key": "prompt",     "label": "检测提示词", "type": "textarea",
-          "placeholder": "例:请检测画面中是否有需要关注的目标" },
+        { "id": "vtd-prompt",      "ui_key": "prompt",     "label": "例:请检测画面中是否有需要关注的目标", "summary_label": "检测提示词", "type": "textarea" },
         { "id": "vtd-detect-size", "ui_key": "detectSize", "label": "检测尺寸",   "type": "select",
           "options": [
             { "value": "auto", "label": "自动选择",     "selected": true },
