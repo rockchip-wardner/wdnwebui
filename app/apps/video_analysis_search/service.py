@@ -320,8 +320,18 @@ def _looks_like_schema_echo(text: str) -> bool:
     漏判 (Latin 字段名每个仅 1 次 + 空格分隔 CJK), 显示成有效 text →
     前端把 echo 当描述渲染。这里 word-boundary 检测 ≥3 个 SceneFrame
     字段名即视为 echo 静默丢弃走"本帧分析失败"占位, 与 garbled 同路径。
+
+    **结构化格式排除** (v0.15+):模型输出 YAML/JSON key-value 时也含字
+    段名 (例 ``scene: 户外\nactors: 行人``), 这种是**有效**结构化输入
+    不该丢弃。判断:含 ASCII ``:`` / 全角 ``：`` / ``{`` / ``[`` 即视为
+    尝试结构化输出,跳过 echo 检测。Path 2 / Path 3 现在也用此函数,
+    必须避免把合法 YAML 输入误判成 echo 静默丢失 scene/action 真值。
     """
     if not text or len(text) < 10:
+        return False
+    # 含结构化格式标记 → 不是纯 echo,放过 (Path 2/3 已分别走
+    # _normalize_structured / _parse_kv_lines 处理)
+    if any(c in text for c in (":", "：", "{", "[")):
         return False
     text_lower = text.lower()
     import re as _re_schema_echo
@@ -465,12 +475,54 @@ def _split_scene_frame_result(result) -> tuple:
                     "vfa: raw dict 路径 text 字段乱码（%d chars），静默丢弃", len(text),
                 )
                 return None, ""
+            # **schema-echo 兜底**（v0.15+）：用户 VAS prompt 在末尾显式给
+            # 出 JSON 字段名示例（scene/actors/action/objects/text），
+            # Qwen3-VL-4B 在 RKNN3 上概率性 (~17-46%, 取决于 prompt
+            # 长度 / image_size) 退化输出时把这些字段名 echo 进 ``text``
+            # 字段，但其他字段（scene/action/...）可能仍是真值。dict 路径
+            # 必须做同样判定,否则前端"逐帧分析"列表会把 echo 当描述渲染。
+            # Path 1 的 SceneFrame 实例路径已有此检查,这里补 Path 2。
+            # 行为:丢弃 bad text,从 structured 字段合成 fallback text,
+            # 让 scene='户外街道' 这种真值仍能被前端反查 / 取帧 modal 看到。
+            if text and _looks_like_schema_echo(text):
+                LOG.warning(
+                    "vfa: raw dict 路径 text 字段命中 schema-echo (≥3 字段名),"
+                    " 静默丢弃 raw text: %r", text[:80],
+                )
+                text = ""
+                if structured:
+                    scene = structured.get("scene", "") or ""
+                    action = structured.get("action", "") or ""
+                    text = (
+                        f"{scene}：{action}".strip("：")
+                        or action or scene or ""
+                    )
+                if structured and structured.get("note") and _looks_like_schema_echo(
+                    structured["note"]
+                ):
+                    # 旧 _normalize_structured 把 dict 顶层 ``text`` 塞进
+                    # note_extras(v0.15+ 已修),但历史 run 仍有此数据。
+                    # 兜底清掉 echo 污染的 note。
+                    structured["note"] = None
+                return structured, text
             return structured, text
         except Exception as e:
             LOG.warning("vfa: raw dict 归一化失败: %s", e)
 
     # 失败分支：result 是 str。优先尝试 JSON parse，再 regex。
     raw = str(result).strip()
+    # **schema-echo 兜底**(v0.15+):同上,但作用于 str 路径(Path 3)。
+    # 模型偶尔不输出 JSON,直接 print 退化模型输出作为 str (例
+    # ``"scene 户外街道 actors action objects text"``)。Path 1 的
+    # SceneFrame 实例已经处理,这里补 Path 3。命中则丢弃整段 ——
+    # str 路径上 text 是 raw text 本身,保留会污染前端;让
+    # ``_infer_one`` 走"空事件 + dirty 占位"语义。
+    if raw and _looks_like_schema_echo(raw):
+        LOG.warning(
+            "vfa: raw str 路径命中 schema-echo (≥3 字段名), 静默丢弃: %r",
+            raw[:80],
+        )
+        return None, ""
     parsed = _parse_structured_from_str(raw)
     if parsed is not None:
         return parsed, raw
@@ -600,8 +652,12 @@ def _normalize_structured(obj: dict) -> dict:
     text 是顶层字段，单独存放在 ``ev.text``，不进 structured（避免
     与顶层 text 字段重复）。structured 只放可过滤的 5 个字段。
 
-    智能匹配：scene/actors/action/objects/note 直接映射；其他未知
-    字段（Qwen3-VL 经常输出 ``analysis`` / ``error``）拼到 ``note`` 里。
+    智能匹配：scene/actors/action/objects/note 直接映射；``text`` 也
+    列入"已知但不抽出"集合（worker 端 ``SceneFrame.model_dump()`` 经
+    ``result_data_path`` SHM 还原的 dict 里通常含 ``text`` 顶层字段——
+    旧实现把它当未知字段塞进 ``note_extras``，schema-echo 模式下会让
+    note 也带 "text: scene ... actors ..." 噪声）。其他未知字段
+    （Qwen3-VL 经常输出 ``analysis`` / ``error``）拼到 ``note`` 里。
 
     **模型输出类型兜底**（v0.10 修）：SDK Path 5 兜底 + 正则抽 JSON 后，
     模型偶尔输出类型与 SceneFrame schema 不符的 JSON —— 例如车辆类
@@ -612,11 +668,16 @@ def _normalize_structured(obj: dict) -> dict:
     拼接成字符串，list of dict 提取 ``description`` / ``text`` / ``name``
     三个候选字段。
     """
+    # 已知但不抽出: text → 顶层 ev.text, 不进 structured 也不进 note_extras
+    _KNOWN_BUT_DROP = ("text",)
     known: dict = {}
     note_extras: list = []
     for k, v in obj.items():
         if k in ("scene", "actors", "action", "objects", "note"):
             known[k] = v
+        elif k in _KNOWN_BUT_DROP:
+            # 顶层 text 在 _text_from_dict 已取出, 这里跳过避免污染 note
+            continue
         elif isinstance(v, str) and v:
             note_extras.append(f"{k}: {v}")
         elif isinstance(v, list) and v:
@@ -1046,6 +1107,15 @@ def _sanitize_text(raw: str, max_len: int = 500) -> str:
     if stripped.startswith("{") or stripped.startswith("["):
         text_value = _extract_json_text_field(stripped)
         if text_value:
+            # **schema-echo 兜底(v0.15+)**: Path 2 的 echo 检测因结构性
+            # 标记 (``{`` / ``:``) 短路,内层 ``text`` 字段才是 echo 真身。
+            # 这里在抽取后再做一次判定,命中即返回空串让上游走 dirty 占位。
+            if _looks_like_schema_echo(text_value):
+                LOG.warning(
+                    "vfa: _sanitize_text 抽 JSON.text 后命中 schema-echo "
+                    "(≥3 字段名), 返回空串: %r", text_value[:80],
+                )
+                return ""
             s = text_value
         else:
             # JSON 解析失败 / 没 text 字段：去掉 { } [ ] " 字符 + 把键值分隔符变空格
@@ -1060,6 +1130,13 @@ def _sanitize_text(raw: str, max_len: int = 500) -> str:
         if m:
             inner = _extract_json_text_field(m.group(0))
             if inner:
+                # 同上,内层 text 也可能命中 schema-echo
+                if _looks_like_schema_echo(inner):
+                    LOG.warning(
+                        "vfa: _sanitize_text 抽 JSON 块.text 后命中 schema-echo "
+                        "(≥3 字段名), 整段丢弃: %r", inner[:80],
+                    )
+                    return ""
                 s = s.replace(m.group(0), inner)
             else:
                 # 块里没 text 字段：去掉 { } [ ] " + 把键值分隔符变空格
@@ -1067,6 +1144,15 @@ def _sanitize_text(raw: str, max_len: int = 500) -> str:
                 cleaned = re.sub(r"\s*:\s*", " ", cleaned)
                 cleaned = re.sub(r"\s*,\s*", " ", cleaned)
                 s = s.replace(m.group(0), cleaned)
+
+    # 终态兜底: _split_scene_frame_result 三条路径已分别过滤,但清洗过程
+    # 可能拼接出意外残留 echo (例 multi-step 文本合并后)。最后一道关。
+    if s and _looks_like_schema_echo(s):
+        LOG.warning(
+            "vfa: _sanitize_text 终态检测命中 schema-echo (≥3 字段名), "
+            "返回空串: %r", s[:80],
+        )
+        return ""
     # 6. 去除控制字符 + U+FFFD 替换字符
     s = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", s)
     s = s.replace("�", "")
