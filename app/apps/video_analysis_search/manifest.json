@@ -2,7 +2,7 @@
   "id": "video-analysis-search",
   "title": "视频分析检索",
   "category": "video",
-  "description": "上传视频文件 → 逐帧 VLM 分析 + 阶段综述 + 语义检索（embedding）",
+  "description": "上传视频做逐帧分析与摘要，并支持自然语言检索片段。",
   "version": "0.2.0",
   "preview_video": "/static/apps/video-analysis-search/preview.mp4",
   "preview_image": "",

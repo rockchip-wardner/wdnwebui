@@ -2,7 +2,7 @@
   "id": "tts",
   "title": "语音生成",
   "category": "audio",
-  "description": "中文文本转语音 (Qwen3-TTS)",
+  "description": "把中文文本转成自然语音。",
   "version": "0.1.0",
   "preview_video": "/static/apps/tts/preview.mp4",
   "preview_image": "",

@@ -2,7 +2,7 @@
   "id": "video-target-localization",
   "title": "视频目标定位",
   "category": "video",
-  "description": "给定文本描述，定位图像中目标区域 (LocateAnything-3B 视觉定位模型)",
+  "description": "输入任意文字描述，从图像中圈出对应目标所在区域。",
   "version": "0.1.0",
   "preview_video": "/static/apps/video-target-localization/preview.mp4",
   "preview_image": "",

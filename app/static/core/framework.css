@@ -6278,18 +6278,35 @@ body.dg-modal-open .back-home-btn {
 }
 
 .app-card-title {
-  font-size: 48px;
+  font-size: 36px;
   font-weight: 600;
-  margin: 8px 0 0;
-  padding: 0 8px;
+  margin: 12px 8px 0;
+  padding: 0;
   transition: color 0.2s ease;
-  text-align: center;
+  text-align: left;
   color: #111827;
   word-break: keep-all;
   overflow-wrap: break-word;
 }
 
 .app-card:hover .app-card-title {
+  color: #2563eb;
+}
+
+/* 应用卡片副标题(一句话功能说明) — caption 样式,放在 <h2> 下方;
+   hover 与标题同色变蓝,让整张卡片一起被点亮 */
+.app-card-desc {
+  font-size: 15px;
+  line-height: 1.55;
+  color: #6b7280;
+  margin: 4px 8px 0;
+  padding: 0;
+  text-align: left;
+  transition: color 0.2s ease;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+.app-card:hover .app-card-desc {
   color: #2563eb;
 }
 
@@ -6301,6 +6318,7 @@ body.dg-modal-open .back-home-btn {
 @media (prefers-reduced-motion: reduce) {
   .app-card,
   .app-card-title,
+  .app-card-desc,
   .app-card-video {
     transition: none;
   }

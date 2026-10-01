@@ -160,6 +160,8 @@ def _manifest_to_dict(m: CardManifest) -> dict:
         "errors": m.errors,
         "hidden": m.hidden,
         "display_order": m.display_order,
+        # 应用一句话功能简介,缺失则 framework 不渲染 .app-card-desc 标签
+        "description": m.raw.get("description", ""),
         # 应用层声明的向导配置文件路径(通常是 "wizard.json",
         # 与 manifest.json 同目录);缺失 → framework tryMount 零开销跳过。
         "wizard_config": str(m.raw.get("wizard_config", "")).strip(),

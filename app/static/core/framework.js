@@ -326,9 +326,14 @@
         ? `<video class="app-card-video" autoplay muted playsinline preload="metadata" loop
                 src="${m.preview_video}" aria-hidden="true"></video>`
         : "";
+      // description 是一句话功能说明,缺失则不渲染标签
+      const desc = m.description
+        ? `<p class="app-card-desc">${escapeHtml(m.description)}</p>`
+        : "";
       return `<a href="#${m.id}" class="app-card" data-page="${m.id}">
         <div class="app-card-placeholder">${preview}</div>
         <h2 class="app-card-title">${escapeHtml(m.title)}</h2>
+        ${desc}
       </a>`;
     }).join("");
     grid.innerHTML = html;

@@ -2,7 +2,7 @@
   "id": "text-chat",
   "title": "文本对话",
   "category": "chat",
-  "description": "通用大语言模型对话，支持多轮上下文",
+  "description": "与通用大模型多轮对话，支持上下文连续追问。",
   "version": "0.1.0",
   "preview_video": "/static/apps/text-chat/preview.mp4",
   "preview_image": "",

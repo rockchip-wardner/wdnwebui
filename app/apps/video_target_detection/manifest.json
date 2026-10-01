@@ -2,7 +2,7 @@
   "id": "video-target-detection",
   "title": "视频目标监控",
   "category": "video",
-  "description": "实时视频流目标检测，模型输出 ROI 框 + 中文描述",
+  "description": "对实时视频流持续检测指定目标是否出现，命中时自动告警并描述。",
   "version": "0.1.0",
   "preview_video": "/static/apps/video-target-detection/preview.mp4",
   "preview_image": "",

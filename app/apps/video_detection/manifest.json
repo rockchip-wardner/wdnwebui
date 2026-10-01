@@ -2,7 +2,7 @@
   "id": "video-detection",
   "title": "音视频描述",
   "category": "video",
-  "description": "实时音视频流描述 + 音频理解 + 可挂工具提醒",
+  "description": "对实时视频流逐帧理解，输出画面与声音的文字描述。",
   "version": "0.1.0",
   "preview_video": "/static/apps/video-detection/preview.mp4",
   "preview_image": "",
