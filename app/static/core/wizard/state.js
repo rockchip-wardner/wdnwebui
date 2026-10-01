@@ -761,27 +761,146 @@
     const targets = Object.entries(cfg.swcap_to_model).map(([cap, m]) => m.model_id);
     if (targets.length === 0) return;
     const statusBox = _q("#" + WIZARD_NS + "finish-error");
+    if (!statusBox) return;
     const deadline = Date.now() + 90 * 1000; // 90s 兜底超时
-    let spinnerOn = true;
+    const PROG_CLS = WIZARD_NS + "finish-progress";
+    const FAIL_CLS = WIZARD_NS + "finish-error-fail";
+    const hasHeader = targets.length > 1;
+
+    // DOM 只构建一次:tick 内只更新 fill.style.width 让 CSS transition
+    // (0.5s) 把"数字跳变"变成视觉上"跑"的进度,避免每秒重建节点导致
+    // bar 从 0% 重铺的抖动。
+    let initialized = false;
+    const initDOM = () => {
+      statusBox.classList.remove(FAIL_CLS);
+      statusBox.classList.add(PROG_CLS);
+      statusBox.innerHTML = "";
+      if (hasHeader) {
+        const h = document.createElement("div");
+        h.className = WIZARD_NS + "finish-progress-h";
+        h.dataset.role = "header";
+        statusBox.appendChild(h);
+      }
+      for (const m of targets) {
+        const row = document.createElement("div");
+        row.className = WIZARD_NS + "progress-row";
+        row.dataset.modelId = m;
+        const head = document.createElement("div");
+        head.className = WIZARD_NS + "progress-row-head";
+        const label = document.createElement("span");
+        label.className = WIZARD_NS + "progress-row-label";
+        label.textContent = m;
+        const pctEl = document.createElement("span");
+        pctEl.className = WIZARD_NS + "progress-row-pct";
+        head.appendChild(label);
+        head.appendChild(pctEl);
+        const bar = document.createElement("div");
+        bar.className = WIZARD_NS + "progress-bar";
+        const fill = document.createElement("div");
+        fill.className = WIZARD_NS + "progress-bar-fill";
+        fill.style.width = "0%";
+        bar.appendChild(fill);
+        row.appendChild(head);
+        row.appendChild(bar);
+        statusBox.appendChild(row);
+      }
+      initialized = true;
+    };
+
+    const updateProgress = (statusMap, doneCount) => {
+      if (hasHeader) {
+        const h = statusBox.querySelector("[data-role=\"header\"]");
+        if (h) h.textContent = `模型加载进度 (${doneCount}/${targets.length})`;
+      }
+      for (const m of targets) {
+        const info = statusMap[m];
+        if (!info) continue;
+        // CSS.escape 防御连字符 / 点号(model_id 限定 a-z0-9- 但保留)
+        const row = statusBox.querySelector(
+          `[data-model-id="${CSS.escape(m)}"]`
+        );
+        if (!row) continue;
+        const fill = row.querySelector("." + WIZARD_NS + "progress-bar-fill");
+        const pctEl = row.querySelector("." + WIZARD_NS + "progress-row-pct");
+        fill.style.width = info.barPct + "%";
+        fill.classList.toggle(WIZARD_NS + "progress-bar-done",  info.status === "done");
+        fill.classList.toggle(WIZARD_NS + "progress-bar-error", info.status === "error");
+        pctEl.textContent = info.label;
+      }
+    };
+
+    const setError = (msg) => {
+      statusBox.classList.remove(PROG_CLS);
+      statusBox.classList.add(FAIL_CLS);
+      statusBox.textContent = msg;
+    };
+    const clearBox = () => {
+      statusBox.classList.remove(PROG_CLS, FAIL_CLS);
+      statusBox.textContent = "";
+    };
+
     while (Date.now() - deadline < 0) {
       try {
         const r = await fetch("/api/compute", { cache: "no-store" });
         if (r.ok) {
           const data = await r.json();
+          // 预估耗时复用 /api/compute 快照(与算力配置页 "初始化中…约 Xs" 同源)
+          const perModel = (data.estimated_init_seconds_per_model) || {};
+          const defaultEst = data.default_estimated_init_seconds || 30;
           // 只算本机算力(spawned / adopted_local),peer adopted 不算 —— 与
           // _probeEnv 一致;_wizardBringUpModels 已保证 POST 成功 = 本机就绪。
-          const running = new Set(
-            (data.instances || [])
-              .filter((i) => i.status === "running" && i._source !== "adopted")
-              .map((i) => i.model_id)
+          const instances = (data.instances || [])
+            .filter((i) => i._source !== "adopted");
+          const runningSet = new Set(
+            instances.filter((i) => i.status === "running").map((i) => i.model_id)
           );
-          if (targets.every((m) => running.has(m))) return;
-          if (statusBox) statusBox.textContent = "等待模型启动中... (" + targets.length + " 个)";
+          if (targets.every((m) => runningSet.has(m))) {
+            // 模型全部就绪 → 清空 statusBox,避免误导用户"是不是出错了"
+            clearBox();
+            return;
+          }
+          if (!initialized) initDOM();
+          // 进度 = (now - inst.started_at) / estimated;99% 封顶避免先撞
+          // 100% 后 status=running 才到位的小幅抖动。
+          const now = Date.now() / 1000;
+          const statusMap = {};
+          let doneCount = 0;
+          for (const m of targets) {
+            const est = perModel[m] != null ? perModel[m] : defaultEst;
+            const inst = instances.find((i) => i.model_id === m);
+            if (!inst) {
+              // POST 后 1s 内 worker 还没上报 status;显式 "等待启动…" 而
+              // 非 0%,避免和真 0% 加载混淆
+              statusMap[m] = { status: "wait", barPct: 0, label: "等待启动…" };
+              continue;
+            }
+            if (inst.status === "running") {
+              statusMap[m] = { status: "done", barPct: 100, label: "✓ 100%" };
+              doneCount++;
+              continue;
+            }
+            if (inst.status === "error") {
+              statusMap[m] = {
+                status: "error", barPct: 0,
+                label: `✗ ${inst.error || "未知错误"}`,
+              };
+              continue;
+            }
+            const startTs = inst.started_at || now;
+            const elapsed = Math.max(0, now - startTs);
+            const pct = Math.min(99, Math.max(0, Math.round((elapsed / est) * 100)));
+            const remaining = Math.max(0, Math.round(est - elapsed));
+            statusMap[m] = {
+              status: "loading", barPct: pct,
+              label: `${pct}% (~${remaining}s 剩余)`,
+            };
+          }
+          updateProgress(statusMap, doneCount);
         }
       } catch (_) { /* retry */ }
       await new Promise((r) => setTimeout(r, 1000));
     }
-    if (statusBox) statusBox.textContent = "模型启动超时,可继续等待或退出";
+    setError("模型启动超时,可继续等待或退出");
     throw new Error("等待模型启动超时");
   }
 

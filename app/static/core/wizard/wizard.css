@@ -378,6 +378,104 @@
   display: none;
 }
 
+/* v0.16: finish 步骤等待模型启动由 "等待模型启动中..." 一行改为进度条
+   + 百分比 + 剩余时间。errBox 同时承担"加载进度"(蓝)与"启动失败 /
+   超时"(红)两种语义,避免双色混用产生误导。 */
+.wd-wizard-finish-progress {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1e40af;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.wd-wizard-finish-progress-h {
+  font-weight: 600;
+  color: #1e3a8a;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+.wd-wizard-progress-row {
+  margin-bottom: 12px;
+}
+.wd-wizard-progress-row:last-child {
+  margin-bottom: 0;
+}
+.wd-wizard-progress-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.wd-wizard-progress-row-label {
+  color: #1e3a8a;
+  font-weight: 600;
+}
+.wd-wizard-progress-row-pct {
+  color: #1e40af;
+  font-size: 12px;
+}
+.wd-wizard-progress-bar {
+  width: 100%;
+  height: 8px;
+  background: rgba(191, 219, 254, 0.5);
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+/* 填充:蓝色渐变 + 0.5s width transition + ::after 白光透扫 (shimmer)
+   给出"在跑"的视觉。done/error 时通过 class 切色并停掉 shimmer。 */
+.wd-wizard-progress-bar-fill {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #3b82f6, #1d4ed8);
+  border-radius: 4px;
+  transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.3s ease-out;
+  position: relative;
+  overflow: hidden;
+}
+.wd-wizard-progress-bar-fill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.45) 50%,
+    transparent 100%
+  );
+  animation: wd-wizard-progress-shimmer 1.6s linear infinite;
+  pointer-events: none;
+}
+.wd-wizard-progress-bar-done {
+  background: linear-gradient(90deg, #10b981, #059669);
+}
+.wd-wizard-progress-bar-done::after {
+  display: none;
+}
+.wd-wizard-progress-bar-error {
+  background: linear-gradient(90deg, #ef4444, #b91c1c);
+}
+.wd-wizard-progress-bar-error::after {
+  display: none;
+}
+@keyframes wd-wizard-progress-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+/* 系统级"减少动效"偏好下关掉 shimmer,保留基础 width transition */
+@media (prefers-reduced-motion: reduce) {
+  .wd-wizard-progress-bar-fill::after { animation: none; }
+  .wd-wizard-progress-bar-fill { transition: width 0.5s linear; }
+}
+/* 显式标记确保 progress / fail 两态切换时颜色稳定可预测 */
+.wd-wizard-finish-error-fail {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+
 /* footer buttons */
 .wd-wizard-foot {
   display: flex;
