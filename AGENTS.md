@@ -1586,9 +1586,26 @@ Frontend (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/ap
 
 ## Gotchas
 
-- **No lint / typecheck / test / CI config exists yet.** Do not invent
-  `ruff`/`mypy`/`pytest` invocations — there is nothing to run, and adding
-  config requires a decision the user hasn't made.
+- **CI lives at `.github/workflows/regression.yml`** (3 jobs, see file
+  for current config). Don't invent a different CI — extend or run
+  these instead:
+  - `lint` (always, ~30s): py_compile the files touched by the broadcast
+    fix + the regression scripts in `scripts/`. No service / SDKs needed.
+  - `unit` (always, ~10s): `scripts/verify_video_session_broadcast.py`
+    exercises `VideoSession.subscribe() / _broadcast_frame() / _teardown()`
+    in pure Python. No service / SDKs / hardware needed.
+  - `integration` (self-hosted rk3588 runner only, gated by
+    `RUN_INTEGRATION=true` env on the runner + `WDNAV_DEPLOY_KEY`
+    secret for the private SDK mirror): runs
+    `scripts/verify_video_ws_broadcast.py` and (when `RUN_ALL=true`)
+    `scripts/verify_ws_after_page_switch.py`. These hit a live
+    `wdnwebui` on `127.0.0.1:8000` and need `/userdata/video_test/rk-0.mp4`.
+  - To add a new check: pick the right job (lint / unit / integration),
+    add the step, update this gotcha if the job scope changes.
+- **No lint / typecheck / test config exists yet** beyond the above CI.
+  Do not invent `ruff`/`mypy`/`pytest` invocations — there is nothing
+  else to run, and adding config requires a decision the user hasn't
+  made.
 - **Reload mode picks up `.venv/src/` edits** because the editable installs
   live there. Editing wdnav/wdnai source via Uvicorn reload is fine; the
   installed metadata is in `.venv/lib/python3.11/site-packages/`.

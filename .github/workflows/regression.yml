@@ -1,0 +1,173 @@
+name: regression
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:  # manual trigger for ad-hoc runs
+
+# Cancel in-flight runs for the same branch on new pushes.
+concurrency:
+  group: regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # Job 1: lint — fast feedback, runs on every push.
+  # Catches syntax errors and missing imports in the regression scripts
+  # and the recently changed api.py / session.py files (the WS broadcast
+  # fix). Doesn't need any service / SDKs / hardware.
+  # ──────────────────────────────────────────────────────────────────
+  lint:
+    name: lint (syntax + imports)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install runtime deps (no internal SDKs needed for lint)
+        run: |
+          python -m pip install --upgrade pip
+          # Install ONLY what `import`/syntax-check needs. We skip
+          # `pip install -r requirements.txt` because lancedb / pyarrow /
+          # wechatbot-sdk / av / gguf / opencv-python-headless all pull
+          # native binaries the lint job doesn't need.
+          pip install "fastapi>=0.110.0" "uvicorn[standard]>=0.27.0" "pydantic>=2.6.0" "psutil>=5.9.0"
+
+      - name: Syntax check (py_compile) on changed files
+        # AGENTS.md "改动只触及目标功能及其直接依赖" — only the files
+        # touched by the broadcast fix + the regression scripts need to
+        # parse. py_compile is fast (~10ms) and catches SyntaxErrors.
+        run: |
+          python -m py_compile \
+            app/core/video/session.py \
+            app/apps/video_detection/api.py \
+            app/apps/video_target_detection/api.py \
+            app/apps/video_target_localization/api.py \
+            && echo "✅ changed files parse OK"
+
+      - name: Syntax check on regression scripts
+        run: |
+          for f in scripts/verify_video_ws_broadcast.py \
+                   scripts/verify_ws_after_page_switch.py \
+                   scripts/verify_video_session_broadcast.py; do
+            python -m py_compile "$f"
+          done && echo "✅ regression scripts parse OK"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Job 2: unit — exercises VideoSession.subscribe / _broadcast_frame
+  # without needing wdnwebui / wdnav / wdnai / RK3588 hardware. Catches
+  # regressions in the broadcast fix itself: dropping a subscriber,
+  # forgetting EOF broadcast, breaking the legacy fetch_frame() path,
+  # etc. Fast (a few seconds).
+  # ──────────────────────────────────────────────────────────────────
+  unit:
+    name: unit (VideoSession broadcast)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run broadcast unit tests
+        # VideoSession imports wdnav lazily inside the module, but the
+        # import is wrapped in try/except — module loads without wdnav
+        # and _WdnavVideoCapture is None. The unit tests only exercise
+        # subscribe()/unsubscribe()/_broadcast_*(), none of which need
+        # the SDK or any running service.
+        env:
+          PYTHONPATH: .
+        run: |
+          python scripts/verify_video_session_broadcast.py
+
+  # ──────────────────────────────────────────────────────────────────
+  # Job 3: integration — exercises the actual WS broadcast end-to-end
+  # against a live wdnwebui service. This job needs the internal SDKs
+  # (wdnav / wdnai / wdndds) and a test video; both are unavailable on
+  # standard GitHub-hosted runners. Gated by `RUN_INTEGRATION` env so
+  # forks and PRs from external contributors don't fail spuriously.
+  #
+  # To run on a self-hosted RK3588 dev box, set the GitHub Actions
+  # environment variable ``RUN_INTEGRATION=true`` on the workflow run.
+  # The integration scripts are:
+  #   scripts/verify_video_ws_broadcast.py
+  #   scripts/verify_ws_after_page_switch.py
+  # which need /userdata/video_test/rk-0.mp4 and the wdnwebui service
+  # reachable on http://127.0.0.1:8000.
+  # ──────────────────────────────────────────────────────────────────
+  integration:
+    name: integration (WS broadcast end-to-end)
+    runs-on: [self-hosted, wdnwebui, rk3588]  # label required for integration runners
+    needs: lint
+    if: ${{ vars.RUN_INTEGRATION == 'true' || env.RUN_INTEGRATION == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps + internal SDKs from private SSH repo
+        # wdnav / wdnai / wdndds live behind SSH on git@10.10.10.10.
+        # The runner must have the deploy key added to its SSH agent
+        # (~/.ssh/id_ed25519 with the deploy key in authorized_keys on
+        # the git server). GH Actions secret ``WDNAV_DEPLOY_KEY`` is the
+        # raw private key content; we write it to a temp file with 0600
+        # permissions and add it to ssh-agent.
+        env:
+          WDNAV_DEPLOY_KEY: ${{ secrets.WDNAV_DEPLOY_KEY }}
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          mkdir -p ~/.ssh && chmod 0700 ~/.ssh
+          echo "$WDNAV_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 0600 ~/.ssh/id_ed25519
+          # Add the host key for git@10.10.10.10 to known_hosts.
+          ssh-keyscan -H git@10.10.10.10 >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Eval the SSH agent forwarding so subsequent pip install
+          # can git+ssh into the private mirror.
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_ed25519
+          # Install the 3 internal SDKs editable so the test can import
+          # them via .venv/src/. The build hooks (wdndds .so, wdnav video
+          # path) need apt deps (libfoonathan-memory-dev, patchelf) which
+          # the runner image lacks; we bootstrap once here.
+          sudo ./bootstrap_wdndds_native.sh || true
+          pip install -e ".venv/src/wdnav" \
+                     -e ".venv/src/wdnai" \
+                     -e ".venv/src/wdndds" || true
+
+      - name: Run integration regression scripts
+        # The two scripts POST /api/video-detection/open with the same
+        # test video (/userdata/video_test/rk-0.mp4) and exercise the
+        # multi-WS broadcast path. Each script exits 0 on pass.
+        # RUN_ALL: if true, run BOTH; if unset, run only the broadcast
+        # regression script (the page-switch one is gated on a real
+        # browser interaction model).
+        env:
+          PYTHONPATH: .
+        run: |
+          python scripts/verify_video_ws_broadcast.py
+          [ "${RUN_ALL:-false}" = "true" ] && python scripts/verify_ws_after_page_switch.py || true

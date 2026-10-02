@@ -5,6 +5,22 @@ that the WebSocket handler drains. Designed to keep ``import wdnav.video``
 lazy — the wdnav/AGENTS.md gotcha about non-Rockchip dev boxes still applies
 (a missing native lib sets ``VideoCapture`` to ``None`` in
 ``wdnav/__init__.py``).
+
+Multi-consumer WS broadcast
+----------------------------
+The decode loop broadcasts each produced JPEG to every active subscriber
+queue (``subscribe()`` returns a per-consumer ``queue.Queue(maxsize=1)``).
+This is required because all three video WS handlers (``/video-detection``,
+``/video-target-detection``, ``/video-target-localization``) share this
+singleton — if they shared a single-slot queue they'd fight over frames
+and each receive ~half the frames, causing visible playback stutter when
+the user has more than one of these pages' WS connection alive
+simultaneously (the typical trigger: card JS IIFE never re-runs because
+``DemoGuard._loadedApps`` only adds — the original page's WS is
+preserved across page navigation and competes with the new page's WS).
+
+Legacy ``fetch_frame()`` is retained so any caller that hasn't migrated
+to ``subscribe()`` continues to work — it drains the same default queue.
 """
 from __future__ import annotations
 
@@ -15,7 +31,7 @@ import queue
 import sys
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 import cv2
 
@@ -106,6 +122,17 @@ class VideoSession:
         # be cheap or marshal work elsewhere themselves.
         self._frame_sinks: list = []
         self._sinks_lock = threading.Lock()
+
+        # Per-WS frame subscribers (broadcast pattern). Each WS handler
+        # that wants pixel-depth playback calls ``subscribe()`` to get its
+        # own ``queue.Queue(maxsize=1)``; the decode loop then broadcasts
+        # every decoded JPEG to all registered subscribers. Multiple
+        # consumers (vd / vtd / vtl all share this singleton) each
+        # receive every frame independently — without this, they'd fight
+        # over a single-slot queue and each get ~half the frames
+        # (visible stutter when more than one of these WS is alive).
+        self._subscribers: List[queue.Queue] = []
+        self._subscribers_lock = threading.Lock()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -278,7 +305,18 @@ class VideoSession:
             return list(self._frame_sinks)
 
     def fetch_frame(self, timeout: float = 0.1):
-        """Pull the next event for the WS loop."""
+        """Pull the next event from the **legacy** single-consumer queue.
+
+        .. deprecated::
+            Use :meth:`subscribe` instead. Multiple WS handlers on the
+            same singleton (``/video-detection``, ``/video-target-detection``,
+            ``/video-target-localization`` all share this ``VideoSession``)
+            would otherwise fight over this single-slot queue and each
+            receive only every-other frame — visible playback stutter.
+
+        New callers should ``subscribe()`` to get a private queue and
+        read it independently.
+        """
         try:
             item = self._frame_queue.get(timeout=timeout)
         except queue.Empty:
@@ -286,6 +324,84 @@ class VideoSession:
         if item is self._EOF:
             return ("eof", None)
         return ("frame", item)
+
+    # ------------------------------------------------------------------ #
+    # Multi-consumer WS broadcast (preferred API)
+    # ------------------------------------------------------------------ #
+    def subscribe(self) -> "queue.Queue":
+        """Register a new per-consumer queue and return it.
+
+        Each call returns a fresh, independent ``queue.Queue(maxsize=1)``.
+        The decode loop broadcasts every decoded JPEG to all active
+        subscribers in turn (drop-oldest per queue); each subscriber
+        drains at its own pace without blocking the others. EOF events
+        are also broadcast — a subscriber that is too slow to drain
+        will simply skip EOF and pick up the next frame after the
+        decoder has looped back to playing.
+
+        Always pair with :meth:`unsubscribe` when the WS connection
+        closes — otherwise the decode thread will keep waking on every
+        frame push into the queue you no longer read.
+        """
+        q: "queue.Queue" = queue.Queue(maxsize=self.FRAME_QUEUE_MAX)
+        with self._subscribers_lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: "queue.Queue") -> None:
+        """Drop a previously registered subscriber queue. Idempotent."""
+        with self._subscribers_lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def _current_subscribers(self) -> list:
+        # Cheap snapshot under lock so the broadcast call below doesn't
+        # hold the lock during put_nowait (which is fine but keeps the
+        # critical section tight and the lock-free read path hot).
+        with self._subscribers_lock:
+            return list(self._subscribers)
+
+    def _broadcast_frame(self, jpg: bytes) -> None:
+        """Push a JPEG to every subscriber queue (drop-oldest per queue).
+
+        Slow / disconnected subscribers never block the decoder: their
+        queue stays full at the latest frame and ``put_nowait`` on top
+        of that drops the stale frame. EOF is broadcast separately by
+        :meth:`_broadcast_eof` so each subscriber sees the end-of-file
+        marker exactly once on its own queue.
+        """
+        for q in self._current_subscribers():
+            try:
+                q.put_nowait(jpg)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(jpg)
+                except queue.Full:
+                    # Queue vanished mid-flight (e.g. subscriber just
+                    # unsubscribed); benign — skip.
+                    pass
+
+    def _broadcast_eof(self) -> None:
+        """Push the EOF sentinel to every subscriber queue (best-effort).
+
+        Drop-oldest on Full — a slow subscriber that hasn't drained its
+        latest frame yet is happy to lose the EOF marker; the decoder
+        will loop (or stay idle, depending on ``self._loop``) and the
+        subscriber's NEXT ``get()`` will return either the new frame
+        or a future EOF depending on whether the session is still in
+        EOF state.
+        """
+        for q in self._current_subscribers():
+            try:
+                q.put_nowait(self._EOF)
+            except queue.Full:
+                pass
 
     def _fail(self, msg: str) -> None:
         with self._lock:
@@ -329,6 +445,12 @@ class VideoSession:
                 self._frame_queue.get_nowait()
             except queue.Empty:
                 break
+        for q in self._current_subscribers():
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
 
     def _decode_loop(self) -> None:
         """Read frames until the source is exhausted or the user stops.
@@ -477,6 +599,7 @@ class VideoSession:
                     self._frame_queue.put_nowait(self._EOF)
                 except queue.Full:
                     pass
+                self._broadcast_eof()
                 return
 
             # Grab pts from the zero-copy frame BEFORE materialising
@@ -553,7 +676,8 @@ class VideoSession:
             if _TIMING_ENABLED:
                 _t_acc_sinks += time.monotonic() - _t0_sinks
                 _t0_put = time.monotonic()
-            # Drop oldest on overflow — favor low latency over completeness.
+# Drop oldest on overflow — favor low latency over completeness.
+            self._broadcast_frame(jpg)
             try:
                 self._frame_queue.put_nowait(jpg)
             except queue.Full:

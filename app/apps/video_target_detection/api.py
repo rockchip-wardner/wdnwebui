@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import shutil
 from pathlib import Path
 
@@ -264,6 +265,9 @@ async def stream_ws(ws: WebSocket) -> None:
     session = get_session()
     detector = get_target_detector()
     loop = asyncio.get_event_loop()
+    # Per-WS subscriber queue — shared VideoSession can have multiple
+    # WS handlers connected; broadcast lets each receive every frame.
+    sub_q = session.subscribe()
     last_status = 0.0
     last_event_id = 0
     eof_sent = False
@@ -273,14 +277,23 @@ async def stream_ws(ws: WebSocket) -> None:
                 last_event_id = ev["id"]
                 await ws.send_json({"type": "event", **ev})
 
-            kind, data = await loop.run_in_executor(
-                None, lambda: session.fetch_frame(timeout=0.05)
-            )
-            if kind == "frame":
-                eof_sent = False
-                await send_frame_bytes(ws, data)
+            try:
+                item = await loop.run_in_executor(
+                    None, lambda: sub_q.get(timeout=0.05)
+                )
+            except queue.Empty:
+                item = None
+            if item is None:
+                now = loop.time()
+                if now - last_status >= 1.0:
+                    snap = session.snapshot()
+                    snap["type"] = "status"
+                    snap["detector"] = detector.snapshot()
+                    await ws.send_json(snap)
+                    last_status = now
+                await asyncio.sleep(0.02)
                 continue
-            if kind == "eof":
+            if item is session._EOF:
                 if not eof_sent:
                     snap = session.snapshot()
                     snap["type"] = "eof"
@@ -288,6 +301,8 @@ async def stream_ws(ws: WebSocket) -> None:
                     eof_sent = True
                 await asyncio.sleep(0.2)
                 continue
+            eof_sent = False
+            await send_frame_bytes(ws, item)
             now = loop.time()
             if now - last_status >= 1.0:
                 snap = session.snapshot()
@@ -297,12 +312,9 @@ async def stream_ws(ws: WebSocket) -> None:
                 last_status = now
             await asyncio.sleep(0.02)
     except WebSocketDisconnect:
-        return
-    except Exception as e:  # pragma: no cover - defensive
-        try:
-            await ws.send_json({"type": "error", "detail": str(e)})
-        except Exception:
-            pass
+        pass
+    finally:
+        session.unsubscribe(sub_q)
 
 
 async def send_frame_bytes(ws, data: bytes) -> None:
