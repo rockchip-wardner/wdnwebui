@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Compact guide for OpenCode sessions in this repo. **Current version: 0.4.0** (见 `app/__init__.py`)。
+Compact guide for OpenCode sessions in this repo. **Current version: 0.9.2** (见 `app/__init__.py`)。
 
 ## What this repo is
 
@@ -885,7 +885,7 @@ wdnwebui/
 ├── run.py                              # uvicorn.run("app.main:app", 0.0.0.0:8000, reload)
 ├── bootstrap_wdndds_native.sh          # wdndds .so build (apt + stub + pip; since v0.6.1)
 ├── app/
-│   ├── __init__.py                     # __version__ = "0.4.0" (single source)
+│   ├── __init__.py                     # __version__ = "0.9.2" (single source)
 │   ├── main.py                         # create_app() — discover_cards + register APIs + boot_compute
 │   │
 │   ├── core/                           # 共享内核(原 app/services/*)
