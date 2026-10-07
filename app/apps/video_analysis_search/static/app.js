@@ -37,6 +37,13 @@ const VAS_SEARCH = {
   playGen: 0,       // 播放连接代际：切换片段时自增，作废旧 WS 的在途回调
   playPaused: false,
   lastImg: null,    // 最近一帧 <img> 的 objectURL
+  // 向导模式 / 手动预览 — 复用 vd 单例 VideoSession 的 WS 帧流
+  previewWs: null,
+  previewGen: 0,
+  // 状态回调:wizard 在 _renderFormStep 里 setSourceMeta 用同款渲染,
+  // 但 wizard 内 _vcsSourceStatus 是空(预渲染阶段无后端 status)。
+  // 真实接入点是 initVideoSearch 末尾注册,接收后端 /source 快照。
+  _vcsSourceStatus: null,
 
   // ---- 勾选路径（缓存窗口）：selected key = `${md5}|${chunk}|${overlap}`
   cacheSel: new Set(),
@@ -1125,6 +1132,92 @@ function vcsClosePlayWs(settle) {
   }
 }
 
+// ------------------------------------------------------------------ *
+//  向导模式 / 手动预览:打开视频源(后端复用 vd 单例 VideoSession,        *
+//  ws 帧流走 /api/video-analysis-search/source/ws)。                  *
+//  与 vcsPlaySegment(检索命中片段回放)互斥 — 共用 #vcs-canvas,         *
+//  不能同时写。打开预览前关掉检索播放,反之亦然。                       *
+// ------------------------------------------------------------------ *
+async function vcsOpenPreview(source, loop) {
+  if (!source) { vcsShowError("请先选择视频源"); return; }
+  vcsClosePlayWs(false);                 // 抢占 canvas:先关掉可能存在的检索播放
+  await vcsClosePreviewWs();             // 重新打开前确保上一路 preview WS 已关
+  try {
+    const r = await fetch(API_PREFIX + "/video-analysis-search/source/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, loop: !!loop }),
+    });
+    if (!r.ok) {
+      const detail = await r.text().catch(() => "");
+      vcsShowError("打开失败: HTTP " + r.status + " " + detail);
+      return;
+    }
+    const snap = await r.json();
+    if (snap && snap.error) { vcsShowError("打开失败: " + snap.error); return; }
+    vcsShowError("");
+    vcsSetSourceMeta("已选: " + source);
+    vcsConnectPreviewWs();
+    if (VAS_SEARCH._vcsSourceStatus) VAS_SEARCH._vcsSourceStatus(snap);
+  } catch (e) {
+    vcsShowError("打开失败: " + (e?.message || e));
+  }
+}
+
+async function vcsClosePreview() {
+  await vcsClosePreviewWs();
+  try {
+    await fetch(API_PREFIX + "/video-analysis-search/source/close", { method: "POST" });
+  } catch (_) { /* ignore */ }
+  vcsSetSourceMeta("尚未选择");
+  if (VAS_SEARCH._vcsSourceStatus) VAS_SEARCH._vcsSourceStatus(null);
+}
+
+function vcsConnectPreviewWs() {
+  vcsClosePreviewWs().then(() => {
+    const gen = ++VAS_SEARCH.previewGen;
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${location.host}${API_PREFIX}/video-analysis-search/source/ws`);
+    VAS_SEARCH.previewWs = ws;
+    ws.binaryType = "arraybuffer";
+    ws.onmessage = (ev) => {
+      if (gen !== VAS_SEARCH.previewGen) return;
+      // 检索片段播放激活时,preview 让位 — 让 play WS 独占 vcs-canvas。
+      // 否则两路 ws 同时画帧会闪烁。
+      if (VAS_SEARCH.playWs) return;
+      if (typeof ev.data === "string") {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        if (msg.type === "eof" || msg.type === "status") {
+          if (VAS_SEARCH._vcsSourceStatus) VAS_SEARCH._vcsSourceStatus(msg);
+        }
+        return;
+      }
+      // binary JPEG — 与 vcsOpenPlayWs 共用 vcsDrawJpeg。
+      vcsDrawJpeg(new Uint8Array(ev.data));
+    };
+    ws.onclose = () => {
+      if (gen === VAS_SEARCH.previewGen) VAS_SEARCH.previewWs = null;
+    };
+    ws.onerror = () => {
+      if (gen !== VAS_SEARCH.previewGen) return;
+      try { ws.close(); } catch (_) {}
+    };
+  });
+}
+
+async function vcsClosePreviewWs() {
+  VAS_SEARCH.previewGen++;
+  if (VAS_SEARCH.previewWs) {
+    try { VAS_SEARCH.previewWs.close(); } catch (_) {}
+    VAS_SEARCH.previewWs = null;
+  }
+  if (VAS_SEARCH.lastImg) {
+    URL.revokeObjectURL(VAS_SEARCH.lastImg);
+    VAS_SEARCH.lastImg = null;
+  }
+}
+
 // 把 vcs-canvas 像素尺寸同步为播放器区域（.vd-stage）显示尺寸，
 // 使 canvas 填满窗口、contain 绘制能放大到最大（消除元素级黑边）。
 function vcsSyncCanvasSize() {
@@ -1232,8 +1325,6 @@ function vcsStopPlayback() {
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
   }
-  const overlay = vcsEl("vcs-overlay");
-  if (overlay) overlay.textContent = "选择视频并开始，检索后点击命中片段在此播放";
   if (typeof DemoGuard !== "undefined") {
     vasReport();
   }
@@ -1538,6 +1629,30 @@ function initVideoSearch() {
   refreshBtn?.addEventListener("click", vasRefreshAll);
   startBtn?.addEventListener("click", vasStart);
   stopBtn?.addEventListener("click", vasStop);
+
+  // 向导模式 / 手动预览 — 复用 vd 单例 VideoSession 跑连续预览帧流。
+  // 与 vd / vtd / vtl 的「打开 / 关闭」按钮行为一致:open 把 source/loop
+  // 写回后端,然后把后端 WS 帧流接到 #vcs-canvas(已被 wizard 搬到
+  // canvasWrap 内,getElementById 不变,直接画就行)。
+  const openBtn  = vcsEl("vcs-open");
+  const closeBtn = vcsEl("vcs-close");
+  const loopEl   = vcsEl("vcs-loop");
+  openBtn?.addEventListener("click", () => {
+    const src = (sourceEl?.value || "").trim();
+    vcsOpenPreview(src, !!(loopEl && loopEl.checked));
+  });
+  closeBtn?.addEventListener("click", () => {
+    vcsClosePreview();
+  });
+  // loop 同步到后端:不重 open(避免断流),走独立控制端点 (暂用 close+open)
+  loopEl?.addEventListener("change", async () => {
+    if (!VAS_SEARCH.previewWs) return;
+    const src = (sourceEl?.value || "").trim();
+    if (!src) return;
+    try { await fetch(API_PREFIX + "/video-analysis-search/source/close", { method: "POST" }); }
+    catch (_) {}
+    vcsOpenPreview(src, !!loopEl.checked);
+  });
   // 功能勾选切换 → 重算按钮 / 子栏启用态
   vcsEl("vas-mode-analyze")?.addEventListener("change", vasUpdateButtons);
   vcsEl("vas-mode-search")?.addEventListener("change", vasUpdateButtons);
@@ -3040,6 +3155,7 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
   };
 
   if (opts.source) setVal("vcs-source", opts.source);
+  if (opts.loop != null) setChecked("vcs-loop", !!opts.loop);
   if (opts.prompt) setVal("vas-prompt", opts.prompt);
   if (opts.everyN != null && opts.everyN !== "") setVal("vas-every-n", String(opts.everyN));
   // 检索问题可选:填了才启用「检索」功能并写入问题框(勾选动作统一放到

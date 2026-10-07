@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.apps.video_analysis_search.api import router as analysis_router
+from app.apps.video_analysis_search.api import preview_router, router as analysis_router
 from app.apps.video_analysis_search.search_api import router as search_router
 
 LOG = __import__("logging").getLogger("apps.video_analysis_search")
@@ -30,14 +30,16 @@ _API_PREFIX = "/api/video-analysis-search"
 
 
 def register_api(app: FastAPI) -> None:
-    """Mount the card's analysis + search routers.
+    """Mount the card's analysis + search + preview routers.
 
-    分析侧 → ``/api/video-analysis-search/analysis/*``；
-    检索侧 → ``/api/video-analysis-search/search/*``。
+    分析侧     → ``/api/video-analysis-search/analysis/*``
+    检索侧     → ``/api/video-analysis-search/search/*``
+    向导预览   → ``/api/video-analysis-search/{upload,source/{open,close,ws}}``
     """
     app.include_router(analysis_router, prefix=_API_PREFIX + "/analysis")
     app.include_router(search_router, prefix=_API_PREFIX + "/search")
-    LOG.info("video_analysis_search: API mounted at %s/{analysis,search}",
+    app.include_router(preview_router, prefix=_API_PREFIX)
+    LOG.info("video_analysis_search: API mounted at %s/{analysis,preview,search}",
              _API_PREFIX)
 
 

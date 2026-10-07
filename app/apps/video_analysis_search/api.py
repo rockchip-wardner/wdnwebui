@@ -1,17 +1,45 @@
-"""视频分析检索：REST + WebSocket（分析 + 检索合并卡片）。"""
+"""视频分析检索：REST + WebSocket（分析 + 检索合并卡片）。
+
+v0.15 起合并页顶部多了一个『视频源预览』区 —— 向导模式（v0.4 wizard）
+在 source 步骤里把 app 自己的 #vcs-canvas 搬到 wizard 内嵌预览，
+后端复用 ``app.core.video.session.get_session()`` 这一个
+``VideoSession`` 单例（vd / vtd / vtl / vcs 四页共享同一路解码 +
+WS 帧流），保证向导预览帧率与其他视频 app 一致，避免每页各起一份
+wdnav 解码线程争 NPU / DDR。
+"""
 from __future__ import annotations
 
 import asyncio
+import queue
+import shutil
 import urllib.parse
+from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from app.apps.video_analysis_search.service import LOG, get_service
+from app.core.config import default_resource_root
+from app.core.video.session import get_session
 
 
 router = APIRouter(tags=["video-analysis-search"])
+
+# 向导模式共享 router — 挂在 /api/video-analysis-search 根前缀,
+# 与 vd / vtd / vtl 的 /upload /open /close /ws 平级。
+# 不与分析侧 /analysis/* 或检索侧 /search/* 路径冲突(避免给已
+# 稳定的子路径上加路由,降低 review/grep 干扰)。
+preview_router = APIRouter(tags=["video-analysis-search-preview"])
+
+# 向导模式拖放上传的视频文件落地目录 — 三个视频 app 共用同一目录
+# ``<resource_dir>/uploads``(设备端 ``/userdata/assets/uploads``)。
+# 与 vd / vtd / vtl 完全一致;同名文件直接覆盖(``open("wb")`` 截断写)。
+UPLOAD_DIR = default_resource_root() / "uploads"
+try:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 
 
 @router.get("")
@@ -25,6 +53,138 @@ async def get_snapshot() -> dict:
     某些代理/客户端下重定向会丢 header。
     """
     return get_service().snapshot()
+
+
+# --------------------------------------------------------------------- #
+# 向导模式预览 — 复用 vd 单例 VideoSession（vd / vtd / vtl / vcs 共享）
+# --------------------------------------------------------------------- #
+@preview_router.post("/upload")
+async def upload_video(file: UploadFile = File(...)) -> dict:
+    """向导模式拖放上传 → 写到 ``UPLOAD_DIR``(与 vd / vtd / vtl 共用)。
+
+    与 vd 的 ``/api/video-detection/upload`` 行为完全一致(由
+    ``app.core.uploads`` 兜底),保证用户从任一视频应用拖放上传,
+    在另一应用里直接用同一绝对路径不会再产生第二份副本。
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="empty filename")
+    safe_name = Path(file.filename).name
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if not Path(safe_name).suffix:
+        safe_name = safe_name + ".bin"
+    dest = UPLOAD_DIR / safe_name
+    try:
+        with dest.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"write failed: {e}")
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
+    return {
+        "path": str(dest),
+        "name": file.filename,
+        "size": dest.stat().st_size,
+    }
+
+
+@preview_router.post("/source/open")
+async def open_source(payload: dict) -> dict:
+    """向导模式预览:打开视频源(复用 vd 单例 VideoSession)。
+
+    与 vd 的 ``/open`` 行为一致 —— ``get_session()`` 拿到的是 vd
+    / vtd / vtl / vcs 四页共享的同一个 ``VideoSession`` 单例;vcs
+    仅消费 WS 帧流、不注册 frame sink,不会与 vd 的 detector 抢帧。
+    视频源路径可以是本地文件 / RTSP / RTMP / HLS / 摄像头,统一
+    走 :func:`VideoSession.open` 路由。
+    """
+    payload = payload or {}
+    source = (payload.get("source") or "").strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="source required")
+    loop = bool(payload.get("loop", False))
+    try:
+        return get_session().open(source, loop=loop)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"open failed: {e}")
+
+
+@preview_router.post("/source/close")
+async def close_source() -> dict:
+    """向导模式预览:关闭视频源。
+
+    与 vd 的 ``/close`` 等价;只是清理共享 session,不会杀掉分析侧
+    / 检索侧的解码 / VLM 任务。
+    """
+    return get_session().close()
+
+
+@preview_router.get("/source")
+async def get_source_snapshot() -> dict:
+    """向导模式预览:取当前预览 session 快照(状态 / 尺寸 / fps / loop)。"""
+    return get_session().snapshot()
+
+
+@preview_router.websocket("/source/ws")
+async def ws_source(ws: WebSocket) -> None:
+    """向导模式预览:JPEG 帧流(由 ``VideoSession`` 广播给每个订阅者)。
+
+    与 ``/api/video-detection/ws`` 走同一个 ``VideoSession.subscribe()``,
+    因此 vcs 向导预览的实时性和 vd / vtd / vtl 严格一致(共享一份解码 +
+    编码线程;每路 WS 各自一个订阅队列,broadcast 模式)。
+    """
+    await ws.accept()
+    session = get_session()
+    loop = asyncio.get_event_loop()
+    sub_q = session.subscribe()
+    last_status = 0.0
+    eof_sent = False
+    try:
+        while True:
+            try:
+                item = await loop.run_in_executor(
+                    None, lambda: sub_q.get(timeout=0.05)
+                )
+            except queue.Empty:
+                item = None
+            if item is None:
+                now = loop.time()
+                if now - last_status >= 1.0:
+                    snap = session.snapshot()
+                    snap["type"] = "status"
+                    await ws.send_json(snap)
+                    last_status = now
+                continue
+            if item is session._EOF:
+                if not eof_sent:
+                    snap = session.snapshot()
+                    snap["type"] = "eof"
+                    await ws.send_json(snap)
+                    eof_sent = True
+                await asyncio.sleep(0.2)
+                continue
+            eof_sent = False
+            await ws.send_bytes(item)
+            now = loop.time()
+            if now - last_status >= 1.0:
+                snap = session.snapshot()
+                snap["type"] = "status"
+                await ws.send_json(snap)
+                last_status = now
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        LOG.warning("vcs source/ws: abnormal disconnect", exc_info=True)
+    finally:
+        try:
+            session.unsubscribe(sub_q)
+        except Exception:
+            pass
 
 
 @router.get("/events")

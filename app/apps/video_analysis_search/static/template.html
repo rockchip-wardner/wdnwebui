@@ -30,6 +30,12 @@
                   <button type="button" class="vd-btn" id="vcs-browse">浏览…</button>
                 </div>
                 <div class="vd-actions-row">
+                  <button type="button" class="vd-btn vd-btn-primary" id="vcs-open">打开</button>
+                  <button type="button" class="vd-btn" id="vcs-close">关闭</button>
+                  <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
+                    <input type="checkbox" id="vcs-loop" />
+                    <span>循环播放</span>
+                  </label>
                   <span class="vd-meta" id="vcs-source-meta">尚未选择</span>
                 </div>
               </div>
@@ -195,7 +201,7 @@
           <div class="vd-stage-col">
             <div class="vd-stage">
               <canvas id="vcs-canvas" width="960" height="540"></canvas>
-              <div class="vd-overlay" id="vcs-overlay">选择视频并开始，检索后点击命中片段在此播放</div>
+              <div class="vd-overlay" id="vcs-overlay" hidden></div>
             </div>
 
             <div class="vd-controls">
