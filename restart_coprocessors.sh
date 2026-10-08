@@ -1,13 +1,14 @@
 #!/bin/bash
 # 重启所有 RK NPU 协处理器
 #
-# 镜像 pyrkaiweb `app/api/coprocessor.py` 里的复位序列:
-#   1) sudo rknn-smi reset -t hw -d 0    ×4
-#      (某些板子第一次复位不生效,需要多试几次 — 与
-#       /userdata/samples/reset_182x.sh 行为一致)
+# 镜像 wdnwebui `app/system/api/coprocessor.py` 里的复位序列:
+#   1) wdnai.RknnSmi.hw_reset_device(0)  (内部循环 4 次,跟旧 reset_182x.sh
+#      "某些板子第一次复位不生效,需要多试几次" 的语义对齐)
 #   2) sudo rknn3_startup restart
 #
-# 与 Python 端一致:
+# wdnwebui 已禁止用 `rknn-smi` CLI 来查询 NPU 状态或执行复位,
+# 本脚本保留是为了在没有 wdnwebui 的极简目标 (例如仅装 reset_182x.sh
+# 的工厂治具) 上人工排障时仍能跑;复位的"成功"判定走同样的退出码:
 #   - `rknn-smi reset -t hw -d 0` 退出码 255 表示"目标 NPU 已处于复位后
 #     状态,无需再操作",属于良性结果,继续后续步骤。
 #   - `rknn3_startup restart` 必须返回 0。

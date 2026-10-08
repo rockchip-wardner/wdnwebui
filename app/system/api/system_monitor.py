@@ -1,9 +1,18 @@
 """System monitor endpoint.
 
 Returns CPU/memory usage (via psutil), per-thermal-zone temperature read
-from sysfs, and per-device NPU telemetry parsed from ``rknn-smi info``.
+from sysfs, and per-device NPU telemetry. NPU data is read through the
+``wdnai.RknnSmi`` ctypes shim (``/usr/lib/librknnsmi.so``) — the same
+C ABI the ``rknn-smi`` CLI uses, but in-process so we don't fork a
+subprocess for every poll. The legacy `rknn-smi info` table parser is
+kept for fallback (e.g. very old targets where the SO isn't shipped)
+but is no longer the default.
+
 Service must run as root (or with sudo) so the NPU driver's sysfs/BAR
-interface and ``/sys/class/thermal/`` are readable.
+interface and ``/sys/class/thermal/`` are readable, AND so the
+``/tmp/rknnsmi.lock`` flock taken by ``librknnsmi.so``'s ``init`` can
+be acquired (the lock file is created 0666 but ``flock`` against a
+file the process can't write fails with EACCES on some kernels).
 """
 from __future__ import annotations
 
@@ -21,6 +30,9 @@ from fastapi import APIRouter
 
 router = APIRouter(tags=["system-monitor"])
 
+# 旧 fallback 路径：``rknn-smi info`` 子进程。默认不再走，保留是因为
+# 极少数目标（如 5.10 BSP 之前不带 librknnsmi.so 的镜像）仍然只能靠
+# CLI 拿数。前端永远看到相同 shape 的 JSON。
 _RKNNSMI_BIN = "rknn-smi"
 _RKNNSMI_TIMEOUT_S = 5
 _BLOCK_SEP = re.compile(r"^\+[-=]+\+\s*$", re.MULTILINE)
@@ -201,7 +213,7 @@ def _wdnai_canonical_device_index(bus_id: str | None) -> int | None:
     enumerate-index in ``RKNN3Lite().get_devices_id()``.
 
     wdnai (and therefore 算力配置页) uses ``enumerate(get_devices_id())``
-    as the canonical ``npu_index``; ``rknn-smi info`` numbers devices by
+    as the canonical ``npu_index``; the SMI driver numbers devices by
     its own internal order, which doesn't always match. This helper
     bridges the two so 系统信息 / 算力卡信息 and 算力配置 label the same
     physical card with the same ``#K``. Returns ``None`` when wdnai is
@@ -210,7 +222,7 @@ def _wdnai_canonical_device_index(bus_id: str | None) -> int | None:
 
     Caches the ``RKNN3Lite`` probe and the resolved lookup map at
     module scope. ``/api/system-monitor`` calls this once per
-    rknn-smi device per poll; without the cache each call instantiates
+    smi device per poll; without the cache each call instantiates
     a new ``RKNN3Lite`` (which opens ``/dev/rknn3`` and contends with
     the worker's inference on RK3588).
     """
@@ -239,13 +251,13 @@ _wdnai_dev_ids: Optional[list] = None
 
 
 def _align_npu_indices(devices: list[dict]) -> list[dict]:
-    """Re-index each rknn-smi row to the wdnai-canonical ``npu_index``.
+    """Re-index each smi row to the wdnai-canonical ``npu_index``.
 
-    Sorts the returned list by the canonical index (rknn-smi-only
+    Sorts the returned list by the canonical index (smi-only
     orphans come last, in their original order) so the UI sees
     ``#0, #1, #2, ...`` in the same order the 算力配置 page does. The
     rknn-smi native idx is preserved as ``rknn_smi_idx`` for debugging.
-    Orphans (cards wdnai can't see, e.g. rknn-smi mis-scan) get a
+    Orphans (cards wdnai can't see, e.g. smi mis-scan) get a
     negative ``index`` and an ``orphan=True`` flag so they render
     after the canonical rows without colliding on the same ``#N``.
     """
@@ -268,12 +280,188 @@ def _align_npu_indices(devices: list[dict]) -> list[dict]:
     return [t[3] for t in aligned]
 
 
+async def _collect_npu_via_smi() -> list[dict]:
+    """Read per-device NPU telemetry via :class:`wdnai.RknnSmi`.
+
+    Returns a list of dicts in the same shape as
+    :func:`_parse_rknn_smi_table` produced (so the downstream
+    :func:`_align_npu_indices` reordering and the frontend rendering
+    paths need no changes):
+
+        {index, id, type, bus_id, status, health, power_mw, temp_c,
+         npu_percent, mem_used_mb, mem_total_mb, mem_raw}
+
+    Each per-device probe is wrapped in its own try/except so a
+    single bad device (e.g. one that just rebooted and has no chip
+    info yet) doesn't blank the whole card grid. Returns an empty
+    list if the SO can't be opened at all; callers should fall back
+    to the CLI parser.
+    """
+    from wdnai import RknnSmi  # local import: wdnai pulls cv2 + gguf
+
+    def _probe() -> list[dict]:
+        smi = RknnSmi()
+        devs = smi.get_device_list()
+        out: list[dict] = []
+        for d in devs:
+            idx = int(d["index"])
+            row: dict = {
+                "index": idx,
+                "id": None,
+                "type": d.get("mode"),
+                "bus_id": None,
+                "status": "Online",
+                "health": None,
+                "power_mw": None,
+                "temp_c": None,
+                "npu_percent": None,
+                "mem_used_mb": None,
+                "mem_total_mb": None,
+                "mem_raw": None,
+                "rknn_smi_idx": idx,
+            }
+            # device_info / chip_info — best-effort, log on failure
+            try:
+                info = smi.get_device_info(idx)
+                if info.get("product_name"):
+                    row["id"] = info["product_name"]
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(
+                    "rknnsmi get_device_info(%d) failed: %s: %s",
+                    idx, type(e).__name__, e,
+                )
+            try:
+                chips = smi.get_chip_list(idx)
+                chip_id = chips[0] if chips else 0
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(
+                    "rknnsmi get_chip_list(%d) failed: %s: %s",
+                    idx, type(e).__name__, e,
+                )
+                chip_id = 0
+            try:
+                pcie = smi.get_pcie_info(idx, chip_id)
+                if pcie.get("bus_id"):
+                    row["bus_id"] = pcie["bus_id"]
+            except Exception:
+                # USB / ETH devices don't expose PCIe BDF; leave None.
+                pass
+            try:
+                row["temp_c"] = smi.get_device_temperature(idx)
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(
+                    "rknnsmi get_device_temperature(%d) failed: %s: %s",
+                    idx, type(e).__name__, e,
+                )
+            try:
+                row["power_mw"] = smi.get_device_power(idx)
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(
+                    "rknnsmi get_device_power(%d) failed: %s: %s",
+                    idx, type(e).__name__, e,
+                )
+            try:
+                npu = smi.get_npu_info(idx, chip_id)
+                row["npu_percent"] = float(npu.get("util_rate_pct", 0) or 0)
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(
+                    "rknnsmi get_npu_info(%d, %d) failed: %s: %s",
+                    idx, chip_id, type(e).__name__, e,
+                )
+            try:
+                mem = smi.get_memory_info(idx, chip_id)
+                total = int(mem.get("total_size", 0))
+                free = int(mem.get("free_size", 0))
+                if total > 0:
+                    used = max(0, total - free)
+                    row["mem_total_mb"] = round(total / (1024 * 1024), 1)
+                    row["mem_used_mb"] = round(used / (1024 * 1024), 1)
+                    row["mem_raw"] = (
+                        f"{int(used / (1024 * 1024))} / "
+                        f"{int(total / (1024 * 1024))}"
+                    )
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(
+                    "rknnsmi get_memory_info(%d, %d) failed: %s: %s",
+                    idx, chip_id, type(e).__name__, e,
+                )
+            try:
+                health = smi.get_chip_health(idx, chip_id)
+                row["health"] = health.name
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(
+                    "rknnsmi get_chip_health(%d, %d) failed: %s: %s",
+                    idx, chip_id, type(e).__name__, e,
+                )
+            out.append(row)
+        return out
+
+    try:
+        return await asyncio.to_thread(_probe)
+    except Exception as e:  # noqa: BLE001
+        # RknnSmi init failed (no SO, no root, no driver). Let caller
+        # try the CLI fallback. We do NOT raise — the endpoint should
+        # still return a valid (degraded) JSON shape.
+        raise _SmiUnavailable(str(e))
+
+
+class _SmiUnavailable(Exception):
+    """Marker: in-process RknnSmi shim could not be initialized.
+
+    Handled by :func:`_collect_npu` to decide between the
+    wdnai RknnSmi path (preferred) and the ``rknn-smi info`` CLI
+    fallback (legacy targets without ``librknnsmi.so``).
+    """
+
+
 async def _collect_npu() -> dict:
+    """Aggregate NPU device telemetry, with graceful degradation.
+
+    Tries the in-process :class:`wdnai.RknnSmi` ctypes shim first
+    (no subprocess, no per-poll fork). If the shim can't load or
+    ``rknnsmi_init`` fails (e.g. SO not present on very old images,
+    or the process is missing the privileges to grab
+    ``/tmp/rknnsmi.lock``), falls back to the legacy
+    ``rknn-smi info`` subprocess + table parser so the UI keeps
+    showing data instead of going dark.
+
+    Either way the response shape is the same — frontend rendering
+    doesn't care which path produced the data.
+    """
+    try:
+        devices = _align_npu_indices(await _collect_npu_via_smi())
+        return {
+            "available": True,
+            "source": "wdnai.RknnSmi",
+            "devices": devices,
+            "raw_output": "",
+            "stderr": "",
+        }
+    except _SmiUnavailable as e:
+        fallback_reason = f"wdnai.RknnSmi unavailable: {e}"
+    except Exception as e:  # noqa: BLE001
+        # Per-device errors we can't predict — also fall back to the
+        # CLI rather than blanking the UI on a single broken probe.
+        fallback_reason = f"wdnai.RknnSmi runtime error: {type(e).__name__}: {e}"
+
+    # --- legacy CLI fallback (deprecated; kept for very old images
+    # without librknnsmi.so). The legacy parser is still loaded because
+    # the v0.4 dependency upgrade doesn't *guarantee* the SO is on
+    # the target — only the typical wdnai install path does.
     if shutil.which(_RKNNSMI_BIN) is None:
         return {
             "available": False,
             "source": _RKNNSMI_BIN,
-            "reason": f"{_RKNNSMI_BIN} not found in PATH",
+            "reason": (
+                f"{fallback_reason}; and {_RKNNSMI_BIN} not in PATH"
+            ),
             "devices": [],
             "raw_output": "",
             "stderr": "",
@@ -283,7 +471,9 @@ async def _collect_npu() -> dict:
         return {
             "available": False,
             "source": _RKNNSMI_BIN,
-            "reason": f"exit={rc}; empty output",
+            "reason": (
+                f"{fallback_reason}; CLI exit={rc}, empty output"
+            ),
             "devices": [],
             "raw_output": stdout,
             "stderr": stderr,
@@ -291,7 +481,7 @@ async def _collect_npu() -> dict:
     devices = _align_npu_indices(_parse_rknn_smi_table(stdout))
     return {
         "available": True,
-        "source": _RKNNSMI_BIN,
+        "source": f"{_RKNNSMI_BIN} (fallback: {fallback_reason})",
         "devices": devices,
         "raw_output": stdout,
         "stderr": stderr,

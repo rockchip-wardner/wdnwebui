@@ -5,18 +5,22 @@ on-device sample ``/userdata/samples/reset_182x.sh`` directly, streaming
 each step's stdout / stderr to the client so the user can watch the
 NPU come back up:
 
-    sudo rknn-smi reset -t hw -d 0    # ×4 (the original script repeats
-                                     # the reset for chips that don't
-                                     # always take it on the first try)
+    rknnsmi_hw_reset_device(0)          # ×4 (some chips don't take
+                                       # the reset on the first try)
     sudo rknn3_startup restart
     <in-process> restart all spawned compute_worker processes
 
-The commands are inlined (and wrapped in ``sudo`` to match the original
-sample) rather than shelling out to a script file because the sample
-isn't guaranteed to exist on every target. Each subprocess call is
-bounded by ``_STEP_TIMEOUT_S``; on expiry the process tree is killed
-and a timeout message is reported so the WS closes even when a step is
-wedged.
+The NPU reset step is **not** a shell-out to ``rknn-smi reset -t hw``:
+wdnwebui is required to avoid invoking the rknn-smi CLI per the
+"全面禁止使用 rknn-smi 命令查询 NPU 状态" constraint. Instead we call
+``wdnai.RknnSmi.hw_reset_device(...)`` which is the ctypes shim over
+``/usr/lib/librknnsmi.so``. This requires the webui process to have
+permission to ``open(O_RDWR | O_CREAT) /tmp/rknnsmi.lock`` and to talk
+to the NPU driver — same privileges the legacy ``sudo rknn-smi``
+invocation assumed.
+
+Each step is bounded by ``_STEP_TIMEOUT_S``; on expiry the step is
+marked failed and the WS closes.
 
 The compute-worker restart step (``restart_all_local``) runs
 in-process and uses the Q3 4-step per-instance flow (unload → shutdown
@@ -24,13 +28,15 @@ in-process and uses the Q3 4-step per-instance flow (unload → shutdown
 ``rknn3_startup restart`` so the new rknn3 driver userspace is live
 when workers re-open it; doing it before would race the reset.
 
-``rknn-smi reset -t hw -d 0`` frequently exits with code 255 when the
-target NPU is already in the expected post-reset state — that's a
-benign "nothing to reset" reply, not a failure. Each entry in
-``_STEPS`` carries an ``acceptable_exits`` set so such non-zero but
-expected exit codes don't abort the rest of the sequence. The WS
-``step_end`` frame includes an ``accepted`` flag the UI uses to colour
-the line (danger vs. warn).
+``rknnsmi_hw_reset_device`` returns ``RKNNSMI_SUCCESS`` (=0) on
+success, and a negative ``RKNNSMI_ERR_*`` code otherwise. Code
+``-4 (RKNNSMI_ERR_STATE)`` and a few other transient codes are
+treated as "the chip is already in the expected post-reset state" —
+the same benign case the legacy ``rknn-smi reset -t hw -d 0`` rc=255
+covered. Each entry in ``_STEPS`` carries an ``acceptable_codes`` set
+so such non-success but expected codes don't abort the rest of the
+sequence. The WS ``step_end`` frame includes an ``accepted`` flag
+the UI uses to colour the line (danger vs. warn).
 
 WS frame types:
 - ``step_start`` — ``{index, total, command, message}``
@@ -54,7 +60,73 @@ from app.core.compute.registry import ComputeRegistry, get_registry
 router = APIRouter(tags=["coprocessor"])
 
 
-_RKNNSMI_RESET_OK = {0, 255}
+# rknnsmi 返回的 success 码 = 0；STATE = -4 (chip 已经在预期状态
+# —— 跟旧路径 rknn-smi 退出码 255 等价)；其余负码是真正的错误。
+_RKNNSMI_RESET_OK = {0, -4}
+_RESET_DEVICE_ID = 0
+# 重试次数：旧 reset_182x.sh 把 rknn-smi reset 跑 4 次。新路径直接重试
+# 同一次调用 4 次比维护 4 个 _STEPS 条目更直观，也避免 WS 客户端看到
+# 4 段几乎一样的 step_start。原始脚本的"重试理由"——某些板子第一次不
+# 生效——我们保留这个语义（timeout 内的循环重试）。
+_HW_RESET_ATTEMPTS = 4
+
+
+# ---- in-process step: 硬件复位 NPU（替代旧 sudo rknn-smi reset -t hw）----
+def _hw_reset_npu_step() -> tuple[int, str, str]:
+    """Drive ``rknnsmi_hw_reset_device`` N times (legacy = 4).
+
+    Returns ``(exit, stdout, stderr)`` so it slots into the same
+    step_start/step_end frames as the shell commands.
+
+    exit = 0   → 至少一次 reset 成功（其余可能命中 RKNNSMI_ERR_STATE，
+                  跟旧 rknn-smi rc=255 等价)
+    exit = 1   → 所有重试都返回非可接受错误码
+
+    The :class:`wdnai.RknnSmi` shim wraps ``/usr/lib/librknnsmi.so``;
+    no subprocess is involved.
+    """
+    from wdnai import RknnSmi, RknnSmiError
+    try:
+        smi = RknnSmi()
+    except Exception as e:  # noqa: BLE001
+        return 1, "", f"RknnSmi 初始化失败: {type(e).__name__}: {e}"
+
+    last_code: int | None = None
+    log_lines: list[str] = []
+    for attempt in range(1, _HW_RESET_ATTEMPTS + 1):
+        try:
+            smi.hw_reset_device(_RESET_DEVICE_ID)
+            log_lines.append(
+                f"rknnsmi_hw_reset_device({_RESET_DEVICE_ID}) "
+                f"attempt {attempt}/{_HW_RESET_ATTEMPTS}: OK"
+            )
+            return 0, "\n".join(log_lines), ""
+        except RknnSmiError as e:
+            last_code = e.code
+            log_lines.append(
+                f"rknnsmi_hw_reset_device({_RESET_DEVICE_ID}) "
+                f"attempt {attempt}/{_HW_RESET_ATTEMPTS}: "
+                f"{e.enum.name} ({e.code})"
+            )
+            if last_code in _RKNNSMI_RESET_OK:
+                # 已经在预期状态 — 跟旧 rknn-smi rc=255 同义。
+                return 0, "\n".join(log_lines), ""
+            # 其他错：等 0.5s 再试一次，模拟旧 reset_182x.sh 的节奏。
+            time.sleep(0.5)
+        except Exception as e:  # noqa: BLE001
+            log_lines.append(
+                f"rknnsmi_hw_reset_device({_RESET_DEVICE_ID}) "
+                f"attempt {attempt}/{_HW_RESET_ATTEMPTS}: "
+                f"{type(e).__name__}: {e}"
+            )
+            last_code = -1
+            time.sleep(0.5)
+
+    return (
+        1,
+        "\n".join(log_lines),
+        f"硬件复位 {_HW_RESET_ATTEMPTS} 次均失败 (last code={last_code})",
+    )
 
 
 # ---- in-process step: 重启全部 spawned compute_worker ----
@@ -95,10 +167,12 @@ _Step = Union[_ShellStep, _CallableStep]
 
 
 _STEPS: list[tuple[_Step, set[int]]] = [
-    (["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"], _RKNNSMI_RESET_OK),
-    (["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"], _RKNNSMI_RESET_OK),
-    (["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"], _RKNNSMI_RESET_OK),
-    (["sudo", "rknn-smi", "reset", "-t", "hw", "-d", "0"], _RKNNSMI_RESET_OK),
+    # NPU 硬件复位：旧路径是 4 次 `sudo rknn-smi reset -t hw -d 0`。
+    # 改用 wdnai.RknnSmi 后内部循环 4 次，单条 step 一次性跑完，
+    # 避免前端看到 4 行几乎一样的 step_start。retry 节奏（每次间隔
+    # 0.5s）跟旧 reset_182x.sh 对齐 —— 上游注释："某些板子第一次
+    # 复位不生效,需要多试几次"。
+    (_hw_reset_npu_step, {0}),
     (["sudo", "rknn3_startup", "restart"], {0}),
     # 必须放在 rknn3_startup 之后：worker 重启时会重新打开 rknn3 驱动。
     # 没有 spawned worker 时这条 step 走 rc=0 + stdout="无 spawned

@@ -2114,7 +2114,8 @@ const ComputeConfigPage = {
 
       // 首屏：并行拉 compute + system-monitor。
       // 之后每 tick 只拉 compute（status 变化快）。system-monitor 不
-      // 再高频轮询 —— 会把 rknn-smi 打挂，3s 一次即可。
+      // 再高频轮询 —— 每次都会过 librknnsmi.so + libfastdds，3s 一
+      // 次即可（v0.5 之前 fork rknn-smi 时它更扛不住，被砍到 3s）。
       const firstLoad = this._snapshot == null;
       const rComp = await fetchCompute();
       if (!rComp.ok) throw new Error("compute HTTP " + rComp.status);
@@ -2123,7 +2124,8 @@ const ComputeConfigPage = {
       if (firstLoad || this._systemTickCount % 3 === 0) {
         // 每 3 个 compute tick（约 3s）刷新一次 system-monitor，
         // 顶部 3588 内存 + 每张 182x 卡显存 / 温度 / 功耗才能动。
-        // rknn-smi 不扛高频轮询。
+        // librknnsmi.so ctypes 调用虽然比 fork rknn-smi 子进程轻，
+        // 但 PCIe / sysfs 读仍然随每次拉取递增。3s 节拍已经够用。
         try {
           const rSys = await fetchSystem();
           if (rSys.ok) this._system = await rSys.json();
@@ -2243,7 +2245,7 @@ const ComputeConfigPage = {
     // 位置 1 ↔ #0、位置 2 ↔ #1，跨刷新稳定。详见 _sortNpuCards。
     let rk182xCards = this._sortNpuCards(cards).slice(0, MAX_RK182X_CARDS);
 
-    // wdnai 完全枚举不到 NPU 时，rknn-smi 兜底一次（host 没有 wdnai
+    // wdnai 完全枚举不到 NPU 时，librknnsmi 兜底一次（host 没有 wdnai
     // / rknn3 的开发板情况），同样按 name 排序后再 cap。
     if (rk182xCards.length === 0 && devices.length > 0) {
       const seen = new Set();
@@ -3463,7 +3465,7 @@ const ComputeConfigPage = {
 
     // 历史 bug：之前假设 ``npu_index == 0`` 是 RK3588 主控 SoC，把
     // enumerate 第 1 张 182x 显示成 "RK182x #0"，导致顶部内存条
-    // 跟运行在 radio 的 #K 跟系统其它地方（比如 rknn-smi / 系统
+    // 跟运行在 radio 的 #K 跟系统其它地方（比如 librknnsmi / 系统
     // 信息页）对不上 —— 选 #0 实际跑在 #1 上。
     //
     // 真相：``RKNN3Lite().get_devices_id()`` 枚举的是 RK182x 协卡
@@ -3569,7 +3571,7 @@ const ComputeConfigPage = {
   // 跟系统信息页 / radio 选 #N 实际跑在 #N 上对不上。
   //
   // 真相：wdnai 枚举的 npu_index 本身就是 canonical 编号（与系统
-  // 信息页 / rknn-smi 对齐后的 index 同源），按 npu_index 排即按
+  // 信息页 / librknnsmi 对齐后的 index 同源），按 npu_index 排即按
   // 物理编号从左到右。每张物理卡始终落在同一格，位置 = label。
   // ties 时按 device_id 字符串作 tiebreaker 稳定顺序。
   // 入参可能是 [{npu_index, device_id, ...}, ...]；按 npu_index 去重。
