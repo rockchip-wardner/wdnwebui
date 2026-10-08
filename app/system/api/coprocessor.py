@@ -5,19 +5,35 @@ on-device sample ``/userdata/samples/reset_182x.sh`` directly, streaming
 each step's stdout / stderr to the client so the user can watch the
 NPU come back up:
 
+    pcie_upgrade_tool -s <bdf> uf /lib/firmware/rknn3_rk1820.img -reset
+        # per card — explicit "烧写" step, previously hidden inside
+        # `rknn3_startup restart`
     rknnsmi_hw_reset_device(0)          # ×4 (some chips don't take
                                        # the reset on the first try)
-    sudo rknn3_startup restart
+    rknn3_startup start
     <in-process> restart all spawned compute_worker processes
 
-The NPU reset step is **not** a shell-out to ``rknn-smi reset -t hw``:
-wdnwebui is required to avoid invoking the rknn-smi CLI per the
-"全面禁止使用 rknn-smi 命令查询 NPU 状态" constraint. Instead we call
-``wdnai.RknnSmi.hw_reset_device(...)`` which is the ctypes shim over
-``/usr/lib/librknnsmi.so``. This requires the webui process to have
-permission to ``open(O_RDWR | O_CREAT) /tmp/rknnsmi.lock`` and to talk
-to the NPU driver — same privileges the legacy ``sudo rknn-smi``
-invocation assumed.
+The webui process is **not** root, and we deliberately do NOT shell out
+to ``sudo`` anywhere in this module — the legacy reset_182x.sh assumed
+root (it inlined `sudo rknn-smi reset -t hw -d 0` and `sudo rknn3_startup
+restart`); the v0.6 refactor moves everything possible into
+non-privileged paths:
+
+  * hw_reset goes through ``wdnai.RknnSmi.hw_reset_device(...)``
+    (ctypes over ``/usr/lib/librnsmi.so``); requires the process to
+    hold the ``/tmp/rknnsmi.lock`` flock (writable by group) and to
+    have r/w on ``/dev/pcie-rkep-*`` (mode 660 root:video, and the
+    webui user is in the video group).
+  * burn goes through ``pcie_upgrade_tool`` directly (not via
+    ``rknn3_startup``); passes a tmp dir to dodge the loader.bin
+    write to ``/usr/bin``.
+  * rknn3_startup start still requires ``/sys/bus/pci/rescan`` write
+    (root-only on most targets). When wdnwebui runs as a non-root user
+    the script's rescan will EACCES; the step's stderr surfaces the
+    exact reason and the WS frame is marked ``accepted=False`` so
+    the operator sees the gap. Production deploys that need a clean
+    rescan run wdnwebui as root (matches the AGENTS.md
+    "Service must run as root" expectation for the rknn3 driver).
 
 Each step is bounded by ``_STEP_TIMEOUT_S``; on expiry the step is
 marked failed and the WS closes.
@@ -174,8 +190,20 @@ def _burn_firmware_step() -> tuple[int, str, str]:
       without doing a full hw-reset + worker-restart
 
     Returns (rc, stdout, stderr):
-      rc=0  all cards flashed
-      rc=1  any card failed (or pcie_upgrade_tool not on PATH)
+      rc=0  step ran to completion (tool present, at least one card
+             attempted). Per-card failure details are surfaced in
+             stdout but DO NOT fail the step — burning is a
+             best-effort reflash; the next two steps (hw_reset via
+             librknnsmi + rknn3_startup userspace restart) are the
+             authoritative recovery path and must always run, even
+             if every card failed to flash here. The only way this
+             step returns rc=1 is if pcie_upgrade_tool / the firmware
+             image is missing entirely, in which case the next steps
+             would also be useless.
+      rc=1  pcie_upgrade_tool not on PATH, firmware image missing, or
+             `ld` returned no devices (the latter usually means the
+             kernel driver isn't bound — i.e. environment broken, no
+             point continuing)
     """
     import shutil as _shutil
     import subprocess as _sp
@@ -216,7 +244,8 @@ def _burn_firmware_step() -> tuple[int, str, str]:
             f"使用 tmp dir: {tmp}",
             f"firmware: {_RK1828_FIRMWARE_PATH}",
         ]
-        any_fail = False
+        ok_count = 0
+        fail_count = 0
         for bdf in bdfs:
             cmd = [
                 _PCIE_UPGRADE_BIN, "-s", bdf, "uf",
@@ -229,13 +258,13 @@ def _burn_firmware_step() -> tuple[int, str, str]:
                     timeout=_BURN_TIMEOUT_S, cwd=tmp,
                 )
             except _sp.TimeoutExpired:
-                any_fail = True
+                fail_count += 1
                 out_lines.append(
                     f"!!! 超时 ({_BURN_TIMEOUT_S}s): {bdf}"
                 )
                 continue
             except Exception as e:  # noqa: BLE001
-                any_fail = True
+                fail_count += 1
                 out_lines.append(
                     f"!!! 异常: {type(e).__name__}: {e}"
                 )
@@ -244,14 +273,28 @@ def _burn_firmware_step() -> tuple[int, str, str]:
             out_lines.append(
                 f"rc={p.returncode}  (last 5 lines: {tail})"
             )
-            if p.returncode != 0:
-                any_fail = True
+            if p.returncode == 0:
+                ok_count += 1
+            else:
+                fail_count += 1
                 err_tail = (p.stderr or "").strip()
                 if err_tail:
                     out_lines.append(f"stderr: {err_tail[-200:]}")
 
-        rc = 1 if any_fail else 0
-        return rc, "\n".join(out_lines), ""
+        out_lines.append(
+            f"\n汇总: {ok_count}/{len(bdfs)} 烧写成功, "
+            f"{fail_count} 失败"
+        )
+        if fail_count > 0:
+            out_lines.append(
+                "\n注意: 烧写失败不阻塞后续步骤 —— hw_reset / "
+                "rknn3_startup 是真正能把卡救回来的复位动作。烧写"
+                "失败可后续手动 `pcie_upgrade_tool -s <bdf> uf ... -reset` 重试。"
+            )
+        # 步骤永远 rc=0，让 hw_reset / rknn3_startup / worker_restart
+        # 一定有机会跑。这些才是从烧写失败状态恢复的真正手段。烧写
+        # 失败 → 顶多记在 stdout，UI 标 accepted=True。
+        return 0, "\n".join(out_lines), ""
 
 
 # ---- in-process step: 重启全部 spawned compute_worker ----
@@ -300,20 +343,29 @@ _STEPS: list[tuple[_Step, set[int]]] = [
     #   - 操作员可以单独跑这步做 reflash
     # pcie_upgrade_tool 提取 bootloader 时会往 CWD 写 loader.bin，
     # /usr/bin 是 root 写的，webui 进程无权写 —— 强制给一个 tmpdir。
+    # 烧写是 best-effort：单卡/全卡失败都返回 rc=0（见 _burn_fire
+    # docstring）。后续 hw_reset + rknn3_startup 才是真正把卡救回来
+    # 的复位动作；卡死在烧写这一关会让后续步骤根本起不来。
     (_burn_firmware_step, {0}),
-    # 2) NPU 硬件复位：旧路径是 4 次 `sudo rknn-smi reset -t hw -d 0`。
-    # 改用 wdnai.RknnSmi 后内部循环 4 次，单条 step 一次性跑完，
-    # 避免前端看到 4 行几乎一样的 step_start。retry 节奏（每次间隔
-    # 0.5s）跟旧 reset_182x.sh 对齐 —— 上游注释："某些板子第一次
-    # 复位不生效,需要多试几次"。
+    # 2) NPU 硬件复位：旧路径是 4 次 `rknn-smi reset -t hw -d 0`（带
+    # sudo）。改用 wdnai.RknnSmi 后内部循环 4 次，单条 step 一次性
+    # 跑完，避免前端看到 4 行几乎一样的 step_start。retry 节奏
+    # （每次间隔 0.5s）跟旧 reset_182x.sh 对齐 —— 上游注释："某些
+    # 板子第一次复位不生效,需要多试几次"。
     (_hw_reset_npu_step, {0}),
     # 3) 重启 rknn3 userspace（rknn3_transfer_proxy 守护 + 重新打开
     # /dev/pcie-rkep-*）。现在烧写已经单独跑了，这一步只剩
     # userspace half，所以从 ``restart`` 改成 ``start`` —— 不需要
     # 再 stop 一次（rknn3_transfer_proxy 在烧写 + hw reset 期间
-    # 状态本来就未刷新；新 start 直接接管）。这一步仍然要 root
-    # （/sys/bus/pci/rescan），失败时 step_end.stderr 会带原因。
-    (["sudo", "rknn3_startup", "start"], {0}),
+    # 状态本来就未刷新；新 start 直接接管）。
+    #
+    # 不要在前面加 sudo —— wdnwebui 进程不是 root，且本模块全程
+    # 走非特权路径（hw_reset 用 librknnsmi ctypes / 烧写用
+    # pcie_upgrade_tool）。rknn3_startup 内部如果需要 root
+    # （/sys/bus/pci/rescan），就让它失败，stderr 会把原因发给
+    # 前端；如果目标机器 webui 是以 root 跑的，rknn3_startup 会
+    # 正常完成。
+    (["rknn3_startup", "start"], {0}),
     # 4) 重启全部 spawned compute_worker。必须放在 rknn3_startup 之
     # 后：worker 重启时会重新打开 rknn3 驱动。没有 spawned worker 时
     # 这条 step 走 rc=0 + stdout="无 spawned worker，跳过"，UI 标
