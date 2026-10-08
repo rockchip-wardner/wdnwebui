@@ -3158,6 +3158,14 @@ body.dg-modal-open .back-home-btn {
   overflow: auto;
 }
 
+/* v0.15: adopted peer 卡 loading 中性文案(route A, 不带秒数) */
+.cc-peer-loading-note {
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-style: italic;
+  margin-top: 4px;
+}
+
 /* ---------- compute-config: 网络算力卡（只读，从 DDS 发现） ---------- */
 .cc-network-section {
   margin-bottom: 14px;

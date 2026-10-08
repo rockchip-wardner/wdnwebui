@@ -1378,8 +1378,26 @@ class ComputeRegistry:
         error_count   = sum(1 for i in instances if i["status"] == "error")
         loaded_count = sum(1 for i in instances
                            if i["status"] in {"running", "loading"})
+        # v0.15: per-source 拆分,顶部汇总"本机 X / 远端 Y"用。本机 =
+        # spawned ∪ adopted_local;远端 = adopted。unavailable 不进任何桶。
+        def _is_local(s):
+            return s in ("spawned", "adopted_local")
+        local_running_count  = sum(1 for i in instances
+                                   if i["status"] == "running" and _is_local(i.get("_source")))
+        remote_running_count  = sum(1 for i in instances
+                                   if i["status"] == "running" and i.get("_source") == "adopted")
+        local_loading_count  = sum(1 for i in instances
+                                   if i["status"] == "loading" and _is_local(i.get("_source")))
+        remote_loading_count = sum(1 for i in instances
+                                   if i["status"] == "loading" and i.get("_source") == "adopted")
+        local_error_count    = sum(1 for i in instances
+                                   if i["status"] == "error" and _is_local(i.get("_source")))
+        remote_error_count   = sum(1 for i in instances
+                                   if i["status"] == "error" and i.get("_source") == "adopted")
         capabilities = self.list_active_capabilities()
         services = self.list_with_source()
+        # v0.15: 不再产出 queued 计数 —— not_loaded 是默认态,顶部再报是
+        # 重复 + "排队"在中文里易误读。
 
         from app.core.tools.registry import get_tool_registry
         tool_reg = get_tool_registry()
@@ -1421,6 +1439,12 @@ class ComputeRegistry:
                                      if s["status"] == "not_loaded"),
             "loaded_count":      loaded_count,
             "error_count":       error_count,
+            "local_running_count":   local_running_count,
+            "remote_running_count":  remote_running_count,
+            "local_loading_count":   local_loading_count,
+            "remote_loading_count":  remote_loading_count,
+            "local_error_count":     local_error_count,
+            "remote_error_count":    remote_error_count,
             "estimated_init_seconds_per_model": estimated_per_model,
             "default_estimated_init_seconds":  DEFAULT_ESTIMATED_INIT_SECONDS,
             "worker_alive":      True,

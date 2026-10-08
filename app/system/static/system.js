@@ -2083,6 +2083,14 @@ const CC_PRESET_ORDER = [
 // 增/减协卡时同步改这里 + 各处"渲染 cap" 即可。
 const CC_MAX_RK182X_CARDS = 2;
 
+// v0.15: banner / 顶部汇总只对"本机算力"响。adopted 远端 peer 状态本机
+// 无权干预,告警 = 误导。_source 缺失按 spawned 兜底(与 _renderBanners
+// 错误桶 fallback 一致);unavailable 进本机桶以对齐"本机声明"语义,
+// 但 status="unavailable" 实际不触发任何 banner。
+function isLocalComputeSource(s) {
+  return s === "spawned" || s === "adopted_local" || s === "unavailable" || !s;
+}
+
 
 const ComputeConfigPage = {
   initialized: false,
@@ -2378,10 +2386,12 @@ const ComputeConfigPage = {
     const snap = this._snapshot || {};
     // missing_model_dir 单独在算力卡上提示，不进红色 banner —— 它
     // 是资源/环境缺失，不是真正的启动错误。
+    // v0.15: 三个 banner 入口都按 isLocalComputeSource 过滤,本机无权
+    // 干预的 adopted 远端 peer 不产生告警(详情见 _detectStuck / 错误桶)。
     const errored = (snap.instances || []).filter(
-      i => i.status === "error");
+      i => i.status === "error" && isLocalComputeSource(i._source));
     const missingDirs = (snap.instances || []).filter(
-      i => i.status === "missing_model_dir");
+      i => i.status === "missing_model_dir" && isLocalComputeSource(i._source));
     const stuck = this._detectStuck(snap);
 
     stack.innerHTML = "";
@@ -2453,15 +2463,15 @@ const ComputeConfigPage = {
       };
 
       // 三类按顺序渲染；标题文案区分清楚。
+      // v0.15: 删除 buckets.adopted 整桶 —— 远端 peer 本机无权操作,
+      // "对端失联"banner 违反"banner 只对本机算力响"原则(per-card 卡片
+      // 仍会显示 adopted state dot / error 文案,信息保留)。
       renderBucket("is-error",
         (l) => `${l.length} 个算力实例启动失败（用户主动启用）`,
         buckets.spawned);
       renderBucket("is-warn",
         (l) => `${l.length} 个本机孤儿 worker 异常（reload 残留，需 kill PID 清理）`,
         buckets.adopted_local);
-      renderBucket("is-warn",
-        (l) => `${l.length} 个对端 worker 失联（远端机子，本机无权操作）`,
-        buckets.adopted);
     }
 
     if (missingDirs.length) {
@@ -2542,6 +2552,9 @@ const ComputeConfigPage = {
     const out = [];
     for (const inst of snap.instances || []) {
       if (inst.status !== "queued" && inst.status !== "loading") continue;
+      // v0.15: 过滤 adopted —— 它的 started_at 是 adopt 时刻(进程内全程
+      // 不变),now - started_at 必然累积上千秒,触发假阳性卡住告警。
+      if (!isLocalComputeSource(inst._source)) continue;
       const est = perModel[inst.model_id] ?? snap.default_estimated_init_seconds ?? 10;
       const startTs = inst.status === "queued"
         ? (inst.queued_at || 0)
@@ -3249,6 +3262,16 @@ const ComputeConfigPage = {
       body.appendChild(pre);
     }
 
+    // v0.15: adopted peer 卡 loading 时给中性文案(route A) —— 本机无权
+    // 操作,精确秒数无意义且 adoption 后 locked_at - start_at 必是错的,
+    // 只解释 state-dot 脉冲即可。其他状态不动。
+    if (state === "loading") {
+      const note = document.createElement("div");
+      note.className = "cc-peer-loading-note";
+      note.textContent = "远端正在加载…";
+      body.appendChild(note);
+    }
+
     card.appendChild(body);
     return card;
   },
@@ -3612,21 +3635,34 @@ const ComputeConfigPage = {
   _renderSummary() {
     const snap = this._snapshot || {};
     const cards = snap.cards || [];
-    const running = snap.running_count || 0;
-    const queued  = snap.queued_count  || 0;
-    const loading = snap.loading_count || 0;
-    const error   = snap.error_count   || 0;
+    // v0.15: 双段汇总"本机 X / 远端 Y",不再合并。snapshot 端产出 6 个
+    // per-source 字段(running/loading/error),客户端直接读。not_loaded
+    // 不计入 —— 是默认态,per-card "未启用" badge 已显示。
     const rk182xCount = Math.min(
       CC_MAX_RK182X_CARDS,
       cards.length,
     );
-    const parts = [
-      `${rk182xCount} 张算力卡`,
-      `${running} 运行中`,
-      error   ? `${error} 失败`  : null,
-      loading ? `${loading} 加载中` : null,
-      queued  ? `${queued} 排队中`  : null,
-    ].filter(Boolean);
+    const L = {
+      run:  snap.local_running_count  || 0,
+      load: snap.local_loading_count || 0,
+      err:  snap.local_error_count   || 0,
+    };
+    const R = {
+      run:  snap.remote_running_count  || 0,
+      load: snap.remote_loading_count || 0,
+      err:  snap.remote_error_count   || 0,
+    };
+    const localParts = [];
+    if (L.run)  localParts.push(`${L.run} 运行`);
+    if (L.load) localParts.push(`${L.load} 加载`);
+    if (L.err)  localParts.push(`${L.err} 失败`);
+    const remoteParts = [];
+    if (R.run)  remoteParts.push(`${R.run} 运行`);
+    if (R.load) remoteParts.push(`${R.load} 加载`);
+    if (R.err)  remoteParts.push(`${R.err} 失败`);
+    const parts = [`${rk182xCount} 张算力卡`];
+    if (localParts.length)  parts.push(`本机 ${localParts.join("/")}`);
+    if (remoteParts.length) parts.push(`远端 ${remoteParts.join("/")}`);
     const at = document.getElementById("cc-collected-at");
     if (at) at.textContent = parts.join(" · ");
     const last = snap.last_updated;
