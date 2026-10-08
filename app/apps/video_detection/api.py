@@ -68,6 +68,14 @@ async def upload_video(file: UploadFile = File(...)) -> dict:
         safe_name = safe_name + ".bin"
     dest = UPLOAD_DIR / safe_name
     try:
+        # 同名覆盖: 先 unlink 再 open("wb"),避免目标文件由其他用户/不可写
+        # 拥有时 ``open("wb")`` 因需 inode 上的写权限而失败
+        # (PermissionError: [Errno 13]);unlink 走的是目录级写权限,与
+        # 新建文件一致。missing_ok=True 容忍首次上传时目标不存在。
+        try:
+            dest.unlink()
+        except FileNotFoundError:
+            pass
         with dest.open("wb") as f:
             shutil.copyfileobj(file.file, f)
     except Exception as e:
