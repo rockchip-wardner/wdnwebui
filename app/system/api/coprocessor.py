@@ -69,6 +69,10 @@ _RESET_DEVICE_ID = 0
 # 4 段几乎一样的 step_start。原始脚本的"重试理由"——某些板子第一次不
 # 生效——我们保留这个语义（timeout 内的循环重试）。
 _HW_RESET_ATTEMPTS = 4
+# 单卡 pcie_upgrade_tool uf 实测 1-2 GB PCIe DMA 写 3-4s 完成，给 30s
+# 富余（5.10 BSP 之前老镜像偶尔会卡在 bootloader 提取，30s 内会自然
+# 失败退出；超过 30s 视为卡死，kill 子进程 + step 失败）。
+_BURN_TIMEOUT_S = 30.0
 
 
 # ---- in-process step: 硬件复位 NPU（替代旧 sudo rknn-smi reset -t hw）----
@@ -129,6 +133,127 @@ def _hw_reset_npu_step() -> tuple[int, str, str]:
     )
 
 
+# ---- in-process step: 烧写 RK1828 firmware 到每张卡 ----
+_RK1828_FIRMWARE_PATH = "/lib/firmware/rknn3_rk1820.img"
+_PCIE_UPGRADE_BIN = "pcie_upgrade_tool"
+
+
+def _parse_pcie_addresses(text: str) -> list[str]:
+    """Extract PCIe BDF addresses from `pcie_upgrade_tool ld` output.
+
+    The tool prints lines like ``Addr=0000:01:00.0 [1d87:182a]``;
+    we pull the BDF and dedup. Empty / unparseable output → [].
+    """
+    import re as _re
+    out: list[str] = []
+    for line in text.splitlines():
+        m = _re.search(r"Addr=([0-9a-fA-F:.]+)", line)
+        if m:
+            bdf = m.group(1)
+            if bdf not in out:
+                out.append(bdf)
+    return out
+
+
+def _burn_firmware_step() -> tuple[int, str, str]:
+    """Run ``pcie_upgrade_tool uf <fw> -reset`` on every RK1828 card.
+
+    This is the "烧写命令" the user wants visible in the reset flow.
+    Old paths hid it inside ``rknn3_startup restart`` (which calls
+    `pcie_upgrade_tool` per-device as part of its ``start`` action) —
+    but when wdnwebui runs as a non-root user that script silently
+    no-ops on `/sys/bus/pci/rescan` and the burn never happens.
+    Surfacing it as its own WS step means:
+
+    * the UI shows the firmware-upload progress + per-card exit codes
+    * non-root failures (e.g. "Cannot new file /usr/bin/loader.bin"
+      when pcie_upgrade_tool can't write its working dir, or EACCES
+      on /sys/bus/pci/rescan) are visible in step_end.stderr instead
+      of being swallowed
+    * operators can run just this step if they only need to reflash
+      without doing a full hw-reset + worker-restart
+
+    Returns (rc, stdout, stderr):
+      rc=0  all cards flashed
+      rc=1  any card failed (or pcie_upgrade_tool not on PATH)
+    """
+    import shutil as _shutil
+    import subprocess as _sp
+    import tempfile
+
+    if _shutil.which(_PCIE_UPGRADE_BIN) is None:
+        return 1, "", f"未找到 {_PCIE_UPGRADE_BIN}（不在 PATH 中）"
+    if not os.path.isfile(_RK1828_FIRMWARE_PATH):
+        return 1, "", f"未找到 firmware 镜像: {_RK1828_FIRMWARE_PATH}"
+
+    # 1) 列出所有 RK1828 BDF。
+    try:
+        ld = _sp.run(
+            [_PCIE_UPGRADE_BIN, "ld"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except _sp.TimeoutExpired:
+        return 1, "", f"{_PCIE_UPGRADE_BIN} ld 超时 (10s)"
+    except Exception as e:  # noqa: BLE001
+        return 1, "", f"{_PCIE_UPGRADE_BIN} ld 失败: {type(e).__name__}: {e}"
+
+    bdfs = _parse_pcie_addresses(ld.stdout)
+    if not bdfs:
+        return (
+            1,
+            ld.stdout,
+            (ld.stderr or "")
+            + "\n未在 pcie_upgrade_tool ld 输出中找到任何 Addr= 行",
+        )
+
+    # 2) pcie_upgrade_tool 在提取 bootloader 阶段会尝试把 loader.bin
+    # 写到它自己的 CWD；/usr/bin 是 root 写的，所以非 root 跑会爆
+    # "Cannot new file /usr/bin/loader.bin"。给个可写的 tmp dir 让它
+    # 落地，行为不变（loader 走 DMA 不影响）。
+    with tempfile.TemporaryDirectory(prefix="wdnwebui-burn-") as tmp:
+        out_lines: list[str] = [
+            f"检测到 {len(bdfs)} 张 NPU: {', '.join(bdfs)}",
+            f"使用 tmp dir: {tmp}",
+            f"firmware: {_RK1828_FIRMWARE_PATH}",
+        ]
+        any_fail = False
+        for bdf in bdfs:
+            cmd = [
+                _PCIE_UPGRADE_BIN, "-s", bdf, "uf",
+                _RK1828_FIRMWARE_PATH, "-reset", tmp,
+            ]
+            out_lines.append(f"\n>>> {' '.join(cmd)}")
+            try:
+                p = _sp.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=_BURN_TIMEOUT_S, cwd=tmp,
+                )
+            except _sp.TimeoutExpired:
+                any_fail = True
+                out_lines.append(
+                    f"!!! 超时 ({_BURN_TIMEOUT_S}s): {bdf}"
+                )
+                continue
+            except Exception as e:  # noqa: BLE001
+                any_fail = True
+                out_lines.append(
+                    f"!!! 异常: {type(e).__name__}: {e}"
+                )
+                continue
+            tail = (p.stdout or "").strip().splitlines()[-5:]
+            out_lines.append(
+                f"rc={p.returncode}  (last 5 lines: {tail})"
+            )
+            if p.returncode != 0:
+                any_fail = True
+                err_tail = (p.stderr or "").strip()
+                if err_tail:
+                    out_lines.append(f"stderr: {err_tail[-200:]}")
+
+        rc = 1 if any_fail else 0
+        return rc, "\n".join(out_lines), ""
+
+
 # ---- in-process step: 重启全部 spawned compute_worker ----
 async def _restart_compute_workers_step() -> tuple[int, str, str]:
     """Drive :meth:`ComputeRegistry.restart_all_local` from inside the
@@ -167,17 +292,33 @@ _Step = Union[_ShellStep, _CallableStep]
 
 
 _STEPS: list[tuple[_Step, set[int]]] = [
-    # NPU 硬件复位：旧路径是 4 次 `sudo rknn-smi reset -t hw -d 0`。
+    # 1) 烧写 RK1828 firmware 到每张卡。旧路径隐藏在
+    # `rknn3_startup restart` 的 start 函数里，非 root 跑 webui 时
+    # 那个脚本会静默 no-op，用户看不到。把烧写独立成 step 后：
+    #   - UI 直接展示每张卡的 pcie_upgrade_tool 进度和 rc
+    #   - 失败（loader.bin 写不出 / rescan EACCES）有 stderr 可看
+    #   - 操作员可以单独跑这步做 reflash
+    # pcie_upgrade_tool 提取 bootloader 时会往 CWD 写 loader.bin，
+    # /usr/bin 是 root 写的，webui 进程无权写 —— 强制给一个 tmpdir。
+    (_burn_firmware_step, {0}),
+    # 2) NPU 硬件复位：旧路径是 4 次 `sudo rknn-smi reset -t hw -d 0`。
     # 改用 wdnai.RknnSmi 后内部循环 4 次，单条 step 一次性跑完，
     # 避免前端看到 4 行几乎一样的 step_start。retry 节奏（每次间隔
     # 0.5s）跟旧 reset_182x.sh 对齐 —— 上游注释："某些板子第一次
     # 复位不生效,需要多试几次"。
     (_hw_reset_npu_step, {0}),
-    (["sudo", "rknn3_startup", "restart"], {0}),
-    # 必须放在 rknn3_startup 之后：worker 重启时会重新打开 rknn3 驱动。
-    # 没有 spawned worker 时这条 step 走 rc=0 + stdout="无 spawned
-    # worker，跳过"，UI 标 ok 不影响整体 done。rc=1（任一 worker
-    # 失败）视为整步失败，让用户在 WS done 帧看到。
+    # 3) 重启 rknn3 userspace（rknn3_transfer_proxy 守护 + 重新打开
+    # /dev/pcie-rkep-*）。现在烧写已经单独跑了，这一步只剩
+    # userspace half，所以从 ``restart`` 改成 ``start`` —— 不需要
+    # 再 stop 一次（rknn3_transfer_proxy 在烧写 + hw reset 期间
+    # 状态本来就未刷新；新 start 直接接管）。这一步仍然要 root
+    # （/sys/bus/pci/rescan），失败时 step_end.stderr 会带原因。
+    (["sudo", "rknn3_startup", "start"], {0}),
+    # 4) 重启全部 spawned compute_worker。必须放在 rknn3_startup 之
+    # 后：worker 重启时会重新打开 rknn3 驱动。没有 spawned worker 时
+    # 这条 step 走 rc=0 + stdout="无 spawned worker，跳过"，UI 标
+    # ok 不影响整体 done。rc=1（任一 worker 失败）视为整步失败，
+    # 让用户在 WS done 帧看到。
     (_restart_compute_workers_step, {0}),
 ]
 
@@ -249,7 +390,12 @@ async def coprocessor_ws(ws: WebSocket) -> None:
             if isinstance(cmd, list):
                 label = " ".join(cmd)
             else:
-                label = "重启算力 worker（spawned 本地进程）"
+                # 用 callable 的 ``__name__`` 当 label，方便前端
+                # 区分 _burn_firmware_step / _hw_reset_npu_step /
+                # _restart_compute_workers_step，而不是全部写成
+                # "重启算力 worker"。原写死在 v0.8 引入 burn /
+                # hw_reset 之后没更新。
+                label = getattr(cmd, "__name__", repr(cmd))
             await ws.send_json({
                 "type": "step_start",
                 "index": i,
