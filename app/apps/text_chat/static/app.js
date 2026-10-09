@@ -163,7 +163,7 @@ const TextChat = {
     }
     this._renderState();
     // v0.4 修复：text-chat 在 capability 缺失时不广播给前端 WS,导致
-    // 用户在「算力配置」页启用 qwen3-4b 后回到 text-chat,sticky 的
+    // 用户在「算力配置」页启用对话模型后回到 text-chat,sticky 的
     // snapshot.error = "功能未启用: swcap_text_chat" 还在 hint 上显示
     // —— 必须用户主动点"刷新"或发条消息才会纠正。装一个 poll,只
     // 在 error 匹配 "功能未启用" 时启动,snapshot 转好自动停。

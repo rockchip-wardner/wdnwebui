@@ -40,7 +40,7 @@ def main():
                      "_peer_ip": "192.168.1.100",
                      "capability_types": ["swcap_video_retrieval"]},
                     # 远端 adopted,running,swcap_text_chat → 绝不应删
-                    {"model_id": "qwen3-4b", "status": "running",
+                    {"model_id": "peer-text-llm", "status": "running",
                      "_source": "adopted",
                      "_peer_name": "PeerBoard-Y",
                      "_peer_ip": "192.168.1.101",
@@ -91,8 +91,8 @@ def main():
         print(f"  posted_payloads: {posted_payloads}")
 
         # 验证:应删 spawned qwen3-vl-embedding-2b(不需要 + 本机)
-        # 绝不能删 adopted qwen3-vl-embedding-2b 或 adopted qwen3-4b
-        adopted_models = ["qwen3-vl-embedding-2b", "qwen3-4b"]  # adopted 的两个
+        # 绝不能删 adopted qwen3-vl-embedding-2b 或 adopted peer-text-llm
+        adopted_models = ["qwen3-vl-embedding-2b", "peer-text-llm"]  # adopted 的两个
         if deleted_models == ["qwen3-vl-embedding-2b"]:
             print(f"  ✅ 只删本机 spawned qwen3-vl-embedding-2b")
             ok += 1

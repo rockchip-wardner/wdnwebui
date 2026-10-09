@@ -53,14 +53,46 @@ from app.core.config import get_config
 from app.core.video.session import get_session
 
 
-# 诊断 (v0.13): client 端 (detector) 引用 _RpcSessionProxy 的内部 _ProxyResult
-# class 用于 type check —— worker 端 sess.respond() 在 schema 校验失败时
-# 返回 raw text,proxy 把 raw text 塞进 _ProxyResult.text 字段,client 收到后
-# 在应用层 rescue。
-try:
-    from app.core.compute.proxy import _ProxyResult
-except ImportError:  # pragma: no cover
-    _ProxyResult = None  # type: ignore[assignment,misc]
+def _result_raw_text(result) -> str:
+    """The model's raw output behind whatever ``respond()`` handed back.
+
+    ``LLMSession.respond()`` has three return shapes and the detector has
+    to cope with all of them:
+
+    * a ``generating`` instance (``VLMDoc`` / ``TargetDoc`` / …) — the
+      output validated;
+    * a plain ``str`` — it did not. The SDK's ``_safe_validate`` returns
+      the raw model text rather than raising, which is deliberate: a
+      schema miss must not lose what the model actually said;
+    * a ``@Callable`` instance — the model called a tool.
+
+    Only the first two carry text, and ``getattr(result, "text", "")``
+    silently returns ``""`` for a ``str`` — which would turn "the model
+    wrote something we could not parse" into "the model wrote nothing".
+    """
+    if isinstance(result, str):
+        return result
+    text = getattr(result, "text", None)
+    return str(text) if text else ""
+
+
+def _result_schema_parse_failed(result, generating_cls) -> bool:
+    """Did ``respond()`` come back unparsed for a schema we asked for?
+
+    True whenever a schema was requested and what arrived is not an
+    instance of it. The old transport flagged this explicitly
+    (``_ProxyResult.schema_parse_failed``); now the shape says it — and
+    says it in a way that cannot be wrong by omission, because there is
+    no separate flag to forget to set.
+    """
+    if getattr(result, "schema_parse_failed", False):
+        return True
+    if generating_cls is None:
+        return False
+    try:
+        return not isinstance(result, generating_cls)
+    except TypeError:  # generating_cls not a class — can't type-check it
+        return False
 
 
 # 历史默认（不再使用，简化版见 DEFAULT_*_DESC）：见 _build_vlm_doc_class / _build_target_doc_class 函数体内 inline 字符串
@@ -271,7 +303,7 @@ def _build_vlm_doc_class(text_desc: str, level_desc: str):
 #      ``isinstance(result, TargetDoc)`` 检查的对象，类 identity 必须随
 #      结构变化而变化；否则 worker 端 model_dump 出的新字段
 #      （``bbox``）主进程用老 class model_validate 会失败，触发 silent
-#      fallback 到 _ProxyResult。
+#      fallback 到裸 raw text string。
 #   3. ``tuple(sorted(field_descs))`` —— 用户在「系统配置 → App 提示词模板」
 #      覆盖的 ``Field(description=...)`` 文本；缺 / 空时 fallback 到
 #      ``DEFAULT_*_DESC`` 常量。任何 PUT 触发 desc 变化 → 新 cache key →
@@ -1776,7 +1808,7 @@ class WdnaiDetector:
                 # 完整 raw text, 不再截断 —— 排查 SDK fallback 时 [:120]
                 # 看不清是 JSON 半截还是空字符串。Log 端用 LOG.warning
                 # 接收完整字符串。
-                last_raw_text = str(getattr(result, "text", "") or "")
+                last_raw_text = _result_raw_text(result)
 
                 # 诊断：result 类型是 SDK / proxy 路径的核心信号。任何
                 # "推理 2 次后停"的问题几乎都跟 result 类型与生成
@@ -1797,26 +1829,27 @@ class WdnaiDetector:
                     _TargetDocCls is not None and isinstance(result, _TargetDocCls),
                     bool(tool_classes) and isinstance(result, tuple(tool_classes)),
                     len(last_raw_text),
-                    bool(getattr(result, "schema_parse_failed", False)),
+                    _result_schema_parse_failed(result, generating_cls),
                 )
 
                 # ------------------------------------------------------------------ #
-                # 诊断 (v0.13): 应用层 rescue —— wdnai SDK 的 ``_safe_validate``  #
-                # 对没 ``text`` 字段的 schema (TargetDoc) 在 ValidationError 时返 #
-                # 回 raw text string,主进程拿到 ``_ProxyResult(text=raw_text)`` 而 #
-                # 不是 TargetDoc 实例,Qwen3.5-VL-4B 经常把 SDK 自动注入的   #
-                # schema hint 复述为输出(形如 ``{properties: {x1: 590, ...}, ...")`` #
-                # 这种形态 SDK 解析失败。worker 是 thin RPC server,不应该做     #
-                # schema-specific 解析 —— 由 client (本 detector) 应用层处理。  #
+                # 应用层 rescue —— wdnai SDK 的 ``_safe_validate`` 在               #
+                # ValidationError 时返回 raw text string 而不是抛异常；Qwen3.5-VL-4B#
+                # 经常把 SDK 自动注入的 schema hint 复述为输出(形如                 #
+                # ``{properties: {x1: 590, ...}, ...")``)导致校验失败。              #
+                # worker 是 thin RPC server,不应该做 schema-specific 解析 ——      #
+                # 由 client (本 detector) 应用层处理。                             #
                 # ------------------------------------------------------------------ #
-                # duck-type check:不用 isinstance(_ProxyResult) (RPC 链路细节),
-                # 而是看 result 有 .text 属性 + 不是 TargetDoc 实例。
+                # duck-type check:不看是不是 ``str``(那是 SDK 的既有行为,        #
+                # 任何解析失败都是它),而是看"没有 .text 属性且不是 TargetDoc      #
+                # 实例" —— 后者兼容仍在用包裹对象的老会话。
                 if (TargetDoc is not None
                         and not isinstance(result, TargetDoc)
-                        and getattr(result, "text", None)
-                        and isinstance(getattr(result, "text", None), str)):
+                        and getattr(result, "text", None) is None
+                        and isinstance(last_raw_text, str)
+                        and last_raw_text):
                     _rescued = _try_rescue_target_doc(
-                        result.text, TargetDoc,
+                        last_raw_text, TargetDoc,
                     )
                     if _rescued is not None:
                         LOG.info(
@@ -1940,26 +1973,27 @@ class WdnaiDetector:
                 # JSON 解析失败时会回退到 raw text，可能含特殊 token 或半截
                 # JSON），写事件前统一过 sanitize 兜底。
                 att_count = len(getattr(result, "attachment", []) or [])
-                raw_text = str(getattr(result, "text", "") or "")
+                raw_text = _result_raw_text(result)
                 clean_text = _sanitize_event_text(raw_text) or ""
-                # 诊断 (v0.13): worker 端 schema_parse_failed marker 透传
-                # 来了 —— 模型输出没解析成 generating schema,主进程拿
-                # 到的不是 TargetDoc 实例而是 _ProxyResult(raw_text)。
-                # 给事件 text 加 ``[解析失败]`` 前缀,前端历史记录里能直接
-                # 区分"正常 VLM 描述" vs "目标检测 schema 解析失败"。
-                _schema_parse_failed = bool(getattr(result, "schema_parse_failed", False))
+                # 模型输出没解析成 generating schema —— 拿到的是 SDK 的
+                # raw-text fallback(``str``)而不是 schema 实例。给事件
+                # text 加 ``[解析失败]`` 前缀,前端历史记录里能直接区分
+                # "正常 VLM 描述" vs "目标检测 schema 解析失败"。
+                _schema_parse_failed = _result_schema_parse_failed(
+                    result, generating_cls)
                 if _schema_parse_failed:
                     LOG.error(
-                        "frame iter %d: SCHEMA PARSE FAILED (worker marker) — "
-                        "result_type=%s",
+                        "frame iter %d: SCHEMA PARSE FAILED — "
+                        "result_type=%s generating=%s",
                         i + 1, type(result).__name__,
+                        getattr(generating_cls, "__name__", generating_cls),
                     )
-                    _format_raw_text_for_log(raw_text, "raw_text (worker-side)")
+                    _format_raw_text_for_log(raw_text, "raw_text (unparsed)")
                 # 诊断：探测"result 不是 generating schema 实例"的隐形
                 # 失败模式 —— 当生成 schema 是 VLMDoc 时，正常情况下
                 # _parse_output 应该返回 VLMDoc 实例；如果不是，要么是
-                # SDK 走了 raw-text fallback (返回 str)，要么是 _ProxyResult
-                # 解析后构造出奇怪的 BaseModel 子类。两种都打 warning 让
+                # SDK 走了 raw-text fallback (返回 str)，要么是解析后
+                # 构造出奇怪的 BaseModel 子类。两种都打 warning 让
                 # 后续复现可定位。
                 try:
                     _is_schema_inst = (
@@ -2064,7 +2098,7 @@ class WdnaiDetector:
                 # 不应到达这里 —— 上面的 tool / TargetDoc / VLMDoc 三个
                 # 分支里只要有一个匹配都会 break。日志埋点，捕获 SDK 返回
                 # result 类型与任何已知分支都不匹配的"第四态"（例如
-                # _ProxyResult 重构后仍不是 VLMDoc/TargetDoc/工具实例）。
+                # 仍不是 VLMDoc/TargetDoc/工具实例）。
                 # 这是用户报告"推理 2 次后停"的核心可疑路径 —— 若该类
                 # 结果反复出现而 multi-iter 循环命中 cap_hit，可能让上层
                 # 误判"推理停"。
@@ -2386,7 +2420,7 @@ class WdnaiDetector:
         # miss),此时用 ``wdnai.utils._parse_locate_output`` 直接从文本
         # 重新解析。导入放在函数体内,dev box 没装 wdnai 时也不会 crash。
         if not raw_boxes:
-            _text_attr = str(getattr(result, "text", "") or "")
+            _text_attr = _result_raw_text(result)
             if "<box>" in _text_attr:
                 try:
                     from wdnai.utils import _parse_locate_output

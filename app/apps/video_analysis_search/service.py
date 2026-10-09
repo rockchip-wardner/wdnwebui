@@ -453,13 +453,10 @@ def _split_scene_frame_result(result) -> tuple:
                                 result.setdefault(_kn, _kv)
                 except Exception:
                     pass
-            # worker 端 ``SceneFrame.model_dump()`` 经
-            # ``result_data_path``（/dev/shm）回主进程 → ``_decode_reply_shm``
-            # 还原成 ``_raw["result_data"]``；``_call_llm`` 又把
-            # ``_ProxyResult._raw`` 直接当 result 返回 → 结构化字段嵌在
-            # ``result["result_data"]`` 下。旧实现只查 ``result["structured"]``
-            # （历史键名）→ 漏掉 result_data → scene/actors/action/objects
-            # 全丢（前端显示 null，只剩 text）。
+            # SceneFrame 的字段现在就平铺在 result 顶层（``model_dump()`` 的
+            # 结果），不再套在 ``result["result_data"]`` 下。保留
+            # ``structured`` 这个键是因为它可能来自模型的原始输出 ——
+            # 模型偶尔会把 SceneFrame 当成"里面再包一层"的 JSON。
             for _key_vfa in ("structured", "result_data"):
                 _struct_vfa = result.get(_key_vfa)
                 if isinstance(_struct_vfa, dict) and _struct_vfa:
@@ -654,7 +651,7 @@ def _normalize_structured(obj: dict) -> dict:
 
     智能匹配：scene/actors/action/objects/note 直接映射；``text`` 也
     列入"已知但不抽出"集合（worker 端 ``SceneFrame.model_dump()`` 经
-    ``result_data_path`` SHM 还原的 dict 里通常含 ``text`` 顶层字段——
+    ``model_dump()`` 得到的 dict 里通常含 ``text`` 顶层字段——
     旧实现把它当未知字段塞进 ``note_extras``，schema-echo 模式下会让
     note 也带 "text: scene ... actors ..." 噪声）。其他未知字段
     （Qwen3-VL 经常输出 ``analysis`` / ``error``）拼到 ``note`` 里。
@@ -3058,10 +3055,15 @@ class VideoAnalysisSearchService:
         # 输入 token 总数，逼近 4096 时 WARNING、超过 ERROR（让用户立刻
         # 看到是 prompt 而不是 C-level 引起的 stall）。
         try:
-            tokenizer = getattr(getattr(sess, "_backend", None), "tokenizer", None)
-            spec = getattr(getattr(sess, "_backend", None), "spec", None)
-            if tokenizer is not None and spec is not None:
-                user_t = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+            # The tokenizer lives in the worker, not here: ``sess`` is an
+            # RPC handle and has no ``_backend``. Ask over the control
+            # plane instead of silently skipping the diagnostic — a
+            # diagnostic that quietly stops running is worse than none,
+            # because the log then looks like the prompt was fine.
+            from app.core.compute.proxy import count_tokens as _count_tokens
+            spec = getattr(sess, "spec", None)
+            if spec is not None:
+                user_t = _count_tokens(sess, [prompt])[0]
                 img_size = getattr(spec, "image_size", 384) or 384
                 img_tokens = (img_size // 14) ** 2 + 6  # patches + start/end/pad
                 # 估算 SDK wrapping：system + chatml overhead + JSON schema hint
@@ -3249,18 +3251,14 @@ class VideoAnalysisSearchService:
                 sample,
             )
 
-        # 兼容 RpcSessionProxy 包装：worker 把推理结果序列化成 dict，
-        # 主进程 ``_RpcSessionProxy.respond`` 统一包成 ``_ProxyResult``
-        # （rpc_session_proxy.py:301-309）。_ProxyResult 不是 str/dict，
-        # 但 ``.text`` 字段等同 ``sess.respond()`` 的 str 返回、
-        # ``._raw`` 字段是 worker 发回的完整 JSON dict（含 scene /
-        # actors / action / objects / text 等 SceneFrame 字段）。
+        # ``respond()`` 归一化。``generating=SceneFrame`` 校验成功时返回真正的
+        # SceneFrame 实例（``model_dump()`` 后面就是它自己）；校验失败时
+        # SDK 的 ``_safe_validate`` 返回**裸 str**（模型原文），而不是
+        # 抛异常 —— 那正是我们想要的：模型写了什么得留住，下游
+        # ``_split_scene_frame_result`` 的 str 路径会再抽一次 JSON。
         #
-        # 不归一化的话，``_run_summary`` 拿 ``text.startswith("(")``
-        # / ``_rescue_structured_batch`` 拿 ``raw.startswith("(")`` 都
-        # 会 AttributeError；``_infer_one`` → ``_split_scene_frame_result``
-        # 走 Path 5 兜底返回 ``(None, _ProxyResult)``，上游同样崩。
-        # ``audio_analysis.py:385-395`` 已用同款模式。
+        # 所以这里要处理的是"一个 schema 实例，但下游只认 dict/str"这
+        # 一种情况，不是以前那种 RPC 包裹对象（``._raw``）。
         if generating is None:
             if not isinstance(result, str):
                 text_attr = getattr(result, "text", None)
@@ -3270,17 +3268,7 @@ class VideoAnalysisSearchService:
                     result = str(result)
         else:
             if not isinstance(result, (dict, str)):
-                raw = getattr(result, "_raw", None)
-                if isinstance(raw, dict) and raw:
-                    result = raw
-                else:
-                    # _raw 缺失（老 worker / fallback 路径）—— 用顶层字段
-                    # 拼个最小 dict，让 _split_scene_frame_result Path 2
-                    # 接管；缺 scene/actors 等字段时由 _normalize_structured
-                    # 走智能归一化兜底。
-                    text_attr = getattr(result, "text", None)
-                    if isinstance(text_attr, str):
-                        result = {"text": text_attr}
+                result = result.model_dump()
         return result
 
 
@@ -3312,17 +3300,16 @@ def _interrupt_rknn_session(sess, *, wait_sec: float = 2.0) -> None:
     调用方需仍在 ``with lock`` 内，避免下一轮 ``sess.reset()`` 在
     C 层 abort 完成前抢跑。
     """
-    backend = getattr(sess, "_backend", None)
-    if backend is None:
-        return
-    rknn_llm = getattr(backend, "rknn_llm", None)
-    if rknn_llm is None:
+    if sess is None:
         return
     try:
-        rknn_llm.session_stop()
+        # 推理在另一个进程：``sess._backend`` 恒为 None，直接摸
+        # ``_backend.rknn_llm.session_stop()`` 会静默 return —— 也就是
+        # 这个函数以前等于没做。``sess.stop()`` 是 transport 的取消
+        # 通道，把标志发到旁路 topic 后立即返回。
+        sess.stop()
     except Exception as ex:
-        # session_stop() 内部可能因 driver 状态异常抛错；不影响主路径
-        LOG.warning("vfa: session_stop() 异常（继续）: %s", ex)
+        LOG.warning("vfa: session.stop() 异常（继续）: %s", ex)
     if wait_sec > 0:
         # 同步等待：C 层在 kernel 间检查 stop flag 并让出 NPU mutex。
         # Python 端 sleep（C 线程不阻塞），sleep 期间主线程可以处理

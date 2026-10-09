@@ -646,7 +646,7 @@ showRootWarning();
  *
  *  顶部一行：内存条（3588 系统内存 + 每张 RK182x 卡显存），复用
  *           /api/system-monitor 的 memory / npu.devices 字段。
- *  中间三张：按 preset（Qwen3-VL-4B / Qwen3-TTS / Qwen3-4B）划分
+ *  中间几张：按 preset（Qwen3-VL-4B / Qwen3-TTS / …）划分
  *           的 service 卡片 —— 每张卡片列出子模型清单（来自本地
  *           CC_PRESET_META，按文件后缀标注可用 target），下方用
  *           radio 选运行在哪张 NPU，点 启用 / 停用 走现有的
@@ -670,15 +670,6 @@ const CC_PRESET_META = {
     memory_estimate_mb: 1900,
     estimated_init_seconds: 30,
     description: "文字转语音模型",
-    available_targets: ["182x"],
-  },
-  "qwen3-4b": {
-    label: "[LLM]文字对话v3",
-    capability_types: ["swcap_text_chat"],
-    instance_name: "llm-q30-4b",
-    memory_estimate_mb: 4950,
-    estimated_init_seconds: 60,
-    description: "文字对话模型",
     available_targets: ["182x"],
   },
   "qwen3-vl-embedding-2b": {
@@ -722,7 +713,6 @@ const CC_PRESET_META = {
 const CC_PRESET_ORDER = [
   "qwen3-vl-4b",
   "qwen3.5-vl-4b",     // 多模态卡（同时支持文本对话 + 视频描述）
-  "qwen3-4b",          // Qwen3 纯文本
   "qwen3-tts",
   "qwen3-vl-embedding-2b",
   "qwen2.5-omni-3b",

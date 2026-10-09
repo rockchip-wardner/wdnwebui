@@ -76,7 +76,7 @@ def register_api(app: FastAPI) -> None:
     try:
         from app.core.tools.registry import get_tool_registry
         # 走 _builtins 共用注册函数,与 compute_worker 子进程共享
-        # registry 真源:worker 端 _resolve_tool_classes(['TtsAlert'])
+        # registry 真源:主进程侧 chat_agent._tool_classes(['TtsAlert'])
         # 否则查不到类 → 提示词缺工具 schema。详见 app/core/tools/_builtins.py。
         from app.core.tools._builtins import register_builtin_tools
         register_builtin_tools(get_tool_registry())

@@ -1,18 +1,18 @@
 """微信对接文本对话模型桥接。
 
 开启开关后，微信用户发来的文字消息自动进入一个串行 worker 队列，桥接
-调用 ``swcap_text_chat``（qwen3-4b）的 ``chat_run`` 推理，把回答通过
+调用 ``swcap_text_chat``（qwen3.5-vl-4b）的 ``respond`` 推理，把回答通过
 ``Wechat.send_text`` 发回给该微信用户。
 
 设计要点
 ========
 
 * **开关内存态**：``_enabled`` 只存内存，不落盘（重启即关）；开关可开性
-  由 ``available()`` 决定 —— qwen3-4b 未加载时无法开启（后端校验兜底）。
+  由 ``available()`` 决定 —— 对话模型未加载时无法开启（后端校验兜底）。
 * **per-user 上下文隔离**：``self.histories: dict[user_id, deque]`` 各自
-  独立，与 web 文本对话的全局历史完全无关。上下文裁剪复用
-  ``chat_runner.trim_history``。
-* **串行保证**：桥接 worker 线程串行消费队列；``chat_run`` 用
+  独立，与 web 文本对话的全局历史完全无关。上下文裁剪由
+  ``chat_agent`` 统一处理。
+* **串行保证**：桥接 worker 线程串行消费队列；``respond`` 用
   ``chat_serial.get_chat_run_lock()`` 与 text_chat worker 互斥。
 * **只回 answer 不回 thinking**：最终轮输出已是面向用户的自然语言
   （正常回答 / wrap-up 确认语 / 失败回喂后的解释），直接发微信。
@@ -49,7 +49,7 @@ def _llm_log(msg: str) -> None:
 
 
 class _LlmBridge:
-    """微信文字消息 → qwen3-4b → 自动回复 的串行桥接。"""
+    """微信文字消息 → swcap_text_chat → 自动回复 的串行桥接。"""
 
     MAX_NEW_TOKENS = 2048
 
@@ -68,7 +68,7 @@ class _LlmBridge:
 
     # ------------------------------------------------------------- 状态
     def available(self) -> bool:
-        """qwen3-4b 是否已加载、可对话（用于前端置灰 + 后端开启校验）。"""
+        """对话模型是否已加载、可对话（用于前端置灰 + 后端开启校验）。"""
         try:
             from app.core.compute.registry import get_registry
             get_registry().get_session("swcap_text_chat")
@@ -100,8 +100,8 @@ class _LlmBridge:
     def set_enabled(self, on: bool) -> dict:
         if on and not self.available():
             raise RuntimeError(
-                "文本对话模型未启用（请在算力配置页启用 [LLM]文字对话v3 "
-                "(qwen3-4b)）"
+                "文本对话模型未启用（请在算力配置页启用 "
+                "[VLLM]视觉文字多模态v3.5）"
             )
         with self._lock:
             self._enabled = bool(on)
@@ -300,8 +300,9 @@ class _LlmBridge:
 
         context_limit = self._resolve_context_limit()
 
-        # 裁剪 / ChatML 拼接由 worker 端 _chat_run_loop 完成（真实 tokenizer）；
-        # 工具执行与 wrap-up / 回喂 / 失败告知循环由主进程侧 chat_agent 完成。
+        # 上下文裁剪用 worker 的 tokenizer 精确计数（一次无推理的
+        # count_tokens 控制调用），ChatML 由 wdnai 拼；工具执行与
+        # wrap-up / 回喂 / 失败告知循环由 chat_agent 完成。
         try:
             with get_chat_run_lock():
                 agent = run_chat_with_tools(
@@ -315,7 +316,7 @@ class _LlmBridge:
                     channel="wechat",
                 )
         except Exception as exc:  # noqa: BLE001
-            _LOG.exception("chat_run failed for %s", user_id)
+            _LOG.exception("chat turn failed for %s", user_id)
             self._reply_no_context(user_id, f"推理失败：{exc}")
             return
 

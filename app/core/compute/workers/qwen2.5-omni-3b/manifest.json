@@ -1,0 +1,16 @@
+{
+  "label": "[Omni]多感知描述v2.5",
+  "capability_types": [
+    "swcap_audio_understand"
+  ],
+  "worker_name": "audio-3b",
+  "model_dir_name": "Qwen2.5-Omni-3B",
+  "instance_name": "omni-q25-3b",
+  "memory_estimate_mb": 2500,
+  "estimated_init_seconds": 50,
+  "description": "多感知描述模型（kind=omni，wav-in/text-out，单次推理上限 6s）",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 50
+}

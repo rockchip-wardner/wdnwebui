@@ -2017,15 +2017,6 @@ const CC_PRESET_META = {
     description: "文字转语音模型",
     available_targets: ["182x"],
   },
-  "qwen3-4b": {
-    label: "[LLM]文字对话v3",
-    capability_types: ["swcap_text_chat"],
-    instance_name: "llm-q30-4b",
-    memory_estimate_mb: 4950,
-    estimated_init_seconds: 60,
-    description: "文字对话模型",
-    available_targets: ["182x"],
-  },
   "qwen3-vl-embedding-2b": {
     label: "[VLEmb]视觉信息编码v3",
     capability_types: ["swcap_video_retrieval"],
@@ -2070,7 +2061,6 @@ const CC_PRESET_META = {
 const CC_PRESET_ORDER = [
   "qwen3-vl-4b",
   "qwen3.5-vl-4b",     // 多模态卡（同时支持文本对话 + 视频描述）
-  "qwen3-4b",          // Qwen3 纯文本
   "qwen3-tts",
   "qwen3-vl-embedding-2b",
   "qwen2.5-omni-3b",

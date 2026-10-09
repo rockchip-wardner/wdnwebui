@@ -1,0 +1,16 @@
+{
+  "label": "[VLEmb]视觉信息编码v3",
+  "capability_types": [
+    "swcap_video_retrieval"
+  ],
+  "worker_name": "emb-2b",
+  "model_dir_name": "Qwen3-VL-Embedding-2B",
+  "instance_name": "vlemb-q30-2b",
+  "memory_estimate_mb": 2000,
+  "estimated_init_seconds": 30,
+  "description": "视觉信息编码模型（~1GB 权重 + 622MB embed 表 + vision）",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 40
+}

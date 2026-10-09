@@ -13,9 +13,9 @@
     这两个调用点都只在**主进程** uvicorn 里跑，**compute_worker 子
     进程**从来不执行。结果：
 
-    * proxy 端 ``RpcSessionProxy.chat_run(..., tools=['VideoSearch'])``
+    * 主进程 ``session.respond(..., tools=[VideoSearch])``
       发到 worker
-    * worker 端 ``_resolve_tool_classes(['VideoSearch'])`` 在自己的
+    * 主进程 ``chat_agent._tool_classes(['VideoSearch'])`` 在自己的
       空 registry 里查不到类 → ``LOG.warning("unknown tool name ..."
       -- skipping)``
     * ``tool_specs=None`` → ``build_chatml_prompt()`` 出来的 prompt
@@ -141,7 +141,7 @@ def register_builtin_tools(registry) -> None:
     * 主进程 — 替代 ``app/system/__init__.py`` 与
       ``app/apps/video_detection/__init__.py`` 里原本的内联注册；
       进程内多次调用幂等；
-    * compute_worker 子进程 — 在 ``_resolve_tool_classes`` 第一次
+    * chat agent 第一次
       调用前（或 ``main()`` 启动早期）调一次，保证 prompt 注入 +
       输出解析都能在 worker registry 里查到类；
     * ``get_tool_registry`` 首次调用 — 兜底 reload 后空 registry

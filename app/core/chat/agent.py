@@ -1,11 +1,16 @@
 """chat agent-loop —— 文本对话链路的工具执行与多轮回喂。
 
-``compute_worker`` 在 worker 进程内完成工具 schema 注入与 ``<tool_call>``
-解析（阶段 1），但工具副作用依赖主进程资源（TtsSession / registry /
-未来的设备控制等），worker 子进程无法访问。本模块在主进程侧补齐
-agent-loop：
+工具的**副作用**依赖主进程资源（TtsSession / registry / 未来的设备
+控制等），worker 子进程无法访问，因此 agent-loop 必须留在主进程。
 
-    用户输入 ─▶ chat_run(tools) ──无 tool_call──▶ 正常出口
+模型那一侧则已经完全是通用能力，不需要本模块操心：worker 用
+``wdndds.serve_local_session`` 把 ``respond()`` 暴露成 RPC，工具 schema
+由**调用方**拼进 prompt、工具 JSON 由**调用方**解析回 ``@Callable``
+实例 —— worker 既不知道 ``VideoSearch`` 是什么，也不做任何
+schema-specific 的解析。于是本模块只剩一件事：拿到模型说"调工具"时，
+在主进程把它真的执行掉，再把结果喂回去。
+
+    用户输入 ─▶ respond(tools) ──无 tool_call──▶ 正常出口
                     │
                     └─ 有 tool_call ─▶ 主进程实例化并执行 @Callable
                                           │
@@ -29,12 +34,14 @@ agent-loop：
   连续失败由 max_iters 兜底收敛。
 
 并发约束：调用方必须持有 ``chat_serial.get_chat_run_lock()``（与现有
-text_chat / wechat_llm 相同），保证同一时刻只有一个 chat_run 在飞。
+text_chat / wechat_llm 相同），保证同一时刻只有一个 chat 在飞。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 import time
 from typing import Any, Callable as TypingCallable, Dict, List, Optional
 
@@ -213,6 +220,146 @@ def _wrapup_instruction(name: str, outcome: dict, user_text: str) -> str:
     return base
 
 
+def _tool_classes(names: List[str]) -> list:
+    """Tool NAMES → the actual ``@Callable`` classes.
+
+    Resolved here, in the process that owns the registry, rather than in
+    the worker: ``respond(tools=[...])`` renders each class's field
+    schema into the prompt and parses the model's reply back into a
+    populated instance of it, so the worker never needs to know that
+    ``"VideoSearch"`` exists — only what the model said and produced.
+    """
+    out = []
+    for name in names or []:
+        spec = _lookup_spec(name)
+        if spec is None:
+            _LOG.warning("tool %s not registered — omitting from prompt", name)
+            continue
+        out.append(spec.tool_class)
+    return out
+
+
+def _trim(history: List[dict], session, context_limit: int,
+          max_new_tokens: int) -> List[dict]:
+    """Drop the oldest turns until the transcript fits the context window.
+
+    Counts come from the worker's tokenizer via a cheap control-plane
+    call — no inference, no NPU, one round trip for the whole
+    transcript. Falls back to a character estimate when the worker is
+    unreachable; that estimate under-counts Chinese by ~3x, so the
+    practical effect is trimming a little earlier than strictly needed,
+    which is the safe direction to be wrong in.
+    """
+    from app.core.chat.runner import MAX_NEW_TOKENS
+    from app.core.compute.proxy import count_tokens
+
+    reserve = min(max_new_tokens or MAX_NEW_TOKENS,
+                  max(1, context_limit // 8))
+    contents = [(m.get("content") or "") for m in history]
+    user_text = next(
+        (m.get("content") or "" for m in reversed(history)
+         if m.get("role") == "user"), "")
+    # Index 0 is the trailing user turn the prompt will append; the rest
+    # are the history entries, newest first.
+    counts = count_tokens(session, [user_text] + list(reversed(contents)))
+
+    user_tokens = counts[0] if counts else 0
+    if user_tokens + reserve > context_limit:
+        raise ValueError(
+            f"单条消息过长（{user_tokens} tokens + 预留 {reserve} > "
+            f"{context_limit}），请缩短输入")
+
+    selected: List[dict] = []
+    total = user_tokens
+    for msg, c in zip(reversed(history), counts[1:]):
+        if total + c + reserve > context_limit:
+            break
+        selected.insert(0, msg)
+        total += c
+    return selected
+
+
+def _run_coro(coro):
+    """Bridge the session's async surface into this thread-pool caller.
+
+    ``text_chat`` and the WeChat bridge both call this module from a
+    worker thread, so there is no loop to await on. If a loop *is*
+    running we cannot block it — hand the coroutine to a throwaway
+    thread rather than deadlock.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    box: Dict[str, Any] = {}
+
+    def _target():
+        try:
+            box["value"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    th = threading.Thread(target=_target, name="chat-turn", daemon=True)
+    th.start()
+    th.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _run_turn(
+    session,
+    *,
+    history: List[dict],
+    text: str,
+    tool_names: List[str],
+    context_limit: int,
+    max_new_tokens: int,
+    on_delta: Optional[TypingCallable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """One generation turn: trim → infer → classify → split.
+
+    Returns ``{"answer", "thinking", "tool_call", "tool_call_args",
+    "prompt_tokens"}``, with ``tool_call`` set only when the model
+    actually called one of ``tool_names``.
+    """
+    from app.core.chat.runner import sanitize_chat_output, split_thinking
+
+    classes = _tool_classes(tool_names)
+    trimmed = _trim(history, session, context_limit, max_new_tokens)
+    result = _run_coro(session.respond(
+        prompt=text,
+        history=trimmed,
+        tools=classes,
+        on_delta=on_delta,
+        max_new_tokens=max_new_tokens,
+    ))
+
+    tool_call = ""
+    tool_args: Optional[dict] = None
+    if classes and isinstance(result, tuple(classes)):
+        tool_call = type(result).__name__
+        try:
+            tool_args = result.model_dump()
+        except Exception:  # noqa: BLE001
+            tool_args = {}
+        # The tool-call JSON is protocol, not prose: it was never shown to
+        # the user, so only a thinking trace is worth carrying forward.
+        thinking, answer = "", ""
+    else:
+        thinking, answer = split_thinking(
+            result if isinstance(result, str) else str(result or ""))
+
+    return {
+        "answer": sanitize_chat_output(answer),
+        "thinking": sanitize_chat_output(thinking),
+        "tool_call": tool_call,
+        "tool_call_args": tool_args,
+        "prompt_tokens": int(getattr(session, "_last_prompt_tokens", 0) or 0),
+    }
+
+
 def run_chat_with_tools(
     session,
     history: List[dict],
@@ -233,7 +380,7 @@ def run_chat_with_tools(
     web 侧 channel="web"），经 ``ToolContext`` 透传给工具 —— 渠道
     感知型工具（如 VideoSearch 按 user_id 取视频素材）依赖此字段。
 
-    参数与 ``RpcSessionProxy.chat_run`` 对齐，额外承担工具执行与
+    参数与 ``LLMSession.respond`` 对齐，额外承担工具执行与
     多轮回喂。返回 dict::
 
         {
@@ -269,21 +416,21 @@ def run_chat_with_tools(
             interrupted = True
             break
         try:
-            result = session.chat_run(
+            result = _run_turn(
+                session,
                 history=work_history,
                 text=current_text,
+                tool_names=tool_names if i == 1 else [],
                 context_limit=context_limit,
                 max_new_tokens=max_new_tokens,
                 on_delta=on_delta,
-                stop_event=stop_event,
-                tool_names=tool_names if i == 1 else [],
             )
         except Exception as exc:  # noqa: BLE001
             if stop_event is not None and stop_event.is_set():
                 interrupted = True
                 break
             error_msg = str(exc)
-            _LOG.warning("chat_run failed at iter %d: %s", i, exc)
+            _LOG.warning("chat turn failed at iter %d: %s", i, exc)
             break
 
         prompt_tokens = int(result.get("prompt_tokens") or 0)
@@ -368,12 +515,13 @@ def run_chat_with_tools(
         if consume:
             # wrap-up：tools=[] 跑最后一轮生成自然语言确认后退出
             try:
-                wres = session.chat_run(
+                wres = _run_turn(
+                    session,
                     history=work_history, text=current_text,
+                    tool_names=[],
                     context_limit=context_limit,
                     max_new_tokens=max_new_tokens,
-                    on_delta=on_delta, stop_event=stop_event,
-                    tool_names=[],
+                    on_delta=on_delta,
                 )
                 prompt_tokens = int(wres.get("prompt_tokens") or 0)
                 final_thinking = wres.get("thinking") or ""

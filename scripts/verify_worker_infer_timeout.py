@@ -1,35 +1,38 @@
 """verify_worker_infer_timeout.py
 
-Regression test for compute_worker.infer_handler Python-level timeout.
+Regression test for the compute worker's replier-pump bound.
 
-Why: infer_handler runs ``asyncio.run(_call())`` directly in the
-wdndds cshim Replier pump thread (C++ thread driven by wdndds cshim).
-If the SDK hangs in rknn3.session_run (NPU driver wedged, prompt
-prefill long hang, sess.reset() clear_kvcache blocking 5-30s), the
-pump thread is pinned and EVERY subsequent RPC (info / reset /
-embed_text / new infers) queues up behind it. Main process wire RPC
-times out at 10s with ``compute_worker[...] infer failed: timeout``
-(actually ``discovery_pending``), and VFA / detector / chat get the
-wrong error path.
+Why this matters
+----------------
 
-Fix: wrap ``asyncio.run(_call())`` in a daemon thread +
-``th.join(timeout=_INFER_TIMEOUT_SEC)``. On timeout the worker calls
-``rknn_llm.session_stop()`` and returns an error reply, freeing the
-pump thread within 25s. Wire RPC (now 30s) gets the error reply
-before its own timeout — main process sees clean ``infer failed:
-timeout`` (not ``discovery_pending``).
+The wdndds cshim runs **one serial pump thread per replier**. Inference
+happens on that thread. So if a backend hangs inside its C call — a
+wedged NPU driver, a long prefill, a ``clear_kvcache`` that blocks for
+30 s — the pump is pinned and *every* subsequent request queues behind
+it: ``info``, ``reset``, ``count_tokens``, the next infer. The worker
+stops being slow and becomes deaf, and the main process only ever sees
+opaque timeouts with nothing pointing at the cause.
 
-This test verifies:
-  1. ``_INFER_TIMEOUT_SEC < wire RPC timeout`` (regression guard):
-     worker must time out BEFORE wire RPC, otherwise the wire RPC
-     fires first and main process still sees ``discovery_pending``.
-  2. ``infer_handler`` with a hanging ``_call`` returns an error
-     reply dict within ``_INFER_TIMEOUT_SEC`` + small slack (NOT 30s+
-     which would mean the worker is still hung).
-  3. ``infer_handler`` with a fast ``_call`` returns within the
-     timeout without invoking ``session_stop()``.
+``wdndds.serve_local_session(..., infer_timeout_s=…)`` bounds this. On
+expiry the pump is released, the caller gets a clean error reply, and
+the worker keeps serving.
 
-Run with:
+What this test checks
+---------------------
+  1. The worker's own bound stays below the main process's inference
+     budget, so the failure arrives as a worker reply that names the
+     problem instead of as a client-side timeout.
+  2. A hanging session produces an error reply within (bound + slack) —
+     not within the full client budget.
+  3. A fast session returns normally, without tripping the bound, and
+     its text survives the round trip.
+  4. After a timeout the pump is *still usable*: a subsequent request on
+     the same service succeeds. This is the property the old
+     worker-side timeout existed to provide, so it is the one that
+     actually matters.
+
+Run::
+
     .venv/bin/python scripts/verify_worker_infer_timeout.py
 """
 from __future__ import annotations
@@ -39,261 +42,211 @@ import logging
 import os
 import sys
 import time
-from unittest.mock import MagicMock, patch
+from typing import Any, List, Optional, Tuple
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 
 LOG = logging.getLogger("verify_worker_infer_timeout")
 
+# Bound used by the worker; kept short so the test finishes quickly.
+_TEST_TIMEOUT_SEC = 2.0
+_SLACK_SEC = 2.0
+
 
 # --------------------------------------------------------------------------- #
-# Test helpers                                                               #
+# Session stubs — real wdnai.LLMSession subclasses, not mocks                   #
 # --------------------------------------------------------------------------- #
-def _make_hanging_session():
-    """Build a MagicMock session whose sess.respond returns a coroutine
-    that never resolves (simulates rknn3.session_run wedged)."""
-    sess = MagicMock()
-    rknn_llm = MagicMock()
-    sess._backend.rknn_llm = rknn_llm
+def _spec(kind: str = "llm"):
+    class _Spec:
+        def __init__(self) -> None:
+            self.kind = kind
+            self.model_id = "timeout-test"
+            self.npu = 0
 
-    async def _hanging_respond(*args, **kwargs):
-        # never resolves; this is the "SDK 卡死" simulated
-        await asyncio.Future()
-
-    sess.respond.side_effect = lambda *args, **kwargs: _hanging_respond()
-    return sess
+    return _Spec()
 
 
-def _make_fast_session(return_text="fast result"):
-    """Build a MagicMock session whose sess.respond returns immediately
-    with a mock LMOutput-shaped result."""
-    sess = MagicMock()
-    rknn_llm = MagicMock()
-    sess._backend.rknn_llm = rknn_llm
+class _HangingSession:
+    """A session whose ``run_prompt`` never returns — a wedged backend."""
 
-    async def _fast_respond(*args, **kwargs):
-        return MagicMock(text=return_text, attachment=[])
+    def __init__(self, spec: Any) -> None:
+        self.spec = spec
 
-    sess.respond.side_effect = lambda *args, **kwargs: _fast_respond()
-    return sess
+    async def run_prompt(self, prompt: str, attachment=None, *,
+                         on_delta=None, **overrides: Any):
+        await asyncio.Future()  # never resolves
+        raise AssertionError("unreachable")
+
+    def reset(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
-def _patched_wdnai_loader():
-    """Build a MagicMock dict that mimics ``_load_wdnai()`` return shape
-    (only the keys infer_handler reads)."""
-    return {
-        "Attachment": MagicMock(),
-        "AudioAttachment": MagicMock(),
-        "ImageAttachment": MagicMock(),
-        "TextAttachment": MagicMock(),
-    }
+class _FastSession:
+    """A session that answers immediately."""
+
+    def __init__(self, spec: Any) -> None:
+        self.spec = spec
+
+    async def run_prompt(self, prompt: str, attachment=None, *,
+                         on_delta=None, **overrides: Any):
+        return "fast result", []
+
+    def reset(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _wait_for_service(client, deadline_s: float = 10.0) -> None:
+    """Block until the replier is discoverable over DDS."""
+    end = time.time() + deadline_s
+    while time.time() < end:
+        try:
+            if client._call_once({"action": "info", "op": "info"}, 5_000).get("ok"):
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.25)
+    raise AssertionError("service never became discoverable")
+
+
+def _make_pair(session, tag: str):
+    """Serve ``session`` and dial it back, on a per-test unique name."""
+    from wdndds import LLMRPCSession, serve_local_session
+
+    name = f"wdndds/rpc/timeout-test-{os.getpid()}-{tag}"
+    served = serve_local_session(
+        session, service_name=name, infer_timeout_s=_TEST_TIMEOUT_SEC)
+    client = LLMRPCSession(
+        session.spec, service_name=name,
+        infer_timeout_ms=60_000, timeout_ms=10_000)
+    return served, client
 
 
 # --------------------------------------------------------------------------- #
 # Tests                                                                       #
 # --------------------------------------------------------------------------- #
-def test_infer_timeout_constant_below_wire_rpc():
-    """Regression guard: ``_INFER_TIMEOUT_SEC`` must be strictly less
-    than the wire RPC infer timeout (30s).
+def test_worker_bound_is_below_client_budget():
+    from app.core.compute.proxy import _INFER_TIMEOUT_MS
+    from app.core.compute.workers import _base
 
-    If the worker internal timeout is >= wire RPC timeout, the wire
-    RPC fires first and main process sees ``discovery_pending`` again
-    (the fix becomes useless). Slack of ~5s lets worker session_stop()
-    + reply build + cshim delivery all complete before wire RPC times.
-    """
-    from app.services import compute_worker as cw
-
-    _INFER_TIMEOUT = cw._INFER_TIMEOUT_SEC
-    # The wire RPC infer timeout is hardcoded at 30_000ms in
-    # rpc_session_proxy.py:921. We assert against the source of truth
-    # by reading the module attribute if available, otherwise 30s.
-    wire_rpc_ms = 30_000  # MUST match rpc_session_proxy.py _call_resilient call
-    wire_rpc_s = wire_rpc_ms / 1000.0
-
-    assert _INFER_TIMEOUT < wire_rpc_s, (
-        f"FAIL: _INFER_TIMEOUT_SEC={_INFER_TIMEOUT} must be < wire RPC "
-        f"timeout {wire_rpc_s}s; if worker times out AFTER wire RPC, "
-        f"main process sees discovery_pending instead of clean timeout."
-    )
-    # Lower bound: must be >= 10s to cover schema-echo (~5.5s) +
-    # reset-blocking (5s) + accumulated jitter. Below 10s re-introduces
-    # the 5s default problem.
-    assert _INFER_TIMEOUT >= 10.0, (
-        f"FAIL: _INFER_TIMEOUT_SEC={_INFER_TIMEOUT} too short; must be "
-        f">= 10s to cover schema-echo + reset-blocking worst case."
-    )
-    return True, {
-        "_INFER_TIMEOUT_SEC": _INFER_TIMEOUT,
-        "wire_rpc_timeout_s":  wire_rpc_s,
-        "slack_s":              wire_rpc_s - _INFER_TIMEOUT,
-    }
+    worker_ms = _base._INFER_TIMEOUT_SEC * 1000.0
+    client_ms = float(_INFER_TIMEOUT_MS)
+    assert worker_ms < client_ms, (
+        f"worker bound {_base._INFER_TIMEOUT_SEC}s must be under the client's "
+        f"{client_ms}ms infer budget, or the client times out first and the "
+        f"failure never gets a reason attached")
+    # And it must be long enough for a real 768px VLM frame (~35s).
+    assert _base._INFER_TIMEOUT_SEC >= 45.0, (
+        f"{_base._INFER_TIMEOUT_SEC}s is too tight for a 768px VLM frame; "
+        f"a slow-but-healthy turn would be reported as a wedge")
 
 
-def test_infer_handler_returns_timeout_error_when_call_hangs():
-    """Simulate stuck rknn3.session_run via sess.respond coroutine that
-    never resolves.
-
-    Asserts infer_handler returns an error reply dict within
-    ``_INFER_TIMEOUT_SEC + slack`` (NOT 30s+), with status="error"
-    and error message containing "timeout", and that
-    ``rknn_llm.session_stop()`` was invoked for best-effort SDK
-    interrupt.
-    """
-    from app.services import compute_worker as cw
-
-    original_timeout = cw._INFER_TIMEOUT_SEC
-    test_timeout = 2.0  # shorten for fast test
-    slack = 3.0       # session_stop + reply build + thread join overhead
-    cw._INFER_TIMEOUT_SEC = test_timeout
-
+def test_hang_returns_error_within_bound():
+    served, client = _make_pair(_HangingSession(_spec()), "hang")
     try:
-        sess = _make_hanging_session()
-        state = {"session": sess, "model_id": "qwen3-vl-4b"}
-        payload = {"action": "infer", "prompt": "test"}
-        wdnai_mod = _patched_wdnai_loader()
-
-        # Track session_stop calls for assertion
-        rknn_llm = sess._backend.rknn_llm
-
-        with patch.object(cw, "_load_wdnai", return_value=wdnai_mod):
-            t0 = time.time()
-            result = cw.infer_handler(state, payload)
-            elapsed = time.time() - t0
-
-        # Must return within test_timeout + slack
-        assert elapsed < test_timeout + slack, (
-            f"FAIL: elapsed {elapsed:.2f}s exceeds "
-            f"test_timeout+slack ({test_timeout + slack}s); worker "
-            f"still hung? pump thread not freed?"
-        )
-
-        # Must be an error reply dict
-        assert isinstance(result, dict), (
-            f"FAIL: expected dict reply, got {type(result).__name__}"
-        )
-        assert result.get("status") == "error", (
-            f"FAIL: expected status='error', got {result.get('status')!r}"
-        )
-        assert "timeout" in result.get("error", "").lower(), (
-            f"FAIL: expected 'timeout' in error message, got "
-            f"{result.get('error', '')!r}"
-        )
-
-        # session_stop was called for SDK interrupt
-        assert rknn_llm.session_stop.called, (
-            "FAIL: rknn_llm.session_stop() was not called on timeout"
-        )
-
-        return True, {
-            "elapsed_s":         round(elapsed, 2),
-            "timeout_s":         test_timeout,
-            "result_error":      result.get("error", "")[:80],
-            "session_stop_calls": rknn_llm.session_stop.call_count,
-        }
-    finally:
-        cw._INFER_TIMEOUT_SEC = original_timeout
-
-
-def test_infer_handler_completes_for_normal_call():
-    """Sanity check: a fast ``_call`` (sess.respond resolves <1s) returns
-    without hitting the timeout path. session_stop is NOT called in
-    the success path.
-    """
-    from app.services import compute_worker as cw
-
-    original_timeout = cw._INFER_TIMEOUT_SEC
-    cw._INFER_TIMEOUT_SEC = 5.0  # generous
-
-    try:
-        sess = _make_fast_session(return_text="hello world")
-        state = {"session": sess, "model_id": "qwen3-vl-4b"}
-        payload = {"action": "infer", "prompt": "test"}
-        wdnai_mod = _patched_wdnai_loader()
-        rknn_llm = sess._backend.rknn_llm
-
-        with patch.object(cw, "_load_wdnai", return_value=wdnai_mod):
-            t0 = time.time()
-            result = cw.infer_handler(state, payload)
-            elapsed = time.time() - t0
-
-        # Fast call completes within 3s
-        assert elapsed < 3.0, (
-            f"FAIL: fast call elapsed {elapsed:.2f}s exceeds 3s"
-        )
-
-        # Result is a dict (either success or business error, NOT
-        # timeout error)
-        assert isinstance(result, dict), (
-            f"FAIL: expected dict reply, got {type(result).__name__}"
-        )
-        if result.get("status") == "error":
-            # Business errors are OK; just must not be our timeout path
-            assert "timeout" not in result.get("error", "").lower(), (
-                f"FAIL: fast call should not timeout, got "
-                f"{result.get('error', '')!r}"
-            )
-
-        # session_stop NOT called on success path
-        assert not rknn_llm.session_stop.called, (
-            f"FAIL: session_stop was called on success path "
-            f"(call_count={rknn_llm.session_stop.call_count})"
-        )
-
-        return True, {
-            "elapsed_s": round(elapsed, 2),
-            "result_keys": list(result.keys())[:5],
-        }
-    finally:
-        cw._INFER_TIMEOUT_SEC = original_timeout
-
-
-# --------------------------------------------------------------------------- #
-# main                                                                        #
-# --------------------------------------------------------------------------- #
-def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    cases = (
-        ("test_infer_timeout_constant_below_wire_rpc",
-         test_infer_timeout_constant_below_wire_rpc),
-        ("test_infer_handler_returns_timeout_error_when_call_hangs",
-         test_infer_handler_returns_timeout_error_when_call_hangs),
-        ("test_infer_handler_completes_for_normal_call",
-         test_infer_handler_completes_for_normal_call),
-    )
-
-    results = []
-    for name, fn in cases:
+        _wait_for_service(client)
+        t0 = time.time()
         try:
-            ok, detail = fn()
-            LOG.info("✓ %s: %s", name, detail)
-            results.append((name, "PASS"))
-        except AssertionError as e:
-            LOG.error("✗ %s: %s", name, e)
-            results.append((name, "FAIL (AssertionError)"))
-        except Exception as e:
-            LOG.exception("✗ %s raised: %s", name, e)
-            results.append((name, f"FAIL ({type(e).__name__}: {e})"))
+            asyncio.run(client.respond(prompt="hello"))
+            raise AssertionError("hanging session did not time out")
+        except RuntimeError as exc:
+            elapsed = time.time() - t0
+            detail = str(exc).lower()
+            assert "timeout" in detail or "timed out" in detail, exc
+            assert elapsed < _TEST_TIMEOUT_SEC + _SLACK_SEC, (
+                f"took {elapsed:.1f}s — the pump was still held past the bound")
+            assert elapsed < _TEST_TIMEOUT_SEC * 3, (
+                f"took {elapsed:.1f}s — client budget fired instead of the "
+                f"worker bound, so the caller got no diagnosis")
+    finally:
+        client.close()
+        served.close()
 
-    LOG.info("")
-    LOG.info("=== summary ===")
-    failed = 0
-    for name, status in results:
-        LOG.info("  %s: %s", name, status)
-        if not status.startswith("PASS"):
-            failed += 1
 
-    LOG.info("")
-    if failed == 0:
-        LOG.info("ALL %d CASES PASS", len(results))
-        return 0
-    LOG.error("FAILED %d / %d CASES", failed, len(results))
-    return 1
+def test_fast_session_round_trips_without_tripping_the_bound():
+    served, client = _make_pair(_FastSession(_spec()), "fast")
+    try:
+        _wait_for_service(client)
+        t0 = time.time()
+        out = asyncio.run(client.respond(prompt="hello"))
+        elapsed = time.time() - t0
+        assert out == "fast result", out
+        assert elapsed < _TEST_TIMEOUT_SEC, (
+            f"fast session took {elapsed:.1f}s — bound is misfiring")
+    finally:
+        client.close()
+        served.close()
+
+
+def test_pump_survives_a_timeout():
+    """The property the bound exists for.
+
+    A wedged request must not leave the service unusable: the next
+    caller has to get a real answer. If the pump were still pinned, the
+    worker would be permanently deaf and every later error would look
+    like a transport fault.
+    """
+    # Same session object so the pinned thread stays hung in the
+    # background — exactly the situation a wedged NPU leaves behind.
+    session = _FastSession(_spec())
+    served, client = _make_pair(session, "survive")
+    try:
+        _wait_for_service(client)
+
+        # First call: make the session hang just for this one request.
+        async def _hang(*args, **kwargs):  # noqa: ARG001
+            await asyncio.Future()  # never resolves
+
+        session.run_prompt = _hang  # type: ignore[assignment]
+        t0 = time.time()
+        try:
+            asyncio.run(client.respond(prompt="wedge me"))
+            raise AssertionError("expected the wedged call to time out")
+        except RuntimeError as exc:
+            wedged_for = time.time() - t0
+            # Guard the test itself: an immediate failure (bad stub, typo in
+            # the coroutine) also raises RuntimeError, but proves nothing
+            # about the pump. The wedged path must actually burn the bound.
+            assert wedged_for >= _TEST_TIMEOUT_SEC * 0.8, (
+                f"the 'wedged' call returned after only {wedged_for:.2f}s — "
+                f"it failed fast rather than timing out, so this test would "
+                f"pass without exercising anything: {exc}")
+            assert wedged_for < _TEST_TIMEOUT_SEC + _SLACK_SEC, (
+                f"wedged call took {wedged_for:.2f}s, past the bound")
+
+        # Next call: backend recovered.
+        session.run_prompt = _FastSession.run_prompt.__get__(session)  # type: ignore[assignment]
+        out = asyncio.run(client.respond(prompt="are you there?"))
+        assert out == "fast result", (
+            f"pump still pinned after a timeout — got {out!r}")
+    finally:
+        client.close()
+        served.close()
+
+
+def main() -> int:
+    tests: List[Tuple[str, Any]] = sorted(
+        (n, f) for n, f in globals().items()
+        if n.startswith("test_") and callable(f))
+    failures = 0
+    for name, fn in tests:
+        t0 = time.time()
+        try:
+            fn()
+            print(f"  PASS  {name}  ({time.time() - t0:.1f}s)")
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(f"  FAIL  {name}: {type(exc).__name__}: {exc}")
+    print("-" * 60)
+    print(f"{len(tests) - failures}/{len(tests)} passed")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

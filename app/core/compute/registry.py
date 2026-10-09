@@ -48,6 +48,12 @@ from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 from app.core.config import default_models_root, get_config
+from app.core.compute.workers import (
+    WorkerManifest,
+    discover as discover_workers,
+    load_one as load_worker_manifest,
+    model_presets as _model_presets,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -418,7 +424,7 @@ def _terminate_orphan_pids(pids: List[int], grace_sec: int = 5) -> int:
 
 
 def _resolve_worker_model_id(comm: str) -> Optional[str]:
-    """Reverse-lookup: given a comm string (e.g. ``worker:llm-4b``),
+    """Reverse-lookup: given a comm string (e.g. ``worker:vlm-4b``),
     return the ``model_id`` whose ``MODEL_PRESETS[model_id].worker_name``
     matches the suffix. Returns ``None`` for unknown comms (e.g.
     ``worker:debug``, future aliases not in the preset table).
@@ -434,210 +440,32 @@ def _resolve_worker_model_id(comm: str) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
-# preset 映射表                                                              #
+# Preset table — derived from the worker manifests                          #
 # --------------------------------------------------------------------------- #
-def _qwen3_vl_4b_spec():
-    from wdnai import SystemLanguageModel  # noqa: F401  lazy
-    return SystemLanguageModel.qwen3_vl_4b()
-
-
-def _qwen3_tts_spec():
-    from wdnai import SystemLanguageModel
-    return SystemLanguageModel.qwen3_tts()
-
-
-def _qwen3_4b_spec():
-    from dataclasses import replace as _dc_replace
-    from wdnai import SystemLanguageModel
-    spec = SystemLanguageModel.qwen3_4b()
-    return _dc_replace(spec, max_context_len=16384).with_options(
-        max_new_tokens=2048,
-        keep_history=1,
-        enable_thinking=True,
-    )
-
-
-def _qwen3_vl_embedding_2b_spec():
-    """Qwen3-VL-Embedding-2B 检索 embedding preset（kind="embedding"）。
-
-    不做 token 生成，LLM 走 RKNN3Lite 普通模型路径输出 2048 维归一化
-    向量；wdnai 侧 ``EmbeddingBackend`` 暴露 ``embed_text`` /
-    ``embed_video``。模型路径走 ``WDNAI_MODELS_DIR``（默认
-    见 :func:`app.core.config.default_models_root`，与 Qwen3-VL-4B
-    同款文件布局）。
-    """
-    from wdnai import SystemLanguageModel
-    return SystemLanguageModel.qwen3_vl_embedding()
-
-
-def _qwen_2_5_omni_3b_spec():
-    """Qwen2.5-Omni-3B 音频理解 preset（kind="omni"）。
-
-    单次 ``run_audio`` 输入上限 6.0 秒（omni.py 硬限制），调用方负责切片。
-    """
-    from wdnai import SystemLanguageModel
-    return SystemLanguageModel.qwen_2_5_omni_3b()
-
-
-def _qwen3_5_vl_4b_spec():
-    """Qwen3.5-VL-4B 多模态 preset（kind="vlm"，图像+文本）。
-
-    同时声明 ``swcap_text_chat`` 和 ``swcap_video_describe`` 两种
-    capability——VLM-mode 的 RKNN 既能做纯文本推理，也能消费视觉
-    token，因此文本对话页（text_chat / 微信桥接）和视频描述页
-    （音视频描述 / 视频内容检索 / 视频文件分析）都能用它。
-    内存占用 ~2.7 GB Qwen3.5 LLM 权重 + ~200 MB vision (384/768)
-    + ~200 MB embed；MRoPE 节点在 RKNN 模型内部烧录。
-    """
-    from wdnai import SystemLanguageModel
-    return SystemLanguageModel.qwen3_5_vl_4b()
-
-
-def _locate_anything_spec():
-    """LocateAnything grounding preset（kind="grounding"）。
-
-    图片输入 + 文本输出（归一化 bbox 坐标）。绑定
-    ``$WDNAI_MODELS_DIR/LocateAnything-3B`` 下全套文件
-    （llm_LocateAnything.1828.rknn + weight、vision 448x448、tokenizer、
-    embed），任意文件缺失会抛 :class:`FileNotFoundError`。
-    """
-    from wdnai import SystemLanguageModel
-    return SystemLanguageModel.locate_anything()
-
-
-def _locate_anything_spec_template():
-    """LocateAnything preset 但不绑路径 —— 用于模型未部署场景。
-
-    跳过 ``_verify_locate_anything_files``（``SystemLanguageModel.locate_anything``
-    内部会调），直接返回 ``_locate_anything_spec()`` 的裸 spec；调用方
-    可以再 ``.with_paths(...)`` 覆盖默认路径，或者单纯用作 schema / 类
-    形态的占位 spec。算力配置页 / 启动预检不强制要求模型已就位，但
-    真实 ``LLMSession(model=spec, npu=K)`` init 时仍会报 ``FileNotFoundError``。
-    """
-    from wdnai.model import _locate_anything_spec as _sdk_locate_spec
-    return _sdk_locate_spec()
-
-
-# 每个 model 的 ``estimated_init_seconds`` 是经验值，用来渲染"加载中"倒计时
-# 的初始起点；loading 段倒计时按 (estimate - (now - started_at)) 实算，estimate
-# 只影响倒计时的**起点**。真机冷启动实测（page cache dropped 之后）：
+# 每个模型的「身份」现在由 ``app/core/compute/workers/<id>/manifest.json``
+# 声明，模型规格的构造则在该目录的 ``compute_worker.py`` 里（worker 进程
+# 才需要真正 build spec）。这里从扫描结果生成兼容视图，让 registry /
+# config / compute / manifest 四处共 54 处既有调用点零改动。
+#
+# 旧的 ``preset_factory`` 字段连同 7 个 ``_*_spec()`` 构造函数已随之删除：
+# 那个字段定义过 7 次却从未被任何代码读取（只有 worker.py 自己的
+# if/elif 在干同样的事，而那份已下沉到各 worker 目录）。
+#
+# ``estimated_init_seconds`` 是经验值，用来渲染「加载中」倒计时的**起点**
+# （loading 段按 estimate - (now - started_at) 实算）。真机冷启动实测
+# （page cache dropped 之后）：
 #   * Qwen3-VL-4B: 57s → +3s buffer → 60s
-#   * Qwen3-TTS:   改 wdnai 加上 ensure_loaded() 后变成 eager init：
-#                  - load_resources:  ~4s
-#                  - init_text_projection: ~0.4s
-#                  - init_speech_decoder:  ~2s
-#                  - init_code_predictor:  ~1.6s
-#                  - init_talker (785MB weight + 24MB rknn, 8-core AR): dev box
-#                    init_talker 直接 MODEL_SETUP fail，没法在 dev box 测真机
-#                    时延；真机用户体感"首次等非常久"，按 VL-4B 同档拍 60s
-#                    + buffer → 60s（无真机实测，等你测完再调）
-#   * Qwen3-ASR:   未实测（模型文件不在板上），按编码器+LLM 推算 ~15s + 10s buffer → 25s
+#   * Qwen3-TTS:   加 ensure_loaded() 后变 eager init：load_resources ~4s +
+#                  init_text_projection ~0.4s + init_speech_decoder ~2s +
+#                  init_code_predictor ~1.6s + init_talker（785MB weight，
+#                  8-core AR）在 dev box 上直接 MODEL_SETUP fail 没法实测，
+#                  按 VL-4B 同档拍 60s（无真机实测，等你测完再调）
+#   * Qwen3-ASR:   未实测（模型文件不在板上），按编码器+LLM 推算 ~15s →
+#                  +10s buffer → 25s
 #   * Qwen3-VL-Embedding-2B：~30s（加载 2 个 rknn + embed 表）
-# 取"最冷"加载时间（即用户首次加载，不是文件页缓存命中后的二次加载）+ 小 buffer，
-# 保证倒计时结束时实际加载大概率已就绪，避免 UI 卡很久才更新。
-MODEL_PRESETS: dict[str, dict] = {
-    "qwen3-vl-4b": {
-        "label":            "[VLM]视觉描述v3",
-        "preset_factory":   _qwen3_vl_4b_spec,
-        "model_dir_name":   "Qwen3-VL-4B",
-        "memory_estimate_mb": 3500,
-        "estimated_init_seconds": 60,
-        "capability_types": ["swcap_video_describe"],
-        "instance_name":    "vlm-q30-4b",
-        "worker_name":      "vlm-4b",          # comm = "worker:vlm-4b"（15 chars）
-        "description":      "视频描述模型",
-        "available_targets": ["182x"],   # .1828.rknn 权重 — RK182x 协卡
-    },
-    "qwen3-tts": {
-        "label":            "[TTS]文字转语音v3",
-        "preset_factory":   _qwen3_tts_spec,
-        "model_dir_name":   "Qwen3-TTS",
-        "memory_estimate_mb": 1900,
-        "estimated_init_seconds": 30,
-        "capability_types": ["swcap_audio_tts"],
-        "instance_name":    "tts-q30",
-        "worker_name":      "tts",             # comm = "worker:tts"（10 chars）
-        "description":      "文字转语音模型",
-        "available_targets": ["182x"],
-    },
-    "qwen3-4b": {
-        "label":            "[LLM]文字对话v3",
-        "preset_factory":   _qwen3_4b_spec,
-        "model_dir_name":   "Qwen3-4B",
-        "memory_estimate_mb": 4950,
-        "estimated_init_seconds": 60,
-        "capability_types": ["swcap_text_chat"],
-        "instance_name":    "llm-q30-4b",
-        "worker_name":      "llm-4b",          # comm = "worker:llm-4b"（12 chars）
-        "description":      "文字对话模型",
-        "available_targets": ["182x"],
-    },
-    "qwen3-vl-embedding-2b": {
-        "label":            "[VLEmb]视觉信息编码v3",
-        "preset_factory":   _qwen3_vl_embedding_2b_spec,
-        "model_dir_name":   "Qwen3-VL-Embedding-2B",
-        "memory_estimate_mb": 2000,        # ~1GB 权重 + 622MB embed 表 + vision
-        "estimated_init_seconds": 30,      # 加载两个 rknn + embed 表
-        "capability_types": ["swcap_video_retrieval"],
-        "instance_name":    "vlemb-q30-2b",
-        "worker_name":      "emb-2b",          # comm = "worker:emb-2b"（12 chars）
-        "description":      "视觉信息编码模型",
-        "available_targets": ["182x"],
-    },
-    "qwen2.5-omni-3b": {
-        # Qwen2.5-Omni-3B（kind="omni"，wav-in/text-out）。单次推理上限
-        # 6.0 秒（omni.py 硬限制），调用方负责切片。memory_estimate_mb /
-        # estimated_init_seconds 是预估值，真机测后回填。
-        "label":            "[Omni]多感知描述v2.5",
-        "preset_factory":   _qwen_2_5_omni_3b_spec,
-        "model_dir_name":   "Qwen2.5-Omni-3B",
-        "memory_estimate_mb": 2500,
-        "estimated_init_seconds": 50,
-        "capability_types": ["swcap_audio_understand"],
-        "instance_name":    "omni-q25-3b",
-        "worker_name":      "audio-3b",     # comm = "worker:audio-3b" (13 chars)
-        "description":      "多感知描述模型",
-        "available_targets": ["182x"],
-    },
-    "qwen3.5-vl-4b": {
-        # Qwen3.5-VL-4B 多模态模型（kind="vlm"，image-in/text-out）。
-        # 同时声明 swcap_text_chat + swcap_video_describe —— VLM-mode
-        # RKNN 既能做纯文本推理也能消费视觉 token，所以文本对话页 +
-        # 视频描述页（detector / VAS / audio_analysis 等）都能用它。
-        # 与 qwen3-vl-4b 共用 swcap_video_describe capability；算力
-        # 配置页同一 capability 内互斥（先加载的赢）。
-        "label":            "[VLLM]视觉文字多模态v3.5",
-        "preset_factory":   _qwen3_5_vl_4b_spec,
-        "model_dir_name":   "Qwen3.5-4B",
-        "memory_estimate_mb": 3500,
-        "estimated_init_seconds": 60,
-        "capability_types": ["swcap_text_chat", "swcap_video_describe"],
-        "instance_name":    "vlm-q35-4b",
-        "worker_name":      "q5-vl",        # comm = "worker:q5-vl" (12 chars)
-        "description":      "Qwen3.5-4B 多模态模型，支持图像描述和文本对话",
-        "available_targets": ["182x"],
-    },
-    "LocateAnything-3b": {
-        # LocateAnything 视觉定位模型（kind="grounding"，image-in / text-out
-        # 含 0-1000 归一化 bbox）。文件布局位于
-        # $WDNAI_MODELS_DIR/LocateAnything-3B/，由
-        # ``_default_locate_anything_paths`` 在 wdnai 内 resolve
-        # （可用 ``WDNAI_LOCATE_ANYTHING_DIR`` 覆写）。
-        # 模型未部署时 ``_locate_anything_spec`` 会抛 FileNotFoundError；
-        # ``_locate_anything_spec_template`` 跳过校验返回裸 spec，
-        # 仅供预检 / 形态占位用，真实 LLMSession init 仍会报缺文件。
-        "label":            "[GD]视觉定位模型",
-        "preset_factory":   _locate_anything_spec,
-        "model_dir_name":   "LocateAnything-3B",
-        "memory_estimate_mb": 5500,
-        "estimated_init_seconds": 60,
-        "capability_types": ["swcap_grounding"],
-        "instance_name":    "llm-ground-3b",
-        "worker_name":      "ground",       # comm = "worker:ground" (13 chars); alias 6 chars, < 8 chars AGENTS 硬限
-        "description":      "视觉定位模型，给定文本描述输出图像中目标区域",
-        "available_targets": ["182x"],
-    },
-}
+# 取「最冷」加载时间（用户首次加载，不是文件页缓存命中后的二次加载）+ 小
+# buffer，保证倒计时结束时实际加载大概率已就绪，避免 UI 卡很久才更新。
+MODEL_PRESETS: dict[str, dict] = _model_presets()
 
 
 # --------------------------------------------------------------------------- #
@@ -661,7 +489,13 @@ _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
 # Legacy preset-name migration (kept for backward compat with old configs)   #
 # --------------------------------------------------------------------------- #
 _LEGACY_PRESET_NAME_RENAMES: dict[str, str] = {
-    "qwen3-8b":        "qwen3-4b",
+    # NOTE: the old ``qwen3-8b`` → ``qwen3-4b`` rename is **gone**. The
+    # qwen3-4b worker was deleted (no weights on the target board, and
+    # qwen3.5-vl-4b already declares ``swcap_text_chat``). Redirecting a
+    # stale config to a different model than the one its author named
+    # would be worse than rejecting it, so such a config now fails
+    # validation with an explicit "unknown model" instead of silently
+    # loading something else.
     "locate-anything": "LocateAnything-3b",
 }
 
@@ -975,6 +809,9 @@ class ComputeRegistry:
         self._rknn_device_ids: Optional[list] = None
         self._hub: Any = None                   # wdndds Hub for client side
         self._hub_lock = threading.Lock()
+        # Shared side-channel participant for all LLMRPCSessions — see
+        # ``_side_hub``. Owned and closed here, never per instance.
+        self._side_channel_hub: Any = None
         self._peers: dict[str, dict] = {}       # guid → {name, discovered_at}
         self._peers_lock = threading.Lock()
         # 防 peer listener 重入 adopt:同 model_id SPDP lease 重发时,
@@ -1164,6 +1001,35 @@ class ComputeRegistry:
                 f"Reason: {self._cards_failed}"
             )
         return self._hub
+
+    def _side_hub(self):
+        """One shared side-channel participant for every session.
+
+        ``LLMRPCSession`` carries stream deltas and stop flags on its own
+        DomainParticipant so they are never queued behind the replier's
+        reply path. Letting each session build its own breaks as soon as
+        there are two: participant names must be unique within a domain,
+        and a duplicate name corrupts discovery **silently** — the second
+        worker's RPCs stop routing while the process still answers, so the
+        symptom is "this model never finishes loading" rather than anything
+        that points at DDS.
+
+        One participant serves every instance because the topics are
+        namespaced per service (``<service_name>/delta``), so they cannot
+        collide. Teardown belongs to the registry, not to any one session.
+        """
+        with self._lock:
+            if self._side_channel_hub is None:
+                from wdndds.dds._rpc import Hub as _RpcHub
+
+                hub = _RpcHub(
+                    participant_name=f"wdnwebui-side-{os.getpid()}",
+                    domain_id=0,
+                    discovery_servers=[],
+                )
+                hub.start()
+                self._side_channel_hub = hub
+            return self._side_channel_hub
 
     # ------------------------------------------------------------------ #
 
@@ -1522,8 +1388,10 @@ class ComputeRegistry:
     # 禁用 / 重启"对应 ensure_worker_for_model / unload_instance /
     # restart_instance_local。npu_index 通过 RPC load action 传给 worker，
     # 而不是命令行；worker 启动后只注册 DDS endpoint，不建 LLMSession。
-    # 禁用 = unload（worker 进程保留，可秒级重启用）；stop_instance_local
-    # 仅 restart 路径会走到，不再由 UI "禁用"按钮触发。
+    # 禁用 = unload + shutdown + SIGTERM + SIGKILL（进程真的关掉，
+    # 重启用走冷启 spawn + load）；UI "禁用"按钮走 stop_instance_local，
+    # 与"重启"共用同一条关闭路径。unload_instance 单独使用的地方只剩
+    # stop-all 端点，那里进程保留。
 
     def _register_errored_instance(self, inst: ModelInstance) -> None:
         """把 spawn / RPC setup 失败的 errored inst 加进 _instances，让
@@ -1702,9 +1570,18 @@ class ComputeRegistry:
             get_config().get_section("base", {}).get(
                 "model_path", f"{default_models_root()}/"))
 
+        manifest = load_worker_manifest(model_id)
+        entry = (manifest.entry_path if manifest is not None
+                 else str(Path(__file__).resolve().parent / "worker.py"))
         cmd = [
             sys.executable, "-u",
-            str(Path(__file__).resolve().parent / "worker.py"),
+            # Per-worker entry script under ``workers/<id>/compute_worker.py``.
+            # The basename is deliberately unchanged: both the spawn dedup
+            # needle and ``system_monitor``'s process scan match this exact
+            # string in /proc/<pid>/cmdline, so renaming it would silently
+            # break both. The fallback above only fires if a model has no
+            # manifest at all (it would then be unspawnable anyway).
+            entry,
             "--model", model_id,
             # v0.8.15: 主进程 spawn 本机 worker 时传 --local-only,让 worker
             # 只注册 per-PID service,不注册 standard。避免本机 spawned worker
@@ -2212,7 +2089,7 @@ class ComputeRegistry:
                         "npu=%d thread=%s",
                         inst.model_id, npu_index, threading.get_ident())
                     r = rpc_client.call(
-                        {"action": "load", "npu_index": npu_index},
+                        {"action": "load", "op": "load", "npu_index": npu_index},
                         timeout_ms=5_000,
                     )
                 data = (r or {}).get("data") or {}
@@ -2339,15 +2216,22 @@ class ComputeRegistry:
                          name=f"compute-bind-{inst.model_id}").start()
         return inst
 
-    def unload_instance(self, model_id: str) -> None:
+    def unload_instance(self, model_id: str, teardown: bool = True) -> None:
         """RPC ``unload``: worker drops its LLMSession, status returns
         to ``not_loaded``, npu_index resets to -1.
 
         Works for adopted peers too — we just ask the peer to release
         the resource; we don't terminate anything we don't own.
 
+        The RPC is **synchronous**: ``rpc_client.call`` blocks until the
+        worker replies, and the worker only replies after ``unload_handler``
+        has run ``sess.close()`` → ``backend.close()`` → ``rknn3_destroy``.
+        So when this returns, the NPU memory pool has actually been
+        returned — not merely dereferenced. Callers that are about to kill
+        the worker process depend on that ordering.
+
         v0.14.3: after the worker drops its session, also tear down
-        the per-instance FastDDS Service / Requester / RpcSessionProxy
+        the per-instance FastDDS Service / Requester / LLMRPCSession
         in the main process via :meth:`_teardown_rpc_client`. Without
         this, every enable→disable cycle leaks one Service (cshim
         payload pool ~60 MB per the AGENTS.md "Service 生命周期"
@@ -2362,6 +2246,17 @@ class ComputeRegistry:
         RPC 期间（500-1000ms）也看到一致状态；
         (2) ``_probe_gen += 1`` —— 失效 probe in-flight 的陈旧 ``r``，
         避免覆盖乐观写。
+
+        ``teardown=False`` defers :meth:`_teardown_rpc_client` to the
+        caller, leaving ``rpc_client`` / ``_svc`` usable. **Only
+        :meth:`stop_instance_local` may pass False** — it is about to
+        send a ``shutdown`` RPC, and that call is guarded by
+        ``if inst.rpc_client is not None``. Tearing down first makes
+        the shutdown unreachable, the worker never sees the stop
+        event, and the whole graceful-exit path (audio writer close,
+        served-session close, side-hub close, atexit ``/dev/shm``
+        sweep) is skipped in favour of a bare SIGKILL. Leave it True
+        everywhere else — nothing else has a follow-up RPC to make.
         """
         inst = self._find_by_model(model_id)
         if inst is None:
@@ -2376,7 +2271,7 @@ class ComputeRegistry:
                     if inst.rpc_client is None:
                         return
                     inst.rpc_client.call(
-                        {"action": "unload"}, timeout_ms=5_000)
+                        {"action": "unload", "op": "unload"}, timeout_ms=5_000)
             except Exception as e:  # noqa: BLE001
                 LOG.warning("unload %s RPC failed: %s", model_id, e)
         with self._lock:
@@ -2393,10 +2288,42 @@ class ComputeRegistry:
         # is what AGENTS.md calls "每个 ~60 MB of RSS" per Service;
         # stopping here gives the user real memory reclaim on disable
         # without a worker process restart.
-        self._teardown_rpc_client(inst)
+        #
+        # Skipped when the caller defers it (see the ``teardown`` arg) —
+        # ``stop_instance_local`` still needs this Requester to deliver
+        # the shutdown RPC that follows.
+        if teardown:
+            self._teardown_rpc_client(inst)
+        else:
+            LOG.debug(
+                "unload %s: rpc_client teardown deferred to caller",
+                model_id)
 
     def stop_instance_local(self, model_id: str) -> None:
-        """Spawned-only: unload → RPC shutdown → wait 3 s → kill -9.
+        """Unload → RPC shutdown → SIGTERM → wait 3 s → kill -9.
+
+        The order is load-bearing, and reversing any two steps breaks
+        something real:
+
+        1. ``unload_instance(teardown=False)`` runs **first**. It blocks
+           on the worker's ``unload`` reply, and the worker only replies
+           after ``unload_handler`` has run ``rknn3_destroy`` — so the
+           NPU memory pool is genuinely returned before we do anything
+           to the process. Shutting down first would let the worker exit
+           while its ``LLMSession`` is still alive, and the pool would
+           stay claimed: killing the process would then be pointless.
+           ``teardown=False`` keeps ``rpc_client`` alive for step 2.
+        2. ``shutdown`` over RPC so the worker runs its graceful path:
+           stop event → main-loop ``finally`` → audio writer close →
+           served-session close → side-hub close → atexit ``/dev/shm``
+           sweep (``max_age=0``).
+        3. SIGTERM as a second, transport-independent nudge. The worker
+           installs a SIGTERM handler (``workers/_base.py``) equivalent
+           to the shutdown RPC, and unlike step 2 this does not depend on
+           the Requester still working — which is the *only* route to a
+           graceful exit for an ``adopted_local`` instance (``proc`` is
+           None there, so 4/5 are skipped).
+        4. 3 s grace, then SIGKILL.
 
         Raises ``RuntimeError`` if the instance is adopted (proc is
         None) — the caller (API layer) turns this into HTTP 403.
@@ -2413,21 +2340,32 @@ class ComputeRegistry:
             "compute_registry: stop_instance_local enter model=%s "
             "source=%s thread=%s",
             model_id, inst._source, threading.get_ident())
+        # (1) unload first — must not tear down the Requester, step 2
+        # needs it. See the method docstring for why this order.
         try:
-            self.unload_instance(model_id)
+            self.unload_instance(model_id, teardown=False)
         except Exception as e:  # noqa: BLE001
             LOG.warning("stop: unload %s raised: %s", model_id, e)
+        # (2) graceful shutdown over the still-live Requester
         try:
             if inst.rpc_client is not None:
                 inst.rpc_client.call(
-                    {"action": "shutdown"}, timeout_ms=5_000)
+                    {"action": "shutdown", "op": "shutdown"}, timeout_ms=5_000)
         except Exception as e:  # noqa: BLE001
             LOG.info("stop: shutdown RPC %s raised: %s", model_id, e)
         proc = inst.proc
         if proc is not None and proc.poll() is None:
+            # (3) SIGTERM nudge; (4) grace period, then SIGKILL
+            try:
+                proc.terminate()
+            except Exception as e:  # noqa: BLE001
+                LOG.info("stop: terminate %s raised: %s", model_id, e)
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
+                LOG.warning(
+                    "stop: %s did not exit within 3s of SIGTERM/SIGKILL "
+                    "shutdown — SIGKILL", model_id)
                 try:
                     proc.kill()
                     proc.wait(timeout=2)
@@ -2438,8 +2376,10 @@ class ComputeRegistry:
                 inst.rpc_session_proxy.close()
         except Exception:
             pass
-        # Defensive: ``unload_instance`` already cleared these; the
-        # locks below mirror _teardown_rpc_client in case of partial state.
+        # The local endpoints are still live at this point — step 1
+        # deferred its teardown, and steps 2/3 needed them. The locks
+        # below mirror _teardown_rpc_client. This block is idempotent:
+        # it is a no-op if something above already dropped a handle.
         try:
             with inst._probe_lock:
                 if inst.rpc_client is not None:
@@ -2557,7 +2497,7 @@ class ComputeRegistry:
     # subprocess-mode spawn (wdndds cshim RPC)                           #
     # ------------------------------------------------------------------ #
     def _setup_rpc_client(self, inst: ModelInstance) -> None:
-        """Create the RpcClient + RpcSessionProxy for the given instance.
+        """Create the RpcClient + LLMRPCSession for the given instance.
 
         Used by both ``_start_one_subprocess`` (fresh spawn) and
         ``_adopt_existing_worker`` (boot-time adoption of an already
@@ -2600,19 +2540,28 @@ class ComputeRegistry:
         # pre-fix main-process RSS jumped ~80 MB per restart cycle).
         inst._svc = svc
         try:
-            from app.core.compute.proxy import make_rpc_session_proxy
-            inst.rpc_session_proxy = make_rpc_session_proxy(
-                rpc_client, inst.model_id, _svc=svc,
-                # LAN peer (adopted from another machine): the proxy's
-                # /dev/shm path-list trick can't reach the remote worker
-                # (different filesystem namespace). Fall back to JPEG +
-                # base64 — slightly lossy but byte-exact through FastDDS's
-                # builtin UDPv4/TCPv4 transports on the LAN hop.
+            from app.core.compute.proxy import make_rpc_session
+            spec = MODEL_PRESETS.get(inst.model_id)
+            if spec is None:
+                raise RuntimeError(f"no ModelSpec for model {inst.model_id!r}")
+            inst.rpc_session_proxy = make_rpc_session(
+                model=spec,
+                model_id=inst.model_id,
+                service_name=service_name,
+                hub=hub,
+                requester=rpc_client,
+                side_hub=self._side_hub(),
+                _svc=svc,
+                # LAN peer (adopted from another machine): the peer's
+                # /dev/shm is a different filesystem namespace, so the
+                # transport falls back to JPEG + base64 for frames —
+                # slightly lossy, but it survives FastDDS's builtin
+                # UDPv4/TCPv4 transports on the LAN hop.
                 is_remote=(inst._source == "adopted"),
             )
             inst.llm_session = inst.rpc_session_proxy
         except Exception as e:  # noqa: BLE001
-            LOG.warning("RpcSessionProxy create failed for %s: %s",
+            LOG.warning("LLMRPCSession create failed for %s: %s",
                         inst.model_id, e)
 
     def _teardown_rpc_client(self, inst: ModelInstance) -> None:
@@ -2638,10 +2587,11 @@ class ComputeRegistry:
         proxy = getattr(inst, "rpc_session_proxy", None)
         if proxy is not None:
             try:
-                # ``_RpcSessionProxy.close()`` only shuts down its
-                # ThreadPoolExecutor + stops the matched-sampler daemon
-                # — it does NOT touch the cshim client / Service.
-                # We do those separately below.
+                # ``LLMRPCSession.close()`` shuts down its own
+                # ThreadPoolExecutor + the cshim client and the delta /
+                # stop side channel. It does NOT destroy the registry's
+                # Service — for an ``adopted`` peer that Service has to
+                # survive, so we do that separately below.
                 proxy.close()
             except Exception as e:  # noqa: BLE001
                 LOG.debug("teardown[%s]: proxy.close raised: %s",
@@ -2749,7 +2699,7 @@ class ComputeRegistry:
                     continue
                 return None
             try:
-                r = rpc.call({"action": "info"}, timeout_ms=timeout_ms)
+                r = rpc.call({"action": "info", "op": "info"}, timeout_ms=timeout_ms)
             except Exception as e:  # noqa: BLE001
                 LOG.debug("probe: call failed for %s (attempt %d/%d): %s",
                           model_id, attempt, attempts, e)
@@ -3060,7 +3010,7 @@ class ComputeRegistry:
         修法：遍历所有 ``adopted`` (LAN peer) 且 ``status="running"`` 的
         instance，直接在 ``inst.rpc_client`` 上发一次 ``info`` RPC，强制
         SEDP endpoint 匹配在 boot 时完成。这样之后
-        ``RpcSessionProxy.respond()`` 跑时 endpoint 已经 warm。
+        ``LLMRPCSession.respond()`` 跑时 endpoint 已经 warm。
 
         约束：
           * 故意不走 ``_call_with_recreate`` —— 该 helper 在 wedged client
@@ -3089,7 +3039,7 @@ class ComputeRegistry:
             try:
                 t0 = time.time()
                 reply = inst.rpc_client.call(
-                    {"action": "info"}, timeout_ms=5000)
+                    {"action": "info", "op": "info"}, timeout_ms=5000)
                 dt_ms = (time.time() - t0) * 1000
                 if reply.get("ok"):
                     LOG.info(
@@ -3330,6 +3280,14 @@ class ComputeRegistry:
                 self._hub.close()
         except Exception:
             pass
+        # The shared side-channel participant outlives every session, so
+        # no ``LLMRPCSession.close()`` will release it — it is ours.
+        try:
+            if self._side_channel_hub is not None:
+                self._side_channel_hub.close()
+                self._side_channel_hub = None
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Boot                                                              #
@@ -3408,7 +3366,7 @@ class ComputeRegistry:
                             continue
                         try:
                             r = inst.rpc_client.call(
-                                {"action": "info"}, timeout_ms=5000)
+                                {"action": "info", "op": "info"}, timeout_ms=5000)
                         except Exception as e:
                             consecutive_failures += 1
                             LOG.warning("info call failed for %s (%d): %s",
@@ -3595,7 +3553,7 @@ class ComputeRegistry:
     # 消费者 API                                                         #
     # ------------------------------------------------------------------ #
     def get_session(self, capability_type: str) -> Any:
-        """Return the RpcSessionProxy for the first running instance
+        """Return the ``LLMRPCSession`` for the first running instance
         exposing ``capability_type``. Raises RuntimeError if none.
 
         **本机优先**：多实例可用时（如 LAN 上两台板都加载了同一
@@ -3634,7 +3592,7 @@ class ComputeRegistry:
         raise RuntimeError(f"功能未启用: {capability_type}")
 
     def get_session_for_model(self, capability_type: str, model_id: str) -> Any:
-        """Return the RpcSessionProxy for a specific running instance
+        """Return the ``LLMRPCSession`` for a specific running instance
         matching both ``capability_type`` and ``model_id``.
 
         Used by the consumer pages (音视频描述 / 视频目标检测 / 音频理解)

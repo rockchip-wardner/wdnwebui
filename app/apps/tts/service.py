@@ -616,6 +616,7 @@ class TtsSession:
         """
         if audio is None or audio.size == 0:
             return
+        produced_sec: Optional[float] = None
         # Per-chunk header: 8-byte (sample_rate, channels, sample_count)
         # little-endian. Browser ignores it for now (it uses the
         # constructor-passed SR) but it's there for future re-emit.
@@ -655,8 +656,19 @@ class TtsSession:
                     self._run_pcm_chunks.append(flat)
                     if self._run_pcm_sr <= 0:
                         self._run_pcm_sr = sr
+                    produced_sec = sum(c.size for c in self._run_pcm_chunks
+                                       ) / float(max(sr, 1))
         except Exception as exc:               # noqa: BLE001
             LOG.debug("pcm accumulate failed: %s", exc)
+
+        # Progress tick. This used to be the SDK's ``on_step(n_frames,
+        # audio_sec)`` callback, which only existed in-process; now that
+        # inference runs elsewhere it can't cross the wire. Deriving it
+        # from the PCM stream is strictly better anyway: it's the audio
+        # actually produced and actually on its way to the speakers,
+        # not the decoder's internal frame counter.
+        if produced_sec is not None:
+            self._on_step(int(produced_sec * 50), produced_sec)
 
     @staticmethod
     def _enqueue_chunk(q: asyncio.Queue, data: bytes) -> None:
@@ -835,13 +847,15 @@ class TtsSession:
             sess = None
         if sess is not None:
             try:
-                inner = getattr(sess, "rknn_llm", None) or getattr(sess, "_backend", None)
-                target = getattr(inner, "rknn_llm", inner)
-                stop_fn = getattr(target, "session_stop", None)
-                if callable(stop_fn):
-                    stop_fn()
+                # ``sess.stop()`` publishes the cancel out-of-band and
+                # returns immediately; the worker notices once inference
+                # returns. It is also the only thing that can work here:
+                # the session lives in another process, so ``sess._backend``
+                # is None and reaching for a C handle through it was
+                # silently a no-op.
+                sess.stop()
             except Exception as exc:           # noqa: BLE001
-                LOG.debug("session_stop raised: %s", exc)
+                LOG.debug("session.stop raised: %s", exc)
         return self.snapshot()
 
     def close(self) -> None:
@@ -899,12 +913,14 @@ class TtsSession:
                     volume=req.volume,
                     no_play=no_play,
                     non_streaming_mode=req.non_streaming_mode,
-                    stop_event=self._stop_event,
-                    on_step=self._on_step,
-                    on_audio_chunk=self._on_audio_chunk,
-                )
-                # 路径走 proxy 的 options 白名单，让 worker 开 client socket
-                # 回流 PCM（_run_safe 里建 socket）。
+                                    )
+                # **只传路径，不传回调。** 推理在另一个进程，callable
+                # 无法 JSON 序列化；worker 收到这个路径后自己 connect
+                # 并装 ``on_audio_chunk``，把 PCM 推回本进程在
+                # _run_safe 里起的 AF_UNIX reader（同一条
+                # ``_on_audio_chunk`` 路径）。LAN peer 走
+                # ``wdndds/audio/tts_chunk/<model_id>`` 兜底
+                # （见 ``_dds_chunk_reader_thread``）。
                 if self._pcm_sock_path:
                     kwargs["tts_pcm_socket_path"] = self._pcm_sock_path
                 return await sess.respond(**kwargs)

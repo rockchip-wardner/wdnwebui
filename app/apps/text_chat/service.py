@@ -1,28 +1,30 @@
-"""Qwen3-4B 文本对话服务：单例 + worker + RPC 流式拉取。
+"""文本对话服务：单例 + worker + RPC 流式。
 
 设计要点
 ========
 
 * **LLMSession 必须从 ComputeRegistry 取**（``get_session("swcap_text_chat")``）；
-  拿到的是 ``RpcSessionProxy``，找不到抛
+  拿到的是 ``wdndds.LLMRPCSession``，找不到抛
   ``RuntimeError("功能未启用: swcap_text_chat")``，调用方决定如何上报。
-* **推理在 compute_worker 子进程里跑**：``session.chat_run(...)`` 通过 wdndds
-  RPC 把 ``{history, text, context_limit, max_new_tokens}`` 发给 worker；
-  worker 后台线程用 tokenizer 精确裁剪历史、拼 ChatML、跑
-  ``_backend.run``，边跑边把 ``sink.text`` 增量收进 chat state。
-  主进程 ``chat_poll`` 轮询拉增量，``on_delta`` 喂给 ``_ThinkingRouter``
-  流式切分 thinking / answer。
+* **推理在 compute_worker 子进程里跑**：``session.respond(...)`` 经 wdndds
+  RPC 发出 ``{prompt, history, tools, options}``；worker 跑完
+  ``LLMLocalSession`` 并把**原始文本**回传。ChatML 拼接在调用方完成
+  （``wdnai.build_chatml_prompt``），工具 JSON 的解析也在调用方完成 ——
+  worker 不认识任何 schema 或工具。
+* **流式走 ``on_delta`` 回调**：delta 从一条独立的 RELIABLE 旁路 topic
+  回来（reply 通道在推理期间是聋的），喂给 ``_ThinkingRouter`` 流式切分
+  thinking / answer。没有轮询，也没有 chat state 机。
 * **thinking 与 answer 分离**：每个 delta 增量先过一道 ``_ThinkingRouter``
   状态机，按 `` thinking`` / `` response`` 推到对应频道；``done`` 时再
   用 ``split_thinking`` 兜底切一次（处理 token 边界切碎等极端情况）。
-* **多轮上下文**：app 端消息 deque 全量发给 worker；worker 用真实 tokenizer
-  从最旧历史滚动裁剪（超 ``context_limit - max_new_tokens`` 就丢更早的），
-  拼 ChatML 后 ``keep_history=0`` 跑 —— 历史只写 ``content:answer``，
-  不写 thinking，下一轮看不到。
+* **多轮上下文**：app 端消息 deque 全量交给 agent；agent 用 worker 的
+  tokenizer 精确计数（一次无推理的 ``count_tokens`` 控制调用）从最旧历史
+  滚动裁剪（超 ``context_limit - max_new_tokens`` 就丢更早的）。历史只写
+  ``content:answer``，不写 thinking，下一轮看不到。
 * **context_limit 可配置**：``config.jsonc["compute"]["text_chat"]["context_limit"]``，
-  默认 16384；每次推理前热读。超限自动裁剪最旧历史，仅单条消息超限才报错。
-* **停止 = 软停**：``stop()`` 置 ``_worker_stop_event``；proxy 的 ``chat_run``
-  轮询循环感知后调 ``chat_stop`` RPC，worker 跑完返回 stopped，主进程丢本轮。
+  默认 4096（= qwen3.5-vl-4b 的 max_context_len）；每次推理前热读。超限自动裁剪最旧历史，仅单条消息超限才报错。
+* **停止 = 软停**：``stop()`` 置 ``_worker_stop_event`` 并调 ``session.stop()``；
+  后者把取消标志发到旁路 topic，worker 跑完本轮看到后回报 stopped，本轮丢弃。
 * **broadcast pattern**：worker 线程 push 到 ``asyncio.Queue`` 列表；
   WS handler 在主 event loop 里 ``drain``。
 
@@ -103,7 +105,15 @@ class _TextChatManager:
     # ---- 限制 ----
     HISTORY_MAX        = 200          # deque maxlen
     MAX_NEW_TOKENS     = 2048         # spec max_new_tokens
-    CONTEXT_LIMIT      = 16384        # spec max_context_len（qwen3-4b）
+    # 对话窗口上限。**必须 ≤ 实际服务模型的 max_context_len**，否则
+    # 裁剪会放进一个装不下的历史 —— 症状不是报错，而是 rknn3 在
+    # prefill 阶段长挂（见 VAS ``_call_llm`` 的同款诊断注释）。
+    #
+    # 4096 是 ``swcap_text_chat`` 唯一 provider
+    # ``qwen3.5-vl-4b`` 的真实窗口（原 qwen3-4b 专用文本 worker 已
+    # 删除，它的 16384 不再适用）。换 provider 时必须同步改这里 ——
+    # 这是 manifest 与 spec 之间唯一需要手工对齐的常量。
+    CONTEXT_LIMIT      = 4096
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -119,6 +129,9 @@ class _TextChatManager:
         # 单 worker 线程，串行消费请求
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop_event = threading.Event()
+        # Handle on the in-flight session, so ``stop()`` can publish a
+        # cancel out-of-band while a turn is blocked in inference.
+        self._session = None
         self._request_queue: "_queue.Queue[Optional[ChatRequest]]" = _queue.Queue()
         self._wake_event = threading.Event()
 
@@ -205,18 +218,29 @@ class _TextChatManager:
     def stop(self) -> None:
         """请求停止正在跑的推理。
 
-        v0.4 起 worker 侧 ``sess.respond`` 是阻塞 + 不可中断的（cshim
-        RPC 还没有 streaming/cancel 通路），主进程没有 cancel RPC 通道。
-        本方法只翻状态 + 置位 ``_worker_stop_event``——worker 跑完
-        那一轮 ``await sess.respond()`` 后看到 ``stopped`` 就丢弃本轮
-        结果，不写历史。UI 端立即显示 "已停止"；用户体感是 "已停"，但
-        下一轮 ``session.reset()`` 仍要等 worker 把当前一轮跑完。
+        rknn3 没有协作式取消，in-flight 的 ``session_run`` 中断不了。
+        所以停止是"软停"：``session.stop()`` 把取消标志发布到一条旁路
+        DDS topic（不等任何 RPC 应答），worker 跑完那一轮推理后看到标志、
+        回报 ``stopped``，``respond()`` 随即抛错，本轮结果被丢弃、不写
+        历史。
+
+        另有一道本地 ``_worker_stop_event``：工具轮之间 agent 会检查它，
+        能在下一轮开始前就退出，不必等当前推理结束。
+
+        用户体感和 UI 都是"已停"；下一轮 ``session.reset()`` 仍要等
+        worker 把当前这一轮跑完。
         """
         with self._lock:
             if self._state != self.STATE_RUNNING:
                 return
+            session = self._session
         self._worker_stop_event.set()
-        _LOG.info("stop requested: worker will discard result after respond() returns")
+        if session is not None:
+            try:
+                session.stop()
+            except Exception as e:  # noqa: BLE001 — cancel is best-effort
+                _LOG.debug("session.stop() failed (best-effort): %s", e)
+        _LOG.info("stop requested: worker discards this turn once inference returns")
 
     def reset(self) -> None:
         """清空 history + history_tokens，回到 idle。"""
@@ -263,7 +287,7 @@ class _TextChatManager:
         切 thinking/answer → 推 WS → 写历史。"""
         from app.core.compute.registry import get_registry
 
-        # 1. 拿 _RpcSessionProxy（ComputeRegistry 不存在 / capability 未启用 → RuntimeError）
+        # 1. 拿 LLMRPCSession（ComputeRegistry 不存在 / capability 未启用 → RuntimeError）
         try:
             session = get_registry().get_session("swcap_text_chat")
         except RuntimeError as e:
@@ -276,6 +300,8 @@ class _TextChatManager:
             })
             self._broadcast({"type": "state", "state": self.snapshot()})
             return
+        with self._lock:
+            self._session = session
 
         with self._lock:
             history_snapshot = list(self._history)
@@ -398,7 +424,9 @@ class _TextChatManager:
     def _resolve_context_limit(self) -> int:
         """读 ``config.jsonc["compute"]["text_chat"]["context_limit"]``。
 
-        默认 16384；缺失 / 类型错 / <1 → 回退默认。每次推理前重读，配置热生效。
+        缺失 / 类型错 / <1 → 回退 :attr:`CONTEXT_LIMIT`（4096，即 qwen3.5-vl-4b
+        的真实窗口）。每次推理前重读，配置热生效 —— 但用户把它调大到
+        模型装不下的值时不会被拦，只会变成 prefill 长挂。
         """
         try:
             cfg = get_config().get_section("compute", {})
@@ -438,7 +466,7 @@ class _TextChatManager:
 class _ThinkingRouter:
     """增量状态机：维护一个游标决定下一段 delta 推 thinking 还是 answer。
 
-    进入点固定假设模型先输出 thinking（用户已确认 Qwen3-4B 走 enable_thinking
+    进入点固定假设模型先输出 thinking（用户已确认对话模型走 enable_thinking
     必输出 ``<think>...</think>``）；首次见到 ``</think>`` 后切到 answer。
     """
 

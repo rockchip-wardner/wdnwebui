@@ -54,7 +54,7 @@ def register_all(app: FastAPI) -> None:
     #
     # 走 ``app.core.tools._builtins.register_builtin_tools()`` —— 与
     # compute_worker 子进程共用同一份"真源",避免 worker 端
-    # ``_resolve_tool_classes(['VideoSearch'])`` 查不到类 → prompt
+    # ``chat_agent._tool_classes(['VideoSearch'])`` 查不到类 → prompt
     # 缺工具 schema → 模型 hallucinate "假装在调用" 的破事
     # (issue: 应用对接 / im-bridge 视频检索在 c219e71 后输出正常 →
     # v0.4 重构后仅返回 "我将模拟调用工具" 的假答案)。

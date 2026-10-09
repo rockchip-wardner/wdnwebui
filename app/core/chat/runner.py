@@ -1,22 +1,25 @@
+"""文本后处理 —— thinking/answer 切分 + 输出清洗。
+
+**不再拼 prompt**。ChatML 的拼装归 ``wdnai.build_chatml_prompt``（单一
+真源，``LLMSession.respond(history=…)`` 内部就是调它）；历史裁剪归
+``chat_agent._trim``（它需要向 worker 的 tokenizer 提问）。本模块曾经
+各留了一份副本，两份迟早会漂 —— 现已删除。
+
+``MAX_NEW_TOKENS`` / ``sanitize_chat_output`` / ``split_thinking`` 三者
+都是纯文本处理，与 transport 无关，留在这里。
+"""
 from __future__ import annotations
 
 import re
-from typing import Any, List, Optional, Tuple
+from typing import Tuple
 
 MAX_NEW_TOKENS = 2048
 
-# 严格配对：``<think>...</think>``。Qwen3-4B / Qwen3.5-VL 在某些输出
+# 严格配对：``<think>...</think>``。Qwen3.5-VL 在某些输出
 # 里也会丢开口只写 ``</think>``（实测 Qwen3.5-VL 自报家门那段就漏了
 # ``<think>``），所以还要有 ``_THINK_TAIL_RE`` 兜底。
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 _THINK_TAIL_RE = re.compile(r"^(.*?)</think>", re.DOTALL)
-
-
-_TOOL_CALL_INSTRUCTION = (
-    "When you decide to call a tool, output **exactly one** JSON object "
-    "matching the format above. Do not output multiple JSON objects, "
-    "placeholder/example JSONs, or any text before/after the JSON."
-)
 
 
 _CHATML_STRAY_RE = re.compile(r"<\|im_end\|>")
@@ -32,10 +35,10 @@ def sanitize_chat_output(text: str) -> str:
     检索回复里出现大量 ``<|im_start|>user`` / ``<|im_end|>`` 等）。
 
     触发这类越界生成的上游原因是 C 侧 KV cache 在轮次间未清理
-    （见 ``compute_worker._clear_backend_kv``），模型看到上一轮历史后
-    续写出新的回合。修复后正常单轮输出**不应**含 ``<|im_start|>``，
-    因此：从首个 ``<|im_start|>`` 起整段丢弃（其后内容是模型幻觉的
-    新回合，不可信），再删掉残留的 ``<|im_end|>``。
+    （wdnai ``reset()`` 已在 SDK 侧修好，worker 不再自己清）。修复后
+    正常单轮输出**不应**含 ``<|im_end|>``，因此：从首个 ``<|im_end|>``
+    起整段丢弃（其后内容是模型幻觉的新回合，不可信），再删掉残留的
+    ``<|im_end|>``。
 
     ``<think>`` / ``</think>`` **刻意保留** —— 上层 ``split_thinking``
     依赖它们做思维链切分。
@@ -51,7 +54,7 @@ def split_thinking(text: str) -> Tuple[str, str]:
     """把 ``text`` 切成 ``(thinking, answer)``。
 
     三档兜底（从最严到最松）：
-      1. ``<think>...</think>`` 严格配对（Qwen3-4B / 多数 Qwen3-VL 都
+      1. ``<think>...</think>`` 严格配对（多数 Qwen3-VL 都
          走这条路径）→ 取出 group(1) 当 thinking，其余当 answer。
       2. 只有 ``</think>`` 没 ``<think>`` 开头（实测 Qwen3.5-VL
          在 ``enable_thinking=True`` 时的偶发输出）：
@@ -79,72 +82,3 @@ def split_thinking(text: str) -> Tuple[str, str]:
         answer = text[m.end():].strip()
         return thinking, answer
     return "", text.strip()
-
-
-def count_tokens(tokenizer: Any, text: str) -> int:
-    if not text:
-        return 0
-    try:
-        return len(tokenizer.encode(text, add_special_tokens=False))
-    except Exception:
-        return len(text) // 2
-
-
-def build_chatml_prompt(history: List[dict], user_text: str,
-                        tool_specs: Optional[List[dict]] = None) -> str:
-    """拼 ChatML 文本 prompt。
-
-    ``tool_specs``（可选，``get_tool_specs(tools)`` 返回值）非空时，
-    渲染 wdnai 的 ``render_tools_block`` 并以独立段形式追加到 system
-    段之后、对话历史之前（与 wdnai 默认追加到末尾不同——chat_run 走
-    独立段，结构清晰）。模型只需看到工具描述，无需被历史 / 用户问题
-    注意力分散。
-
-    同时追加 ``_TOOL_CALL_INSTRUCTION`` 强化指令（chat_run ↔ @Callable
-    链路 双重保险之一），让 LLM 在 answer 段只输出**单个** tool_call
-    JSON，避免"先示例后真实"的多 JSON 场景。解析层
-    ``compute_worker._parse_qwen_tool_call`` 路径 2 提供兜底。
-    """
-    parts = ["system\nYou are a helpful assistant.\n"]
-    if tool_specs:
-        from wdnai._callable import render_tools_block
-        parts.append("\n")
-        parts.append(render_tools_block(tool_specs))
-        parts.append("\n\n")
-        parts.append(_TOOL_CALL_INSTRUCTION)
-        parts.append("\n\n---\n\n")
-    for msg in history:
-        if msg.get("role") == "user":
-            parts.append(f"user\n{msg.get('content') or ''}\n")
-        elif msg.get("role") == "assistant":
-            parts.append(f"assistant\n{msg.get('content') or ''}\n")
-    parts.append(f"user\n{user_text}\n")
-    parts.append("assistant\n")
-    return "".join(parts)
-
-
-def trim_history(
-    history: List[dict],
-    user_text: str,
-    tokenizer: Any,
-    context_limit: int,
-    max_new_tokens: int = MAX_NEW_TOKENS,
-) -> Tuple[List[dict], Optional[str]]:
-    reserve = min(max_new_tokens, max(1, context_limit // 8))
-    user_tokens = count_tokens(tokenizer, user_text)
-    if user_tokens + reserve > context_limit:
-        detail = (
-            f"单条消息过长（{user_tokens} tokens + 预留 {reserve} > "
-            f"{context_limit}），请缩短输入"
-        )
-        return [], detail
-    selected: List[dict] = []
-    total = user_tokens
-    for msg in reversed(history):
-        content = msg.get("content") or ""
-        t = count_tokens(tokenizer, content)
-        if total + t + reserve > context_limit:
-            break
-        selected.insert(0, msg)
-        total += t
-    return selected, None

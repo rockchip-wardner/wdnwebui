@@ -2,7 +2,7 @@
   "enabled": true,
   "wizard_title": "文本对话快速配置",
   "swcap_to_model": {
-    "swcap_text_chat": { "npu_index": 0, "model_id": "qwen3-4b" }
+    "swcap_text_chat": { "npu_index": 0, "model_id": "qwen3.5-vl-4b" }
   },
   "open_source_button": "",
   "start_buttons": [],

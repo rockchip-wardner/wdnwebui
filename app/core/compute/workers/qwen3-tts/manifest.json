@@ -1,0 +1,16 @@
+{
+  "label": "[TTS]文字转语音v3",
+  "capability_types": [
+    "swcap_audio_tts"
+  ],
+  "worker_name": "tts",
+  "model_dir_name": "Qwen3-TTS",
+  "instance_name": "tts-q30",
+  "memory_estimate_mb": 1900,
+  "estimated_init_seconds": 30,
+  "description": "文字转语音模型",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 60
+}

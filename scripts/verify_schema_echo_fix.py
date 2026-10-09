@@ -11,7 +11,7 @@ User-reported bug (2026-09):
 Root cause:
   ``_split_scene_frame_result()`` 已有 ``_looks_like_schema_echo`` 检测,但只
   在 Path 1 (SceneFrame 实例) 调用。Path 2 (dict 路径,worker 通过
-  ``result_data_path`` SHM 还原的 raw dict) 和 Path 3 (str 路径,SDK Path 5
+  ``model_dump()`` 还原的 dict) 和 Path 3 (str 路径,SDK Path 5
   兜底返回 raw text) 都漏检。结果:
     * Path 2: ``_text_from_dict`` 取出 echo text → 前端当描述渲染
     * Path 3: 同 Path 2,且 raw 是 str 整体兜底直接显示

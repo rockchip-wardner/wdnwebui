@@ -1,0 +1,17 @@
+{
+  "label": "[VLLM]视觉文字多模态v3.5",
+  "capability_types": [
+    "swcap_text_chat",
+    "swcap_video_describe"
+  ],
+  "worker_name": "q5-vl",
+  "model_dir_name": "Qwen3.5-4B",
+  "instance_name": "vlm-q35-4b",
+  "memory_estimate_mb": 3500,
+  "estimated_init_seconds": 60,
+  "description": "Qwen3.5-4B 多模态模型，支持图像描述和文本对话",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 20
+}
