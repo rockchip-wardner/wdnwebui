@@ -187,8 +187,11 @@
       document.querySelectorAll(".nav-item").forEach((n) => {
         n.classList.toggle("active", n.dataset.page === page);
       });
+      // B 方案:卡片进入前先 dismiss 残留 loading,再按需重挂(B 方案关键)。
+      _dismissCardLoading();
       if (this.isCardPage(page)) {
         if (!DemoGuard._loadedApps.has(page)) {
+          _prepareCardEntry(page);
           this._loadCardJS(page);
         } else if (!DemoGuard._wizardMounted.has(page)
                    && window.WizardRegistry?.tryMount) {
@@ -196,6 +199,7 @@
           // 向导，**不**重新注入 <script>：否则卡片 IIFE 重跑，复用的 DOM
           // 上事件监听器累积、模块状态归零（用户实测：清空缓存 confirm
           // 重复 / 进度条切页复活 / 反查按钮闪烁）。
+          _prepareCardEntry(page);
           const m = (window.__APP_MANIFESTS__?.cards || [])
             .find((x) => x.id === page);
           if (m) {
@@ -250,6 +254,53 @@
       }
     },
   };
+
+  // ─────────────────────────────────────────────────────────────────────
+  // B 方案:卡片首次进入的 loading 占位,彻底消除"先到功能页、过几秒才到
+  // wizard"的闪窗。详见 state.js:mount 末尾的 wizard:mounted 事件。
+  // ─────────────────────────────────────────────────────────────────────
+  let _cardLoadingTimeout = null;
+
+  function _prepareCardEntry(page) {
+    const m = (window.__APP_MANIFESTS__?.cards || [])
+      .find((x) => x.id === page);
+    if (!m || !m.wizard_config) return;
+    const pageSection = document.getElementById("page-" + page);
+    if (pageSection) pageSection.classList.add("hidden");
+    const overlay = document.getElementById("wd-loading-section");
+    if (overlay) {
+      const text = overlay.querySelector("#wd-loading-text");
+      if (text) text.textContent = `正在加载 ${m.title || page}…`;
+      overlay.classList.remove("hidden");
+    }
+    if (_cardLoadingTimeout) clearTimeout(_cardLoadingTimeout);
+    // 30s 兜底:tryMount 失败 / wizard.json 404 / mount 抛错 等场景不会
+    // 触发 wizard:mounted 事件,这里超时清掉 loading 让用户能进功能页。
+    _cardLoadingTimeout = setTimeout(() => {
+      _cardLoadingTimeout = null;
+      const o = document.getElementById("wd-loading-section");
+      if (o && !o.classList.contains("hidden")) {
+        o.classList.add("hidden");
+        if (currentPage() === page) {
+          const ps = document.getElementById("page-" + page);
+          if (ps) ps.classList.remove("hidden");
+        }
+      }
+    }, 30000);
+  }
+
+  function _dismissCardLoading() {
+    if (_cardLoadingTimeout) {
+      clearTimeout(_cardLoadingTimeout);
+      _cardLoadingTimeout = null;
+    }
+    const overlay = document.getElementById("wd-loading-section");
+    if (overlay) overlay.classList.add("hidden");
+  }
+
+  window.addEventListener("wizard:mounted", () => {
+    _dismissCardLoading();
+  });
 
   // 向导卸载时只清 _wizardMounted 标记，**不**动 _loadedApps —— 否则
   // ROUTER 认为卡片未加载、重新注入 <script>（IIFE 重跑 → 监听器在复用
@@ -343,6 +394,45 @@
       ev.preventDefault();
       ROUTER.navigate(a.dataset.page);
     });
+    _preloadCardScripts();
+  }
+
+  // 预热所有卡片 JS,让首次点击直接命中 _loadedApps,避免 showPage 同步
+  // 切 page 可见性 + _loadCardJS 异步加载之间的"先到功能页"竞态。
+  // **不**调 tryMount —— 否则 6 个 wizard 会在 boot 时全部自动弹出。
+  let _cardsPreloadStarted = false;
+  function _preloadCardScripts() {
+    if (_cardsPreloadStarted) return;
+    _cardsPreloadStarted = true;
+    const data = window.__APP_MANIFESTS__ || { cards: [] };
+    for (const card of (data.cards || [])) {
+      if (!card || !card.id) continue;
+      if (DemoGuard._loadedApps.has(card.id)) continue;
+      const jsList = (card.frontend && card.frontend.js) || [];
+      if (!jsList.length) continue;
+      // 串行加载,与 _loadCardJS 保持一致(避免并行 race)
+      const chain = jsList.reduce((p, url) => {
+        return p.then(() => new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = url;
+          s.defer = false;
+          s.dataset.cardPreload = card.id;
+          s.onload = () => resolve();
+          s.onerror = () => {
+            console.warn("[router] card preload failed:", card.id, url);
+            reject(new Error("Failed to load " + url));
+          };
+          document.head.appendChild(s);
+        }));
+      }, Promise.resolve());
+      chain.then(() => {
+        DemoGuard._loadedApps.add(card.id);
+      }).catch((e) => {
+        console.warn("[router] card preload chain failed for",
+                     card.id, e && (e.message || e));
+        // _loadedApps 不加,用户点击时会走 _loadCardJS 重试
+      });
+    }
   }
 
   function escapeHtml(s) {

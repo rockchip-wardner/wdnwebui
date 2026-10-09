@@ -695,6 +695,15 @@
         </details>
       </section>
 
+      <!-- 卡片首次进入的 loading 占位:framework.js:_prepareCardEntry 同步显示,
+           wizard/state.js:mount() 末尾 dispatch wizard:mounted 后 framework 隐藏。 -->
+      <section id="wd-loading-section" class="wd-loading-section hidden" aria-live="polite" aria-busy="true">
+        <div class="wd-loading-inner">
+          <div class="wd-loading-spinner" aria-hidden="true"></div>
+          <div class="wd-loading-text" id="wd-loading-text">正在加载…</div>
+        </div>
+      </section>
+
       </main>
   </div>
 

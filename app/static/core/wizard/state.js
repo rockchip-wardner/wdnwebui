@@ -952,6 +952,16 @@
     };
     window.addEventListener("hashchange", onNavAway);
     _active._onNavAway = onNavAway;
+
+    // B 方案:通知 framework 隐藏 wd-loading-section(同步在 showPage
+    // 期间挂上的 loading 占位)。失败路径(tryMount catch / fetch
+    // wizard.json 404 / mount 抛错)不会到这里,framework 那边有 30s
+    // 兜底 timeout 兜住。
+    try {
+      window.dispatchEvent(new CustomEvent("wizard:mounted", {
+        detail: { appId: app.id, action: "mount" },
+      }));
+    } catch (_) {}
   }
 
   function unmount(silent) {
