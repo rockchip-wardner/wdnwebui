@@ -5,8 +5,10 @@ Endpoints
 * ``GET    /api/compute``                  完整 snapshot（cards / services /
                                           instances / capabilities / tools）。
                                           UI 算力配置页 / discovery 页都从这里读。
-* ``GET    /api/compute/config``           读 ``config.jsonc["compute"]`` 数据。
+* ``GET    /api/compute/config``           读 ``config.jsonc["compute"]["autostart"]``
+                                          （只读；编辑请直接改 config.jsonc）。
 * ``PUT    /api/compute/config``           全量替换 ``compute`` section。
+                                          **不**触发 live 启停，要生效需重启。
 * ``POST   /api/compute/instances``        ``{npu_index, model}`` → 用户在算力
                                           配置页点"启用"。两步：
                                           (1) ensure worker（probe → adopt /
@@ -36,10 +38,10 @@ Endpoints
 """
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.compute.registry import (
     MODEL_PRESETS,
@@ -56,10 +58,34 @@ router = APIRouter(tags=["compute"])
 class InstanceRequest(BaseModel):
     """``POST /compute/instances`` 入参：用户选好 (model, npu) 后启用。
 
-    npu_index 必填，因为 enable 步骤包含 RPC load 绑定 NPU。
+    ``npu_index`` 必填 —— enable 步骤包含 RPC load 绑定 NPU。
+
+    **可以是单个卡号，也可以是一串卡号**：算力页的「运行在」是多选，
+    同一个模型可以同时跑在两张卡上（两个独立 worker，各占一卡，各自
+    一个按 PID 命名的 DDS service）。传 ``[0, 1]`` 会依次为每张卡
+    spawn+bind，返回的 ``instances`` 是本次**新建**的那些。
     """
-    npu_index: int = Field(ge=0, le=15)
+    #: Range checked in ``_npu_list`` instead of via ``Field(ge=..., le=...)``:
+    #: those constraints do not survive the ``int | list[int]`` union.
+    npu_index: int | list[int]
     model: str
+
+    @field_validator("npu_index")
+    @classmethod
+    def _npu_list(cls, v):
+        """Normalise ``0`` / ``[0]`` / ``[0, 1]`` to a de-duplicated list."""
+        items = [v] if isinstance(v, int) else list(v)
+        if not items:
+            raise ValueError("npu_index 不能为空列表")
+        out: list[int] = []
+        for n in items:
+            if not isinstance(n, int) or isinstance(n, bool):
+                raise ValueError(f"npu_index 必须是整数，got {n!r}")
+            if n < 0:
+                raise ValueError(f"npu_index 必须 >= 0（实际卡号，0 起），got {n}")
+            if n not in out:
+                out.append(n)
+        return out
 
     @field_validator("model")
     @classmethod
@@ -106,41 +132,34 @@ class RestartRequest(BaseModel):
         return v
 
 
-class ServiceEntry(BaseModel):
-    """``compute.services[]`` 的单条 entry schema。
+class AutostartEntry(BaseModel):
+    """``compute.autostart[]`` 的单条 entry schema.
 
-    ``name``    ——  ``MODEL_PRESETS`` key（如 ``"qwen3-vl-4b"``）。
-    ``label``   ——  在算力配置卡上显示的名字（可与 preset 默认 label
-                  不同，让用户自定义品牌名）。
-    ``autostart`` ——  ``"enabled"`` / ``"disabled"`` / ``"hidden"``
-                  * ``enabled``:  boot 时 spawn worker + RPC bind 到
-                    NPU；服务常驻，重启 / reload 后自动恢复。
-                  * ``disabled``: boot 时仅 adopt 现有 peer（不 spawn /
-                    不 bind）。用户需在算力配置页点 启用 才加载模型。
-                  * ``hidden``:   完全禁用 —— boot 不碰、UI 不渲染、
-                    capability 也不对外暴露。相当于"在文件里注释掉"。
-    ``device``  ——  物理设备号（不是 npu_index）:
-                  * ``0`` —— 主控（RK3588 主机；当前没有 preset 跑这里）
-                  * ``1`` —— 第一张 RK182x 卡
-                  * ``2`` —— 第二张 RK182x 卡
-                  boot bind / UI radio 默认都按这个号选 NPU，但用户仍
-                  可在 radio 里手动覆盖（device 是 hint，不是硬绑）。
+    ``model``      ——  ``MODEL_PRESETS`` key，即 ``workers/<model_id>.json``
+                      的文件名主干（如 ``"qwen3-vl-4b"``）。
+    ``npu_index``  ——  开机要绑定的**真实卡号**（直接来自 ``list_cards()``
+                      的 ``npu_index``，0 起）。spawn 时作为 ``--npu``
+                      传给 worker，worker 自己开始加载模型。
+
+    不在 ``autostart`` 里的模型开机不启动（不 spawn / 不 adopt / 不占
+    NPU 显存），算力页仍显示为 unavailable，可手动启用。
 
     校验规则：
-    * ``name`` 必须在 ``MODEL_PRESETS`` 中存在（否则 422）；
-    * ``autostart`` 必须是上述三选一；
-    * ``device`` 必须是 0 / 1 / 2（其它值 422）；
-    * 同名 entry 在同一份 config 里**只允许一条**（多于一条 → 422）。
+    * ``model`` 必须在 ``MODEL_PRESETS`` 中存在（否则 422）；
+    * ``npu_index`` 必须是非负整数（否则 422）；
+    * 同一模型只允许一条（多于一条 → 422）：一张卡一个模型，反悔就在
+      算力页手动换卡；
+    * 旧 ``services[]`` 的 ``label`` / ``device`` 字段已删除 —— label
+      归 ``workers/<id>.json``，卡号直接写 ``npu_index``。带上旧字段会
+      被当成未知字段报错，而不是被静默忽略。
     """
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
-    name: str
-    label: str
-    autostart: Literal["enabled", "disabled", "hidden"] = "disabled"
-    device: int = 1
+    model: str
+    npu_index: int
 
-    @field_validator("name")
+    @field_validator("model")
     @classmethod
     def _known_model(cls, v: str) -> str:
         if v not in MODEL_PRESETS:
@@ -149,49 +168,61 @@ class ServiceEntry(BaseModel):
             )
         return v
 
-    @field_validator("label")
+    @field_validator("npu_index")
     @classmethod
-    def _label_nonempty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("label 不能为空")
-        return v
-
-    @field_validator("device")
-    @classmethod
-    def _device_in_range(cls, v: int) -> int:
-        if v not in (0, 1, 2):
-            raise ValueError(f"device 必须是 0/1/2（主控 / 182x#0 / 182x#1），got {v}")
+    def _npu_nonnegative(cls, v: int) -> int:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(f"npu_index 必须是整数，got {v!r}")
+        if v < 0:
+            raise ValueError(
+                f"npu_index 必须 >= 0（实际卡号，0 起），got {v}")
         return v
 
 
 class ComputeConfigPayload(BaseModel):
     """``PUT /api/compute/config`` 入参。
 
-    ``services`` 每条由 :class:`ServiceEntry` 校验；同名 entry 在一份
-    config 里只允许一条（构造时在 model validator 里统一去重）。
+    ``autostart`` 每条由 :class:`AutostartEntry` 校验；同一模型只允许一条。
 
     其它字段（hardware_capabilities / app.prompts /
-    tool_call_max_iters 等）按现有语义落盘；``instances`` 若存在被
-    ``extra="ignore"`` 丢弃（实例选择不在 config 持久化）。
+    tool_call_max_iters 等）按现有语义落盘；未知字段被 ``extra="ignore"``
+    丢弃。注意这里只 ignore **顶层**字段——``autostart`` 的每一条内部
+    是 ``extra="forbid"``，所以把旧 ``services`` 里的 label / device 顺手
+    拷进来会明确报错，而不是悄悄丢掉。
+
+    已删除的顶层 ``services`` 键**单独拒绝**（见 ``_reject_legacy_services``）：
+    本端点是全量替换 ``compute`` section，旧客户端发来的
+    ``{"services": [...]}`` 若只是 ignore 掉，``autostart`` 会取默认值
+    ``[]`` 并把用户现有的开机自启配置整个清空——静默数据丢失比报错糟得多。
     """
 
     model_config = {"extra": "ignore"}
 
-    services: list[ServiceEntry] = Field(default_factory=list)
+    autostart: list[AutostartEntry] = Field(default_factory=list)
 
-    @field_validator("services")
+    @model_validator(mode="before")
     @classmethod
-    def _unique_names(cls, v: list[ServiceEntry]) -> list[ServiceEntry]:
+    def _reject_legacy_services(cls, data):
+        if isinstance(data, dict) and "services" in data:
+            raise ValueError(
+                "compute.services 已删除，请改用 autostart："
+                '[{"model": "qwen3-vl-4b", "npu_index": 0}]。'
+                "旧字段（label / device / autostart=enabled）不再被接受。"
+            )
+        return data
+
+    @field_validator("autostart")
+    @classmethod
+    def _unique_models(cls, v: list[AutostartEntry]) -> list[AutostartEntry]:
         seen: set[str] = set()
         for entry in v:
-            if entry.name in seen:
+            if entry.model in seen:
                 raise ValueError(
-                    f"compute.services 含重复 name: {entry.name!r}；"
-                    "同名 entry 只允许一条（要部署多实例请加 NPU 容量"
-                    "或拆分 capability，不在 config 层支持）"
+                    f"compute.autostart 含重复 model: {entry.model!r}；"
+                    "同一模型只允许一条（一个模型一张卡；要跑第二张卡请在"
+                    "算力页手动启用）"
                 )
-            seen.add(entry.name)
+            seen.add(entry.model)
         return v
 
 
@@ -240,34 +271,33 @@ async def get_compute(response: Response) -> dict:
 
 @router.get("/compute/config")
 async def get_compute_config() -> dict:
-    """读 ``config.jsonc["compute"]``（不触发任何启动）。
+    """读 ``config.jsonc["compute"]["autostart"]``（不触发任何启动）。
 
-    ``services`` 字段是 :class:`ServiceEntry` 列表形式；如果文件里是
-    老格式（纯字符串数组），返 ``{"services": [], "legacy": [...]}"``
-    让前端能给出迁移提示（不主动改写文件 —— 用户的选择）。
+    这个端点原本配套系统配置页的「算力实例列表」编辑表格；那张表已随
+    ``compute.services`` 一起删除，这里保留为**只读**，方便脚本 / 运维
+    确认当前开机自启配置。写入仍走 Pydantic 的 ``AutostartEntry`` 校验。
     """
     from app.core.config import get_config
     section = get_config().get_section("compute", {})
-    services_raw = section.get("services") if isinstance(section, dict) else None
-    services_out: list[dict] = []
-    legacy: list = []
-    if isinstance(services_raw, list):
-        for entry in services_raw:
-            if isinstance(entry, str):
-                legacy.append(entry)
-            elif isinstance(entry, dict):
-                services_out.append(entry)
-    result: dict = {"services": services_out}
-    if legacy:
-        result["legacy"] = legacy
-    return result
+    raw = section.get("autostart") if isinstance(section, dict) else None
+    entries: list[dict] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, dict) and isinstance(entry.get("model"), str):
+                entries.append(entry)
+    return {"autostart": entries}
 
 
 @router.put("/compute/config")
 async def put_compute_config(payload: ComputeConfigPayload) -> dict:
     """全量替换 ``config.jsonc["compute"]``，**不**触发 live 启动。
 
-    Pydantic ``extra="ignore"``：未知字段（``instances`` 等）静默丢弃。
+    改了 ``autostart`` 不会立刻启停模型 —— 要等下次 boot 生效。启停请用
+    ``/api/compute/instances``。
+
+    未知**顶层**字段被 ``extra="ignore"`` 丢弃；但 ``autostart`` 的每条
+    内部是 ``extra="forbid"``，所以把旧 ``services`` 的 label / device
+    拷进来会明确报错，而不是悄悄丢掉。
     """
     from app.core.config import get_config
     try:
@@ -281,39 +311,58 @@ async def put_compute_config(payload: ComputeConfigPayload) -> dict:
 async def start_instance(req: InstanceRequest) -> dict:
     """用户在算力配置页点"启用"（model + NPU 已选定）。
 
-    流程：
-      1. ``ensure_worker_for_model(model)``：
-         - 本机已有 → 复用
+    流程（每张选中的卡各走一遍）：
+      1. ``ensure_worker_for_model(model, npu_index=n)``：
+         - 本机该卡上已有 → 复用
          - daemon 上有 peer → adopt
          - 否则 → spawn 本机新进程
-      2. ``bind_instance(model, npu_index)``：RPC ``load{npu_index}`` →
-         worker 调 ``LLMSession(model, npu=N)``。spawned 与 adopted_local
+      2. ``bind_instance(inst, n)``：RPC ``load{n}`` →
+         worker 调 ``LLMSession(model, npu=n)``。spawned 与 adopted_local
          都允许；adopted (远端 peer) → 403。
+
+    ``req.npu_index`` 可以是单个卡号或一串。传一串时按顺序逐张启用，
+    同一个模型因此可以在多张卡上并存（各有各的 worker 和 per-PID DDS
+    service）。单张失败不影响其余卡 —— 失败信息落在对应的
+    ``errors[]`` 里，最终仍返回 200 + 完整 snapshot，让算力页照常
+    渲染部分成功的状态。
 
     Raises:
         400: npu_index 越界 / 未知 model。
         403: model 是 adopted from peer，本机无权 bind。
     """
     reg = get_registry()
-    try:
-        inst = reg.ensure_worker_for_model(req.model, allow_adopt=False)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    if inst._source == "adopted":
-        peer_label = inst._peer_name or (inst._peer_guid or "")[:8] or "peer"
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"{req.model} 是远端 peer ({peer_label}) 提供的 service，"
-                "本机无权 bind。请到对端机器上点启用，或先在本机启动"
-                "一个新实例（unavailable → spawned）。"
-            ),
-        )
-    try:
-        inst = reg.bind_instance(inst, req.npu_index)
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    return {"ok": True, "instance": inst.to_dict(), "snapshot": reg.snapshot()}
+    npu_indices = (req.npu_index if isinstance(req.npu_index, list)
+                   else [req.npu_index])
+    created: list[dict] = []
+    errors: list[dict] = []
+    for n in npu_indices:
+        try:
+            # eager_load=False：算力页的卡是用户在 UI 上选的，走
+            # 「spawn（不带 --npu）→ RPC action=load」这条路。若同时传
+            # --npu 让 worker 自己 eager-load，两条 load 会争同一个
+            # session slot，worker 直接 rc=-6（真机实测）。
+            inst = reg.ensure_worker_for_model(req.model, allow_adopt=False,
+                                               npu_index=n, eager_load=False)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if inst._source == "adopted":
+            peer_label = inst._peer_name or (inst._peer_guid or "")[:8] or "peer"
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"{req.model} 是远端 peer ({peer_label}) 提供的 service，"
+                    "本机无权 bind。请到对端机器上点启用，或先在本机启动"
+                    "一个新实例（unavailable → spawned）。"
+                ),
+            )
+        try:
+            inst = reg.bind_instance(inst, n)
+        except RuntimeError as e:
+            errors.append({"npu_index": n, "detail": str(e)})
+            continue
+        created.append(inst.to_dict())
+    return {"ok": not errors, "instances": created,
+            "errors": errors, "snapshot": reg.snapshot()}
 
 
 @router.delete("/compute/instances")

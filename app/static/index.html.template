@@ -393,30 +393,6 @@
             </div>
           </section>
 
-          <section class="bc-section" id="bc-section-compute-services">
-            <header class="bc-section-head">
-              <h3>算力实例列表</h3>
-            </header>
-            <div class="bc-cs-table-wrap">
-              <table class="bc-cs-table">
-                <thead>
-                  <tr>
-                    <th class="bc-cs-col-name">name</th>
-                    <th class="bc-cs-col-label">label</th>
-                    <th class="bc-cs-col-autostart">autostart</th>
-                    <th class="bc-cs-col-device">device</th>
-                  </tr>
-                </thead>
-                <tbody id="bc-cs-tbody">
-                  <!-- rows dynamically rendered by Base.loadServices() -->
-                </tbody>
-              </table>
-            </div>
-            <div class="bc-meta">
-              <span class="bc-hint"><code>autostart</code> 三选一：<code>disabled</code>（默认手动启）/ <code>enabled</code>（boot spawn+bind）/ <code>hidden</code>（算力配置页不显示）；<code>device</code> 三选一：<code>0</code> 主控 / <code>1</code> 182x#0 / <code>2</code> 182x#1（仅作为 UI radio 默认 + autostart 启动时的 NPU hint，不是硬绑）。</span>
-            </div>
-          </section>
-
           <section class="bc-section" id="bc-section-app-prompts">
             <header class="bc-section-head">
               <h3>App 提示词模板</h3>

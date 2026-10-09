@@ -2405,7 +2405,8 @@ body.dg-modal-open .back-home-btn {
   opacity: 0.4;
   cursor: not-allowed;
 }
-.cc-target-opt.is-unsupported input[type="radio"]:disabled + span {
+.cc-target-opt.is-unsupported input[type="radio"]:disabled + span,
+.cc-target-opt.is-unsupported input[type="checkbox"]:disabled + span {
   text-decoration: line-through;
   text-decoration-color: var(--text-muted, #9ca3af);
 }
@@ -3006,11 +3007,15 @@ body.dg-modal-open .back-home-btn {
   cursor: pointer;
   user-select: none;
 }
-.cc-target-opt input[type="radio"] {
+/* v0.19: 「运行在」是 checkbox（一个模型可同时勾多张卡），不是 radio。
+   选择器放宽到 radio + checkbox，老 DOM 若还有 radio 也不丢样式。 */
+.cc-target-opt input[type="radio"],
+.cc-target-opt input[type="checkbox"] {
   margin: 0;
   cursor: pointer;
 }
-.cc-target-opt input[type="radio"]:disabled {
+.cc-target-opt input[type="radio"]:disabled,
+.cc-target-opt input[type="checkbox"]:disabled {
   cursor: not-allowed;
   opacity: 0.5;
 }
@@ -5562,81 +5567,6 @@ body.dg-modal-open .back-home-btn {
   word-break: break-word;
 }
 
-
-/* 算力实例列表（系统配置 → bc-section-compute-services） */
-.bc-cs-table-wrap {
-  overflow-x: auto;
-  margin-bottom: 0.75rem;
-}
-.bc-cs-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85rem;
-}
-.bc-cs-table thead th {
-  text-align: left;
-  padding: 0.45rem 0.5rem;
-  background: #f3f4f6;
-  border-bottom: 1px solid var(--border);
-  color: #374151;
-  font-weight: 600;
-  font-family: var(--mono);
-  white-space: nowrap;
-}
-.bc-cs-table tbody td {
-  padding: 0.4rem 0.5rem;
-  border-bottom: 1px solid var(--border);
-  vertical-align: middle;
-}
-.bc-cs-table tbody tr.is-hidden td {
-  opacity: 0.6;
-}
-.bc-cs-col-name  { width: 26%; }
-.bc-cs-col-label { width: 28%; }
-.bc-cs-col-autostart { width: 14%; }
-.bc-cs-col-device { width: 14%; }
-.bc-cs-col-op    { width: 8%; text-align: right; }
-.bc-cs-table input.bc-input,
-.bc-cs-table select.bc-input {
-  padding: 0.3rem 0.5rem;
-  font-size: 0.85rem;
-  width: 100%;
-  box-sizing: border-box;
-}
-.bc-cs-table .bc-input-name {
-  font-family: var(--mono);
-  color: var(--muted);
-  background: #f3f4f6;
-}
-.bc-cs-remove-btn {
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 0.25rem 0.55rem;
-  font-size: 0.8rem;
-  color: #b91c1c;
-  cursor: pointer;
-}
-.bc-cs-remove-btn:hover {
-  background: rgba(220, 80, 80, 0.08);
-  border-color: #b91c1c;
-}
-.bc-cs-add-row {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-top: 0.4rem;
-}
-.bc-cs-add-row select.bc-input {
-  width: auto;
-  min-width: 220px;
-}
-.bc-cs-empty {
-  text-align: center;
-  color: var(--muted);
-  padding: 0.6rem 0;
-  font-style: italic;
-}
 
 /* 基础配置 section 的左右结构（label 左 + value 右） */
 .bc-kv-row {

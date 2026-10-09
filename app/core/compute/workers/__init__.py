@@ -165,6 +165,11 @@ class WorkerManifest:
             "description": self.description,
             "notes": self.notes,
             "available_targets": list(self.available_targets),
+            "hidden": self.hidden,
+            # Sorted ascending by discover(); the compute page uses it as
+            # the display order of its 本地算力 card list, so the UI order
+            # is declared here instead of in a hand-maintained JS array.
+            "display_order": self.display_order,
             "entry_path": self.entry_path,
             "service_name": self.service_name(),
         })

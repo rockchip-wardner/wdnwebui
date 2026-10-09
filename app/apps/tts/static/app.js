@@ -642,82 +642,21 @@ showRootWarning();
 /* ---------------------------------------------------------------- *
  * 算力配置 (Compute Config) page — v0.6 重构                          *
  * ---------------------------------------------------------------- *
- * v0.6 把布局从"NPU 列 × 模型行"改成"模型卡片 × 目标 radio"：
+ * v0.6 把布局从"NPU 列 × 模型行"改成"模型卡片 × 目标 checkbox"：
  *
  *  顶部一行：内存条（3588 系统内存 + 每张 RK182x 卡显存），复用
  *           /api/system-monitor 的 memory / npu.devices 字段。
  *  中间几张：按 preset（Qwen3-VL-4B / Qwen3-TTS / …）划分
- *           的 service 卡片 —— 每张卡片列出子模型清单（来自本地
- *           CC_PRESET_META，按文件后缀标注可用 target），下方用
- *           radio 选运行在哪张 NPU，点 启用 / 停用 走现有的
+ *           的 service 卡片 —— 每张卡片列出子模型清单（来自后端
+ *           snapshot，字段由 workers/<id>.json 透出），下方用
+ *           checkbox 选运行在哪张 NPU（可多选），点 启用 / 停用 走现有的
  *           /api/compute/instances 接口；倒计时复用 snapshot
  *           estimated_init_seconds_per_model。
  */
-const CC_PRESET_META = {
-  "qwen3-vl-4b": {
-    label: "[VLM]视觉描述v3",
-    capability_types: ["swcap_video_describe"],
-    instance_name: "vlm-q30-4b",
-    memory_estimate_mb: 3500,
-    estimated_init_seconds: 60,
-    description: "视频描述模型",
-    available_targets: ["182x"],
-  },
-  "qwen3-tts": {
-    label: "[TTS]文字转语音v3",
-    capability_types: ["swcap_audio_tts"],
-    instance_name: "tts-q30",
-    memory_estimate_mb: 1900,
-    estimated_init_seconds: 30,
-    description: "文字转语音模型",
-    available_targets: ["182x"],
-  },
-  "qwen3-vl-embedding-2b": {
-    label: "[VLEmb]视觉信息编码v3",
-    capability_types: ["swcap_video_retrieval"],
-    instance_name: "vlemb-q30-2b",
-    memory_estimate_mb: 2000,
-    estimated_init_seconds: 30,
-    description: "视觉信息编码模型",
-    available_targets: ["182x"],
-  },
-  "qwen2.5-omni-3b": {
-    label: "[Omni]多感知描述v2.5",
-    capability_types: ["swcap_audio_understand"],
-    instance_name: "omni-q25-3b",
-    memory_estimate_mb: 2500,
-    estimated_init_seconds: 50,
-    description: "多感知描述模型",
-    available_targets: ["182x"],
-  },
-  "qwen3.5-vl-4b": {
-  // ...
-    label: "[VLLM]视觉文字多模态v3.5",
-    capability_types: ["swcap_text_chat", "swcap_video_describe"],
-    instance_name: "vlm-q35-4b",
-    memory_estimate_mb: 3500,
-    estimated_init_seconds: 60,
-    description: "Qwen3.5-VL-4B 多模态模型，同时支持文本对话和视频描述",
-    available_targets: ["182x"],
-  },
-  "LocateAnything-3b": {
-    label: "[GD]视觉定位模型",
-    capability_types: ["swcap_grounding"],
-    instance_name: "llm-ground-3b",
-    memory_estimate_mb: 5500,
-    estimated_init_seconds: 60,
-    description: "视觉定位模型，给定文本描述输出图像中目标区域",
-    available_targets: ["182x"],
-  },
-};
-const CC_PRESET_ORDER = [
-  "qwen3-vl-4b",
-  "qwen3.5-vl-4b",     // 多模态卡（同时支持文本对话 + 视频描述）
-  "qwen3-tts",
-  "qwen3-vl-embedding-2b",
-  "qwen2.5-omni-3b",
-  "LocateAnything-3b",
-];
+// 本地算力卡片的元数据与排序全部来自后端 snapshot
+// （每个 service 条目自带 label / capability_types / memory_estimate_mb /
+// description / available_targets，列表顺序走 snapshot.preset_order）。
+// v0.9 之前这里是 CC_PRESET_META / CC_PRESET_ORDER 的第二份抄写。
 
   // ...
 const CC_MAX_RK182X_CARDS = 2;
@@ -728,7 +667,7 @@ const ComputeConfigPage = {
   _snapshot: null,
   _system: null,        // /api/system-monitor 缓存
   _loading: false,
-  _selectedTarget: {},  // {model_id: npu_index} —— 用户在 radio 上选的目标
+  _selectedTarget: {},  // {model_id: [npu_index, ...]} —— 「运行在」勾选的卡（可多张）
 
   init() {
     if (this.initialized) return;
@@ -1204,7 +1143,11 @@ const ComputeConfigPage = {
     const ordered = [];
     const seen = new Set();
     const seenKey = (s) => `${s.model_id}__${s._source || ""}`;
-    for (const id of CC_PRESET_ORDER) {
+    const orderOf = (mid) => {
+      const i = (snap.preset_order || []).indexOf(mid);
+      return i === -1 ? 9999 : i;
+    };
+    for (const id of (snap.preset_order || [])) {
       for (const s of services.filter(x => x.model_id === id)) {
         const k = seenKey(s);
         if (!seen.has(k)) { ordered.push(s); seen.add(k); }
@@ -1239,10 +1182,8 @@ const ComputeConfigPage = {
   // ...
     for (const g of peerFrameOrder) {
       g.services.sort((a, b) => {
-        const ai = CC_PRESET_ORDER.indexOf(a.model_id);
-        const bi = CC_PRESET_ORDER.indexOf(b.model_id);
-        const aPos = ai === -1 ? 9999 : ai;
-        const bPos = bi === -1 ? 9999 : bi;
+        const aPos = orderOf(a.model_id);
+        const bPos = orderOf(b.model_id);
         if (aPos !== bPos) return aPos - bPos;
         return a.model_id.localeCompare(b.model_id);
       });
@@ -1287,18 +1228,18 @@ const ComputeConfigPage = {
 
     for (const s of ordered) {
   // ...
-      const cm = CC_PRESET_META[s.model_id] || {};
       const meta = {
-        label:                s.label || cm.label || s.model_id,
-        capability_types:     s.capability_types || cm.capability_types || [],
-        memory_estimate_mb:   s.memory_estimate_mb || cm.memory_estimate_mb || 0,
+        label:                s.label || s.model_id,
+        capability_types:     s.capability_types || [],
+        memory_estimate_mb:   s.memory_estimate_mb || 0,
         estimated_init_seconds:
-          cm.estimated_init_seconds
-          || (snap.estimated_init_seconds_per_model || {})[s.model_id]
+          (snap.estimated_init_seconds_per_model || {})[s.model_id]
+          || snap.default_estimated_init_seconds
           || 30,
-        submodels:            cm.submodels || [],
-        description:          s.description || cm.description || "",
-        available_targets:    s.available_targets || cm.available_targets || ["182x"],
+        // 恒为空：manifest 不声明子模型，无数据源填过它。渲染端仍读此字段。
+        submodels:            [],
+        description:          s.description || "",
+        available_targets:    s.available_targets || ["182x"],
       };
       const isLocal = s._source !== "adopted";
 
@@ -1314,8 +1255,8 @@ const ComputeConfigPage = {
         meta.available_targets.join(","),
         cards.map(c => c.npu_index).join(","),
   // ...
-        this._selectedTarget[s.model_id] != null
-          ? String(this._selectedTarget[s.model_id]) : "_",
+        this._selectedTargets(s.model_id).join(",") || "_",
+        this._modelNpus(s.model_id).join(","),
       ].join("|");
       const prev = prevCard[seenKey(s)];
       let targetContainer;
@@ -1478,8 +1419,8 @@ const ComputeConfigPage = {
   // ...
       const curSvc = this._findSvcInSnapshot(modelId);
       const curCards = (this._snapshot && this._snapshot.cards) || [];
-      const target = this._selectedTarget[modelId] != null
-        ? this._selectedTarget[modelId]
+      const targets = this._selectedTargets(modelId);
+      const target = (targets && targets.length) ? targets
         : (curSvc && curSvc.npu_index >= 0
             ? curSvc.npu_index
             : this._defaultTargetNpu(curCards));
@@ -1576,7 +1517,7 @@ const ComputeConfigPage = {
   // ...
     if (svc._autostart === "enabled") {
       h.autostartBadge.textContent = "开机自启";
-      h.autostartBadge.title = "compute.services[] 的 autostart=enabled —— boot 时自动 spawn + bind NPU；reload / 重启后会自动恢复";
+      h.autostartBadge.title = "已列入 config.jsonc 的 compute.autostart —— boot 时自动 spawn worker 并绑定 NPU 卡；reload / 重启后会自动恢复";
       h.autostartBadge.style.display = "";
     } else {
       h.autostartBadge.style.display = "none";
@@ -1713,6 +1654,22 @@ const ComputeConfigPage = {
     return svcs.find(s => s.model_id === modelId) || null;
   },
 
+  // 该模型当前占用的**所有**卡（同一模型可同时跑多张卡）
+  _modelNpus(modelId) {
+    const svcs = (this._snapshot && this._snapshot.services) || [];
+    return Array.from(new Set(
+      svcs.filter(s => s.model_id === modelId && s.npu_index >= 0)
+           .map(s => s.npu_index))).sort((a, b) => a - b);
+  },
+
+  // 「运行在」的勾选集合（数组）。兼容早期单值。
+  _selectedTargets(modelId) {
+    const raw = this._selectedTarget[modelId];
+    if (Array.isArray(raw)) return raw.filter(n => Number.isInteger(n) && n >= 0);
+    if (typeof raw === "number" && raw >= 0) return [raw];
+    return [];
+  },
+
   // ...
   _makePeerCard(modelId, meta, svc) {
     const card = document.createElement("article");
@@ -1774,11 +1731,12 @@ const ComputeConfigPage = {
   },
 
   async _enableInstance(npu_index, model) {
+    const cards = Array.isArray(npu_index) ? npu_index : [npu_index];
     try {
       const r = await fetch(API_PREFIX + "/compute/instances", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({npu_index, model}),
+        body: JSON.stringify({npu_index: cards, model}),
       });
       if (!r.ok) {
         const text = await r.text();
@@ -1899,8 +1857,7 @@ const ComputeConfigPage = {
     const sw = document.createElement("button");
     sw.type = "button";
     sw.className = "cc-svc-switch";
-    const selectedTarget = this._selectedTarget[modelId] != null
-      ? this._selectedTarget[modelId]
+    const selectedTarget = this._selectedTargets(modelId)[0]
       : (inst ? inst.npu_index : this._defaultTargetNpu(cards));
     sw.dataset.target = String(selectedTarget);
 
@@ -1993,10 +1950,9 @@ const ComputeConfigPage = {
 
   // ...
     let defaultIdx = null;
-    if (this._selectedTarget[modelId] != null
-        && sortedIndices.includes(this._selectedTarget[modelId])
+    if (this._selectedTargets(modelId).length
         && supported.has("182x")) {
-      defaultIdx = this._selectedTarget[modelId];
+      defaultIdx = this._selectedTargets(modelId)[0];
     } else if (inst && inst.npu_index >= 0
                && sortedIndices.includes(inst.npu_index)) {
       defaultIdx = inst.npu_index;
@@ -2010,7 +1966,7 @@ const ComputeConfigPage = {
       }
     }
     if (defaultIdx != null) {
-      this._selectedTarget[modelId] = defaultIdx;
+      this._selectedTarget[modelId] = [defaultIdx];
     }
 
     let rendered = 0;
@@ -2022,14 +1978,17 @@ const ComputeConfigPage = {
       label.className = "cc-target-opt";
       label.title = sub || "";
       const input = document.createElement("input");
-      input.type = "radio";
+      // checkbox：同一个模型可同时跑在多张卡上
+      input.type = "checkbox";
       input.name = `cc-target-${modelId}`;
       input.value = String(npuIndex);
       input.className = "cc-target-radio";
   // ...
       if (npuIndex === defaultIdx) input.checked = true;
       input.addEventListener("change", () => {
-        if (input.checked) this._selectedTarget[modelId] = npuIndex;
+        const cur = new Set(this._selectedTargets(modelId));
+        if (input.checked) cur.add(npuIndex); else cur.delete(npuIndex);
+        this._selectedTarget[modelId] = Array.from(cur);
       });
       label.appendChild(input);
       const txt = document.createElement("span");
@@ -2082,8 +2041,8 @@ const ComputeConfigPage = {
   // ...
   _hasTargetPicked(modelId, svc) {
     if (svc && svc.npu_index >= 0) return true;
-    const t = this._selectedTarget[modelId];
-    return typeof t === "number" && t >= 0;
+    if (this._modelNpus(modelId).length) return true;
+    return this._selectedTargets(modelId).length > 0;
   },
 
   // ...

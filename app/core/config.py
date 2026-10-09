@@ -214,9 +214,8 @@ class ConfigStore:
         """Re-read the file from disk.
 
         Missing file → write the first-run template (random
-        ``device_name`` + every model from ``MODEL_PRESETS`` registered
-        as ``compute.services``) so a fresh deployment boots with
-        ``boot_compute_services`` actually able to spawn workers. An
+        ``device_name`` + empty ``compute.autostart``) so a fresh
+        deployment starts from a known-good config. An
         existing-but-empty / corrupted / non-object payload still
         collapses to ``{}`` — we only auto-seed when the file is
         genuinely missing, never overwrite a user-wiped one.
@@ -260,13 +259,13 @@ class ConfigStore:
           * device-attached fields: ``hardware_capabilities``（来自
             :data:`app.services.compute_registry.HARDWARE_CAPABILITIES`
             全 True）
-        * ``compute.services`` — every model from
-          :data:`app.services.compute_registry.MODEL_PRESETS`, written
-          as **objects** ``{name, label, autostart, device}``. Defaults:
-          autostart=disabled（用户在算力配置页点启用才加载），device=1
-          （第一张 RK182x 卡，UI radio 默认值），label 直接复用
-          ``MODEL_PRESETS`` 的内置 label。用户拿到首启配置后再按需
-          改成 enabled / 别的 device。
+        * ``compute.autostart`` — seeds as an **empty list**: nothing
+          starts at boot until the user declares a
+          ``{model, npu_index}`` entry. That matches the schema's
+          contract (only listed models are started; everything else is
+          inert and gets enabled from the compute page), so a fresh
+          device boots with zero workers holding NPU memory rather than
+          every preset racing to load onto one card.
         * ``app.prompts`` — the three configurable schema fields
           (VLMDoc.text / .level, TargetDoc.desc) seeded with the SDK's
           :mod:`app.services.detector` ``DEFAULT_*_DESC`` constants,
@@ -282,7 +281,6 @@ class ConfigStore:
         by the app import graph.
         """
         from app.core.compute.registry import (
-            MODEL_PRESETS,
             _hardware_capability_default_state,
         )
         from app.core.llm.detector_base import (
@@ -291,15 +289,6 @@ class ConfigStore:
             DEFAULT_VLM_DOC_TEXT_DESC,
         )
         with self._lock:
-            services_seed = [
-                {
-                    "name":      model_id,
-                    "label":     preset["label"],
-                    "autostart": "disabled",
-                    "device":    1,
-                }
-                for model_id, preset in MODEL_PRESETS.items()
-            ]
             _base_defaults = default_base_paths()
             self._data = {
                 "base": {
@@ -309,7 +298,7 @@ class ConfigStore:
                     "hardware_capabilities": _hardware_capability_default_state(),
                 },
                 "compute": {
-                    "services": services_seed,
+                    "autostart": [],
                 },
                 "app": {
                     "prompts": {

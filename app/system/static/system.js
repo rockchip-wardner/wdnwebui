@@ -817,196 +817,6 @@ const Base = {
 
     // 算力实例列表固定列（所有 MODEL_PRESETS），无需添加按钮。
   },
-
-  // ----- 算力实例列表（compute.services[]，枚举所有 preset）----- #
-  // 系统配置页的算力实例区块：表格覆盖全部 MODEL_PRESETS，
-  // 不论 config.jsonc 里 services[] 是否已经写到它。每行可独立
-  // 编辑 label / autostart / device；不在 services[] 里的行用
-  // 默认值（label = preset.label, autostart = disabled, device = 1）
-  // —— 用户可以直接编辑它，省掉「+ 添加」按钮的中间步骤。
-  // 保存路径：收集所有行全量 PUT 给后端（不再是局部差集），
-  // 后端 Pydantic 校验通过后写盘。
-
-  /** Render the table: one row per MODEL_PRESETS key, with values from
-   *  ``services`` (the config.jsonc contents) or defaults.
-   *
-   * ``services```` is [{name, label, autostart, device}, ...] from
-   * GET /api/compute/config. If a preset isn't in there we still render
-   * a row with defaults — that's the whole point of this section.
-   */
-  renderServices(services) {
-    const tbody = document.getElementById("bc-cs-tbody");
-    if (!tbody) return;
-    tbody.textContent = "";
-
-    // Index current services by name so we can fast-lookup each preset.
-    const byName = new Map();
-    for (const s of (services || [])) {
-      if (s && s.name) byName.set(s.name, s);
-    }
-
-    // Stable order: walk CC_PRESET_META keys (mirrors MODEL_PRESETS).
-    const presetIds = Object.keys(CC_PRESET_META || {});
-    if (!presetIds.length) {
-      const tr = document.createElement("tr");
-      const td = document.createElement("td");
-      td.colSpan = 4;
-      td.className = "bc-cs-empty";
-      td.textContent = "（未检测到任何 MODEL_PRESETS —— 这通常是 SDK 加载失败，请检查 wdnai 安装）";
-      tr.appendChild(td);
-      tbody.appendChild(tr);
-      return;
-    }
-
-    for (const name of presetIds) {
-      const meta = CC_PRESET_META[name] || {};
-      const existing = byName.get(name);
-      const entry = existing || {
-        name,
-        label: meta.label || name,
-        autostart: "disabled",
-        device: 1,
-      };
-      tbody.appendChild(this._renderServiceRow(entry));
-    }
-  },
-
-  /** Build one <tr> for the services table. */
-  _renderServiceRow(entry) {
-    const tr = document.createElement("tr");
-    tr.dataset.name = entry.name || "";
-    if (entry.autostart === "hidden") tr.classList.add("is-hidden");
-
-    // --- name (read-only — preset id; 不能从 UI 改名) ---
-    const tdName = document.createElement("td");
-    const nameInput = document.createElement("input");
-    nameInput.type = "text";
-    nameInput.className = "bc-input bc-input-name";
-    nameInput.value = entry.name || "";
-    nameInput.readOnly = true;
-    nameInput.title = "name 锁定为 MODEL_PRESETS key；如需更换请改 MODEL_PRESETS";
-    tdName.appendChild(nameInput);
-    tr.appendChild(tdName);
-
-    // --- label ---
-    const tdLabel = document.createElement("td");
-    const labelInput = document.createElement("input");
-    labelInput.type = "text";
-    labelInput.className = "bc-input";
-    labelInput.value = entry.label || "";
-    labelInput.placeholder = "算力配置卡显示的名字";
-    labelInput.dataset.field = "label";
-    labelInput.maxLength = 64;
-    tdLabel.appendChild(labelInput);
-    tr.appendChild(tdLabel);
-
-    // --- autostart ---
-    const tdAuto = document.createElement("td");
-    const autoSel = document.createElement("select");
-    autoSel.className = "bc-input";
-    autoSel.dataset.field = "autostart";
-    for (const v of ["disabled", "enabled", "hidden"]) {
-      const opt = document.createElement("option");
-      opt.value = v;
-      opt.textContent = v;
-      if (v === (entry.autostart || "disabled")) opt.selected = true;
-      autoSel.appendChild(opt);
-    }
-    tdAuto.appendChild(autoSel);
-    tr.appendChild(tdAuto);
-
-    // --- device ---
-    const tdDev = document.createElement("td");
-    const devSel = document.createElement("select");
-    devSel.className = "bc-input";
-    devSel.dataset.field = "device";
-    for (const v of [0, 1, 2]) {
-      const opt = document.createElement("option");
-      opt.value = String(v);
-      opt.textContent = v === 0 ? "0 (主控)" : `${v} (182x#${v - 1})`;
-      if (Number(v) === Number(entry.device ?? 1)) opt.selected = true;
-      devSel.appendChild(opt);
-    }
-    tdDev.appendChild(devSel);
-    tr.appendChild(tdDev);
-
-    return tr;
-  },
-
-  /** Read all rows in the table into [{name, label, autostart, device}, ...].
-   *  Always emits one row per MODEL_PRESETS (the table always shows all
-   *  of them, so collection is symmetric).
-   */
-  _collectServices() {
-    const tbody = document.getElementById("bc-cs-tbody");
-    if (!tbody) return [];
-    const out = [];
-    for (const tr of tbody.querySelectorAll("tr[data-name]")) {
-      const name = tr.dataset.name || "";
-      const label = tr.querySelector('input[data-field="label"]')?.value.trim() || "";
-      const autostart = tr.querySelector('select[data-field="autostart"]')?.value || "disabled";
-      const device = parseInt(
-        tr.querySelector('select[data-field="device"]')?.value || "1",
-        10,
-      );
-      if (!name) continue;
-      out.push({ name, label, autostart, device });
-    }
-    return out;
-  },
-
-  /** Load compute.services from GET /api/compute/config. */
-  async loadServices() {
-    try {
-      const r = await fetch(API_PREFIX + "/compute/config");
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      const data = await r.json();
-      this.renderServices(data.services || []);
-    } catch (e) {
-      console.error("loadServices failed:", e);
-      this.setFoot("加载算力实例列表失败: " + e.message, "danger");
-    }
-  },
-
-  /** Persist the table to PUT /api/compute/config. Returns a structured
-   *  result so Base.save can compose the success/error message:
-   *
-   *      { ok: true } | { ok: false, msg: "..." }
-   */
-  async saveServices() {
-    const services = this._collectServices();
-    // Client-side dedup (server validates too, but cheaper to fail fast).
-    const seen = new Set();
-    for (const s of services) {
-      if (!s.name) return { ok: false, msg: "算力实例 name 不能为空" };
-      if (!s.label) return { ok: false, msg: `${s.name}: label 不能为空` };
-      if (seen.has(s.name)) {
-        return { ok: false, msg: `同名 entry 重复: ${s.name}` };
-      }
-      seen.add(s.name);
-    }
-    try {
-      const r = await fetch(API_PREFIX + "/compute/config", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ services }),
-      });
-      const text = await r.text();
-      let body;
-      try { body = JSON.parse(text); } catch { body = { detail: text }; }
-      if (!r.ok) {
-        const msg = (body.detail && JSON.stringify(body.detail))
-          || ("HTTP " + r.status);
-        return { ok: false, msg: `算力实例保存失败: ${msg}` };
-      }
-      return { ok: true, count: services.length };
-    } catch (e) {
-      return { ok: false, msg: `算力实例保存异常: ${e.message}` };
-    }
-  },
-
-
-
   async load() {
     try {
       const r = await fetch(API_PREFIX + "/config/base");
@@ -1029,7 +839,6 @@ const Base = {
       this.renderHwCapsError("加载失败: " + e2.message);
     }
     this.loadPrompts();
-    this.loadServices();
   },
 
   render(data) {
@@ -1265,14 +1074,8 @@ const Base = {
         parts.push("⚠ 提示词保存失败: " + e3.message);
       }
 
-      // 算力实例列表（compute.services）：写在 app.prompts 之后；
-      // 任何一项失败都不阻塞其它项的结果汇总。
-      const svcs = await this.saveServices();
-      if (svcs.ok) {
-        parts.push(`算力实例已保存（${svcs.count} 条）`);
-      } else {
-        parts.push("⚠ " + svcs.msg);
-      }
+      // compute.autostart（开机自启模型）不在这里保存：它决定启动哪些
+      // worker、绑哪张卡，属于部署配置，由 config.jsonc 直接编辑。
 
       this.setFoot("已保存（" + parts.join(" · ") + "）", "ok");
     } catch (e) {
@@ -1998,79 +1801,22 @@ CoprocessorMenu.init();
  * TTS (语音生成) page                                              *
  * ---------------------------------------------------------------- */
 
-const CC_PRESET_META = {
-  "qwen3-vl-4b": {
-    label: "[VLM]视觉描述v3",
-    capability_types: ["swcap_video_describe"],
-    instance_name: "vlm-q30-4b",
-    memory_estimate_mb: 3500,
-    estimated_init_seconds: 60,
-    description: "视频描述模型",
-    available_targets: ["182x"],
-  },
-  "qwen3-tts": {
-    label: "[TTS]文字转语音v3",
-    capability_types: ["swcap_audio_tts"],
-    instance_name: "tts-q30",
-    memory_estimate_mb: 1900,
-    estimated_init_seconds: 30,
-    description: "文字转语音模型",
-    available_targets: ["182x"],
-  },
-  "qwen3-vl-embedding-2b": {
-    label: "[VLEmb]视觉信息编码v3",
-    capability_types: ["swcap_video_retrieval"],
-    instance_name: "vlemb-q30-2b",
-    memory_estimate_mb: 2000,
-    estimated_init_seconds: 30,
-    description: "视觉信息编码模型",
-    available_targets: ["182x"],
-  },
-  "qwen2.5-omni-3b": {
-    label: "[Omni]多感知描述v2.5",
-    capability_types: ["swcap_audio_understand"],
-    instance_name: "omni-q25-3b",
-    memory_estimate_mb: 2500,
-    estimated_init_seconds: 50,
-    description: "多感知描述模型",
-    available_targets: ["182x"],
-  },
-  "qwen3.5-vl-4b": {
-    // Qwen3.5-VL-4B 同时声明 swcap_text_chat + swcap_video_describe
-    // ——VLM-mode RKNN 既能做纯文本也能消费 vision token，一张一张卡
-    // 同时满足对话页 + 视频描述页。启用后文本对话、视频描述、视频
-    // 内容检索、视频文件分析、音视频描述等页均直接可用。
-    label: "[VLLM]视觉文字多模态v3.5",
-    capability_types: ["swcap_text_chat", "swcap_video_describe"],
-    instance_name: "vlm-q35-4b",
-    memory_estimate_mb: 3500,
-    estimated_init_seconds: 60,
-    description: "Qwen3.5-VL-4B 多模态模型，同时支持文本对话和视频描述",
-    available_targets: ["182x"],
-  },
-  "LocateAnything-3b": {
-    label: "[GD]视觉定位模型",
-    capability_types: ["swcap_grounding"],
-    instance_name: "llm-ground-3b",
-    memory_estimate_mb: 5500,
-    estimated_init_seconds: 60,
-    description: "视觉定位模型，给定文本描述输出图像中目标区域",
-    available_targets: ["182x"],
-  },
-};
-const CC_PRESET_ORDER = [
-  "qwen3-vl-4b",
-  "qwen3.5-vl-4b",     // 多模态卡（同时支持文本对话 + 视频描述）
-  "qwen3-tts",
-  "qwen3-vl-embedding-2b",
-  "qwen2.5-omni-3b",
-  "LocateAnything-3b",
-];
+// --------------------------------------------------------------------------- //
+// 本地算力卡片的元数据与排序 **全部来自后端**：
+//   * 每个 service 条目自带 label / capability_types / instance_name /
+//     memory_estimate_mb / description / available_targets / display_order
+//     （由 workers/<id>.json 扫描而来，见 registry.to_dict / _unavailable_entry）；
+//   * estimated_init_seconds 走 snapshot.estimated_init_seconds_per_model；
+//   * 列表顺序走 snapshot.preset_order（manifest 的 display_order 升序）。
+// v0.9 之前这里有两份硬编码表（CC_PRESET_META + CC_PRESET_ORDER，且
+// system.js 与 tts/app.js 各抄一份）。它们早已和 manifest 漂移 ——
+// qwen3.5-vl-4b 的 description 两边文案都不一样，且新增模型时漏改
+// 就静默不显示。现在没有任何一份副本。
+// --------------------------------------------------------------------------- //
 
 // 系统拓扑：1× RK3588 主控（不占"算力卡"位置） + N× RK182x 协卡。
 // wdnai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡多
 // npu_index）返回；按物理协卡数 cap 住，避免 UI 出现重复 option。
-// 增/减协卡时同步改这里 + 各处"渲染 cap" 即可。
 const CC_MAX_RK182X_CARDS = 2;
 
 // v0.15: banner / 顶部汇总只对"本机算力"响。adopted 远端 peer 状态本机
@@ -2088,7 +1834,7 @@ const ComputeConfigPage = {
   _snapshot: null,
   _system: null,        // /api/system-monitor 缓存
   _loading: false,
-  _selectedTarget: {},  // {model_id: npu_index} —— 用户在 radio 上选的目标
+  _selectedTarget: {},  // {model_id: [npu_index, ...]} —— 用户勾选的卡（可多张）
 
   init() {
     if (this.initialized) return;
@@ -2284,7 +2030,7 @@ const ComputeConfigPage = {
       strip.appendChild(ph);
     } else {
       // enumerate index 就是 NPU 编号 —— 第 1 张 182x 是 #0，跟下面
-      // 算力卡 "运行在" radio / 系统信息页 NPU #N 完全对齐。
+      // 算力卡「运行在」的 #N 与系统信息页 NPU #N 完全对齐。
       // 排序已固定（见上方 _sortNpuCards），每张物理卡始终落在同一格。
       for (const card of rk182xCards) {
         const idx = card.npu_index;
@@ -2614,13 +2360,22 @@ const ComputeConfigPage = {
       return;
     }
 
-    // 按 CC_PRESET_ORDER 排序，保证 UI 默认视觉顺序稳定。
-    // 同 model 可以出现多条(例如 adopted 一条 + unavailable 一条),
-    // dedup 用 (model_id, _source) 复合 key 让两张卡都进 ordered。
+    // 按 snapshot.preset_order 排序（= manifest 的 display_order 升序），
+    // 保证 UI 默认视觉顺序稳定。同 model 可以出现多条（例如 adopted 一条
+    // + unavailable 一条），dedup 用 (model_id, _source) 复合 key 让两张
+    // 卡都进 ordered。preset_order 里没有的 model 排到末尾（display_order
+    // 缺失兜底 9999），不会因为 manifest 刚加就静默消失。
+    const orderOf = (mid) => {
+      const i = (snap.preset_order || []).indexOf(mid);
+      return i === -1 ? 9999 : i;
+    };
     const ordered = [];
     const seen = new Set();
     const seenKey = (s) => `${s.model_id}__${s._source || ""}`;
-    for (const id of CC_PRESET_ORDER) {
+    // 卡号**不进** key：同一个模型同时跑在卡 0 / 卡 1 时，两条 service
+    // 必须折叠成同一张模型卡片（用户视角是一个模型、一组「运行在」
+    // 勾选），而不是并排两张卡。同理，勾选状态以整个模型为单位。
+    for (const id of (snap.preset_order || [])) {
       for (const s of services.filter(x => x.model_id === id)) {
         const k = seenKey(s);
         if (!seen.has(k)) { ordered.push(s); seen.add(k); }
@@ -2641,7 +2396,7 @@ const ComputeConfigPage = {
 
     // ---------- peer 设备框 ----------
     // 只 adopted 进网络栏，按 (device_name, peer_ip) 分组；组内按
-    // CC_PRESET_ORDER 排序保证视觉一致。unavailable 是本机 preset
+    // preset_order 排序保证视觉一致。unavailable 是本机 preset
     // model，进本地栏（见 _renderServices 顶部 docstring）。
     const peerFrameOrder = [];          // [{key, name, ip, services: [...]}]
     const peerFrameByKey = new Map();
@@ -2658,13 +2413,11 @@ const ComputeConfigPage = {
         peerFrameByKey.get(key).services.push(s);
       }
     }
-    // 组内按 CC_PRESET_ORDER 排序
+    // 组内按 preset_order（manifest display_order）排序
     for (const g of peerFrameOrder) {
       g.services.sort((a, b) => {
-        const ai = CC_PRESET_ORDER.indexOf(a.model_id);
-        const bi = CC_PRESET_ORDER.indexOf(b.model_id);
-        const aPos = ai === -1 ? 9999 : ai;
-        const bPos = bi === -1 ? 9999 : bi;
+        const aPos = orderOf(a.model_id);
+        const bPos = orderOf(b.model_id);
         if (aPos !== bPos) return aPos - bPos;
         return a.model_id.localeCompare(b.model_id);
       });
@@ -2715,21 +2468,23 @@ const ComputeConfigPage = {
     }
 
     for (const s of ordered) {
-      // v0.8: meta 优先从服务实例（snapshot.services[i]）拿 description /
-      // available_targets，再 fallback 到前端 CC_PRESET_META（submodels /
-      // estimated_init_seconds 等只在前端有的字段）。
-      const cm = CC_PRESET_META[s.model_id] || {};
+      // meta 全部来自后端：service 条目自带 label / capability_types /
+      // memory_estimate_mb / description / available_targets（registry 从
+      // workers/<id>.json 透出），estimated_init_seconds 走 snapshot 的
+      // estimated_init_seconds_per_model。没有前端副本可 fallback。
       const meta = {
-        label:                s.label || cm.label || s.model_id,
-        capability_types:     s.capability_types || cm.capability_types || [],
-        memory_estimate_mb:   s.memory_estimate_mb || cm.memory_estimate_mb || 0,
+        label:                s.label || s.model_id,
+        capability_types:     s.capability_types || [],
+        memory_estimate_mb:   s.memory_estimate_mb || 0,
         estimated_init_seconds:
-          cm.estimated_init_seconds
-          || (snap.estimated_init_seconds_per_model || {})[s.model_id]
+          (snap.estimated_init_seconds_per_model || {})[s.model_id]
+          || snap.default_estimated_init_seconds
           || 30,
-        submodels:            cm.submodels || [],
-        description:          s.description || cm.description || "",
-        available_targets:    s.available_targets || cm.available_targets || ["182x"],
+        // 恒为空：manifest 不声明子模型，历史上也没有任何数据源填过它。
+        // 渲染端 (_makeLocalCard) 仍读这个字段，故保留。
+        submodels:            [],
+        description:          s.description || "",
+        available_targets:    s.available_targets || ["182x"],
       };
       const isLocal = s._source !== "adopted";
 
@@ -2744,12 +2499,13 @@ const ComputeConfigPage = {
         meta.description,
         meta.available_targets.join(","),
         cards.map(c => c.npu_index).join(","),
-        // v0.8 patch: 把用户的 NPU 选取也放进 sig —— 不然 radio change
+        // v0.8 patch: 把用户的 NPU 选取也放进 sig —— 不然 checkbox change
         // 后 _selectedTarget 更新了，但 sig 没变 → 节点复用 → toggle.disabled
         // 还是旧值（needsTarget && !targetPicked）。sig 包含 _selectedTarget
-        // 后切 radio 会触发重建，toggle 立即变可用。
-        this._selectedTarget[s.model_id] != null
-          ? String(this._selectedTarget[s.model_id]) : "_",
+        // 后切勾选会触发重建，toggle 立即变可用。
+        this._selectedTargets(s.model_id).join(",") || "_",
+        // 同模型可能同时占多张卡，一并进 sig（禁用全部 / 启一张都会变）。
+        this._modelNpus(s.model_id).join(","),
       ].join("|");
       const prev = prevCard[seenKey(s)];
       let targetContainer;
@@ -2792,7 +2548,7 @@ const ComputeConfigPage = {
         prev.isLocal = isLocal;
         // 容器错了才 detach + appendChild；ordering 交由末尾 newOrder
         // loop 用 insertBefore 完成 —— 不要在这里做 reorder，否则 omni
-        // （CC_PRESET_ORDER 末位）在循环中途会被推到位置 0，浏览器若
+        // （preset_order 末位）在循环中途会被推到位置 0，浏览器若
         // 中途 commit 就会先看到 omni 再看到真正点击的目标。
         if (prev.card.parentNode !== targetContainer) {
           if (prev.card.parentNode) prev.card.remove();
@@ -2950,13 +2706,15 @@ const ComputeConfigPage = {
       // 用当前 snapshot 里的 svc，避免 update 后闭包 svc 过时。
       const curSvc = this._findSvcInSnapshot(modelId);
       const curCards = (this._snapshot && this._snapshot.cards) || [];
-      const target = this._selectedTarget[modelId] != null
-        ? this._selectedTarget[modelId]
-        : (curSvc && curSvc.npu_index >= 0
-            ? curSvc.npu_index
-            : this._defaultTargetNpu(curCards));
+      // 「运行在」是多选：用户可能勾了两张卡，启用时两张都起 worker。
+      const targets = this._selectedTargets(modelId);
+      const finalTargets = (targets && targets.length)
+        ? targets
+        : [ (curSvc && curSvc.npu_index >= 0)
+              ? curSvc.npu_index
+              : this._defaultTargetNpu(curCards) ];
       if (toggleInput.checked) {
-        this._enableInstance(target, modelId);
+        this._enableInstance(finalTargets, modelId);
       } else {
         if (confirm(`确认禁用 ${meta.label}？将卸载模型并关闭 worker 进程。`)) {
           this._disableInstance(modelId);
@@ -3050,10 +2808,10 @@ const ComputeConfigPage = {
     // ---- title
     h.titleEl.textContent = meta.label;
 
-    // ---- autostart 徽章：enabled → 显示"开机自启"
+    // ---- autostart 徽章：在 compute.autostart[] 里声明 → 显示"开机自启"
     if (svc._autostart === "enabled") {
       h.autostartBadge.textContent = "开机自启";
-      h.autostartBadge.title = "compute.services[] 的 autostart=enabled —— boot 时自动 spawn + bind NPU；reload / 重启后会自动恢复";
+      h.autostartBadge.title = "已列入 config.jsonc 的 compute.autostart —— boot 时自动 spawn worker 并绑定 NPU 卡；reload / 重启后会自动恢复";
       h.autostartBadge.style.display = "";
     } else {
       h.autostartBadge.style.display = "none";
@@ -3157,14 +2915,19 @@ const ComputeConfigPage = {
       h.missingDirEl.style.display = "none";
     }
 
-    // ---- radio fieldset：cards / available_targets / npu_index 任一变化才换
+    // ---- 运行在 fieldset：cards / available_targets / 本模型占用的卡 任一
+    // 变化才换节点。勾选集合也进 sig —— 用户点 checkbox 后要立刻反映
+    // 到 toggle 的可用状态上。
     const radioSig = [
       (cards || []).map(c => `${c.npu_index}:${c.device_id || ""}`).join(","),
       (meta.available_targets || []).join(","),
-      String(svc.npu_index),
+      this._modelNpus(card.dataset.model).join(","),
+      this._selectedTargets(card.dataset.model).join(","),
     ].join("|");
     if (h.lastRadioSig !== radioSig) {
-      const newFs = this._makeTargetFieldset(card.dataset.model, meta, svc, cards);
+      const newFs = this._makeTargetFieldset(
+        card.dataset.model, meta,
+        this._findSvcInSnapshot(card.dataset.model), cards);
       h.radioFieldsetEl.replaceWith(newFs);
       h.radioFieldsetEl = newFs;
       h.lastRadioSig = radioSig;
@@ -3192,6 +2955,23 @@ const ComputeConfigPage = {
   _findSvcInSnapshot(modelId) {
     const svcs = (this._snapshot && this._snapshot.services) || [];
     return svcs.find(s => s.model_id === modelId) || null;
+  },
+
+  // 该模型当前**所有**实例占用的卡（同一个模型可能同时跑在多张卡上）。
+  _modelNpus(modelId) {
+    const svcs = (this._snapshot && this._snapshot.services) || [];
+    return Array.from(new Set(
+      svcs.filter(s => s.model_id === modelId && s.npu_index >= 0)
+           .map(s => s.npu_index))).sort((a, b) => a - b);
+  },
+
+  // 「运行在」的勾选集合。v0.19 起是**数组**（同模型可多卡），早期版本
+  // 是单个数字 —— 这里做一次兼容读取，免得热更新后老状态把 toggle 卡死。
+  _selectedTargets(modelId) {
+    const raw = this._selectedTarget[modelId];
+    if (Array.isArray(raw)) return raw.filter(n => Number.isInteger(n) && n >= 0);
+    if (typeof raw === "number" && raw >= 0) return [raw];
+    return [];
   },
 
   // adopted peer —— 只读
@@ -3267,11 +3047,14 @@ const ComputeConfigPage = {
   },
 
   async _enableInstance(npu_index, model) {
+    // npu_index 可以是单卡或卡数组 —— 「运行在」是多选，一个模型可以
+    // 同时跑在多张卡上（后端为每张卡各 spawn 一个 worker）。
+    const cards = Array.isArray(npu_index) ? npu_index : [npu_index];
     try {
       const r = await fetch(API_PREFIX + "/compute/instances", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({npu_index, model}),
+        body: JSON.stringify({npu_index: cards, model}),
       });
       if (!r.ok) {
         const text = await r.text();
@@ -3382,7 +3165,7 @@ const ComputeConfigPage = {
       body.appendChild(subs);
     }
 
-    // ----- 目标 radio（3588 / 182x#0 / 182x#1 / ...）
+    // ----- 目标 checkbox（3588 / 182x#0 / 182x#1 / ...，可多选）
     const fieldset = this._makeTargetFieldset(modelId, meta, inst, cards);
     body.appendChild(fieldset);
 
@@ -3392,9 +3175,10 @@ const ComputeConfigPage = {
     const sw = document.createElement("button");
     sw.type = "button";
     sw.className = "cc-svc-switch";
-    const selectedTarget = this._selectedTarget[modelId] != null
-      ? this._selectedTarget[modelId]
-      : (inst ? inst.npu_index : this._defaultTargetNpu(cards));
+    // 已废弃的 switch 节点（v0.7 起被启用/禁用/重启三个显式按钮取代），
+    // 这里保留 dataset.target 只是为了不破坏任何残留样式选择器。
+    const selectedTarget = this._selectedTargets(modelId)[0]
+      ?? (inst ? inst.npu_index : this._defaultTargetNpu(cards));
     sw.dataset.target = String(selectedTarget);
 
     const noCards = !cards || cards.length === 0;
@@ -3478,7 +3262,7 @@ const ComputeConfigPage = {
 
     // 历史 bug：之前假设 ``npu_index == 0`` 是 RK3588 主控 SoC，把
     // enumerate 第 1 张 182x 显示成 "RK182x #0"，导致顶部内存条
-    // 跟运行在 radio 的 #K 跟系统其它地方（比如 librknnsmi / 系统
+    // 「运行在」的 #K 与系统其它地方（比如 librknnsmi / 系统
     // 信息页）对不上 —— 选 #0 实际跑在 #1 上。
     //
     // 真相：``RKNN3Lite().get_devices_id()`` 枚举的是 RK182x 协卡
@@ -3490,7 +3274,7 @@ const ComputeConfigPage = {
     const sortedIndices = sorted.map(c => c.npu_index);
 
     // v0.8: 模型本身只支持某些 target（available_targets，如 ["182x"]）；
-    // 不支持的 radio 灰掉 + 不可点。
+    // 不支持的卡灰掉 + 不可点。
     const supported = new Set(
       (meta.available_targets && meta.available_targets.length)
         ? meta.available_targets
@@ -3499,30 +3283,33 @@ const ComputeConfigPage = {
             : ["182x"]
     );
 
-    // 默认选中：用户已记录 → 那个；否则 instance.npu_index >= 0 → 那个；
-    // 否则从 config.compute.services[].device 推出的 default_npu_index
-    // （算力配置 autostart=enabled/disabled 都靠这个绑 NPU）；
-    // 否则按 npu_index 升序排好后的第一个 supported 的 target。
-    let defaultIdx = null;
-    if (this._selectedTarget[modelId] != null
-        && sortedIndices.includes(this._selectedTarget[modelId])
-        && supported.has("182x")) {
-      defaultIdx = this._selectedTarget[modelId];
-    } else if (inst && inst.npu_index >= 0
-               && sortedIndices.includes(inst.npu_index)) {
-      defaultIdx = inst.npu_index;
-    } else if (inst && Number.isInteger(inst._default_npu_index)
-               && inst._default_npu_index >= 0
-               && sortedIndices.includes(inst._default_npu_index)) {
-      defaultIdx = inst._default_npu_index;
-    } else {
+    // 默认勾选：用户在「运行在」里选过的那些卡；其次是当前实例实际占用的
+    // 卡（多卡时全部勾上）；再其次 config.compute.autostart 里声明的
+    // npu_index；最后兜底第一个 supported target。
+    let defaults = new Set(this._selectedTargets(modelId));
+    if (defaults.size === 0) {
+      // 模型当前实际占用的卡（同时跑两张卡时两张都勾上）
+      const running = this._modelNpus(modelId);
+      if (running.length) defaults = new Set(running);
+    }
+    if (defaults.size === 0 && inst && inst.npu_index >= 0) {
+      defaults.add(inst.npu_index);
+    }
+    if (defaults.size === 0 && inst
+        && Number.isInteger(inst._default_npu_index)
+        && inst._default_npu_index >= 0) {
+      defaults.add(inst._default_npu_index);
+    }
+    if (defaults.size === 0) {
       for (const idx of sortedIndices) {
-        if (supported.has("182x")) { defaultIdx = idx; break; }
+        if (supported.has("182x")) { defaults.add(idx); break; }
       }
     }
-    if (defaultIdx != null) {
-      this._selectedTarget[modelId] = defaultIdx;
+    // 只保留真实枚举出来的卡，避免 snapshot 里的陈旧卡号留下幽灵勾选。
+    for (const n of Array.from(defaults)) {
+      if (!sortedIndices.includes(n)) defaults.delete(n);
     }
+    this._selectedTarget[modelId] = Array.from(defaults);
 
     let rendered = 0;
     const renderOpt = (npuIndex, title, sub, targetFamily, supportedFlag) => {
@@ -3533,14 +3320,16 @@ const ComputeConfigPage = {
       label.className = "cc-target-opt";
       label.title = sub || "";
       const input = document.createElement("input");
-      input.type = "radio";
-      input.name = `cc-target-${modelId}`;
+      // checkbox 而非 radio：同一个模型可以同时跑在多张卡上（每个勾选的
+      // 卡各起一个 worker，各占一张卡）。
+      input.type = "checkbox";
       input.value = String(npuIndex);
       input.className = "cc-target-radio";
-      // 默认勾选：当前 defaultIdx
-      if (npuIndex === defaultIdx) input.checked = true;
+      if (defaults.has(npuIndex)) input.checked = true;
       input.addEventListener("change", () => {
-        if (input.checked) this._selectedTarget[modelId] = npuIndex;
+        const cur = new Set(this._selectedTargets(modelId));
+        if (input.checked) cur.add(npuIndex); else cur.delete(npuIndex);
+        this._selectedTarget[modelId] = Array.from(cur);
       });
       label.appendChild(input);
       const txt = document.createElement("span");
@@ -3552,7 +3341,7 @@ const ComputeConfigPage = {
 
     // enumerate index 本身就是 NPU 编号。3588 走 device_id 路径不在
     // npu 枚举里 —— enumerate 0 就是第一张 182x 协卡，label 写
-    // "RK182x #0"，radio value 也是 0（直接给 worker 用）。
+    // "RK182x #0"，input value 也是 0（直接给 worker 用）。
     // 排序按 npu_index 升序，与顶部 182x 内存条位置完全对齐。
     for (const card of sorted) {
       if (rendered >= MAX_RK182X_OPTIONS) break;
@@ -3581,7 +3370,7 @@ const ComputeConfigPage = {
   // NPU 卡片按 enumerate index (npu_index) 升序，与 label "RK182x #N"
   // 完全对齐。早期版本按 device_id 字符串排序，会让 Position 1 显示
   // "RK182x #1" 而 Position 2 显示 "RK182x #0"（label 与位置错位），
-  // 跟系统信息页 / radio 选 #N 实际跑在 #N 上对不上。
+  // 跟系统信息页 / 勾选 #N 实际跑在 #N 上对不上。
   //
   // 真相：wdnai 枚举的 npu_index 本身就是 canonical 编号（与系统
   // 信息页 / librknnsmi 对齐后的 index 同源），按 npu_index 排即按
@@ -3602,12 +3391,12 @@ const ComputeConfigPage = {
     });
   },
 
-  // v0.8: 校验"已选 NPU"——用户必须先在 select 里选一个目标，toggle
-  // 才能启用。spawned/adopted_local 已 bind 的也认。
+  // v0.8: 校验"已选 NPU"——用户必须先在「运行在」里勾至少一张卡，
+  // toggle 才能启用。已 bind 的实例也算（多卡时任一张占用即算）。
   _hasTargetPicked(modelId, svc) {
     if (svc && svc.npu_index >= 0) return true;
-    const t = this._selectedTarget[modelId];
-    return typeof t === "number" && t >= 0;
+    if (this._modelNpus(modelId).length) return true;
+    return this._selectedTargets(modelId).length > 0;
   },
 
   // v0.8: 加载中倒计时（按 estimated_init_seconds - (now - started_at)）

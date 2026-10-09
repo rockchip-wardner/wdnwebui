@@ -501,143 +501,111 @@ _LEGACY_PRESET_NAME_RENAMES: dict[str, str] = {
 
 
 # --------------------------------------------------------------------------- #
-# compute.services[] schema (ServiceEntry) helpers                            #
+# compute.autostart schema helpers                                            #
 # --------------------------------------------------------------------------- #
-# A config-driven entry has 4 fields:
-#   name      : MODEL_PRESETS key
-#   label     : display name on the compute config card (overrides preset)
-#   autostart : "enabled" | "disabled" | "hidden"
-#   device    : 0 = main, 1 = 182x#0, 2 = 182x#1
+# An entry has 2 fields:
+#   model      : workers/<model_id>.json stem (a MODEL_PRESETS key)
+#   npu_index  : physical card index, straight from ``list_cards()``
 #
-# `hidden`   = 完全禁用 (no spawn, no UI render, no capability exposure).
-# `enabled`  = spawn worker + boot-bind to NPU at startup.
-# `disabled` = adopt-from-peer at boot only (current legacy behaviour);
-#              user must click 启用 on the page to spawn + bind.
+# Only models listed here are started at boot. Everything else is inert:
+# no spawn, no bind, no NPU memory — the user enables it from the compute
+# page when they want it. This replaces the old ``compute.services[]`` table,
+# which had to enumerate every model to say "don't start this one", and
+# mixed a label override and a device number into the same record.
 #
-# device is a HINT, not a hard pin: boot-bind uses device→npu_index as
-# the default, but the user can still pick a different NPU on the radio.
+# ``npu_index`` is passed to the worker as ``--npu``, so the model is
+# already loading by the time the first ``info`` probe lands. The worker
+# does that on a background thread *after* its replier is registered, so
+# the probe gets a real answer instead of a boot-timeout.
 
-_VALID_AUTOSTART: frozenset[str] = frozenset({"enabled", "disabled", "hidden"})
-_VALID_DEVICES:   frozenset[int] = frozenset({0, 1, 2})
+_VALID_AUTOSTART_KEYS: frozenset[str] = frozenset({"model", "npu_index"})
 
 
-def _parse_services_config(raw) -> list[dict]:
-    """Validate the ``compute.services`` config payload.
+def _parse_autostart_config(raw) -> list[dict]:
+    """Validate the ``compute.autostart`` config payload.
 
-    Returns a list of dicts ``{name, label, autostart, device}`` — one
-    per valid entry. The list is filtered / rejected as follows:
+    Returns ``[{"model": str, "npu_index": int}, ...]`` in file order.
 
-    * non-list (None / dict / scalar) → ``[]`` (no services declared)
-    * list entry not a dict → **raise** ``ValueError`` (old format
-      ``["qwen3-vl-4b", ...]`` is rejected; user said "不兼容")
-    * dict entry missing required keys → **raise** ``ValueError``
-    * ``name`` not in ``MODEL_PRESETS`` → **raise** ``ValueError``
-    * ``autostart`` not in ``_VALID_AUTOSTART`` → **raise** ``ValueError``
-    * ``device`` not in ``_VALID_DEVICES`` → **raise** ``ValueError``
-    * duplicate ``name`` → **raise** ``ValueError``
+    * non-list (None / dict / scalar) → ``[]`` (nothing autostarts)
+    * list entry not a dict → **raise** ``ValueError``
+    * ``model`` not in ``MODEL_PRESETS`` → **raise** ``ValueError``
+    * ``npu_index`` not a non-negative int → **raise** ``ValueError``
+    * duplicate ``model`` → **raise** ``ValueError`` (one card per model;
+      a second entry for the same model could only fight the first one)
+
+    Rejecting loudly matters here: a typo in this file means a model the
+    operator expects to be up at boot is silently not there.
     """
     if not isinstance(raw, list):
         return []
     out: list[dict] = []
-    seen_names: set[str] = set()
+    seen: set[str] = set()
     for idx, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ValueError(
-                f"compute.services[{idx}] 必须是 object "
-                "(新格式 {name, label, autostart, device})；"
-                "老格式字符串数组已不再支持，请在算力配置页或手工编辑"
-                "config.jsonc 改为对象格式"
+                f"compute.autostart[{idx}] 必须是 object "
+                "{{model, npu_index}}；例如 "
+                '{"model": "qwen3-vl-4b", "npu_index": 0}'
             )
-        # Reject any other *known-legacy* field names so silent
-        # misconfigurations don't propagate (e.g. a user copying an
-        # older sample would otherwise get autostart default + ignore
-        # the legacy ``policy`` key entirely, hiding the intent).
-        name = entry.get("name")
-        if not isinstance(name, str) or not name:
-            raise ValueError(f"compute.services[{idx}].name 缺失或非字符串")
-        new_name = _LEGACY_PRESET_NAME_RENAMES.get(name)
-        if new_name and new_name in MODEL_PRESETS:
-            LOG.info("compute.services[%d].name=%r 已自动迁移到 %r",
-                     idx, name, new_name)
-            entry["name"] = new_name
-            name = new_name
-        if name not in MODEL_PRESETS:
+        unknown = set(entry) - _VALID_AUTOSTART_KEYS
+        if unknown:
             raise ValueError(
-                f"compute.services[{idx}].name={name!r} 不在 "
+                f"compute.autostart[{idx}] 含未知字段 {sorted(unknown)}；"
+                f"只接受 {sorted(_VALID_AUTOSTART_KEYS)}（label / device 等"
+                "旧 services 字段已删除，label 见 workers/<model_id>.json）"
+            )
+        model = entry.get("model")
+        if not isinstance(model, str) or not model:
+            raise ValueError(
+                f"compute.autostart[{idx}].model 缺失或非字符串")
+        if model not in MODEL_PRESETS:
+            raise ValueError(
+                f"compute.autostart[{idx}].model={model!r} 不在 "
                 f"MODEL_PRESETS {sorted(MODEL_PRESETS.keys())} 中"
             )
-        if name in seen_names:
+        if model in seen:
             raise ValueError(
-                f"compute.services 含重复 name={name!r}；"
-                "同名 entry 只允许一条"
-            )
-        seen_names.add(name)
-        label = entry.get("label")
-        if not isinstance(label, str) or not label.strip():
-            raise ValueError(f"compute.services[{idx}].label 缺失或为空")
-        # Explicitly reject the legacy ``policy`` field name so users
-        # don't silently get autostart=disabled when their old config
-        # had policy="hidden" (which they expected to *hide* the entry).
-        if "policy" in entry:
+                f"compute.autostart 含重复 model={model!r}；一个模型只允许"
+                "一条（一条卡；同一模型跑第二张卡请在算力页手动启用）")
+        seen.add(model)
+        npu_index = entry.get("npu_index")
+        if not isinstance(npu_index, int) or isinstance(npu_index, bool):
             raise ValueError(
-                f"compute.services[{idx}].policy 字段已重命名为 autostart；"
-                "值对应 manual → disabled、auto_start → enabled、"
-                "hidden → hidden。请在 config.jsonc 改为 autostart 字段。"
-            )
-        autostart = entry.get("autostart", "disabled")
-        if autostart not in _VALID_AUTOSTART:
+                f"compute.autostart[{idx}].npu_index 缺失或不是整数 "
+                f"(got {npu_index!r})；可选 0..N 的实际卡号")
+        if npu_index < 0:
             raise ValueError(
-                f"compute.services[{idx}].autostart={autostart!r} 非法；"
-                f"可选 {sorted(_VALID_AUTOSTART)}"
-            )
-        device = entry.get("device", 1)
-        if device not in _VALID_DEVICES:
-            raise ValueError(
-                f"compute.services[{idx}].device={device!r} 非法；"
-                f"可选 {sorted(_VALID_DEVICES)}"
-            )
-        out.append({
-            "name":      name,
-            "label":     label.strip(),
-            "autostart": autostart,
-            "device":    int(device),
-        })
+                f"compute.autostart[{idx}].npu_index={npu_index} 非法；"
+                "必须是 0 起的实际卡号（主控 NPU 用 0）")
+        out.append({"model": model, "npu_index": int(npu_index)})
     return out
+
+
+def _autostart_npu_index(model_id: str) -> int:
+    """``npu_index`` this model autostarts on, or ``-1`` when it doesn't.
+
+    Tolerates a broken config: boot must not die because one entry is
+    malformed, and the model simply stays off until enabled by hand.
+    """
+    try:
+        section = get_config().get_section("compute", {})
+    except Exception:
+        return -1
+    try:
+        entries = _parse_autostart_config(
+            section.get("autostart") if isinstance(section, dict) else None)
+    except ValueError as e:
+        LOG.error("compute.autostart 配置非法（%s 默认卡信息按未配置处理）: %s",
+                  model_id, e)
+        return -1
+    for entry in entries:
+        if entry["model"] == model_id:
+            return entry["npu_index"]
+    return -1
 
 
 def _sorted(it):
     return sorted(it) if not isinstance(it, (set, frozenset)) else sorted(it)
-
-
-def _device_to_npu_index(device: int, cards: list[dict]) -> int:
-    """Map logical ``device`` number → physical ``npu_index``.
-
-    Mapping
-    -------
-    * ``device=0`` (main controller / RK3588 host) → ``-1`` (no NPU
-      pinned; presets currently all target RK182x so this is effectively
-      "not used"). Callers should skip auto-bind for device 0.
-    * ``device=1`` → first enumerated ``npu_index`` in ``cards``.
-    * ``device=2`` → second enumerated ``npu_index``.
-    * If the device index exceeds available cards → ``-1``.
-
-    The mapping assumes ``cards`` is ordered by ``npu_index`` (which is
-    how ``list_cards`` returns them). Chip-type discrimination
-    (RK3588 built-in NPU vs RK182x add-on) is not implemented yet —
-    the current ``MODEL_PRESETS`` are all ``available_targets=["182x"]``
-    anyway, so the enum order on a typical RK3588+2×RK182x board maps
-    cleanly to "first/second 182x".
-
-    Returns ``-1`` when no mapping is possible; callers should treat
-    that as "let the user pick" or "skip".
-    """
-    if device == 0:
-        return -1
-    cards_sorted = sorted(cards, key=lambda c: c.get("npu_index", -1))
-    target = device - 1
-    if target >= len(cards_sorted):
-        return -1
-    return int(cards_sorted[target].get("npu_index", -1))
 
 
 # --------------------------------------------------------------------------- #
@@ -689,14 +657,15 @@ class ModelInstance:
     instance_name: str = ""
     label: str = ""
     memory_estimate_mb: int = 0
-    # Config-driven overrides (from compute.services[] entry).
-    # ``_config_label`` overrides preset label when present (non-empty).
-    # ``_autostart`` mirrors the entry's autostart value: "enabled" /
-    # "disabled" / "hidden". ``_default_npu_index`` is the device→npu
-    # mapping used as UI radio default + boot-bind target. All three
-    # are empty/-1 when the model isn't in compute.services[] (presets
-    # not in config fall through to legacy behaviour: show as
-    # unavailable, user enables manually).
+    # Config-driven overrides (from the compute.autostart[] entry).
+    # ``_config_label`` overrides preset label when present (non-empty) —
+    # kept for API clients; the autostart schema itself has no label field.
+    # ``_autostart`` is "enabled" for models declared in compute.autostart,
+    # "" for every other preset. ``_default_npu_index`` is the card index
+    # the entry pins, used as the compute-page radio default and as the
+    # boot-bind target (``--npu``). All three are empty/-1 when the model
+    # isn't in compute.autostart (those presets fall through to legacy
+    # behaviour: shown as unavailable, user enables manually).
     _config_label: str = ""
     _autostart: str = ""
     _default_npu_index: int = -1
@@ -785,11 +754,55 @@ class ModelInstance:
             "_peer_name":         self._peer_name,
             "_peer_ip":           self._peer_ip,
             "_peer_pid":          self._peer_pid,
-            # Config-driven overrides from compute.services[] entry. Empty
-            # when the model isn't declared in services (legacy fallback).
+            # Config-driven overrides from the compute.autostart[] entry.
+            # Empty when the model isn't declared there.
             "_autostart":         self._autostart,
             "_default_npu_index": self._default_npu_index,
             "_config_label":      self._config_label,
+            # Enumeration order for the compute page's 本地算力 card list,
+            # straight from the worker manifest. The UI sorts on this so
+            # the card order lives in workers/<id>.json, not in JS.
+            "display_order":      preset.get("display_order", 9999),
+        }
+
+
+@dataclass(frozen=True)
+class SessionHandle:
+    """One addressable inference endpoint behind a capability.
+
+    The same model can be running on several cards at once (the compute
+    page's 运行在 is multi-select), and a LAN peer can be serving the same
+    model too. A consumer therefore has to be able to *name* the endpoint
+    it wants — ``LLMRPCSession`` is bound to one worker's per-PID DDS
+    service (``wdndds/rpc/<model>/worker-<pid>``), so there is no
+    transparent round-robin: picking a card means picking a handle.
+
+    ``npu_index`` is the card the worker is loaded on (-1 when unknown,
+    e.g. a worker that came up without a bind). ``source`` mirrors
+    ``ModelInstance._source``; ``is_remote`` is the one bit callers
+    actually branch on.
+    """
+
+    model_id: str
+    npu_index: int
+    source: str
+    pid: int
+    is_remote: bool
+    session: Any
+
+    @property
+    def worker_key(self) -> str:
+        """Stable identity for logs / UI labels: ``model@card#pid``."""
+        return f"{self.model_id}@{self.npu_index}#{self.pid}"
+
+    def to_dict(self) -> dict:
+        return {
+            "model_id":   self.model_id,
+            "npu_index":  self.npu_index,
+            "source":     self.source,
+            "pid":        self.pid,
+            "is_remote":  self.is_remote,
+            "worker_key": self.worker_key,
         }
 
 
@@ -1062,24 +1075,30 @@ class ComputeRegistry:
                 LOG.warning("failed to persist migrated capability_types: %s", e)
 
     def _migrate_legacy_preset_names(self) -> None:
+        """Rewrite renamed model ids inside ``compute.autostart``.
+
+        Runs once at boot so an old config keeps working instead of
+        silently autostarting nothing (the parser raises on an unknown
+        model, which would take the whole list down).
+        """
         cfg = get_config().get_section("compute", {})
-        services = cfg.get("services") if isinstance(cfg, dict) else None
-        if not isinstance(services, list):
+        autostart = cfg.get("autostart") if isinstance(cfg, dict) else None
+        if not isinstance(autostart, list):
             return
         renamed_total = 0
-        for idx, entry in enumerate(services):
+        for idx, entry in enumerate(autostart):
             if not isinstance(entry, dict):
                 continue
-            name = entry.get("name")
+            name = entry.get("model")
             new_name = _LEGACY_PRESET_NAME_RENAMES.get(name)
             if new_name and new_name in MODEL_PRESETS:
-                entry["name"] = new_name
+                entry["model"] = new_name
                 renamed_total += 1
-                LOG.info("compute.services[%d].name=%r 已自动迁移到 %r "
+                LOG.info("compute.autostart[%d].model=%r 已自动迁移到 %r "
                          "（如有疑问参见 git log / AGENTS.md）",
                          idx, name, new_name)
         if renamed_total:
-            cfg["services"] = services
+            cfg["autostart"] = autostart
             try:
                 get_config().set_section("compute", cfg)
             except Exception as e:  # noqa: BLE001
@@ -1313,6 +1332,17 @@ class ComputeRegistry:
             "remote_error_count":    remote_error_count,
             "estimated_init_seconds_per_model": estimated_per_model,
             "default_estimated_init_seconds":  DEFAULT_ESTIMATED_INIT_SECONDS,
+            # Model ids in the order the manifests declare (ascending
+            # ``display_order``, then id) — the compute page's 本地算力
+            # list order. Computed from MODEL_PRESETS rather than from
+            # ``services``: list_with_source() sorts by (_source,
+            # model_id) so a spawned model would sort ahead of an
+            # unavailable one regardless of display_order.
+            "preset_order":       sorted(
+                MODEL_PRESETS,
+                key=lambda mid: (MODEL_PRESETS[mid].get("display_order", 9999),
+                                 mid),
+            ),
             "worker_alive":      True,
             "last_updated":      time.time(),
             "capabilities":      capabilities,
@@ -1413,12 +1443,36 @@ class ComputeRegistry:
                  inst.model_id, inst.error[:200])
 
     def _spawn_compute_worker(self, model_id: str,
-                            allow_adopt: bool = True) -> ModelInstance:
+                            allow_adopt: bool = True,
+                            npu_index: int | None = None,
+                            eager_load: bool | None = None) -> ModelInstance:
         """Spawn a fresh ``compute_worker.py --model <id>`` subprocess.
 
-        The worker boots up with no ``--npu``: it brings its Hub +
-        Service + Replier online and waits in ``not_loaded`` state
-        until the main process sends ``{"action":"load","npu_index":N}``.
+        ``npu_index`` has **two independent jobs** and they must not be
+        conflated:
+
+        * *matching* — an existing instance already bound to this same
+          card is reused instead of spawning a second one. Needed once a
+          model may live on several cards at once.
+        * *``--npu`` on the cmdline* — controlled by ``eager_load``, NOT
+          by ``npu_index`` alone. The worker then builds its
+          ``LLMSession`` itself, on an eager-load thread that starts
+          *after* its replier is registered (so the first ``info`` probe
+          is answered rather than timing out). That is the autostart
+          path.
+
+        The compute page's 启用 deliberately passes ``eager_load=False``:
+        it spawns **without** ``--npu`` and then sends
+        ``{"action":"load","npu_index":N}`` via :meth:`bind_instance`.
+        Passing ``--npu`` there as well makes the worker eager-load
+        *while* the RPC load arrives — two loads racing on the same
+        session slot, which aborts the worker with ``rc=-6``. (Seen on
+        real hardware: every enable turned into ``rc=-6``.) Hence the
+        split.
+
+        ``eager_load`` defaults to ``npu_index is not None``, which keeps
+        the historical autostart behaviour for callers that don't say
+        otherwise.
 
         v0.8 dedup: before spawning, scan ``/proc`` for any pre-existing
         ``compute_worker.py --model <id>`` process. If found, refuse to
@@ -1455,6 +1509,28 @@ class ComputeRegistry:
                         old._source, model_id, getattr(old, "_peer_pid", None))
         # 1. 进程级 dedup:扫 /proc 同 comm 名的 worker
         orphan_pids = _find_workers_by_name(model_id)
+        # **排除本 registry 已经跟踪的 spawned worker。** 这条是「同一个
+        # 模型跑多张卡」的前提：给卡 1 启第二个实例时，`/proc` 里必然还
+        # 躺着刚给卡 0 spawn 的那个 worker，needle 只认 `--model <id>`，
+        # 分不清它是我们自己的。若不排除，`orphan_pids` 会命中它 →
+        # 注册成 adopted_local → 把卡 0 的那个实例从 dict 里踢掉 →
+        # 两个 registry 条目指向同一个进程，然后 bind 会让**同一个**
+        # worker 去 load 第二份模型（同卡再叠模型会 rc=-6，跨卡则状态
+        # 全乱）。实测症状：POST [0,1] 返回两个 pid 相同的实例。
+        tracked_pids = set()
+        with self._lock:
+            for i in self._instances.values():
+                if (i.model_id == model_id and i._source == "spawned"
+                        and i.proc is not None and i.proc.poll() is None):
+                    tracked_pids.add(i.proc.pid)
+        reusable = [p for p in orphan_pids if p not in tracked_pids]
+        if orphan_pids and not reusable:
+            LOG.info(
+                "spawn: %d existing %s worker(s) (pids=%s) are all ours "
+                "(already-tracked spawned) — proceeding to spawn a NEW "
+                "worker for the requested card", model_id, len(orphan_pids),
+                orphan_pids)
+        orphan_pids = reusable
         if allow_adopt and orphan_pids:
             LOG.warning(
                 "spawn skipped: %d existing %s worker(s) found (pids=%s); "
@@ -1538,12 +1614,18 @@ class ComputeRegistry:
             inst._probe_thread = probe
             probe.start()
             return inst
-        # 2. 让 ensure_worker_for_model 阶段不重复进入
+        # 2. 让 ensure_worker_for_model 阶段不重复进入。Same card-aware rule as
+        # upstream: an instance on a *different* card must not short-circuit
+        # the spawn, otherwise 「同一模型跑两张卡」 永远只有第一张卡。
         with self._lock:
             for inst in self._instances.values():
                 if inst.model_id != model_id:
                     continue
                 if not allow_adopt and inst._source == "adopted":
+                    continue
+                if (npu_index is not None
+                        and inst._source in ("spawned", "adopted_local")
+                        and inst.npu_index not in (-1, npu_index)):
                     continue
                 return inst
         preset = MODEL_PRESETS[model_id]
@@ -1589,8 +1671,15 @@ class ComputeRegistry:
             # 与 LAN peer 共用 standard topic 让 adopted (NETWORK) RpcClient
             # 路由到本机,造成 NETWORK 卡 status 翻转。
             "--local-only",
-            # 不传 --npu：npu_index 由用户在算力配置页选 NPU 后通过 RPC 传入
         ]
+        if npu_index is not None and (npu_index if eager_load is None else eager_load):
+            # autostart path: the card is known now, so hand it over and
+            # let the worker's own eager-load thread build the model. The
+            # replier is registered before that thread starts, so probe
+            # and ``info`` keep answering while the weights load.
+            # The compute page passes eager_load=False and loads over RPC
+            # instead — see the method docstring.
+            cmd += ["--npu", str(int(npu_index))]
         try:
             # v0.8.6 改:worker stdout/stderr 写独立 log file,而不是 PIPE。
             # 原因:PIPE 在 parent(uwsgi worker / uvicorn)死掉时 read 端
@@ -1964,7 +2053,9 @@ class ComputeRegistry:
         return self.bind_instance(inst, npu_index)
 
     def ensure_worker_for_model(self, model_id: str,
-                               allow_adopt: bool = True) -> ModelInstance:
+                               allow_adopt: bool = True,
+                               npu_index: int | None = None,
+                               eager_load: bool | None = None) -> ModelInstance:
         """User-facing: ensure *some* worker exists for this model.
 
         Order:
@@ -1979,6 +2070,19 @@ class ComputeRegistry:
         "启用" card and explicitly wants a fresh local worker on the
         chosen NPU regardless of peer presence.
 
+        ``npu_index`` is forwarded to the spawn as ``--npu`` so the
+        worker starts loading on its own — that is the ``autostart``
+        path. The compute page leaves it ``None`` because the user picks
+        the card in the UI and :meth:`bind_instance` sends the ``load``
+        RPC afterwards.
+
+        When ``npu_index`` is given, an **existing instance on that same
+        card** is reused. That is what makes 「一个模型跑两张卡」 work:
+        card 0 already holding ``qwen3-vl-4b`` does not stop the caller
+        from getting one on card 1 — it gets its own worker with its own
+        per-PID DDS service, and the two coexist in ``_instances`` (the
+        instance key has always been ``(npu, model_id, source)``).
+
         Status returned may be ``not_loaded`` if the worker is up but
         the user has not yet bound an NPU (call ``bind_instance`` for
         that).
@@ -1988,6 +2092,14 @@ class ComputeRegistry:
                 if inst.model_id != model_id:
                     continue
                 if not allow_adopt and inst._source == "adopted":
+                    continue
+                # Card-aware matching: without this, a model already on
+                # card 0 would be handed back for a request naming card 1
+                # and bind_instance would then ask one worker to load a
+                # second model onto a second card.
+                if (npu_index is not None
+                        and inst._source in ("spawned", "adopted_local")
+                        and inst.npu_index not in (-1, npu_index)):
                     continue
                 # spawned workers: 如果 subprocess 死了（probe 还没
                 # 来得及翻 error，或 probe 已 return），不要复用 stale
@@ -2013,8 +2125,48 @@ class ComputeRegistry:
             adopted = self._adopt_existing_worker(model_id)
             if adopted is not None:
                 return adopted
-        spawned = self._spawn_compute_worker(model_id, allow_adopt=allow_adopt)
+        spawned = self._spawn_compute_worker(model_id, allow_adopt=allow_adopt,
+                                             npu_index=npu_index,
+                                             eager_load=eager_load)
         return spawned
+
+    def _call_load_with_warmup(self, rpc_client, inst: ModelInstance,
+                               npu_index: int) -> dict:
+        """Send the ``load`` RPC, retrying while the cshim Requester is
+        still matching the worker's per-PID DDS service.
+
+        The first worker on a board gets its endpoint matched long before
+        anyone enables it, so a flat 5 s timeout has always sufficed. But
+        when one model is loaded on a **second** card, that worker was
+        spawned seconds ago: its ``wdndds/rpc/<model>/worker-<pid>``
+        service has to go through SEDP/SPDP before the Requester can
+        reach it, and a bare 5 s call comes back ``{"ok": false, "error":
+        "timeout"}`` while the worker sits there perfectly healthy.
+
+        Bounded backoff: 3 attempts with a 5 s → 15 s → 30 s budget. A
+        genuine load failure still surfaces (the worker replies
+        ``ok: false`` with a real message, which is returned as-is and
+        never retried) — this only rides out discovery.
+        """
+        payload = {"action": "load", "op": "load", "npu_index": npu_index}
+        timeouts = (5_000, 15_000, 30_000)
+        r = None
+        for attempt, timeout_ms in enumerate(timeouts):
+            if attempt:
+                time.sleep(2.0)
+            LOG.debug(
+                "load RPC attempt %d/%d model=%s npu=%d timeout=%dms",
+                attempt + 1, len(timeouts), inst.model_id, npu_index,
+                timeout_ms)
+            r = rpc_client.call(payload, timeout_ms=timeout_ms)
+            if not (r or {}).get("error") == "timeout":
+                return r or {}
+            LOG.info(
+                "load RPC timed out (attempt %d/%d) model=%s npu=%d — "
+                "likely DDS discovery still settling for worker pid=%s",
+                attempt + 1, len(timeouts), inst.model_id, npu_index,
+                getattr(inst.proc, "pid", None))
+        return r or {}
 
     def bind_instance(self, inst: ModelInstance, npu_index: int) -> ModelInstance:
         """v0.8 fire-and-forget：立即把 ``inst.status="loading"`` 返回，
@@ -2089,10 +2241,8 @@ class ComputeRegistry:
                         "compute_registry: _run_load.call load model=%s "
                         "npu=%d thread=%s",
                         inst.model_id, npu_index, threading.get_ident())
-                    r = rpc_client.call(
-                        {"action": "load", "op": "load", "npu_index": npu_index},
-                        timeout_ms=5_000,
-                    )
+                    r = self._call_load_with_warmup(
+                        rpc_client, inst, npu_index)
                 data = (r or {}).get("data") or {}
                 if not (r or {}).get("ok"):
                     err_msg = (r or {}).get("error") or "RPC failed"
@@ -2258,32 +2408,41 @@ class ComputeRegistry:
         served-session close, side-hub close, atexit ``/dev/shm``
         sweep) is skipped in favour of a bare SIGKILL. Leave it True
         everywhere else — nothing else has a follow-up RPC to make.
+
+        Acts on **every** instance of the model: one model can be loaded
+        on several cards at once, and "停止这个模型" that only released
+        card 0 would leave card 1 still holding NPU memory while the UI
+        showed it as stopped.
         """
-        inst = self._find_by_model(model_id)
-        if inst is None:
-            return
-        inst._probe_gen += 1  # 失效 in-flight probe 的 r
-        if inst.rpc_client is not None:
+        for inst in self._instances_of(model_id):
+            inst._probe_gen += 1  # 失效 in-flight probe 的 r
+            if inst.rpc_client is not None:
+                try:
+                    # unload_handler 立即返回 {"status": "unloaded"}。5s 足够。
+                    with inst._probe_lock:
+                        if inst.rpc_client is None:
+                            continue
+                        inst.rpc_client.call(
+                            {"action": "unload", "op": "unload"},
+                            timeout_ms=5_000)
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning("unload %s (npu=%s) RPC failed: %s",
+                                model_id, inst.npu_index, e)
             with self._lock:
-                inst.status = "not_loaded"  # 乐观写,RPC 完成前保持
-            try:
-                # unload_handler 立即返回 {"status": "unloaded"}。5s 足够。
-                with inst._probe_lock:
-                    if inst.rpc_client is None:
-                        return
-                    inst.rpc_client.call(
-                        {"action": "unload", "op": "unload"}, timeout_ms=5_000)
-            except Exception as e:  # noqa: BLE001
-                LOG.warning("unload %s RPC failed: %s", model_id, e)
-        with self._lock:
-            old_key = inst.key
-            inst.npu_index = -1
-            inst.key = (-1, model_id, inst._source)
-            inst.status = "not_loaded"
-            inst.load_time_sec = None
-            inst.loaded_at = None
-            self._instances.pop(old_key, None)
-            self._instances[inst.key] = inst
+                old_key = inst.key
+                inst.npu_index = -1
+                inst.key = (-1, model_id, inst._source)
+                inst.status = "not_loaded"
+                inst.load_time_sec = None
+                inst.loaded_at = None
+                self._instances.pop(old_key, None)
+                # Two instances unloading at once would both land on
+                # key (-1, model, source) and the second would overwrite
+                # the first, orphaning it. Keep them apart by suffixing.
+                if (-1, model_id, inst._source) in self._instances:
+                    inst.key = (-1 - len(self._instances), model_id,
+                                inst._source)
+                self._instances[inst.key] = inst
         # Tear down the local FastDDS endpoints so the cshim payload
         # pool doesn't pin in hub._services. The hub Service / Requester
         # is what AGENTS.md calls "每个 ~60 MB of RSS" per Service;
@@ -2293,12 +2452,12 @@ class ComputeRegistry:
         # Skipped when the caller defers it (see the ``teardown`` arg) —
         # ``stop_instance_local`` still needs this Requester to deliver
         # the shutdown RPC that follows.
-        if teardown:
-            self._teardown_rpc_client(inst)
-        else:
-            LOG.debug(
-                "unload %s: rpc_client teardown deferred to caller",
-                model_id)
+            if teardown:
+                self._teardown_rpc_client(inst)
+            else:
+                LOG.debug(
+                    "unload %s (npu=%s): rpc_client teardown deferred to caller",
+                    model_id, inst.npu_index)
 
     def stop_instance_local(self, model_id: str) -> None:
         """Unload → RPC shutdown → SIGTERM → wait 3 s → kill -9.
@@ -2328,19 +2487,32 @@ class ComputeRegistry:
 
         Raises ``RuntimeError`` if the instance is adopted (proc is
         None) — the caller (API layer) turns this into HTTP 403.
+
+        Acts on **every** instance of the model, matching
+        :meth:`unload_instance` — a model loaded on two cards must not
+        leave one of them running behind the UI's back.
         """
-        t0 = time.time()
-        inst = self._find_by_model(model_id)
-        if inst is None:
+        targets = self._instances_of(model_id)
+        if not targets:
             raise RuntimeError(f"{model_id} 不在 registry")
+        t0 = time.time()
+        for inst in targets:
+            self._stop_inst(model_id, inst)
+        LOG.info(
+            "compute_registry: stop_instance_local exit model=%s "
+            "instances=%d elapsed=%.2fs thread=%s",
+            model_id, len(targets), time.time() - t0, threading.get_ident())
+
+    def _stop_inst(self, model_id: str, inst: ModelInstance) -> None:
+        """The 5-step teardown for one instance. See
+        :meth:`stop_instance_local` for why the order is load-bearing."""
         if inst._source == "adopted":
             raise RuntimeError(
                 f"{model_id} 是远端 peer 提供的 service，本机无权停止")
         inst._probe_gen += 1  # 同 unload_instance 理由
         LOG.debug(
-            "compute_registry: stop_instance_local enter model=%s "
-            "source=%s thread=%s",
-            model_id, inst._source, threading.get_ident())
+            "compute_registry: stop enter model=%s npu=%s source=%s thread=%s",
+            model_id, inst.npu_index, inst._source, threading.get_ident())
         # (1) unload first — must not tear down the Requester, step 2
         # needs it. See the method docstring for why this order.
         try:
@@ -2402,10 +2574,9 @@ class ComputeRegistry:
                             model_id, e)
         with self._lock:
             self._instances.pop(inst.key, None)
-        LOG.info(
-            "compute_registry: stop_instance_local exit model=%s "
-            "elapsed=%.2fs thread=%s",
-            model_id, time.time() - t0, threading.get_ident())
+        LOG.debug(
+            "compute_registry: stop_inst done model=%s npu=%s thread=%s",
+            model_id, inst.npu_index, threading.get_ident())
 
     def restart_instance_local(self, model_id: str) -> None:
         """Spawned-only 4-step restart (Q3 spec):
@@ -2431,8 +2602,9 @@ class ComputeRegistry:
         untouched."""
         models = []
         with self._lock:
+            # A model on two cards contributes two instances — stop it once.
             for inst in self._instances.values():
-                if inst.proc is not None:
+                if inst.proc is not None and inst.model_id not in models:
                     models.append(inst.model_id)
         for m in models:
             try:
@@ -2732,14 +2904,12 @@ class ComputeRegistry:
         return None
 
     def _find_by_model(self, model_id: str) -> Optional[ModelInstance]:
-        """Look up a registered instance by model_id (key changes after
-        bind so we can't just key-index).
+        """First registered instance of ``model_id`` (本机优先).
 
-        本机实例(spawned / adopted_local)优先于远端 adopted — 同
-        model_id 可能并存一条本机 + 一条 adopted(本机先 spawn 后,
-        DDS 又从 peer 收到同名服务),用户禁/启操作的目标一定是本机
-        那个;返回 adopted 会触发 Layer 2 的 403,误以为禁不掉本机的
-        模型。fallback 到 adopted 仅在没有任何本机实例时。
+        Kept for call sites that only care about "some instance". When a
+        model runs on several cards this returns an arbitrary one — use
+        :meth:`_instances_of` (or pass ``npu_index``) when the card
+        matters.
         """
         with self._lock:
             adopted = None
@@ -2750,6 +2920,26 @@ class ComputeRegistry:
                     return inst
                 adopted = adopted or inst
             return adopted
+
+    def _instances_of(self, model_id: str,
+                      npu_index: Optional[int] = None) -> List[ModelInstance]:
+        """Every registered instance of ``model_id``, optionally narrowed
+        to one card.
+
+        One model can hold several instances at once — the compute page's
+        运行在 is multi-select, so the same manifest may be loaded on card
+        0 and card 1 simultaneously. Ordering is 本机优先, then ascending
+        ``npu_index``, so "the first" is deterministic instead of
+        whatever the dict happens to yield.
+        """
+        local_first = {"spawned": 0, "adopted_local": 1, "adopted": 2}
+        with self._lock:
+            found = [i for i in self._instances.values()
+                     if i.model_id == model_id
+                     and (npu_index is None or i.npu_index == npu_index)]
+        found.sort(key=lambda i: (local_first.get(i._source, 9),
+                                  i.npu_index))
+        return found
 
     def list_with_source(self) -> list[dict]:
         """UI-friendly snapshot of every catalog model's current state.
@@ -2763,31 +2953,20 @@ class ComputeRegistry:
 
         Ordered: spawned first, adopted second, unavailable last.
 
-        Hidden-by-config filter
-        ------------------------
-        Entries in ``compute.services[]`` with ``autostart="hidden"`` are
-        dropped from the snapshot entirely — they're "configured to
-        never be exposed". Their entries don't appear as "unavailable"
-        placeholder cards either; the UI simply doesn't see them.
-        This matches the boot path which doesn't spawn / adopt /
-        register hidden entries.
+        Hidden-by-manifest filter
+        -------------------------
+        A model whose ``workers/<id>.json`` sets ``"hidden": true`` is
+        dropped from the snapshot entirely — it is "configured to never
+        be exposed", and it also never appears as an "unavailable"
+        placeholder. This replaces the old ``compute.services[].autostart
+        == "hidden"`` flag, which meant the same thing but lived in a
+        table that had to enumerate every model to express it.
         """
-        # Resolve hidden set (best-effort; if config is broken, treat as
-        # empty hidden set and let other layers surface the error).
-        hidden_set: set[str] = set()
-        cfg_overrides: dict[str, dict] = {}
-        try:
-            stored = get_config().get_section("compute", {})
-            if isinstance(stored, dict):
-                raw = stored.get("services")
-                if isinstance(raw, list):
-                    for e in raw:
-                        if isinstance(e, dict) and isinstance(e.get("name"), str):
-                            cfg_overrides[e["name"]] = e
-                            if e.get("autostart") == "hidden":
-                                hidden_set.add(e["name"])
-        except Exception:  # noqa: BLE001
-            pass
+        # Hidden models come from their own manifest now, not from
+        # config — a broken config can't accidentally hide a model.
+        hidden_set: set[str] = {
+            m.id for m in discover_workers() if m.hidden
+        }
 
         out: list[dict] = []
         with self._lock:
@@ -2806,17 +2985,13 @@ class ComputeRegistry:
 
         def _unavailable_entry(model_id: str) -> dict:
             preset = MODEL_PRESETS[model_id]
-            entry = cfg_overrides.get(model_id, {})
-            cfg_label = (entry.get("label") or "").strip() if isinstance(entry, dict) else ""
-            cfg_autostart = entry.get("autostart", "") if isinstance(entry, dict) else ""
-            cfg_device = entry.get("device", 1) if isinstance(entry, dict) else 1
-            cfg_default_npu = _device_to_npu_index(
-                cfg_device if isinstance(cfg_device, int) else 1,
-                self._cards or [],
-            )
+            # No label override anymore — the manifest owns it. The
+            # autostart card is only a preselect for the radio; -1 means
+            # "this model isn't autostarted, let the user pick".
+            cfg_default_npu = _autostart_npu_index(model_id)
             return {
                 "model_id":           model_id,
-                "label":              cfg_label or preset["label"],
+                "label":              preset["label"],
                 "instance_name":      preset["instance_name"],
                 "capability_types":   list(preset["capability_types"]),
                 "memory_estimate_mb": preset["memory_estimate_mb"],
@@ -2833,9 +3008,10 @@ class ComputeRegistry:
                 "_peer_guid":         "",
                 "_peer_name":         "",
                 "_peer_ip":           "",
-                "_autostart":         cfg_autostart,
+                "_autostart":         "enabled" if cfg_default_npu >= 0 else "",
                 "_default_npu_index": cfg_default_npu,
-                "_config_label":      cfg_label,
+                "_config_label":      "",
+                "display_order":      preset.get("display_order", 9999),
             }
 
         for model_id, preset in MODEL_PRESETS.items():
@@ -2868,80 +3044,86 @@ class ComputeRegistry:
         return out
 
     def boot_compute_services(self) -> None:
-        """App boot: for each ``compute.services[]`` entry, decide what
-        to do based on its ``autostart`` field.
+        """App boot: start every model listed in ``compute.autostart``.
 
-        Per-entry behaviour
-        -------------------
-        * ``"hidden"``   —— 完全跳过（不 adopt、不 spawn、不 bind、不参与
-          capability 路由）。UI 算力配置页也看不到这张卡。
-        * ``"disabled"`` —— 仅尝试 adopt LAN peer（不 spawn 本地 worker，
-          不 bind）。用户到算力配置页点 启用 才会 spawn + bind。
-        * ``"enabled"``  —— 同 disabled 的 adopt 流程 + 后台 daemon
-          线程走 ``bind_instance(device→npu_index)``：让模型常驻。
-          adopt 失败的也照常 spawn + bind（peer-only 场景 fall through）。
+        Each entry is ``{"model": <id>, "npu_index": <card>}``. The model
+        is spawned with ``--npu`` so the worker starts building its
+        ``LLMSession`` on its own background thread the moment its
+        replier is up — no second RPC round-trip, and ``info`` answers
+        immediately (``not_loaded`` → ``loading`` → ``running`` as the
+        build progresses).
 
-        老格式（``services: ["name", ...]``）会被
-        :func:`_parse_services_config` 直接拒绝，让 PUT /api/config
-        校验那一关先拦下。如果文件直接写到磁盘上、读到这里遇到老格式，
-        LOG warning + skip 全部 —— 不破坏 boot。
+        A model already answered by a LAN peer is adopted rather than
+        spawned. That is a *different* situation from autostart: the peer
+        already loaded it on its own card, so there is nothing to bind
+        locally — sending a ``load`` to a peer's worker would try to grab
+        an NPU this board does not own. The requested ``npu_index`` is
+        recorded as the default for the compute page's radio, but the
+        worker is left alone.
 
-        Presets NOT in ``services`` 完全不参与 boot（无 adopt / spawn /
-        bind）；UI 仍按现有逻辑把它们渲染为 "unavailable"，用户可手动
-        启用。这是"permissive" 路径，避免新增 preset 后忘了同步 config
-        导致模型"消失"的体验回归。
+        Models *not* in ``autostart`` do not participate in boot at all:
+        no spawn, no adopt, no NPU memory. The compute page still lists
+        them as unavailable so the user can enable one by hand.
+
+        A malformed ``autostart`` (unknown model, bad card index, a
+        leftover ``services``-style entry) is logged and dropped rather
+        than raised — one bad line must not stop the other models from
+        coming up.
+
+        Ordering matters: the orphan sweep runs **before** the spawn
+        loop. :meth:`_boot_spawn_async` is fire-and-forget, so a sweep
+        that ran afterwards would race the spawn threads for
+        ``tracked_pids`` and SIGTERM a worker that had just been Popen'd
+        but not yet registered in ``_instances`` (observed: the first
+        autostart model died ``rc=-15`` within the same second it was
+        spawned). Sweeping first is also semantically right — it reaps
+        the *previous* boot's leftovers, before this boot adds any.
         """
         try:
             self.list_cards()
         except Exception:
             pass
         try:
+            self._cleanup_unregistered_workers()
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("boot cleanup sweep failed: %s", e)
+        try:
             stored = get_config().get_section("compute", {})
         except Exception:
             stored = {}
-        services_raw = stored.get("services") if isinstance(stored, dict) else None
+        raw = stored.get("autostart") if isinstance(stored, dict) else None
         try:
-            entries = _parse_services_config(services_raw)
+            entries = _parse_autostart_config(raw)
         except ValueError as e:
-            LOG.error("compute.services 配置非法: %s；老格式字符串数组"
-                      "不再支持，请在算力配置页或手工编辑 config.jsonc "
-                      "改为对象格式", e)
+            LOG.error("compute.autostart 配置非法，已跳过开机启动: %s", e)
             entries = []
-
-        # device→npu_index 映射一次性算好（每张 entry 都要用）
-        cards_snapshot = self._cards or []
+        if not entries:
+            LOG.info("boot: compute.autostart 为空 —— 不自动启动任何模型"
+                     "（算力页可手动启用）")
+        else:
+            known = sorted(e["model"] for e in entries)
+            LOG.info("boot: compute.autostart 声明了 %d 个模型: %s",
+                     len(entries), known)
 
         for entry in entries:
-            if entry["autostart"] == "hidden":
-                LOG.info("boot: %s hidden by config, skip entirely",
-                         entry["name"])
-                continue
+            model_id = entry["model"]
+            npu_index = entry["npu_index"]
 
-            model_id = entry["name"]
-            cfg_label = entry["label"]
-            cfg_device = entry["device"]
-            cfg_default_npu = _device_to_npu_index(cfg_device, cards_snapshot)
-
-            # 已经 register 过的实例也要把 config metadata 灌进去
             with self._lock:
-                existing = [i for i in self._instances.values()
-                            if i.model_id == model_id]
-            for inst in existing:
-                if cfg_label and cfg_label != inst.label:
-                    inst.label = cfg_label
-                if cfg_default_npu >= 0 and inst._default_npu_index < 0:
-                    inst._default_npu_index = cfg_default_npu
+                already = [i for i in self._instances.values()
+                           if i.model_id == model_id]
+            for inst in already:
+                # config no longer overrides labels (that lives in the
+                # manifest), but the autostart card is still the right
+                # default to preselect on the compute page's radio.
+                if inst._default_npu_index < 0:
+                    inst._default_npu_index = npu_index
                 if not inst._autostart:
-                    inst._autostart = entry["autostart"]
-                if not inst._config_label:
-                    inst._config_label = cfg_label
-
-            with self._lock:
-                if any(i.model_id == model_id
-                       for i in self._instances.values()):
-                    LOG.info("boot: %s already in registry, skip adopt",
-                             model_id)
-                    continue
+                    inst._autostart = "enabled"
+            if already:
+                LOG.info("boot: %s 已在 registry（%s），跳过 adopt/spawn",
+                         model_id, already[0]._source)
+                continue
 
             adopted = None
             try:
@@ -2950,36 +3132,20 @@ class ComputeRegistry:
                 LOG.warning("boot peer-adopt failed for %s: %s",
                             model_id, e)
             if adopted is not None:
-                if cfg_label:
-                    adopted.label = cfg_label
-                adopted._config_label = cfg_label
-                adopted._autostart = entry["autostart"]
-                adopted._default_npu_index = cfg_default_npu
-                LOG.info("boot: adopted %s (peer guid=%s status=%s "
-                         "autostart=%s device=%d→npu=%d)",
-                         model_id, adopted._peer_guid, adopted.status,
-                         entry["autostart"], cfg_device, cfg_default_npu)
-                # enabled: 如果 adopt 成功且 autostart=enabled,
-                # 把 bind 也走了（远端 adopted 本机无法 bind，但语义上
-                # "enabled" 在远端 peer 那边早就 load 好了；这里仅在
-                # inst 是 adopted_local 时尝试 bind）。
-                if entry["autostart"] == "enabled" \
-                        and adopted._source == "adopted_local" \
-                        and cfg_default_npu >= 0:
-                    self._boot_bind_async(adopted, cfg_default_npu,
-                                          reason="enabled+adopted_local")
-            else:
-                # 没 adopt 到 —— 不在 boot 时 spawn（保留 legacy 行为：
-                # 用户点 启用 才 spawn）。如果 autostart=enabled,
-                # 还是要走 spawn + bind 流程。
-                if entry["autostart"] == "enabled" and cfg_default_npu >= 0:
-                    self._boot_spawn_and_bind_async(
-                        model_id, cfg_default_npu, cfg_label)
+                adopted._default_npu_index = npu_index
+                adopted._autostart = "enabled"
+                LOG.info("boot: autostart %s → adopted %s (peer guid=%s "
+                         "status=%s); 不发 load —— 算力归对方，本板不动",
+                         model_id, adopted._source, adopted._peer_guid,
+                         adopted.status)
+                continue
 
-        try:
-            self._cleanup_unregistered_workers()
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("boot cleanup sweep failed: %s", e)
+            # No worker anywhere → this board is responsible for it.
+            self._boot_spawn_async(model_id, npu_index)
+
+        # NOTE: the orphan sweep already ran above the loop. Do not add a
+        # second one here — it would race the fire-and-forget spawn
+        # threads (see the docstring).
 
         # v0.8.24: 后台 daemon 再扫一次 peer。boot probe 接受首个 responder,
         # 如果本机已有 /proc orphan(cshim 路由非确定),LAN peer 可能漏掉。
@@ -3075,25 +3241,40 @@ class ComputeRegistry:
         threading.Thread(target=_runner, name=f"boot-bind-{inst.model_id}",
                          daemon=True).start()
 
-    def _boot_spawn_and_bind_async(self, model_id: str, npu_index: int,
-                                   cfg_label: str) -> None:
-        """Fire-and-forget spawn + bind for ``autostart=enabled`` entries."""
+    def _boot_spawn_async(self, model_id: str, npu_index: int) -> None:
+        """Fire-and-forget spawn for one ``compute.autostart`` entry.
+
+        The card travels to the worker as ``--npu``, so the model starts
+        building itself on the worker's own eager-load thread. We do
+        **not** follow up with ``bind_instance``: that would send a second
+        ``load`` RPC for a model that is already building, and the two
+        would race on the worker's session slot.
+
+        ``_probe_instance`` is still started by the spawn path, so the
+        instance's status walks ``not_loaded`` → ``loading`` →
+        ``running`` on its own and the compute page renders the same
+        countdown it always did.
+
+        The autostart markers (``_autostart`` / ``_default_npu_index``)
+        are stamped here rather than in the ``ensure_worker_for_model``
+        path: that path is shared with ``POST /compute/instances``, where
+        the user picked the card by hand and nothing is autostarted. Doing
+        it on the returned instance keeps the two callers honest.
+        """
         def _runner():
             try:
-                inst = self.ensure_worker_for_model(model_id, allow_adopt=True)
-                if cfg_label:
-                    inst.label = cfg_label
-                    inst._config_label = cfg_label
+                inst = self.ensure_worker_for_model(
+                    model_id, allow_adopt=True, npu_index=npu_index)
+                inst._autostart = "enabled"
+                inst._default_npu_index = npu_index
                 if inst._source == "adopted":
-                    LOG.info("boot enabled: %s adopted from peer "
-                             "(peer is the active instance); no bind needed",
-                             model_id)
+                    LOG.info("boot autostart: %s came up as a peer instance; "
+                             "leaving its NPU alone", model_id)
                     return
-                self.bind_instance(inst, npu_index)
-                LOG.info("boot enabled: %s spawned+bound to npu=%d → %s",
+                LOG.info("boot autostart: %s spawned with --npu=%d → %s",
                          model_id, npu_index, inst.status)
             except Exception as e:  # noqa: BLE001
-                LOG.warning("boot enabled failed for %s @ npu=%d: %s",
+                LOG.warning("boot autostart failed for %s @ npu=%d: %s",
                             model_id, npu_index, e)
         threading.Thread(target=_runner,
                          name=f"boot-autostart-{model_id}",
@@ -3212,7 +3393,7 @@ class ComputeRegistry:
     def _cleanup_unregistered_workers(self) -> int:
         """Boot-time defensive sweep.
 
-        对每个在 ``config.compute.services`` 列出的 model 调
+        对每个在 ``config.compute.autostart`` 列出的 model 调
         :func:`_find_workers_by_name`（先按 comm、再 fallback cmdline
         兼容老 worker），扫出所有同名进程：
           * 已经在 registry 里的（spawned 的 proc.pid / adopted_local
@@ -3220,15 +3401,24 @@ class ComputeRegistry:
           * 剩下的（不在 registry 但 comm/cmdline 匹配）→ 视为孤儿，
             SIGTERM → 5s grace → SIGKILL。
 
-        对**不在** config 里的 model_id 的孤儿 worker 也会扫（用
-        ``MODEL_PRESETS`` 全集）—— 用户从 config 删除某个 service
+        对**不在** autostart 里的 model_id 的孤儿 worker 也会扫（用
+        ``MODEL_PRESETS`` 全集）—— 用户从 autostart 删除某个 model
         后，那个孤儿进程应该被回收，不能继续吃 NPU 内存。
 
         Returns the count of PIDs killed.
         """
         try:
-            configured = set(
-                get_config().get_section("compute", {}).get("services", []))
+            # autostart entries are objects, so take the ``model`` field;
+            # a raw set() over the list would raise on unhashable dicts
+            # and silently degrade ``configured`` to empty.
+            configured = {
+                entry["model"]
+                for entry in get_config()
+                .get_section("compute", {})
+                .get("autostart", [])
+                if isinstance(entry, dict) and isinstance(
+                    entry.get("model"), str)
+            }
         except Exception:
             configured = set()
 
@@ -3242,9 +3432,9 @@ class ComputeRegistry:
                     if isinstance(pid, int):
                         tracked_pids.add(pid)
 
-        # 扫的范围：config 里的 + preset 全集（处理 user 从 config 删
-        # 掉的孤儿）。preset 里没的 model_id 不会被 _find_workers_by_name
-        # 误识（needle 不匹配），所以多扫也安全。
+        # 扫的范围：autostart 里的 + preset 全集（处理 user 从
+        # autostart 删掉的孤儿）。preset 里没的 model_id 不会被
+        # _find_workers_by_name 误识（needle 不匹配），所以多扫也安全。
         scan_targets = set(configured) | set(MODEL_PRESETS.keys())
         orphans: List[int] = []
         for model_id in scan_targets:
@@ -3259,7 +3449,7 @@ class ComputeRegistry:
                 else:
                     LOG.warning(
                         "cleanup: %s pid=%d no longer in "
-                        "config.compute.services; killing",
+                        "config.compute.autostart; killing",
                         model_id, pid)
 
         if not orphans:
@@ -3553,87 +3743,120 @@ class ComputeRegistry:
     # ------------------------------------------------------------------ #
     # 消费者 API                                                         #
     # ------------------------------------------------------------------ #
-    def get_session(self, capability_type: str) -> Any:
-        """Return the ``LLMRPCSession`` for the first running instance
-        exposing ``capability_type``. Raises RuntimeError if none.
+    def list_sessions(self, capability_type: str, *,
+                       include_remote: bool = False,
+                       model_id: Optional[str] = None) -> List[SessionHandle]:
+        """Every running endpoint exposing ``capability_type``.
 
-        **本机优先**：多实例可用时（如 LAN 上两台板都加载了同一
-        embedding），优先返回本机 ``spawned`` / ``adopted_local``
-        实例 —— 视频类消费方（VAS_SEARCH / wechat_video_manager）走
-        ``/dev/shm`` path-list 传帧，跨机Worker 读不到本机 tmpfs，
-        命中远端实例会逐片 imread 失败；同时本机 NPU 推理延迟也远低
-        于 LAN RPC。无本机 running 时才退回 LAN peer（远端 wire
-        上仅 base64 图像可达，见 rpc_session_proxy 的 is_remote
-        分支）。
+        This is the enumeration a consumer should reach for when it needs
+        to *choose* a card rather than accept whatever is first: the same
+        model may be loaded on card 0 and card 1 at the same time, and a
+        LAN peer may additionally be serving it.
+
+        ``include_remote=False`` (the default) returns **本机** instances
+        only — ``spawned`` / ``adopted_local``. Video consumers pass
+        frames over ``/dev/shm`` path lists, which a peer on another
+        machine cannot read, so they must not silently land on a remote
+        endpoint. Pass ``include_remote=True`` when base64-over-the-wire
+        frames are acceptable (and you want the peer's capacity).
+
+        Ordering: 本机优先 (``spawned`` → ``adopted_local``), then ascending
+        ``npu_index``; remote peers last. Instances whose proxy failed to
+        build are skipped — a half-usable handle is worse than a short
+        list.
+
+        Returns ``[]`` when nothing matches; callers that need the old
+        raise-on-empty behaviour should use :meth:`get_session`.
         """
+        local_first = {"spawned": 0, "adopted_local": 1, "adopted": 2}
         with self._lock:
-            local = remote = None
-            for inst in self._instances.values():
-                if (inst.status == "running"
-                        and capability_type in inst.capability_types):
-                    if ((inst._source or "") in ("spawned", "adopted_local")
-                            and local is None):
-                        local = inst
-                    elif remote is None:
-                        remote = inst
-            chosen = local or remote
-            if chosen is None:
-                raise RuntimeError(f"功能未启用: {capability_type}")
-            LOG.info(
-                "get_session(%s): %s instance %s %s (pid=%s)",
-                capability_type,
-                "LOCAL" if local is not None else "REMOTE",
-                chosen.model_id, chosen._source,
-                chosen._peer_pid if isinstance(chosen._peer_pid, int)
-                else getattr(chosen.proc, "pid", None))
-            if chosen.rpc_session_proxy is None:
-                raise RuntimeError(
-                    f"功能未启用: {capability_type} (instance has no proxy)")
-            return chosen.rpc_session_proxy
-        raise RuntimeError(f"功能未启用: {capability_type}")
+            candidates = [
+                inst for inst in self._instances.values()
+                if inst.status == "running"
+                and capability_type in inst.capability_types
+                and (model_id is None or inst.model_id == model_id)
+                and inst.rpc_session_proxy is not None
+                and (include_remote
+                     or inst._source in ("spawned", "adopted_local"))
+            ]
+        candidates.sort(key=lambda i: (local_first.get(i._source, 9),
+                                       i.npu_index))
+        out: List[SessionHandle] = []
+        for inst in candidates:
+            pid = 0
+            if inst.proc is not None and inst.proc.pid:
+                pid = inst.proc.pid
+            elif isinstance(inst._peer_pid, int):
+                pid = inst._peer_pid
+            out.append(SessionHandle(
+                model_id=inst.model_id,
+                npu_index=inst.npu_index,
+                source=inst._source,
+                pid=pid,
+                is_remote=(inst._source == "adopted"),
+                session=inst.rpc_session_proxy,
+            ))
+        return out
 
-    def get_session_for_model(self, capability_type: str, model_id: str) -> Any:
-        """Return the ``LLMRPCSession`` for a specific running instance
-        matching both ``capability_type`` and ``model_id``.
+    def get_session(self, capability_type: str,
+                        npu_index: Optional[int] = None) -> Any:
+        """Return the ``LLMRPCSession`` of one running instance exposing
+        ``capability_type``. Raises RuntimeError if none.
+
+        本机优先：默认只在 spawned / adopted_local 里挑（视频类消费方
+        （VAS_SEARCH / wechat_video_manager）走 ``/dev/shm`` path-list 传帧，
+        跨机 Worker 读不到本机 tmpfs，命中远端会逐片 imread 失败；本机
+        NPU 延迟也远低于 LAN RPC）。无本机实例时才退回 LAN peer。
+
+        ``npu_index`` 用于指名某张卡 —— 同一个模型跑在两张卡上时，不传
+        就是"取第一个"（本机优先 + 卡号升序，确定但不是你选的）；需要
+        让用户选卡请改用 :meth:`list_sessions`。
+        """
+        handles = self.list_sessions(capability_type, include_remote=True)
+        if npu_index is not None:
+            handles = [h for h in handles if h.npu_index == npu_index]
+        if not handles:
+            raise RuntimeError(f"功能未启用: {capability_type}")
+        chosen = handles[0]
+        LOG.info(
+            "get_session(%s): %s instance %s %s (npu=%s pid=%s)",
+            capability_type,
+            "REMOTE" if chosen.is_remote else "LOCAL",
+            chosen.model_id, chosen.source, chosen.npu_index, chosen.pid)
+        return chosen.session
+
+    def get_session_for_model(self, capability_type: str, model_id: str,
+                               npu_index: Optional[int] = None) -> Any:
+        """Return the ``LLMRPCSession`` for one running instance matching
+        ``capability_type`` **and** ``model_id`` (optionally pinned to a
+        card).
 
         Used by the consumer pages (音视频描述 / 视频目标检测 / 音频理解)
-        after the user picks one model from a UI dropdown that lists all
-        running instances exposing ``capability_type``.  Local preferred
-        over remote when multiple instances of the same ``model_id``
-        coexist (e.g.  spawned + adopted), mirroring ``get_session``'s
-        本机优先 rule.
+        after the user picks one entry from the instance dropdown.
+
+        ``npu_index`` names the card when the same model is loaded on
+        several of them; without it the first 本机 instance wins
+        (本机优先, then ascending 卡号). When you need to present the
+        choices rather than pick one, enumerate with :meth:`list_sessions`.
 
         Raises ``RuntimeError`` if no running instance matches.
         """
-        with self._lock:
-            local = remote = None
-            for inst in self._instances.values():
-                if (inst.status != "running"
-                        or inst.model_id != model_id
-                        or capability_type not in inst.capability_types):
-                    continue
-                if ((inst._source or "") in ("spawned", "adopted_local")
-                        and local is None):
-                    local = inst
-                elif remote is None:
-                    remote = inst
-            chosen = local or remote
-            if chosen is None:
-                raise RuntimeError(
-                    f"功能未启用: {capability_type} (model_id={model_id!r} "
-                    f"未在 running 实例中找到)")
-            if chosen.rpc_session_proxy is None:
-                raise RuntimeError(
-                    f"功能未启用: {capability_type} (model_id={model_id!r} "
-                    f"instance has no proxy)")
-            LOG.info(
-                "get_session_for_model(%s, %s): %s instance %s (pid=%s)",
-                capability_type, model_id,
-                "LOCAL" if chosen is local else "REMOTE",
-                chosen._source,
-                chosen._peer_pid if isinstance(chosen._peer_pid, int)
-                else getattr(chosen.proc, "pid", None))
-            return chosen.rpc_session_proxy
+        handles = self.list_sessions(capability_type,
+                                         include_remote=True,
+                                         model_id=model_id)
+        if npu_index is not None:
+            handles = [h for h in handles if h.npu_index == npu_index]
+        if not handles:
+            raise RuntimeError(
+                f"功能未启用: {capability_type} (model_id={model_id!r} "
+                f"未在 running 实例中找到)")
+        chosen = handles[0]
+        LOG.info(
+            "get_session_for_model(%s, %s, npu=%s): %s instance %s (pid=%s)",
+            capability_type, model_id, npu_index,
+            "REMOTE" if chosen.is_remote else "LOCAL",
+            chosen.source, chosen.pid)
+        return chosen.session
 
     def list_running_by_capability(self, capability_type: str) -> list[dict]:
         """Return one entry per running instance exposing ``capability_type``.

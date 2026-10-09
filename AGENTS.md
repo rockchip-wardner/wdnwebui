@@ -538,6 +538,70 @@ adopted 仅作 fallback(用户主动选择)。
   `verify_stage3_smoke.py` 则相反：它独占 NPU 且**默认绑 npu 0**，
   所以 UI 上已有模型时它必 `rc=-6` —— 两者是互补的，不是替代。
 
+### 同一个模型跑两张卡（v0.19，算力页「运行在」多选）
+
+**成立且已真机验证**：`qwen3-vl-4b` 同时加载在 npu0 + npu1，两个独立
+worker（pid 不同）双双 `running`。约束是「**一卡一模型**」，不是
+「一模型一卡」——同一个模型可以占多张卡，不同模型也可以各占一张。
+
+数据层本来就支持：`ModelInstance.key = (npu, model_id, source)` 带卡号，
+`--local-only` 让每个 worker 的 DDS service 名带 PID
+（`wdndds/rpc/<id>/worker-<pid>`），两个实例不会撞。真正要改的是四处
+单例假设，见下。
+
+**`LLMRPCSession` 绑定 worker 身份，所以没有透明负载均衡**。
+`_setup_rpc_client` 按 pid 建 Service，session 对象本身带着「我是哪张卡的
+哪个 worker」这个身份。想打另一张卡就必须显式指名 —— 这也是
+`list_sessions()` 返回**列表**而不是单个 session 的原因：
+
+```python
+# 枚举所有能服务该 capability 的端点（含/不含远端由 include_remote 决定）
+handles = get_registry().list_sessions("swcap_video_describe", include_remote=False)
+handles = get_registry().list_sessions("swcap_video_describe",
+                                       include_remote=True,     # 也含 LAN peer
+                                       model_id="qwen3-vl-4b")
+for h in handles:
+    h.model_id, h.npu_index, h.source, h.pid, h.is_remote, h.worker_key
+# 不指名时用 get_session / get_session_for_model（可传 npu_index 指名）
+```
+
+`include_remote` 默认 `False`（只返回本机）的原因见 `get_session` 的
+docstring：视频消费方走 `/dev/shm` path-list 传帧，跨机 worker 读不到。
+
+### 这块踩过的三个坑（都造成 rc=-6 或 500，勿回退）
+
+1. **`/proc` 孤儿扫描会把自己的 worker 当孤儿接管**。
+   给卡 1 启第二个实例时，`_find_workers_by_name(<model>)` 必然命中刚给
+   卡 0 spawn 的那个（needle 只认 `--model <id>`，分不清是不是我们的）。
+   不排除它 → 注册成 `adopted_local` → 把卡 0 的条目从 `_instances` 踢掉
+   → 两个条目指向同一进程 → bind 让同一个 worker load 第二份模型。
+   实测症状：`POST [0,1]` 返回两个 **pid 相同** 的实例。
+   修法：算出 `tracked_pids`（本 registry 已跟踪且存活的 spawned），从
+   `orphan_pids` 里剔掉，全是我们的就照常 spawn 新的。
+
+2. **`npu_index` 不能既用来匹配又用来 spawn `--npu`**。
+   算力页启用走「spawn（不带 `--npu`）→ RPC `action=load`」。若顺手把
+   `npu_index` 透传给 spawn，worker 会带 `--npu` **自己 eager-load**，
+   同时 RPC load 又到了 —— 两条 load 争同一个 session slot，worker
+   `rc=-6`，而且**所有**模型的启用都会挂（不只双卡场景）。
+   修法：拆成 `npu_index`（只管匹配已有实例）+ `eager_load: bool`
+   （才决定 `--npu`，仅 autostart 为 True）。算力页显式传
+   `eager_load=False`。
+
+3. **新 spawn 的 worker，`load` RPC 的 5 s 超时不够**。
+   第一台 worker 的 endpoint 早就被 discovery 匹配上了，所以 5 s 一直够用。
+   但第二张卡的 worker 刚 spawn 几秒，它的 per-PID service 还要过
+   SEDP/SPDP 才连得上，裸 5 s 会回 `{"ok": false, "error": "timeout"}`——
+   worker 本身完全健康。修法：`_call_load_with_warmup()` 有界退避
+   5 s → 15 s → 30 s 共 3 次。真实 load 失败返回的是带原因的 `ok: false`，
+   不会被误重试。
+
+**诊断提醒**：测试期 `kill -9` 会让板子状态漂移，之后**任何**模型单卡
+启用都会 `rc=-6`，看起来像代码坏了。判别办法是跑
+`scripts/verify_worker_split.py`（它自己 spawn + load，完全不经过
+registry）—— 它通过就说明板子健康，问题在主进程侧。清场请走
+`DELETE /api/compute/instances` 或重启服务。
+
 ## 算力注册中心 — per-model-subprocess RPC (v0.4)
 
 v0.4 重大重构：每个 (npu_index, model_id) 实例现在跑在**独立
@@ -1423,6 +1487,69 @@ shared session — see "Resource budget" below.
   design here makes that a horizontal scaling decision rather than a
   per-channel one.
 
+## 开机自启 `compute.autostart`（v0.18 起取代 `compute.services[]`）
+
+**一句话**：`compute.autostart` 只声明"这台板子开机要跑哪几个 worker、
+各绑哪张卡"。不在列表里的模型开机**完全不参与**（不 spawn / 不 adopt /
+不占 NPU 显存），算力页仍显示 unavailable 供手动启用。
+
+```jsonc
+"compute": {
+  "autostart": [
+    {"model": "qwen3-vl-4b",     "npu_index": 0},
+    {"model": "qwen2.5-omni-3b", "npu_index": 1}
+  ]
+}
+```
+
+字段只有两个，`extra="forbid"`：
+
+| 字段 | 含义 |
+|---|---|
+| `model` | `workers/<model_id>.json` 的文件名主干（同时是 `MODEL_PRESETS` 的 key） |
+| `npu_index` | 物理卡号，直接来自 `list_cards()`，0 起 |
+
+**为什么删掉旧的 `compute.services[]`**：那张表必须把每个模型都列出来
+才能表达"这个不要启动"，还得把 label 覆盖和设备号混在同一条记录里。
+现在 label 归 manifest 管，卡号直接写真实 `npu_index`，旧字段（`name` /
+`label` / `device` / `autostart=enabled`）会被明确拒绝而不是静默忽略。
+系统配置页的「算力实例列表」编辑表格已随之删除，但
+`GET`/`PUT /api/compute/config` 保留为只读 / 校验过的写入入口，方便脚本
+和运维确认配置。
+
+**两条启动路径是有意区分的**：
+
+| 来源 | worker cmdline | 卡号怎么到 |
+|---|---|---|
+| autostart | `--model X --local-only --npu N` | 命令行参数，worker 自己 load |
+| 算力页手动启用 | `--model X --local-only` | 主进程发 RPC `action=load npu_index=N` |
+
+autostart 之所以恢复 `--npu`，是因为 `workers/_base.py:run_worker` 里
+replier 注册**先于** eager-load 线程启动，worker 一起来 `info` 就有应答
+（`not_loaded` → `loading` → `running`），不会 boot 超时；同时避免了
+"spawn 时一个 load + 主进程再 bind 一次 load" 两条路径在同一个 session
+slot 上打架。
+
+**autostart adopt 到远端 peer 时不发 load** —— 那是对面板子的卡，发过去
+等于抢本机不拥有的 NPU。只把 `npu_index` 记成算力页 checkbox 的默认值。
+
+**每张卡一条 autostart**。同一个模型出现在两条里（不同 `npu_index`）是
+合法的，会生成两个 worker 各占一卡；同一个 `npu_index` 出现两次则被
+`compute.autostart 含重复 model` 校验拒掉（因为那才是真撞车）。
+
+**踩过的坑（勿回退）**：
+
+* `_cleanup_unregistered_workers()` 必须排在 spawn 循环**之前**。排在
+  后面会和 fire-and-forget 的 spawn 线程竞争 `tracked_pids`，把刚
+  `Popen` 但还没登记进 `_instances` 的 worker 判成孤儿杀掉 —— 实测首个
+  autostart 模型在 spawn 同一秒以 `rc=-15` 挂掉。
+* `_spawn_compute_worker` 里的 `/proc` 孤儿扫描必须先扣掉本 registry 已
+  跟踪的 spawned pid。autostart 两条同模型不同卡时，第二条必然 `/proc`
+  命中第一条刚起的 worker，不扣就会把它抢成 `adopted_local`。详见
+  [同一个模型跑两张卡](#同一个模型跑两张卡v019算力页运行在多选) 的坑 1。
+* `hidden` 语义已从 `compute.services[].autostart == "hidden"` 迁到
+  manifest 的 `hidden` 字段，这样配置写坏了也不会误隐藏模型。
+
 ## Configuration
 
 > **不要 commit `config.jsonc`** —— 设备级运行时配置，由
@@ -1531,10 +1658,26 @@ holds it in memory. The file is seeded with a `base` section at
   NPU 上多个不同 model 允许（按内存预算自我约束），但同 NPU 重复同
   model 拒绝（pydantic 校验 + 注册中心运行时校验双层防护）。内存估算
   取自各 worker 的 ``manifest.json``（Qwen3-VL-4B ≈ 3500 MB /
-  Qwen3-TTS ≈ 1900 MB / …）。Boot 流程：`boot_compute_services()` 遍历
-  `config.compute.services` 逐条 probe → adopt-or-spawn；worker 起来
-  后**不** build LLMSession，等用户在算力配置页选 NPU 触发 RPC load
-  才 instantiate（55-90s）。UI 通过 `GET /api/compute` 每秒轮询状态，
+  Qwen3-TTS ≈ 1900 MB / …）。
+
+  **开机自启配置 `config.jsonc["compute"]["autostart"]`**（v0.18 起取代
+  旧的 `compute.services[]` 表格，见下方「开机自启 compute.autostart」）：
+  ```jsonc
+  "compute": {
+    "autostart": [
+      {"model": "qwen3-vl-4b",      "npu_index": 0},
+      {"model": "qwen2.5-omni-3b",  "npu_index": 1}
+    ]
+  }
+  ```
+  `boot_compute_services()` 遍历这些条目逐条 adopt-or-spawn。**只有**列在
+  这里面的模型参与开机启动：不在列表里的完全不 spawn / 不 adopt / 不占
+  NPU 显存，算力页仍显示为 unavailable 可手动启用。`npu_index` 以
+  `--npu` 传给 worker，worker 在注册完 replier 后用后台线程自己 load
+  （见「开机自启 compute.autostart」）。用户在算力配置页手动启用的模型
+  不带 `--npu`，卡号走 RPC `action=load npu_index=N`。
+
+  UI 通过 `GET /api/compute` 每秒轮询状态，
   loading 实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL`）。
   Capability 概念作为内部 key 使用（`get_session("swcap_video_describe")` /
   `"swcap_audio_tts"`）；capability 路由仅走同进程 `ComputeRegistry`，
@@ -1837,10 +1980,13 @@ Frontend (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/ap
   匹配 PID，剩下的孤儿永远没人收。新实现
   `_find_workers_by_name(model_id)` 返 `List[int]`，扫出**所有**同 model
   worker；`_adopt_existing_worker` 接管 1 个后 SIGTERM 其余（5s 宽限 →
-  SIGKILL 兜底）；`boot_compute_services` 末尾再跑一次
+  SIGKILL 兜底）；`boot_compute_services` **在 spawn 循环之前**再跑一次
   `_cleanup_unregistered_workers` 兜底扫
-  （同时清掉 config.compute.services 移除后残留的孤儿 + proc 文件
-  异常权限扫不到的边界情况）。
+  （同时清掉 config.compute.autostart 移除后残留的孤儿 + proc 文件
+  异常权限扫不到的边界情况）。**顺序不可调换**：清理若排在 spawn 之后
+  会和 fire-and-forget 的 spawn 线程抢 `tracked_pids`，把刚 Popen 还没
+  登记进 `_instances` 的 worker 判成孤儿杀掉（实测首个 autostart 模型
+  会在 spawn 同一秒以 `rc=-15` 挂掉）。
 
   **Worker 进程命名**：worker 启动后通过 ``prctl(PR_SET_NAME)`` 把
   自己的 comm（`/proc/<pid>/comm` / `ps -c`）设为 ``worker:<alias>``，

@@ -1094,12 +1094,12 @@ def run_worker(argv=None) -> int:
     ap.add_argument("--model", required=True,
                     help="model id (key in MODEL_PRESETS)")
     ap.add_argument("--npu", type=int, required=False, default=None,
-                    help="DEPRECATED: npu_index 现在通过 RPC load action 传入。"
-                         "保留只为兼容旧 systemd / 调试用。worker 启动后只注册 "
-                         "DDS endpoint 不建 LLMSession；npu_index 由用户在算力"
-                         "配置页选择后通过 RPC ``action=load npu_index=N`` 传"
-                         "入。如果这里也传，worker 启动后会自动 build LLMSession"
-                         "（仅用于 e2e 测试方便）。")
+                    help="开机自动启动的 worker 在 spawn 时由主进程传入"
+                         "（config.jsonc 的 compute.autostart[].npu_index）。"
+                         "传了就等于注册完 replier 后立刻在后台线程 load，"
+                         "所以 worker 一起来 info probe 就有应答，不会 boot 超时。"
+                         "不传则只注册 DDS endpoint，等用户在算力页选卡后通过 "
+                         "RPC ``action=load npu_index=N`` 加载。")
     ap.add_argument("--local-only", action="store_true",
                     help="主进程 spawn 本机 worker 时传:worker 只注册 per-PID "
                          "service (wdndds/rpc/<model_id>/worker-<pid>)，不注册 "
@@ -1329,9 +1329,11 @@ def run_worker(argv=None) -> int:
                 pass
             audio_hub = None
 
-    # Legacy compat: if --npu was passed on the command line, build the
-    # session eagerly so old systemd / debug workflows keep working.
-    # Production paths omit --npu and rely on the RPC load action.
+    # --npu passed (config.jsonc compute.autostart): load on a background
+    # thread *after* the replier is registered, so the boot-time info probe
+    # gets a real answer instead of blocking until the model is resident.
+    # No --npu: only the DDS endpoint, and load arrives via the RPC action
+    # once the user picks a card on the compute page.
     if npu_index is not None:
         def _eager_load():
             try:
