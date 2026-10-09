@@ -82,10 +82,13 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    应在多次切页后恒为 1（CDP `DOMDebugger.getEventListeners` 同理）。
 
 6. **worker 进程是薄 RPC server，类云端 AI 调用语义**。
-   `compute_worker.py` / `compute_worker_lazy.py` 进程只负责：
-   * 接收 prompt / attachment / generating schema / tools 参数；
-   * 透传给 `wdnai.LLMSession.respond(...)`；
-   * 把模型返回结果（schema 实例的 `model_dump()` 或原始 str）原样发回。
+   `app/core/compute/workers/<model_id>/compute_worker.py`（7 个，每个
+   model_id 一个文件夹 + `manifest.json`）进程只负责：
+   * 接收 `wdndds.serve_local_session` 定义的
+     `{prompt, attachments, options}`；
+   * 透传给 `wdnai.LLMLocalSession.run_prompt(...)`（**跳过** prompt 重新
+     组装 —— prompt 是调用方拼好的）；
+   * 把模型返回的**原始文本**原样发回。
 
    worker **不应做**：
    * schema 字段语义理解（如 bbox 单位归一化、bbox 是否全画面、
@@ -106,14 +109,22 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    （`_normalize_bbox_to_0_1000`）而不是 worker 侧，正是这条原则
    的应用。
 
-   **历史上下文**：早期（`73b8808` 之前）worker 端曾把"0-1 → 0-1000
-   隐式校正"塞在 `compute_worker.py:infer_handler` 里（~12 行 +
-   LOG.info），看起来无害但违反本原则——业务级语义理解放在 worker
-   端会导致：(a) worker 必须知道 calling context（哪条业务线 /
-   哪个 schema）才能决定要不要做这步；(b) 一份代码处理多种模型
-   时归一化阈值互相干扰;(c) detach 进程不能 reload,bug fix 必须
-   restart worker(50s+ LLMSession 重启)。当前归一化已挪到主
-   进程 `_normalize_bbox_to_0_1000`,worker 端模型输出原样透传。
+   **历史上下文 → 已闭环（v0.16）**：早期（`73b8808` 之前）worker 端曾把
+   "0-1 → 0-1000 隐式校正"塞在 `compute_worker.py:infer_handler` 里
+   （~12 行 + LOG.info），看起来无害但违反本原则——业务级语义理解放在
+   worker 端会导致：(a) worker 必须知道 calling context（哪条业务线 /
+   哪个 schema）才能决定要不要做这步；(b) 一份代码处理多种模型时归一化
+   阈值互相干扰；(c) detach 进程不能 reload，bug fix 必须 restart worker
+   （50s+ LLMSession 重启）。
+
+   v0.16 把这条从"约定"变成了"物理上做不到"：worker 换成
+   `wdndds.serve_local_session`，**`generating` / `tools` 根本不过线**，
+   wire 上只有 `{prompt, attachments, options}`。worker 收到的是拼好的
+   prompt，交回的是模型原始文本，`generating` 的解析（含
+   `_normalize_bbox_to_0_1000`）全在调用方进程。同理 worker 侧的
+   `_resolve_tool_classes` / `_parse_qwen_tool_call` /
+   `chat_runner.build_chatml_prompt` 也一并消失 —— 不是"不该做"，是
+   **没有信息可做**。
 
 ## App 插件系统 (v0.4 卡片架构)
 
@@ -480,6 +491,31 @@ adopted 仅作 fallback(用户主动选择)。
   v0.6.0 修过的 RSS 漏问题
 * **当前不动**——6s/12s/18s 都安全，撞了再扩
 
+## 单卡 NPU 容量约束（两张卡 ≠ 一张卡装两个）
+
+实测结论（v0.17，RK3588 8G + NPU×2）：
+
+* **同一张 NPU 卡上不能同时加载两个模型**。第二个 worker 会在
+  `load` 阶段 `rc=-6`（SIGABRT），stderr 为空。主进程侧只看到
+  "failed to load"，`_instances` 里翻成 `error`。
+* **两张卡各绑一个模型完全正常**。`qwen3-vl-4b @ npu0` +
+  `qwen2.5-omni-3b @ npu1` 双双 `running`，两路真机推理并发跑通
+  （见 `scripts/verify_dual_card_smoke.py`，3/3）。
+* 这不是 wdnwebui 的 bug，也**不是内存不够**：worker 实际 RSS 只有
+  200–400 MB，系统 `MemAvailable` 还有 5+ GB。`memory_estimate_mb`
+  （1900–5500）描述的是 **NPU 侧权重 + 激活池**预算，跟 DDR 无关。
+  RK3588 单卡的 NPU 内存池装不下两个模型。
+* **操作含义**：算力页启第二个模型时**换一张卡**，不要在同一张卡上
+  叠加。实测 3500 MB（`qwen3-vl-4b`）+ 2500 MB（omni）同卡必崩。
+* **为什么主进程不做预检**：worker 的 abort 没有可读原因码，主进程
+  拿不到「NPU 池还剩多少」信号（`/proc/rknpu/load` 在本板为空），
+  只能靠 `sum(memory_estimate_mb) vs 单卡容量` 猜。宁可让用户撞到
+  一次 loud 的 `rc=-6`，也不加一个会误杀合法配置的猜测性检查。
+* **回归**：`scripts/verify_dual_card_smoke.py` —— adopt-only（绝
+  不 spawn），按 `capability_types` 分派，跑 UI 已经启好的两个实例。
+  `verify_stage3_smoke.py` 则相反：它独占 NPU 且**默认绑 npu 0**，
+  所以 UI 上已有模型时它必 `rc=-6` —— 两者是互补的，不是替代。
+
 ## 算力注册中心 — per-model-subprocess RPC (v0.4)
 
 v0.4 重大重构：每个 (npu_index, model_id) 实例现在跑在**独立
@@ -493,7 +529,7 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   `libwdndds_cshim.so`。运行时链接系统 `libfastrtps2.9` /
   `libfastcdr1`（apt install libfastrtps-dev libfastcdr-dev）。
 * **每个 model = 1 个 compute_worker 进程**。`ComputeRegistry.start
-`     ` 在主进程 spawn 一个 `python app/core/compute/worker.py
+`     ` 在主进程 spawn 一个 `python app/core/compute/workers/<model_id>/compute_worker.py
        --model <id> --npu <k>` 子进程（**子进程默认不加载模型** —
        等首次 RPC 到达时再 lazy `LLMSession(model=spec, npu=k)`）。
 * **主进程持 RpcClient**：`get_registry().get_session(cap)` 返回
@@ -605,22 +641,20 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   v0.8.30 的 `get_session` 本机优先 / `embed_video` path-list
   无 is_remote 守卫同源（见"get_session 本机优先"段）。
 
-  **v0.15 短期降级（已实施）**：`rpc_session_proxy._sync_call` 在
-  payload 加 `is_remote: self._is_remote`；worker `infer_handler` 读到
-  `True` 时 4 个 SHM 路由块（`crop_b64` / `result_data` / `structured` /
-  `text`）全部 drop + per-worker 进程一次性 WARNING log。consumer
-  fallback：VAS Path 1 garbage → "本帧分析失败"占位 / TargetDoc 从
-  `frame_bgr` 重裁 / detector 走 `_ProxyResult._raw` 默认值。同机
-  （`_is_remote=False`，默认）行为完全不变。smoke：
-  `scripts/verify_text_shm_path.py` 11/11 pass。
+  **v0.15 的 LAN 降级已作废（v0.16）**：当年 `is_remote=True`（跨机
+  worker）时，worker 会把 4 个 SHM 路由块（`crop_b64` / `result_data` /
+  `structured` / `text`）**全部 drop**，因为对端读不到本机
+  `/dev/shm`，而内联又会撞 FastCDR 255 字节硬截断。代价是 VAS Path 1
+  garbage 占位、TargetDoc 从 `frame_bgr` 重裁、detector 拿默认值。
 
-  **待办 — 中期（方案 C, 估 1-2 天）**：worker 端 `is_remote=True`
-  时把大 payload 走**专用 wdndds topic multi-packet 通路**——复用
-  `wdndds_topic_writer_create` / `wdndds_topic_reader_create` 助手
-  （wdndds 0.4+ 已在 `871d00f` 引入），wire 不受 255 字节限。改动范围
-  仅 `compute_worker.py` + `rpc_session_proxy.py` + 新建一对
-  `wdndds/rpc/result_heavy/<model_id>` topic 句柄，无需动 wdndds
-  IDL / cshim。
+  现在没有这条降级：附件与长文本的 tmpfs 路由由 wdndds 两端统一负责，
+  跨机自动回退 JPEG+base64（内容不丢，只是有损），不再整块丢弃。
+  `scripts/verify_text_shm_path.py` 随 worker 侧 shm 路由一起退役。
+
+  **方案 C（专用 topic 通路）已作废**：这一层现在就是 wdndds 的职责 ——
+  `serve_local_session` / `LLMRPCSession` 两端各自把超限内容转成
+  `/dev/shm` 描述符，`is_remote=True` 时退回 JPEG+base64。不需要
+  wdnwebui 侧再造一条 topic 通路。
 
   **待办 — 长期（方案 B, 估 3-5 天, 动 wdndds 仓库）**：改
   `.venv/src/wdndds/idl/compute.idl` 把 `ComputeReply` 5 个 string
@@ -894,14 +928,13 @@ wdnwebui/
 │   │   ├── uploads.py                  # 公共 uploads 路径管理
 │   │   ├── compute/
 │   │   │   ├── registry.py             # ComputeRegistry — 见"算力注册中心"章节
-│   │   │   ├── worker.py               # compute_worker.py 子进程实现
-│   │   │   ├── proxy.py                # RpcSessionProxy — 主进程→worker RPC 客户端
+│   │   │   ├── workers/                # 一 model_id 一文件夹 + manifest.json
+│   │   │   ├── proxy.py                # LLMRPCSession 装配 + count_tokens 策略
 │   │   │   └── jsonc.py                # 注释保留的 JSON 读写
 │   │   ├── chat/                       # 文本对话核心
 │   │   │   ├── agent.py                # run_chat_with_tools 主进程工具循环
-│   │   │   ├── runner.py               # worker 端 chat_run 上下文管理
-│   │   │   ├── stream.py               # C 回调注入流式增量(避免 GIL 抢)
-│   │   │   └── serial.py               # 进程级 RLock: 串行化所有 chat_run
+│   │   │   ├── runner.py               # thinking/answer 切分 + 输出清洗
+│   │   │   └── serial.py               # 进程级 RLock: 串行化所有 chat
 │   │   ├── llm/
 │   │   │   └── detector_base.py        # WdnaiDetector 基类 + VLMDoc/TargetDoc/LocatorDoc
 │   │   ├── video/                      # 视频通用
@@ -944,7 +977,7 @@ wdnwebui/
 │   │   │   └── versions.py             # 组件版本探测
 │   │   ├── im_bridge/                  # 微信桥接实现
 │   │   │   ├── bot.py                  # Wechat 类(同步门面 + daemon thread)
-│   │   │   ├── llm.py                  # LLM bridge(微信 ↔ qwen3-4b)
+│   │   │   ├── llm.py                  # LLM bridge(微信 ↔ swcap_text_chat)
 │   │   │   ├── video_manager.py        # 微信视频分流 → embedding 索引
 │   │   │   ├── video_search.py         # VideoSearch @Callable 工具
 │   │   │   ├── video_cache.py          # LanceDB 缓存 (md5 + 切片参数 key)
@@ -1135,8 +1168,9 @@ class AudioEvent:
 * `MODEL_PRESETS["qwen2.5-omni-3b"]`：memory_estimate_mb=2500 /
   estimated_init_seconds=50 / capability_types=["swcap_audio_understand"] /
   worker_name="audio-3b"（comm="worker:audio-3b", 13 字符）。
-* `compute_worker.py:_build_session` / `compute_worker_lazy.py:_preset_for`
-  都加了 `model_id == "qwen2.5-omni-3b"` 分支（`SLM.qwen_2_5_omni_3b()`）。
+* 该 worker 的 `compute_worker.py::build_spec` 返回
+  `SLM.qwen_2_5_omni_3b()`；`comm_name="audio-3b"` 来自同目录
+  `manifest.json` 的 `worker_name`（`compute_worker_lazy.py` 已删除）。
 * `_LEGACY_CAPABILITY_TYPE_RENAMES` 加 `"audio_understand" → "swcap_audio_understand"`，
   兼容老 config.jsonc。
 
@@ -1184,7 +1218,7 @@ class AudioEvent:
 | omni 内存 | ~ 2500 MB | audio encoder + llm + embed；按 VL-4B 同档估；真机测后回填 |
 | omni init | ~ 50s | 两个 rknn + embed；倒计时同其它 preset |
 | 60s 音频切片 | 10 段 × ~ 1s | 单线程串行 ≈ 10s 总耗时 |
-| 与 qwen3-vl-4b 共存 | ~ 6 GB | OK；与 qwen3-4b 同时跑超 8 GB |
+| 与 qwen3-vl-4b 共存 | ~ 6 GB | OK |
 | NPU 互斥 | 进程级 `_llm_session_call_lock` 串行 | 与 detector / VAS / text_chat 共享同一把锁 |
 
 `_check_npu_memory_budget()`（`compute_registry.py`）自动纳入 omni preset
@@ -1199,7 +1233,7 @@ class AudioEvent:
 * **超时熔断**：单段 SDK 卡死没有 timeout；上层若需要可包一层
   `asyncio.wait_for(...)`，但当前按 detector / VAS 现有风格不做。
 * **不做二次聚合**：60 秒以上音频不会自动生成"综述"；如未来需要，
-  加一段独立的 LLM 调用（建议复用 `swcap_text_chat` 的 qwen3-4b）。
+  加一段独立的 LLM 调用（建议复用 `swcap_text_chat`，即 qwen3.5-vl-4b）。
 
 ## Surveillance page (视频监控) — **已下线（v0.4 重构）**
 
@@ -1471,8 +1505,8 @@ holds it in memory. The file is seeded with a `base` section at
   （由 `RKNN3Lite().get_devices_id()` 枚举）+ 一个 model preset。同一
   NPU 上多个不同 model 允许（按内存预算自我约束），但同 NPU 重复同
   model 拒绝（pydantic 校验 + 注册中心运行时校验双层防护）。内存估算
-  硬编码：Qwen3-VL-4B ≈ 3500 MB / Qwen3-TTS ≈ 1900 MB / Qwen3-4B ≈
-  4950 MB。Boot 流程：`boot_compute_services()` 遍历
+  取自各 worker 的 ``manifest.json``（Qwen3-VL-4B ≈ 3500 MB /
+  Qwen3-TTS ≈ 1900 MB / …）。Boot 流程：`boot_compute_services()` 遍历
   `config.compute.services` 逐条 probe → adopt-or-spawn；worker 起来
   后**不** build LLMSession，等用户在算力配置页选 NPU 触发 RPC load
   才 instantiate（55-90s）。UI 通过 `GET /api/compute` 每秒轮询状态，
@@ -1722,18 +1756,49 @@ Frontend (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/ap
 - **Local-only operations**：算力配置页的 "启用 / 禁用 / 重启" 按钮
   可见性 / 行为：
   - **spawed**：启用 / 重启 / 禁用 三按钮全开；禁用 = RPC `unload`
-    （worker 进程保留，status=not_loaded，可秒级重启用）。
+    + `shutdown` + SIGTERM/SIGKILL，**worker 进程真的关掉**（实例
+    从 registry 移除，状态变 `unavailable`）。重启用走冷启
+    spawn + RPC load（约 40s，**不再有"秒级"这回事**）。
   - **adopted_local**：启用 / 禁用 两按钮可点（重启 disable 提示
-    `kill <pid>` 手动清理）；禁用走 RPC `unload` 同 spawned。
-  - **adopted**：启用 / 禁用 两按钮可点（重启 disable）；禁用走
-    RPC `unload` 让对端 peer 释放 LLMSession，本机 registry 同步
-    not_loaded，但**不**碰 peer 进程。
+    `kill <pid>` 手动清理）；禁用同 spawned，但该实例 `proc is None`
+    → SIGTERM 那步跳过，**只能靠 shutdown RPC 让 worker 自退**
+    （这正是 `unload_instance` 必须传 `teardown=False` 的原因，见下）。
+  - **adopted**：只有 重启 disable；禁用按钮 **403**（关的是别人板子
+    的进程，见 Layer 2 纵深防御）。
   - **unavailable**：只有 启用 可点（spawn 新进程）。
-  - "完全关 worker 进程" 唯一入口：重启服务按钮（Q3 4 步：unload →
-    shutdown → wait/kill → 走 boot 流程重 spawn）。孤儿 worker
-    由下次 boot 的 `_find_workers_by_name` 兜底。
-  后端 `_require_owned` 仅对 **重启** 仍拦 adopted → 403（restart
-  要 kill 进程）；禁用走 `unload_instance()` 对三类来源都允许。
+  - **孤儿 worker** 仍由下次 boot 的 `_find_workers_by_name` 兜底 ——
+    主进程退出（`close_all`）**故意不杀** worker，热重载后靠 adopt
+    接管，不要把这个当成泄漏。
+  - 后端 `_require_owned` 仅对 **重启** 仍拦 adopted → 403；禁用的
+    403 护栏在 `stop_instance` 端点里单独写了（同样的理由）。
+  - **与 `POST /compute/stop-all` 有意不同**：那个端点（只有 TTS
+    卡片在用）仍只 `unload_instance`，进程留着。别统一"顺手"改掉。
+- **禁用必须先 unload 再杀进程（v0.17）**：`stop_instance_local` 的
+  顺序是 load-bearing，任何两步反过来都会坏：
+  1. `unload_instance(teardown=False)` **先跑**，且**同步阻塞**等
+     worker reply —— worker 在 reply 前已执行 `unload_handler` →
+     `sess.close()` → `backend.close()` → `rknn3_destroy(ctx)`，
+     所以返回时 NPU 池是真的归还了。反过来先 shutdown，worker 会在
+     LLMSession 还活着时退出，池子一直被占，**光杀进程没意义**。
+  2. `teardown=False` 让 `rpc_client` 活到 shutdown RPC 发完为止。
+     **这里曾有一个真 bug**：`_teardown_rpc_client` 会把
+     `inst.rpc_client` 置 `None`，而 shutdown RPC 的守卫是
+     `if inst.rpc_client is not None` —— 于是 shutdown 永远不执行，
+     worker 收不到 stop event，3s 后只能 SIGKILL，优雅清理（audio
+     writer close / served session close / side hub close / atexit
+     清 `/dev/shm`）全部被跳过。改 `unload_instance` 签名时别把
+     `teardown=False` 拿掉。
+  3. SIGTERM 是第二保险：worker 侧装了等效 handler（`_base.py`
+     SIGTERM/SIGINT），且不依赖 Requester 还能用 —— 这是
+     `adopted_local`（`proc is None`）唯一的优雅退出途径。
+  4. 3s 宽限 → SIGKILL 兜底。
+  - 验收判据不能只看状态，必须**制造 NPU 压力**：禁用 npu0 上的模型
+    后，在**同一张卡**启另一个同量级模型。能起来 = 池真释放了。
+- **禁用会打断正在进行的推理（已知，不修）**：`LLMLocalSession.close()`
+  是 `executor.shutdown(wait=False)`，不等在跑的推理，禁用会让
+  `rknn3_destroy` 与推理并发。unload-only 时代同样如此，不是新回归，
+  但进程没了之后只能重来，后果更明显。兜底靠各业务自己的
+  超时重建（VAS `restart_and_rebind_instance_local`）。
 - **Orphan worker 处理（v0.8 dedup → v0.9 强化）**：uvicorn reload 路径下
   `Popen(start_new_session=True)` 起的 worker 脱离原进程组，reload
   SIGTERM 不会传过来 —— 每次 reload 都会留一个孤儿。`_spawn_compute_worker`
@@ -1757,7 +1822,6 @@ Frontend (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/ap
   alias 来自 ``MODEL_PRESETS[model_id]["worker_name"]``。预设：
   - qwen3-vl-4b → `worker:vlm-4b`（13 字符）
   - qwen3-tts → `worker:tts`（10 字符）
-  - qwen3-4b → `worker:llm-4b`（12 字符）
   - qwen3-vl-embedding-2b → `worker:emb-2b`（12 字符）
   - qwen3.5-vl-4b → `worker:q5-vl`（12 字符；多模态 LLM+vision）
 
@@ -2297,16 +2361,19 @@ RIFF header by hand.
 
 ## Text chat (文本对话) page
 
-`#page-text-chat` 暴露 Qwen3-4B 纯文本对话（`swcap_text_chat` capability），
+`#page-text-chat` 暴露纯文本对话（`swcap_text_chat` capability，由
+qwen3.5-vl-4b 提供），
 流式逐字渲染 ` thinking... response` 与正式回答，单页实例串行推理，
-多轮上下文由 worker 端滚动裁剪 + ChatML 拼接维持。
+多轮上下文由主进程裁剪、wdnai 拼 ChatML。
 
 **推理走 compute_worker 子进程（RPC）**。`get_session("swcap_text_chat")`
-返回 `RpcSessionProxy`，`session.chat_run(...)` 通过 wdndds RPC 把
-`{history, text, context_limit, max_new_tokens}` 发给 worker；worker 后台
-线程用真实 tokenizer 精确裁剪历史、拼 ChatML、跑 `_backend.run`，边跑边把
-`sink.text` 增量收进 chat state。主进程 `chat_poll` 轮询拉增量（~150ms
-粒度），`on_delta` 喂给 `_ThinkingRouter` 流式切分 thinking / answer。
+返回 `wdndds.LLMRPCSession`。`chat_agent._run_turn` 调
+`session.respond(prompt=…, history=…, tools=[…], on_delta=…, max_new_tokens=…)`：
+主进程自己裁剪历史并拼 ChatML（`wdnai.build_chatml_prompt`），工具 JSON
+也在主进程解析回 `@Callable` 实例；wire 上只有拼好的 prompt 和
+`{attachments, options}`，worker 侧不认识任何 schema 或工具。delta 走
+独立 RELIABLE 旁路 topic 直达 `on_delta`，`respond()` 的返回值不因流式
+而变，**没有轮询、没有 chat state 机**。
 
 * **Backend** (`app/apps/text_chat/api.py`):
   - `GET /api/text-chat` — snapshot：state / busy / error / history_count /
@@ -2315,9 +2382,10 @@ RIFF header by hand.
   - `POST /api/text-chat/send` `{text}` — 发起一轮推理；返回
     `{request_id, snapshot}`。400 text 为空 / 409 还在生成中 /
     502 capability 未启用。
-  - `POST /api/text-chat/stop` — 置 `_worker_stop_event`；proxy 的
-    `chat_run` 轮询循环感知后调 `chat_stop` RPC（软停：worker 跑完返回
-    stopped，主进程丢弃本轮，不写历史）。
+  - `POST /api/text-chat/stop` — 置 `_worker_stop_event` 并调
+    `session.stop()`（取消标志发布到旁路 topic，不等 RPC 应答；软停：
+    worker 跑完本轮看到后回报 stopped，主进程丢弃本轮，不写历史）。
+    本地 event 另负责工具轮之间的提前退出。
   - `POST /api/text-chat/reset` — 清空 history + history_tokens，回到 idle。
   - `WS /api/text-chat/ws` — server-push 流式 token + 状态变更；连接后立即
     推 `{type:"snapshot", snapshot:...}` hydrate。
@@ -2328,18 +2396,20 @@ RIFF header by hand.
     其它服务风格一致。
   - **LLMSession 必须从 ComputeRegistry 取**（`get_session("swcap_text_chat")`）；
     找不到抛 `RuntimeError("功能未启用: swcap_text_chat")`，HTTP 502 透传。
-    拿到的是 `RpcSessionProxy` —— 本模块**不再访问 `session._backend`**，
-    wdnai 的 monkey-patch（`make_result_callback` 包装）已整体移除。
-  - **`_ThinkingRouter`**：`chat_run` 的 `on_delta` 每次拿到增量时按
+    拿到的是 `LLMRPCSession` —— 本模块**不再访问 `session._backend`**，
+    wdnai 的 monkey-patch（`make_result_callback` 包装）已整体移除，
+    流式是接口的一部分（`on_delta`），不是补丁。
+  - **`_ThinkingRouter`**：`respond` 的 `on_delta` 每次拿到增量时按
     ` response` 切频道推到 `thinking` / `answer` 两条流；`done` 时再用
     `chat_runner.split_thinking` 兜底切一次（处理 token 边界切碎等极端情况）。
   - 单 daemon worker thread（`text-chat-worker`）串行消费 `request_queue`；
-    `chat_run` 同步阻塞在 RPC 轮询里，每轮检查 `_worker_stop_event`。
-  - **上下文管理在 worker 端**（`app/core/chat/runner.py`）：
-    `trim_history` 用真实 tokenizer 从最新往回累计每条消息 token，超
-    `context_limit - reserve` 就裁掉更早的（滚动窗口）；reserve =
-    `min(max_new_tokens, context_limit // 8)`（自适应输出预留，小 context
-    测试如 2048 不会误伤）。仅单条用户消息超限才报"单条消息过长"。
+    每轮开始前检查 `_worker_stop_event`。
+  - **上下文管理在主进程**（`chat_agent._trim`）：一次无推理的
+    `count_tokens` 控制面往返拿 worker 真实 tokenizer 的精确计数，从最新
+    往回累计，超 `context_limit - reserve` 就裁掉更早的（滚动窗口）；
+    reserve = `min(max_new_tokens, context_limit // 8)`（自适应输出预留，
+    小 context 测试如 2048 不会误伤）。仅单条用户消息超限才报"单条消息
+    过长"。worker 不可达时降级 `len(t)//2`（中文少算约 3×，偏保守）。
   - **多轮上下文**：app 端消息 deque 全量发给 worker；worker 每轮
     `sess.reset()` 清 C 端 KV 后 `_backend.run(prompt, keep_history=0)`。
     **历史中只写 `content:answer`，不写 thinking** —— 下轮 prompt 看不到
@@ -2354,83 +2424,101 @@ RIFF header by hand.
     WS handler 在主 event loop 里 `await queue.get()` drain；observer
     也走同一条路径，避免第二条 channel。
 
-* **Worker 端 chat 通道**（`app/core/compute/worker.py`）：
-  - `chat_run` action：校验 session loaded + 无并发 chat；把 history/text/
-    context_limit/max_new_tokens 存进 `state["chat"]`，起后台线程
-    `_chat_run_loop`，pump 线程立即返回 `{"status":"chat_started"}`（对齐
-    `load_handler` 的后台线程模式，避免长推理占住 cshim pump 线程）。
-  - `_chat_run_loop`：`chat_runner.trim_history` 精确裁剪 → 拼 ChatML →
-    `sess.reset()` → **注册 C 回调 observer**（`app/core/chat/stream.py`，
-    见下）把 `sink.text` 增量 append 到 `state["chat"]["deltas"]` →
-    `_backend.run(prompt, keep_history=0, enable_thinking=True)` → done
-    （text / elapsed_sec / prompt_tokens / answer_tokens）。
-  - **工具 schema 注入与解析（worker 端只解析不执行）**：payload 带
-    `tools`（class 名列表）时，`_resolve_tool_classes` 从工具 registry
-    枚举真实 class（无手工映射表），`render_tools_block` +
-    `_TOOL_CALL_INSTRUCTION` 注入 prompt；done 后仅对 answer 段跑
-    `_parse_qwen_tool_call`（`<tool_call>` 标签优先 + 倒序 JSON 扫描
-    兜底——真机主力路径是 markdown ```json 围栏）。result 附
-    `tool_call` / `tool_call_args`。副作用执行在主进程侧，见
-    "Chat 工具调用 (chat-agent)" 章节。
-  - `chat_poll` action：按 offset 返回新 delta + status（running / done /
-    error / idle），done 时附 result。
-  - `chat_stop` action：置 `state["chat"]["stop"]`（软停标志）。
-  - `_build_session` 已支持 qwen3-4b（`max_context_len=16384` +
-    `with_options(max_new_tokens=2048, keep_history=1, enable_thinking=True)`）。
+* **Worker 端（v0.16 起）= `wdndds.serve_local_session`，无自研 chat 通道**：
+  worker 只做三件事：把 `state["session"]`（懒建，首次 `load` 时
+  `LLMLocalSession`）交给 `serve_local_session`、用 `extra_ops` 挂上
+  wdnwebui 自己的生命周期动词、跑主循环。**没有 `chat_run` /
+  `chat_poll` / `chat_stop` / `infer_handler`**。
+  - `extra_ops`（`_build_extra_ops`）分两类：
+    **新增** `load` / `unload` / `shutdown` / `count_tokens`；
+    **覆盖**内置 `info`（要报 `not_loaded` / `missing_model_dir` /
+    `error` 这套自己的状态机）与 `embed_text` / `embed_video`
+    （必须离开 replier pump 线程 + 超时，否则 NPU 卡死会占住串行 pump
+    让整个 worker 变聋）。`respond` 不可覆盖（见
+    `wdndds.ai_session._handle_request`）。
+  - **`count_tokens`**：唯一还留在 worker 的 session 能力。历史裁剪是
+    调用方策略，但**只有持有 tokenizer 的进程能精确计数**，而它在
+    worker 里。一次无推理、无 NPU 的控制面往返（`_base._session_tokenizer`
+    经 `backend.tokenizer` 拿）。降级是 `len(t)//2`，对中文少算约 3×。
+  - 两个 service（`.../worker-<pid>` 与标准名）各挂一个 replier，**共用
+    同一个 session**：`LLMLocalSession` 自己的单 worker 线程池负责串行，
+    delta/stop 旁路 topic 按各自的 service 名派生，客户端天然对上。
 
-* **流式采集 = C 回调注入**（`app/core/chat/stream.py`）：
-  - **不能靠独立线程轮询 `sink.text`** —— `_backend.run` 的 `session_run`
-    是同步阻塞的 C 调用，解码回调持有 GIL 逐批执行，并行轮询线程抢不到
-    GIL，`deltas` 恒为空（真机实测：状态走到 done 但前端无任何回复）。
-  - `install_patch()`：幂等包装 wdnai 的结果回调工厂（在原 callback
-    之后按 `id(sink)` 查全局 observer，算 `sink.text` 增量并调用它；
-    回调本身在 C 层持有 GIL 时执行，采集可靠。**必须显式
-    `return ret`**，漏 return 会让 ctypes/shim 把返回值吞掉并导致
-    原 callback 副作用失效）。**patch 点随 wdnai 上游重构演进**
-    （f61dddd 把 backends 从 rknn3lite 迁到 vendored
-    `wdnai._librknn` shim 时把工厂 `make_result_callback` 改名为
-    `_make_sink_result_cb`，2026-09 事故：真机算力配置页所有模型
-    加载报 `AttributeError: ... no attribute 'make_result_callback'`
-    —— wrapper 依赖 SDK 私有符号，SDK 一重构就断）。现行探测顺序：
-    `_make_sink_result_cb`（当前 SDK）→ `make_result_callback`
-    （旧 SDK 回滚兼容）→ 都缺则 **fail-soft**：LOG.error 后放弃
-    patch —— chat 退化为无流式（done 一次性输出全文），
-    **不阻断模型加载**。`compute_worker._load_wdnai()` 里对
-    install_patch 再包一层 try/except（双保险，patch 内部任何
-    意外都不阻断 worker 加载模型）。**pull wdnai 后 chat 若无流式，
-    先查 worker 日志里 chat_stream 的 patch 行**。
-  - shim 调用契约（`wdnai._librknn._result_trampoline`）：
-    `user_cb(py_obj, tokens, state)` 3 实参，`py_obj` 取
-    `getattr(cb, "__self__", cb)`（free closure 无 `__self__` →
-    pin closure 本身）—— wrapper 用 free closure 3 参签名直接兼容，
-    无需 bound-method 改造；`_LLMCallState` 数值
-    NORMAL=0 / FINISH 族 (2,3,4) / ERROR=5 与 `chat_stream.py`
-    顶部常量一致。
-  - 在 `compute_worker._load_wdnai()` 里安装（早于任何 `_build_session`
-    构造 LLMSession，patch 才能绑进 `init_runtime`）。未注册 observer 的
-    sink（detector / vlm / tts）走原 callback 零开销。
-  - `register_observer(sink, cb)` / `unregister_observer(sink)`：全局 dict
-    key=`id(sink)`，`_chat_run_loop` 在 run 前后注册/注销。
+* **流式 = `respond(on_delta=...)`，不再有 C 回调猴子补丁**：
+  - delta 走 `service_name/delta` 这条**独立 participant** 上的
+    **RELIABLE** topic（best_effort 会静默丢样本，表现为流式内容凭空
+    缺块且无人报错）。worker 在 handler 返回前发布 stream-end 标记，
+    客户端 `finally` 里 `bridge.done.wait(2.0)` 保证 delta 先于
+    `respond()` 返回。
+  - 顺序保证只有一条是可靠的：**拼接 == 返回值**。中间样本可能被合并，
+    不要断言 delta 个数或逐块内容。
+  - 历史教训（勿回退）：采集增量**不能靠独立线程轮询 `sink.text`**
+    —— `_backend.run` 的 `session_run` 是同步阻塞 C 调用，解码回调持有
+    GIL，并行轮询抢不到 GIL，`deltas` 恒为空（真机实测：状态 done 但
+    前端无任何回复）。同样**不要再写 `install_patch()` 去包
+    `make_result_callback` / `_make_sink_result_cb`**：wrapper 依赖 SDK
+    私有符号，SDK 一重构就断（f61dddd 改名事故：算力配置页所有模型加载
+    报 `AttributeError`，worker 静默退化成无流式）。
 
-* **Proxy**（`app/core/compute/proxy.py`）：
-  - `chat_run(history, text, *, context_limit, max_new_tokens, on_delta,
-    stop_event, poll_interval_ms=150, timeout_ms=300000,
-    tool_names=None)` — 同步阻塞，发
-    `chat_run` 后循环 `chat_poll` 拉增量调 `on_delta`；`stop_event` 置位即
-    调 `chat_stop`；done 返回 result dict（含 thinking / answer /
-    tool_call / tool_call_args）；error 抛 `RuntimeError`；超时抛
-    `TimeoutError`。
-  - `chat_stop()` — RPC `chat_stop`。
+* **跨进程后立刻失效的东西 —— v0.16 实测踩过的坑，别再踩**：
+  - **`sess._backend` 恒为 None**。会话在 worker 进程，任何
+    `getattr(sess, "_backend").rknn_llm.session_stop()` / `.tokenizer`
+    都**静默返回 None**，代码看起来在跑其实什么都没做。已修：
+    取消走 `sess.stop()`，token 计数走 `count_tokens` extra op。
+    新增任何"从会话摸模型内部"的代码前，先确认它在 RPC 会话上有意义。
+  - **callable 过不了 JSON**。`respond(**overrides)` 的 overrides 会
+    进 `options` 被 `json.dumps`。TTS 曾把 `on_audio_chunk` /
+    `on_step` / `stop_event` 塞进 kwargs → `TypeError: Object of
+    type Event is not JSON serializable`，整页 TTS 不可用。
+    **规则：RPC 会话只传标量。** 需要回调时，worker 侧根据标量自己
+    构造（见 `_base._tts_channel_options`：调用方只给
+    `tts_pcm_socket_path`，worker 自己 connect 并装 forwarder）。
+    `on_delta` 是唯一的例外 —— 它是 transport 的一等参数。
+  - **同名 DomainParticipant 会静默毒化整条泵**。一个 worker 挂两个
+    service（`.../worker-<pid>` + 标准名），若两次 `serve_local_session`
+    各自新建 side hub，默认 `participant_name=f"wdnai-serve-<pid>"`
+    完全相同 → 发现冲突 → replier 泵悄悄不响应，**所有** RPC 超时，
+    而进程看起来活得很好。必须共用一个 side hub（topic 名按各自
+    service 名派生，本来就不冲突）。
+  - **主进程侧同一个坑，换了个受害者（v0.17 修）**。切换到
+    `LLMRPCSession` 后，每个 session 的 side channel 默认也叫
+    `wdnai-rpc-side-<pid>` —— **同进程内多个 session 就撞名**。症状
+    极有迷惑性：第二个 worker 的 `load` RPC **永远 timeout**，实例
+    卡在 `not_loaded`，用户看到的是「算力页启动完模型后整页卡住」
+    （前端 1Hz 轮询也一起挂）。旧 `_RpcSessionProxy` 没有 side
+    participant，所以这是协议切换新引入的回归。
+    修法：`LLMRPCSession(side_hub=...)` + `_owns_side_hub`，registry
+    用**一个** `_side_channel_hub` 服务所有 instance，`close_all()`
+    统一关；默认 participant 名再加 service 尾巴兜底。
+    诊断：第二个 worker 收不到任何 load reply，但 `ps` 里进程活着、
+    stderr 干净 → 几乎一定是 side channel 撞名，不是 NPU 问题。
+  - **backend 的返回形状不统一**。grounding 的 `run_images` 返回
+    `GroundingResult` 而不是文本，`run_prompt` 契约是"返回原始文本"
+    —— 不归一化就会在 worker 里抛 `TypeError: ... has no len()`。
+    wdnai 的 `_normalize_backend_result` 收口（str / `(text, atts)` /
+    带 `.text` 的对象），新增 backend 必须过这一关。
+  - **shm 文件格式两端必须一致**。曾出现 client 写**原始 BGR**、
+    server 用 `cv2.imdecode`（要 JPEG 字节）读 → 每帧都是 None。
+    现在图像与 embed_video 帧统一走 `_bgr_to_path` / `decode_attachments`
+    一套描述符，不再有第二套解码分支。
 
-* **ComputeRegistry** preset（`app/core/compute/registry.py:136-164`）：
-  - 新增 `MODEL_PRESETS["qwen3-4b"]`：`capability_types=["swcap_text_chat"]`，
-    `memory_estimate_mb=4950`，`estimated_init_seconds=60`。
-  - `_qwen3_4b_spec()` 工厂用 `dataclasses.replace(spec, max_context_len=16384)`
-    + `with_options(max_new_tokens=2048, keep_history=1, enable_thinking=True)`。
-    注意 `max_context_len` 是 `ModelSpec` 的 dataclass 字段（被
-    `_common.build_llm_args` 直接读），**不能用 `with_options` 设**，必须
-    `replace`。
-  - `_init_session_subprocess` 子进程硬编码分支加 `elif model_id == 'qwen3-4b'`。
+* **Proxy**（`app/core/compute/proxy.py`，v0.16 起只剩装配 + 一条策略）：
+  - `make_rpc_session(...)` → 返回 `wdndds.LLMRPCSession`，复用 registry
+    已有的 `Hub` / `Service` / `Requester`（不再自建 participant）。
+    `_INFER_TIMEOUT_MS=120_000`（够 768px VLM 帧的 ~35s，又要能抓住真卡
+    死）、`_CONTROL_TIMEOUT_MS=15_000`（控制面毫秒级，不该继承推理预算）。
+  - `count_tokens(sess, texts)`：带降级，控制面失败不让整轮对话失败。
+  - **不再有** `_ProxyResult` / `_AttachmentProxy` / `_decode_reply_shm` /
+    `_encode_attachments`：schema 在调用方解析，附件与长文本的
+    `/dev/shm` 路由由 wdndds 两端统一负责。**没有 LAN peer 降级**了 ——
+    旧路径对跨机 worker 会把大字段全 drop（VFA 因此有"解析失败"占位
+    路径），新路径靠 JPEG+base64 兜底，不丢内容。
+  - **`respond()` 解析失败时返回裸 `str`**（SDK `_safe_validate` 的既有
+    行为，不是新引入的）。消费方要认这个形态：`detector_base`
+    的 `_result_raw_text()` / `_result_schema_parse_failed()` 就是为它
+    写的。用 `getattr(result, "text", "")` 读 `str` 会静默得到 `""`，
+    把"模型写了但没解析出来"变成"模型什么都没写"。
+
 * **ComputeRegistry 配置 — `locate-anything` grounding preset**
   （`app/core/compute/registry.py`）：纯图像输入 + 文本输出（0–1000
   归一化 bbox + 描述），与 VLM 共用同款文件布局（`rknn_llm_path` +
@@ -2471,15 +2559,18 @@ RIFF header by hand.
   - `loadPageData("text-chat")` 调 `TextChat.init() + refresh() + ensureWs()`；
     `showPage()` 离开时调 `TextChat.closeWs()`。
 
-* **资源预算** —— 单实例常驻 ~5.5 GB（Qwen3-4B 量化权重 + embed table +
-  KV cache 200×2K token）。板上 8 GB 统一内存比较紧张，但与 Qwen3-VL-4B
-  单实例不冲突（2 个同时跑超 9 GB）。多用户并发首版不支持 —— worker
-  串行；如需横向扩展，在算力配置页加第 2 个 Qwen3-4B 实例（多卡环境）。
+* **资源预算** —— 由所选模型的 ``manifest.json`` 声明
+  （``memory_estimate_mb``）。多用户并发首版不支持 —— worker 串行。
+  注意 `swcap_text_chat` 现在**只有 qwen3.5-vl-4b 一个 provider**（原
+  qwen3-4b 专用文本 worker 已删除，权重不在目标板上，且与 qwen3.5-vl-4b
+  争同一个 capability）。因此对话与视频描述会落在同一个进程 —— 两者
+  都要用时注意显存叠加，不能再像以前那样分开加载。
 
 * **限制 / 已知问题**：
-  - stop 为**软停**：`chat_stop` 只置 worker 标志，`_backend.run` 同步阻塞
-    跑完才返回，主进程丢弃本轮。跨线程 `session_stop()` 硬中断（C 库
-    FINISH state=3）尚未打通，真机验证后再加。
+  - stop 为**软停**：`session.stop()` 把取消标志发到旁路 topic，
+    `_backend.run` 同步阻塞跑完才返回，worker 回报 stopped、主进程丢弃
+    本轮。rknn3 没有协作式取消，跨线程硬中断（C 库 FINISH state=3）
+    尚未打通，真机验证后再加。
   - `history` 全量每次 RPC 传输（deque 200 条上限）：同机 SHM 无碍；跨机
     UDP 传输受 FastDDS 单包大小限制，长对话跨机场景需评估。
   - thinking 不写历史 —— 用户"接着问"时下一轮 prompt 看不到上轮思考；
@@ -2499,7 +2590,7 @@ RIFF header by hand.
 | Added/removed a model preset          | `MODEL_PRESETS` in `app/core/compute/registry.py` + `register` the new capability in the same table; update `app/static/index.html.template` and `app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)` only if the UI needs new model cards |
 | `ComputeRegistry` config schema       | `ComputeConfigPayload` in `app/system/api/compute.py` + `MODEL_PRESETS` keys; reboot-flush config (`PUT /api/compute/config`) carries Pydantic validation |
 | Schema hint prompts (`VLMDoc.text`/`level`, `TargetDoc.desc`) | `app.prompts.<app_key>.<schema_cls>.<field>` in `config.jsonc`; UI under 系统配置 → App 提示词模板 section. `TargetDoc.x1/y1/x2/y2` stay hardcoded in `_build_target_doc_class` (`app/core/llm/detector_base.py`) — protocol-level 0–1000 归一化坐标格式说明，刻意不开 UI 编辑 |
-| Built-in `@Callable` 工具（`VideoSearch` / `TtsAlert` 等）注册点 | 集中在 `app/core/tools/_builtins.py::register_builtin_tools()`。**主进程**和**compute_worker 子进程**各自在启动时调一次（主进程在 `app/system/__init__.py:register_all()` 与卡片 `register_api()`；worker 在 `app/core/compute/worker.py:main()` 末尾 `hub.start()` 之后）。**不能只放在主进程** — worker 端 `_resolve_tool_classes()` / `parse_classes` 都靠本地 registry 查类，缺类就静默 `WARNING unknown tool name ... skipping`，prompt 缺工具 schema，模型就会"假装在调用"工具(hallucinate)。详见下方"工具注册双进程陷阱"。 |
+| Built-in `@Callable` 工具（`VideoSearch` / `TtsAlert` 等）注册点 | 集中在 `app/core/tools/_builtins.py::register_builtin_tools()`。**主进程**和**compute_worker 子进程**各自在启动时调一次（主进程在 `app/system/__init__.py:register_all()` 与卡片 `register_api()`；worker 在 `app/core/compute/workers/_base.py:run_worker()` 末尾 `hub.start()` 之后）。**不能只放在主进程** — worker 端 `_resolve_tool_classes()` / `parse_classes` 都靠本地 registry 查类，缺类就静默 `WARNING unknown tool name ... skipping`，prompt 缺工具 schema，模型就会"假装在调用"工具(hallucinate)。详见下方"工具注册双进程陷阱"。 |
 ## Tools (音视频检测页工具)
 
 `app/core/tools/` 装的是给音视频描述页 (`WdnaiDetector` 走
@@ -2566,38 +2657,36 @@ v0.4 重构后两个内置工具的注册点散在不同地方：
 * ``app/apps/video_detection/__init__.py:register_api()`` → 注册
   ``tts_alert`` （音视频描述页拥有）
 
-这两处只在**主进程** uvicorn 里跑 —— ``compute_worker`` 子进程是
-独立 Python 进程，registry 启动为空**且再也不会被填充**，除非
-worker 自己显式 import 工具类。
+这两处只在**主进程** uvicorn 里跑。
 
-**故障链路** (2026-09 真机实测复现)：
+**这段历史在 v0.16 已成为结构性不可能**：工具 class 的查表、schema
+注入 prompt、模型 JSON 解析，**全部发生在主进程**
+（``chat_agent._tool_classes`` → ``respond(tools=[...])``）。wire 上只有
+拼好的 prompt，worker 既看不到工具名，也就无从"查不到类"。
+
+**故障链路** (2026-09 真机实测复现，v0.16 前的形态) —— 留档说明为什么
+"worker 需要自己注册工具"这件事曾经成立：
 1. 主进程 ``resolve_available_tool_names()`` 返 ``["VideoSearch"]``
-   给 chat_run payload
-2. proxy 端 ``RpcSessionProxy.chat_run(..., tools=['VideoSearch'])``
-   发到 worker
-3. worker 端 ``_resolve_tool_classes(['VideoSearch'])`` 在自己**空**
-   的 registry 里查不到 → ``LOG.warning("unknown tool name 'VideoSearch'
-   — skipping")``
-4. ``tool_specs = None`` → ``build_chatml_prompt(...)`` 出来的 prompt
-   完全没有工具 schema（实测从正常的 ~1100 字符缩到 192 字符）
+2. proxy 端 ``RpcSessionProxy.chat_run(..., tools=['VideoSearch'])`` 发到 worker
+3. worker 端 ``_resolve_tool_classes(['VideoSearch'])`` 在自己**空**的
+   registry 里查不到 → ``LOG.warning("unknown tool name ... — skipping")``
+4. ``tool_specs = None`` → prompt 完全没有工具 schema（实测从正常的
+   ~1100 字符缩到 192 字符）
 5. 模型看不到 ``VideoSearch`` 描述，按"普通问答"作答 → 输出
-   ``<think>...我将调用VideoSearch工具...</think>`` + 一段
-   假想的"模拟调用"输出，**完全不产生** ``<tool_call>``{}`` 标签
-6. 同样 ``parse_classes=[]`` → 即使模型真按格式吐了 JSON 也无人解析
-7. 用户最终看到 "我将模拟调用工具并提供答案" 的假回答
+   ``<think>...我将调用VideoSearch工具...</think>`` + 一段假想的
+   "模拟调用"，**完全不产生** ``<tool_call>`` 标签
+6. 用户最终看到 "我将模拟调用工具并提供答案" 的假回答
 
-**修法** (``app/core/tools/_builtins.py::register_builtin_tools()``)：
-集中所有内置工具注册到单一函数，主进程 + worker 各自在启动时调一次。
-**新增内置工具时在 ``_REGISTRARS`` 列表追加 ``(label, register_fn)``
-一行**；主进程 ``register_all`` 与 worker ``main()`` 已有现成调用点。
+**当时修法**（``app/core/tools/_builtins.py::register_builtin_tools()``）：
+集中所有内置工具注册到单一函数，主进程 + worker 各自启动时调一次。
+新增内置工具在 ``_REGISTRARS`` 追加 ``(label, register_fn)`` 一行。
 
-主进程调用栈：
-* ``app/system/__init__.py:register_all()`` (im-bridge VideoSearch)
-* ``app/apps/video_detection/__init__.py:register_api()`` (tts_alert)
-
-Worker 调用栈：
-* ``app/core/compute/worker.py:main()`` 在 ``Hub.start()`` 之后调一次
-  （早于任何 ``chat_run`` / ``infer`` RPC 请求到达）
+**现在的调用点**：
+* 主进程 ``app/system/__init__.py:register_all()``（VideoSearch）
+* 主进程 ``app/apps/video_detection/__init__.py:register_api()``（tts_alert）
+* worker ``_base.py:run_worker()`` 仍调一次 —— **只为让两个进程的
+  registry 保持一致**（如 im_bridge 直接问 worker capability 可用性），
+  worker 推理链路本身已不依赖它。
 
 ## Chat 工具调用 (chat-agent)
 
@@ -2774,13 +2863,6 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
 调用），将来真机若出现 abort，可以把 `_run_one` 改回原路径（恢复
 双 init）或加 fallback 策略。
 
-**实例配置**（`MODEL_PRESETS["qwen3-4b"]`）：
-
-| 字段 | 值 | 备注 |
-|---|---|---|
-| `memory_estimate_mb` | **4950** | 真机 4 卡板 RK1828 实际占用 |
-| `estimated_init_seconds` | **60** | 实测 ~55s + 5s buffer |
-
 ## Im-bridge page (应用对接 — 微信 iLink)
 
 `#page-im-bridge` 拆成两块：左侧登录面板 + 右侧调试收发对话
@@ -2874,25 +2956,25 @@ asyncio loop），不是直接 `await` SDK。`wechatbot-sdk` 是 wdnwebui
 
 im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模型」开关。开启后
 微信用户发来的**文字**消息自动进入桥接队列 → 调 `swcap_text_chat`
-（qwen3-4b）推理 → 把回答（只回 answer，不含 thinking）通过
+（qwen3.5-vl-4b）推理 → 把回答（只回 answer，不含 thinking）通过
 `Wechat.send_text` 发回给该微信用户，实现微信上的多轮文本对话。
 
 * **Service** (`app/system/im_bridge/llm.py`)：
   - `_LlmBridge` 单例（`get_llm_bridge()`），由 `_WechatManager` 持有并
     在 `_handle_incoming` 里转发 `handle_incoming(msg)`。
   - **开关内存态**：`_enabled` 不落盘（重启即关）。`available()` 通过
-    `get_registry().get_session("swcap_text_chat")` 判断 qwen3-4b 是否
+    `get_registry().get_session("swcap_text_chat")` 判断对话模型是否
     已加载；未加载时 `set_enabled(True)` 抛 `RuntimeError`（前端置灰 +
     后端 409 双层防护）。
   - **per-user 上下文隔离**：`histories: dict[user_id, deque(maxlen=200)]`
     各自独立，与 web 文本对话的全局历史完全无关；服务重启即清空。
-  - **串行保证**：桥接 worker 线程串行消费 `queue.Queue`；`chat_run` 用
+  - **串行保证**：桥接 worker 线程串行消费 `queue.Queue`；`respond` 用
     `chat_serial.get_chat_run_lock()`（进程级 `RLock`）与 text_chat worker
-    互斥 —— 同一时刻只有一个 `chat_run` 发往 worker，避免并发轮询/停止
-    冲突。`text_chat._run_one` 的 `chat_run` 同样包这把锁。
-  - **裁剪在 worker 端**：主进程只透传 `history`，`compute_worker`
-    `_chat_run_loop` 用真实 tokenizer 裁剪 + 拼 ChatML；主进程侧
-    `run_chat_with_tools()` 完成工具执行与回喂循环（成功 wrap-up /
+    互斥 —— 同一时刻只有一个会话发往 worker，避免并发停止冲突。
+    `text_chat._run_one` 同样包这把锁。
+  - **裁剪与 ChatML 都在主进程**：与 web 侧共用 `run_chat_with_tools()`
+    （内含 `chat_agent._trim` 的真实 tokenizer 计数 + wdnai 的
+    `build_chatml_prompt`）；主进程完成工具执行与回喂循环（成功 wrap-up /
     失败回喂自然告知）后，把最终 answer 直接发微信。
   - **发送复用 `wechat_bot`**：回复走 `Wechat.send_text`，自动出现在
     "调试收发"消息列表（out 方向），与手动发送共用同一发送通道、线程安全。
@@ -2913,7 +2995,8 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
 
 * **前端**（`app/static/index.html.template` + `app.js` `ImBridge`）：
   - 调试收发卡片顶部一行：checkbox + 提示。`available=false` → checkbox
-    disabled + 红字提示「文本对话模型未启用，请在算力配置页加载 qwen3-4b」；
+    disabled + 红字提示「文本对话模型未启用，请在算力配置页加载
+    [VLLM]视觉文字多模态v3.5」；
     `enabled` + `busy` → 「已对接，生成中…」。
   - `_toggleLlmBridge` 调 `POST /api/wechat/llm-bridge`；409 时 revert +
     提示。`send()` 顶部也兜底拦截（按钮已置灰，防 Cmd+Enter 绕过）。
@@ -3129,11 +3212,11 @@ multicast bug。v0.6 改成 **FastDDS SIMPLE discovery** 直接走组播
 ### 架构
 
 ```
-        ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-        │  main    │  │ worker   │  │ worker   │  │ worker   │  (FastDDS
-        │ (wdnwebui│  │ qwen3-vl │  │ qwen3-tts│  │ qwen3-4b │   SIMPLE)
-        │  main)   │  │  -4b     │  │          │  │          │
-        └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
+        ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐
+        │  main    │  │ worker   │  │ worker   │  │  worker    │  (FastDDS
+        │ (wdnwebui│  │ qwen3-vl │  │ qwen3-tts│  │ qwen3.5-vl │   SIMPLE)
+        │  main)   │  │  -4b     │  │          │  │   -4b      │
+        └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘
              │              │             │             │
              └──────────────┴──── UDP multicast 239.255.0.1:7400 ───────
                                           │

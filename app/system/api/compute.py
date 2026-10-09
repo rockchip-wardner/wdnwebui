@@ -12,11 +12,13 @@ Endpoints
                                           (1) ensure worker（probe → adopt /
                                           spawn）；(2) RPC ``load`` 绑定 npu。
                                           adopted peer → 403（本机无权 bind）。
-* ``DELETE /api/compute/instances``        ``{npu_index, model}`` → "禁用"。
-                                          仅卸载模型（worker 进程保留，
-                                          status=not_loaded），可秒级重
-                                          启用。spawned / adopted_local /
-                                          adopted 三类都允许。
+* ``DELETE /api/compute/instances``        ``{model}`` → "禁用"。
+                                          卸载模型**并关闭 worker 进程**
+                                          （unload → shutdown → SIGTERM →
+                                          3s → SIGKILL），实例随后从
+                                          registry 移除。重启用走冷启。
+                                          spawned / adopted_local 允许；
+                                          adopted peer → 403。
 * ``POST   /api/compute/restart``          ``{npu_index?, model}`` → Q3 4 步：
                                           unload → shutdown → wait/kill →
                                           走 boot 流程（不自动 bind）。
@@ -316,24 +318,37 @@ async def start_instance(req: InstanceRequest) -> dict:
 
 @router.delete("/compute/instances")
 async def stop_instance(req: StopInstanceRequest) -> dict:
-    """用户在算力配置页点"禁用"——只卸载模型，**不**关 worker 进程。
+    """用户在算力配置页点"禁用"——卸载模型**并关闭 worker 进程**。
 
-    worker 进程保留在 ``not_loaded`` 状态：NPU 显存释放（LLMSession 句柄
-    drop），但 cshim Hub / RpcClient / 进程句柄全部保留；用户在算力配置
-    页再次点"启用"可秒级走 RPC ``load`` 重载，无需重启 worker。
+    走 :meth:`ComputeRegistry.stop_instance_local`，顺序是
+    unload → RPC shutdown → SIGTERM → 3s → SIGKILL：
 
-    对 spawned / adopted_local / adopted 三类都允许：
-      * spawned / adopted_local —— 本机 RPC 给本机 worker，LLMSession
-        释放后 worker 回到 ``not_loaded``；
-      * adopted —— RPC 让对端 peer 释放 LLMSession，本机 registry 状态
-        同步翻成 ``not_loaded``；peer 进程不被本机关。
+    * **先 unload**（``unload_instance`` 同步阻塞等 worker reply，
+      worker 在 reply 前已跑完 ``rknn3_destroy``）——NPU 内存池是真的
+      归还了才动进程。反过来先 shutdown 会让 worker 在 LLMSession
+      还活着时退出，池子一直被占，光杀进程就没意义。
+    * shutdown 让 worker 走优雅退出（主循环 finally 关闭 audio
+      writer / served session / side hub，atexit 清 ``/dev/shm``）；
+      SIGTERM 是第二保险——worker 侧装了等效 handler，且不依赖
+      Requester 还能用（``adopted_local`` 的 ``proc`` 是 None，
+      SIGTERM 那步会跳过，它只能靠 shutdown RPC 自退）。
 
-    完全 kill worker 进程的能力已**移除**（"重启服务"按钮走 Q3 4 步自带
-    unload+shutdown+respawn）；孤儿 worker 由下次 boot 的
-    ``_find_workers_by_name`` 兜底。
+    禁用后实例从 registry 移除，算力页状态变成 ``unavailable``（不再是
+    ``not_loaded``）。重新点"启用"要走完整冷启：spawn + RPC load。
+
+    ``spawned`` / ``adopted_local`` 都允许；``adopted``（远端 peer）
+    仍然 403 —— 那是别的板子的算力，本机无权关。
+
+    **注意**：推理进行中禁用会打断推理。worker 侧 ``close()`` 用的是
+    ``executor.shutdown(wait=False)``，不会等在跑的推理跑完。
+
+    与 ``POST /compute/stop-all`` 的**有意不一致**：那个端点（只有 TTS
+    卡片在用）仍然只 unload 不杀进程。别把它们当成同一个语义。
 
     Raises:
         404: model 不在 registry。
+        403: 实例来自远端 peer。
+        400: registry 侧停止失败。
     """
     reg = get_registry()
     inst = reg._find_by_model(req.model)
@@ -357,7 +372,7 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
             ),
         )
     try:
-        reg.unload_instance(req.model)
+        reg.stop_instance_local(req.model)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "snapshot": reg.snapshot()}
@@ -471,7 +486,12 @@ async def put_hardware_capabilities(payload: HardwareCapabilityUpdate) -> dict:
 async def stop_all_instances() -> dict:
     """全部停止 — 释放所有 model 的 LLMSession (worker 进程保留)。
     spawned / adopted_local 走本机 RPC;adopted peers 也走 RPC 让对端
-    释放,但本机不终止 worker。"""
+    释放,但本机不终止 worker。
+
+    **有意与 ``DELETE /api/compute/instances`` 语义不同**：那个端点
+    （算力页"禁用"单个）现在会关闭 worker 进程,这个不会。它只
+    ``unload_instance`` —— 进程留着,重新点"启用"走 RPC load 重载。
+    别把两者当成同一件事。"""
     reg = get_registry()
     stopped: list[str] = []
     errors: list[str] = []

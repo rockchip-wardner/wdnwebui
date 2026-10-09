@@ -1486,7 +1486,7 @@ const ComputeConfigPage = {
       if (toggleInput.checked) {
         this._enableInstance(target, modelId);
       } else {
-        if (confirm(`确认禁用 ${meta.label}？将卸载模型，worker 进程保留。`)) {
+        if (confirm(`确认禁用 ${meta.label}？将卸载模型并关闭 worker 进程。`)) {
           this._disableInstance(modelId);
         } else {
   // ...
