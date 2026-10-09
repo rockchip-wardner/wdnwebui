@@ -3,12 +3,14 @@
   "capability_types": [
     "swcap_audio_tts"
   ],
+  "spec_factory": "qwen3_tts",
   "worker_name": "tts",
   "model_dir_name": "Qwen3-TTS",
   "instance_name": "tts-q30",
   "memory_estimate_mb": 1900,
   "estimated_init_seconds": 30,
   "description": "文字转语音模型",
+  "notes": "TTS 自带 3 张 embed 表（text_embed / input_embed / codec_embed，合计 ~750 MB），不走 load_embed_table；卸载时由 unload_handler 的 malloc_trim 兜底回收。",
   "available_targets": [
     "182x"
   ],

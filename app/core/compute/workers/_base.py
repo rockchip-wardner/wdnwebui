@@ -8,9 +8,13 @@ Spawned by ``ComputeRegistry._spawn_compute_worker`` via
 
 This module is the model-agnostic half: process bring-up, comm naming,
 logging, SHM helpers, the router and every RPC handler. Everything that
-is specific to *one* model lives in that model's folder — its
-``manifest.json`` (declarative) and its ``compute_worker.py`` (which
-supplies ``build_spec``).
+is specific to *one* model lives in its manifest — ``workers/<id>.json``,
+which names both what to build and the ``spec_factory`` that builds it.
+There is exactly one entry script for all of them.
+
+Model-specific *behaviour* belongs in wdnai's ``LLMLocalSession`` / backend
+layer, not in a manifest and not here. A manifest says which model; it
+never says how to behave.
 
 Nothing in here may import ``app.apps.*`` / ``app.system.*`` (zero-coupling
 rule, same as cards), and it deliberately does **not** import
@@ -238,62 +242,32 @@ _AUDIO_CHUNK_WRITER: Any = None
 # --------------------------------------------------------------------------- #
 _WDNAI = None
 
-#: ``build_spec(mod) -> ModelSpec``, installed by each worker's entry
-#: point via :func:`set_spec_factory`. ``mod`` is the dict returned by
-#: :func:`_load_wdnai` (so the spec builder does not have to import wdnai
-#: itself, and a non-RK host fails with one clear error).
-_SPEC_FACTORY = None
+#: Absolute path of ``workers/`` — every manifest sits next to this module
+#: as ``<model_id>.json``.
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def set_spec_factory(fn):
-    """Install this worker's spec factory.
+def load_manifest(model_id: str) -> dict:
+    """Read ``workers/<model_id>.json``.
 
-    ``fn`` receives the :func:`_load_wdnai` module dict and returns a
-    ``wdnai.model.ModelSpec``. Called by ``compute_worker.py`` before
-    :func:`run_worker`.
-    """
-    global _SPEC_FACTORY
-    if not callable(fn):
-        raise TypeError("spec factory must be callable")
-    _SPEC_FACTORY = fn
-    return fn
-
-
-def resolve_worker_dir(worker_dir=None) -> str:
-    """Locate this worker's own folder.
-
-    Cannot be inferred from ``__file__``: this module sits in
-    ``workers/`` while the worker is ``workers/<id>/``. So the entry
-    point passes its own directory, and we fall back to ``sys.argv[0]``'s
-    directory for the manual/scripted launch path.
-    """
-    if worker_dir:
-        return os.path.abspath(worker_dir)
-    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else ""
-    if argv0:
-        cand = os.path.dirname(os.path.abspath(argv0))
-        if os.path.isfile(os.path.join(cand, "manifest.json")):
-            return cand
-    raise RuntimeError(
-        "compute_worker: cannot locate this worker's manifest.json — pass "
-        "worker_dir= to run_worker() or launch the worker's own "
-        "compute_worker.py")
-
-
-def load_manifest(worker_dir=None) -> dict:
-    """Read this worker's ``manifest.json``.
-
-    Read from the worker's own folder rather than imported from the
-    registry — the registry spawns workers, so importing back into it
-    would close the cycle.
+    Resolved from the model id rather than a caller-supplied folder:
+    every model now has exactly one manifest file, so the id *is* the
+    path. Read from this package rather than imported from the registry —
+    the registry spawns workers, so importing back into it would close
+    the cycle.
     """
     import json as _json
-    folder = resolve_worker_dir(worker_dir)
-    with open(os.path.join(folder, "manifest.json"), encoding="utf-8") as f:
-        return _json.load(f)
+    path = os.path.join(HERE, f"{model_id}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return _json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"compute_worker: no manifest for model {model_id!r} "
+            f"(expected {path})") from None
 
 
-def worker_comm_name(model_id: str, worker_dir=None) -> str:
+def worker_comm_name(model_id: str) -> str:
     """Process comm name (``worker:<alias>``) for this worker.
 
     Computed from the manifest's ``worker_name`` rather than imported
@@ -305,7 +279,7 @@ def worker_comm_name(model_id: str, worker_dir=None) -> str:
     """
     alias = ""
     try:
-        alias = (load_manifest(worker_dir).get("worker_name")
+        alias = (load_manifest(model_id).get("worker_name")
                  or model_id[:8]).strip()
     except Exception:  # noqa: BLE001 — manifest unreadable is not fatal here
         alias = model_id[:8]
@@ -348,22 +322,35 @@ def _load_wdnai() -> dict:
 
 
 def _build_session(model_id: str, npu_index: int):
-    """Construct the session for this worker using its own spec factory.
+    """Construct the session for this worker using its manifest.
 
-    The factory is installed by the worker's ``compute_worker.py`` entry
-    point via :func:`set_spec_factory`. Keeping the per-model knowledge
-    out of this module is the point of the split: adding a model means
-    adding a folder, not editing another branch of this ``elif`` chain.
+    ``spec_factory`` in ``workers/<model_id>.json`` names a method on
+    ``wdnai.SystemLanguageModel``; that is the whole per-model knowledge
+    the worker needs. Resolving it by name keeps model-specific behaviour
+    out of this module entirely — and out of per-model Python files that
+    would have to be kept in sync. Anything beyond "which model" belongs
+    in wdnai's session/backend layer, where every caller gets it.
+
+    A missing or misspelled factory surfaces here as a clear
+    ``RuntimeError`` (the instance flips to ``error`` with this text)
+    rather than a bare ``AttributeError`` from deep inside a loader.
     """
-    factory = _SPEC_FACTORY
+    manifest = load_manifest(model_id)
+    factory_name = (manifest.get("spec_factory") or "").strip()
+    if not factory_name:
+        raise RuntimeError(
+            f"worker {model_id!r}: manifest has no 'spec_factory' "
+            f"(expected a wdnai.SystemLanguageModel method name)")
+    mod = _load_wdnai()
+    factory = getattr(mod["SystemLanguageModel"], factory_name, None)
     if factory is None:
         raise RuntimeError(
-            f"worker {model_id!r}: no spec factory installed — the worker's "
-            f"compute_worker.py must call set_spec_factory(build_spec) "
-            f"before run_worker()")
-    mod = _load_wdnai()
-    spec = factory(mod)
-    LOG.info("building LLMLocalSession(model=%s, npu=%d) ...", model_id, npu_index)
+            f"worker {model_id!r}: wdnai.SystemLanguageModel has no "
+            f"{factory_name!r} — check 'spec_factory' in "
+            f"workers/{model_id}.json against the installed wdnai")
+    spec = factory()
+    LOG.info("building LLMLocalSession(model=%s, npu=%d) via %s) ...",
+             model_id, npu_index, factory_name)
     t0 = time.time()
     # Not the deprecated ``LLMSession(model=…)`` shim: the worker is the
     # one place that genuinely means "inference runs right here".
@@ -1078,13 +1065,13 @@ def _config_path() -> str:
     return os.environ.get('WDNWEBUI_CONFIG') or str(_main_resolve())
 
 
-def run_worker(argv=None, worker_dir=None) -> int:
+def run_worker(argv=None) -> int:
     """Boot this worker: bring up the Hub, register the replier, serve.
 
-    Called by the worker's ``compute_worker.py`` after it has installed
-    its spec factory with :func:`set_spec_factory`. Kept as a function
-    (not a ``__main__`` block) so the per-model entry point stays a
-    short shim.
+    Called by the shared ``compute_worker.py``, which knows nothing about
+    any particular model — everything comes from ``workers/<id>.json``.
+    Kept as a function (not a ``__main__`` block) so the entry point stays
+    a thin shim.
     """
     # fd 保险：把 soft RLIMIT_NOFILE 提到 hard 上限。worker 是长寿命进程，
     # RKNN init（每 context/卡一堆 fd）+ mmap 权重 + DDS endpoint 的 fd
@@ -1133,7 +1120,7 @@ def run_worker(argv=None, worker_dir=None) -> int:
     # 能通过 /proc/<pid>/comm 找到我们做 dedup。必须在 _setup_logging 后
     # 调，让 LOG.warning 报错时 comm 已经设上。
     try:
-        comm_name = worker_comm_name(model_id, worker_dir)
+        comm_name = worker_comm_name(model_id)
         _set_comm_name(comm_name)
     except Exception as e:  # noqa: BLE001
         LOG.warning("could not set comm name for %s: %s", model_id, e)
@@ -1145,7 +1132,7 @@ def run_worker(argv=None, worker_dir=None) -> int:
         # off-device workers don't pin to a non-existent ``/userdata/models``.
         from app.core.config import default_models_root
         base_dir = os.environ.get("WDNAI_MODELS_DIR", f"{default_models_root()}/")
-        manifest = load_manifest(worker_dir)
+        manifest = load_manifest(model_id)
         dir_name = manifest.get("model_dir_name")
         if dir_name:
             model_dir = os.path.join(base_dir, dir_name)

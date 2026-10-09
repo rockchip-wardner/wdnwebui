@@ -4,12 +4,14 @@
     "swcap_text_chat",
     "swcap_video_describe"
   ],
+  "spec_factory": "qwen3_5_vl_4b",
   "worker_name": "q5-vl",
   "model_dir_name": "Qwen3.5-4B",
   "instance_name": "vlm-q35-4b",
   "memory_estimate_mb": 3500,
   "estimated_init_seconds": 60,
   "description": "Qwen3.5-4B 多模态模型，支持图像描述和文本对话",
+  "notes": "VLM-mode LLM（MRoPE 烙印），既能吃图像也能纯文本。spec.options 里的 presence_penalty=1.5 来自 examples/Qwen3_5_VL/cpp/main.cc 的默认值，用来压制长 multimodal 输出的复读。注：Qwen3.5-4B-llm.1828.rknn 同时支撑文本对话与视频描述两份能力，本机没有纯文本版 Qwen3.5-4B RKNN。",
   "available_targets": [
     "182x"
   ],

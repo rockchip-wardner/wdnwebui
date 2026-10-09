@@ -1,10 +1,10 @@
-"""End-to-end check of the split worker layout.
+"""End-to-end check of the flat worker layout.
 
 Boots a real worker as a subprocess exactly the way
 ``ComputeRegistry._spawn_compute_worker`` does, then drives it over DDS:
-``info`` → ``load`` → ``infer``. Verifies the per-worker entry script,
-the manifest-derived metadata, the ``/proc`` dedup needle and the real
-model round trip.
+``info`` → ``load`` → ``infer``. Verifies the shared entry script, the
+manifest-derived metadata, the ``/proc`` dedup needle and the real model
+round trip.
 
 Usage::
 
@@ -47,6 +47,30 @@ def main() -> int:
     print(f"[split] entry = {manifest.entry_path}")
     if not os.path.isfile(manifest.entry_path):
         failures.append("entry script missing")
+
+    # ---- 1b. flat-layout invariants --------------------------------------
+    # One manifest per model, one entry script for all of them. If either
+    # drifts back to per-model scripts, the dedup needle below starts
+    # matching more than it should and the per-model copy drift starts
+    # again — so assert the shape, not just that it happens to boot.
+    entries = {m.entry_path for m in manifests}
+    if len(entries) != 1:
+        failures.append(f"expected 1 shared entry script, got {len(entries)}: "
+                        f"{sorted(entries)}")
+    else:
+        print(f"[split] all {len(manifests)} models share one entry script")
+
+    from wdnai import SystemLanguageModel
+    for m in manifests:
+        if not m.spec_factory:
+            failures.append(f"{m.id}: manifest has no spec_factory")
+        elif not hasattr(SystemLanguageModel, m.spec_factory):
+            # Would otherwise only surface as an AttributeError deep inside
+            # a boot-time loader, long after the manifest looked fine.
+            failures.append(
+                f"{m.id}: wdnai.SystemLanguageModel has no "
+                f"{m.spec_factory!r}")
+    print(f"[split] spec_factory resolved for all {len(manifests)} manifests")
 
     # ---- 2. spawn exactly like the registry does --------------------------
     env = dict(os.environ)

@@ -11,13 +11,15 @@ halves: ``serve_local_session`` on the worker, ``LLMRPCSession`` on the client,
 including the ``/dev/shm`` attachment and long-reply routing that keeps big
 payloads under the cshim per-message ceiling.
 
-Workers are plugins: one folder per model under
-``app/core/compute/workers/<model_id>/``, each holding a ``manifest.json``
-(declarative identity — label, swcaps, memory estimate) plus a
-``compute_worker.py`` entry point that knows how to build that model's spec.
+Workers are plugins: one ``<model_id>.json`` manifest per model under
+``app/core/compute/workers/``, carrying the declarative identity (label,
+swcaps, memory estimate) plus a ``spec_factory`` naming the ``wdnai``
+method that builds that model. There is a single shared entry script,
+``workers/compute_worker.py``, for all of them — adding a model means
+dropping in a JSON file, not writing a near-duplicate of that script.
 The shared, model-agnostic runtime is ``workers/_base.py``; discovery and
-manifest validation live in ``workers/__init__.py``. The registry spawns a
-worker's entry script on demand.
+manifest validation live in ``workers/__init__.py``. The registry spawns
+the shared entry script with ``--model <id>`` on demand.
 
 The one piece of session knowledge a worker still lends out is exact token
 counting (``count_tokens``): history trimming is caller-side policy, but only

@@ -3,12 +3,14 @@
   "capability_types": [
     "swcap_grounding"
   ],
+  "spec_factory": "locate_anything",
   "worker_name": "ground",
   "model_dir_name": "LocateAnything-3B",
   "instance_name": "llm-ground-3b",
   "memory_estimate_mb": 5500,
   "estimated_init_seconds": 60,
   "description": "视觉定位模型，给定文本描述输出图像中目标区域",
+  "notes": "视觉定位（kind=\"grounding\"，0-1000 归一化 bbox）。权重目录由 wdnai 内部的 _default_locate_anything_paths 解析，可用 WDNAI_LOCATE_ANYTHING_DIR 覆写。模型未部署时 load 会抛 FileNotFoundError，由 worker 的 load 流程转成 errored 状态。",
   "available_targets": [
     "182x"
   ],

@@ -1,21 +1,37 @@
-"""Worker plugin discovery — one folder per model, manifest-declared.
+"""Worker plugin discovery — one manifest per model, one shared entry point.
 
-Mirrors the card plugin system (:mod:`app.core.manifest`): a worker is a
-directory under ``app/core/compute/workers/<id>/`` holding a
-``manifest.json`` (declarative metadata) plus a ``compute_worker.py``
-entry point that knows how to build that one model.
+A worker is a JSON file at ``app/core/compute/workers/<id>.json`` plus the
+single ``compute_worker.py`` next to it. The manifest is the only
+per-model artefact: identity, capabilities, UI metadata, and the name of
+the ``wdnai`` spec factory that builds the model.
 
-Why split this out
-------------------
+Why this shape
+--------------
 Until v0.9 the whole worker was one 2358-line ``worker.py`` that served
 every model, with the model→spec mapping living in an ``if/elif`` chain
-inside ``_build_session``. Adding a model meant editing that chain; the
-declarative half of the metadata (``MODEL_PRESETS``) and the executable
-half (``_build_session``) then had to be kept in sync by hand.
+inside ``_build_session``. Adding a model meant editing that chain.
 
-Splitting them makes a worker self-contained: the manifest is the only
-place a model's identity is declared, and the worker entry point is the
-only place its spec is built.
+The first attempt at splitting that up gave every model a *folder*
+(``workers/<id>/manifest.json`` + ``workers/<id>/compute_worker.py``).
+That did separate declaration from code, but it was heavier than the
+problem deserved: all six entry scripts were 45-50 lines and differed
+only in a docstring and one line of the form
+``mod["SystemLanguageModel"].<factory>()``. Six near-identical files that
+have to stay in sync is exactly the failure mode the split was meant to
+eliminate.
+
+So the per-model ``build_spec`` function became the manifest field
+``spec_factory`` (a method name on ``wdnai.SystemLanguageModel``), and
+there is now one entry script. Adding a model is dropping in a JSON file.
+
+Where per-model behaviour belongs
+---------------------------------
+**Not here.** This package is a transport shell: it brings up the DDS hub,
+registers the replier and forwards a prompt. Anything model-specific —
+special inference options, a different loading strategy, an extra backend —
+belongs in ``wdnai``'s ``LLMLocalSession`` / backend layer, where it can
+be shared by every caller instead of forked per worker. The manifest
+carries *what* to build and *what to call it*, never *how to behave``.
 
 Compatibility
 -------------
@@ -24,11 +40,10 @@ Compatibility
 ``registry.py`` / ``config.py`` / ``compute.py`` / ``manifest.py`` keep
 working unchanged.
 
-Zero-coupling rule (same as cards): a worker may import ``app.core.*``
+Zero-coupling rule (same as cards): this package may import ``app.core.*``
 only. In particular it must NOT import ``app.apps.*`` or ``app.system.*``
-— and it should not import :mod:`app.core.compute.registry` either, since
-the registry spawns workers and that would close the cycle. Everything a
-worker needs to know about itself lives in its own manifest.
+— and it must not import :mod:`app.core.compute.registry` either, since
+the registry spawns workers and that would close the cycle.
 """
 from __future__ import annotations
 
@@ -43,12 +58,17 @@ LOG = logging.getLogger("compute.workers")
 
 WORKERS_DIR = Path(__file__).resolve().parent
 
-#: Filename inside each worker folder. Kept as ``compute_worker.py`` on
-#: purpose: the spawn dedup in ``registry.py`` and the process scan in
-#: ``app/system/api/system_monitor.py`` both match this exact string in
-#: ``/proc/<pid>/cmdline``. Renaming it means updating both.
+#: The one entry script, shared by every model. Its basename stays
+#: ``compute_worker.py`` on purpose: the spawn dedup in ``registry.py``
+#: and the process scan in ``app/system/api/system_monitor.py`` both match
+#: ``compute_worker.py\x00--model\x00<id>\x00`` in ``/proc/<pid>/cmdline``.
+#: Keeping the basename *and* the ``--model`` flag means that needle is
+#: byte-for-byte unchanged by the flat layout — only the directory part of
+#: the path differs.
 ENTRY_FILENAME = "compute_worker.py"
-MANIFEST_FILENAME = "manifest.json"
+
+#: Suffix of the per-model manifest files (``<id>.json``).
+MANIFEST_SUFFIX = ".json"
 
 
 @dataclass
@@ -63,6 +83,13 @@ class WorkerManifest:
     id: str
     label: str
     capability_types: List[str] = field(default_factory=list)
+    #: Name of the ``wdnai.SystemLanguageModel`` factory that builds this
+    #: model's ``ModelSpec`` (e.g. ``"qwen3_vl_4b"``). This is the only
+    #: per-model *code* the worker needs, and it is resolved by
+    #: ``getattr`` — a typo here surfaces as an ``error`` instance with
+    #: the AttributeError text rather than a silently wrong model.
+    #: Model-specific behaviour belongs in wdnai, not here.
+    spec_factory: str = ""
     #: Short alias used for the process comm name (``worker:<alias>``).
     #: Linux truncates comm to 15 chars; ``registry._worker_comm_name``
     #: enforces the limit and appends a numeric suffix when it overflows.
@@ -74,10 +101,14 @@ class WorkerManifest:
     memory_estimate_mb: int = 0
     estimated_init_seconds: int = 60
     description: str = ""
+    #: Free-form operator notes. The old per-worker docstrings carried
+    #: real knowledge (why an option is set to a particular value, what a
+    #: hard limit is); that is what this is for.
+    notes: str = ""
     available_targets: List[str] = field(default_factory=list)
-    #: ``True`` keeps a worker out of the default view while its code and
-    #: entry point stay fully live — the worker-side analogue of a hidden
-    #: card, and the safe way to stage a rollout.
+    #: ``True`` keeps a worker out of the default view while its manifest
+    #: stays fully live — the worker-side analogue of a hidden card, and
+    #: the safe way to stage a rollout.
     hidden: bool = False
     #: Sort key for the enumeration order (ascending). Defaults to
     #: ``display_order`` semantics used by cards.
@@ -85,7 +116,7 @@ class WorkerManifest:
     #: Extra keys we do not model explicitly, preserved verbatim so a
     #: manifest can carry worker-specific metadata without a code change.
     extra: Dict[str, Any] = field(default_factory=dict)
-    #: Absolute path of the worker folder.
+    #: Absolute path of this worker's manifest file.
     path: str = ""
     status: str = "ok"          # "ok" | "fatal"
     errors: List[str] = field(default_factory=list)
@@ -93,8 +124,12 @@ class WorkerManifest:
     # ------------------------------------------------------------------ #
     @property
     def entry_path(self) -> str:
-        """Absolute path to this worker's entry script."""
-        return os.path.join(self.path, ENTRY_FILENAME)
+        """Absolute path to the shared worker entry script.
+
+        Same file for every model — the manifest decides what gets built,
+        not which script runs.
+        """
+        return str(WORKERS_DIR / ENTRY_FILENAME)
 
     def service_name(self, *, local_only: bool = False, pid: Optional[int] = None) -> str:
         """DDS service name this worker registers.
@@ -121,12 +156,14 @@ class WorkerManifest:
             "id": self.id,
             "label": self.label,
             "capability_types": list(self.capability_types),
+            "spec_factory": self.spec_factory,
             "worker_name": self.worker_name,
             "model_dir_name": self.model_dir_name,
             "instance_name": self.instance_name,
             "memory_estimate_mb": self.memory_estimate_mb,
             "estimated_init_seconds": self.estimated_init_seconds,
             "description": self.description,
+            "notes": self.notes,
             "available_targets": list(self.available_targets),
             "entry_path": self.entry_path,
             "service_name": self.service_name(),
@@ -137,22 +174,30 @@ class WorkerManifest:
 # --------------------------------------------------------------------------- #
 # Scanning
 # --------------------------------------------------------------------------- #
-def _validate(raw: Any, folder: Path) -> tuple[Optional[WorkerManifest], List[str]]:
+def _validate(raw: Any, stem: str) -> tuple[Optional[WorkerManifest], List[str]]:
     errors: List[str] = []
     if not isinstance(raw, dict):
-        return None, ["manifest.json must contain a JSON object"]
+        return None, ["manifest must contain a JSON object"]
 
-    # ``id`` defaults to the folder name — same rule as card apps. Keeping
-    # it implicit removes the chance of a manifest renaming itself away
-    # from the directory the registry spawns out of.
-    worker_id = raw.get("id") or folder.name
+    # ``id`` defaults to the filename stem (``qwen3-vl-4b.json`` →
+    # ``qwen3-vl-4b``) — same implicit-rule idea as cards. Making it
+    # explicit is allowed but must agree: a manifest that renames itself
+    # away from its own filename would break ``--model <id>`` ↔
+    # ``workers/<id>.json`` lookup and spawn the wrong model.
+    worker_id = raw.get("id") or stem
     if not isinstance(worker_id, str) or not worker_id.strip():
         return None, ["'id' 存在但不是非空字符串"]
-    if worker_id != folder.name:
-        errors.append(f"id {worker_id!r} 与目录名 {folder.name!r} 不一致")
+    if worker_id != stem:
+        errors.append(f"id {worker_id!r} 与文件名 {stem!r} 不一致")
 
     if not isinstance(raw.get("label"), str) or not raw["label"].strip():
         errors.append("'label' 缺失或为空")
+
+    # Required: without it there is no way to build the model, and the
+    # failure would otherwise only surface as a boot-time AttributeError.
+    factory = raw.get("spec_factory")
+    if not isinstance(factory, str) or not factory.strip():
+        errors.append("'spec_factory' 缺失（wdnai.SystemLanguageModel 上的方法名）")
 
     caps = raw.get("capability_types")
     if caps is None:
@@ -167,82 +212,87 @@ def _validate(raw: Any, folder: Path) -> tuple[Optional[WorkerManifest], List[st
         return None, errors
 
     known = {
-        "id", "label", "capability_types", "worker_name", "model_dir_name",
-        "instance_name", "memory_estimate_mb", "estimated_init_seconds",
-        "description", "available_targets", "hidden", "display_order",
+        "id", "label", "capability_types", "spec_factory", "worker_name",
+        "model_dir_name", "instance_name", "memory_estimate_mb",
+        "estimated_init_seconds", "description", "notes",
+        "available_targets", "hidden", "display_order",
     }
     return WorkerManifest(
         id=worker_id,
         label=raw["label"],
         capability_types=list(caps),
+        spec_factory=raw["spec_factory"],
         worker_name=raw.get("worker_name") or worker_id[:8],
         model_dir_name=raw.get("model_dir_name", ""),
         instance_name=raw.get("instance_name", ""),
         memory_estimate_mb=int(raw.get("memory_estimate_mb", 0)),
         estimated_init_seconds=int(raw.get("estimated_init_seconds", 60)),
         description=raw.get("description", ""),
+        notes=raw.get("notes", ""),
         available_targets=list(raw.get("available_targets", [])),
         hidden=bool(raw.get("hidden", False)),
         display_order=int(raw.get("display_order", 9999)),
         extra={k: v for k, v in raw.items() if k not in known},
-        path=str(folder),
+        path="",
     ), errors
 
 
 def discover() -> List[WorkerManifest]:
-    """Scan ``workers/*/manifest.json`` and return validated manifests.
+    """Scan ``workers/<id>.json`` and return validated manifests.
 
     A malformed manifest is reported on that worker (``status="fatal"``)
-    rather than raised: one bad folder must not take down discovery for
-    every other model. Folders without a manifest are ignored entirely,
-    and folders marked ``hidden`` are returned with ``hidden=True`` so
-    callers can filter them out of the UI while keeping the code live.
+    rather than raised: one bad file must not take down discovery for
+    every other model. Files whose stem starts with ``.`` or ``_`` are
+    ignored, and manifests marked ``hidden`` are returned with
+    ``hidden=True`` so callers can filter them out of the UI while keeping
+    them live.
     """
     found: List[WorkerManifest] = []
     if not WORKERS_DIR.is_dir():
         return found
 
+    entry = WORKERS_DIR / ENTRY_FILENAME
+    entry_missing = not entry.is_file()
+
     seen: Dict[str, str] = {}
-    for folder in sorted(WORKERS_DIR.iterdir()):
-        if not folder.is_dir() or folder.name.startswith((".", "_")):
-            continue
-        manifest_path = folder / MANIFEST_FILENAME
-        if not manifest_path.is_file():
+    for path in sorted(WORKERS_DIR.glob(f"*{MANIFEST_SUFFIX}")):
+        stem = path.stem
+        if stem.startswith((".", "_")):
             continue
         try:
-            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            LOG.error("worker %s: unreadable manifest: %s", folder.name, exc)
+            LOG.error("worker %s: unreadable manifest: %s", stem, exc)
             found.append(WorkerManifest(
-                id=folder.name, label=folder.name, path=str(folder),
-                status="fatal", errors=[f"manifest.json 解析失败: {exc}"],
+                id=stem, label=stem, path=str(path),
+                status="fatal", errors=[f"manifest 解析失败: {exc}"],
             ))
             continue
 
-        manifest, errors = _validate(raw, folder)
+        manifest, errors = _validate(raw, stem)
         if manifest is None:
-            LOG.error("worker %s: invalid manifest: %s", folder.name,
+            LOG.error("worker %s: invalid manifest: %s", stem,
                       "; ".join(errors))
             found.append(WorkerManifest(
-                id=folder.name, label=str(raw.get("label", folder.name))
-                if isinstance(raw, dict) else folder.name,
-                path=str(folder), status="fatal", errors=errors,
+                id=stem, label=str(raw.get("label", stem))
+                if isinstance(raw, dict) else stem,
+                path=str(path), status="fatal", errors=errors,
             ))
             continue
+        manifest.path = str(path)
 
         if manifest.id in seen:
             errors = [f"id {manifest.id!r} 与 {seen[manifest.id]} 重复"]
             manifest.status = "fatal"
             manifest.errors = errors
-            LOG.error("worker %s: %s", folder.name, "; ".join(errors))
+            LOG.error("worker %s: %s", stem, "; ".join(errors))
 
-        entry = Path(manifest.entry_path)
-        if not entry.is_file():
+        if entry_missing:
             manifest.status = "fatal"
             manifest.errors = manifest.errors + [
                 f"入口文件缺失: {ENTRY_FILENAME}"]
 
-        seen[manifest.id] = folder.name
+        seen[manifest.id] = stem
         found.append(manifest)
 
     # Ascending display_order, then id — matches the card panel's rule.
@@ -288,7 +338,7 @@ def known_capability_types() -> set:
 
 __all__ = [
     "ENTRY_FILENAME",
-    "MANIFEST_FILENAME",
+    "MANIFEST_SUFFIX",
     "WORKERS_DIR",
     "WorkerManifest",
     "discover",

@@ -442,14 +442,14 @@ def _resolve_worker_model_id(comm: str) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 # Preset table — derived from the worker manifests                          #
 # --------------------------------------------------------------------------- #
-# 每个模型的「身份」现在由 ``app/core/compute/workers/<id>/manifest.json``
-# 声明，模型规格的构造则在该目录的 ``compute_worker.py`` 里（worker 进程
-# 才需要真正 build spec）。这里从扫描结果生成兼容视图，让 registry /
-# config / compute / manifest 四处共 54 处既有调用点零改动。
+# 每个模型的「身份」现在由 ``app/core/compute/workers/<id>.json`` 声明，
+# 规格构造则由该 manifest 的 ``spec_factory`` 字段指名 ``wdnai`` 上的方法
+# （只有 worker 进程才需要真正 build spec）。这里从扫描结果生成兼容视图，
+# 让 registry / config / compute / manifest 四处共 54 处既有调用点零改动。
 #
 # 旧的 ``preset_factory`` 字段连同 7 个 ``_*_spec()`` 构造函数已随之删除：
-# 那个字段定义过 7 次却从未被任何代码读取（只有 worker.py 自己的
-# if/elif 在干同样的事，而那份已下沉到各 worker 目录）。
+# 那个字段定义过 7 次却从未被任何代码读取（只有当时的 worker.py 自己的
+# if/elif 在干同样的事，而那份已下沉为 manifest 的一个字符串字段）。
 #
 # ``estimated_init_seconds`` 是经验值，用来渲染「加载中」倒计时的**起点**
 # （loading 段按 estimate - (now - started_at) 实算）。真机冷启动实测
@@ -1575,7 +1575,8 @@ class ComputeRegistry:
                  else str(Path(__file__).resolve().parent / "worker.py"))
         cmd = [
             sys.executable, "-u",
-            # Per-worker entry script under ``workers/<id>/compute_worker.py``.
+            # The single shared entry script under ``workers/``. Every model
+            # runs the same file; the manifest decides what gets built.
             # The basename is deliberately unchanged: both the spawn dedup
             # needle and ``system_monitor``'s process scan match this exact
             # string in /proc/<pid>/cmdline, so renaming it would silently

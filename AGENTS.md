@@ -82,13 +82,35 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    应在多次切页后恒为 1（CDP `DOMDebugger.getEventListeners` 同理）。
 
 6. **worker 进程是薄 RPC server，类云端 AI 调用语义**。
-   `app/core/compute/workers/<model_id>/compute_worker.py`（7 个，每个
-   model_id 一个文件夹 + `manifest.json`）进程只负责：
+   **一个共享入口 + 一个 per-model manifest**：
+   `app/core/compute/workers/compute_worker.py`（**唯一**进程入口，所有
+   model 共用）+ `workers/<model_id>.json`（每个模型一个文件，声明身份 +
+   `spec_factory`）。进程只负责：
    * 接收 `wdndds.serve_local_session` 定义的
      `{prompt, attachments, options}`；
    * 透传给 `wdnai.LLMLocalSession.run_prompt(...)`（**跳过** prompt 重新
      组装 —— prompt 是调用方拼好的）；
    * 把模型返回的**原始文本**原样发回。
+
+   **加模型 = 放一个 `workers/<id>.json`**，不用再写一份 45 行的入口脚本。
+   曾短暂用过「一模型一文件夹」（`workers/<id>/{manifest.json,
+   compute_worker.py}`），但 6 份入口脚本只差一个 docstring 和一行
+   `mod["SystemLanguageModel"].<factory>()` —— 6 份近似副本正是这次拆分
+   本来要消灭的东西，所以压成了单入口 + `spec_factory` 字段。
+
+   **per-model 的行为差异写进 wdnai，不写进 manifest**。
+   `spec_factory` 只回答「调 wdnai 的哪个方法造 spec」；特殊推理选项、
+   不同的加载策略、额外 backend 一律在 `wdnai.LLMLocalSession` / backend
+   层实现 —— 那样所有调用方都受益，而不是每个 worker 各分叉一份。
+   manifest 只说「是哪个模型」，绝不说「怎么表现」。
+   原先各入口 docstring 里的领域知识（presence_penalty=1.5 的来源、
+   omni 单次 6s 上限等）已迁到各 manifest 的 `notes` 字段。
+
+   **入口文件名与 `--model` 参数不可改**：
+   `registry` 的 spawn 去重 needle 与 `system_monitor` 的进程扫描都匹配
+   `/proc/<pid>/cmdline` 里的 `compute_worker.py\x00--model\x00<id>\x00`
+   （`registry.py:_find_workers_by_name`）。改其中任何一个都会**静默**破坏
+   孤儿检测与去重。扁平布局只改路径的目录部分，这个 needle 逐字节不变。
 
    worker **不应做**：
    * schema 字段语义理解（如 bbox 单位归一化、bbox 是否全画面、
@@ -529,9 +551,11 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
   `libwdndds_cshim.so`。运行时链接系统 `libfastrtps2.9` /
   `libfastcdr1`（apt install libfastrtps-dev libfastcdr-dev）。
 * **每个 model = 1 个 compute_worker 进程**。`ComputeRegistry.start
-`     ` 在主进程 spawn 一个 `python app/core/compute/workers/<model_id>/compute_worker.py
-       --model <id> --npu <k>` 子进程（**子进程默认不加载模型** —
-       等首次 RPC 到达时再 lazy `LLMSession(model=spec, npu=k)`）。
+`     ` 在主进程 spawn 一个 `python app/core/compute/workers/compute_worker.py
+       --model <id>` 子进程 —— **所有模型共用这个入口脚本**，具体造哪个
+       spec 由 `workers/<id>.json` 的 `spec_factory` 决定（子进程默认不
+       加载模型 —— 等首次 RPC 到达时再 lazy
+       `LLMLocalSession(model=spec, npu=k)`）。
 * **主进程持 RpcClient**：`get_registry().get_session(cap)` 返回
   `app/core/compute/proxy.RpcSessionProxy`(原 `app/services/rpc_session_proxy.RpcSessionProxy`),内部转发
   `reset()` / `respond()` 到 worker 的 `wdndds/rpc/<model_id>` service
@@ -1168,9 +1192,10 @@ class AudioEvent:
 * `MODEL_PRESETS["qwen2.5-omni-3b"]`：memory_estimate_mb=2500 /
   estimated_init_seconds=50 / capability_types=["swcap_audio_understand"] /
   worker_name="audio-3b"（comm="worker:audio-3b", 13 字符）。
-* 该 worker 的 `compute_worker.py::build_spec` 返回
-  `SLM.qwen_2_5_omni_3b()`；`comm_name="audio-3b"` 来自同目录
-  `manifest.json` 的 `worker_name`（`compute_worker_lazy.py` 已删除）。
+* 该 manifest 的 `spec_factory="qwen_2_5_omni_3b"`，worker 侧据此调
+  `SLM.qwen_2_5_omni_3b()`；`comm_name="audio-3b"` 来自同文件
+  `workers/qwen2.5-omni-3b.json` 的 `worker_name`（`compute_worker_lazy.py`
+  已删除）。
 * `_LEGACY_CAPABILITY_TYPE_RENAMES` 加 `"audio_understand" → "swcap_audio_understand"`，
   兼容老 config.jsonc。
 
