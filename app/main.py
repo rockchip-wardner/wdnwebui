@@ -100,26 +100,35 @@ def _assemble_index_html(manifests: list[CardManifest]) -> str:
     manifests_json = json.dumps(manifests_data, ensure_ascii=False)
     template = template.replace("{{ app_manifests }}", manifests_json)
 
-    # 4. Cache-bust core static assets (?v=<mtime>) — StaticFiles 默认不发
+    # 4. Cache-bust static assets (?v=<mtime>) — StaticFiles 默认不发
     # Cache-Control, 浏览器会按 Last-Modified 启发式缓存; 用文件 mtime 作
-    # 版本串使 URL 随改动变化, 避免改前端后需手动硬刷新。
-    core_static = Path(__file__).resolve().parent / "static" / "core"
-
-    def _stamp_asset(match: re.Match) -> str:
-        attr, rel = match.group("attr"), match.group("rel")
-        try:
-            ver = int((core_static / rel).stat().st_mtime)
-        except OSError:
-            return match.group(0)
-        return f'{attr}="/static/core/{rel}?v={ver}"'
-
-    template = _CORE_ASSET_RE.sub(_stamp_asset, template)
+    # 版本串使 URL 随改动变化, 避免改前端后需手动硬刷新。覆盖 core/ 与
+    # system/（算力配置页的 system.js 在后者，早先漏掉它会让改完算力页
+    # 前端后浏览器仍跑旧副本，表现为"修复没生效"）。
+    for prefix, root in _STAMP_DIRS.items():
+        template = _ASSET_RE.sub(_make_stamp(root, prefix), template)
 
     return template
 
 
-# 匹配 template 里对 /static/core/** 的 href/src 引用（尚未带 ?v= 的）。
-_CORE_ASSET_RE = re.compile(r'(?P<attr>href|src)="/static/core/(?P<rel>[^"?]+)"')
+def _make_stamp(root: Path, prefix: str):
+    def stamp(match: re.Match) -> str:
+        attr, rel = match.group("attr"), match.group("rel")
+        try:
+            ver = int((root / rel).stat().st_mtime)
+        except OSError:
+            return match.group(0)
+        return f'{attr}="/static/{prefix}/{rel}?v={ver}"'
+    return stamp
+
+
+# 匹配 template 里对 /static/{core,system}/** 的 href/src（尚未带 ?v= 的）。
+_ASSET_RE = re.compile(
+    r'(?P<attr>href|src)="/static/(?:core|system)/(?P<rel>[^"?]+)"')
+_STAMP_DIRS = {
+    "core": Path(__file__).resolve().parent / "static" / "core",
+    "system": Path(__file__).resolve().parent / "system" / "static",
+}
 
 
 class _NoCacheStaticFiles(StaticFiles):

@@ -1827,6 +1827,18 @@ function isLocalComputeSource(s) {
   return s === "spawned" || s === "adopted_local" || s === "unavailable" || !s;
 }
 
+// 判断响应是不是「远端 peer，本机无权操作」这一**预期内**的拒绝。
+// 后端两处会这么回：403（compute.py::_require_owned 的安全护栏）与
+// 400（registry.stop_instance_local 的 RuntimeError）。两个码都要留
+// —— 真正的手动禁用失败（进程 kill 失败等）也走 400，所以必须再匹配
+// 文案，不能只看 status。命中时调用方静默：远端算力本就不可操作，
+// 弹窗只会让用户以为点错了。
+const PEER_REJECT_HINT = /远端\s*peer|本机无权(停止|bind|操作)|来自\s*\S+/;
+function isRemotePeerRejection(status, text) {
+  if (status !== 400 && status !== 403) return false;
+  return PEER_REJECT_HINT.test(String(text || ""));
+}
+
 
 const ComputeConfigPage = {
   initialized: false,
@@ -2797,6 +2809,9 @@ const ComputeConfigPage = {
     const noCards  = !cards || cards.length === 0;
     const isOrphan = svc._source === "adopted_local";
     const isUnavail = svc._source === "unavailable";
+    // 远端 peer（其他板子的 worker）：本机无权启停，toggle 直接禁用，
+    // 用户不必点得到、也不会再撞弹窗。
+    const isPeer   = svc._source === "adopted";
 
     // ---- card 整体 class
     card.dataset.source = svc._source || "spawned";
@@ -2842,20 +2857,26 @@ const ComputeConfigPage = {
     h.toggle.classList.toggle("is-on", isOn);
     h.toggle.classList.toggle("is-load", isLoad);
     h.toggle.classList.toggle("is-err", isErr);
-    h.toggle.classList.toggle("is-disabled", noCards);
+    h.toggle.classList.toggle("is-disabled", noCards || isPeer);
 
     const targetPicked = this._hasTargetPicked(card.dataset.model, svc);
     const needsTarget = !isOn && !isErr && !isMissingDir
-                     && svc._source !== "adopted"
-                     && svc._source !== "unavailable";
+                     && !isPeer && !isUnavail;
     const toggleBlocked = noCards
                        || isLoad
                        || isErr
+                       || isPeer
                        || (needsTarget && !targetPicked);
     h.toggleInput.checked = isOn;
     h.toggleInput.disabled = toggleBlocked;
-    h.toggleInput.setAttribute("aria-label",
-      `${meta.label}：${isOn ? "已启用" : "未启用"}，点击切换`);
+    if (isPeer) {
+        const peerLabel = svc._peer_name || "其他板子";
+        h.toggleInput.setAttribute("aria-label",
+          `${meta.label}：由远端 ${peerLabel} 提供，本机无权启停`);
+    } else {
+      h.toggleInput.setAttribute("aria-label",
+        `${meta.label}：${isOn ? "已启用" : "未启用"}，点击切换`);
+    }
 
     if (noCards) {
       h.toggle.title = "无可用 NPU 卡";
@@ -3046,58 +3067,40 @@ const ComputeConfigPage = {
     return card;
   },
 
-  async _enableInstance(npu_index, model) {
-    // npu_index 可以是单卡或卡数组 —— 「运行在」是多选，一个模型可以
-    // 同时跑在多张卡上（后端为每张卡各 spawn 一个 worker）。
+  // 启用/禁用/重启三条路径的公共骨架：发请求 → 失败则按语义决定是否
+  // 弹窗 → 刷新。抽出来是因为三者除 method/path/body/文案外完全同构。
+  async _computeAction(path, method, body, actionLabel) {
+    try {
+      const r = await fetch(API_PREFIX + path, {
+        method,
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const text = await r.text();
+        if (isRemotePeerRejection(r.status, text)) return;
+        alert(`${actionLabel}失败 (HTTP ${r.status}): ${text}`);
+      }
+    } catch (e) {
+      alert("请求失败: " + e.message);
+    }
+    await this.load();
+  },
+
+  // npu_index 可以是单卡或卡数组 —— 「运行在」是多选，一个模型可以
+  // 同时跑在多张卡上（后端为每张卡各 spawn 一个 worker）。
+  _enableInstance(npu_index, model) {
     const cards = Array.isArray(npu_index) ? npu_index : [npu_index];
-    try {
-      const r = await fetch(API_PREFIX + "/compute/instances", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({npu_index: cards, model}),
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        alert(`启用失败 (HTTP ${r.status}): ${text}`);
-      }
-    } catch (e) {
-      alert("请求失败: " + e.message);
-    }
-    await this.load();
+    return this._computeAction("/compute/instances", "POST",
+                               {npu_index: cards, model}, "启用");
   },
 
-  async _disableInstance(model) {
-    try {
-      const r = await fetch(API_PREFIX + "/compute/instances", {
-        method: "DELETE",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({model}),
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        alert(`卸载失败 (HTTP ${r.status}): ${text}`);
-      }
-    } catch (e) {
-      alert("请求失败: " + e.message);
-    }
-    await this.load();
+  _disableInstance(model) {
+    return this._computeAction("/compute/instances", "DELETE", {model}, "卸载");
   },
 
-  async _restartInstance(model) {
-    try {
-      const r = await fetch(API_PREFIX + "/compute/restart", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({model}),
-      });
-      if (!r.ok) {
-        const text = await r.text();
-        alert(`重启失败 (HTTP ${r.status}): ${text}`);
-      }
-    } catch (e) {
-      alert("请求失败: " + e.message);
-    }
-    await this.load();
+  _restartInstance(model) {
+    return this._computeAction("/compute/restart", "POST", {model}, "重启");
   },
 
   _makeServiceCard(modelId, meta, inst, cards) {
