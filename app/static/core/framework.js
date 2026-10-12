@@ -220,12 +220,19 @@
     },
 
     async _loadCardJS(page) {
-      if (DemoGuard._loading[page]) {
-        return DemoGuard._loading[page];
-      }
       const manifests = window.__APP_MANIFESTS__ && window.__APP_MANIFESTS__.cards || [];
       const m = manifests.find((x) => x.id === page);
       if (!m) return Promise.resolve();
+      // preload 在途时不早退:等它跑完再补挂向导。早退会让本页永远等不到
+      // wizard(而 _prepareCardEntry 已把 page 藏了 → 白屏)。
+      if (DemoGuard._loading[page]) {
+        try { await DemoGuard._loading[page]; } catch (_) { return; }
+        if (!DemoGuard._wizardMounted.has(page) && window.WizardRegistry?.tryMount) {
+          window.WizardRegistry.tryMount(m);
+          DemoGuard._wizardMounted.add(page);
+        }
+        return;
+      }
       const jsList = (m.frontend && m.frontend.js) || [];
       const chain = jsList.reduce((p, url) => {
         return p.then(() => new Promise((resolve, reject) => {
@@ -425,12 +432,19 @@
           document.head.appendChild(s);
         }));
       }, Promise.resolve());
+      // 必须挂进 DemoGuard._loading —— 否则 preload 期间用户点进该卡片时,
+      // _loadCardJS(只查 _loading / _loadedApps)会**再注入一份** <script>。
+      // 卡片 IIFE 于是跑两遍,旧闭包的 WebSocket 无人 close,每条帧被两个
+      // socket 各收一次 → 每条消息在页面上出现两遍。
+      DemoGuard._loading[card.id] = chain;
       chain.then(() => {
         DemoGuard._loadedApps.add(card.id);
       }).catch((e) => {
         console.warn("[router] card preload chain failed for",
                      card.id, e && (e.message || e));
         // _loadedApps 不加,用户点击时会走 _loadCardJS 重试
+      }).finally(() => {
+        delete DemoGuard._loading[card.id];
       });
     }
   }

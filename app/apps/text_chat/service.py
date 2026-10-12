@@ -23,8 +23,9 @@
   ``content:answer``，不写 thinking，下一轮看不到。
 * **context_limit 可配置**：``config.jsonc["compute"]["text_chat"]["context_limit"]``，
   默认 4096（= qwen3.5-vl-4b 的 max_context_len）；每次推理前热读。超限自动裁剪最旧历史，仅单条消息超限才报错。
-* **停止 = 软停**：``stop()`` 置 ``_worker_stop_event`` 并调 ``session.stop()``；
-  后者把取消标志发到旁路 topic，worker 跑完本轮看到后回报 stopped，本轮丢弃。
+* **停止 = 真中断**：``stop()`` 置 ``_worker_stop_event`` 并调 ``session.stop()``；
+  标志经旁路 topic 送到 worker，``ServedSession.request_stop()`` 转发给
+  ``LLMLocalSession.stop()``，由 rknn3 侧真正中止本轮并释放 NPU。
 * **broadcast pattern**：worker 线程 push 到 ``asyncio.Queue`` 列表；
   WS handler 在主 event loop 里 ``drain``。
 
@@ -216,19 +217,15 @@ class _TextChatManager:
         return rid
 
     def stop(self) -> None:
-        """请求停止正在跑的推理。
+        """停止正在跑的推理；当前轮丢弃，不写历史。
 
-        rknn3 没有协作式取消，in-flight 的 ``session_run`` 中断不了。
-        所以停止是"软停"：``session.stop()`` 把取消标志发布到一条旁路
-        DDS topic（不等任何 RPC 应答），worker 跑完那一轮推理后看到标志、
-        回报 ``stopped``，``respond()`` 随即抛错，本轮结果被丢弃、不写
-        历史。
+        rknn3 支持中途取消：``session.stop()`` 把标志经旁路 DDS topic 送到
+        worker，worker 侧 ``ServedSession.request_stop()`` 转发给
+        ``LLMLocalSession.stop()``，最终由 ``rknn3_session_stop()`` 真正中止
+        本轮。停止消息带 stream_id，上一轮的残留重发不会误杀下一轮。
 
-        另有一道本地 ``_worker_stop_event``：工具轮之间 agent 会检查它，
-        能在下一轮开始前就退出，不必等当前推理结束。
-
-        用户体感和 UI 都是"已停"；下一轮 ``session.reset()`` 仍要等
-        worker 把当前这一轮跑完。
+        ``_worker_stop_event`` 是本地的一道：agent 在工具轮之间检查它，能在下一轮
+        开始前就退出，不必等当前推理结束。
         """
         with self._lock:
             if self._state != self.STATE_RUNNING:
