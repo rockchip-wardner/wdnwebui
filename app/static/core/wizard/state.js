@@ -39,6 +39,56 @@
     } catch (_) { /* ignore quota */ }
   }
 
+  // ------------------------------------------------------------------ //
+  // 上传在途守卫 (source step drop-zone)
+  //
+  // 手填 url/路径与拖放上传写的是同一个 wizard input `el`。上传是异步的,
+  // 而「下一步」此前不受上传状态约束,于是用户可在 POST 在途时点下一步:
+  // _captureValues 把**上传前**的 el.value(上次填的 rtsp://… 或本地路径)
+  // 当作用户填的视频源存进 state.values;随后 _gotoStep 重建 body 使 el
+  // 脱离文档,fetch 回来后 `el.value = data.path` 只写在游离节点上,权威值
+  // 仍是旧源 → finish 时 applyWizardSnapshot 打开的不是刚上传的视频。
+  //
+  // 三层防护:锁住导航 / path 直写 state.values / 不对游离 DOM 做副作用。
+  // ------------------------------------------------------------------ //
+  function _setUploadBusy(state, busy, fieldId) {
+    if (!state) return;
+    // 用计数而非布尔:drop-zone 在上传期间仍在 DOM 里,用户可能再拖一个
+    // 文件,先完成的那个不能把仍在途的上传解锁。
+    state.uploadInFlight = Math.max(0, (state.uploadInFlight || 0) + (busy ? 1 : -1));
+    state.uploadBusy = state.uploadInFlight > 0;
+    state.uploadBusyFieldId = state.uploadBusy ? (fieldId || state.uploadBusyFieldId) : null;
+    _applyNavLock(state);
+  }
+
+  // 把上传锁同步到「下一步」/「打开」按钮。footer 重建后需重新调用
+  // (此时按钮是新节点,disabled 不会继承)。
+  function _applyNavLock(state) {
+    const ids = [WIZARD_NS + "next-btn"];
+    if (state.uploadBusyFieldId) {
+      ids.push(WIZARD_NS + "source-open-" + state.uploadBusyFieldId);
+    }
+    ids.forEach((id) => {
+      const btn = _q("#" + id);
+      // form step 的「下一步」恒为 enabled(`_renderFootNext(..., true)`),
+      // 直接置 false 安全;env_check step 没有 upload UI。
+      if (btn) btn.disabled = state.uploadBusy;
+    });
+  }
+
+  // 按钮已 disabled,这里是键盘 Enter / 脚本旁路的兜底,兼作一次提示。
+  function _flashUploadHint() {
+    const box = _q("#" + WIZARD_NS + "body .wd-wizard-drop-status");
+    if (!box) return;
+    box.textContent = "视频正在上传中,请等待上传完成后再进入下一步";
+    box.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-busy";
+  }
+
+  // 向导仍存活 + 本步骤节点仍在文档中(未跳步 / 未卸载)。
+  function _isStepAlive(state, el) {
+    return !!_active && _active === state && !!el && el.isConnected;
+  }
+
   // ------------------------------------------------------------------ #
   // 字段定义 → opts key 的映射(去掉 app id 前缀 + camelCase)
   // ------------------------------------------------------------------ #
@@ -415,6 +465,7 @@
           const actions = _ce("div", WIZARD_NS + "source-actions");
           const openBtn = _ce("button", WIZARD_NS + "source-action-btn", "打开");
           openBtn.type = "button";
+          openBtn.id = WIZARD_NS + "source-open-" + field.id;
           // 点击"打开"后,wizard 容器内需要展示视频。应用页面的 canvas 元素
           // (id 形如 <prefix>-canvas,如 vd-canvas / vtd-canvas / vtl-canvas)
           // 在 page section 内、被 wizard hidden;点击"打开"时把 canvas 元素
@@ -446,6 +497,8 @@
             const handleUpload = async (file) => {
               dropStatus.textContent = `正在上传 ${file.name}...`;
               dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-busy";
+              // 上传在途:锁住「下一步」/「打开」(见文件头守卫注释)
+              _setUploadBusy(state, true, field.id);
               try {
                 const fd = new FormData();
                 fd.append("file", file);
@@ -461,6 +514,15 @@
                   dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-err";
                   return;
                 }
+                // 权威值直写 state.values —— 即使 DOM 之后被重建/销毁,
+                // finish 读到的仍是上传后的路径;localStorage 同步写,
+                // 避免下次进向导又回到旧值。
+                state.values[field.id] = data.path;
+                _publishValues(state, cfg);
+
+                // 向导已卸载 / 已跳步 → 不再对游离 DOM 做副作用
+                if (!_isStepAlive(state, el)) return;
+
                 // 把 server 路径写回 wizard input + 自动触发 vd-open
                 // vd-open click → 后端 vdOpen → ws 推帧 → ws callback
                 // drawVdFrame 通过 canvasId 找到 canvas 画帧(此时 canvas
@@ -477,8 +539,13 @@
                 dropStatus.textContent = `✓ 已上传,加载中...`;
                 dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-ok";
               } catch (e) {
-                dropStatus.textContent = `上传失败: ${e?.message || e}`;
-                dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-err";
+                // 节点已不在文档中时无需刷状态
+                if (_isStepAlive(state, el)) {
+                  dropStatus.textContent = `上传失败: ${e?.message || e}`;
+                  dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-err";
+                }
+              } finally {
+                _setUploadBusy(state, false, field.id);
               }
             };
 
@@ -531,6 +598,8 @@
             }
           };
           openBtn.addEventListener("click", () => {
+            // 上传在途时点「打开」会放旧源,同「下一步」一并锁住
+            if (_active && _active.uploadBusy) { _flashUploadHint(); return; }
             try {
               const srcEl = document.getElementById(field.id);
               const loopEl = inlineLoopFieldId
@@ -632,15 +701,26 @@
 
     if (state.currentStep < cfg.steps.length - 1) {
       const nextBtn = _ce("button", WIZARD_NS + "primary-btn", "下一步");
+      nextBtn.id = WIZARD_NS + "next-btn";
       nextBtn.disabled = !canNext;
       nextBtn.addEventListener("click", () => stepForward());
       foot.appendChild(nextBtn);
+      // 重建 footer 后重新应用上传守卫
+      if (state.uploadBusy) _applyNavLock(state);
     }
   }
 
   // ------------------------------------------------------------------ #
   // Step navigation
   // ------------------------------------------------------------------ #
+  // 落 localStorage + 刷新 debug hook;抽出来是为了让「上传成功直写
+  // state.values」这条不经 _captureValues 的路径保持同一落盘口径。
+  function _publishValues(state, cfg) {
+    _lsSave(state.app.id, cfg, state.values);
+    // debug hook for test/e2e visibility(零开销,生产环境无副作用)
+    try { window._wd_wizard_values = JSON.parse(JSON.stringify(state.values)); } catch (_) {}
+  }
+
   function _captureValues(cfg, state) {
     const body = _q("#" + WIZARD_NS + "body");
     body.querySelectorAll("[data-field-id]").forEach((el) => {
@@ -667,9 +747,7 @@
         delete state.values[fid];
       }
     });
-    _lsSave(state.app.id, cfg, state.values);
-    // debug hook for test/e2e visibility(零开销,生产环境无副作用)
-    try { window._wd_wizard_values = JSON.parse(JSON.stringify(state.values)); } catch (_) {}
+    _publishValues(state, cfg);
   }
 
   function _gotoStep(idx) {
@@ -689,6 +767,8 @@
   function stepForward() {
     if (!_active) return;
     const { cfg } = _active;
+    // 兜底:上传在途禁止跳步(键盘 Enter / 脚本旁路)
+    if (_active.uploadBusy) { _flashUploadHint(); return; }
     _captureValues(cfg, _active);   // 先 capture 当前步骤 body
     _gotoStep(_active.currentStep + 1);
   }

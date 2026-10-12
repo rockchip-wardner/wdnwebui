@@ -1858,7 +1858,7 @@ const ComputeConfigPage = {
     sw.type = "button";
     sw.className = "cc-svc-switch";
     const selectedTarget = this._selectedTargets(modelId)[0]
-      : (inst ? inst.npu_index : this._defaultTargetNpu(cards));
+      ?? (inst ? inst.npu_index : this._defaultTargetNpu(cards));
     sw.dataset.target = String(selectedTarget);
 
     const noCards = !cards || cards.length === 0;
