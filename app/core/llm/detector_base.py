@@ -569,6 +569,16 @@ class DetectorEvent:
     # multi-iter 循环，不再把 "你刚说了 X" 的 transcript 喂回下一轮
     # 避免模型退化到复读用户的提示词。
     consume_iteration: bool = False
+    # **判据在这一帧上的分数**（`conc` 之类度量的原始值），手动跳帧模式下
+    # 为 None（没做画面比对，没有分数可言）。
+    #
+    # 为什么必须记进事件：这是回答"为什么阈值 10 还会出事件"的唯一凭据。
+    # 事件历史原来只有 frame_pos 和描述文本，用户盯着页面只能看到"又刷了一
+    # 条"，分不清是**阈值触发**（score > threshold）、**兜底间隔触发**
+    # （gap >= every_n 且 score >= threshold/2，**本来就允许阈值以下的帧**
+    # 送检），还是压根没走判据。没有这个字段就只能猜，而这两者的处置完全
+    # 不同：前者要调阈值，后者是兜底在正常工作、只是频率比预期高。
+    judge_score: Optional[float] = None
     # 视频目标定位页 (LocatorDoc) 专用字段。一帧一事件，事件内 ``boxes``
     # 是本次定位到的全部目标 bbox 列表(可能为空 —— "未检测到")；
     # ``frame_b64`` + ``frame_w`` + ``frame_h`` 是整帧 JPEG base64,前端
@@ -601,6 +611,7 @@ class DetectorEvent:
             "frame_b64":        self.frame_b64,
             "frame_w":          self.frame_w,
             "frame_h":          self.frame_h,
+            "judge_score":      self.judge_score,
         }
 
 
@@ -1492,6 +1503,7 @@ class WdnaiDetector:
         frame_bgr: "np.ndarray",
         frame_pos: int,
         frame_b64: str = "",
+        judge_score: Optional[float] = None,
     ) -> None:
         with self._lock:
             if not (self._enabled and self._prompt):
@@ -1507,7 +1519,7 @@ class WdnaiDetector:
             pass
         try:
             self._item_q.put_nowait(
-                (frame_bgr, frame_pos, prompt, frame_b64),
+                (frame_bgr, frame_pos, prompt, frame_b64, judge_score),
             )
         except queue.Full:
             pass
@@ -2710,14 +2722,28 @@ class WdnaiDetector:
                     self._generating_cls.__name__ if self._generating_cls else "?",
                 )
                 return
-            if len(item) == 4:
+            if len(item) == 5:
+                frame_bgr, frame_pos, prompt, frame_b64, judge_score = item
+            elif len(item) == 4:
                 frame_bgr, frame_pos, prompt, frame_b64 = item
+                judge_score = None
             else:
                 frame_bgr, frame_pos, prompt = item
                 frame_b64 = ""
+                judge_score = None
             _t0_infer = time.monotonic()
             try:
                 events = self._infer_sync(frame_bgr, prompt, frame_pos, frame_b64)
+                # 判据分数在这一帧上是**所有事件共用的**（一次推理一帧，
+                # 一帧里的多个事件分数一样），所以统一在这里回填，而不是
+                # 在每个 DetectorEvent(...) 构造点都加一遍参数 —— 那些点
+                # 有 10 处以上，漏一处就出现"有些事件有分数有些没有"。
+                if judge_score is not None:
+                    for _ev in (events or []):
+                        try:
+                            _ev.judge_score = judge_score
+                        except Exception:  # noqa: BLE001
+                            pass
             except BaseException as e:
                 # 兜底: _infer_sync 内部已经 catch BaseException 写 diag,
                 # 但万一再次冒出,worker_loop 也要保命,不让一次异常永久

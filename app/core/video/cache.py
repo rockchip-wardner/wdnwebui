@@ -80,6 +80,7 @@ def _build_schema() -> "pa.Schema":
         ("analyzed_at", pa.float64()),
         ("kind", pa.string()),
         ("every_n", pa.int32()),
+        ("sample_key", pa.string()),
         ("prompt", pa.string()),
         ("prompt_hash", pa.string()),
         ("events_json", pa.string()),
@@ -96,10 +97,48 @@ def _build_schema() -> "pa.Schema":
 _KIND_RETRIEVAL = "retrieval"
 _KIND_ANALYSIS = "analysis"
 
+
+#: 走默认度量的几种写法。历史 ``sample_mode`` 只有 manual/auto 两态且 auto
+#: 硬编码 z_mad，所以历史自动行的键是 ``a:<阈值>``；新判据器直接报真实度量名
+#: （现在是 ``conc``），**必须映射回同一个键**，否则改完 UI 后所有历史自动缓存
+#: 全部失配 —— 用户每次点开始都要重新分析，是静默的性能回归。
+_AUTO_KEY_ALIASES = frozenset({"auto", "z_mad", "gscore"})
+
+
+def analysis_sample_key(sample_mode: str, change_threshold) -> str:
+    """分析缓存的"采样模式指纹"。
+
+    * **手动 → 空串 ``""``**：与迁移前写入的历史手动行**完全一致**。若这里
+      返回 ``"m"``，所有历史缓存行永远匹配不上（``sample_key=''`` vs
+      ``'m'``），用户每次点开始都要重新分析 —— 那是静默的性能回归，不是
+      正确性问题，但很难被察觉。
+    * **自动（默认度量）→** ``"a:<阈值×100>"``：阈值不同 → 采到的帧集不同 →
+      结果不同，必须进键，否则"改了模式结果却一样"（缓存串味）。
+    * **其它度量（sad / ncc …）→** ``"a:<度量>:<阈值×100>"``：算法都进键。
+      只按"非手动"归并成 ``a:<阈值>`` 的话，sad 与 ncc 同阈值会共用一条
+      缓存 —— 而它们选出的帧集根本不同，那是实打实的串味。
+
+    非法 ``sample_mode`` 不会走到这里：``service.start()`` 先用
+    ``frame_judge.normalize_mode`` 收敛过，非 manual 必然是合法度量名。
+    """
+    mode = str(sample_mode or "manual").strip().lower()
+    if mode == "manual":
+        return ""
+    try:
+        thr = "a:%d" % int(round(float(change_threshold) * 100))
+    except (TypeError, ValueError):
+        thr = "a:default"
+    if mode in _AUTO_KEY_ALIASES:
+        return thr
+    return f"{thr}:{mode}"
+
 # 各新列的 SQL 默认值（迁移用；retrieval 行 kind='retrieval' + 其余空/零）。
 _NEW_COLUMN_DEFAULTS = {
     "kind": "'retrieval'",
     "every_n": "0",
+    # 采样模式指纹。空串 = 历史手动模式行（迁移前只有 every_n 采样）。
+    # 自动模式的阈值不同 → 结果不同，必须进键，否则手动/自动串味。
+    "sample_key": "''",
     "prompt": "''",
     "prompt_hash": "''",
     "events_json": "''",
@@ -118,10 +157,10 @@ def _migrate_schema(table) -> None:
 
     历史：
     * 补 ``source_path`` 列（空串默认，见渠道隔离）。
-    * 补 ``kind`` / ``every_n`` / ``prompt`` / ``prompt_hash`` /
-      ``events_json`` / ``scene_boundaries_json`` / ``run_id`` /
-      ``frame_count`` / ``dirty_count`` / ``state`` / ``summary``；
-      旧行一律 ``kind='retrieval'``（迁移前表里只有检索数据）。
+    * 补 ``kind`` / ``every_n`` / ``sample_key`` / ``prompt`` /
+      ``prompt_hash`` / ``events_json`` / ``scene_boundaries_json`` /
+      ``run_id`` / ``frame_count`` / ``dirty_count`` / ``state`` /
+      ``summary``；旧行一律 ``kind='retrieval'``（迁移前表里只有检索数据）。
 
     lancedb 0.34 的 ``add_columns`` 接受 ``{col: sql_default}`` 形状
     （实测），**持久化**且幂等；失败的列兜底为 drop + 新 schema 重建
@@ -166,7 +205,7 @@ def _migrate_schema(table) -> None:
                 py_defaults = {
                     "kind": _KIND_RETRIEVAL,
                     "source_path": "",
-                    "every_n": 0, "prompt": "", "prompt_hash": "",
+                    "every_n": 0, "sample_key": "", "prompt": "", "prompt_hash": "",
                     "events_json": "", "scene_boundaries_json": "",
                     "run_id": "", "frame_count": 0, "dirty_count": 0,
                     "state": "done", "summary": "", "meta_json": "",
@@ -502,7 +541,8 @@ class WechatVideoCache:
                       prompt_hash: str, run_id: str, events: List[dict],
                       scene_boundaries: List, summary: str,
                       meta: Dict[str, Any],
-                      payload: Optional[Dict[str, Any]] = None) -> bool:
+                      payload: Optional[Dict[str, Any]] = None,
+                      sample_key: str = "") -> bool:
         """逐帧分析结果入库（**一行一视频**，delete + add 幂等覆盖）。
 
         与检索缓存不同：分析缓存的主体是 ``events_json``（逐帧结构化
@@ -510,9 +550,14 @@ class WechatVideoCache:
         缓存保存，否则命中后综述退化为固定 15 帧切块）；``vec`` 为
         ``null``（分析缓存不参与向量检索）。
 
-        缓存键 = ``(md5, every_n, prompt_hash)`` —— 逐帧结果由"分析
-        要求"（prompt）问出，换 prompt 必须重新逐帧（正确性）。同一
-        视频不同 every_n / prompt 是**独立行**，各自占 LRU 槽。
+        缓存键 = ``(md5, every_n, prompt_hash, sample_key)`` —— 逐帧
+        结果由"分析要求"（prompt）问出，换 prompt 必须重新逐帧（正确性）。
+        同一视频不同 every_n / prompt 是**独立行**，各自占 LRU 槽。
+
+        ``sample_key`` 是**采样模式指纹**（``"m"`` 手动 / ``"a:<阈值>"``
+        自动，详见 ``analysis_sample_key``）：自动模式下同一 every_n 但
+        阈值不同会采到不同的帧集，结果不同，必须进键否则手动/自动互相
+        串味。历史行 ``sample_key=''`` 等价于 ``"m"``。
 
         仅调用方确认全成功（done）时入库。
         """
@@ -543,6 +588,7 @@ class WechatVideoCache:
                     "analyzed_at": [now],
                     "kind": [_KIND_ANALYSIS],
                     "every_n": [int(every_n)],
+                    "sample_key": [str(sample_key or "")],
                     "prompt": [str(prompt or "")],
                     "prompt_hash": [str(prompt_hash or "")],
                     "events_json": [json.dumps(events or [],
@@ -559,17 +605,19 @@ class WechatVideoCache:
                 }
                 arrow = pa.Table.from_pydict(
                     _complete_rows(rows), schema=_build_schema())
-                # 同 (md5, every_n, prompt_hash) 幂等覆盖；不碰检索行。
+                # 同 (md5, every_n, prompt_hash, sample_key) 幂等覆盖；
+                # 不碰检索行。
                 table.delete(
                     f"md5 = '{md5}' AND kind = '{_KIND_ANALYSIS}' AND "
                     f"every_n = {int(every_n)} AND "
-                    f"prompt_hash = '{prompt_hash}'")
+                    f"prompt_hash = '{prompt_hash}' AND "
+                    f"sample_key = '{sample_key or ''}'")
                 table.add(arrow)
                 self._evict_if_needed(table)
                 _LOG.info("wechat video cache: saved analysis md5=%s "
-                          "(every_n=%d, %d frames, run=%s)",
-                          md5[:12], int(every_n), len(events or []),
-                          str(run_id)[:8])
+                          "(every_n=%d, sample_key=%s, %d frames, run=%s)",
+                          md5[:12], int(every_n), sample_key or "-",
+                          len(events or []), str(run_id)[:8])
                 return True
             except Exception as exc:  # noqa: BLE001
                 _LOG.warning("wechat video cache: save_analysis failed for "
@@ -577,13 +625,16 @@ class WechatVideoCache:
                 return False
 
     def lookup_analysis(self, md5: str, every_n: int,
-                        prompt_hash: str) -> Optional[dict]:
-        """按 ``(md5, every_n, prompt_hash)`` 取逐帧分析缓存；未命中 None。
+                        prompt_hash: str,
+                        sample_key: str = "") -> Optional[dict]:
+        """按 ``(md5, every_n, prompt_hash, sample_key)`` 取逐帧分析缓存。
+
+        未命中 None。``sample_key=''`` 兼容迁移前的手动模式历史行。
 
         返回 ``{events, scene_boundaries, summary, run_id, every_n,
-        prompt, filename, source_path, duration_s, fps, frame_count,
-        dirty_count, analyzed_at}``（``events`` / ``scene_boundaries``
-        已从 JSON 反序列化）。
+        sample_key, prompt, filename, source_path, duration_s, fps,
+        frame_count, dirty_count, analyzed_at}``（``events`` /
+        ``scene_boundaries`` 已从 JSON 反序列化）。
         """
         if not md5:
             return None
@@ -592,7 +643,8 @@ class WechatVideoCache:
             return None
         where = (f"md5 = '{md5}' AND kind = '{_KIND_ANALYSIS}' AND "
                  f"every_n = {int(every_n)} AND "
-                 f"prompt_hash = '{prompt_hash}'")
+                 f"prompt_hash = '{prompt_hash}' AND "
+                 f"sample_key = '{sample_key or ''}'")
         try:
             tbl = (table.search().where(where).limit(1).to_arrow())
         except Exception as exc:  # noqa: BLE001
@@ -640,6 +692,7 @@ class WechatVideoCache:
             "md5": str(col("md5") or ""),
             "run_id": str(col("run_id") or ""),
             "every_n": int(col("every_n") or 0),
+            "sample_key": str(col("sample_key") or ""),
             "prompt": str(col("prompt") or ""),
             "prompt_hash": str(col("prompt_hash") or ""),
             "events": events if isinstance(events, list) else [],
@@ -672,7 +725,7 @@ class WechatVideoCache:
             with self._lock:
                 tbl = (table.search()
                        .where(where)
-                       .select(["md5", "run_id", "every_n", "prompt",
+                       .select(["md5", "run_id", "every_n", "sample_key", "prompt",
                                 "prompt_hash", "frame_count", "dirty_count",
                                 "state", "filename", "source_path",
                                 "duration_s", "fps", "analyzed_at",
@@ -692,6 +745,7 @@ class WechatVideoCache:
                 "md5": str(col("md5") or ""),
                 "run_id": str(col("run_id") or ""),
                 "every_n": int(col("every_n") or 0),
+                "sample_key": str(col("sample_key") or ""),
                 "prompt": str(col("prompt") or ""),
                 "prompt_hash": str(col("prompt_hash") or ""),
                 "frame_count": int(col("frame_count") or 0),
@@ -718,8 +772,8 @@ class WechatVideoCache:
         return self._delete_rows(table, where, f"run_id={str(run_id)[:8]}")
 
     def delete_analysis(self, md5: str, every_n: int,
-                        prompt_hash: str) -> int:
-        """按 (md5, every_n, prompt_hash) 删除分析条目。"""
+                        prompt_hash: str, sample_key: str = "") -> int:
+        """按 (md5, every_n, prompt_hash, sample_key) 删除分析条目。"""
         if not md5:
             return 0
         table = self._ensure_table()
@@ -727,7 +781,8 @@ class WechatVideoCache:
             return 0
         where = (f"md5 = '{md5}' AND kind = '{_KIND_ANALYSIS}' AND "
                  f"every_n = {int(every_n)} AND "
-                 f"prompt_hash = '{prompt_hash}'")
+                 f"prompt_hash = '{prompt_hash}' AND "
+                 f"sample_key = '{sample_key or ''}'")
         return self._delete_rows(table, where, f"md5={md5[:12]}")
 
     def _delete_rows(self, table, where: str, label: str) -> int:

@@ -33,6 +33,15 @@ import threading
 import time
 from typing import List, Optional
 
+import numpy as np
+
+from app.core.video.frame_judge import (
+    DEFAULT_EVERY_N,
+    EXPOSED_METRICS,
+    MODE_MANUAL,
+    FrameJudge,
+)
+
 import cv2
 
 
@@ -134,6 +143,16 @@ class VideoSession:
         self._subscribers: List[queue.Queue] = []
         self._subscribers_lock = threading.Lock()
 
+        # 帧判据（app/core/video/frame_judge.py）：决定"这一帧要不要送给
+        # frame sink"，并把逐帧分数留给 UI 画曲线 / 浮框。
+        #
+        # **判据是唯一的节流旋钮** —— 下游 detector 一律收到 every_n=1，
+        # 否则两级节流相乘（间隔 30 撞上 30 = 900 帧才送一帧），卡片上
+        # 写的"间隔 N 帧"就成了假话。默认值 30 与三张卡历史上 detector 的
+        # every_n 默认值一致，所以接入判据**不改变**开箱行为。
+        self._judge = FrameJudge(mode=EXPOSED_METRICS[0], every_n=DEFAULT_EVERY_N)
+        self._judge_lock = threading.Lock()
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -147,7 +166,36 @@ class VideoSession:
                 "is_live": self._is_live,
                 "loop": self._loop,
                 "last_frame_ts": self._last_frame_ts,
+                # 判据视图 —— 四张视频卡共用同名字段，前端一套组件直接读。
+                "judge": self._judge.snapshot(),
             }
+
+    # ------------------------------------------------------------------ #
+    # 帧判据
+    # ------------------------------------------------------------------ #
+    def configure_judge(self, mode: Optional[str] = None,
+                        every_n: Optional[int] = None,
+                        threshold: Optional[float] = None) -> dict:
+        """配置判据（算法 / 阈值 / 帧间隔），返回新的判据视图。
+
+        ``mode`` 既可以是 ``"manual"``（手动跳帧），也可以是
+        ``frame_judge.metrics()`` 暴露的任一度量名（当前只有 ``conc``）。
+        未知名字回落 ``manual``；**已下架的 ``z_mad`` / ``auto`` 则迁移到
+        ``conc`` 并重置阈值**（见 ``frame_judge._migrate``）。
+        """
+        with self._judge_lock:
+            self._judge.reconfigure(mode=mode, every_n=every_n,
+                                    threshold=threshold)
+            return self._judge.snapshot()
+
+    def judge_snapshot(self) -> dict:
+        """判据只读视图（不夹 ``self._lock``，decode 热路径不碰它）。"""
+        return self._judge.snapshot()
+
+    def reset_judge(self) -> None:
+        """新一段视频前清空参照帧 —— 循环重播 / 重开源时必须调用，
+        否则上一段的尾帧会继续当参照帧，算出一个人为的巨大「变化」。"""
+        self._judge.reset()
 
     def open(self, source: str, timeout: float = 10.0, loop: bool = False) -> dict:
         """Tear down any active source and open a new one.
@@ -202,6 +250,53 @@ class VideoSession:
             self._cap = cap
             self._width = cap.width
             self._height = cap.height
+            # **buf0 / buf1 / buf2 三级 buffer 架构**（v0.19 用户拍板）：
+            #
+            # * **buf0** = mpp 出来的原始分辨率 Y 平面（1920×1080 灰度）—— 给
+            #   **网页预览**用，让用户看清原始画面，不再是 160×90 缩略图拉伸。
+            # * **buf1** = buf0 第一次 resize 到的**推理分辨率**（中间尺寸
+            #   src//4，避开 librga 7x 缩放比坑）—— 给**模型推理**用，NPU
+            #   看到的是中等分辨率（480×270 / 640×360），不是被压成 160×90
+            #   的缩略图。
+            # * **buf2** = buf1 第二次 resize 到 160×90 缩略图—— 给**帧判据
+            #   gscore**用（gscore 期望 8x8 块网格在小图上跑，160×90 是标定
+            #   过的尺寸）。
+            #
+            # 三级都**在 ndarray 阶段**走（mpp frame 一次性出原始 NV12
+            # ndarray，wdnwebui 侧用 cv2.resize 缩两级）—— librga 7x 缩放
+            # 比坑不踩，因为 mpp 那一次 read0 **不缩放**（src 尺寸直出）。
+            long_side = self._judge.long_side
+            src_w, src_h = cap.width, cap.height
+            # ---- thumb 尺寸（buf2）: 160×90 缩略图给 gscore
+            if src_w >= src_h and src_w > 0:
+                self._thumb_w = long_side
+                self._thumb_h = max(1, int(round(src_h * long_side / src_w)))
+            elif src_h > 0:
+                self._thumb_h = long_side
+                self._thumb_w = max(1, int(round(src_w * long_side / src_h)))
+            else:  # pragma: no cover - 不会到这里
+                self._thumb_w, self._thumb_h = long_side, long_side
+            # ---- mid 尺寸（buf1）: 推理分辨率
+            # 设计：每级缩放比 ≤ 6x（librga 7x 边界留 1x 余量；实测 8x 失败
+            # 6x 稳定）。buf0 → buf1 缩放比 4x，buf1 → buf2 缩放比 3x，
+            # 都安全。
+            mid_long = max(long_side * 4, max(src_w, src_h) // 4)
+            mid_long = min(mid_long, max(src_w, src_h))
+            mid_long = (mid_long + 15) & ~15
+            if src_w >= src_h:
+                self._mid_w = mid_long
+                self._mid_h = max(1, int(round(src_h * mid_long / src_w)))
+            else:
+                self._mid_h = mid_long
+                self._mid_w = max(1, int(round(src_w * mid_long / src_h)))
+            self._mid_w = (self._mid_w + 15) & ~15
+            self._mid_h = (self._mid_h + 15) & ~15
+            # mid 必须**严格**比 thumb 大（buf1 → buf2 是真下采样，不能
+            # 是放大）：mid_long 至少是 thumb_long * 2，否则直接缩到 thumb
+            # 尺寸（avoid 两次 cv2.resize 走冤枉路）
+            if self._mid_w < self._thumb_w * 2 or self._mid_h < self._thumb_h * 2:
+                # src 太小（< 320 长边），直接一步到 thumb，不走 mid
+                self._mid_w, self._mid_h = 0, 0
             self._fps = float(getattr(cap, "fps", 0.0) or 0.0)
             if self._fps <= 0 and not self._is_live:
                 try:
@@ -547,9 +642,20 @@ class VideoSession:
                     self._cap = cap
                     self._width = cap.width
                     self._height = cap.height
+                    long_side = self._judge.long_side
+                    src_w, src_h = cap.width, cap.height
+                    if src_w >= src_h and src_w > 0:
+                        self._thumb_w = long_side
+                        self._thumb_h = max(1, int(round(src_h * long_side / src_w)))
+                    elif src_h > 0:
+                        self._thumb_h = long_side
+                        self._thumb_w = max(1, int(round(src_w * long_side / src_h)))
+                    else:  # pragma: no cover
+                        self._thumb_w, self._thumb_h = long_side, long_side
                     self._fps = float(getattr(cap, "fps", 0.0) or 0.0)
                     self._frame_pos = 0
                     self._state = self.STATE_PLAYING
+                self._judge.reset()
                 # Pre-compute the fallback interval (PTS path overrides
                 # it at decode time when time_base is available).
                 if self._fps > 0:
@@ -563,7 +669,18 @@ class VideoSession:
             try:
                 if _TIMING_ENABLED:
                     _t0_read0 = time.monotonic()
-                ret, frame0 = cap.read0()
+                # **mpp 内置 RGA 一次出原始 BGR**（buf0）—— read0 用
+                # fmt='BGR' 让 wdnav 走 mpp DMA-BUF 路径（**物理连续内存**）
+                # 调 RGA NV12→BGR。这是 wdnav 0.5.2 的"正确"彩色路径：
+                # 同尺寸 1920×1080 NV12→BGR 不踩 librga 7x 缩放比上限
+                # （实测 OK），且 librga 在 mpp DMA-BUF fd 上 map 成功。
+                #
+                # 之前一版曾尝试 read0(fmt='NV12') 拿 NV12 ndarray 再用
+                # wdnav rga.cvtcolor 二次转换，但 `rga.wrap_virtual(numpy
+                # heap ptr)` librga 在 Python heap 虚拟地址上 map 失败
+                # （job buffer map failed）—— 静默失败，buf 是脏数据；
+                # fallback 到灰度让用户看到"花屏"或单色。
+                ret, frame0 = cap.read0(w=None, h=None, fmt="BGR")
                 if _TIMING_ENABLED:
                     _t_acc_read0 += time.monotonic() - _t0_read0
             except Exception as e:  # pragma: no cover - depends on source
@@ -591,6 +708,9 @@ class VideoSession:
                     with self._lock:
                         self._frame_pos = 0
                         self._state = self.STATE_PLAYING
+                    # 循环重播：清掉判据参照帧，让新一段的第一帧重新当
+                    # 基准。否则拿上一段尾帧做参照，算出的「变化」是人为的。
+                    self._judge.reset()
                     play_start_wall = 0.0
                     pts_start = 0
                     next_frame_wall = 0.0
@@ -613,11 +733,39 @@ class VideoSession:
             try:
                 if _TIMING_ENABLED:
                     _t0_numpy = time.monotonic()
-                frame = frame0.numpy()
+                # **buf0 = 原始分辨率彩色 BGR ndarray**（v0.19 + 修正花屏）：
+                # read0(fmt='BGR') 走 mpp 内置 RGA NV12→BGR（DMA-BUF
+                # 路径），frame.numpy() 直接给 (h, w, 3) BGR ndarray。
+                # **不要**再走 wdnav rga.cvtcolor —— numpy heap 虚拟地址上
+                # librga map 失败，buf 是脏数据，让预览花屏。
+                buf0_bgr = frame0.numpy()
+                # **buf1 = 推理分辨率**（中间尺寸，src//4）BGR —— 给模型推理。
+                if self._mid_w > 0:
+                    buf1 = cv2.resize(
+                        buf0_bgr,
+                        (self._mid_w, self._mid_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    buf1 = buf0_bgr
+                # **buf2 = 160×90 灰度缩略图** —— 给 gscore 帧判据。
+                if self._mid_w > 0 and (
+                        buf1.shape[1] != self._thumb_w or
+                        buf1.shape[0] != self._thumb_h):
+                    buf1_thumb = cv2.resize(
+                        buf1,
+                        (self._thumb_w, self._thumb_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    buf1_thumb = buf1
+                buf2 = cv2.cvtColor(buf1_thumb, cv2.COLOR_BGR2GRAY)
+                # sinks 拿 **buf1**（中间尺寸 BGR）做 NPU 推理 + base64 帧。
+                frame = buf1
                 if _TIMING_ENABLED:
                     _t_acc_numpy += time.monotonic() - _t0_numpy
-                    _t_size_w = int(frame.shape[1])
-                    _t_size_h = int(frame.shape[0])
+                    _t_size_w = int(buf1.shape[1])
+                    _t_size_h = int(buf1.shape[0])
             except Exception as e:
                 # RGA conversion failure (e.g. unsupported size on this
                 # board). Skip this frame rather than crashing the loop.
@@ -625,9 +773,13 @@ class VideoSession:
 
             if _TIMING_ENABLED:
                 _t0_encode = time.monotonic()
+            # **预览 JPEG 用 buf0_bgr**（原始分辨率彩色）—— 用户拍板 v0.19
+            # 要看**彩色**原始画面。buf1/buf2 在 numpy 阶段已经算好，下
+            # 面 sinks 拿 buf1 做 base64 帧（中间尺寸 NPU 推理），buf2 喂
+            # gscore。
             ok, buf = cv2.imencode(
                 ".jpg",
-                frame,
+                buf0_bgr,
                 [int(cv2.IMWRITE_JPEG_QUALITY), self.JPEG_QUALITY],
             )
             if _TIMING_ENABLED:
@@ -651,11 +803,27 @@ class VideoSession:
             sinks = self._current_sinks()
             if _TIMING_ENABLED:
                 _t0_sinks = time.monotonic()
+            # 判帧先跑：它决定本帧要不要送给 sink，并顺手把分数记进
+            # 环形缓冲（UI 曲线 / 浮框读它）。判为"没变化"的帧**照样
+            # 广播给 WS 预览** —— 省的是推理算力，不是给人看的画面。
+            # **buf2**（160×90 缩略图）喂 gscore：8x8 块网格在标定过的
+            # 尺寸上跑，threshold=10 是 gscore 标定值。
+            take = self._judge.observe(buf2, cur_frame_pos)
+            if not take:
+                sinks = []
             if sinks:
-                # 共用上面 ``jpg`` 字节 —— 重复 cv2.imencode 每帧 ~15-25ms,
-                # 实时流 + detector 用同帧同内容,质量共用 JPEG_QUALITY。
+                # detector 拿 **buf1**（中间尺寸 BGR）的 base64 JPEG —— 与
+                # ndarray 尺寸匹配。buf0_bgr 的 jpeg 给 WS 网页预览。
                 try:
-                    frame_b64_for_detector = base64.b64encode(jpg).decode("ascii")
+                    _ok1, _buf1 = cv2.imencode(
+                        ".jpg",
+                        buf1,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), self.JPEG_QUALITY],
+                    )
+                    frame_b64_for_detector = (
+                        base64.b64encode(bytes(_buf1)).decode("ascii")
+                        if _ok1 else ""
+                    )
                 except Exception as _enc_e:  # noqa: BLE001
                     LOG.debug(
                         "video_session: detector frame_b64 base64 encode "
@@ -664,9 +832,28 @@ class VideoSession:
                     frame_b64_for_detector = ""
             else:
                 frame_b64_for_detector = ""
+            # 本帧的判据分数**一并送给 sink**：下游要把"这一帧为什么被送检"
+            # 写进检测事件，事件历史里没有这个数就分不清是阈值触发还是
+            # 兜底触发（后者本来就允许阈值以下的帧送检）。只送给 take=True
+            # 的帧，所以分数一定非空；手动跳帧模式下判据不算分，为 None。
+            judge_score = self._judge.current_score if take else None
             for sink in sinks:
                 try:
-                    sink(frame, cur_frame_pos, frame_b64_for_detector)
+                    sink(frame, cur_frame_pos, frame_b64_for_detector,
+                         judge_score)
+                except TypeError as e:
+                    # sink 还是老的 3 参签名 —— 判据分数是**附加**信息，
+                    # 不该因为它把 sink 打挂。按老签名再调一次。
+                    if "positional argument" not in str(e):
+                        raise
+                    try:
+                        sink(frame, cur_frame_pos, frame_b64_for_detector)
+                    except Exception as e2:  # noqa: BLE001
+                        LOG.warning(
+                            "video_session: frame sink raised "
+                            "(frame_pos=%d): %s: %s",
+                            cur_frame_pos, type(e2).__name__, e2,
+                        )
                 except Exception as e:  # noqa: BLE001
                     LOG.warning(
                         "video_session: frame sink raised (frame_pos=%d): "

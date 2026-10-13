@@ -35,6 +35,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from app.core.video.change_detector import (
+    DEFAULT_CHANGE_THRESHOLD,
+    SAMPLE_MODE_AUTO,
+    SAMPLE_MODE_MANUAL,
+    ChangeDetector,
+)
+from app.core.video.frame_judge import (DEFAULT_LONG_SIDE, LEGACY_MODE_ALIASES,
+                                       metrics, normalize_mode)
+
 
 try:
     from wdnav import VideoCapture as _WdnavVideoCapture
@@ -1386,6 +1395,22 @@ class VideoAnalysisSearchService:
         self._source = ""
         self._prompt = ""
         self._every_n = 30
+        # 采样模式：``manual`` 固定间隔（原行为，零额外开销）/ 其余为
+        # ``frame_judge.metrics()`` 暴露的判帧算法名，按画面
+        # 变化采样。自动模式下 ``_every_n`` 语义变为"**最长间隔上限**"
+        # （兜底：静止画面太久也强制送检，防止 VLM 结果永不刷新）。
+        self._sample_mode = SAMPLE_MODE_AUTO
+        self._change_threshold = DEFAULT_CHANGE_THRESHOLD
+        # 本轮真正在用的判帧器；手动模式下是 FrameJudge(manual) 实例，
+        # 它不做差分、不跑 RGA，所以构造它本身没有开销。
+        self._change_detector = None
+        # 运行中改判据时暂存 ``(mode, every_n, threshold)``，**下次 start
+        # 才生效**。中途换阈值会让本轮的帧集混用两把尺子，落库的
+        # ``sample_mode`` / 缓存键也跟着错位。``None`` = 无待生效改动。
+        self._pending_judge = None
+        # 判据 WS 推送节流（decode 侧）：解码可能跑到几百 fps，而 VLM 推理
+        # 约 1 帧/数秒 —— 只靠 state 推送的话曲线会一跳一大段。
+        self._judge_push_ts = 0.0
         self._is_live = False
         self._cap = None
         self._width = 0
@@ -1476,6 +1501,17 @@ class VideoAnalysisSearchService:
                 "source":        self._source,
                 "prompt":        self._prompt,
                 "every_n":       self._every_n,
+                # 采样模式：manual = 固定间隔；auto = 按画面变化采样
+                # （every_n 此时是"最长间隔"兜底）。
+                "sample_mode":   self._sample_mode,
+                "change_threshold": self._change_threshold,
+                # 判据完整视图（分数环形缓冲 + 当前判定）—— 与 vd/vtd/vtl
+                # 的 snap.judge 同名同结构，前端一套组件直接读。
+                # **判据器可能还没建**：进程刚起来、还没 open 过一次分析、
+                # 也没人调过 /judge 时它是 None（那时它还没被任何 decode 循环
+                # 消费过，没有分数可言）。直接 .snapshot() 会让
+                # GET /analysis 整个 500 —— 前端一进 VAS 页就打这个端点。
+                "judge":         self._judge_snapshot_safe(),
                 "is_live":       self._is_live,
                 "width":         self._width,
                 "height":        self._height,
@@ -1543,7 +1579,9 @@ class VideoAnalysisSearchService:
     # ------------------------------------------------------------------ #
     # 控制
     # ------------------------------------------------------------------ #
-    def start(self, source: str, prompt: str, every_n: int = 30) -> dict:
+    def start(self, source: str, prompt: str, every_n: int = 30,
+                 sample_mode: str = "manual",
+                 change_threshold: Optional[float] = None) -> dict:
         ok, _, wdnai_err = _load_wdnai()
         if not ok:
             raise RuntimeError(f"wdnai 不可用: {wdnai_err}")
@@ -1557,6 +1595,30 @@ class VideoAnalysisSearchService:
             every_n = max(1, int(every_n))
         except (TypeError, ValueError):
             raise ValueError("every_n 必须为整数")
+
+        # 采样模式校验。``manual`` = 固定 every_n 帧（原行为，零额外开销）；
+        # 其余是判帧算法名（见 ``frame_judge.metrics``）。老前端可能仍传
+        # 字面量 ``auto``（历史上它硬编码走已下架的 z_mad），这里显式映射，
+        # 不靠兼容层兜。
+        mode_in = str(sample_mode or "manual").strip().lower()
+        sample_mode = normalize_mode(mode_in)
+        if sample_mode != mode_in and mode_in not in LEGACY_MODE_ALIASES:
+            raise ValueError(
+                "sample_mode 必须是 manual 或 %s 之一" % "/".join(metrics()))
+        if mode_in in LEGACY_MODE_ALIASES:
+            # 存量配置带着**旧刻度**的阈值（z_mad 是灰阶口径，线上实测 1.0），
+            # 直接套到 conc 上会几乎每帧都触发 —— 比漏检更糟。这里丢掉它，
+            # 走 conc 的默认值，而不是给老客户端一个 400（那会让"升级后点开始
+            # 就报错"，比静默失效还难排查）。
+            change_threshold = None
+        if change_threshold is None:
+            change_threshold = DEFAULT_CHANGE_THRESHOLD
+        try:
+            change_threshold = float(change_threshold)
+        except (TypeError, ValueError):
+            raise ValueError("change_threshold 必须是数字")
+        if not (0.0 < change_threshold <= 1000.0):
+            raise ValueError("change_threshold 必须在 (0, 1000] 区间")
 
         # v0.10 关键修复：用户传 "describe scene" 这种英文 prompt 时，
         # qwen3-vl-4b 会输出 700+ 字的英文段落描述（"This is a close-up
@@ -1610,18 +1672,27 @@ class VideoAnalysisSearchService:
                 LOG.warning("vfa: md5 计算失败（本次不查缓存）%s: %s",
                             source, e)
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+        # 采样模式指纹进键：自动模式下阈值不同 → 采到的帧集不同 → 结果
+        # 不同。缺了它会出现"我改了模式，结果却一模一样"（缓存串味）。
+        # 手动模式返回空串，与迁移前写入的历史行完全一致（不失效旧缓存）。
+        from app.core.video.cache import analysis_sample_key
+        sample_key = analysis_sample_key(sample_mode, change_threshold)
         if md5:
             from app.core.video.cache import get_video_cache
             cache = get_video_cache()
-            entry = (cache.lookup_analysis(md5, every_n, prompt_hash)
+            entry = (cache.lookup_analysis(md5, every_n, prompt_hash,
+                                           sample_key)
                      if cache is not None else None)
             if entry:
-                LOG.info("vfa: 分析缓存命中 md5=%s every_n=%d (%d 帧) — "
+                LOG.info("vfa: 分析缓存命中 md5=%s every_n=%d mode=%s (%d 帧) — "
                          "跳过逐帧，直接生成综述",
-                         md5[:12], every_n, len(entry.get("events") or []))
+                         md5[:12], every_n, sample_mode,
+                         len(entry.get("events") or []))
                 return self._start_from_cache(
                     entry, source=source, prompt=prompt, every_n=every_n,
-                    md5=md5, prompt_hash=prompt_hash)
+                    md5=md5, prompt_hash=prompt_hash,
+                    sample_mode=sample_mode,
+                    change_threshold=change_threshold)
 
         # 同一服务串行：若还在跑，先强制收尾（不抛错）。同时把上一
         # 轮的快照落盘（run_id 不同），避免被覆盖丢失。
@@ -1636,6 +1707,17 @@ class VideoAnalysisSearchService:
             self._source = source
             self._prompt = prompt
             self._every_n = every_n
+            self._sample_mode = sample_mode
+            self._change_threshold = change_threshold
+            # 本轮判据配置已物化进上面三个字段 —— 运行中改的待生效值在这里
+            # 被吸收，不要残留到下一轮。判据推送节流也随新 run 归零。
+            self._pending_judge = None
+            self._judge_push_ts = 0.0
+            # 手动模式下判帧器不做差分、不跑 RGA → decode 循环走原来的
+            # ``cur_pos % every_n == 0``，零额外开销。
+            self._change_detector = ChangeDetector(
+                sample_mode=sample_mode, every_n=every_n,
+                change_threshold=change_threshold)
             self._is_live = (
                 "://" in source or source.startswith("/dev/video")
             )
@@ -1704,15 +1786,19 @@ class VideoAnalysisSearchService:
         return self.snapshot()
 
     def _start_from_cache(self, entry: dict, *, source: str, prompt: str,
-                          every_n: int, md5: str, prompt_hash: str) -> dict:
+                          every_n: int, md5: str, prompt_hash: str,
+                          sample_mode: str = "manual",
+                          change_threshold: Optional[float] = None) -> dict:
         """缓存命中路径：恢复逐帧结果 + 场景边界，只跑综述。
 
         **跳过** decode / 采样 / 逐帧 VLM 三段（昂贵的 NPU 逐帧推理），
         直接从 LanceDB 恢复 ``events`` + ``scene_boundaries`` 进入
         ``STATE_SUMMARIZING``；综述完成时 ``_persist`` 按
-        ``(md5, every_n, prompt_hash)`` 幂等覆盖同一缓存行 → 不产生重复
-        历史条目。
+        ``(md5, every_n, prompt_hash, sample_key)`` 幂等覆盖同一缓存行 →
+        不产生重复历史条目。
         """
+        if change_threshold is None:
+            change_threshold = DEFAULT_CHANGE_THRESHOLD
         if self._state in (self.STATE_RUNNING, self.STATE_OPENING,
                            self.STATE_DONE, self.STATE_STOPPED,
                            self.STATE_ERROR, self.STATE_SUMMARIZING):
@@ -1733,6 +1819,17 @@ class VideoAnalysisSearchService:
             self._source = source
             self._prompt = prompt
             self._every_n = every_n
+            # 缓存命中恢复：逐帧来自缓存（不再解码），但采样模式要如实
+            # 恢复 —— 否则前端显示的"间隔 N 帧"与实际运行模式不符，
+            # 后续 _persist 也会用错的 sample_key 覆盖缓存行。
+            self._sample_mode = sample_mode
+            self._change_threshold = change_threshold
+            # 同 start()：配置已物化，清掉待生效值（本路径不再解码，
+            # 判据器只用于让历史元数据如实显示）。
+            self._pending_judge = None
+            self._change_detector = ChangeDetector(
+                sample_mode=sample_mode, every_n=every_n,
+                change_threshold=change_threshold)
             self._is_live = False
             self._started_at = time.time()
             self._error = ""
@@ -1817,6 +1914,97 @@ class VideoAnalysisSearchService:
         self._teardown(reason="stopped")
         return self.snapshot()
 
+    # ------------------------------------------------------------------ #
+    # 帧判据（前端配置入口，见 judge_api.py）
+    # ------------------------------------------------------------------ #
+    def _judge_snapshot_safe(self) -> dict:
+        """判据器的快照，**判据器还没建时**退回配置视图（不会 500）。
+
+        ``snapshot()`` 与 ``judge_view()`` 都要用，所以抽出来共用一份 ——
+        两处各写一遍 fallback，迟早有一处漏掉 None 判断。
+        """
+        cd = self._change_detector
+        if cd is None:
+            return self._judge_cfg_view()
+        return cd.snapshot()
+
+    def _judge_cfg_view(self) -> dict:
+        """「只有配置、没有运行数据」的判据视图。"""
+        return {
+            "mode": self._sample_mode,
+            "manual": self._sample_mode == SAMPLE_MODE_MANUAL,
+            "every_n": self._every_n, "threshold": self._change_threshold,
+            "long_side": DEFAULT_LONG_SIDE, "cur": None, "changed": False,
+            "evaluated": 0, "sampled": 0, "above_ratio": 0.0, "recent": [],
+            "applied": True,
+        }
+
+    def judge_view(self) -> dict:
+        """**配置**视图：前端配置区该显示什么。与 vd/vtd/vtl 的
+        ``snap.judge`` 同名同结构，前端一套组件直接读。
+
+        与 ``snapshot()["judge"]`` 的区别：那个是**本轮运行真实**的判据状态
+        （喂浮框 / 曲线），这个是**用户设的**配置（喂配置区）。运行中改配置
+        不会影响本轮，两者短暂不一致是有意为之。
+        """
+        with self._lock:
+            if self._pending_judge is not None:
+                mode, every_n, threshold = self._pending_judge
+                return {
+                    "mode": mode, "manual": mode == SAMPLE_MODE_MANUAL,
+                    "every_n": every_n, "threshold": threshold,
+                    "long_side": DEFAULT_LONG_SIDE, "cur": None,
+                    "changed": False, "evaluated": 0, "sampled": 0,
+                    "above_ratio": 0.0, "recent": [], "applied": False,
+                }
+            return {**self._judge_snapshot_safe(), "applied": True}
+
+    def configure_judge(self, mode: Optional[str] = None,
+                       every_n: Optional[int] = None,
+                       threshold: Optional[float] = None) -> dict:
+        """配置帧判据 —— 空闲时立刻生效，运行中则**下次开始分析时生效**。
+
+        为什么运行中不热切
+        ------------------
+        判据决定"哪些帧送去跑 VLM"。中途换阈值 / 换算法，本轮的帧集就会
+        混用两把尺子，既不可复现（同一视频两次跑结果不同），落库时的
+        ``sample_mode`` 与缓存键也会按新值写、按旧值采 —— 历史列表上显示的
+        "间隔 N 帧 / 阈值 20" 是假的。所以运行中只暂存（``_pending_judge``），
+        空闲时没有 decode 循环在跑，直接换判据器。
+
+        ``mode`` / ``every_n`` / ``threshold`` 任一为 None → **保留当前
+        值**，不重建 ChangeDetector。JudgePayload default = "manual"（向
+        后兼容），但前端只改 every_n 的请求 body 里 mode 字段是空字符串，
+        judge_api 把它转 None 传进来 —— 这条路径不再误把 mode 强制设成
+        manual。ChangeDetector 本身也用 SAMPLE_MODE_AUTO（gscore）当默认
+        sample_mode，新装服务从一开始就是 gscore。
+        """
+        with self._lock:
+            cur_mode = self._sample_mode
+            cur_n = self._every_n
+            cur_t = self._change_threshold
+            new_mode = cur_mode if mode is None or mode == "" else mode
+            new_n = cur_n if every_n is None else int(every_n)
+            new_t = cur_t if threshold is None else float(threshold)
+            cd = ChangeDetector(sample_mode=new_mode, every_n=new_n,
+                                change_threshold=new_t)
+            active = self._state in (self.STATE_OPENING, self.STATE_RUNNING,
+                                     self.STATE_SUMMARIZING)
+            if active:
+                self._pending_judge = (cd.mode, cd.every_n, cd.threshold)
+            else:
+                self._change_detector = cd
+                self._pending_judge = None
+                # 同步 run 元数据：这三个字段会随快照落进缓存与历史列表，
+                # 必须与真实判据一致，否则恢复出来的 run 显示的是假配置。
+                self._every_n = cd.every_n
+                self._sample_mode = cd.sample_mode
+                self._change_threshold = cd.threshold
+        LOG.info("vas judge configured: mode=%s every_n=%d threshold=%.2f%s",
+                 cd.mode, cd.every_n, cd.threshold,
+                 "（下次开始生效）" if active else "")
+        return self.judge_view()
+
     def close(self) -> dict:
         self._stop_event.set()
         self._teardown(reason="closed")
@@ -1865,13 +2053,15 @@ class VideoAnalysisSearchService:
     def _persist(self) -> bool:
         """把当前快照写入 LanceDB（``kind='analysis'`` 行，幂等覆盖）。
 
-        分析缓存键 = ``(md5, every_n, prompt_hash)``；同一 run 重复 persist
-        （done 后 summary 更新、stop 后状态变更）会覆盖同一行，不产生重复。
+        分析缓存键 = ``(md5, every_n, prompt_hash, sample_key)``；同一 run
+        重复 persist（done 后 summary 更新、stop 后状态变更）会覆盖同一行，
+        不产生重复。``sample_key`` 区分手动 / 自动采样（阈值不同结果不同）。
 
         **live 流**没有本地文件 → md5 用 ``live-<run_id>`` 伪值：依然进
         历史列表（可见 run 记录），但不可能被其它 live 流命中复用。这是
         刻意的 —— live 流内容每次不同，复用毫无意义。
         """
+        from app.core.video.cache import analysis_sample_key
         with self._lock:
             run_id = self._run_id
             if not run_id:
@@ -1880,11 +2070,17 @@ class VideoAnalysisSearchService:
             every_n = self._every_n
             prompt = self._prompt
             prompt_hash = self._prompt_hash
+            sample_mode = self._sample_mode
+            change_threshold = self._change_threshold
             payload = {
                 "run_id":      run_id,
                 "source":      self._source,
                 "prompt":      prompt,
                 "every_n":     every_n,
+                # 采样模式随快照落库：历史列表 / 恢复 run 时前端要按模式
+                # 显示（自动模式的 every_n 是"最长间隔"而非固定间隔）。
+                "sample_mode": sample_mode,
+                "change_threshold": change_threshold,
                 "is_live":     self._is_live,
                 "state":       self._state,
                 "error":       self._error,
@@ -1931,14 +2127,16 @@ class VideoAnalysisSearchService:
                   "duration_s": duration_s, "fps": fps,
                   "dirty_count": dirty_count},
             payload=payload,
+            sample_key=analysis_sample_key(sample_mode, change_threshold),
         )
 
     def list_runs(self) -> List[dict]:
         """从 LanceDB 取分析历史（按 finished_at / started_at 倒序）。
 
-        响应结构与旧的 JSON 扫描版**完全一致**（前端零改动）：每条含
+        响应结构与旧的 JSON 扫描版**向后兼容**（老字段不动）：每条含
         run_id / source / prompt / every_n / state / started_at /
-        finished_at / events_count / has_summary / path / total_frames / fps。
+        finished_at / events_count / has_summary / path / total_frames / fps，
+        另增 ``sample_mode``（历史列表按模式显示"间隔 N 帧"还是"自动判帧"）。
         ``total_frames`` / ``started_at`` / ``finished_at`` 从行内
         ``meta_json``（完整 payload）取 —— 新 run 一定有值，不再需要
         PyAV 自愈探测。
@@ -1955,6 +2153,7 @@ class VideoAnalysisSearchService:
                 "source":       str(payload.get("source") or ""),
                 "prompt":       a.get("prompt") or "",
                 "every_n":      int(a.get("every_n") or 30),
+                "sample_mode":  str(payload.get("sample_mode") or "manual"),
                 "state":        a.get("state") or "unknown",
                 "started_at":   float(payload.get("started_at") or 0.0),
                 "finished_at":  float(payload.get("finished_at") or 0.0),
@@ -1984,6 +2183,7 @@ class VideoAnalysisSearchService:
             "source":       str(payload.get("source") or ""),
             "prompt":       str(entry.get("prompt") or ""),
             "every_n":      int(entry.get("every_n") or 30),
+            "sample_mode": str(payload.get("sample_mode") or "manual"),
             "is_live":      bool(payload.get("is_live", False)),
             "state":        str(entry.get("state") or "unknown"),
             "total_frames": int(payload.get("total_frames") or 0),
@@ -2080,6 +2280,23 @@ class VideoAnalysisSearchService:
             self._source = data.get("source", "")
             self._prompt = data.get("prompt", "")
             self._every_n = int(data.get("every_n", 30) or 30)
+            # 采样模式随历史快照恢复（缺省手动 = 迁移前的老行）。
+            self._sample_mode = str(data.get("sample_mode") or "manual")
+            # 存量快照里的阈值是**旧度量刻度**（z_mad 灰阶口径），不能直接
+            # 沿用 —— 判据器会把它迁成 conc+默认阈值，这里若不同步，
+            # 落库的 sample_mode / 缓存键就会与真正在跑的判据对不上。
+            if self._sample_mode in LEGACY_MODE_ALIASES:
+                self._sample_mode = normalize_mode(self._sample_mode)
+                self._change_threshold = DEFAULT_CHANGE_THRESHOLD
+            else:
+                self._change_threshold = float(
+                    data.get("change_threshold")
+                    or DEFAULT_CHANGE_THRESHOLD)
+            # 判帧器按恢复出的模式重建：历史 run 的 snapshot 会带上真实
+            # 模式，否则前端显示的"间隔 N 帧"与实际运行模式不符。
+            self._change_detector = ChangeDetector(
+                sample_mode=self._sample_mode, every_n=self._every_n,
+                change_threshold=self._change_threshold)
             self._is_live = bool(data.get("is_live", False))
             self._state = data.get("state", self.STATE_DONE)
             self._error = data.get("error", "")
@@ -2155,6 +2372,10 @@ class VideoAnalysisSearchService:
             self._height = 0
             self._fps = 0.0
             self._finished_at = 0.0
+            # 判帧器状态必须清 —— 否则上一 run 的参照帧会污染新 run 的
+            # 首帧判定（首帧不送检，用户点"开始"后迟迟没结果）。
+            if self._change_detector is not None:
+                self._change_detector.reset()
         # 每次 run 重置超时计数 + 自动重启防抖（避免跨 run 残留）
         self._consecutive_timeouts = 0
         self._auto_restarted = False
@@ -2297,12 +2518,25 @@ class VideoAnalysisSearchService:
             with self._lock:
                 self._frame_pos = int(getattr(cap, "frame_pos", self._frame_pos) or 0)
                 cur_pos = self._frame_pos
-                every_n = self._every_n
+                change_detector = self._change_detector
             # 场景检测 —— 每帧调用（cv2 操作很便宜）
             self._update_scene_detection(frame, cur_pos)
-            # 取样判定 —— 反压点：worker 还在推理前一个样本时，decode 停
+            # 取样判定交给 ChangeDetector：手动模式走固定间隔（逐位不变、
+            # 零额外开销），自动模式走毫秒级判帧（变化 或 满 every_n 帧
+            # 兜底才送）。它内部已把异常降级为"送检"，不静默丢帧。
+            take = change_detector.should_sample(frame, cur_pos)
+            # 判据单独推一路（每 0.5s 最多一次）。只靠 state 推送的话，
+            # 解码已经跑出去几百帧而 VLM 才回来一帧 —— 曲线会一跳一大段，
+            # 浮框里的"这一帧变了没有"也严重滞后。手动模式无分数可推，跳过。
+            if change_detector.is_auto:
+                now = time.monotonic()
+                if now - self._judge_push_ts >= 0.5:
+                    self._judge_push_ts = now
+                    self._broadcast({"type": "judge",
+                                     "judge": change_detector.snapshot()})
+            # 反压点：worker 还在推理前一个样本时，decode 停
             # 在这里直到 worker 把上一个样本从队列里 get 走（set event）。
-            if cur_pos > 0 and cur_pos % every_n == 0:
+            if take:
                 # 等 worker 准备好（短超时轮询，方便响应 stop）
                 while not self._stop_event.is_set():
                     if self._worker_ready.wait(timeout=0.1):
