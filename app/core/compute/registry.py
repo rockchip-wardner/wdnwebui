@@ -3097,6 +3097,16 @@ class ComputeRegistry:
         except ValueError as e:
             LOG.error("compute.autostart 配置非法，已跳过开机启动: %s", e)
             entries = []
+        # v0.4+: 顺便读一下 active_app 标记 —— boot 后日志会顺手打印
+        # 一下当前记的"用户上次所在的卡片"。前端 bootRestore 会读
+        # 这个值并跳过去，这里**不**做导航（主进程没有 webview），
+        # 也不**清**它：active_app 是用户态偏好，boot 之后仍要保留
+        # 至少到用户主动离开卡片；自动失效由前端 _evaluate 检测
+        # cap 不全时 DELETE。这里打 log 是给运维 / 排障一个提示。
+        active_app_id = self.get_active_app()
+        if active_app_id:
+            LOG.info("boot: compute.active_app=%r （前端会读此值并自动"
+                     "跳到对应 #%s 页面）", active_app_id, active_app_id)
         if not entries:
             LOG.info("boot: compute.autostart 为空 —— 不自动启动任何模型"
                      "（算力页可手动启用）")
@@ -3910,6 +3920,190 @@ class ComputeRegistry:
         for e in out:
             e.pop("_rank", None)
         return out
+
+    # ------------------------------------------------------------------ #
+    # active_app：用户当前所在的"卡片模式"                              #
+    #                                                                    #
+    # 用途：当用户进入一个 demo 卡片、且其所有 software_capabilities      #
+    # 都已 running 时，前端把 app_id 写到这里的 ``compute.active_app``。  #
+    # 下次开机 / 重启时：                                                #
+    #   * 浏览器拉 ``GET /api/compute/active-app`` → 前端直接跳转到该    #
+    #     卡片页（无需再走一次 wizard）。                                  #
+    #   * 必要时 ``set_active_app`` 会把当前承载该 app 的本地 (model,    #
+    #     npu_index) 增量写进 ``compute.autostart``，让 worker 提前     #
+    #     spawn —— 否则 reboot 后 30~60s 的 NPU 加载会让用户以为"卡     #
+    #     住了"。                                                         #
+    #                                                                    #
+    # 故意不耦合 manifest：manifest 的 software_capabilities 由 API      #
+    # 层做查找与传入，registry 只负责"按给的 caps 校验 + 落盘"。         #
+    # ------------------------------------------------------------------ #
+
+    def get_active_app(self) -> Optional[str]:
+        """读取 ``compute.active_app`` —— 用户最近一次进入的卡片 id。
+
+        缺省 / 非字符串 → ``None``。**不**触发任何启动 / 校验。
+        """
+        try:
+            section = get_config().get_section("compute", {}) or {}
+        except Exception:  # noqa: BLE001
+            return None
+        v = section.get("active_app") if isinstance(section, dict) else None
+        return v if isinstance(v, str) and v else None
+
+    def set_active_app(
+        self,
+        app_id: str,
+        required_capabilities: list[str],
+    ) -> dict:
+        """记录 ``compute.active_app = app_id``，并按需扩展 autostart。
+
+        Parameters
+        ----------
+        app_id:
+            卡片 id（必须非空字符串）。调用方负责保证它对应一张
+            ``status="ok"`` 的 manifest —— registry 不耦合 manifest。
+        required_capabilities:
+            该 app 声明的 ``software_capabilities``。会逐个检查是否
+            至少有一个 **local**（spawned ∪ adopted_local）running 实例
+            提供该能力 —— 不接受远端 adopted（peer 那台板子 reboot
+            后就没了，留 autostart 等于留个空头）。
+        Returns
+        -------
+        dict
+            ``{"ok": True, "active_app": app_id,
+                "autostart": [...], "autostart_extended": [...]}``
+            其中 ``autostart_extended`` 列出了本次新增的 (model,
+            npu_index) —— 方便前端 / 运维看出"这次开启"实际多挂了几张
+            卡的 worker。
+        Raises
+        ------
+        ValueError
+            * ``app_id`` 不是非空字符串
+            * ``required_capabilities`` 里有不在 ``MODEL_PRESETS`` 注册
+              表中的 capability（用户拼错 / 老 manifest 残留字段）
+            * 任一 required_capability 当前**没有** local running 实例
+              （意味着 wizard 还没跑完 / 模型还没加载，贸然记下"active"
+              等于自我欺骗）。
+        """
+        if not isinstance(app_id, str) or not app_id:
+            raise ValueError("app_id 必须是非空字符串")
+
+        # 1. 校验 capability 拼写：所有 req 必须在 MODEL_PRESETS 至少一
+        #    个 preset 的 capability_types 里出现。否则就是用户 manifest
+        #    拼错 / 老字段。
+        registered_caps: set[str] = set()
+        for preset in MODEL_PRESETS.values():
+            for c in (preset.get("capability_types") or []):
+                registered_caps.add(c)
+        unknown = [
+            c for c in required_capabilities
+            if c not in registered_caps
+        ]
+        if unknown:
+            raise ValueError(
+                "未注册的 software_capability: "
+                + ", ".join(sorted(unknown))
+                + "（请检查 manifest 的 software_capabilities 字段）"
+            )
+
+        # 2. 检查每个 req 是否有 local running 实例承载。local =
+        #    spawned ∪ adopted_local —— adopted (LAN peer) 故意排除：
+        #    那台板子随时可能掉电，留个 autostart 进去下次启动等于啥
+        #    也没起来。
+        with self._lock:
+            local_running = [
+                inst for inst in self._instances.values()
+                if inst.status == "running"
+                and inst._source in ("spawned", "adopted_local")
+            ]
+
+        missing: list[str] = []
+        # 对每个 cap 找承载它的 local running 实例（不要求唯一）。
+        cap_to_local: dict[str, "ModelInstance"] = {}
+        for cap in required_capabilities:
+            chosen = next(
+                (i for i in local_running if cap in i.capability_types),
+                None,
+            )
+            if chosen is None:
+                missing.append(cap)
+            else:
+                cap_to_local[cap] = chosen
+        if missing:
+            raise ValueError(
+                "以下 required_capability 当前无 local running 实例: "
+                + ", ".join(missing)
+                + " —— 等模型加载完再进入此 app，或先在算力页启用对应模型"
+            )
+
+        # 3. 落盘：active_app + 增量扩展 autostart。任一失败抛 OSError
+        #    让上层 HTTP 层 502 透传。
+        try:
+            section = get_config().get_section("compute", {}) or {}
+        except Exception:  # noqa: BLE001
+            section = {}
+        if not isinstance(section, dict):
+            section = {}
+
+        prev_autostart = _parse_autostart_config(
+            section.get("autostart") if isinstance(section, dict) else None
+        )
+        # 索引：(model_id, npu_index) → True 方便 O(1) 去重
+        existing_keys: set[tuple[str, int]] = {
+            (e["model"], e["npu_index"]) for e in prev_autostart
+        }
+        extended: list[dict] = []
+        new_autostart = list(prev_autostart)
+        for cap, inst in cap_to_local.items():
+            key = (inst.model_id, inst.npu_index)
+            if key in existing_keys:
+                continue
+            new_entry = {"model": inst.model_id, "npu_index": inst.npu_index}
+            new_autostart.append(new_entry)
+            existing_keys.add(key)
+            extended.append({"capability": cap, **new_entry})
+
+        section["autostart"] = new_autostart
+        section["active_app"] = app_id
+        get_config().set_section("compute", section)
+
+        if extended:
+            LOG.info(
+                "compute.active_app=%s：autostart 新增 %d 条 —— %s",
+                app_id, len(extended), extended,
+            )
+        else:
+            LOG.info("compute.active_app=%s：autostart 无需扩展", app_id)
+
+        return {
+            "ok": True,
+            "active_app": app_id,
+            "autostart": list(new_autostart),
+            "autostart_extended": extended,
+        }
+
+    def clear_active_app(self) -> None:
+        """清除 ``compute.active_app`` 标记。
+
+        不动 ``compute.autostart`` —— autostart 是"开机该启的算力"，可能
+        还有别处依赖它（手动配 / 其它 app 共用），由用户去算力页关掉。
+        只清 active_app = "我当前不在这个 app 的模式了"。
+        """
+        try:
+            section = get_config().get_section("compute", {}) or {}
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(section, dict):
+            return
+        if "active_app" not in section:
+            return  # 已经是干净的，省一次 fs write
+        section.pop("active_app", None)
+        try:
+            get_config().set_section("compute", section)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("clear_active_app persist failed: %s", e)
+            return
+        LOG.info("compute.active_app 已清空")
 
 
 # --------------------------------------------------------------------------- #

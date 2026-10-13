@@ -129,6 +129,235 @@
   window.DemoGuard = DemoGuard;
 
   // ─────────────────────────────────────────────────────────────────────
+  // ActivateManager — 把"用户当前所在 app"同步到后端 config.jsonc
+  //   * 用户进入某张卡片、且该卡片所有 software_capabilities 都有
+  //     **local** running 实例（不依赖远端 adopted peer）承载时 →
+  //     PUT /api/compute/active-app。后端把当前承载该 app 的
+  //     (model, npu_index) 增量写进 compute.autostart —— 下次
+  //     reboot 时 worker 自动 spawn，用户不用再走一遍 wizard 才
+  //     让卡片进入"模型就绪"状态。
+  //   * 用户离开卡片（切到 home / 系统页 / 另一张卡）→ DELETE，
+  //     让 autostart 仍保留但 active_app 标记清掉。
+  //   * 后端会在 reboot 后的第一次 GET 看到 active_app 非空 → 前端
+  //     拿到该值后直接跳到对应 #<id>，不再让用户重新点卡片。
+  //
+  // 与 DemoGuard 的边界：
+  //   * DemoGuard 判定"页面在跑后台"（session.state in {playing,...}），
+  //     控制离开时是否弹 confirm。语义是"runtime 状态"。
+  //   * ActivateManager 判定"模型已加载"（capability 有 local running
+  //     实例），决定是否把"我在这"持久化到 config。语义是"模型就绪"。
+  //     这两者通常同步但不一定 —— 例如 video-target-detection 配完
+  //     流后 session 才开始 playing，而 video-detection 的 detector 一
+  //     启动 session.state 就已是 opening；ActivateManager 不看 session，
+  //     只看模型层 readiness，所以它会比 DemoGuard 早触发。
+  // ─────────────────────────────────────────────────────────────────────
+
+  const ActivateManager = {
+    _current:   null,        // 当前 _active_app 同步给后端的 app_id
+    _pollHandle: null,       // 1Hz 轮询 handle,仅在卡片页启用
+    _inFlight:  false,       // 防重入（_evaluate 本身是 async）
+    _bootDone:  false,       // 启动期 bootRestore 是否已跑过
+
+    _findManifest(appId) {
+      const ms = (window.__APP_MANIFESTS__
+                  && window.__APP_MANIFESTS__.cards) || [];
+      return ms.find((m) => m && m.id === appId) || null;
+    },
+
+    // 卡片"可作为 active_app 目标"：status=ok 且非 hidden。
+    _isTrackableCard(m) {
+      return !!(m && m.status === "ok" && m.hidden !== true);
+    },
+
+    _requiredCaps(m) {
+      if (!m) return [];
+      const caps = m.software_capabilities;
+      return Array.isArray(caps) ? caps.slice() : [];
+    },
+
+    // 从 /api/compute snapshot 判断"该 app 所需 cap 是否全部有 local
+    // running 实例"。adopted (LAN peer) 故意排除：peer reboot 后这
+    // 个 autostart 等于没意义,用户得手动在本机重启用对应模型。
+    _capsAllLocalRunning(caps, snapshot) {
+      if (!caps || caps.length === 0) return false;  // 无 cap 的不进入 active_app
+      if (!snapshot || !Array.isArray(snapshot.instances)) return false;
+      const localRunning = snapshot.instances.filter(
+        (i) => i && i.status === "running" && i.source !== "adopted"
+      );
+      return caps.every((cap) =>
+        localRunning.some((i) => Array.isArray(i.capability_types)
+                              && i.capability_types.indexOf(cap) !== -1)
+      );
+    },
+
+    async _fetchSnapshot() {
+      try {
+        const r = await fetch("/api/compute", { cache: "no-store" });
+        if (!r.ok) return null;
+        return await r.json();
+      } catch (_) { return null; }
+    },
+
+    async _set(appId) {
+      try {
+        const r = await fetch("/api/compute/active-app", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ app_id: appId }),
+        });
+        if (r.ok) {
+          this._current = appId;
+        } else {
+          // 409 = 后端校验不过(cap 没 local running / app 不存在);
+          // 此时不应在 _current 留 stale 值。
+          this._current = null;
+          let detail = "";
+          try { detail = (await r.json()).detail || ""; } catch (_) {}
+          if (r.status !== 404) {
+            // 404 是 app 被 manifest 删了 —— 静默;其它错误值得 console
+            console.warn("[active-app] PUT failed for",
+                         appId, r.status, detail);
+          }
+        }
+      } catch (_) {
+        // 网络挂了 / 浏览器后台节流,下次 _evaluate 再来
+      }
+    },
+
+    async _clear() {
+      // 同步:本端先清 _current,再异步发 DELETE(网络挂了也无所谓)
+      this._current = null;
+      try {
+        await fetch("/api/compute/active-app", { method: "DELETE" });
+      } catch (_) { /* best-effort */ }
+    },
+
+    _startPolling() {
+      if (this._pollHandle) return;
+      this._pollHandle = setInterval(() => this._evaluate(), 1000);
+    },
+
+    _stopPolling() {
+      if (this._pollHandle) {
+        clearInterval(this._pollHandle);
+        this._pollHandle = null;
+      }
+    },
+
+    // 在 ROUTER.showPage 之后由框架调用。当前页是"可追踪卡片"才轮询,
+    // 否则停轮询并清掉 active_app(用户去了 home / 系统页 / 不可见卡片)。
+    async _evaluate() {
+      if (!this._bootDone) return;
+      if (this._inFlight) return;
+      this._inFlight = true;
+      try {
+        const page = ROUTER.currentPage();
+        const m = this._isTrackableCard(this._findManifest(page))
+          ? this._findManifest(page) : null;
+        if (!m) {
+          // 不在卡片页 → 静默停轮询并清掉 active_app。
+          // (注意:用户从卡片去"系统页"系统按 DemoGuard 语义会
+          // silent keep 模型运行,但 _active_app 标记仍应清掉 —— 因为
+          // 我们说"用户在 X 卡片"的语义,要看到 X 页面才算。)
+          this._stopPolling();
+          if (this._current !== null) {
+            await this._clear();
+          }
+          return;
+        }
+        const caps = this._requiredCaps(m);
+        if (caps.length === 0) {
+          // 卡片声明无 software_capabilities(纯静态页 / 仅配置类) →
+          // 不进入 active_app 模式;保持现状。
+          this._stopPolling();
+          if (this._current !== null) {
+            await this._clear();
+          }
+          return;
+        }
+        const snap = await this._fetchSnapshot();
+        if (!snap) return;  // 网络挂了,下个 tick 再来
+        if (this._capsAllLocalRunning(caps, snap)) {
+          if (this._current !== m.id) {
+            await this._set(m.id);
+          }
+        } else {
+          // 当前页是这张卡但 cap 还没全 running(可能在 wizard 中、
+          // 模型 loading、用户刚停掉)→ 清掉 _active_app。
+          // 等下个 tick 1s 后再判定,避免 wizard 还在跑时反复刷盘。
+          if (this._current !== null) {
+            await this._clear();
+          }
+        }
+      } finally {
+        this._inFlight = false;
+      }
+    },
+
+    // ROUTER.showPage 完成之后由 framework 调一次 —— 既要立刻
+    // 判定一次(避免 1s 等待用户看到错误状态),也要起 1Hz 轮询
+    // 跟踪 cap 从 loading → running 的转变。
+    onNavigated() {
+      this._evaluate();
+      const page = ROUTER.currentPage();
+      const m = this._isTrackableCard(this._findManifest(page))
+        ? this._findManifest(page) : null;
+      if (m && this._requiredCaps(m).length > 0) {
+        this._startPolling();
+      } else {
+        this._stopPolling();
+      }
+    },
+
+    // 关 tab / 刷页时 best-effort 清 active_app。用 keepalive 让请求
+    // 在 beforeunload 后还能送达;完全送不到是浏览器限制,这里承诺
+    // 不了,reboot 之后该 app 的 worker 仍会 autostart 起来。
+    onBeforeUnload() {
+      if (this._current !== null) {
+        try {
+          fetch("/api/compute/active-app",
+                { method: "DELETE", keepalive: true });
+        } catch (_) { /* beforeunload, ignore */ }
+      }
+      this._stopPolling();
+    },
+
+    // Boot 时调一次:若后端记着 active_app 且对应卡片仍可追踪 →
+    // 直接跳到 #<app_id>。否则保持默认 #apps。
+    async bootRestore() {
+      if (this._bootDone) return;
+      this._bootDone = true;
+      try {
+        const r = await fetch("/api/compute/active-app");
+        if (!r.ok) return;
+        const data = await r.json();
+        const appId = data && data.active_app;
+        if (!appId) return;
+        const m = this._findManifest(appId);
+        if (!this._isTrackableCard(m)) {
+          // 后端记的 app 现在没了 → 清掉,别让 stale 状态一直留着。
+          // 同步发 DELETE 不 await(best-effort),但要在本端先清
+          // _current(还没填过就 0 effect)。
+          try { await fetch("/api/compute/active-app", { method: "DELETE" }); }
+          catch (_) { /* ignore */ }
+          return;
+        }
+        // 用户大概率还没动 hash,直接跳过去;但若用户已主动离开
+        // 过一次默认页(罕见),尊重现状不抢。
+        if (ROUTER.currentPage() === "apps") {
+          // 用 location.hash 而不是 ROUTER.navigate:boot 期还没
+          // 注册 _keptPages / DemoGuard,走 navigate 会触发一些
+          // 还没初始化的回调。直接改 hash 让 hashchange listener
+          // 接管(那个 listener 此时已经绑好了)。
+          location.hash = "#" + appId;
+        }
+      } catch (_) { /* boot failure, ignore */ }
+    },
+  };
+
+  window.ActivateManager = ActivateManager;
+
+  // ─────────────────────────────────────────────────────────────────────
   // Apps API — utility for cards to register optional callbacks
   // (onPageEnter / onPageLeave / helpers). The original apps.js exposed
   // setCardImage / setCardVideo; the latter is no longer needed since
@@ -690,14 +919,24 @@
     wireAppsPanel();
     updateBackHomeLabels();
     onHashChange();
+    // Boot 后端记着的 active_app(若有)→ 直接跳过去。必须在第一次
+    // onHashChange 之后调,否则会被 hashchange 覆盖成 #apps 状态。
+    ActivateManager.bootRestore();
   }
 
   window.addEventListener("hashchange", () => {
     DemoGuard._refreshActive();
     updateBackHomeLabels();
     onHashChange();
+    // 跟踪新页面是否需要更新 _active_app(hash 改完 → evaluate)。
+    ActivateManager.onNavigated();
   });
   window.addEventListener("demoguard:active-change", updateBackHomeLabels);
+  // 关 tab / 刷页时 best-effort 告诉后端"我已离开"。keepalive 让请求
+  // 在 unload 后还能送达(浏览器限制不一定靠谱,见 manifest 注释)。
+  window.addEventListener("beforeunload", () => {
+    ActivateManager.onBeforeUnload();
+  });
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", onReady);

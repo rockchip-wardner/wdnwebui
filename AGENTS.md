@@ -2053,6 +2053,82 @@ slot 上打架。
 * `hidden` 语义已从 `compute.services[].autostart == "hidden"` 迁到
   manifest 的 `hidden` 字段，这样配置写坏了也不会误隐藏模型。
 
+## `compute.active_app` —— 用户"所在卡片"自恢复（v0.4 起）
+
+**一句话**：用户进入某张 demo 卡片、且该卡片所有 `software_capabilities`
+都有 **local** running 实例承载时，前端框架把 `app_id` 写到
+`config.jsonc["compute"]["active_app"]`，并把承载该 app 的
+`(model, npu_index)` **增量写进 `compute.autostart`**。下次 reboot
+之后：
+
+1. `boot_compute_services()` 读 autostart，把这些 worker 拉起来
+   （autostart 那条机制不变）。
+2. 浏览器 boot，前端 `GET /api/compute/active-app` 拿到非空 → 直接
+   跳到 `#<app_id>`，**不再让用户重新点卡片走一遍 wizard**。
+
+```jsonc
+"compute": {
+  "autostart": [
+    {"model": "qwen3-vl-4b",     "npu_index": 0},
+    {"model": "qwen2.5-omni-3b", "npu_index": 1}
+  ],
+  "active_app": "video-detection"
+}
+```
+
+**为什么需要这块机制**：
+
+* 默认行为下 `compute.autostart` 是空的 / 用户没主动配 → 浏览器 boot
+  之后用户看到的还是 `#apps` 首页，必须挨个点卡片、走 wizard、等
+  30~60s 加载模型，才能"进入 app 模式"。
+* 我们想要"开发板进入这个 app 的模式"——一旦用户上次停在某张卡片、
+  卡片已经在用，重启后直接恢复到那个状态即可。
+
+**触发与失效**：
+
+| 时机 | 动作 |
+|---|---|
+| 框架 hashchange 落到某张 status=ok 的卡片、且 1Hz 轮询发现该卡 `software_capabilities` 全部有 local running | `PUT /api/compute/active-app {app_id}` |
+| 用户切到 home / 系统页 / 另一张卡 | `DELETE /api/compute/active-app`（autostart 不动） |
+| `beforeunload` | keepalive DELETE（browser 不一定送达，见 DemoGuard 同款限制） |
+| boot 拉取 | 读 `active_app` → 跳 #<id>；若 manifest 已下架 → 同时清掉，避免 stale 状态永远留着 |
+
+**关键设计点**：
+
+1. **local only，不接受 adopted (LAN peer)**。peer 板子 reboot 之后
+   autostart 等于没意义。前端轮询 `_capsAllLocalRunning` 与后端
+   `set_active_app` 校验都排除 `source == "adopted"`。
+2. **active_app 与 autostart 是耦合的**：`set_active_app` 会把承载该
+   app 的 `(model, npu_index)` 增量写进 autostart；已存在的不重复。
+   这意味着"进入视频检测 → 自动加 autostart"，用户后续如果想关掉
+   这个 worker，得去算力配置页（不会因为切走卡片就被自动关）。
+3. **autostart 不被 DELETE 主动撤销** —— active_app 是用户态偏好，
+   autostart 是"该启的算力"。用户切走卡片不等于模型不再启；只有当
+   用户主动去算力配置页 disable 时 autostart 才会改。
+4. **不存在"开了半透明但被人为篡改"**：autostart 解析器（v0.18
+   schema，extra=forbid）依然有效；active_app 只是多了一个字段。
+5. **manifest 校验**：`PUT` 时服务端用 `discover_cards()` 找对应
+   manifest 并要求 `status==ok`、非 hidden；找不到 → 404。
+6. **没有任何 installed 软依赖的卡片不会被自动 restore**：manifest
+   里 `software_capabilities: []` 的卡片（纯静态页 / 仅配置类）不
+   会进入 active_app 模式，因为它们不消耗算力。
+
+**已知边界**：
+
+* 浏览器 `beforeunload` 期间 JS 不能保证请求送达；user 强杀 / 浏览器
+  崩溃时 active_app 仍可能残留。下次 boot 时若该 app 的 worker 已
+  autostart 起来，前端会照常跳过去——这是**预期**而不是 bug。
+* 若用户改了 autostart（手动删了 active_app 用到的那条），但
+  active_app 字段没清，bootRestore 跳到 #app 后框架会发现 cap 不全
+  → 自动 DELETE 清掉；下一次 boot 不再跳。
+
+**debug**：
+
+* `GET /api/compute/active-app` 直接读当前 active_app。
+* `tail -f logs/app.log | grep active_app` 看服务端的写入 / 清空
+  日志（`compute.active_app=%s：autostart 新增 %d 条`）。
+* `cat config.jsonc | jq .compute.active_app` 看盘上文件。
+
 ## Configuration
 
 > **不要 commit `config.jsonc`** —— 设备级运行时配置，由

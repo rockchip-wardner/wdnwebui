@@ -29,6 +29,19 @@ Endpoints
 * ``GET    /api/compute/capabilities``     discovery 页用：``sw_capabilities``
                                           + ``hw_capabilities``。
 * ``PUT    /api/compute/hardware-capabilities``   HW 能力 enable/disable。
+* ``GET    /api/compute/active-app``      当前"卡片模式"：用户进入某
+                                          demo 卡片后写入；reboot 后
+                                          前端 boot 时读，若非空则直接
+                                          跳到该卡片页。
+* ``PUT    /api/compute/active-app``      ``{app_id}`` → 校验该 app
+                                          所需的 software_capabilities
+                                          全部有 local running 实例承载，
+                                          写 ``compute.active_app``，
+                                          并把承载它的 (model, npu_index)
+                                          增量写进 ``compute.autostart``
+                                          （下次 reboot 也会启）。
+* ``DELETE /api/compute/active-app``      清掉 ``compute.active_app`` 标记。
+                                          **不**动 autostart。
 
 错误码：
 
@@ -579,6 +592,114 @@ async def clear_errors(payload: ClearErrorsRequest) -> dict:
     reg = get_registry()
     cleared = reg.clear_error(payload.model_id)
     return {"ok": True, "cleared": cleared, "snapshot": reg.snapshot()}
+
+
+# --------------------------------------------------------------------------- #
+# active_app：用户进入卡片 → 记录 → reboot 后自动回到同一卡片                  #
+# --------------------------------------------------------------------------- #
+#
+# 三段语义：
+#   GET    /api/compute/active-app     —— 前端 boot 时读，若非空 + 该卡片
+#                                         ok 状态 → 直接 ``#<app_id>`` 跳过去。
+#   PUT    /api/compute/active-app     —— 用户进入 app、且该 app 所有
+#                                         software_capabilities 都有 local
+#                                         running 实例时调用。后端会：
+#                                         (1) 校验 (a) app_id 真实存在且 status=ok
+#                                         (b) 所需 caps 全部有 local running；
+#                                         (2) 把承载这些 caps 的 (model, npu_index)
+#                                         增量写进 compute.autostart —— 之前没
+#                                         启的 worker 下次 reboot 也会起来。
+#                                         失败时 409 + 原因。
+#   DELETE /api/compute/active-app     —— 用户离开 / 切换 / 关闭 tab 时
+#                                         调用，**不**动 autostart（autostart
+#                                         仍负责"该启的算力"，由用户在算力页
+#                                         显式关闭）。
+
+def _resolve_card_manifest(app_id: str):
+    """按 app_id 查 manifest。
+
+    找不到 / 状态非 ok → 返回 ``None``。API 层据此决定 404 vs 200。
+    """
+    # 懒加载：避免在 system register 时就 import manifest 模块循环依赖。
+    from app.core.manifest import discover as discover_cards
+    try:
+        manifests = discover_cards()
+    except Exception:  # noqa: BLE001
+        return None
+    for m in manifests:
+        if m.id == app_id and getattr(m, "status", "ok") == "ok":
+            return m
+    return None
+
+
+@router.get("/compute/active-app")
+async def get_active_app() -> dict:
+    """读 ``compute.active_app``。
+
+    返回 ``{"active_app": str | null}``。前端 boot 时拿到非空 + 该卡片
+    ok → 直接跳过去，不再让用户走一次 wizard。``null`` 表示当前
+    没有处于"app 模式"——首页照常显示。
+    """
     reg = get_registry()
-    reg.stop_all_local()
-    return {"ok": True, "snapshot": reg.snapshot()}
+    return {"active_app": reg.get_active_app()}
+
+
+class ActiveAppSet(BaseModel):
+    """``PUT /compute/active-app`` 入参。"""
+
+    app_id: str = Field(
+        ...,
+        min_length=1,
+        description="目标卡片 id，对应 app/apps/<id>/manifest.json 的 id 字段。",
+    )
+
+    @field_validator("app_id", mode="before")
+    @classmethod
+    def _strip(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+        return v
+
+
+@router.put("/compute/active-app")
+async def put_active_app(payload: ActiveAppSet) -> dict:
+    """记录"用户当前所在 app"。
+
+    校验链（任一不过都 409 + 明确文案）：
+
+    1. ``app_id`` 对应的 manifest 必须存在且 ``status="ok"``：
+   找不到 → 409（前端不可能触发，是防御性的）。
+    2. manifest 的 ``software_capabilities`` 必须全部有 **local** running
+       实例承载（spawned ∪ adopted_local）。adopted peer 故意排除——
+       那台板子 reboot 之后 autostart 等于无效。
+    3. 落盘 ``compute.active_app = app_id``，并把当前承载这些 caps
+       的 (model, npu_index) 增量写进 ``compute.autostart``。已存在
+       的项不重复加。
+    """
+    app_id = payload.app_id
+    manifest = _resolve_card_manifest(app_id)
+    if manifest is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"未找到卡片 {app_id!r}，或该卡片状态非 ok",
+        )
+
+    caps = list(getattr(manifest, "software_capabilities", []) or [])
+    reg = get_registry()
+    try:
+        result = reg.set_active_app(app_id, caps)
+    except ValueError as e:
+        # 校验失败（缺 cap / 未知 cap）→ 409 让前端展示原因。
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return result
+
+
+@router.delete("/compute/active-app")
+async def delete_active_app() -> dict:
+    """清掉 ``compute.active_app`` 标记。
+
+    不动 autostart。响应永远是 ``{"ok": True, "active_app": null}``。
+    """
+    reg = get_registry()
+    reg.clear_active_app()
+    return {"ok": True, "active_app": None}
