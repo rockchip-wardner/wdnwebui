@@ -165,7 +165,7 @@ v0.4 启动后默认进入**应用面板**(`#apps`),而非之前的某个具体�
 - `hidden: true` 的卡片从网格消失但代码 / API / 静态资源 / 直接 URL
   都仍可用,用于"先下线 / 等版本升级"的过渡期 —— 比 `remove_card.py`
   安全,反序列化时想恢复只需把 `hidden` 置 `false`。
-- 8 张卡片都从同一份 `__APP_MANIFESTS__` JSON 渲染,该 JSON 由后端
+- 7 张卡片都从同一份 `__APP_MANIFESTS__` JSON 渲染,该 JSON 由后端
   `_assemble_index_html()` 在每次 `/` 请求时动态拼装 ——
   `/static/index.html.template` 里 3 个占位符:`{% card_slot "<id>" %}`
   (替换为各 app 的 `static/template.html` 片段)、`{{ card_css_links }}`
@@ -184,7 +184,7 @@ v0.4 启动后默认进入**应用面板**(`#apps`),而非之前的某个具体�
 | `#im-bridge` | 应用对接(微信桥接) | `app/system/api/im_bridge.py` |
 | `#system-logs` | 系统日志 | `app/system/api/system_logs.py` |
 
-`#/<card_id>`(8 张卡片)不在侧栏,在 `#apps` 网格里点入。
+`#/<card_id>`(7 张卡片)不在侧栏,在 `#apps` 网格里点入。
 
 ### Back-home 按钮
 
@@ -270,18 +270,496 @@ app/apps/<card_id>/
 | `video-target-detection` | `swcap_video_describe` | `app.apps.video_target_detection` (TargetDoc) |
 | `video-target-localization` | `swcap_grounding` | `app.apps.video_target_localization` (LocatorDoc) |
 
+`scene-threshold-tuner`(曾用名「阈值标定」,显示名「视频画面变更阈值测试」)
+已在 v0.18 **整卡下线**:它的能力(帧间差异判定)不再需要单独一张卡 ——
+`app/core/video/frame_judge.py` 把判据做成了 4 张视频卡共用的底层能力,
+每张卡的视频源配置区直接调它,曲线也搬进了向导(见「帧判据」段)。
+标定台只剩历史价值(它当初用来定下的默认值 6.0 / 长边 160 至今仍是
+`FrameJudge` 的默认),代码已删除。
+
 新增卡片示例(如加一个"图像 OCR"应用):只需 `mkdir app/apps/ocr && 写 manifest.json + api.py + service.py + __init__.py + static/`,`display_order` 自动出现在侧栏,**不动** `app/main.py` 或任何 core 模块。
+
+## 帧判据(v0.18 下沉到 4 张视频卡)
+
+「这一帧要不要送去跑推理」曾经有两套:三张卡的 detector 各自 `every_n` 跳帧,
+VAS 另有一个二值的「自动判帧」。现在**只有一份实现**:
+`app/core/video/frame_judge.py:FrameJudge`,四张卡共用。
+
+| 位置 | 说明 |
+|---|---|
+| 算法原语 | `wdnav.scene`（RGA NV12-Y 缩略图 + 可注册度量） |
+| 判据策略 | `app/core/video/frame_judge.py`（模式 / 阈值 / 兜底间隔 / 分数环形缓冲） |
+| vd·vtd·vtl 接线 | `app/core/video/session.py`（三者共用 `VideoSession` 单例，判据也只有一份） |
+| VAS 接线 | `app/apps/video_analysis_search/service.py`（自管理 decode 循环，判据挂在它自己身上） |
+| HTTP | `app/core/video/api.py` → `/api/video/judge*`（三张卡共用）；VAS 走 `/api/video-analysis-search/judge*` |
+| 前端 | `app/static/core/frame-judge.{js,css}`，四张卡各 mount 一个实例（按 prefix 索引） |
+
+**模式即算法名,v0.21 起放行两个:`gscore`(推荐) 与 `conc`(对比/待下架)**:
+用户可选 `manual`(手动跳帧,逐位保持历史 `pos % n == 0`,零 RGA 开销) +
+自动判帧。`wdnav.scene` 里仍注册着 `sad` / `ncc` / `z_mad`,但
+`frame_judge.EXPOSED_METRICS = ("gscore", "conc")` **只放行这两个**。
+
+两个算法的实现都在 **`app/core/video/frame_judge.py`**(wdnwebui 侧),通过 SDK
+公开的 `wdnav.scene.register_metric` 注册进注册表 —— **不改 SDK 源码**:算法
+差异属于调用方,放进 SDK 只能让每个项目各分叉一份。
+
+```
+conc(a,b)  = max(8x8块内平均绝对差) / max(块均值的90分位, 1.0)
+gscore(a,b) = p99( |B - (g·A + c)| )        # A/B 是 8x8 块均值图
+              其中 (g,c) 是 A↔B 的**双向**最小二乘仿射拟合
+```
+
+`conc` 测"变化有多**集中**在少数几个块上";`gscore` 先把**整幅亮度/对比度
+变化**用仿射拟合整个吃掉,再看剩下的**结构残差**。
+
+**v0.21 换默认算法的原因:conc 对大范围变化结构性失明**。它是**比值**,分子
+分母在大范围变化时同步抬升、比值回到 1。真实 1080p 监控流(`rtsp://…192.168.169.25`,
+700 帧,180x320 缩略图,与线上判据同一管线)上:
+
+| 场景 | conc 绝对响应 | gscore 绝对响应 | conc 底噪 p95 = 11.95 → 分离度 | gscore 底噪 p95 = 0.109 → 分离度 |
+|---|---|---|---|---|
+| 曝光 +45 灰阶 | 1.00 | ≈0(归一掉) | **0.08x** | 免疫 |
+| 对比度 0.5x | 1.17 | 0.33 | 0.10x | 3.0x |
+| 镜头全挡(纯色) | 1.73 | 108.7 | **0.14x** | 999x |
+| 手挡镜头(半透软边) | 1.79 | 87.0 | **0.15x** | 800x |
+| 下半部 +60 灰阶 | 1.79 | 60.0 | **0.15x** | 551x |
+| 整幅右移 8px | 1.87 | 85.3 | **0.16x** | 784x |
+| 小目标 2.3% | 86.0 | 70.8 | 7.2x | 651x |
+
+conc 在前六个场景全塌在 1.0~1.9,而底噪是 11.95 —— **分离度只有 0.08~0.16
+倍,比底噪还低,阈值再怎么调都测不出来**。用户报的"手遮挡摄像头、画面移动
+都做了,浮框始终显示 1.7"就是这个:1.7 就是 conc 在大范围变化下的**天花板**。
+闯入监控两类都要(人走过去是局部的,手挡镜头/相机被动是全局的),只保 conc
+等于把一半场景交给兜底间隔 —— 而兜底间隔实测从来没生效过。
+
+**为什么不是卷积/滤波类方案**(v0.21 做过完整横评,`scripts/bench_conv_judge.py`
++ `scripts/bench_denoise_judge.py`,同一流同一管线):
+
+* **梯度类卷积(LoG / DoG / Sobel)全线失败** —— 几何平均分离度 2.0~2.5x,
+  最差场景 **0.5x**(比底噪还低)。它们是**高通**,而这条流的底噪是 H.264 编码
+  残差,主要就在高频,高通不但压不住噪声还把它放大。
+* **空间滤波(中值/双边/高斯/形态学)压不动底噪** —— 判据是「降噪比 ÷ 信号
+  保留比」,**降噪比全部 ≤1**(中值3x3 = 0.90x、形态学开 = 0.92x、双边 5x5 =
+  0.98x)。编码残差是**时间域**抖动,空间滤波管不了。双边滤波还慢到 4.26ms。
+* **光流法也不行** —— Farnebach 幅值 11.7x / 最差 0.5x,且 **17.06ms**,
+  超预算 20 倍;配准残差 1.6x。
+* **文献也一致**:国内(CSDN)DVR-Scan 类的关键参数是"阈值、最小区域、缓冲
+  时间",《一种基于时空联合的实时视频降噪算法》明确写"**避免了空域降噪
+  带来的图像闪烁问题**"而改用帧间差分+调阈值;国外 shot boundary detection
+  领域承认 "Illumination changes, camera motion, fast-moving objects reduce
+  accuracy",解法是 **local adaptive threshold**。
+* **CNN 特征距离在本机根本跑不了**:整机没有任何 `.onnx`/`.tflite`/`.rknn`
+  权重,也没装 torch/onnxruntime/rknn。而且**成本上也不该** —— 这个项目每 30
+  帧就要跑一次 VLM(实测 2.3s/帧),用 CNN backbone 做纯判帧等于为了省一次
+  推理先跑一次更轻的推理。判据必须是零学习成本的固定算子。
+
+**gscore 的两个设计点,都是实测踩出来的**:
+
+1. **必须双向拟合,不能只算 `B≈g·A+c`**。单向拟合的常数项取 **B 自己的
+   均值**,于是当 B 退化成纯色时(镜头被全挡)残差恒等于 `|B-mean(B)| = 0` ——
+   分数直接归零,把"整幅纹理彻底丢失"这个**最大的变化**判成"完全没变"。
+   实测单向版在「镜头全挡」得 **0.00**,正是用户报的手挡场景。改成双向
+   (A≈g·B+c' 再算一次,取两者残差的大者)后得 **60.36 → 4.8x 底噪**,而
+   底噪几乎没变(12.40 → 12.60)。整幅变暗两边都拟合得上,免疫保留。
+2. **残差聚合取 p99,不是 mean 也不是 max**(同一条流实测,响应 ÷ 各自底噪):
+   `mean` 46.4x / 最差 2.7x(小目标被整幅摊薄)、`max` 9.5x / 最差 1.6x
+   (被单像素尖刺主导,底噪从 1.58 抬到 6.15)、**`p99` 25.6x / 最差 2.8x /
+   小目标 41.1x**。p99 是拐点。
+
+**为什么下架 z_mad**(实测:真实视频 1200 帧相邻帧 + 合成闯入样本):
+
+| 度量 | 目标得分 | 正常相邻帧 p50 | 结论 |
+|---|---|---|---|
+| `z_mad`,30% 高的人 | **1.88** | **2.19** | 目标比正常帧中位数还低 → **阈值怎么调都抓不到人** |
+| `sad`,30% 高的人 | 0.98 | 2.14 | 同上,且曝光跳变下触发率 100% |
+| `ncc` | 0.02 | 0.01 | 取值范围只有 [0,2],与灰阶阈值结构性不兼容 |
+| `conc`,5% 面积目标 | 32.5~140.6 | 3.23 | 2.2~9.4 倍余量 |
+
+z_mad/sad 算的是**整幅图**的统计量,而闯入监控要抓的"画面里一小块变了"会被
+14400 像素平均摊平。**降阈值救不回来**:σ=4 时噪声底就有 3.21,比目标还高。
+这条已固化成 `scripts/verify_frame_judge_metrics.py` 的断言。
+
+三个设计点全是实测逼出来的,改任一常数都要重跑标定:
+
+1. **分母用块均值的 90 分位,不是全图平均**。全图平均**会把目标自己算进去**
+   —— `conc ≈ 1/目标面积占比`,目标一超过约 5% 面积就掉到阈值以下(实测 5%
+   面积 26.2、9% 面积 17.1,阈值 15 根本过不了)。换成分位数之后分母代表"基线
+   水平",5% 面积从 26.2 抬到 140.6,衰减拐点推到约 10% 面积。
+   **注意自变量是"面积占比"不是"高度"** —— 早期基准里"30% 高的人"其实只占
+   2.25% 面积,把结论做窄了;是回归里 220x220 白块测出 17 分才暴露的。
+   (写这类测试时还要注意坐标系:尺寸和坐标必须在同一套分辨率下算,否则
+   "0.5% 面积"贴到全分辨率帧上只剩 2x1 个缩略图像素。)
+2. **分母地板 1.0 给分数封顶**。conc 是比值,两帧几乎全同时分母趋零会让分数
+   炸到几百;而"只有极少数像素变了"在监控里很常见(坏点/编码残差/隔行差)。
+   实测无地板时「静止画面 + 8 像素变 1 灰阶」得 **14.00**,正好压在阈值 15
+   上 —— 静止监控画面会持续误触发。
+3. **比值化是为了对全局变化免疫**。相机微抖 1px 用绝对块差是 34.67(余量只剩
+   1.1x,等于每帧都送检),比值化后只剩 1.19(12 倍余量)—— 微抖是整幅一起动,
+   分子分母同步抬;人闯入是局部暴涨,只有分子抬。
+
+**conc 的阈值 15 操作点**(`DEFAULT_THRESHOLD_BY_MODE` 历史取值,已下架) ——
+仅作历史保留。**v0.22 起** conc 已从 `EXPOSED_METRICS` 移除(对大范围变化
+结构性失明,见下),这段阈值标定记录留作"为什么换算法"的复盘。
+
+`DEFAULT_THRESHOLD=6.0` 混用** —— 那是 z_mad 的灰阶口径,套过来几乎每帧都触发):
+
+* 自然相邻帧 p50 3.23 / p95 6.96 / p99 9.40 → 触发率 0.083%
+* 目标占画面 0.5%~5% 面积 32.5~140.6 → 全部越过(2.2~9.4 倍)
+* 最坏误触 4.69(稀疏微变)/ 1.19(微抖)/ 1.54(σ=16 噪声) → 3~12 倍余量
+* 操作区间很宽:15~25 的自然触发率都在 0.1% 以内
+
+**已知边界**:目标面积超过约 10% 画面时分数回落(实测 9% 面积 5.11)。这类目标
+不可能是"突然闯入"—— 它一路走近时早就被检出并成为参照帧了,之后的连续变化由
+`every_n` 兜底间隔覆盖。`conc` 还**与对比度无关**(对比度 8 与 45 的分数几乎
+相同),灰衣服/灰墙同样抓得到。**以及大范围变化全瞎**(见上表)。
+
+**gscore 的阈值是按两个素材一起标的 —— 这是"阈值不可跨素材迁移"的第二次
+实证,而且这次是同一个算法内部跨素材**。
+
+最初只在监控流上标得出 5.0,搬到车载视频(`carplant_29132868.mp4`,**整幅
+平移**的源)上触发率直接冲到 **31.8%**,
+每 3 帧送一次,等于判据没开 —— 仿射拟合吸收不了**平移**,只吸收亮度/对比度。
+车载源上阈值扫描:5 → 31.8% / 10 → 15.1% / **15 → 0.67%** / 20 → 0.33%。
+监控流上 5.0 看似更合适(底噪 p95 = 0.109,小目标 70.8 → 651× 分离度),
+但跨素材 31.8% 触发率证明 5.0 在车载上**直接死**。
+
+**v0.22 起默认改为 10.0** —— 用户拍板,要求更敏感(办公室监控流底噪
+p95 = 0.10 量级,阈值 10 触发率 0.00%,小目标 7.1× 余量);实测车载源
+15.1% 触发率是**已知素材特性**(整幅平移)而不是算法退化,**用户的相机
+是固定监控头,不会触发**。`verify_frame_judge_metrics.py` 的 [7] 段
+相应地把"底噪 p95 < 默认阈值"改成"大范围变化分离度 > 底噪"——换素材
+不假红。
+
+默认 `every_n = 600`(25fps 下 ≈ 24s 兜底间隔),用户拍板。**长间隔的意图**:
+判据主要靠"超阈值立即送"工作,兜底只在画面**长期静止**后兜一次,避免
+每隔 30 帧送一次"画面没变"的推理请求浪费 NPU;静止画面 24s 送一次
+刚好让 VLM 知道"系统还活着"。
+
+15.0 仍是 gscore 的"双素材标定唯一站得住的点":监控流上底噪 max 余量
+12.3 倍、小目标 4.7 倍、手挡 5.8 倍、镜头全挡 7.2 倍,触发率 0.00%;
+车载上小目标 0.5% 面积只剩 1.4 倍(偏紧)。当用户**希望对低底噪场景
+更激进**(例如抓"小目标 0.5% 面积"或"光照微调"),10.0 在监控流上仍
+有 4.7~7.1 倍余量,可用;当用户**希望跨素材稳**,15.0 是更保守的选项。
+**但 5.0 不可用**(车载 31.8% 触发率,等于判据没开)—— 不论阈值怎么调,
+gscore 对**全局位移**不免疫(仿射吸收不了平移),移动相机上**底噪天然高
+一个量级**,必须重标。
+
+⚠ **gscore 与 conc 的历史默认值都是 15.0,但数值相同纯属巧合,刻度含义完全无关**:
+conc 是比值(无单位),gscore 是归一化后的块级残差(灰阶)。任何"反正都是 15"的
+心智捷径都是错的 —— 判断阈值合不合适只能看**该算法自己**的底噪。
+v0.22 起 conc 已下架,gscore 默认改为 10.0(用户拍板,见上)。
+
+**存量配置迁移**:z_mad 从下拉下架了,但用户本地存的判据配置里还有它。
+`frame_judge.LEGACY_MODE_ALIASES` 把 `z_mad` / `auto` **迁到 gscore 并把阈值
+重置成 gscore 的默认**(见 `_migrate`)。三个理由,少一个都会出事:
+* 不能回落 `manual` —— 那等于把用户的自动判帧悄悄关掉,表象是"判据突然不生效
+  了",比阈值不准更难排查;
+* 不能沿用旧阈值 —— z_mad 的阈值是灰阶口径(线上实测值 1.0),套到 gscore 上
+  会几乎每帧都触发(自然相邻帧 p95 就有 12.60),那是比漏检更糟的故障;
+* 不能迁到 `conc` —— conc 已经是待下架候选,让存量用户落到一个测出结构性缺陷
+  的选项上等于继续吃流量。
+
+**下拉顺序必须按 `EXPOSED_METRICS`,不是 SDK 注册顺序**(`metrics()` 里显式
+过滤)。两者不一样:注册顺序是 SDK 自带的 z_mad/sad/ncc 在前、后注册的 conc /
+gscore 在后,于是 conc 会排到推荐项 gscore **前面**去 —— 用户在下拉里看到的
+第一个应该就是默认推荐,而且 `default_threshold()` 的兜底取的是
+`EXPOSED_METRICS[0]`,两边顺序反了会对不上。`verify_vas_change_detector.py`
+里有这条断言。
+
+**测试不要把"推荐项是谁"写死**(v0.21 换算法时 3 个脚本一起红)。写死
+`== ["conc"]` / `== ["manual","conc"]` / `select_option(..., "conc")` 的地方,
+算法换默认后会直接失败,而**那不是回归,是产品改了**。三个脚本现在都从服务端
+`/judge/metrics` 取 `metrics[0]` 当推荐项:
+
+**兜底不是无条件送检(用户明确要求)**：`FrameJudge.observe` 里兜底条件是
+`gap >= every_n **且** score >= threshold * 0.5`,不是 SDK `FrameDiffer`
+那套的 `gap >= max_gap`。静止画面分数恒为 0 < 半阈值,所以**只送首帧**,
+之后一直安静;人闯入后站立不动也只送闯入那一帧 —— 画面一样,重跑推理
+得到的还是同一个答案,纯徒增一次 NPU 调用。实测(阈值 15 / every_n=30):
+
+| 场景 | 150 帧里判据触发 |
+|---|---|
+| 纯静止 | **1**(只有首帧) |
+| 人闯入后站立不动 | **2**(首帧 + 闯入那帧) |
+| 人横向走动 | 144(每帧都有区别) |
+| 慢漂移 1 灰阶/帧 | 9(约每 16 帧累积越线) |
+
+"变了但没过阈值"的中间地带(分数落在半阈值~阈值之间)仍由兜底兜住 ——
+实测 a/b 两态交替(单步 conc=10.00)时送检落在 [0, 31, 62],间隔 ≈ every_n。
+**改这块时注意**:判据暂停后 `_last_pos` 不推进,而兜底量的是"距上次送检
+满 N 帧",所以交替序列的相位会让命中落在 every_n 或 every_n+1 —— 断言要
+写间隔,写死 30/60 会被相位差打穿。
+
+这条判定是**有意偏离** `FrameDiffer.should_sample` 的(改 `observe` 时
+别"顺手改回去"),理由:SDK 那套的出发点是保证结果会刷新,而静止画面送出去
+的结果与上一次逐位相同,不存在"漏检"。其余判定(首帧必送、超阈值触发、
+异常按送检处理、参照帧只在送检时推进)仍与 SDK 一致。
+
+### 阈值标定**不可跨素材迁移**(v0.20 实测推翻"阈值 15 偏保守")
+
+上面那张"操作点"表是在 `carplant_29132868.mp4`(960x540 **文件**)上标的。
+拿它去标定**真实监控流**会大幅偏低。实测同一套代码、同一块板、同一个
+`conc`,对 `rtsp://…192.168.169.25/…`(1920x1080 **实时** H.264)抓到 900 帧:
+
+| 比较距离 | 本机实时流 | 标定文件 |
+|---|---|---|
+| d=1(相邻帧)p50 / p95 / p99 | **4.41 / 19.33 / 32.85** | 3.23 / 6.96 / 9.40 |
+| d=5 p50 / p95 | 16.78 / 49.91 | — |
+| d=20 p50 / p95 | 32.11 / 86.36 | — |
+
+**相邻帧的 p95 就已经是标定视频 p99 的 2.8 倍。** 1080p 实时流的每帧
+纹理/压缩噪声比 960x540 文件高得多,而 `conc` 的分子正是"块内像素级
+`mean(|a-b|)`"——它吃的就是这项噪声。所以阈值 15 落到这条流上等于
+"每 3 帧就送检一次"。
+
+**自动模式还有一个正反馈,会把上面的数字再放大**:`参照帧只在送检时推进`
+→ 触发得越多,参照帧越旧 → 比较距离越大 → 分数越高 → 触发更多。实测
+阈值 15 下,相邻帧触发率 10.7%,而**完整 auto 语义**(参照帧按送检推进)
+是 **22.4%**,送检间隔 p50 只有 2 帧:
+
+| 阈值 | 相邻帧触发率 | 完整 auto 送检率 | 送检间隔 p50 |
+|---|---|---|---|
+| 10 | 25.8% | 35.6% | 1 帧 |
+| 15 | 10.7% | 22.4% | 2 帧 |
+| 30 | 1.1% | 5.0% | 4 帧 |
+| 40 | 0.2% | 3.1% | 5 帧 |
+
+**结论**:给别的相机制定时**必须重新量**,别套 15;而且要量"完整 auto
+语义"那档(上面的 `scripts/measure_live_conc.py` 会同时给出两档)。
+工具:`.venv/bin/python scripts/measure_live_conc.py --rtsp <url> --frames 900`。
+
+**量分数必须调 `frame_judge.conc` 本体,不要复刻**。这个坑踩过一次:复刻时
+把块内 `mean(|a-b|)` 写成了 `|块均值A - 块均值B|`,后者只看亮度平移,静止
+画面恒接近 0 —— 量出来的分数比线上低一个量级,差点得出"判据在空转误报"的
+完全相反的结论。两者只差"块内纹理"这一项,而这一项恰好是 conc 的信号本身。
+
+### "判据没生效"的可观测性:浮框必须报**实测送检间隔**
+
+用户报的现象是「浮框显示没有变化,但实际一直在检测」。两件事都没错,
+**浮框回答的根本不是同一个问题**:
+
+* 浮框主行 `无变化 / 画面变化` 是**当前这一帧**的判定。阈值低于素材噪声底
+  时 89% 的帧都是"无变化",每次"画面变化"只闪一帧(40ms),肉眼看过去就是
+  一路"无变化"。
+* 用户数的**检测事件**节奏由**推理耗时**决定。实测这台机器单帧 VLM
+  **2.3s**,于是事件恒定每 ~3.75 秒一条,跟判据放行率无关(放行率再低,
+  事件也不会更慢 —— 但也永远不会更密)。
+* 中间还有一层丢帧:`JudgeDetector.submit_frame` 的队列是
+  `ITEM_QUEUE_MAX = 1`(latest-only),判据放行 2.8 帧/秒而推理只吃
+  0.27 帧/秒,**九成放行的帧被直接丢掉**。
+
+于是 `every_n=300` 在这条流上**一次都没生效**(实测稳态:评估 3906 帧、
+送检 140 帧 = 每 **27.9** 帧一次 = 每 1.12 秒一次;阈值 10、每 17.9 帧一次)。
+兜底永远轮不上,因为 gap 从来到不了 300。
+
+修法(`snapshot()` 新增 `every_n_eff = evaluated / sampled`,浮框副行 + 控件
+提示据此告警):
+
+```
+● 无变化 2.23
+conc · 阈值 10.00 · 实际每 18.0 帧送检 · 兜底 300 帧形同虚设   ← 琥珀色告警
+```
+
+判断条件:`every_n_eff <= max(2, every_n / 5)` 就说明阈值把几乎每帧都放行了,
+兜底间隔是摆设,提示里直接告诉用户"调高阈值或改用手动跳帧"。
+**别再让用户靠数事件反推判据状态** —— 那要同时知道推理耗时,信息根本不在界面上。
+
+> **`verify_frame_judge_ui.py` 跨卡连跑时曾时绿时红**,根因值得记住:
+> 四张卡共用一个 `page`,而 `page.goto` 只改 hash **不重载页面**;上一张卡的
+> `select_option` 会把 `document.activeElement` 留在某个判据输入框上,而
+> `update()` **刻意不回写聚焦中的输入框**(不能抹掉用户正在输入的数字,这是
+> 正确的)。于是那个框保留着进入本卡时的环境值,切算法时又把陈旧值发回去 ——
+> 表现是「切 conc 拿到 10、应为 15」。同一份代码单独跑某一张卡永远是对的。
+>
+> 修法不是去改产品的回写逻辑(那会把"用户正在输入的数字被抹掉"这个真 bug
+> 换回来),而是让**测试自己拥有控件状态**:切 conc 之前显式把阈值框置成
+> `/judge/metrics` 的 `default_threshold[conc]` 并派发 `change`。
+> 教训:**共享一份配置的多个入口 + 浏览器里不重载 = 状态会跨测试残留**;
+> 断言前先把自己的输入设成确定值,别依赖"它应该自己同步过来"。
+
+### 事件历史里的「当前帧变化值」= 判断"阈值以下为什么还出事件"的唯一凭据
+
+用户看着事件几秒刷一条、浮框却显示"无变化",合理怀疑是**阈值没生效**。
+事件历史原来只有 `frame_pos` 和描述文本,分不清三种完全不同的情况:
+
+| 事件里的分数 | 含义 | 该动什么 |
+|---|---|---|
+| `score > threshold` | **超阈值触发** | 阈值对这条素材偏低 → 调高阈值 |
+| `0.5*thr <= score <= thr` | **兜底间隔触发**(`gap>=every_n` 且过半) | **设计内,不是故障** → 调帧间隔或换算法,继续抬阈值没用 |
+| `score < 0.5*thr` 且 `gap < every_n` | 不该出现 | 真 bug,查 `observe()` |
+
+所以分数必须**随帧一起送到事件**(`DetectorEvent.judge_score`),而不是前端
+回头去读当前分数 —— 读的是"现在"而不是"这一帧",对慢事件(2.3s 推理)完全
+对不上号。链路:`FrameJudge.current_score`(新增轻量 property,**不能**用
+`snapshot()`,那会每帧复制 200 条环形缓冲)→ `VideoSession` sink 第 4 参 →
+`submit_frame(judge_score=)` → 队列 5 元组 → `_worker_loop` 统一回填。
+
+回填放在 `_worker_loop` 而不是在每个 `DetectorEvent(...)` 构造点加参数:
+构造点有 10 处以上,漏一处就会出现"有些事件有分数有些没有"。
+
+**sink 签名加了参数,老签名不能被打挂**:`VideoSession` 调 sink 时捕 `TypeError`
+并按 3 参重试 —— 判据分数是附加信息,不该因为它让别人的 sink 失效。
+
+渲染放在共享组件 `FrameJudge.scoreSpan(prefix, ev)` 而不是各卡各写一遍:
+vd / vtd / vtl **共用同一份判据**,只给一张卡显示分数、另两张不显示,用户
+看到同样的配置却拿到不同信息,比不显示更难排查。回归:
+`scripts/verify_event_judge_score.py`(7/7,不依赖 NPU —— 真端到端要算力实例)。
+
+**API 层三条踩过的坑**(都在 `app/core/video/api.py::set_judge`，改这块必读):
+
+1. **必须把 `payload.mode` 原样传下去**,只在校验时归一化。曾经先调
+   `_normalize_alias` 把 `z_mad` 转成 `conc` 再传给 `FrameJudge`,迁移表就
+   认不出原始模式名 → **阈值不重置** → 线上变成 `conc + threshold=1.0`
+   (conc 自然相邻帧 p50 有 3.23,1.0 = 几乎每帧都送检)。静默失效比不迁移
+   更糟:它看起来"生效了",实际把节流关掉了。
+2. **`set_judge` 不要做 400 校验**。未知 / 已下线的算法名一律**回落
+   manual**(项目契约,`verify_vas_change_detector` 断言 `normalize_mode("sad")
+   == "manual"`)。改成 400 的话 POST 会失败 → 前端拿不到新状态 →
+   `_pruneModes()` 不执行 → 下拉里那个补出来的幽灵 option 永远留着选不上。
+   曾一度改成 400,就是这条。
+3. **`threshold` 的 Pydantic 默认值必须是 `None`,不能填数字**。"没传阈值"
+   和"显式设成某个值"必须能区分 —— 填数字默认值的话,客户端只想改 `every_n`
+   时也会把阈值冲掉(实测先设 7.5、再发 `{mode:"conc", every_n:60}`,阈值被
+   弹回默认)。`None` 由 `FrameJudge.reconfigure` 解释成
+   **"阈值属于模式":模式变了用新默认、模式没变保留现值**。
+
+前端同理:`frame-judge.js` 的 `_defaultThreshold()` 从 `/judge/metrics` 的
+`default_threshold` 字段取,**前端不存自己的"默认"** —— 刻度按算法不同,写死
+必然慢慢与服务端漂移。阈值输入框同理**不预填常数**(曾经写死 `"6"`,换算法后
+就变成了一个不报错的错值)。改判据相关代码时 grep 一遍 `|| 6` / `value = "6"`。
+
+**第 4 条坑在测试里,而且它比前三条更难发现**:任何**显式带 threshold 的
+POST 都会把那个数值钉进判据**,后续切模式时服务端就不再重置(第 3 条的规则
+只对"没传阈值"生效)。`verify_frame_judge_ui.py` 里两处 z_mad 时代遗留的
+`threshold: 6`(收尾复位 + 4d 验"已下线算法回落")污染链是这样扩散的:
+
+```
+4d 写死 6 → 共享判据 manual/6 → 后面几张卡已挂载的控件从 WS 快照读到 6
+→ 用户在那些卡上改算法,控件把陈旧的 6 又发回去 → "切 conc" 拿到 conc@6
+```
+
+而「切 conc」断言当时**只看 mode 不看阈值**,所以全程 52/52 全绿 —— 测试自己
+把回归基线改坏了还报通过。查这个问题时最容易误判成"迁移没生效":页面上阈值框
+灰字显示 6、浮框写「阈值 6.00」,看着像线上状态坏了,实际干净重启后是 15.0,
+产品代码没问题。两处现在都**省略 threshold**,断言也补上"`threshold` 必须等于
+`/judge/metrics` 的 `default_threshold[conc]`"—— 补完立刻把这条故障抓出来
+(vtd/vtl 红,改完才绿)。教训:**断言要盯住"阈值属于模式"这个不变式,不能只盯
+mode**;而跨卡共用的配置(判据只有一份,三张卡共用 `VideoSession`),任何写死的
+数值都会被下一张卡继承。
+
+下拉里 conc 标着「约 N ms/帧」,这个 N 由 `frame_judge.cost_ms()` **实测**
+（进程内第一次调用时真跑 12 帧 960x540 合成帧,之后走缓存),不是写死的常数
+—— 同一条代码实测两次拿到 1.51 / 1.95 ms/帧,写死一个数只会在改了缩略图长边
+或换了机器之后悄悄过期,而"运行一次的时间"这种标注不准就是在骗人。两个
+`/judge/metrics` 端点都返回 `cost_ms` 字典。`wizard.json` 是静态配置,里面的
+「约 2 ms/帧」只是同一测量的取整近似,权威数字看功能页下拉。
+
+默认模式是 `manual` —— 三张卡历史上默认每 30 帧送一次,`DEFAULT_EVERY_N = 30`
+就是为了保持这个开箱行为不变。
+
+三条**实测踩出来的**规矩，改这块时务必先读:
+
+1. **`snapshot()` 带 `gen`（配置代次），前端必须丢弃过期快照**。WS/HTTP 的
+   传输顺序 ≠ 计算顺序:用户在页面上把判帧算法改成 manual 之后,POST **之前**
+   就已经发出的那几份旧快照还会陆续到达(快照是发送那一刻算好的)。照单全收
+   的表现是控件在两个模式之间来回跳。`gen` 取自
+   `frame_judge._GEN`(进程级单调递增,**不能**改成每实例从 0 开始 ——
+   VAS 每次 `start()` 都新建判据器,按实例计数会让前端记住的 gen 比新 run
+   的还大，之后所有快照都被当过期丢掉，浮框和曲线直接冻住)。
+2. **VAS 的判据配置是「下次开始分析生效」**（`configure_judge` 在运行中只
+   暂存到 `_pending_judge`）。中途换阈值会让本轮的帧集混用两把尺子，落库的
+   `sample_mode` 与缓存键也会按新值写、按旧值采。对应地前端 VAS 实例用
+   `syncControls: false` —— 每 tick 推来的是**本轮真实**判据状态，不能拿去
+   回写「下次生效」的配置控件。
+3. **曲线只在向导里出现**（用户明确要求），功能页只留配置 + 右上角浮框。
+   实现上曲线是 `position: fixed` 的浮层，每 500ms 按
+   `canvas.getBoundingClientRect()` 跟随摆位 —— 因为向导把 `<canvas>` **本身**
+   搬进自己的容器（`state.js:moveCanvasToWizard`），浮框做成 canvas 的兄弟
+   节点就会掉在隐藏页里。这样做也就不用改共享 wizard 框架（改共享框架要跑
+   全量跨卡回归）。
+   **fixed 浮层不占文档流，所以必须配一个占位块**：`.vj-curve-spacer` 插在
+   `.wd-wizard-canvas-wrap` **外面**（wrap 本身是 flex 容器，插进去会跟画布
+   并排），把视频源步里的判据控件顶到曲线下方。少了它，曲线与下拉框抢同一块
+   屏幕 —— 实测 `elementFromPoint` 命中的是曲线 canvas，下拉框点不动。
+   两个浮层同时 `pointer-events: none`，`sync()` 也只在画布可见时画。
+
+**浮框贴画布下沿(不是上沿)**：右上角是各卡检测结果的落点(视频目标框 /
+描述文案都从那儿起),浮框摆上沿会直接压住它们。`sync()` 里按
+`min(canvas.bottom, viewport) - badgeHeight - PAD` 定位,并在画布下沿滚出
+视野时退回**可见下沿**、再兜一次视口 —— 否则浮框会飘到画布下方那些无关
+控件上面。实测(1600x1000):距右 10px、距下 10px,完全落在画面内。
+
+**判据配置的横排 vs 竖排由"它在哪"决定,不由"哪张卡"决定**：共享组件
+`frame-judge.js` 两种布局都有,宿主标了 `data-judge-layout="inline"` 就切
+横向(加 `.vj-inline`),否则竖排。用宿主**属性**做开关而不是认某个 class
+名 —— 认 class 会把共享组件绑死在某一张卡上:下一张卡把判据栏也摊到视频
+下方时,还得再来改组件。另外三张卡的判据控件在自己的配置区里,保持竖排。
+**别为了修一张卡把三张卡一起改了** —— 横排 CSS 全挂在 `.vj-inline` 之下。
+
+**vd(音视频描述)的视频源 + 判据两条栏都在视频正下方,不在 340px 右栏里**:
+视频源(`.stage-source-bar`,实测 x=104 w=1102,与黑框同起点同宽,高 57px) +
+判据(`#vd-judge-config[data-judge-layout=inline]`,高 79px)。原先两者竖排在
+右栏里,把那条栏拉得比视频还高(实测右栏 1324px → 搬走后 851px,与左栏齐平
+且 scroll-client=0 不溢出);而它们都是"看着画面调"的控件,摆在画面旁边才顺手。
+视频源整段**移出了 `<form id="vd-form">`** —— 里面的按钮全是 `type="button"`,
+全仓也没有按 `#vd-form` 取值的代码,移出去不影响任何逻辑(浏览器实测填源 + 点
+打开照常工作,画布出帧,无 pageerror)。
+
+**对齐基准是黑框 `.vd-stage`,不是内层 `<canvas>`**:`#vd-canvas` 只有
+`max-width:100%` 而不强制拉伸,16:9 素材会以 960 宽居中落在 1102 宽的黑框里
+(实测 x=175 vs 黑框 x=104)。拿 canvas 当基准量"没对齐"是量错了对象。
+
+**VAS(video-analysis-search)不在此列** —— 它的视频源与判据仍竖排在左侧控制台
+里(判据挂在「分析」子节,取代了原来的 `#vas-every-n` 输入框)。改布局时**别
+顺手把它也搬走**:那是另一张卡、另一套信息密度,用户要的是 vd。曾按 VAS 做
+了一轮改动又整体还原,`verify_judge_bar_layout.py` 现在对两张卡**分别**断言
+(一张必须搬到位、另一张必须没被误搬),靠"另一张没变"证明不了自己变了。
+
+缓存指纹 `analysis_sample_key` 把**算法**也进键：`conc`/`z_mad`/`auto` →
+`a:<阈值>`（三者都是同一套"默认自动判据"的历史写法，与历史自动行保持一致，
+否则老缓存全失配 —— 改算法时这张别名表要一起改），其它度量名 →
+`a:<阈值>:<算法>`（只按"非手动"归并会让两个算法同阈值共用一条缓存，而它们选出的
+帧集根本不同；现在虽然只放行 conc，规则留着 —— 将来加算法时不必再回头改缓存键）。
+`manual` 仍返回空串，保持与迁移前写入的历史手动行一致。
+
+回归（改了本段任一处都要重跑）:
+
+| 脚本 | 覆盖 | 结果 |
+|---|---|---|
+| `scripts/verify_frame_judge_metrics.py` | **判据选型的不变式**（不靠素材也能跑大半）：目标分必须高于正常帧 p95 / 稀疏微变不炸 / 全局变化被归一 / 面积单调性 + 10% 天花板 / 阈值操作点 | 37/37 |
+| `scripts/verify_vas_change_detector.py` | ChangeDetector/FrameJudge 单元 + 真实视频采样密度 + 只暴露 conc + 存量 z_mad/auto 迁移 | 60/60 |
+| `scripts/verify_judge_bar_layout.py` | 真浏览器两张卡**分别**断言：vd 的视频源 + 判据是否摊在视频正下方（DOM 归属 / 横排 / 与黑框同起点同宽 / 右栏不溢出）、VAS 是否**保持**侧栏竖排没被误搬；含填源 + 点打开的真实交互 | 20/20 |
+| `scripts/verify_frame_judge_ui.py` | 真浏览器 4 张卡：向导内改判据立刻落库 / 曲线与画布等宽 / **曲线不压判据控件** / 下拉只含 manual+conc 且标注实测耗时 / 过期配置不复活 / 无 pageerror | 52/52 |
+| `scripts/verify_vas_judge_e2e.py --mode conc` | 真视频 + 真 NPU：WS 判据推送 / 分数曲线 / 真节流 | 5/5（683 帧看 / 26 送检，3.8%） |
+| `scripts/verify_vas_judge_e2e.py --mode manual` | 同上，手动模式 ≈ 每 30 帧送一次、无分数曲线 | 3/3（510 帧 → 17 送检） |
+| `scripts/verify_wizard_env_step.mjs` | 6 张卡的向导结构（判据并进 source 步后 57/57） | 57/57 |
+| `scripts/smoke_wizard_all.py` | 6 张卡向导实际挂载 | 6/6 |
+
+> `verify_vas_judge_e2e.py` **一轮只跑一次分析**，两轮之间要重启服务 +
+> 重载模型：wdnav 的 VideoCapture 在「跑完一轮 → 再开一轮」时会踩 mpp
+> 缓冲的原生断言（`mpp_buf_slot: Assertion !slot->status.on_used failed`），
+> 第二个 run 的 decode 直接死掉。这是 SDK 侧老问题、与判据无关，但写测试
+> 的人必须知道，否则会误判成"判帧把解码搞挂了"。
+
+> 这条脚本还要求**本机有跑着的算力实例**：`/analysis/open` 依赖
+> `get_registry().get_session(...)`，没有 worker 时直接 **503**。而
+> `config.jsonc` 的 `compute.autostart` 目前是**注释掉的**（"开机自启暂时
+> 关闭"），所以服务重启后不会有任何模型起来 —— 跑这条脚本前先在
+> 「算力配置」页把 `qwen3-vl-4b` 起起来。**别为了跑测试去调
+> `PUT /api/compute/config`**：那会走 `ConfigStore._persist()` 重新序列化，
+> 把 config.jsonc 里那段解释 autostart 为什么关掉的注释整段抹掉（文件里
+> 自己写了这条警告）。要临时开就复制一份配置、用 `WDNWEBUI_CONFIG` 指过去。
 
 ## Wizard 框架(v0.4 起统一应用入口)
 
-v0.4 起,6 个演示页(`text-chat` / `tts` / `video-detection` /
-`video-file-analysis` / `video-target-detection` / `video-target-localization`)
-新增"向导模式"——**每次**进入页面时,framework 自动挂载该 app 的
-wizard(`wizard.json` 驱动),引导用户从空白走到可运行状态
+v0.4 起,6 张带 `wizard.json` 的卡(`text-chat` / `tts` / `video-detection` /
+`video-target-detection` / `video-target-localization` /
+`video-analysis-search`;`audio-analysis` 没有向导)进入页面时 framework 自动
+挂载该 app 的 wizard,引导用户从空白走到可运行状态
 (env_check → form → finish)。点 完成配置 后 wizard 调用 app 的
-`applyWizardSnapshot(opts)` 并 unmount;用户离开页面再回来时,因
-`wizard:unmounted` 事件 framework 清掉 `_loadedApps`,wizard 会再次弹出
-(localStorage 持久化字段值,不会让用户重填)。
+`applyWizardSnapshot(opts)` 并 unmount;用户离开页面再回来时,
+`wizard:unmounted` 让向导**重新挂载**(`_wizardMounted` 清标记,卡片 IIFE
+**不**重跑 —— 详见设计原则第 5 条),localStorage 持久化字段值,不会让用户重填。
 
 > **未实现"只在首次进入时弹出"**:曾计划只对第一次访问显示 wizard,
 > 但用户实测反馈"刷新就丢失引导,记不清配置路径"反而更麻烦 —— v0.4
@@ -334,6 +812,29 @@ wizard(`wizard.json` 驱动),引导用户从空白走到可运行状态
 - `finish` — 收尾步骤,显示摘要 + 等模型 running(`_waitForModelsRunning`
   轮询 `/api/compute` 至所有 `swcap_to_model` 的 model_id 变 running 或 90s 超时)。
   完成后调 `applyWizardSnapshot` 并 unmount。
+
+### 判据配置放在向导的「视频源」步（不单独占一步）
+
+4 张视频卡(vd / vtd / vtl / vas)的 `wizard.json` 都把判据三个字段
+(`judgeMode` / `judgeThreshold` / `judgeEveryN`)并进 **source 步**的
+`fields`,而不是另开一步 —— 曲线画在向导的视频源步里(canvas 那时才被搬进
+向导),配置与它同屏才说得通。改完由 `FrameJudge.fromWizard(prefix, opts)`
+在「完成配置」时落库。
+
+三条实测过的规矩:
+
+1. **别把步数写死进测试**。`scripts/verify_wizard_env_step.mjs` 原来断言
+   vtl「共 4 步」,结构一变就挂。现在只断言**首步 env_check / 末步 finish /
+   source 步含 judgeMode**—— 真正要守的是结构自洽,不是步数。
+2. **向导的「打开」按钮读的是向导自己的输入框**(`[data-field-id]`),
+   不是页面上的 `#<prefix>-source`;填错了会被 wizard 的空值覆盖,
+   表现为「点了打开没反应、canvas 进了向导但一帧不播」。
+3. **改判据要立刻生效,不能等「完成配置」**。曲线就在这一步盯着,改阈值却
+   要等收尾才看到效果等于没曲线。框架侧因此加了一个**通用**事件:字段一
+   改动就 `_captureValues` 并 dispatch `wizard:field-change`(只发事件、
+   不认识任何字段名);`frame-judge.js` 按**字段 id 前缀**认领
+   (`<prefix>-judge-*`)并 `applyConfig`。判据逻辑留在共享组件里,框架仍然
+   零耦合 —— 框架里出现任何具体字段名都算违规。
 
 ### 应用页契约:`applyWizardSnapshot(opts)`
 
@@ -1122,8 +1623,10 @@ The `#page-video-detection` section is wired to:
     `VD_FS_ROOT` (env var, default `/`) and skips `/proc`, `/sys`,
     `/dev`, `/run`, `/snap`, `/usr/share/{doc,locale,man}`, etc.
   - `POST /api/video-detection/prompt` `{prompt, every_n}` — start VLM
-    detection with the user's prompt; `every_n` controls how often
-    (in frames) the worker feeds a frame to the model.
+    detection with the user's prompt. `every_n` 这里恒为 1:节流已从
+    detector 移到 `FrameJudge`（判据是四张卡共用的唯一旋钮，见「帧判据」
+    段),detector 自己不再跳帧。实际送检频率由 `POST /api/video/judge`
+    的模式 / 阈值 / 帧间隔决定。
   - `POST /api/video-detection/prompt/stop` — stop detection (worker
     thread exits, session stays loaded for next start).
   - `GET  /api/video-detection/events` — snapshot + history list + latest.
@@ -2413,8 +2916,19 @@ RIFF header by hand.
   - `GET  /api/video-analysis-search`             — 当前快照（state / 总帧 /
     进度 / 综述 / available / init_error）。
   - `GET  /api/video-analysis-search/events`      — per-frame events + summary。
-  - `POST /api/video-analysis-search/open` `{source, prompt, every_n}` —
-    启动一次；400 source/prompt/every_n 校验失败；503 wdnai 不可用 / 功能未启用。
+  - `POST /api/video-analysis-search/analysis/open` `{source, prompt,
+    every_n, sample_mode, change_threshold}` — 启动一次；400
+    source/prompt/every_n/sample_mode 校验失败（`sample_mode` 收
+    `manual` 或 `frame_judge.metrics()` 里的度量名，当前只有 `conc`；
+    **已下架的 `z_mad` / 字面量 `auto` 放行并迁移到 conc 且丢弃旧阈值**，
+    不要给老客户端报 400 —— 升级后一点「开始」就报错比静默失效更难排查）；
+    503 wdnai 不可用 / 功能未启用。
+    历史 run 恢复（`service.py:_restore`）走同一套迁移，否则落库的
+    `sample_mode` / 缓存键会与真正在跑的判据对不上。
+  - `GET/POST /api/video-analysis-search/judge[ /metrics]` — VAS 自己的
+    帧判据配置（与三张卡共用的 `/api/video/judge` **分开**：判据挂在
+    VideoAnalysisService 上，不在共用的 VideoSession 里）。运行中改配置
+    只暂存，下次 `open` 才生效。
   - `POST /api/video-analysis-search/stop`        — 用户中途停止（不出综述）。
   - `POST /api/video-analysis-search/close`       — 彻底关闭。
   - `POST /api/video-analysis-search/events/clear` — 清空内存 events + summary。
