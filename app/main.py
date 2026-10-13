@@ -239,6 +239,13 @@ def create_app() -> FastAPI:
     from app.system import register_all as system_register_all
     system_register_all(app)
 
+    # 3b. 帧判据共享 API —— vd / vtd / vtl 共用 VideoSession 单例，
+    #     所以判据配置也只有一份。三张卡各自暴露端点会走样（改一处漏
+    #     两处），故挂在 core 层由三张卡共用。VAS 不在此列：它自管理
+    #     VideoCapture，配置走自己的 /api/video-analysis-search/*。
+    from app.core.video.api import register_judge_api
+    register_judge_api(app)
+
     # 4. boot_compute_services — daemon thread (kept from v0.4 architecture)
     threading.Thread(
         target=get_registry().boot_compute_services,
@@ -265,11 +272,16 @@ def create_app() -> FastAPI:
             LOG.warning("[%s] failed to mount static dir: %s", m.id, e)
 
     # 6. Mount framework-level static at /static/core + /static/system + /static
+    # /static/core 同样走 _NoCacheStaticFiles：template 里虽然带了 ?v=<mtime>
+    # 版本串，但浏览器在地址栏里手动导航或被 hashchange 切到同一页时，**仍**
+    # 拿旧 index.html 跑（hash 变化不重新拉 index），于是 ?v= 不更新、JS 也就
+    # 不变。no-cache 让浏览器每次都带 ETag 校验：URL 变了一定拉新，URL 没变
+    # 也只是多一次 304。详见 _NoCacheStaticFiles 注释。
     core_static = STATIC_DIR / "core"
     if core_static.is_dir():
         app.mount(
             "/static/core",
-            StaticFiles(directory=str(core_static)),
+            _NoCacheStaticFiles(directory=str(core_static)),
             name="static-core",
         )
     # System pages have their own static dir (not plugin-driven)
