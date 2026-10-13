@@ -148,37 +148,8 @@ html, body {
   overflow-y: auto;
 }
 
-/* ---------- privilege warning (shown when service is not root) ---------- */
-.root-warning {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.75rem;
-  padding: 0.85rem 1.1rem;
-  margin-bottom: 1.5rem;
-  background: linear-gradient(180deg, #fef3c7, #fde68a);
-  border: 1px solid #f59e0b;
-  border-left: 5px solid #b45309;
-  border-radius: 6px;
-  color: #78350f;
-  font-size: 0.9rem;
-  line-height: 1.5;
-  box-shadow: 0 2px 8px rgba(180, 83, 9, 0.08);
-}
-.root-warning-icon {
-  font-size: 1.4rem;
-  line-height: 1;
-  flex: 0 0 auto;
-  color: #b45309;
-}
-.root-warning-text { flex: 1 1 auto; }
-.root-warning code {
-  background: rgba(120, 53, 15, 0.12);
-  padding: 0.05rem 0.4rem;
-  border-radius: 3px;
-  font-family: var(--mono);
-  font-size: 0.85em;
-  color: #78350f;
-}
+/* 原 .root-warning 系列样式已随横幅一起删除：服务不再要求 root 启动，
+   网页端也不再依赖它。留着这些规则只会让人误以为还会用到。 */
 
 .page-header {
   display: flex;
@@ -853,8 +824,8 @@ html, body {
   justify-content: center;
 }
 #vd-canvas {
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
   display: block;
 }
 #vcs-canvas {
@@ -863,8 +834,8 @@ html, body {
   display: block;
 }
 #vtl-canvas {
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
   display: block;
 }
 .vd-overlay {
@@ -2193,6 +2164,38 @@ body.dg-modal-open .back-home-btn {
   align-items: stretch;
 }
 .surv-input-row .surv-input { flex: 1 1 auto; }
+
+/* 视频源栏摊在视频正下方时（.stage-source-bar）：标题与两行控件并排，
+   整条只占一行高度而不是竖着叠三层。窄栏里那套竖排布局不变。
+   判据栏（#vd-judge-config）紧跟在其下方，由 frame-judge.js 挂出的
+   .vj-config 渲染；它自己带 data-judge-layout="inline" 切横排。 */
+.stage-source-bar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.5rem 0.9rem;
+  padding: 0.45rem 0.7rem;
+}
+.stage-source-bar .surv-form-head {
+  margin-bottom: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  white-space: nowrap;
+}
+.stage-source-bar .surv-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.3rem 0.5rem;
+}
+@media (max-width: 900px) {
+  /* 窄屏下宽位置也没了，退回竖排 —— 两栏并排会把输入框挤成一条缝。 */
+  .stage-source-bar,
+  .stage-source-bar .surv-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 .surv-textarea {
   font-family: inherit;
   resize: vertical;

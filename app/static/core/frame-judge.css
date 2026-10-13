@@ -1,0 +1,209 @@
+/* 帧判据共享组件样式 —— 命名空间 vj-，与卡片私有样式互不覆盖。
+ *
+ * 浮框 / 曲线都是 position:fixed 的浮层，挂在 body 上，由 frame-judge.js
+ * 按 canvas 的 getBoundingClientRect() 逐帧摆位（向导会把 canvas 搬进
+ * 自己的容器，见 frame-judge.js 顶部注释）。
+ */
+
+.vj-config {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 6px;
+  background: #fff;
+}
+.vj-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.vj-row > .vj-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 140px;
+  font-size: 13px;
+  color: var(--text-dim, #475569);
+}
+.vj-select,
+.vj-input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 6px;
+  background: #fff;
+  color: #0f172a;
+  font-size: 14px;
+}
+.vj-input:disabled {
+  background: #f1f5f9;
+  color: #94a3b8;
+}
+.vj-hint {
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.45;
+}
+
+/* ---- 横向模式：判据控件一行排开，贴在视频下方 ----
+   竖排那套（三行：算法 / 阈值+间隔 / 说明）塞进窄配置栏会把整条栏撑得
+   很长，而判据栏摊在视频正下方时有一整行的宽度可用。
+   由宿主标 data-judge-layout="inline" 开启（见 frame-judge.js），不是改
+   默认值 —— 另外三张卡的判据控件在自己的配置区里，竖排更合适。
+   别为了修一张卡把三张卡的布局一起改了。 */
+.vj-config.vj-inline {
+  flex-direction: row;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 0;
+  padding: 8px 12px;
+  background: #f8fafc;
+}
+.vj-config.vj-inline > .vj-row {
+  flex: 0 0 auto;
+  gap: 14px;
+}
+.vj-config.vj-inline > .vj-row > .vj-label {
+  /* 横排时标签与控件同行，而不是叠两行 —— 否则省下的高度又被 label
+     的 flex-direction: column 吃回去。 */
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+/* 横向时给「判帧算法」下拉留足宽度：它的 option 带实测耗时标注，
+   在窄列里会被截成 "conc（约 2…"。 */
+.vj-config.vj-inline > .vj-row:first-child > .vj-label {
+  flex: 1 1 300px;
+  max-width: 380px;
+}
+.vj-config.vj-inline > .vj-row:first-child .vj-select {
+  min-width: 220px;
+}
+.vj-config.vj-inline > .vj-row:nth-child(2) > .vj-label {
+  flex: 0 0 auto;
+}
+.vj-config.vj-inline > .vj-row:nth-child(2) .vj-input {
+  width: 92px;
+}
+.vj-config.vj-inline > .vj-hint {
+  /* 说明文字单独占满下一行，别挤在控件后面把整行撑得歪歪扭扭。 */
+  flex: 1 0 100%;
+}
+
+/* ---- 事件历史行里的「当前帧变化值」（FrameJudge.scoreSpan 生成）----
+   两类颜色对应两种**处置完全不同**的情况，灰色不是"出错"：
+     .over     分数 > 阈值  → 超阈值触发，阈值对这条素材偏低，该调高阈值；
+     .fallback 分数 ≤ 阈值  → 兜底间隔放行（有变化但没过阈值，设计内），
+                            该调的是「帧间隔」或换算法，继续抬阈值没用。
+   样式放这里而不是各卡自己的 app.css：判据是共享的，三张卡的事件列表
+   用同一套标记。 */
+.vj-score {
+  padding: 0 0.4rem;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.vj-score.over {
+  background: #ffedd5;
+  color: #9a3412;
+  border-color: #fdba74;
+}
+.vj-score.fallback {
+  background: #f1f5f9;
+  color: #64748b;
+  border-color: #cbd5e1;
+}
+
+/* ---- 浮框（右上角，画面内）---- */
+.vj-badge {
+  position: fixed;
+  z-index: 60;
+  /* 纯展示层：绝不能吃掉下面控件的点击。曲线同理 —— 它们按画布矩形摆位，
+     画布滚出视野的那一刻起位置就不再对应任何内容，与其挡住下拉框不如
+     让点击穿透（sync() 里同时会把它们藏掉，这里是第二道保险）。 */
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.72);
+  color: #e2e8f0;
+  font-family: var(--mono, monospace);
+  font-size: 13px;
+  line-height: 1.25;
+}
+.vj-badge-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+.vj-badge-num { font-variant-numeric: tabular-nums; opacity: 0.92; }
+.vj-badge-sub { font-size: 11px; color: #94a3b8; }
+.vj-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #64748b;
+}
+/* 判为变化：橙底 + 发光点。**不用 transition** —— WS tick 约 20 次/秒，
+   任何超过 ~50ms 的过渡都会永远停在半路，橙/灰分不出来。 */
+.vj-badge.on {
+  background: rgba(194, 65, 12, 0.85);
+  border-color: rgba(251, 146, 60, 0.9);
+  color: #fff7ed;
+}
+.vj-badge.on .vj-dot {
+  background: #fdba74;
+  animation: vj-pulse 320ms ease-out;
+}
+.vj-badge.on .vj-badge-sub { color: #fed7aa; }
+.vj-badge.manual { background: rgba(51, 65, 85, 0.72); }
+/* 实测送检间隔远小于兜底间隔 = 阈值把几乎每一帧都放行了、兜底根本轮不上。
+   这是**可观测性问题**的兜底告警：判据明明在工作，但"无变化"的主行让
+   用户以为它没生效，而检测器其实被喂满了帧。 */
+.vj-badge.warn {
+  background: rgba(146, 64, 14, 0.85);
+  border-color: rgba(251, 191, 36, 0.9);
+  color: #fffbeb;
+}
+.vj-badge.warn .vj-dot { background: #fcd34d; }
+.vj-badge.warn .vj-badge-sub { color: #fde68a; }
+@keyframes vj-pulse {
+  from { box-shadow: 0 0 0 0 rgba(253, 186, 116, 0.9); transform: scale(1.4); }
+  to   { box-shadow: 0 0 8px 2px rgba(253, 186, 116, 0.7); transform: scale(1); }
+}
+
+/* ---- 实时曲线（视频正下方，仅向导内可见）---- */
+.vj-curve {
+  position: fixed;
+  z-index: 55;
+  pointer-events: none;
+  padding: 4px 0 0;
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 6px;
+  background: #fff;
+}
+.vj-curve-canvas {
+  display: block;
+  width: 100%;
+  height: 88px;
+}
+.vj-curve-hint {
+  padding: 2px 6px 4px;
+  font-size: 11px;
+  color: #64748b;
+}
+/* 曲线是 fixed 浮层、不占文档流；这个占位块替它在文档流里留出等高空间，
+   把后面的控件（判据下拉框等）顶到曲线下方，避免两者抢同一块屏幕。 */
+.vj-curve-spacer {
+  width: 100%;
+  pointer-events: none;
+}

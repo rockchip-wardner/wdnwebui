@@ -48,6 +48,7 @@
                       <span>循环播放</span>
                     </label>
                   </div>
+                  <div id="vtd-judge-config"></div>
                 </div>
               </section>
 
@@ -68,11 +69,6 @@
                   <textarea id="vtd-prompt" class="surv-input surv-textarea"
                             placeholder="例如：描述画面中需要标注的目标位置，直接返回 0–1000 归一化 ROI 坐标 x1,y1,x2,y2 和该 ROI 内的描述文本"></textarea>
                   <div class="vd-detector-row">
-                    <label class="vd-detector-label">
-                      隔
-                      <input type="number" id="vtd-every-n" min="1" max="600" step="1" value="30" />
-                      帧
-                    </label>
                     <button type="button" class="vd-btn vd-btn-primary" id="vtd-detector-start">启动检测</button>
                     <button type="button" class="vd-btn" id="vtd-detector-stop" disabled>停止检测</button>
                   </div>

@@ -15,6 +15,37 @@
               </div>
             </div>
 
+            <!-- 视频源 + 判据：两条配置栏一起从右侧 aside 挪到视频正下方。
+                 原来竖排在 340px 右栏里，把那条栏拉得比视频还高，而这两块
+                 都是"看着画面调"的控件，摆在画面旁边才顺手。整段移出
+                 <form id="vd-form"> 不影响任何逻辑 —— 里面的按钮全是
+                 type="button"，全仓也没有按 #vd-form 取值的代码。
+                 判据栏挂 data-judge-layout="inline" 让共享组件切横排
+                 （判据长什么样由它所在的位置决定，见 frame-judge.js）。 -->
+            <section class="surv-form-section stage-source-bar">
+              <header class="surv-form-head">
+                <h3>视频源</h3>
+                <span class="surv-hint">网络流或本地文件/文件夹</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-input-row">
+                  <input type="text" id="vd-source" class="surv-input"
+                         placeholder="网络流或本地文件/文件夹" spellcheck="false" />
+                  <button type="button" class="vd-btn" id="vd-browse">浏览…</button>
+                </div>
+                <div class="vd-actions-row">
+                  <button type="button" class="vd-btn vd-btn-primary" id="vd-open">打开</button>
+                  <button type="button" class="vd-btn" id="vd-close">关闭</button>
+                  <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
+                    <input type="checkbox" id="vd-loop" />
+                    <span>循环播放</span>
+                  </label>
+                </div>
+              </div>
+            </section>
+
+            <div id="vd-judge-config" data-judge-layout="inline"></div>
+
             <div class="vd-controls">
               <button id="vd-play"  class="vd-btn">▶ 播放</button>
               <button id="vd-pause" class="vd-btn">⏸ 暂停</button>
@@ -30,27 +61,6 @@
 
           <aside class="vd-side">
             <form class="surv-form" id="vd-form" autocomplete="off" onsubmit="return false;">
-              <section class="surv-form-section">
-                <header class="surv-form-head">
-                  <h3>视频源</h3>
-                </header>
-                <div class="surv-field">
-                  <div class="surv-input-row">
-                    <input type="text" id="vd-source" class="surv-input"
-                           placeholder="网络流或本地文件/文件夹" spellcheck="false" />
-                    <button type="button" class="vd-btn" id="vd-browse">浏览…</button>
-                  </div>
-                  <div class="vd-actions-row">
-                    <button type="button" class="vd-btn vd-btn-primary" id="vd-open">打开</button>
-                    <button type="button" class="vd-btn" id="vd-close">关闭</button>
-                    <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
-                      <input type="checkbox" id="vd-loop" />
-                      <span>循环播放</span>
-                    </label>
-                  </div>
-                </div>
-              </section>
-
               <section class="surv-form-section vd-grow">
                 <header class="surv-form-head">
                   <h3>检测提示词</h3>
@@ -68,11 +78,6 @@
                   <textarea id="vd-prompt" class="surv-input surv-textarea"
                             placeholder="例如：检测画面中是否有人进入，或描述图中发生的事件"></textarea>
                   <div class="vd-detector-row">
-                    <label class="vd-detector-label">
-                      隔
-                      <input type="number" id="vd-every-n" min="1" max="600" step="1" value="30" />
-                      帧
-                    </label>
                     <button type="button" class="vd-btn vd-btn-primary" id="vd-detector-start">启动检测</button>
                     <button type="button" class="vd-btn" id="vd-detector-stop" disabled>停止检测</button>
                   </div>

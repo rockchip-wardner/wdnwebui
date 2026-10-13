@@ -106,6 +106,7 @@ function connectVtdWs() {
       setVtdMeta(snap);
       setVtdProgress(snap);
       refreshVtdButtons(snap.state);
+      window.FrameJudge?.update("vtd", snap.judge);
       const payload = document.getElementById("data-video-target-detection");
       if (payload) payload.textContent = JSON.stringify(snap, null, 2);
       return;
@@ -205,6 +206,10 @@ function buildVtdEventLi(ev, isLatest) {
   tag.textContent = "#" + ev.id;
   meta.appendChild(tsSpan);
   meta.appendChild(fpSpan);
+  // 判据分数：区分「超阈值触发」和「兜底间隔触发」。三张卡共用同一份判据，
+  // 所以三处都要显示 —— 只给一张卡加就是"同样的配置、不同的信息"。
+  const jsSpan = window.FrameJudge?.scoreSpan?.("vtd", ev);
+  if (jsSpan) meta.appendChild(jsSpan);
   meta.appendChild(tag);
   const body = document.createElement("div");
   body.className = "vd-event-body";
@@ -382,7 +387,7 @@ function updateVtdDetectorStatus(snap) {
       ? ` · 尺寸 ${snap.image_size}`
       : "";
     statusEl.textContent =
-      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size} · 目标检测${sizeHint}`;
+      `运行中 · 每 ${snap.judge?.every_n ?? snap.every_n} 帧 · 队列 ${snap.queue_size} · 目标检测${sizeHint}`;
   } else if (snap.enabled) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
@@ -413,10 +418,11 @@ async function refreshVtdDetector() {
 }
 async function vtdDetectorStart() {
   const promptEl = document.getElementById("vtd-prompt");
-  const everyEl  = document.getElementById("vtd-every-n");
   const sizeEl   = document.getElementById("vtd-detect-size");
   const prompt = (promptEl?.value || "").trim();
-  const every_n = parseInt(everyEl?.value || "30", 10);
+  // 节流已上移到共享判据器（core/video/frame_judge.py），detector 一律 every_n=1，
+  // 否则两级相乘：30 x 30 = 900 帧才送一帧。
+  const every_n = 1;
   if (!prompt) {
     setVtdOverlay("请先填写检测提示词", true);
     return;
@@ -481,6 +487,7 @@ function initVideoTargetDetection() {
 
   // ...
   loadModelPick("vtd-model-pick", "swcap_video_describe", "vtd.model_id");
+  window.FrameJudge?.mount({ prefix: "vtd", canvasId: "vtd-canvas" });
 
   const sourceEl = document.getElementById("vtd-source");
   const loopEl   = document.getElementById("vtd-loop");
@@ -604,8 +611,10 @@ window.ImApp_video_target_detection.applyWizardSnapshot = async function (opts) 
   if (opts.loop != null) setChk("vtd-loop", opts.loop);
   if (opts.prompt)      setVal("vtd-prompt", opts.prompt);
   if (opts.detectSize)  setVal("vtd-detect-size", opts.detectSize);
+  // 帧判据 —— 必须在 open 之前落地：open 一开视频，判据已经在解码热路径上跑。
+  const judge = await window.FrameJudge?.fromWizard("vtd", opts) ?? null;
 
-  const result = { source_opened: false, detector_started: false };
+  const result = { source_opened: false, detector_started: false, judge_applied: !!judge };
 
   if (opts.source) {
     try {

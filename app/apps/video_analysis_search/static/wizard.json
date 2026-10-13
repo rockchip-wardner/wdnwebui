@@ -14,18 +14,26 @@
       "fields": [
         { "id": "vcs-source", "ui_key": "source", "label": "视频源 URL / 路径",
           "placeholder": "例 /userdata/test/clips/sample.mp4" },
-        { "id": "vcs-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox", "default": true }
+        { "id": "vcs-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox", "default": true },
+        { "id": "vas-judge-mode", "ui_key": "judgeMode", "label": "判帧算法（决定哪些帧送去分析）", "type": "select",
+          "options": [
+            { "value": "manual", "label": "手动跳帧（固定间隔，不比对画面）" },
+            { "value": "gscore", "label": "gscore 画面变化（推荐：先消除整幅光照变化，再看结构残差）", "selected": true }
+          ]
+        },
+        { "id": "vas-judge-threshold", "ui_key": "judgeThreshold", "label": "变化阈值（越小越敏感）", "type": "number",
+          "default": 10, "min": "0.1", "step": "0.1",
+          "default": 10, "min": "0.1", "step": "0.1",
+          "placeholder": "默认 10（刻度按算法不同，切换算法会换成该算法的默认值）" },
+        { "id": "vas-judge-every-n", "ui_key": "judgeEveryN", "label": "帧间隔（有变化时的最长间隔）", "type": "number",
+          "default": 600, "min": "1", "max": "3600", "step": "1",
+          "default": 600, "min": "1", "max": "3600", "step": "1",
+          "placeholder": "默认 600" }
       ]
     },
     { "id": "prompt", "title": "分析要求",     "kind": "form",
       "fields": [
         { "id": "vas-prompt", "ui_key": "prompt", "label": "例:请对整段视频进行内容总结,给出主题、关键事件与时间线", "summary_label": "分析要求", "type": "textarea" }
-      ]
-    },
-    { "id": "sample", "title": "采样间隔",     "kind": "form",
-      "fields": [
-        { "id": "vas-every-n", "ui_key": "everyN", "label": "采样间隔(每隔多少帧)", "type": "number",
-          "placeholder": "默认 60" }
       ]
     },
     { "id": "search", "title": "检索问题",     "kind": "form",

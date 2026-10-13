@@ -22,6 +22,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.apps.video_analysis_search.api import preview_router, router as analysis_router
+from app.apps.video_analysis_search.judge_api import router as judge_router
 from app.apps.video_analysis_search.search_api import router as search_router
 
 LOG = __import__("logging").getLogger("apps.video_analysis_search")
@@ -39,6 +40,7 @@ def register_api(app: FastAPI) -> None:
     app.include_router(analysis_router, prefix=_API_PREFIX + "/analysis")
     app.include_router(search_router, prefix=_API_PREFIX + "/search")
     app.include_router(preview_router, prefix=_API_PREFIX)
+    app.include_router(judge_router, prefix=_API_PREFIX)
     LOG.info("video_analysis_search: API mounted at %s/{analysis,preview,search}",
              _API_PREFIX)
 

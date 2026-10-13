@@ -1,6 +1,6 @@
       <section id="page-video-target-localization" class="page hidden" data-page="video-target-localization">
         <header class="page-header">
-          <h2>视频目标定位</h2>
+          <h2>视频任意目标定位</h2>
           <button class="wizard-mode-btn" data-wizard-mode data-page-id="video-target-localization">向导模式</button>
           <button class="refresh-btn" data-refresh>刷新</button>
         </header>
@@ -48,6 +48,7 @@
                       <span>循环播放</span>
                     </label>
                   </div>
+                  <div id="vtl-judge-config"></div>
                 </div>
               </section>
 
@@ -71,11 +72,6 @@
                     <span class="vtl-prompt-hint" id="vtl-prompt-hint">1 / 20</span>
                   </div>
                   <div class="vd-detector-row">
-                    <label class="vd-detector-label">
-                      隔
-                      <input type="number" id="vtl-every-n" min="1" max="600" step="1" value="30" />
-                      帧
-                    </label>
                     <button type="button" class="vd-btn vd-btn-primary" id="vtl-detector-start">启动定位</button>
                     <button type="button" class="vd-btn" id="vtl-detector-stop" disabled>停止定位</button>
                   </div>

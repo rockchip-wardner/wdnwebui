@@ -34,17 +34,21 @@ _VIDEO_DETECTION_FRAME_SINK = None
 
 
 def _make_video_detection_sink():
-    """Return a frame sink ``(frame, frame_pos, frame_b64) -> None``
+    """Return a frame sink ``(frame, frame_pos, frame_b64, judge_score) -> None``
     that forwards each decoded BGR frame into the VD detector's
     ``submit_frame`` queue. The detector itself decides whether to drop
     the frame (when ``_enabled`` is False) and which Nth one to keep
     (via ``every_n``), so the sink is always-on and cheap.
+
+    ``judge_score`` 是判据在这一帧上的分数，随事件一起落到事件历史 ——
+    没有它就分不清"这条事件是阈值触发的还是兜底触发的"。
     """
     from app.core.llm.detector_base import get_detector
 
-    def _sink(frame, frame_pos, frame_b64):
+    def _sink(frame, frame_pos, frame_b64, judge_score=None):
         try:
-            get_detector().submit_frame(frame, frame_pos, frame_b64)
+            get_detector().submit_frame(frame, frame_pos, frame_b64,
+                                        judge_score=judge_score)
         except Exception as e:  # noqa: BLE001
             LOG.debug(
                 "video_detection: frame sink raised: %s: %s",

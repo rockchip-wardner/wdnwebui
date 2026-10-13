@@ -149,6 +149,16 @@
   // ------------------------------------------------------------------ #
   // 步骤 kind handlers
   // ------------------------------------------------------------------ #
+  // ------------------------------------------------------------------ #
+  // 应用没声明任何能力时，环境检查用这一行代替空列表 ——「无需检查」与
+  // 「检查失败」在视觉上必须区分开（否则卡片只剩一个光秃秃的标题，
+  // 看着像环境探测挂了）。
+  function _envNoReqRow(text) {
+    const row = _ce("div", WIZARD_NS + "env-row " + WIZARD_NS + "env-none");
+    row.textContent = "✓ " + text;
+    return row;
+  }
+
   function _renderEnvStep(body, foot, cfg, stepDef, state) {
     body.innerHTML = "";
     const hwOK = (state.envCheck.hwMissing || []).length === 0;
@@ -163,6 +173,12 @@
       row.textContent = (ok ? "✓ " : "✗ ") + cap;
       card.appendChild(row);
     });
+    // 空能力列表（如阈值标定卡：纯 CPU 判帧，不碰 NPU 也不声明硬件能力）
+    // 会让上面这张卡渲染成一个光秃秃的标题，看着像加载失败。补一行说明，
+    // 让「没有要求」读起来是「无需检查」而不是「检查没跑」。
+    if (!state.envCheck.hwRequired.length) {
+      card.appendChild(_envNoReqRow("本应用不依赖特定硬件能力（纯 CPU 计算）"));
+    }
     if (!hwOK) {
       const err = _ce("div", WIZARD_NS + "env-error");
       err.textContent = "硬件能力不满足,无法继续";
@@ -179,6 +195,9 @@
       row.textContent = (ok ? "✓ " : "✗ ") + cap;
       card2.appendChild(row);
     });
+    if (!state.envCheck.swRequired.length) {
+      card2.appendChild(_envNoReqRow("本应用不依赖模型 / 软件能力"));
+    }
     if (!swOK) {
       const bringBtn = _ce("button", WIZARD_NS + "primary-btn", "一键开启所需模型");
       bringBtn.id = WIZARD_NS + "env-bring-btn";
@@ -319,7 +338,16 @@
         case "number":
           el = _ce("input", WIZARD_NS + "input");
           el.type = "number";
+          // 优先级：已存值 > field.default > placeholder（不写死空框）——
+          // 之前这里只接 ``cur``，新会话 state.values 是空的，输入框就是个
+          // 啥都没有的白框，用户反馈"向导里没默认值"。补 default 之后再
+          // _apply 才会把它推给后端。
           if (cur != null) el.value = cur;
+          else if (field.default != null) el.value = field.default;
+          if (field.placeholder) el.placeholder = field.placeholder;
+          if (field.min != null) el.min = field.min;
+          if (field.max != null) el.max = field.max;
+          if (field.step != null) el.step = field.step;
           break;
         case "checkbox":
           el = _buildToggle(field, state);
@@ -424,6 +452,7 @@
       }
       // toggle / 复合容器(已经设了 data-field-id)无需再设
       if (!el.dataset.fieldId) el.dataset.fieldId = field.id;
+      _bindFieldLive(cfg, state, field, el);
       // 视频源字段(text 类型且 id 以 -source 结尾)自动追加"浏览…"按钮
       // + 同 stepDef 内 -loop toggle 移到 source input 与 browse 之间
       const isSource = field.type !== "textarea" && field.type !== "number"
@@ -491,6 +520,9 @@
           dropZone.appendChild(dropHint);
           const dropStatus = _ce("div", WIZARD_NS + "drop-status");
           dropZone.appendChild(dropStatus);
+          // 没有 upload_endpoint 时的静态占位（见下方 else 分支）。也要能被
+          // moveCanvasToWizard 清掉，所以提到分支外声明。
+          let noUp = null;
           if (cfg.upload_endpoint) {
             canvasWrap.appendChild(dropZone);
 
@@ -574,7 +606,7 @@
             });
           } else {
             // 没声明 upload_endpoint,给一个静态 placeholder
-            const noUp = _ce("div", WIZARD_NS + "drop-text", "点击「打开」开始播放");
+            noUp = _ce("div", WIZARD_NS + "drop-text", "点击「打开」开始播放");
             canvasWrap.appendChild(noUp);
           }
 
@@ -587,8 +619,15 @@
             const originalParent = canvas.parentNode;
             // 把 canvas 搬到 wrap 顶部,移除拖放区
             canvasWrap.appendChild(canvas);
-            if (cfg.upload_endpoint && dropZone.parentNode === canvasWrap) {
+            // 占位元素一律清掉 —— 画面已经在播了,「点击打开开始播放」还
+            // 压在画面上是 bug。此前只在 `cfg.upload_endpoint` 为真时移除
+            // dropZone,于是**没有上传端点的卡**(如阈值标定卡)占位文字会
+            // 永久残留在 canvas 上面,左右还多出一块灰色空隙。
+            if (dropZone.parentNode === canvasWrap) {
               canvasWrap.removeChild(dropZone);
+            }
+            if (noUp && noUp.parentNode === canvasWrap) {
+              canvasWrap.removeChild(noUp);
             }
             // 记录到 _active,unmount() 时还原。
             // (同一 canvas 多次 move 时,以最近一次的 originalParent 为准 —
@@ -621,7 +660,12 @@
               document.getElementById(closeId)?.click();
               // 把 canvas 搬回 page section,让应用页面再次显式拥有
               const canvas = document.getElementById(canvasId);
-              const pageSection = document.getElementById("page-" + app.id);
+              // app 只能从 state 上取:本函数签名是 (body, foot, cfg, stepDef,
+              // state),闭包里**没有** app 这个变量。此前这里写裸 `app.id`,
+              // 一进 handler 就 ReferenceError,被 catch 吞成一条 warn ——
+              // 表现为「关闭」点了没反应、canvas 永远留在向导里(7 张带向导
+              // 的卡全中)。修好后 console 里不再出现这条 warn。
+              const pageSection = document.getElementById("page-" + state.app.id);
               if (canvas && pageSection) {
                 const stage = pageSection.querySelector(".vd-stage, .vtd-stage, .vtl-stage")
                   || pageSection;
@@ -713,12 +757,44 @@
   // ------------------------------------------------------------------ #
   // Step navigation
   // ------------------------------------------------------------------ #
+
   // 落 localStorage + 刷新 debug hook;抽出来是为了让「上传成功直写
   // state.values」这条不经 _captureValues 的路径保持同一落盘口径。
   function _publishValues(state, cfg) {
     _lsSave(state.app.id, cfg, state.values);
     // debug hook for test/e2e visibility(零开销,生产环境无副作用)
     try { window._wd_wizard_values = JSON.parse(JSON.stringify(state.values)); } catch (_) {}
+  }
+
+  /**
+   * 字段一改动就广播 `wizard:field-change`（**通用机制，不认识任何应用**）。
+   *
+   * 为什么需要它：有些配置**只有在向导里才看得到效果** —— 帧判据的实时分数
+   * 曲线就画在向导的视频源步里（canvas 那时才被搬进来）。把判据配置并到
+   * 视频源步之后，用户改阈值就应当立刻看到曲线变化，而不是按「完成配置」
+   * 之后才生效 —— 曲线摆在眼前却不动，比没有曲线更让人困惑。
+   *
+   * 框架只负责**发事件**：谁来接、怎么接由应用 / 共享组件自己决定。框架里
+   * 出现任何具体字段名都违反零耦合。目前只有
+   * `app/static/core/frame-judge.js` 接这个事件。
+   */
+  function _bindFieldLive(cfg, state, field, el) {
+    // checkbox 藏在 toggle 容器里，监听内层 input；其余直接监听自身
+    const target = (el.matches && el.matches('input[type="checkbox"]'))
+      ? el
+      : ((el.querySelector && el.querySelector('input[type="checkbox"]')) || el);
+    const fire = () => {
+      // 已经切走 / 卸载的 wizard 不再发（DOM 还挂着但 _active 换人了）
+      if (!_active || _active !== state) return;
+      _captureValues(cfg, state);
+      try {
+        window.dispatchEvent(new CustomEvent("wizard:field-change", {
+          detail: { appId: state.app.id, values: Object.assign({}, state.values) },
+        }));
+      } catch (_) { /* 事件订阅方抛异常不影响向导 */ }
+    };
+    target.addEventListener("change", fire);
+    target.addEventListener("blur", fire);
   }
 
   function _captureValues(cfg, state) {

@@ -21,6 +21,9 @@ from fastapi.responses import Response
 
 from app.apps.video_analysis_search.service import LOG, get_service
 from app.core.config import default_resource_root
+from app.core.video.change_detector import SAMPLE_MODE_AUTO
+from app.core.video.frame_judge import (LEGACY_MODE_ALIASES, metrics,
+                                       normalize_mode)
 from app.core.video.session import get_session
 
 
@@ -210,7 +213,14 @@ async def list_events() -> dict:
 async def open_analysis(payload: dict) -> dict:
     """启动一次文件级 VLM 分析。
 
-    Body: ``{source: str, prompt: str, every_n: int}``
+    Body: ``{source: str, prompt: str, every_n: int,
+    sample_mode: str, change_threshold: float}``
+
+    ``sample_mode``：
+      * ``"manual"``（默认）= 固定间隔，每 ``every_n`` 帧送检一次（原行为）；
+      * 其余为判帧算法名（见 ``/judge/metrics``）= 按画面变化采样，
+        此时 ``every_n`` 语义变为"**最长间隔**"兜底（静止画面太久强制送检）。
+      * ``"auto"`` 仍被接受，历史上它硬编码等价于已下架的 ``z_mad``。
     """
     payload = payload or {}
     source = (payload.get("source") or "").strip()
@@ -225,8 +235,34 @@ async def open_analysis(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail="every_n 必须为整数")
     if every_n < 1:
         raise HTTPException(status_code=400, detail="every_n 必须 >= 1")
+    sample_mode = str(payload.get("sample_mode") or "manual").strip().lower()
+    # manual = 固定间隔；其余是判帧算法名（见 core/video/frame_judge.metrics）。
+    # 存量客户端可能仍传 "auto" / 已下架的 "z_mad" —— **放行并迁移**，不要
+    # 报 400：升级后一点「开始」就报错，比静默失效更难排查。迁移细节
+    # （含阈值必须重置）见 frame_judge._migrate / service.start()。
+    if normalize_mode(sample_mode) != sample_mode \
+            and sample_mode not in LEGACY_MODE_ALIASES:
+        raise HTTPException(
+            status_code=400,
+            detail="sample_mode 必须是 manual 或 %s 之一" % "/".join(metrics()))
+    raw_thr = payload.get("change_threshold")
+    change_threshold = None
+    if sample_mode in LEGACY_MODE_ALIASES:
+        change_threshold = None      # 旧刻度，沿用会让 conc 几乎每帧触发
+    if raw_thr is not None:
+        try:
+            change_threshold = float(raw_thr)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400,
+                                detail="change_threshold 必须是数字")
+        if not (0.0 < change_threshold <= 1000.0):
+            raise HTTPException(
+                status_code=400,
+                detail="change_threshold 必须在 (0, 1000] 区间")
     try:
-        return get_service().start(source, prompt, every_n)
+        return get_service().start(source, prompt, every_n,
+                                   sample_mode=sample_mode,
+                                   change_threshold=change_threshold)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:

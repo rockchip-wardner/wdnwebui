@@ -336,6 +336,8 @@ function connectVdWs() {
       setVdMeta(snap);
       setVdProgress(snap);
       refreshVdButtons(snap.state);
+      // 浮框 / 曲线靠 tick 里的 judge 字段实时刷新（约 20 次/秒）
+      window.FrameJudge?.update("vd", snap.judge);
       document.getElementById("data-video-detection").textContent =
         JSON.stringify(snap, null, 2);
       return;
@@ -390,6 +392,7 @@ async function vdStatus() {
   refreshVdButtons(snap.state);
   const loopEl = document.getElementById("vd-loop");
   if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
+  window.FrameJudge?.update("vd", snap.judge);
   document.getElementById("data-video-detection").textContent =
     JSON.stringify(snap, null, 2);
   return snap;
@@ -454,6 +457,12 @@ function renderVdEventList() {
     tag.textContent = "#" + ev.id;
     meta.appendChild(tsSpan);
     meta.appendChild(fpSpan);
+    // **判据在这一帧上的分数** —— 没有它就分不清这条事件是"阈值触发的"
+    // 还是"兜底间隔触发的"。后者本来就允许阈值以下的帧送检（兜底条件是
+    // gap >= every_n 且 score >= 阈值一半），两种情况的处置完全不同：前者
+    // 说明阈值偏低该调高，后者说明兜底在正常工作、只是频率比预期高。
+    const jsSpan = window.FrameJudge?.scoreSpan?.("vd", ev);
+    if (jsSpan) meta.appendChild(jsSpan);
     meta.appendChild(tag);
     const text = document.createElement("div");
     text.className = "vd-event-text";
@@ -498,7 +507,7 @@ function updateVdDetectorStatus(snap) {
       ? ` · 尺寸 ${snap.image_size}`
       : "";
     statusEl.textContent =
-      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size}${toolsHint}${sizeHint}`;
+      `运行中 · 每 ${snap.judge?.every_n ?? snap.every_n} 帧 · 队列 ${snap.queue_size}${toolsHint}${sizeHint}`;
   } else if (snap.enabled) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
@@ -548,6 +557,12 @@ async function vdDetectorStart() {
   const sizeEl    = document.getElementById("vd-detect-size");
   const prompt = (promptEl?.value || "").trim();
   const every_n = parseInt(everyEl?.value || "30", 10);
+  // 会话判据在自动模式下已经是唯一的门（见 core/video/frame_judge.py），
+  // detector 自己的 every_n 必须放开成 1，否则两级节流相乘（30x30=900
+  // 帧才送一帧），卡片上写的"间隔 N 帧"就变成了假话。
+  const judgeAuto = window.FrameJudge?.get("vd")?.judge
+    && !window.FrameJudge.get("vd").judge.manual;
+  const effectiveEvery = judgeAuto ? 1 : every_n;
   if (!prompt) {
     setVdOverlay("请先填写检测提示词", true);
     return;
@@ -569,7 +584,7 @@ async function vdDetectorStart() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        prompt, every_n, enabled_tools,
+        prompt, every_n: effectiveEvery, enabled_tools,
         image_size: Number.isFinite(image_size) ? image_size : null,
         model_id: model_id,
       }),
@@ -742,6 +757,11 @@ function initVideoDetection() {
   loadModelPick("vd-model-pick", "swcap_video_describe", "vd.model_id");
   loadModelPick("vd-audio-model-pick", "swcap_audio_understand", "vd.audio.model_id");
 
+  // 帧判据共享组件：配置区落在 #vd-judge-config，右上角浮框 +（仅向导内）
+  // 的分数曲线由组件自己按 canvas 位置摆。vd / vtd / vtl 共用同一个
+  // VideoSession，所以这里配一次三张卡同时生效。
+  window.FrameJudge?.mount({ prefix: "vd", canvasId: "vd-canvas" });
+
   const sourceEl = document.getElementById("vd-source");
   const loopEl   = document.getElementById("vd-loop");
   const openBtn = document.getElementById("vd-open");
@@ -886,8 +906,12 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
   if (opts.prompt)      setVal("vd-prompt", opts.prompt);
   if (opts.detectSize)  setVal("vd-detect-size", opts.detectSize);
   if (opts.audioPrompt) setVal("vd-audio-prompt", opts.audioPrompt);
+  // 帧判据（算法 / 阈值 / 帧间隔）—— 必须在 open 之前落地：open 一开视频，
+  // 判据就已经在解码热路径上跑了。
+  const judge = await window.FrameJudge?.fromWizard("vd", opts) ?? null;
 
-  const result = { source_opened: false, detector_started: false, audio_started: false };
+  const result = { source_opened: false, detector_started: false, audio_started: false,
+                 judge_applied: !!judge };
 
   // 2. 打开视频源(仅 source 非空)
   if (opts.source) {

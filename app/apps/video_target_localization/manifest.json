@@ -1,6 +1,6 @@
 {
   "id": "video-target-localization",
-  "title": "视频目标定位",
+  "title": "视频任意目标定位",
   "category": "video",
   "description": "输入任意文字描述，从图像中圈出对应目标所在区域。",
   "version": "0.1.0",

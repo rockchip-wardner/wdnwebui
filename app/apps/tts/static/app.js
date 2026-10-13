@@ -617,22 +617,10 @@ for (const a of _menus) {
   }
 }
 
-/* Surface a top-of-page warning when the service isn't running as root
- * — power actions (shutdown / reboot) need root and will fail silently
- * or noisily otherwise. */
-async function showRootWarning() {
-  const el = document.getElementById("root-warning");
-  if (!el) return;
-  try {
-    const r = await fetch(API_PREFIX + "/power");
-    if (!r.ok) return;
-    const data = await r.json();
-    if (data && data.is_root === false) {
-      el.classList.remove("hidden");
-    }
-  } catch (_) { /* network down at boot — skip silently */ }
-}
-showRootWarning();
+// 已移除 root 警告横幅：服务不再要求以 root 启动，本系统也不用网页端
+// 的关机/重启（那是 `#power-btn` 弹窗的事，与这里无关）。此前这段代码
+// 挂在 TTS 卡的 app.js 里、页面一加载就拉 /api/power 并弹全局横幅，
+// 导致不进 TTS 页也会看到，且提示的方向已经与实际部署方式相反。
 
   // ...
 

@@ -694,7 +694,16 @@ function vasRetrievalRowHtml(it, rt) {
 // 分析子行（来源徽章「分析」+ 加载/反查/删除）
 function vasAnalysisRowHtml(it, an) {
   const runId = an.run_id || "";
-  const meta = `间隔 ${an.every_n || "?"} 帧 · ${an.frame_count || 0} 帧`
+  // 采样方式文案：手动 = "间隔 N 帧"；自动（任一度量）= "判帧 · 最长 N 帧"
+  //（自动模式下 every_n 语义是"最长间隔"兜底，不是固定间隔）。
+  // 历史行 sample_mode 可能是二值的 "auto"（历史硬编码 z_mad，现迁移到 conc），
+  // 照旧按自动显示。
+  const mode = an.sample_mode || "manual";
+  const isAuto = mode !== "manual" && mode !== "";
+  const sampleText = isAuto
+    ? `${mode === "auto" ? "自动判帧" : mode}（≤${an.every_n || "?"} 帧）`
+    : `间隔 ${an.every_n || "?"} 帧`;
+  const meta = `${sampleText} · ${an.frame_count || 0} 帧`
              + ` · ${an.state || "unknown"}`
              + (an.summary ? " · 有综述" : "");
   // 提示词摘要（去掉追加的 schema hint，截 16 字）—— 同 every_n 不同
@@ -1630,6 +1639,19 @@ function initVideoSearch() {
   startBtn?.addEventListener("click", vasStart);
   stopBtn?.addEventListener("click", vasStop);
 
+  // 帧判据（算法 / 阈值 / 帧间隔）—— 与 vd / vtd / vtl 共用同一份组件
+  // （app/static/core/frame-judge.js）。VAS 走自己的判据端点，因为它的
+  // 判据挂在 VideoAnalysisService 上而不是共用的 VideoSession。
+  // syncControls:false —— 每 tick 推来的是**本轮真实**判据状态，而这里
+  // 的控件是"下次运行生效"的配置，两者不能互相覆盖（否则用户改完的阈值
+  // 会被本轮旧值抹掉）。
+  window.FrameJudge?.mount({
+    prefix: "vas",
+    canvasId: "vcs-canvas",
+    apiBase: "/api/video-analysis-search/judge",
+    syncControls: false,
+  });
+
   // 向导模式 / 手动预览 — 复用 vd 单例 VideoSession 跑连续预览帧流。
   // 与 vd / vtd / vtl 的「打开 / 关闭」按钮行为一致:open 把 source/loop
   // 写回后端,然后把后端 WS 帧流接到 #vcs-canvas(已被 wizard 搬到
@@ -1810,7 +1832,8 @@ const VAS = {
   // 缓存最近一次 state 推送里的元信息；进度推进靠它 + VAS.events.length
   // 实时计算 —— 避免每帧 VLM 完成都要等下一次 state 推送（之前是 2s
   // 节流，导致进度条"跟不上"分析）。
-  meta: { total_frames: 0, every_n: 30, started_at: 0, finished_at: 0, fps: 0 },
+  meta: { total_frames: 0, every_n: 30, started_at: 0, finished_at: 0, fps: 0,
+          sampleMode: "manual", framePos: 0 },
   _progressForceIdle: false,   // 清空"分析结果"后强制复位进度条，直到下次运行
   _srcClearedRun: "",          // 已清空视频源的 run_id（防止同一 run 重复清空）
   _clearedRun: "",             // 已清空"分析结果"的 run_id（反查目标排除它）
@@ -1987,6 +2010,13 @@ function vasApplySnapshot(snap) {
   // 送时按这个 + VAS.events.length 推进进度条，不依赖 state 节流。
   VAS.meta.total_frames = Number(snap.total_frames) || 0;
   VAS.meta.every_n      = Number(snap.every_n) || 30;
+  // 采样模式 + 当前解码位置：自动模式下进度条用 framePos/totalFrames
+  // 作分母（采样数事前不可知，见 vasUpdateProgress 的 auto 分支）。
+  VAS.meta.sampleMode  = String(snap.sample_mode || "manual");
+  VAS.meta.framePos    = Number(snap.frame_pos) || 0;
+  // 浮框 + 曲线：judge 是**本轮真实**的判据状态（分数环形缓冲 + 当前判定），
+  // 与 vd / vtd / vtl 的 snap.judge 同结构，共享组件直接吃。
+  window.FrameJudge?.update("vas", snap.judge);
   VAS.meta.started_at   = Number(snap.started_at) || 0;
   VAS.meta.finished_at  = Number(snap.finished_at) || 0;
   VAS.meta.fps          = Number(snap.fps) || 0;
@@ -2033,12 +2063,19 @@ const _VAS_PHASE_LABEL = {
  *
  * 算法：
  *   total_frames = VAS.meta.total_frames（来自最近一次 state 推送）
- *   expected     = ⌊ total_frames / every_n ⌋  ← 后端采样数
- *                 后端 _decode_loop 只在 cur_pos % every_n == 0 且
- *                 cur_pos <= total_frames 时采样（位置 every_n, 2*every_n,
- *                 ..., floor(total_frames/every_n)*every_n），所以样本数
- *                 是 floor 而不是 ceil。之前用 ceil 导致 totalFrames 不是
- *                 every_n 整数倍时进度条永远停在 (N-1)/N。
+ *   expected     = 分母，按判据模式分两种（**v0.18 判据下沉**）：
+ *                 * manual（默认，旧行为不变）
+ *                   expected = ⌊ total_frames / every_n ⌋
+ *                   后端 _decode_loop 只在 cur_pos % every_n == 0 且
+ *                   cur_pos <= total_frames 时采样（位置 every_n, 2*every_n,
+ *                   ..., floor(total_frames/every_n)*every_n），所以样本数
+ *                   是 floor 而不是 ceil。之前用 ceil 导致 totalFrames 不是
+ *                   every_n 整数倍时进度条永远停在 (N-1)/N。
+ *                 * 判帧模式（conc 等判帧算法名，按画面变化采样）
+ *                   expected = total_frames，分子用 frame_pos 而非
+ *                   analyzed —— 采样数事前不可知（由画面变化决定），
+ *                   floor(total/every_n) 只是兜底间隔的上限，用它当分母
+ *                   会让进度条长期趴在低位。
  *   analyzed     = 优先用 ``snap.analyzed``（state API 的权威计数），
  *                 没有 snap 时退到 ``VAS.events.length``。
  *                 **不要直接用 events.length**：events API 与 state API 是
@@ -2083,6 +2120,9 @@ function vasUpdateProgress(snap) {
     state,
     VAS.meta.total_frames,
     VAS.meta.every_n,
+    // 模式进签名：切模式会换分母公式（analyzed/expected vs
+    // frame_pos/total_frames），不进签名会导致进度条停在旧公式的结果上。
+    VAS.meta.sampleMode,
     VAS.events.length,
     VAS.meta.fps,
     VAS.meta.started_at,
@@ -2145,6 +2185,10 @@ function vasUpdateProgress(snap) {
   // summarizing 阶段：把进度比换成 chunk 完成度（[done, total]）。
   const totalFrames = VAS.meta.total_frames;
   const everyN      = VAS.meta.every_n;
+  const sampleMode  = (snap?.sample_mode || VAS.meta.sampleMode || "manual");
+  const framePosNow = (snap && Number.isFinite(snap.frame_pos))
+    ? Number(snap.frame_pos)
+    : (VAS.meta.framePos || 0);
   // 优先用 snap.analyzed（state API 的权威计数）。没有 snap 时退到 events.length。
   // 关键：events API 与 state API 是两次独立 HTTP 请求，在 done 状态切换瞬间
   // events 端可能延迟 1-2 帧，导致 ratio 在 70%→86%→100% 跳变（用户多次刷新
@@ -2182,7 +2226,23 @@ function vasUpdateProgress(snap) {
     //    全部"不是"7/10 必须采满"，已完成就显示 100%。
     expected = analyzed;
     ratio = 1;
+  } else if (sampleMode && sampleMode !== "manual") {
+    // **判帧模式不能用 analyzed / floor(totalFrames/everyN)**：
+    // 采样数由"画面是否变化"决定，事前不可知 —— floor(total/every_n)
+    // 只是兜底间隔对应的**上限**，绝大多数时候远大于实际采样数，用它
+    // 做分母会让进度条长期趴在低位（甚至分析完了才 20%）。
+    // 改用**解码进度**（frame_pos / total_frames）作为分母：判帧模式
+    // 下"处理了多少帧"与"分析了多少帧"是两个不同的问题，而用户想看到
+    // 的恰恰是"整段视频扫到哪儿了"。
+    //（历史行的 sample_mode 可能是字面量 "auto"，同样走这条分支。）
+    if (totalFrames > 0 && framePosNow > 0) {
+      expected = totalFrames;
+      ratio = Math.min(1, framePosNow / expected);
+    } else {
+      ratio = null;  // 拿不到总量 → indeterminate（live 流同理）
+    }
   } else if (totalFrames > 0 && everyN > 0) {
+    // 手动模式：采样数事前可知 = floor(total / every_n)，原公式不变。
     expected = Math.max(1, Math.floor(totalFrames / everyN));
     ratio = Math.min(1, analyzed / expected);
   }
@@ -2255,6 +2315,10 @@ function connectVfaWs() {
       vasAppendEvent(msg.event);
     } else if (msg.type === "summary") {
       vasSetSummary(msg.summary || "");
+    } else if (msg.type === "judge") {
+      // 判据专用推送（decode 侧 0.5s 节流）。state 要等 VLM 回来才推，
+      // 解码却早就跑出去几百帧 —— 曲线和浮框靠这一路才跟得上。
+      window.FrameJudge?.update("vas", msg.judge);
     } else if (msg.type === "state" || msg.type === "hello") {
       vasApplySnapshot(msg);
       // run 进入终态（done/stopped/error）→ 后端已落盘，刷新历史
@@ -2279,14 +2343,30 @@ async function vasStartAnalyze() {
   // 合并页共用视频源输入框（#vcs-source）。
   const sourceEl = document.getElementById("vcs-source");
   const promptEl = document.getElementById("vas-prompt");
-  const everyNEl = document.getElementById("vas-every-n");
   const source = (sourceEl?.value || "").trim();
   const prompt = (promptEl?.value || "").trim();
-  const everyN = Number(everyNEl?.value);
+  // 判据（算法 / 阈值 / 帧间隔）由共享组件持有，这里只读取值拼请求体 ——
+  // 组件自己在用户改控件时就已经 POST 落库了，这里是把同一份配置告诉
+  // 服务端"本轮按这个跑"。
+  const judge = window.FrameJudge?.config("vas") ||
+                { mode: "manual", every_n: 30, threshold: 6 };
   if (!source)  { vasShowError("请先选择视频源"); return; }
   if (!prompt)  { vasShowError("请填写分析要求"); return; }
-  if (!Number.isInteger(everyN) || everyN < 1) {
-    vasShowError("采样间隔必须为正整数"); return;
+  if (!Number.isInteger(judge.every_n) || judge.every_n < 1) {
+    vasShowError(judge.mode === "manual" ? "采样间隔必须为正整数" : "最长间隔必须为正整数");
+    return;
+  }
+  const body = {
+    source, prompt,
+    every_n: judge.every_n,
+    sample_mode: judge.mode,
+  };
+  if (judge.mode !== "manual") {
+    const thr = judge.threshold;
+    if (!Number.isFinite(thr) || thr <= 0 || thr > 1000) {
+      vasShowError("变化阈值必须是 (0, 1000] 之间的数字"); return;
+    }
+    body.change_threshold = thr;
   }
   vasShowError("");
   VAS.events = [];
@@ -2296,7 +2376,7 @@ async function vasStartAnalyze() {
     const r = await fetch(API_PREFIX + "/video-analysis-search/analysis/open", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, prompt, every_n: everyN }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) {
       const detail = await r.text().catch(() => "");
@@ -3157,7 +3237,16 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
   if (opts.source) setVal("vcs-source", opts.source);
   if (opts.loop != null) setChecked("vcs-loop", !!opts.loop);
   if (opts.prompt) setVal("vas-prompt", opts.prompt);
-  if (opts.everyN != null && opts.everyN !== "") setVal("vas-every-n", String(opts.everyN));
+  // 判据（算法 / 阈值 / 帧间隔）交给共享组件：fromWizard 会同步控件并 POST
+  // 落库。VAS 的判据是"下次开始分析生效"，所以这里必须 await 完成，否则
+  // 紧接着的 vas-start 可能带着上一套参数开跑。
+  // 老 wizard.json 的 sampleMode / everyN / changeThreshold 仍接受（兼容）。
+  const jMode = opts.judgeMode || opts.sampleMode;
+  const jEvery = opts.judgeEveryN || opts.everyN;
+  const jThr = opts.judgeThreshold || opts.changeThreshold;
+  const judgeApplied = await window.FrameJudge?.fromWizard("vas", {
+    judgeMode: jMode, judgeEveryN: jEvery, judgeThreshold: jThr,
+  }) ?? null;
   // 检索问题可选:填了才启用「检索」功能并写入问题框(勾选动作统一放到
   // 算力刷新之后,见下)
   const hasSearch = !!(opts.searchText && String(opts.searchText).trim());
@@ -3170,11 +3259,11 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
   if (opts.chunkOverlap != null && opts.chunkOverlap !== "") {
     setVal("vcs-chunk-overlap", String(opts.chunkOverlap));
   }
-  const baseReady = !!(opts.source && opts.prompt
-                       && opts.everyN != null && opts.everyN !== "");
+  const baseReady = !!(opts.source && opts.prompt);
   if (!baseReady) {
     return { source_set: !!opts.source, prompt_set: !!opts.prompt,
-             everyN_set: false, search_set: hasSearch, chunk_set: hasChunk, started: false };
+             judge_set: !!judgeApplied,
+             search_set: hasSearch, chunk_set: hasChunk, started: false };
   }
   // 分析是向导主路径 —— 勾选前先主动刷新一次算力可用性。向导在
   // _waitForModelsRunning 之后立即回调,而前端 modeAvail 走 5s 周期,此刻
@@ -3187,10 +3276,10 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
   if (btn) {
     try { btn.click(); }
     catch (e) { throw new Error("WizardSnapshotError:vas_start_failed:" + (e?.message || e)); }
-    return { source_set: true, prompt_set: true, everyN_set: true,
+    return { source_set: true, prompt_set: true, judge_set: !!judgeApplied,
              search_set: hasSearch, chunk_set: hasChunk, started: true };
   }
-  return { source_set: true, prompt_set: true, everyN_set: true,
+  return { source_set: true, prompt_set: true, judge_set: !!judgeApplied,
            search_set: hasSearch, chunk_set: hasChunk, started: false };
 };
 

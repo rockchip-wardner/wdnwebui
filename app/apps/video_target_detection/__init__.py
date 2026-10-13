@@ -41,9 +41,10 @@ def _make_vtd_sink():
     """
     from app.core.llm.detector_base import get_target_detector
 
-    def _sink(frame, frame_pos, frame_b64):
+    def _sink(frame, frame_pos, frame_b64, judge_score=None):
         try:
-            get_target_detector().submit_frame(frame, frame_pos, frame_b64)
+            get_target_detector().submit_frame(frame, frame_pos, frame_b64,
+                                               judge_score=judge_score)
         except Exception as e:  # noqa: BLE001
             LOG.debug(
                 "video_target_detection: frame sink raised: %s: %s",

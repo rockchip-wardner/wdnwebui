@@ -159,6 +159,7 @@ function connectVtlWs() {
       setVtlMeta(snap);
       setVtlProgress(snap);
       refreshVtlButtons(snap.state);
+      window.FrameJudge?.update("vtl", snap.judge);
       const payload = document.getElementById("data-video-target-localization");
       if (payload) payload.textContent = JSON.stringify(snap, null, 2);
       return;
@@ -338,6 +339,10 @@ function buildVtlEventLi(ev, isLatest) {
   tag.textContent = "#" + ev.id;
   meta.appendChild(tsSpan);
   meta.appendChild(fpSpan);
+  // 判据分数：区分「超阈值触发」和「兜底间隔触发」。三张卡共用同一份判据，
+  // 所以三处都要显示 —— 只给一张卡加就是"同样的配置、不同的信息"。
+  const jsSpan = window.FrameJudge?.scoreSpan?.("vtl", ev);
+  if (jsSpan) meta.appendChild(jsSpan);
   meta.appendChild(tag);
   li.appendChild(meta);
 
@@ -563,7 +568,7 @@ function updateVtlDetectorStatus(snap) {
     statusEl.textContent = "模型加载失败: " + snap.init_error;
   } else if (snap.enabled && snap.session_ready) {
     statusEl.textContent =
-      `运行中 · 每 ${snap.every_n} 帧 · 队列 ${snap.queue_size} · 视觉定位`;
+      `运行中 · 每 ${snap.judge?.every_n ?? snap.every_n} 帧 · 队列 ${snap.queue_size} · 视觉定位`;
   } else if (snap.enabled) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
@@ -598,8 +603,8 @@ async function refreshVtlDetector() {
 }
 
 async function vtlDetectorStart() {
-  const everyEl = document.getElementById("vtl-every-n");
-  const every_n = parseInt(everyEl?.value || "30", 10);
+  // 节流已上移到共享判据器，detector 一律 every_n=1（避免两级节流相乘）。
+  const every_n = 1;
 
   const items = vtlPromptCollectItems();
   if (items.length === 0) {
@@ -654,6 +659,7 @@ async function vtlEventsClear() {
 }
 
 function initVideoTargetLocalization() {
+  window.FrameJudge?.mount({ prefix: "vtl", canvasId: "vtl-canvas" });
   if (window.__vtlInit) return;
   window.__vtlInit = true;
 
@@ -939,6 +945,8 @@ window.ImApp_video_target_localization.applyWizardSnapshot = async function (opt
 
   if (opts.source)      setVal("vtl-source", opts.source);
   if (opts.loop != null) setChk("vtl-loop", opts.loop);
+  // 帧判据 —— 必须在 open 之前落地：open 一开视频，判据已经在解码热路径上跑。
+  const judge = await window.FrameJudge?.fromWizard("vtl", opts) ?? null;
 
   // prompts:数组(来自 wizard 的 prompt_rows 字段类型),过滤空白后同步
   let promptsApplied = false;
@@ -947,7 +955,8 @@ window.ImApp_video_target_localization.applyWizardSnapshot = async function (opt
     if (cleaned.length > 0) promptsApplied = _vtlWizardSyncPrompts(cleaned);
   }
 
-  const result = { source_opened: false, detector_started: false, prompts_applied: promptsApplied };
+  const result = { source_opened: false, detector_started: false, prompts_applied: promptsApplied,
+                 judge_applied: !!judge };
 
   if (opts.source) {
     try {
