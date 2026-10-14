@@ -28,10 +28,17 @@ from fastapi import (
 
 from app.core.llm.detector_base import get_target_detector
 from app.core.config import default_resource_root
-from app.core.video.session import get_session
+from app.core.video.multi_session import (
+    MAX_CHANNELS,
+    get_multi_session,
+)
 
 
 router = APIRouter(tags=["video-target-detection"])
+
+# WS 连接时回放的历史事件条数上限，与前端 MAX_RENDERED 对齐：
+# 多发只会白耗带宽（每条带 crop_b64 缩略图，实测单条 2~33KB）。
+WS_EVENT_HISTORY_MAX = 50
 
 # 向导模式拖放上传的视频文件落地目录 — 三个视频 app 共用同一目录
 # ``<resource_dir>/uploads``(设备端 ``/userdata/assets/uploads``,off-device
@@ -49,7 +56,11 @@ except OSError:
 
 @router.get("/")
 async def get_state() -> dict:
-    return get_session().snapshot()
+    """本页状态：多路会话快照 + detector 快照。"""
+    return {
+        "session": get_multi_session().snapshot(),
+        "detector": get_target_detector().snapshot(),
+    }
 
 
 @router.post("/upload")
@@ -96,12 +107,33 @@ async def upload_video(file: UploadFile = File(...)) -> dict:
 
 @router.post("/open")
 async def open_source(payload: dict) -> dict:
-    source = (payload or {}).get("source")
-    if not source or not isinstance(source, str):
-        raise HTTPException(status_code=400, detail="source required")
-    loop = bool((payload or {}).get("loop", False))
+    """打开 1~32 路视频。Body: ``{sources: [str, ...], loop: bool}``，
+    每项一路（本地路径 / 目录 / rtsp://）。
+    ``source``（单个字符串）是老前端的兼容写法，等价于 ``sources: [source]``。
+    """
+    payload = payload or {}
+    raw = payload.get("sources")
+    if raw is None:
+        # 兼容：老前端 / 老调用方只传 source
+        single = payload.get("source")
+        raw = [single] if isinstance(single, str) else []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="sources 必须是列表")
+    sources = [s.strip() for s in raw if isinstance(s, str) and s.strip()]
+    if not sources:
+        raise HTTPException(status_code=400, detail="sources 不能为空")
+    if len(sources) > MAX_CHANNELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"最多 {MAX_CHANNELS} 路，收到 {len(sources)} 路",
+        )
+    loop = bool(payload.get("loop", True))
     try:
-        return get_session().open(source, loop=loop)
+        return get_multi_session().open(sources, loop=loop)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -110,17 +142,20 @@ async def open_source(payload: dict) -> dict:
 async def control(payload: dict) -> dict:
     action = (payload or {}).get("action")
     if action == "play":
-        return get_session().play()
+        return get_multi_session().play()
     if action == "pause":
-        return get_session().pause()
+        return get_multi_session().pause()
     if action == "stop":
-        return get_session().close()
+        return get_multi_session().close()
     raise HTTPException(status_code=400, detail=f"unknown action: {action!r}")
 
 
 @router.post("/close")
 async def close_source() -> dict:
-    return get_session().close()
+    """停止并释放全部路。同时摘掉 VLM 轮转，否则调度线程会继续对着
+    已释放的 VideoCapture 提交推理、白烧 NPU。"""
+    get_multi_session().stop_round_robin()
+    return get_multi_session().close()
 
 
 # --------------------------------------------------------------------- #
@@ -151,12 +186,13 @@ async def set_prompt(payload: dict) -> dict:
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt 不能为空")
+    # every_n 是遗留字段：多路节流由轮转调度器承担，这里强制 every_n=1
+    #（见下面 det.start），故不参与推理也不再做 >=1 校验 —— 否则前端合法的
+    # 0（轮转间隔 0 秒）会被误判非法直接 400。只在解析失败时报错。
     try:
-        every_n = int(payload.get("every_n", 30))
+        every_n = int(payload.get("every_n", 30) or 0)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="every_n 必须为整数")
-    if every_n < 1:
-        raise HTTPException(status_code=400, detail="every_n 必须 >= 1")
     # image_size 解析：可选字段，缺省 / ``None`` → auto-pick；非法
     # 类型 → 400（detector ``start()`` 内部也校验实际合法性，这里提前
     # 到 HTTP 层只是为了返回更具体的错误消息）。
@@ -183,20 +219,56 @@ async def set_prompt(payload: dict) -> dict:
         )
     else:
         model_id = raw_model_id
+    det = get_target_detector()
     try:
         # enabled_tools 显式置 [] — 该页不再挂工具。
-        return get_target_detector().start(
-            prompt, every_n=every_n, enabled_tools=[],
+        #
+        # every_n 在多路下**必须锁死为 1**：`submit_frame()` 里
+        # `if self._frame_count % self._every_n != 0: return` 是给单路
+        # 「每 N 帧推一次」用的节流。多路的节流职责已经由轮转调度器承担
+        # —— 调度器本来就是一路一帧地取「当前帧」提交。若这里沿用
+        # every_n=30，30 次轮转里只有 1 次真进队列，其余 29 次直接
+        # return（连 _pending 都不设），wait_idle 立刻返回 True →
+        # 轮转变成 15 次/秒的空转，**看起来在轮转其实一帧没推理**。
+        snap = det.start(
+            prompt, every_n=1, enabled_tools=[],
             image_size=image_size, model_id=model_id,
         )
+        snap["every_n"] = 1
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+    # 多路模式：把会话接给 detector 并起轮转线程。此后**不再走
+    # VideoSession 的 frame sink** —— 帧由 MultiChannelSession 自己的
+    # 调度线程按「第 1 路 → 第 N 路 → 回第 1 路」逐路取当前帧提交
+    #（单路也走同一条路径）。
+    #
+    # every_n 在多路下无意义（一次提交就是一路一帧），保留入参只是
+    # 让旧前端不报错；真正的节奏旋钮是 **rr_interval**（秒/路）。
+    # 前端那个「轮转间隔」控件历史上一直是死控件（只传 every_n），
+    # 这里正式接到调度器上。
+    rr_interval = payload.get("rr_interval", None)
+    if rr_interval is None:
+        # 老前端没这个字段：把 every_n 当「秒/路」解读，兼容页面既有语义
+        rr_interval = float(every_n)
+    try:
+        rr_interval = float(rr_interval)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="rr_interval 必须是数字")
+
+    session = get_multi_session()
+    session.attach_detector(det)
+    session.set_round_robin_interval(rr_interval)
+    session.start_round_robin()
+    snap["session"] = session.snapshot()
+    return snap
+
 
 @router.post("/prompt/stop")
 async def stop_prompt() -> dict:
+    get_multi_session().stop_round_robin()
     return get_target_detector().stop()
 
 
@@ -207,6 +279,7 @@ async def list_events() -> dict:
         "snapshot": det.snapshot(),
         "events": det.events(),
         "latest": det.latest(),
+        "session": get_multi_session().snapshot(),
     }
 
 
@@ -258,27 +331,42 @@ async def clear_diagnostics() -> dict:
 # --------------------------------------------------------------------- #
 @router.websocket("/ws")
 async def stream_ws(ws: WebSocket) -> None:
-    """Push decoded JPEG frames + TargetDoc events to the browser.
+    """多路帧流 + TargetDoc 事件流。
 
     Protocol (server -> client):
-      - JSON text: {"type":"status", ...session snapshot, detector snapshot...}
-      - Binary:    raw JPEG bytes for one frame
-      - JSON text: {"type":"eof"} when a file source reaches end
-      - JSON text: {"type":"event", ...detector event...} when  ``TargetDoc``
-                   fires (event.bbox 是 4 元 [x1,y1,x2,y2] + event.crop_b64
-                   是裁图的 base64 JPEG + event.desc 是模型对 ROI 的描述
-                   文本)。
+
+      - JSON text  ``{"type":"status", ...}``  ~1Hz：会话快照（含每路
+        state / fps / frame_pos / error）+ detector 快照 + VLM 轮转游标
+        （``vlm.current`` = 当前正在推理第几路，``vlm.round`` = 已完成轮数）
+      - JSON text  ``{"type":"frame_meta","idx":N}`` 紧跟其后是
+        ``N`` 路的一张 JPEG **二进制**帧 —— 多路下浏览器必须先知道这帧
+        属于哪一路，所以每帧前插一条极小的 meta（比在二进制里塞头部更省）
+      - JSON text  ``{"type":"event", ..., "channel":N}``  TargetDoc 命中
+        （``channel`` 标明来自第几路）
+      - JSON text  ``{"type":"event_history","events":[...]}``  **仅在
+        连接建立时发一次**：把最近的历史事件**打包成一条**发过去。
     """
     await ws.accept()
-    session = get_session()
+    session = get_multi_session()
     detector = get_target_detector()
     loop = asyncio.get_event_loop()
-    # Per-WS subscriber queue — shared VideoSession can have multiple
-    # WS handlers connected; broadcast lets each receive every frame.
     sub_q = session.subscribe()
     last_status = 0.0
     last_event_id = 0
-    eof_sent = False
+    # ---- 历史事件：一次打包，而不是逐条回放 ---------------------------- #
+    # 原写法是 `last_event_id = 0` + 循环里逐条 send，于是**每次刷新 /
+    # 每次重连都把全部历史重放一遍**。实测 200 条 = 519KB（79% 是
+    # crop_b64 缩略图），前端每条都要 appendVtdEventLi → 建 DOM +
+    # insertBefore + trim，200 条突发足以把浏览器渲染进程打满一个核
+    # （实测 106%，页面直接卡死）。
+    # 现在改成：一条 `event_history` 消息带最近 N 条，客户端一次性重建列表。
+    # 上限取 50 —— 前端 `VTDDetector.MAX_RENDERED` 本来就只渲染 50 条，
+    # 多发纯属浪费。
+    history = detector.events_since(0)
+    if history:
+        last_event_id = history[-1]["id"]          # 已发过的后面不再单发
+        await ws.send_json({"type": "event_history",
+                            "events": history[-WS_EVENT_HISTORY_MAX:]})
     try:
         while True:
             for ev in detector.events_since(last_event_id):
@@ -291,40 +379,24 @@ async def stream_ws(ws: WebSocket) -> None:
                 )
             except queue.Empty:
                 item = None
-            if item is None:
-                now = loop.time()
-                if now - last_status >= 1.0:
-                    snap = session.snapshot()
-                    snap["type"] = "status"
-                    snap["detector"] = detector.snapshot()
-                    await ws.send_json(snap)
-                    last_status = now
-                await asyncio.sleep(0.02)
-                continue
-            if item is session._EOF:
-                if not eof_sent:
-                    snap = session.snapshot()
-                    snap["type"] = "eof"
-                    await ws.send_json(snap)
-                    eof_sent = True
-                await asyncio.sleep(0.2)
-                continue
-            eof_sent = False
-            await send_frame_bytes(ws, item)
+
+            if item is not None:
+                idx, jpg = item
+                await ws.send_json({"type": "frame_meta", "idx": idx})
+                await ws.send_bytes(jpg)
+
             now = loop.time()
             if now - last_status >= 1.0:
-                snap = session.snapshot()
-                snap["type"] = "status"
-                snap["detector"] = detector.snapshot()
-                await ws.send_json(snap)
+                await ws.send_json({
+                    "type": "status",
+                    "session": session.snapshot(),
+                    "detector": detector.snapshot(),
+                })
                 last_status = now
-            await asyncio.sleep(0.02)
+            if item is None:
+                await asyncio.sleep(0.02)
     except WebSocketDisconnect:
         pass
     finally:
         session.unsubscribe(sub_q)
 
-
-async def send_frame_bytes(ws, data: bytes) -> None:
-    """Send JPEG bytes — small wrapper so tests / overrides can stub."""
-    await ws.send_bytes(data)

@@ -89,21 +89,36 @@ def main() -> int:
     det._frame_count = 0
     det._every_n = 1
     det._item_q = queue.Queue(maxsize=1)
-    det.submit_frame(frame, 42, "B64", judge_score=33.25)
+    # submit_frame 末尾会 set _pending（多路 wait_idle 的背压信号），
+    # 用 __new__ 造裸对象时必须自己补上，否则走到最后一行报 AttributeError。
+    det._pending = threading.Event()
+    det.submit_frame(frame, 42, "B64", judge_score=33.25, channel=7)
     item = det._item_q.get_nowait()
+    # 6 元组：(帧, 帧号, prompt, jpeg, 判据分数, 通道号)
     check("submit_frame 队列元组带 judge_score",
-          len(item) == 5 and item[3] == "B64" and item[4] == 33.25,
-          f"len={len(item)} score={item[4] if len(item) == 5 else 'n/a'}")
+          len(item) == 6 and item[3] == "B64" and item[4] == 33.25,
+          f"len={len(item)} score={item[4] if len(item) >= 5 else 'n/a'}")
+    check("submit_frame 队列元组带 channel（与 judge_score 不串位）",
+          len(item) == 6 and item[5] == 7 and isinstance(item[5], int),
+          f"channel={item[5] if len(item) >= 6 else 'n/a'}")
 
-    # --- 3. worker_loop 的 5 元组解包 + 回填 ---
+    # 单路旧调用（不传 channel / judge_score）必须仍能投队列，且 channel 恒 0
+    det._frame_count = 0
+    det.submit_frame(frame, 43, "B64")
+    item1 = det._item_q.get_nowait()
+    check("旧调用（无 channel/judge_score）降级为 6 元组且 channel=0",
+          len(item1) == 6 and item1[4] is None and item1[5] == 0,
+          f"len={len(item1)} score={item1[4]} channel={item1[5]}")
+
+    # --- 3. worker_loop 的 6 元组解包 + 回填 ---
     # 直接复用真实 worker_loop 的解包分支：构造一个假 detector，只跑到
     # 解包处，用哨兵检测是否把 judge_score 传到了回填循环。
     import app.core.llm.detector_base as db
     src_lines = None
     import inspect
     src_lines = inspect.getsource(WdnaiDetector._worker_loop)
-    check("worker_loop 认识 5 元组并把 judge_score 回填给所有事件",
-          "judge_score" in src_lines
+    check("worker_loop 认识 6 元组并把 judge_score 回填给所有事件",
+          "judge_score, channel = item" in src_lines
           and "for _ev in (events or [])" in src_lines,
           "解包 + 回填分支都在")
 

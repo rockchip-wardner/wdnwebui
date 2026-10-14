@@ -589,6 +589,9 @@ class DetectorEvent:
     frame_b64: Optional[str] = None
     frame_w: Optional[int] = None
     frame_h: Optional[int] = None
+    # 视频目标监控页(多路)专用：事件来自第几路。单路恒为 0，前端一套
+    # 渲染代码同时覆盖单路/多路，旧消费者忽略即可。
+    channel: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -611,7 +614,8 @@ class DetectorEvent:
             "frame_b64":        self.frame_b64,
             "frame_w":          self.frame_w,
             "frame_h":          self.frame_h,
-            "judge_score":      self.judge_score,
+"judge_score":      self.judge_score,
+            "channel":          self.channel,
         }
 
 
@@ -1155,6 +1159,8 @@ class WdnaiDetector:
         self._latest: Optional[dict] = None
         self._next_event_id = 1
         self._item_q: "queue.Queue" = queue.Queue(maxsize=self.ITEM_QUEUE_MAX)
+        # 有帧在排队或正在推理。多路轮转用 wait_idle() 等它清零做背压。
+        self._pending = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._broadcaster_lock = threading.Lock()
@@ -1503,8 +1509,14 @@ class WdnaiDetector:
         frame_bgr: "np.ndarray",
         frame_pos: int,
         frame_b64: str = "",
-        judge_score: Optional[float] = None,
+judge_score: Optional[float] = None,
+        channel: int = 0,
     ) -> None:
+        """提交一帧待推理。
+
+        ``judge_score`` = 判据器在这一帧上的分数(手动跳帧模式为 None);
+        ``channel`` = 第几路(单路恒为 0)。两者同帧共用,故都走本签名。
+        """
         with self._lock:
             if not (self._enabled and self._prompt):
                 return
@@ -1519,10 +1531,33 @@ class WdnaiDetector:
             pass
         try:
             self._item_q.put_nowait(
-                (frame_bgr, frame_pos, prompt, frame_b64, judge_score),
+# 6 元组：(帧, 帧号, prompt, jpeg, 判据分数, 通道号)
+                (frame_bgr, frame_pos, prompt, frame_b64, judge_score, channel),
             )
         except queue.Full:
             pass
+        self._pending.set()
+
+    def wait_idle(self, timeout: float = 30.0) -> bool:
+        """等当前这帧推理完（或超时）。仅多路轮转调用。
+
+        返回 True=已空闲，False=超时。
+
+        必须用 ``time.sleep`` 而不是 ``Event.wait()``：后者在 event 已 set
+        时立即返回（只等"变成 set"，不查当前状态），而本方法的正常语义正是
+        "已 set = 正在推理"，于是退化成忙等 —— 推理全程烧满一个核并抢 GIL，
+        把解码线程饿死。实测表现为"一启动检测画面就卡"，但进程 CPU 不涨。
+        ``time.sleep`` 释放 GIL，这是本质区别。详见 AGENTS.md。
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if not self._pending.is_set():
+                return True
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                return False
+            # 5ms 轮询：单路多出 ≤5ms 延迟，相对 0.85~1.9s 的推理可忽略
+            time.sleep(min(0.005, remain))
 
     # ------------------------------------------------------------------ #
     def events(self) -> list:
@@ -2703,6 +2738,8 @@ class WdnaiDetector:
                 # (默认 120s) 没事件 → LOG.warning 给上游排查源是否还在
                 # 推帧。注意: video_session 一旦源 EOF 或文件短,frame_pos
                 # 停滞是正常行为,warning 让用户区分"框架空闲" vs "源停了"。
+                if not self._pending.is_set():
+                    self._pending.clear()
                 if _loop_iter % _WATCHDOG_CHECK_EVERY == 0:
                     _now = time.monotonic()
                     _idle = _now - _last_seen_event_ts
@@ -2721,16 +2758,19 @@ class WdnaiDetector:
                     "worker_loop[%s] received stop sentinel — exiting",
                     self._generating_cls.__name__ if self._generating_cls else "?",
                 )
+                self._pending.clear()
                 return
-            if len(item) == 5:
-                frame_bgr, frame_pos, prompt, frame_b64, judge_score = item
-            elif len(item) == 4:
-                frame_bgr, frame_pos, prompt, frame_b64 = item
-                judge_score = None
+            judge_score = None
+            channel = 0
+            if len(item) == 6:
+                frame_bgr, frame_pos, prompt, frame_b64, judge_score, channel = item
             else:
-                frame_bgr, frame_pos, prompt = item
-                frame_b64 = ""
-                judge_score = None
+                # 3/4/5 元组都是合并判据器之前的旧格式,等价于单路、无判据。
+                # 5 元组曾被两个未发布版本分别占用过(判据分数 / 通道号),
+                # 合并后统一按「无判据的单路」降级 —— 该分支已无生产者,
+                # 只是防止旧调用方静默错位。
+                frame_bgr, frame_pos, prompt = item[0], item[1], item[2]
+                frame_b64 = item[3] if len(item) >= 4 else ""
             _t0_infer = time.monotonic()
             try:
                 events = self._infer_sync(frame_bgr, prompt, frame_pos, frame_b64)
@@ -2755,6 +2795,9 @@ class WdnaiDetector:
                     self._generating_cls.__name__ if self._generating_cls else "?",
                     type(e).__name__, e,
                 )
+                # 失败也要解 pending，否则 wait_idle() 等到超时，
+                # 该路之后的所有路都被卡住。
+                self._pending.clear()
                 continue
             _infer_ms = (time.monotonic() - _t0_infer) * 1000.0
             _video_ts = 0.0
@@ -2801,6 +2844,7 @@ class WdnaiDetector:
                 for ev in events:
                     ev.id = self._next_event_id
                     ev.frame_pos = frame_pos
+                    ev.channel = channel
                     ev.ts = _video_ts
                     ev.video_ts = _video_ts
                     self._next_event_id += 1
@@ -2812,6 +2856,7 @@ class WdnaiDetector:
                 # 顺序仍是 frame_pos 内 id 倒序（最新在前）。
             for ev in events:
                 self._broadcast(ev.to_dict())
+            self._pending.clear()   # 唤醒 wait_idle() 的轮询方
             # 诊断 (v0.13): 每帧处理耗时日志 (DEBUG 级别,高频不刷屏)
             LOG.debug(
                 "worker_loop[%s] frame_pos=%d events=%d it_infer=%.0fms",

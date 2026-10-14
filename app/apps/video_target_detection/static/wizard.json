@@ -11,7 +11,7 @@
     { "id": "env",    "title": "运行环境检查",           "kind": "env_check" },
     { "id": "source", "title": "视频源",                 "kind": "form",
       "fields": [
-        { "id": "vtd-source", "ui_key": "source", "label": "视频源 URL / 路径" },
+{ "id": "vtd-sources", "ui_key": "source", "label": "视频源（每行一路，最多 32 路）", "type": "textarea" },
         { "id": "vtd-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox", "default": true },
         { "id": "vtd-judge-mode", "ui_key": "judgeMode", "label": "判帧算法（决定哪些帧送去分析）", "type": "select",
           "options": [
