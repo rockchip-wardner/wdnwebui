@@ -4906,13 +4906,21 @@ rebase 合入上游判据特性后，vtd 页的判据 UI 曾是**控件在、后
 ### 帧号必须单调：踩过的坑
 
 判据喂的帧号**不能用 `ch.frame_pos`** —— 那是 `cap.frame_pos`，**循环重播时归零**。
-于是 `gap = pos - last_pos` 变负，兜底间隔再也等不到，而文件源循环恰恰是常态。
-多路改用 `ch.frames`（本会话的单调解码计数）。
+归零后 `gap = pos - last_pos` 变负，兜底间隔要等到重新攒够 `last_pos + every_n`
+才恢复；`every_n` 大于视频长度时（共享 UI 默认 600，而 15~30s 素材只有
+375~750 帧）就**再也攒不够**，循环之后彻底静默。多路改用单调的 `ch.frames`。
 
-> **单路 `VideoSession` 目前仍有这个问题**：`session.py` 的
-> `cur_frame_pos = cap.frame_pos` 同样在循环时归零、同样喂给 `judge.observe()`，
-> 影响 vd / vtl / vas 三张卡的兜底间隔。修它要动共享单例并回归三张卡，
-> 已单列待办，本期不处理。
+> **单路 `VideoSession` 没有这个问题，不要照着「一起修」去动它。**
+> 它在循环重播点已经调了 `self._judge.reset()`（`session.py`，注释是
+> 「拿上一段尾帧做参照，算出的变化是人为的」），reset 会把 `_last_pos` 置 -1，
+> 紧接着的首帧无条件送检并重新播种成 0 —— 与 `cap.frame_pos` 同步归零，
+> gap 始终有效。实测盯两次循环边界，`frame_pos` 与判据 `evaluated`
+> （463→38、449→25）逐帧同步。
+>
+> 曾一度误判「单路同样受影响、影响 vd/vtl/vas 三张卡」。用打桩 gscore 复现
+> 两种时序才看清：不 reset 时第 0 轮之后每轮放行 0 次，reset 时每轮都有放行。
+> 附带结论 —— reset 后每轮那 1 次放行来自**首帧无条件送检**，不是兜底；
+> 看 `sampled` 计数容易误判成「兜底已触发」。
 
 ### 端点挂本卡，不共用 /api/video/judge
 

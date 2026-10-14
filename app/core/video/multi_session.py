@@ -779,8 +779,10 @@ class MultiChannelSession:
                 with self._rr_lock:
                     if self._rr_thread is not threading.current_thread():
                         return
-                # 判据帧号必须单调：不能用 ch.frame_pos（那是 cap.frame_pos，循环重播
-                # 时归零，gap 会变负、兜底间隔再也等不到，而文件源循环是常态）。
+                # 判据帧号必须单调：不能用 ch.frame_pos（cap.frame_pos 循环重播时归零，
+                # gap 会变负；every_n 大于视频长度时循环之后彻底静默）。
+                # 单路 VideoSession 同样传 cap.frame_pos 却没事 —— 它在循环
+                # 点调了 judge.reset()，把 _last_pos 重新播种成 0 与之同步。
                 judge_pos = ch.frames
                 judge_score: Optional[float] = None
                 # 判据门控只在自动模式下走，manual 整段跳过（不缩缩略图也
