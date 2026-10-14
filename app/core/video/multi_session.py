@@ -22,23 +22,18 @@ N 个解码线程   各自 1 个 VideoCapture，按**每路自适应**的 decode
 
 三个参数为什么是这个默认值（全部来自本机实测，见 AGENTS.md）
 
-``analysis_size=384`` —— RGA 输出尺寸**决定 VLM 用哪个 vision 变体**。
-wdnai 选变体的规则是「``image_size`` 最接近输入图**最长边**」；本机
-384 / 768 两个变体都在，喂 640 会误选 768（权重 252MB vs 61MB，单帧
-2.06s vs 0.74s）。所以按源宽高比缩到**最长边正好等于** ``analysis_size``。
+送检尺寸 —— **不由参数决定，按源尺寸算**（:func:`derive_inference_size`），
+与单路 ``VideoSession`` 同口径：720p/1080p → 640、4K → 960。早前写死 384
+等于让所有素材掉进便宜的 384 vision 变体，那是**精度降档**而非吞吐优化。
+``analysis_size`` 只剩「强制覆盖」这一个用途，默认 None = 自动。
 
-``decode_fps`` —— **RGA 次数 == 解码帧数，绕不开**（``VideoCapture.read0()``
-内部写死 ``frame._cached_bgr = frame.numpy()``）。真正的上限是**所有路加起来**
-的 RGA 吞吐，实测墙在 750~800 ops/s（720P 源 → 384x216 输出）；32 路 × 25fps
-= 800 正好压线且 **0 错误**。所以 ``decode_fps`` 只是**每路上限**，实际值由
-:func:`derive_decode_fps` 按路数摊分：N 路共享 ``MAX_TOTAL_DECODE_FPS`` 的预算。
-N <= 32（上限）时每路都能跑满源帧率 25fps，只有超上限的 N 才降帧。
+``decode_fps`` / ``display_fps`` —— 都只是**每路上限**，实际值由
+:func:`derive_decode_fps` / :func:`derive_display_fps` 按路数摊分，N 路共享
+``MAX_TOTAL_DECODE_FPS`` / ``MAX_TOTAL_DISPLAY_FPS``。
 
-``display_fps`` —— 同样是**按路数摊分的每路上限**。实测
-``cv2.imencode('.jpg')`` 384x216 只要 **0.77ms/次**（不是老解码循环注释里写的
-15~100ms，那个数字测的是另一档尺寸/负载），所以 UI 推送远比解码便宜。
-总预算 ``MAX_TOTAL_DISPLAY_FPS``：路数少时每路接近源帧率（单路 25fps 流畅
-播放，不卡），路数多时才降帧。
+> 送检尺寸与解码预算**强耦合**：热路径每路只产一张图，既送显又是冷路径的
+> 源，所以抬送检尺寸会把每帧成本从 1.94ms 推到 4.34ms。细节见两个预算常量
+> 的注释。
 
 降级行为
 --------
@@ -71,19 +66,22 @@ from app.core.video.frame_judge import (
 LOG = logging.getLogger("multi_channel_session")
 
 MAX_CHANNELS = 32
-DEFAULT_ANALYSIS_SIZE = 384
 # 每路 fps 的**上限**（不是实际值）。实际值按路数在总预算里摊分，
 # 见 derive_decode_fps / derive_display_fps。25 是常见监控源帧率。
 DEFAULT_DECODE_FPS = 25.0
 DEFAULT_DISPLAY_FPS = 25.0
 DEFAULT_JPEG_QUALITY = 70
 OPEN_TIMEOUT = 10.0
-# 所有路**合计**的 RGA 预算（次/秒）。实测墙 750~800 ops/s
-# （720P 源 → 384x216 输出，32 路 × 25fps = 800 时 0 错误），
-# 这里取 800：N<=32 时每路都能跑满 25fps。
-MAX_TOTAL_DECODE_FPS = 800.0
-# 所有路合计的 UI 推送预算（张/秒）。单张 384x216 JPEG 实测 0.77ms，
-# 800 张/秒 ≈ 0.6 核，留足余量给 WS 发送与浏览器解码。
+# 所有路**合计**的解码预算（次/秒）= 热路径「解码+缩放+JPEG」的吞吐天花板。
+# 跟着送检尺寸走：热路径每路只产一张图（既送显又是冷路径的源），720P 源
+# 单帧 640x360 是 4.34ms、384x216 只要 1.94ms，合计上限因此从 ~790 掉到 ~660。
+#   * 32 路 → 每路 20.6fps（实测 659.6 帧/秒、0 错误）
+#   * 25 路以内每路仍跑满 25fps，不受此预算影响
+# 别为了让 32 路跑满 25fps 调回 800：硬件给不出 25，调度器每帧都「追不上
+# 节流」退化成满速空跑，实测 fps 在 15.4~21.5 乱跳，比主动限流抖得多。
+MAX_TOTAL_DECODE_FPS = 660.0
+# 所有路合计的 UI 推送预算（张/秒）。640x360 JPEG 实测 2.2ms/张，
+# 400 张 ≈ 0.9 核，留足余量给 WS 发送与浏览器解码。
 MAX_TOTAL_DISPLAY_FPS = 400.0
 # 单路推理等待上限。正常单路 ~0.85~1.9s，30s 足够宽裕；超时的路直接跳过
 # 继续轮下一路，不让一路卡死把整个轮转拖住。
@@ -118,41 +116,63 @@ def derive_analysis_size(src_w: int, src_h: int, size: int) -> Tuple[int, int]:
     return (w + 15) & ~15, h
 
 
+def derive_inference_size(src_w: int, src_h: int,
+                           thumb_long_side: int = DEFAULT_LONG_SIDE,
+                           ) -> Tuple[int, int]:
+    """送检 VLM 的尺寸，与单路 ``VideoSession`` 的 buf1 逐字同口径。
+
+    公式直接照抄 ``session.py`` 的
+    ``mid_long = max(thumb_long_side * 4, max(src_w, src_h) // 4)``
+    （再对齐 16 字节、上限不放大）—— 两套口径会长出不一致的行为，而
+    wdnai 是按**输入图最长边**挑 vision 变体的，多路送小一档就是白降精度。
+
+    720p / 1080p → 640 长边；4K → 960；8K → 1280。源更小时收敛到源尺寸。
+    """
+    if src_w <= 0 or src_h <= 0:
+        return thumb_long_side * 4, thumb_long_side * 4
+    src_long = max(src_w, src_h)
+    mid = max(thumb_long_side * 4, src_long // 4)
+    mid = min(mid, src_long)
+    mid = (mid + 15) & ~15
+    if src_w >= src_h:
+        return mid, max(2, (src_h * mid) // src_w)
+    return max(2, (src_w * mid) // src_h), mid
+
+
 # 浏览器显示用的最长边，按路数分档。
 #   1~4 路 → 960（实测单路 24.9fps / 0 错误，铺满播放器不糊）
-#   5 路以上 → 回落 analysis_size（384）
+#   5 路以上 → 回落送检尺寸（见 derive_display_size）
 DISPLAY_LONG_EDGE_HIGH = 960
 DISPLAY_HIGH_MAX_CHANNELS = 4
 
 
 def derive_display_size(n_channels: int, src_w: int, src_h: int,
-                        analysis_size: int) -> Tuple[int, int]:
-    """返回给**浏览器**的解码输出尺寸（也就是 RGA 输出尺寸）。
+                        inference_size: Tuple[int, int],
+                        ) -> Tuple[int, int]:
+    """返回给**浏览器**的显示尺寸。
 
-    显示与送检**分离**：显示尺寸只影响「用户看到的清晰度」，送检尺寸
-    ``analysis_size`` 固定不变（它决定 VLM 选哪个 vision 变体 —— 384 变体
-    权重 61MB / 单帧 0.74s，768 变体 252MB / 2.06s，不能随手放大）。
+    路数少时给 960 长边（单路 24.9fps 实测 0 错误，铺满播放器不糊）；路数多
+    时带宽才是硬约束，回落到送检尺寸。
 
-    分档依据：显示尺寸直接决定 RGA 输出字节量与 JPEG 体积
-    （384×216 = 243KB/帧，960×540 = 1519KB/帧，6.2 倍）。路数少时这点开销
-    可忽略，值得换清晰度；路数多时它就是硬约束，必须降回来。
+    **5 路以上时显示实际就是送检尺寸**：解码线程只产一个缓冲
+    （``_out = max(显示, 送检)``），显示 JPEG 直接从它编码。曾想"再 RGA 降到
+    384 省带宽"，实测反而更贵（直编 1.40ms vs 降采样+编码 1.73ms），别加。
     """
-    long_edge = (DISPLAY_LONG_EDGE_HIGH
-                 if n_channels <= DISPLAY_HIGH_MAX_CHANNELS
-                 else analysis_size)
-    return derive_analysis_size(src_w, src_h, long_edge)
+    if n_channels <= DISPLAY_HIGH_MAX_CHANNELS:
+        return derive_analysis_size(src_w, src_h, DISPLAY_LONG_EDGE_HIGH)
+    return inference_size
 
 
 def derive_decode_fps(n_channels: int, cap: float = DEFAULT_DECODE_FPS) -> float:
-    """按路数摊分**总 RGA 预算**，返回每路的解码帧率。
+    """按路数摊分**总解码预算**，返回每路的解码帧率。
 
     之前这里对所有路数一律返回 5.0，那是拿 32 路极限场景的保守值一刀切：
     开 1 路视频也只有 5fps，播放明显卡顿。正确做法是「N 路共享一个总预算」，
-    路数少时每路跑满源帧率，路数多时才降帧 —— 因为降帧的代价是所有路一起
-    变卡，而 RGA 是**所有路合计**受限的，不该让单路替多路背锅。
+    路数少时每路跑满源帧率，路数多时才降帧 —— 降帧的代价是所有路一起变卡，
+    而热路径是**所有路合计**受限的，不该让单路替多路背锅。
 
-    实测（720P 源 → 384x216）：32 路 × 25fps 合计 797~800 ops/s，**0 错误**，
-    所以预算取 800；N <= MAX_CHANNELS 时每路都能跑满 cap。
+    实测（720P 源 → 640x360）：32 路合计 659.6 帧/秒、**0 错误**，所以预算取
+    660；N <= 25 时每路都能跑满 cap，超过才开始摊分降帧。
     """
     n = max(1, int(n_channels))
     budget = MAX_TOTAL_DECODE_FPS / n
@@ -162,7 +182,7 @@ def derive_decode_fps(n_channels: int, cap: float = DEFAULT_DECODE_FPS) -> float
 def derive_display_fps(n_channels: int, cap: float = DEFAULT_DISPLAY_FPS) -> float:
     """按路数摊分**总推送预算**，返回每路的 UI 显示帧率。
 
-    与解码同理：单张 384x216 JPEG 只要 0.77ms，1~6 路时完全负担得起
+    与解码同理：单张 640x360 JPEG 只要 2.2ms，1~6 路时完全负担得起
     每路 25fps（流畅播放）；只有路数很多时才需要降 UI 推送频率。
     """
     n = max(1, int(n_channels))
@@ -476,7 +496,7 @@ class MultiChannelSession:
     def __init__(
         self,
         *,
-        analysis_size: int = DEFAULT_ANALYSIS_SIZE,
+        analysis_size: Optional[int] = None,
         decode_fps: float = DEFAULT_DECODE_FPS,
         display_fps: float = DEFAULT_DISPLAY_FPS,
         jpeg_quality: int = DEFAULT_JPEG_QUALITY,
@@ -517,11 +537,11 @@ class MultiChannelSession:
         self._eff_decode_fps = decode_fps
         self._eff_display_fps = display_fps
         self.jpeg_quality = jpeg_quality
-        self._out_w = analysis_size
-        self._out_h = analysis_size
-        # 送检尺寸（VLM 用），与显示尺寸解耦
-        self._ana_w = analysis_size
-        self._ana_h = analysis_size
+        # open() 之前的占位初值，真正取值由 open() 按源尺寸算出
+        self._out_w = DEFAULT_LONG_SIDE * 4
+        self._out_h = DEFAULT_LONG_SIDE * 4
+        self._ana_w = DEFAULT_LONG_SIDE * 4
+        self._ana_h = DEFAULT_LONG_SIDE * 4
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -549,17 +569,23 @@ class MultiChannelSession:
 
         # 统一按第一路的宽高比决定尺寸，保证各路一致（尺寸不同会让 RGA
         # 每路走不同分支，反而更慢且前端 tile 尺寸不一）。
-        #   _out_w/_out_h  = RGA 输出 / 浏览器显示（按路数分档）
-        #   _ana_w/_ana_h  = 送检 VLM 的尺寸（恒为 analysis_size）
+        #   _ana_w/_ana_h  = 送检 VLM 的尺寸（与单路 VideoSession 同公式）
+        #   _disp          = 浏览器显示尺寸（按路数分档）
+        #   _out_w/_out_h  = RGA 输出 = max(两者)，保证两者都只需下采样
+        #                    （放大既浪费 RGA 又把糊的图喂给模型）
         sw, sh = probe_size(cleaned[0]) if "://" not in cleaned[0] else (0, 0)
-        self._ana_w, self._ana_h = derive_analysis_size(
-            sw, sh, self.analysis_size)
-        self._out_w, self._out_h = derive_display_size(
-            len(cleaned), sw, sh, self.analysis_size)
-        if (self._out_w, self._out_h) != (self._ana_w, self._ana_h):
-            LOG.info("mc-open: 显示 %dx%d / 送检 %dx%d（送检尺寸决定 vision 变体，"
-                     "不随显示尺寸变化）", self._out_w, self._out_h,
-                     self._ana_w, self._ana_h)
+        if self.analysis_size:
+            self._ana_w, self._ana_h = derive_analysis_size(
+                sw, sh, self.analysis_size)
+        else:
+            self._ana_w, self._ana_h = derive_inference_size(sw, sh)
+        disp_w, disp_h = derive_display_size(len(cleaned), sw, sh,
+                                             (self._ana_w, self._ana_h))
+        self._out_w = max(disp_w, self._ana_w)
+        self._out_h = max(disp_h, self._ana_h)
+        LOG.info("mc-open: RGA 输出 %dx%d（送检 %dx%d / 显示 %dx%d）",
+                 self._out_w, self._out_h, self._ana_w, self._ana_h,
+                 disp_w, disp_h)
 
         self._stop_evt.clear()
         self._play_evt.set()
