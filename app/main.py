@@ -38,6 +38,37 @@ STATIC_DIR = Path(__file__).parent / "static"
 INDEX_TEMPLATE_PATH = STATIC_DIR / "index.html.template"
 
 
+def _raise_nofile_limit() -> None:
+    """把 soft ``RLIMIT_NOFILE`` 提到 hard 上限。
+
+    放在 app 模块而非 ``run.py``：服务有三种入口（``python run.py`` /
+    ``uvicorn app.main:app`` / systemd unit），挂在 run.py 上就漏掉后两种，
+    而 ``sudo`` 还会把 soft 重置回 1024。1024 装不下多路视频 —— MPP 每路
+    VideoCapture 约 17 个 fd，28 路就撞 ``ioctl alloc failed for Too many
+    open files``。
+    """
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            LOG.info("RLIMIT_NOFILE soft %d -> %d", soft, hard)
+        elif soft < 4096:
+            # hard 也抬不动（少数容器 / 老 systemd 配置），点明症状来源，
+            # 否则 28 路崩溃时很难联想到 fd。
+            LOG.warning(
+                "RLIMIT_NOFILE soft=hard=%d，多路视频（约 17 fd/路）"
+                "在 30 路左右就会 Too many open files；"
+                "请用 LimitNOFILE=524288 的 systemd unit 或 "
+                "`ulimit -n 524288` 启动", soft,
+            )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("提升 RLIMIT_NOFILE 失败（忽略）: %s", exc)
+
+
+_raise_nofile_limit()
+
+
 # --------------------------------------------------------------------------- #
 # HTML assembly                                                               #
 # --------------------------------------------------------------------------- #

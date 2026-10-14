@@ -127,7 +127,6 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
       * anything not matching wdnwebui repo paths (defence in depth).
 
     Opt-out: pass ``enabled=False`` (driven by ``--no-kill-stale`` /
->>>>>>> feat(discovery): switch FastDDS discovery from SERVER/CLIENT to SIMPLE multicast (v0.8)
     ``WDNWEBUI_KILL_STALE_ON_BOOT=0``). When disabled the entire
     /proc scan is skipped.
 
@@ -512,19 +511,6 @@ _ensure_wdndds_native_path()
 
 
 def main() -> None:
-    # fd 防线：主进程把 soft RLIMIT_NOFILE 提到 hard 上限。systemd /
-    # rc.local / 手动 shell 环境下默认 soft=1024，而主进程长寿命持有
-    # FastDDS endpoint + uvicorn 连接 + journalctl WS + 各类 fd；
-    # reload 的 multiprocessing.spawn 子进程与本进程 Popen 出的
-    # compute_worker 都会继承本 limit（worker main() 还有自己的
-    # setrlimit 兜底）。
-    try:
-        import resource
-        _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if _soft < _hard:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (_hard, _hard))
-    except Exception:
-        pass
     parser = argparse.ArgumentParser(
         prog="wdnwebui",
         description=f"wdnwebui service v{__version__}",
