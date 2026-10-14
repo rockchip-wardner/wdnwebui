@@ -51,13 +51,21 @@ import logging
 import queue
 import threading
 import time
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 try:
     from wdnav import VideoCapture as _WdnavVideoCapture
 except Exception:  # pragma: no cover - platform-specific load failure
     _WdnavVideoCapture = None
+
+# 帧判据：与 core/video/frame_judge.py 同一份实现，不另写一套。
+# 每路一个独立实例 —— 各摄像头画面不同，共用一个参照帧没有意义。
+from app.core.video.frame_judge import (
+    DEFAULT_EVERY_N,
+    DEFAULT_LONG_SIDE,
+    EXPOSED_METRICS,
+    FrameJudge,
+)
 
 
 LOG = logging.getLogger("multi_channel_session")
@@ -183,6 +191,7 @@ class Channel:
         "frame_pos", "loop", "frames", "opens", "errors", "thread",
         "started_at", "last_frame_ts", "_lock", "_latest_bgr",
         "_out_w", "_out_h", "_stop", "_play", "_live", "_publish",
+        "judge",
     )
 
     def __init__(
@@ -219,6 +228,9 @@ class Channel:
         self._play = play_evt
         # 帧广播回调（由 MultiChannelSession 注入），把 JPEG 推给 WS 订阅者
         self._publish: Optional[Callable[[int, bytes], None]] = None
+        # 本路专属的帧判据器。由 MultiChannelSession.open() 按配置注入 ——
+        # 每路独立，因为参照帧是"上一张**本路**送去推理的图"。
+        self.judge: Optional[FrameJudge] = None
 
     # -- 采样侧 ------------------------------------------------------------ #
     def snapshot_bgr(self):
@@ -251,6 +263,32 @@ class Channel:
             return resize_bgr(frame, w, h)
         except Exception as exc:  # noqa: BLE001
             LOG.warning("mc-ch%02d RGA 缩到 %dx%d 失败: %s", self.idx, w, h, exc)
+            return None
+
+    def snapshot_gray_for_judge(self, long_side: int):
+        """取当前帧 → RGA 缩到长边 → 转灰度，给本路判据器。失败返回 None。
+
+        缩放走 ``wdnav.rga.resize_bgr``，**不做软 resize 兜底**；灰度用
+        ``cv2.cvtColor(BGR2GRAY)``，与单路 ``VideoSession`` 的 buf2 一致
+        （**不要**改用 ``frame[..., 0]``，那是 B 通道不是 Y，分数刻度会偏）。
+
+        只在轮转提交那一瞬调用（每路 ~2s 一次），不是每帧 —— 否则 N 路都要
+        多一次 RGA，32 路时直接撞吞吐上限。
+        """
+        frame = self.snapshot_bgr()
+        if frame is None:
+            return None
+        fh, fw = frame.shape[0], frame.shape[1]
+        tw, th = derive_analysis_size(fw, fh, long_side)
+        try:
+            from wdnav.rga import resize_bgr
+            small = resize_bgr(frame, tw, th) if (fw, fh) != (tw, th) else frame
+            import cv2
+            return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) \
+                if small.ndim == 3 else small
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("mc-ch%02d 判据缩略图 %dx%d 失败: %s",
+                        self.idx, tw, th, exc)
             return None
 
     def set_frame(self, bgr) -> None:
@@ -463,6 +501,15 @@ class MultiChannelSession:
         self._rr_interval = 0.0
         # 累计跳过的路次（推理超时 = 这一路没等到结果，不阻塞整轮）
         self._rr_skips = 0
+        # 累计被帧判据挡下的路次（判为"这一帧不值得送检"）。与 _rr_skips 分开
+        # 计数：前者是判据在省算力（好事），后者是推理卡住了（坏事）。
+        self._rr_judge_skips = 0
+        # 判据配置。持有一个活的 FrameJudge 当配置本：mode/every_n/threshold
+        # 的归一化（迁移表、模式换了跟着换默认阈值）全部复用它自己的实现，
+        # 不在这里重写一遍。默认与单路 VideoSession 一致（gscore）。
+        self._judge_proto = FrameJudge(mode=EXPOSED_METRICS[0],
+                                       every_n=DEFAULT_EVERY_N,
+                                       long_side=DEFAULT_LONG_SIDE)
         self.analysis_size = analysis_size
         self.decode_fps = decode_fps
         self.display_fps = display_fps
@@ -529,6 +576,13 @@ class MultiChannelSession:
                     self._stop_evt, self._play_evt)
             for i, src in enumerate(cleaned)
         ]
+        # 每路一个独立判据器（参照帧必须是本路的图）。重建通道 = 重建判据：
+        # 旧参照帧是旧视频源的内容，换源后继续用等于拿 A 源的图判 B 源。
+        proto = self._judge_proto
+        for ch in channels:
+            ch.judge = FrameJudge(mode=proto.mode, every_n=proto.every_n,
+                                  threshold=proto.threshold,
+                                  long_side=proto.long_side)
         with self._lock:
             self._channels = channels
             self._eff_decode_fps = eff_decode
@@ -559,6 +613,14 @@ class MultiChannelSession:
             channels = self._channels
             self._channels = []
             self._state = STATE_IDLE
+            # 快照描述的是本次会话，清零后前端不会读到上一轮的残留进度。
+            # open() 开头会调 close()，所以新一轮的计数天然从 0 起。
+            self._rr_round = 0
+            self._rr_skips = 0
+            self._rr_judge_skips = 0
+            self._rr_current = -1
+            self._rr_infer_ms = 0.0
+            self._rr_last_ts = 0.0
         for ch in channels:
             if ch.thread is not None:
                 ch.thread.join(timeout=2.0)
@@ -717,8 +779,31 @@ class MultiChannelSession:
                 with self._rr_lock:
                     if self._rr_thread is not threading.current_thread():
                         return
-                # 此刻该路的最新帧，按送检尺寸缩好（显示尺寸可能更大，
-                # 见 derive_display_size）。没出帧 / 缩放失败就跳过本路。
+                # 判据帧号必须单调：不能用 ch.frame_pos（那是 cap.frame_pos，循环重播
+                # 时归零，gap 会变负、兜底间隔再也等不到，而文件源循环是常态）。
+                judge_pos = ch.frames
+                judge_score: Optional[float] = None
+                # 判据门控只在自动模式下走，manual 整段跳过（不缩缩略图也
+                # 不算分），此时行为与接入判据前一致。先判据后取送检图，
+                # 被挡下时连 384 的那次 RGA 都省掉。
+                if ch.judge is not None and ch.judge.is_auto:
+                    thumb = ch.snapshot_gray_for_judge(
+                        ch.judge.long_side)
+                    if thumb is not None:
+                        try:
+                            take = ch.judge.observe(thumb, judge_pos)
+                        except Exception as exc:  # noqa: BLE001
+                            LOG.warning("mc-ch%02d 判据异常，按放行处理: %s",
+                                        ch.idx, exc)
+                            take = True
+                        if not take:
+                            with self._lock:
+                                self._rr_judge_skips += 1
+                            continue
+                        judge_score = ch.judge.current_score
+
+                # 按送检尺寸缩好（显示尺寸可能更大，见 derive_display_size）。
+                # 没出帧 / 缩放失败就跳过本路。
                 frame = ch.snapshot_bgr_for_analysis(ana_w, ana_h)
                 if frame is None:
                     continue
@@ -726,7 +811,9 @@ class MultiChannelSession:
                     self._rr_current = ch.idx
                 t0 = time.perf_counter()
                 try:
-                    detector.submit_frame(frame, ch.frame_pos, channel=ch.idx)
+                    detector.submit_frame(frame, ch.frame_pos,
+                                          judge_score=judge_score,
+                                          channel=ch.idx)
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("mc-vlm-rr ch%02d submit 失败: %s",
                                 ch.idx, exc)
@@ -790,6 +877,93 @@ class MultiChannelSession:
             }
 
     # ------------------------------------------------------------------ #
+    # 帧判据（每路一个独立判据器）
+    # ------------------------------------------------------------------ #
+    def configure_judge(self, mode: Optional[str] = None,
+                        every_n: Optional[int] = None,
+                        threshold: Optional[float] = None) -> dict:
+        """配置判据，对**已在跑**的各路立刻生效。
+
+        归一化全交给 ``_judge_proto.reconfigure()``（迁移表、模式换了换默认
+        阈值都在那里），这里只负责把结果下发到每一路 —— 与单路
+        ``VideoSession.configure_judge`` 语义相同，差别只在这里有 N 份要同步。
+        """
+        self._judge_proto.reconfigure(mode=mode, every_n=every_n,
+                                      threshold=threshold)
+        with self._lock:
+            channels = [ch for ch in self._channels if ch.judge is not None]
+        for ch in channels:
+            # reconfigure 会清参照帧与分数历史：阈值/算法变了之后，旧参照帧
+            # 是按旧口径选出来的，继续用会把新旧分数混在一份曲线里。
+            ch.judge.reconfigure(mode=self._judge_proto.mode,
+                                 every_n=self._judge_proto.every_n,
+                                 threshold=self._judge_proto.threshold)
+        LOG.info("mc-judge: mode=%s every_n=%d threshold=%.2f → %d 路",
+                 self._judge_proto.mode, self._judge_proto.every_n,
+                 self._judge_proto.threshold, len(channels))
+        return self.judge_snapshot()
+
+    def reset_judge(self) -> dict:
+        """清空各路判据的参照帧（不动配置）。"""
+        with self._lock:
+            channels = [ch for ch in self._channels if ch.judge is not None]
+        for ch in channels:
+            ch.judge.reset()
+        return self.judge_snapshot()
+
+    def judge_snapshot(self) -> dict:
+        """各路判据的**聚合**快照。
+
+        对外仍是单个判据器的形状，共享前端组件 ``frame-judge.js`` 一套就能
+        读，不用为多路另写曲线组件。标量是各路合计，逐路明细挂在
+        ``per_channel`` 上（共享组件不读，给排查用）。
+        """
+        proto = self._judge_proto
+        with self._lock:
+            channels = list(self._channels)
+        per: List[dict] = []
+        evaluated = sampled = 0
+        recent: List[List] = []
+        cur: Optional[float] = None
+        changed = False
+        gen = 0
+        for ch in channels:
+            if ch.judge is None:
+                continue
+            s = ch.judge.snapshot()
+            # gen 是配置代次，前端据此丢弃变更前就在路上的旧快照。各路是同一
+            # 份配置下发下去的，取一个即可。
+            gen = gen or s.get("gen") or 0
+            evaluated += s["evaluated"]
+            sampled += s["sampled"]
+            # 曲线点带通道号：各路 pos 各自独立，不带号画出来是乱的
+            recent.extend([p, sc, ch.idx] for p, sc in s["recent"])
+            if s["cur"] is not None:
+                cur = s["cur"]
+                changed = s["changed"]
+            per.append({"channel": ch.idx, "evaluated": s["evaluated"],
+                        "sampled": s["sampled"], "cur": s["cur"],
+                        "changed": s["changed"]})
+        recent.sort(key=lambda x: x[0])
+        del recent[:-200]
+        return {
+            "gen": gen,
+            "mode": proto.mode,
+            "manual": not proto.is_auto,
+            "every_n": proto.every_n,
+            "threshold": proto.threshold,
+            "long_side": proto.long_side,
+            "cur": cur,
+            "changed": changed,
+            "evaluated": evaluated,
+            "sampled": sampled,
+            "every_n_eff": (evaluated / sampled) if sampled else None,
+            "recent": recent,
+            "per_channel": per,
+            "judge_skips": self._rr_judge_skips,
+        }
+
+    # ------------------------------------------------------------------ #
     # 状态
     # ------------------------------------------------------------------ #
     def channels_snapshot(self) -> List[dict]:
@@ -823,6 +997,7 @@ class MultiChannelSession:
             "total_errors": sum(c["errors"] for c in chans),
             "last_frame_ts": started,
             "vlm": self.vlm_snapshot(),
+            "judge": self.judge_snapshot(),
             "channel_list": chans,
         }
 

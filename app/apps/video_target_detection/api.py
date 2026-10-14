@@ -16,6 +16,7 @@ import asyncio
 import queue
 import shutil
 from pathlib import Path
+from typing import Optional
 
 from fastapi import (
     APIRouter,
@@ -26,8 +27,19 @@ from fastapi import (
     WebSocketDisconnect,
 )
 
+from pydantic import BaseModel, Field
+
 from app.core.llm.detector_base import get_target_detector
 from app.core.config import default_resource_root
+from app.core.video.frame_judge import (
+    DEFAULT_EVERY_N,
+    DEFAULT_LONG_SIDE,
+    EXPOSED_METRICS,
+    MODE_MANUAL,
+    cost_ms,
+    default_threshold,
+    metrics,
+)
 from app.core.video.multi_session import (
     MAX_CHANNELS,
     get_multi_session,
@@ -400,3 +412,63 @@ async def stream_ws(ws: WebSocket) -> None:
     finally:
         session.unsubscribe(sub_q)
 
+
+# --------------------------------------------------------------------------- #
+# 帧判据（每路一个独立判据器）
+# --------------------------------------------------------------------------- #
+# 端点挂本卡而不是共用 /api/video/judge：那个操作的是单例 VideoSession
+# （vd / vtl 共用），本页走 MultiChannelSession —— 自管理解码循环的东西
+# 配置就得落到自己这边，与 VAS 挂 /api/video-analysis-search/judge 同理。
+
+
+class JudgePayload(BaseModel):
+    mode: str = Field(default=EXPOSED_METRICS[0],
+                      description="manual（手动跳帧）或任一暴露的度量名")
+    every_n: int = Field(default=DEFAULT_EVERY_N, ge=1, le=3600,
+                         description="兜底帧间隔")
+    threshold: Optional[float] = Field(default=None, gt=0, le=1000,
+                                       description="变化阈值（不传=按模式规则）")
+
+
+@router.get("/judge/metrics")
+async def get_judge_metrics() -> dict:
+    """下拉可选项 + 每个算法的实测单帧成本与默认阈值。
+
+    字段与单路 /api/video/judge/metrics 逐字一致 —— 共享前端组件
+    ``frame-judge.js`` 读的就是这套结构，多路这边不能改名。
+    """
+    ms = metrics()
+    return {
+        "mode": MODE_MANUAL,
+        "metrics": ms,
+        "cost_ms": {m: round(cost_ms(m) or 0.0, 2) for m in ms},
+        "default_threshold": {m: default_threshold(m) for m in ms},
+        "long_side": DEFAULT_LONG_SIDE,
+    }
+
+
+@router.get("/judge")
+async def get_judge() -> dict:
+    return get_multi_session().judge_snapshot()
+
+
+@router.post("/judge")
+async def set_judge(payload: JudgePayload) -> dict:
+    """配置判据。契约：**字段缺失 = 沿用当前值**。
+
+    靠 ``model_fields_set`` 判断 Pydantic 是不是替我们填了 default：这些
+    字段的 default 全都非空，直接透传会把用户调好的值冲掉。
+    （VAS 那边目前只给 mode 做了这个保护要对齐改 VAS，别反过来学它的宽松。）
+    """
+    f = payload.model_fields_set
+    raw = str(payload.mode).strip().lower() if "mode" in f else ""
+    return get_multi_session().configure_judge(
+        mode=raw or None,                       # 显式 mode="" 也保留当前
+        every_n=payload.every_n if "every_n" in f else None,
+        threshold=payload.threshold if "threshold" in f else None)
+
+
+@router.post("/judge/reset")
+async def reset_judge() -> dict:
+    """清空各路判据的参照帧（不动配置）。"""
+    return get_multi_session().reset_judge()

@@ -56,6 +56,10 @@ function setVtdOverlay(text, isError) {
   el.style.display = text ? "" : "none";
 }
 
+/** 通道号对外一律 1 基。内部 idx 是 0 基，此前角标透出 idx（#0）而记录列表
+ *  用 idx+1（通道 1），用户按角标对记录会差一路。抽成函数防三处再漂。 */
+function chNo(idx) { return (idx || 0) + 1; }
+
 /** 按通道数调整宫格（1~32 格）。列数按常见监视器比例取。
  *
  *  刻意**增量复用**而不是整格重建：换源 / 改通道数时若 innerHTML="" 全清，
@@ -109,7 +113,7 @@ function ensureGrid(n) {
     const cv = document.createElement("canvas");
     const label = document.createElement("div");
     label.className = "vd-tile-label";
-    label.textContent = "#" + i;
+    label.textContent = "#" + chNo(i);
     const badge = document.createElement("div");
     badge.className = "vd-tile-badge";
     tile.appendChild(cv);
@@ -225,7 +229,7 @@ function updateVtdTiles(session) {
     // 正常时角标只显示通道号 —— 帧率是运维信息，不是客户要看的；
     // 只有出错时才补上状态/告警，客户一眼能看出哪一路有问题。
     t.label.textContent =
-      `#${c.idx}` +
+      `#${chNo(c.idx)}` +
       (c.state !== "playing" ? ` · ${c.state}` : "") +
       (c.errors ? ` · ⚠${c.errors}` : "");
     t.label.title = src;
@@ -305,12 +309,14 @@ function connectVtdWs() {
       if (snap.session) {
         updateVtdTiles(snap.session);
         VTD.lastSnap = snap.session;
+        // 判据快照挂在 session 下（归 MultiChannelSession 管），不是 snap.judge ——
+        // WS tick 的形状是 {session, detector}。
+        window.FrameJudge?.update("vtd", snap.session.judge);
         if (typeof DemoGuard !== "undefined") {
           DemoGuard.report("video-target-detection",
                            { session: snap.session, detector: snap.detector });
         }
       }
-  window.FrameJudge?.update("vtd", snap.judge);
       const payload = document.getElementById("data-video-target-detection");
       if (payload) payload.textContent = JSON.stringify(snap, null, 2);
       return;
@@ -469,7 +475,7 @@ function buildVtdEventLi(ev, isLatest) {
   // 给客户看的是"通道 N"，不是内部 ch 索引；帧号 / 事件自增 ID 不展示。
   const chMeta = document.createElement("span");
   chMeta.className = "vd-event-ch";
-  chMeta.textContent = "通道 " + ((ev.channel || 0) + 1);
+  chMeta.textContent = "通道 " + chNo(ev.channel);
   li.appendChild(chMeta);
   const meta = document.createElement("div");
   meta.className = "vd-event-meta";
@@ -740,7 +746,10 @@ function initVideoTargetDetection() {
 
   // ...
   loadModelPick("vtd-model-pick", "swcap_video_describe", "vtd.model_id");
-  window.FrameJudge?.mount({ prefix: "vtd", canvasId: "vtd-canvas" });
+  // apiBase 指向本卡判据端点：/api/video/judge 操作的是单例 VideoSession
+  // （vd / vtl 共用），本页走 MultiChannelSession，同 VAS 挂自己的 judge_api。
+  window.FrameJudge?.mount({ prefix: "vtd", canvasId: "vtd-canvas",
+                             apiBase: API_PREFIX + "/video-target-detection/judge" });
 
   const loopEl   = document.getElementById("vtd-loop");
   const openBtn = document.getElementById("vtd-open");

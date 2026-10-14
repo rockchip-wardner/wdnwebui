@@ -4865,27 +4865,88 @@ XML profile 路径：`$XDG_RUNTIME_DIR/wdndds_default_profile.xml`
 前端按 `channel` 显示「通道 N」、按 `judge_score` 显示变化分数，
 两者互不覆盖。
 
-### 已知缺口：vtd 多路页的判据控件目前不生效
+### 历史缺口：vtd 多路页的判据控件曾经不生效（已补）
 
-`/api/video/judge`（`core/video/api.py`）操作的是**单例 `VideoSession`**
-的 `_judge`。视频目标监控页改多路后走的是 `MultiChannelSession`，
-而它**没有任何判据接线**（`grep judge multi_session.py` 为空）。
+rebase 合入上游判据特性后，vtd 页的判据 UI 曾是**控件在、后端不接**：
+`/api/video/judge` 改的是单例 `VideoSession` 的判据，而本页走
+`MultiChannelSession`（`grep judge multi_session.py` 为空），配置写进去没人读。
+当时留下的临时约定是「向导 `gscore` 虽然 `selected: true` 但不生效」。
 
-于是该页的判据 UI（`#vtd-judge-config`、向导里的三个判据字段）会：
+**该缺口已由下一节「多路页的帧判据」补齐**：`MultiChannelSession` 现在
+每路一个独立判据器，端点挂本卡，向导默认也一并改回 `manual`。
+此处保留记录，是想记下「判据接线必须跟着解码路径走」这条教训 —— 
+卡片换了会话实现，判据也得跟着换，光把 UI 接上不解决问题。
 
-* 正常渲染 —— `frame-judge.js` 是 `index.html.template` 全局引入的，
-  `window.FrameJudge` 一定在；
-* POST 到 `/api/video/judge` —— 改的是单例会话的判据，而本页根本不开
-  那个会话，所以**配置写进去没人读**；
-* `snap.judge` 在本页快照里不存在 → 浮层 badge/curve 自动隐藏
-  （`FrameJudge.sync()` 找不到 `#vtd-canvas` 就 `hide()`，不会画歪）。
+## 多路页的帧判据：每路一个独立 FrameJudge（v0.21）
 
-即**控件在、后端不接**。要真正接通需要给 `MultiChannelSession` 加
-**每路独立**的 `FrameJudge`（各摄像头场景不同，不能共用一个参照帧），
-并在 `snapshot` 里汇总。注意那会改变检测语义：gscore 模式下静态画面
-会被判据挡掉、不再产出事件，所以默认值应保持 manual 以免影响既有基线。
+`video-target-detection` 多路版给**每路摄像头配一个独立 `FrameJudge`**，
+判据实现仍是唯一一份 `core/video/frame_judge.py`。
 
-> **当前合并后向导里 `gscore` 是 `selected: true`**（保留了上游的默认），
-> 但它对多路不生效 —— 用户调完阈值看不到任何变化。补上每路判据接线时，
-> 应把默认一并改成 `manual`，否则等于给一个没接线的控件配了个看起来很
-> 能用的默认值。
+### 为什么必须每路一个
+
+参照帧（`_last_luma`）的语义是「上一张**送去推理**的本路画面」。多路画面各不相同，
+共用一个参照帧等于拿 A 路的图去比 B 路 —— 每帧都得高分，判据退化成「永远放行」。
+
+### 判据挂在轮转里，不在解码循环里 —— 与单路最大的语义差别
+
+单路 `VideoSession` 是 `observe()` **每帧**调用，判据自己决定送检。多路不能照抄：
+轮转本身就是节流器（每路 ~2s 才被看一次），若判据也每帧跑，参照帧会跟着「每帧的
+判定」推进而**不是**跟着送检推进，「参照帧 = 上一次送检的帧」这条不变量就破了，
+而且算出来的分数绝大多数没人消费。
+
+所以 `_rr_loop` 的顺序是：
+
+1. `ch.snapshot_gray_for_judge()` —— RGA 缩到长边 160 + `cvtColor` 转灰度
+2. `ch.judge.observe(thumb, judge_pos)` —— 判为「没变」就 `continue`
+3. 通过了才 `snapshot_bgr_for_analysis()` 缩到送检尺寸并 `submit_frame()`
+
+**先判据后取送检图**：被挡下时连那次 384 的 RGA 都省掉。手动模式整段跳过，
+行为与接入判据前**逐位一致**。
+
+### 帧号必须单调：踩过的坑
+
+判据喂的帧号**不能用 `ch.frame_pos`** —— 那是 `cap.frame_pos`，**循环重播时归零**。
+于是 `gap = pos - last_pos` 变负，兜底间隔再也等不到，而文件源循环恰恰是常态。
+多路改用 `ch.frames`（本会话的单调解码计数）。
+
+> **单路 `VideoSession` 目前仍有这个问题**：`session.py` 的
+> `cur_frame_pos = cap.frame_pos` 同样在循环时归零、同样喂给 `judge.observe()`，
+> 影响 vd / vtl / vas 三张卡的兜底间隔。修它要动共享单例并回归三张卡，
+> 已单列待办，本期不处理。
+
+### 端点挂本卡，不共用 /api/video/judge
+
+`/api/video/judge` 操作的是单例 `VideoSession`（vd / vtl 共用），本页走
+`MultiChannelSession`，所以判据端点挂在
+`/api/video-target-detection/judge{,/metrics,/reset}`。理由与 VAS 一致：
+**自管理解码循环的东西，配置就得落到自己的服务上。** 前端
+`FrameJudge.mount({apiBase})` 指向本卡端点，其余卡片共用同一套组件。
+
+### 默认 mode = gscore（与单路一致）
+
+接进来时默认 `gscore`，与单路 `VideoSession` 的
+`FrameJudge(mode=EXPOSED_METRICS[0])` 保持一致，向导里也是 gscore 预选。
+
+判据的意义就是「画面没变就不送检」：静态画面送去推理，拿到的是与上一次
+**逐位相同**的答案，纯徒增 NPU 调用。默认关掉它等于让这张卡成为四张卡里
+唯一的例外，且用户不改配置就拿不到省算力的收益。
+
+> 这里曾一度把默认设成 manual，理由是「默认开启 gscore 会让静态画面不产出
+> 事件，用户会看到『明明有人走动却没事件』」。**这个论证是错的**：
+> 「有人走动」本身就是「画面有变动」的证据，而 gscore 的判定正是
+> 「有变动就放行」—— 两者互相矛盾，描述的场景按定义不会发生。实测也印证：
+> 默认阈值 10 跑真实监控素材时 `evaluated=15 / sampled=15`，**零门控**。
+> 改动判据默认时别再用这类自相矛盾的「用户会看到 X」句式论证。
+
+真正需要注意的边缘情况只有一个，且**四张卡共有**：目标在画面里占比极小
+时，缩到长边 160 之后可能不足 8×8 判据块的显著量，阈值要按现场素材调 ——
+这是阈值标定问题，不该用「改默认 mode」来绕。
+
+### every_n 在多路下的单位
+
+`every_n` 的单位仍是**解码帧**（25fps 源 → every_n=30 ≈ 1.2s）。但多路每路
+每轮只看一次（3 路时约 4s/轮，32 路时更久），所以兜底在多数配置下根本轮不到
+触发，它实际是**双保险**而不是主要节流手段。真要限流用「巡检间隔」秒/路。
+
+这一点与单路不同（单路每帧都判，every_n 是主力），共享前端组件看不出来，
+**排查「为什么限流没生效」时别拿单路的直觉套多路**。
