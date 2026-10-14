@@ -15,10 +15,25 @@
 --------
 ::
 
-N 个解码线程   各自 1 个 VideoCapture，按**每路自适应**的 decode_fps 节流 read0()
-                   → latest_bgr（VLM 用） + 按每路自适应 display_fps 编码 JPEG（UI 用）
-    1 个 VLM 调度   严格轮转 ch0→ch1→…→chN-1，每路等上一路推理完才提交下一路
+    N 个解码线程   各自 1 个 VideoCapture，按每路自适应 decode_fps 节流
+                   read0_multi([(显示尺寸)])                → 绝大多数帧
+                   read0_multi([(显示尺寸), (送检尺寸)])    → 轮转点到的那帧
+                   → 按 display_fps 编码 JPEG 送显
+    1 个 VLM 调度   严格轮转 ch0→ch1→…→chN-1，向该路 _ana_due 要图、
+                   等它交接，再提交下一路
     N 个 WS 订阅    每个订阅者拿 (channel_idx, jpeg_bytes)，drop-oldest
+
+热路径与冷路径**不共用同一张图**
+--------------------------------
+显示（热路径）与送检（冷路径）是两件独立的事，各自在**同一次解码**的
+DMA-BUF 上单独 RGA 到自己的尺寸。早前它们共用一张（``_out = max(显示,
+送检)``），于是送检尺寸绑架了显示尺寸：为了 640 的送检图，浏览器也只能
+看 640，32 路被拖到 609.5 帧/秒。解耦后热路径回到 384、32 路 769.9
+帧/秒，而送检照样拿真 640。
+
+代价是**第二次 RGA 只在被轮转点到的那一帧上发生**（约 2%），不是每帧
+都付双倍 —— 所以送检图必须由解码线程产出：轮转线程自己去调 ``read0``
+会与该路解码线程抢同一个 ``VideoCapture``、打乱解码顺序。
 
 三个参数为什么是这个默认值（全部来自本机实测，见 AGENTS.md）
 
@@ -27,13 +42,12 @@ N 个解码线程   各自 1 个 VideoCapture，按**每路自适应**的 decode
 等于让所有素材掉进便宜的 384 vision 变体，那是**精度降档**而非吞吐优化。
 ``analysis_size`` 只剩「强制覆盖」这一个用途，默认 None = 自动。
 
+显示尺寸 —— **纯显示需求**，按路数分档（:func:`derive_display_size`）：
+1~4 路 960 长边铺满播放器，5 路以上 384。
+
 ``decode_fps`` / ``display_fps`` —— 都只是**每路上限**，实际值由
 :func:`derive_decode_fps` / :func:`derive_display_fps` 按路数摊分，N 路共享
-``MAX_TOTAL_DECODE_FPS`` / ``MAX_TOTAL_DISPLAY_FPS``。
-
-> 送检尺寸与解码预算**强耦合**：热路径每路只产一张图，既送显又是冷路径的
-> 源，所以抬送检尺寸会把每帧成本从 1.94ms 推到 4.34ms。细节见两个预算常量
-> 的注释。
+``MAX_TOTAL_DECODE_FPS`` / ``MAX_TOTAL_DISPLAY_FPS``（都是 384 热路径口径）。
 
 降级行为
 --------
@@ -72,20 +86,25 @@ DEFAULT_DECODE_FPS = 25.0
 DEFAULT_DISPLAY_FPS = 25.0
 DEFAULT_JPEG_QUALITY = 70
 OPEN_TIMEOUT = 10.0
-# 所有路**合计**的解码预算（次/秒）= 热路径「解码+缩放+JPEG」的吞吐天花板。
-# 跟着送检尺寸走：热路径每路只产一张图（既送显又是冷路径的源），720P 源
-# 单帧 640x360 是 4.34ms、384x216 只要 1.94ms，合计上限因此从 ~790 掉到 ~660。
-#   * 32 路 → 每路 20.6fps（实测 659.6 帧/秒、0 错误）
+# 所有路**合计**的解码预算（次/秒）= 热路径「解码 + RGA 到显示尺寸 + JPEG」。
+# 多路时显示 384（见 derive_display_size），冷热各自 RGA，所以这里只看显示档
+# 的单帧成本：720P 源 384x216 实测 1.94ms/帧。
+#   * 32 路 → 每路 ~24fps（实测 769.9 帧/秒、0 错误）
 #   * 25 路以内每路仍跑满 25fps，不受此预算影响
-# 别为了让 32 路跑满 25fps 调回 800：硬件给不出 25，调度器每帧都「追不上
-# 节流」退化成满速空跑，实测 fps 在 15.4~21.5 乱跳，比主动限流抖得多。
-MAX_TOTAL_DECODE_FPS = 660.0
-# 所有路合计的 UI 推送预算（张/秒）。640x360 JPEG 实测 2.2ms/张，
-# 400 张 ≈ 0.9 核，留足余量给 WS 发送与浏览器解码。
-MAX_TOTAL_DISPLAY_FPS = 400.0
+# 别把值调到 800 以上：调度器会给每路 25fps 的节流目标而硬件给不出来，
+# 每帧都「追不上节流」退化成满速空跑，fps 会乱跳（实测 15.4~21.5）。
+MAX_TOTAL_DECODE_FPS = 780.0
+# 所有路合计的 UI 推送预算（张/秒）。384x216 JPEG 实测 0.62ms/张，780 张
+# ≈ 0.48 核，留足余量给 WS 发送与浏览器解码。解码预算是硬顶（769.9），
+# 这个值取到与之相当即可，再大也没有更多帧可推。
+MAX_TOTAL_DISPLAY_FPS = 780.0
 # 单路推理等待上限。正常单路 ~0.85~1.9s，30s 足够宽裕；超时的路直接跳过
 # 继续轮下一路，不让一路卡死把整个轮转拖住。
 RR_INFER_TIMEOUT = 30.0
+# 轮转线程向解码线程要送检图时的等待上限（秒）。解码线程在下一帧上就会
+# 多跑一次 RGA 产出来，正常是一帧周期（1/display_fps ≈ 40ms）内；留 1s
+# 余量给 decode_fps 被预算摊到很低的路数。
+ANA_WAIT_TIMEOUT = 1.0
 # 一次「已完成的推理」耗时下限（毫秒）。正常单路 850~1900ms，远大于此；
 # 若 wait_idle 亚毫秒返回，说明这一帧压根没进队列（见 _rr_loop 的退避分支）。
 RR_MIN_INFER_MS = 100.0
@@ -139,28 +158,25 @@ def derive_inference_size(src_w: int, src_h: int,
     return max(2, (src_w * mid) // src_h), mid
 
 
-# 浏览器显示用的最长边，按路数分档。
+# 浏览器显示用的最长边，按路数分档（纯显示需求，不受送检尺寸影响）。
 #   1~4 路 → 960（实测单路 24.9fps / 0 错误，铺满播放器不糊）
-#   5 路以上 → 回落送检尺寸（见 derive_display_size）
+#   5 路以上 → 384（省 RGA 像素与 JPEG 体积，见 MAX_TOTAL_DECODE_FPS）
 DISPLAY_LONG_EDGE_HIGH = 960
+DISPLAY_LONG_EDGE_LOW = 384
 DISPLAY_HIGH_MAX_CHANNELS = 4
 
 
 def derive_display_size(n_channels: int, src_w: int, src_h: int,
-                        inference_size: Tuple[int, int],
                         ) -> Tuple[int, int]:
-    """返回给**浏览器**的显示尺寸。
+    """返回给**浏览器**的显示尺寸 —— 纯显示需求，与送检尺寸无关。
 
-    路数少时给 960 长边（单路 24.9fps 实测 0 错误，铺满播放器不糊）；路数多
-    时带宽才是硬约束，回落到送检尺寸。
-
-    **5 路以上时显示实际就是送检尺寸**：解码线程只产一个缓冲
-    （``_out = max(显示, 送检)``），显示 JPEG 直接从它编码。曾想"再 RGA 降到
-    384 省带宽"，实测反而更贵（直编 1.40ms vs 降采样+编码 1.73ms），别加。
+    分界线沿用 ``DISPLAY_HIGH_MAX_CHANNELS = 4``（不是拍的新数）：1~4 路
+    大图时前端才有「疯狂屏闪」问题，改成别的值会把那个 bug 的触发条件挪走。
     """
-    if n_channels <= DISPLAY_HIGH_MAX_CHANNELS:
-        return derive_analysis_size(src_w, src_h, DISPLAY_LONG_EDGE_HIGH)
-    return inference_size
+    long_edge = (DISPLAY_LONG_EDGE_HIGH
+                 if n_channels <= DISPLAY_HIGH_MAX_CHANNELS
+                 else DISPLAY_LONG_EDGE_LOW)
+    return derive_analysis_size(src_w, src_h, long_edge)
 
 
 def derive_decode_fps(n_channels: int, cap: float = DEFAULT_DECODE_FPS) -> float:
@@ -204,30 +220,35 @@ def probe_size(path: str) -> Tuple[int, int]:
 
 
 class Channel:
-    """一路视频 = 1 个解码线程 + 1 组最新帧槽。"""
+    """一路视频 = 1 个解码线程 + 显示帧槽 + 送检帧槽。"""
 
     __slots__ = (
         "idx", "source", "state", "error", "width", "height", "fps",
         "frame_pos", "loop", "frames", "opens", "errors", "thread",
         "started_at", "last_frame_ts", "_lock", "_latest_bgr",
-        "_out_w", "_out_h", "_stop", "_play", "_live", "_publish",
-        "judge",
+        "_disp_w", "_disp_h", "_stop", "_play", "_live", "_publish",
+        "judge", "_ana_w", "_ana_h", "_ana_due", "_ana_bgr",
+        "_ana_seq", "_ana_seen",
     )
 
     def __init__(
         self,
         idx: int,
         source: str,
-        out_w: int,
-        out_h: int,
+        disp_w: int,
+        disp_h: int,
+        ana_w: int,
+        ana_h: int,
         loop: bool,
         stop_evt: threading.Event,
         play_evt: threading.Event,
     ) -> None:
         self.idx = idx
         self.source = source
-        self._out_w = out_w
-        self._out_h = out_h
+        self._disp_w = disp_w
+        self._disp_h = disp_h
+        self._ana_w = ana_w
+        self._ana_h = ana_h
         self.loop = loop
         self.state = STATE_IDLE
         self.error = ""
@@ -244,6 +265,12 @@ class Channel:
         self._live = "://" in source or source.startswith("/dev/video")
         self._lock = threading.Lock()
         self._latest_bgr: Any = None
+        # 送检帧交接：轮转线程置 _ana_due，解码线程在**同一帧**上多出一份
+        # 送检尺寸的 BGR。序号判新旧，见 request_inference。
+        self._ana_due = threading.Event()
+        self._ana_bgr: Any = None
+        self._ana_seq = 0        # 解码线程每产出一张送检图 +1
+        self._ana_seen = 0       # 轮转线程已消费到的序号
         self._stop = stop_evt
         self._play = play_evt
         # 帧广播回调（由 MultiChannelSession 注入），把 JPEG 推给 WS 订阅者
@@ -258,39 +285,44 @@ class Channel:
         with self._lock:
             return self._latest_bgr
 
-    def snapshot_bgr_for_analysis(self, w: int, h: int):
-        """取当前帧并 RGA 缩到 (w, h) 送检（VLM 用）。
+    def request_inference(self) -> None:
+        """请求本路下一次解码时额外产出一张送检尺寸的图（轮转线程调用）。
 
-        显示尺寸可能大于送检尺寸（1~4 路时浏览器要 960 长边），所以这里
-        按需缩一次。**只在轮转提交那一瞬调用**（每路 ~2s 一次），不是每帧
-        都缩 —— 否则 RGA 次数翻倍，直接撞吞吐上限。
-
-        缩放走 ``wdnav.rga.resize_bgr``（硬件），**不做软 resize 兜底**：
-        RGA 失败就返回 None，让这一路本轮跳过（轮转循环已经处理
-        ``frame is None``），宁可少一路也不要悄悄走软路径。
+        解码线程在同一帧上多跑一次 RGA，代价只落在被点到的那一帧上（约
+        2%），不是每帧双倍。**必须由解码线程产出**：轮转线程自己去调
+        read0 会与该路解码线程抢同一个 VideoCapture、打乱解码顺序。
         """
-        frame = self.snapshot_bgr()
-        if frame is None:
-            return None
-        try:
-            fh, fw = frame.shape[0], frame.shape[1]
-        except Exception:  # noqa: BLE001
-            return None
-        if (fw, fh) == (w, h):
-            return frame
-        try:
-            from wdnav.rga import resize_bgr
-            return resize_bgr(frame, w, h)
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("mc-ch%02d RGA 缩到 %dx%d 失败: %s", self.idx, w, h, exc)
-            return None
+        self._ana_due.set()
+
+    def take_inference(self, timeout: float = 1.0):
+        """等解码线程交出送检图；没有就返回 None（让本轮跳过）。
+
+        ``timeout`` 要宽于一个解码帧周期（1000/display_fps），否则轮转会
+        频繁空手而归 —— 那正是 ``RR_MIN_INFER_MS`` 要抓的「空转」。
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                if self._ana_seq > self._ana_seen:
+                    self._ana_seen = self._ana_seq
+                    return self._ana_bgr
+            if self._stop.is_set() or time.monotonic() >= deadline:
+                return None
+            time.sleep(0.005)
+
+    def _publish_inference(self, img) -> None:
+        """解码线程内部调用：存下这一帧的送检图并唤醒等待方。"""
+        with self._lock:
+            self._ana_bgr = img
+            self._ana_seq += 1
 
     def snapshot_gray_for_judge(self, long_side: int):
         """取当前帧 → RGA 缩到长边 → 转灰度，给本路判据器。失败返回 None。
 
-        缩放走 ``wdnav.rga.resize_bgr``，**不做软 resize 兜底**；灰度用
-        ``cv2.cvtColor(BGR2GRAY)``，与单路 ``VideoSession`` 的 buf2 一致
-        （**不要**改用 ``frame[..., 0]``，那是 B 通道不是 Y，分数刻度会偏）。
+        源是**显示尺寸**的帧。缩放走 ``wdnav.rga.resize_bgr``，**不做软
+        resize 兜底**；灰度用 ``cv2.cvtColor(BGR2GRAY)``，与单路 ``VideoSession``
+        的 buf2 一致（**不要**改用 ``frame[..., 0]``，那是 B 通道不是 Y，
+        分数刻度会偏）。
 
         只在轮转提交那一瞬调用（每路 ~2s 一次），不是每帧 —— 否则 N 路都要
         多一次 RGA，32 路时直接撞吞吐上限。
@@ -393,10 +425,15 @@ class Channel:
                     # 与 t0 同源，固定步进才不会第一帧就疯狂追平
                     next_disp = t0
 
+                # 绝大多数帧只出显示尺寸；轮转要图的那一帧才多跑一次 RGA
+                want_ana = self._ana_due.is_set()
+                sizes = ([(self._disp_w, self._disp_h),
+                          (self._ana_w, self._ana_h)] if want_ana
+                         else [(self._disp_w, self._disp_h)])
                 try:
-                    ret, frame0 = cap.read0(self._out_w, self._out_h)
+                    ret, frame0 = cap.read0_multi(sizes)
                 except Exception as exc:  # noqa: BLE001
-                    self._note_error(f"read0 异常: {exc}")
+                    self._note_error(f"read0_multi 异常: {exc}")
                     self._drop_cap(cap)
                     cap = None
                     self._stop.wait(0.2)
@@ -406,6 +443,7 @@ class Channel:
                     # EOF —— 循环重开，或停在 eof 等前端决定
                     self._drop_cap(cap)
                     cap = None
+                    self._ana_due.clear()
                     with self._lock:
                         self.frame_pos = 0
                     if self.loop and not self._live:
@@ -415,13 +453,14 @@ class Channel:
                     self.state = STATE_EOF
                     return
 
-                try:
-                    frame = frame0.numpy()
-                except Exception:  # noqa: BLE001
+                outs = getattr(frame0, "_multi_bgr", None)
+                if not outs:
                     # RGA 失败 —— 丢这一帧，不打断整路
                     continue
-                if frame is None:
-                    continue
+                frame = outs[0]
+                if want_ana and len(outs) > 1:
+                    self._publish_inference(outs[1])
+                    self._ana_due.clear()
 
                 self.frames += 1
                 self.last_frame_ts = time.time()
@@ -538,8 +577,8 @@ class MultiChannelSession:
         self._eff_display_fps = display_fps
         self.jpeg_quality = jpeg_quality
         # open() 之前的占位初值，真正取值由 open() 按源尺寸算出
-        self._out_w = DEFAULT_LONG_SIDE * 4
-        self._out_h = DEFAULT_LONG_SIDE * 4
+        self._disp_w = DEFAULT_LONG_SIDE * 4
+        self._disp_h = DEFAULT_LONG_SIDE * 4
         self._ana_w = DEFAULT_LONG_SIDE * 4
         self._ana_h = DEFAULT_LONG_SIDE * 4
 
@@ -569,23 +608,20 @@ class MultiChannelSession:
 
         # 统一按第一路的宽高比决定尺寸，保证各路一致（尺寸不同会让 RGA
         # 每路走不同分支，反而更慢且前端 tile 尺寸不一）。
-        #   _ana_w/_ana_h  = 送检 VLM 的尺寸（与单路 VideoSession 同公式）
-        #   _disp          = 浏览器显示尺寸（按路数分档）
-        #   _out_w/_out_h  = RGA 输出 = max(两者)，保证两者都只需下采样
-        #                    （放大既浪费 RGA 又把糊的图喂给模型）
+        #   _disp_w/_disp_h = 浏览器显示尺寸（按路数分档，纯显示需求）
+        #   _ana_w/_ana_h   = 送检 VLM 的尺寸（与单路 VideoSession 同公式）
+        # 两者**互不影响**：各自在同一次解码上单独 RGA，不再取 max 共用
+        # 一张图。原先共用时送检尺寸会绑架显示（640 档下 32 路只能跑
+        # 20.6fps），解耦后热路径 384 实测 32 路 769.9 帧/秒。
         sw, sh = probe_size(cleaned[0]) if "://" not in cleaned[0] else (0, 0)
         if self.analysis_size:
             self._ana_w, self._ana_h = derive_analysis_size(
                 sw, sh, self.analysis_size)
         else:
             self._ana_w, self._ana_h = derive_inference_size(sw, sh)
-        disp_w, disp_h = derive_display_size(len(cleaned), sw, sh,
-                                             (self._ana_w, self._ana_h))
-        self._out_w = max(disp_w, self._ana_w)
-        self._out_h = max(disp_h, self._ana_h)
-        LOG.info("mc-open: RGA 输出 %dx%d（送检 %dx%d / 显示 %dx%d）",
-                 self._out_w, self._out_h, self._ana_w, self._ana_h,
-                 disp_w, disp_h)
+        self._disp_w, self._disp_h = derive_display_size(len(cleaned), sw, sh)
+        LOG.info("mc-open: 显示 %dx%d / 送检 %dx%d",
+                 self._disp_w, self._disp_h, self._ana_w, self._ana_h)
 
         self._stop_evt.clear()
         self._play_evt.set()
@@ -598,7 +634,8 @@ class MultiChannelSession:
         eff_display = derive_display_fps(n, self.display_fps)
 
         channels = [
-            Channel(i, src, self._out_w, self._out_h, bool(loop),
+            Channel(i, src, self._disp_w, self._disp_h,
+                    self._ana_w, self._ana_h, bool(loop),
                     self._stop_evt, self._play_evt)
             for i, src in enumerate(cleaned)
         ]
@@ -789,7 +826,6 @@ class MultiChannelSession:
                 channels = list(self._channels)
                 detector = self._detector
                 interval = self._rr_interval
-                ana_w, ana_h = self._ana_w, self._ana_h
             if not channels or detector is None:
                 self._stop_evt.wait(0.2)
                 continue
@@ -830,9 +866,11 @@ class MultiChannelSession:
                             continue
                         judge_score = ch.judge.current_score
 
-                # 按送检尺寸缩好（显示尺寸可能更大，见 derive_display_size）。
-                # 没出帧 / 缩放失败就跳过本路。
-                frame = ch.snapshot_bgr_for_analysis(ana_w, ana_h)
+                # 请求本路在**下一次解码**上多出一张送检尺寸的图（同一次
+                # 解码的 DMA-BUF 多跑一次 RGA），然后等它交接。没有出帧就
+                # 跳过本路。等待窗口要宽于一个解码帧周期。
+                ch.request_inference()
+                frame = ch.take_inference(timeout=ANA_WAIT_TIMEOUT)
                 if frame is None:
                     continue
                 with self._lock:
@@ -1013,8 +1051,8 @@ class MultiChannelSession:
             "error": err,
             "channels": n,
             "loop": loop,
-            "out_w": self._out_w,
-            "out_h": self._out_h,
+            "disp_w": self._disp_w,
+            "disp_h": self._disp_h,
             "analysis_size": self.analysis_size,
             "ana_w": self._ana_w,
             "ana_h": self._ana_h,
