@@ -148,7 +148,7 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    `chat_runner.build_chatml_prompt` 也一并消失 —— 不是"不该做"，是
    **没有信息可做**。
 
-## 视频目标监控页：1~32 路并发（v0.21）
+## 视频三卡：1~32 路并发（vtd / vtl / vd，v0.21~v0.22）
 
 `video-target-detection` 已从「单路 canvas」改成「1~32 路宫格 + VLM 逐路轮转」。
 
@@ -159,9 +159,138 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
 内部只有 **1 个** `VideoCapture` + **1 个**解码线程。把多路塞进去等于让另外两页
 的解码路径也背上 N 路复杂度 —— 违反「改动只触及目标功能及其直接依赖」。
 
-所以新开 `app/core/video/multi_session.py::MultiChannelSession`，本页独用，
-另外两页继续跑原单例、零影响。`N=1` 是它的退化情况，**一套代码覆盖 1~32 路**，
-没有「单路分支 / 多路分支」两套路径。
+所以新开 `app/core/video/multi_session.py::MultiChannelSession`。`N=1` 是它的
+退化情况，**一套代码覆盖 1~32 路**，没有「单路分支 / 多路分支」两套路径。
+
+> **v0.22 起 vtl 与 vd 也搬过来了** —— 三张卡全部走
+> `MultiChannelSession`，没有单路例外。共用单例按 **key 注册**
+> （`get_multi_session("vtd" / "vtl" / "vd")`）—— 同一个进程里每张卡各占一个
+> key，否则 vtl 的 `open()` 会把 vtd 的解码器全 close 掉，表现为「切回上一页
+> 画面全黑」。共享的是**代码**不是**实例**。
+>
+> 三张卡的 HTTP 层合并成了工厂 `app/core/video/multi_api.py`
+> （`MultiCardSpec` + `build_multi_router(spec, tag)`）；卡片专属的东西留在卡内：
+> vtd / vd 的 `image_size` / `model_id` 校验，vtl 的 `prompts[]` 校验与固定 448
+> 送检，vd 的 `enabled_tools` 白名单（`tts_alert`）+ `/tools` +
+> `/available-vision-sizes`。
+
+### 帧怎么到 detector：`attach_detector` + 轮转，**不是** frame sink
+
+三张卡的 `__init__.py` 曾经都把 detector 挂成共享 `VideoSession` 的 frame sink
+（`add_frame_sink`）。**多路化之后那三份 sink 全部是死代码** —— 本卡的解码早已
+换成 `MultiChannelSession`，`VideoSession` 上永远不会再有一帧到达 vd / vtd / vtl。
+真正喂帧的是工厂在 `POST /prompt` 里做的三件事：
+
+```python
+session.attach_detector(det)          # 帧源
+session.set_round_robin_interval(...) # 节奏
+session.start_round_robin()           # 逐路取当前帧提交
+```
+
+三张卡**都已经删掉**这份接线。它不只是白费：`VideoSession` 现在仍被
+`video_analysis_search` 的 `/source/open` 单路预览使用，于是「某张卡开着检测
+→ 切到 VAS 点打开」会把 **VAS 的帧以 channel=0 灌进那张卡的检测器**
+（`submit_frame` 只在 detector 未启用时才 no-op），事件被错记到第 1 路。
+删掉它同时省掉一次无谓的每帧调用。
+
+> `VideoSession` 单例本身还在，但三张多路卡都不再走它 —— 现在只剩
+> `video_analysis_search` 的 `/source/*` 单路向导预览在用。
+
+### 音视频描述（vd）的多路化：判据端点跟着搬家
+
+vd 除了 `image_size` / `model_id`，还有两处 vtd 没有的东西：
+
+* `enabled_tools` 白名单（只允许 `tts_alert`）—— 前端 UI 已过滤，后端
+  `ALLOWED_TOOLS` 再卡一层是为了直接 curl 越权；
+* `/tools` 与 `/available-vision-sizes` 两个页面独有端点（检测尺寸下拉框的数据
+  源）。这两条不进工厂，追加在同一个 router 上。
+
+**判据端点从 `/api/video/judge` 迁到 `/api/video-detection/judge`**：前者操作的
+是单例 `VideoSession` 上的判据，多路页走 `MultiChannelSession` —— 自管理解码
+循环的东西，配置就得落到自己这边。`FrameJudge.mount()` 必须显式传
+`apiBase`，否则会静默去够那个已经没人写的单例。
+
+前端还有两个只有 vd 才有的坑：
+
+* **源框是 `#vd-sources`（复数）**，但页面下方的「音轨分析」读的是同一段文本的
+  **第 1 路**（`readVdSources()[0]`）—— 音轨分析吃一路，不是 N 路。
+* 判据下拉里 `gscore` 是默认选中（判帧算法 = 按画面变化采样）。多路下判据器
+  **每路一个**，配置本身仍是服务级（配一次全路共用），逐路分数在
+  `session.channel_list[i].judge`。
+
+### 前端共享：`app/static/core/multi-grid.js` / `.css`
+
+宫格（建格 / 分列 / 每路单飞解码上屏 / 角标高亮）抽成共享组件，三张卡共用：
+`MultiGrid.{ensure,paint,status,reset,chNo}`，诊断计数在 `window.MultiGridDiag`。
+**事件列表刻意不进共享组件** —— vtl 是 bbox、vd 是长文本描述，渲染策略差太远。
+
+三个约定：
+
+* `MultiGrid.paint(container, idx, src, overlay)` 的 `src` 既可以是 JPEG 字节，
+  也可以**已经是可绘制对象**（canvas / ImageBitmap）。后者给「冻结当前画面」用：
+  帧此刻就在 canvas 上，再走一遍编解码纯属浪费，还会掉画质。`overlay(ctx, tile)`
+  在画完帧之后同步调用，让卡片把自己的标注叠上去。
+* 通道号对外一律 1 基（`chNo`），内部 idx 是 0 基。
+* **宫格 div 自己就是 `.vd-stage`**（`class="vd-stage vd-grid"`），不是套在
+  stage 里面。`.vd-stage` 的 16:9 是给单 canvas 的尺寸基准；宫格要靠它给出确定
+  高度，再用 `grid-auto-rows:1fr` 撑满行。提示层（`.vd-overlay`）要放在宫格
+  **内部** —— absolute 不参与网格布局，`inset:0` 正好罩住画面。
+
+### vtl 的「命中定格」：就地快照，不等新图
+
+事件到达时把该路 tile canvas 的像素拷进离屏 canvas，定格 2s，期间的重绘就是
+**反复重贴这张快照 + 叠 bbox**（浏览器渲染管线会把长期不写入的 canvas 降级）。
+
+两个不能省的细节：
+
+* **多路必须按路冻结**。用一份全局冻结态会把所有画面按在同一张旧帧上，看起来
+  就是「整个画面卡住不动」。
+* **不能等一张新图**。grounding 事件的 `frame_b64` 是**空的** ——
+  `_build_grounding_event` 明确去掉了整帧编码（worker_loop 里每事件多编一次要
+  30~100ms），只留 `crop_b64`。所以冻结源只能是画面本身。
+* bbox 坐标在**送检帧**（448×252）空间，画布是**显示尺寸**（960 或 384 宽），
+  必须按 `canvas 实测尺寸 / frame_w·frame_h` 换算，否则框会挤到左上角。
+
+### 向导搬画面：容器 id 必须显式声明
+
+向导按 `open_source_button` 去掉 `-open` 加 `-canvas` 推导画面容器 id。多路卡
+的画面是**宫格 div**（`vtd-grid` / `vtl-grid` / `vd-grid`）而不是 canvas，
+推导出的 `*-canvas` 根本不存在 —— 向导会把画面搬进面板这件事**静默失败**
+（不报错，只是什么都不发生）。所以 `wizard.json` 支持顶层 `canvas_id` 显式
+声明，推导只作单路老卡片的兜底。
+
+同源的另一个坑：`isSource` 的正则是 `/-source$/`，而 vtd 的字段叫
+**`vtd-sources`（复数）**，匹配不上时整个「浏览 + 打开/关闭」按钮行都不渲染。
+现在是 `/-sources?$/`。textarea 也必须给浏览按钮 —— `FSModal._commit` 对
+textarea 是**追加一行**（选一个文件 = 往源列表加一路），正是多路想要的。
+
+### 向导的视频源字段必须显式 `"type": "textarea"`
+
+页面上是 `<textarea id="xxx-sources">`，**不等于**向导里也是多行框 ——
+`wizard.json` 的字段不写 `"type": "textarea"`，`state.js` 就按默认分支渲染成
+**单行 `<input>`**。后果：向导里回车即提交，**一次只能填一路**，且没有任何
+报错（浏览 / 打开 / 关闭按钮全都正常渲染，红不了任何断言）。
+
+vtl 就踩过这个：字段声明还停留在单路时代的 `{ "id": "vtl-source",
+"label": "视频源 URL / 路径" }`。同一份 `wizard.json` 里 vtd / vd 都带
+`"type": "textarea"`，只有它漏了 —— 肉眼扫三张卡的字段几乎看不出差别，
+只有真去填多路才会撞上。
+
+三张卡现在必须逐字对齐（改一张就核另外两张）：
+
+| 卡 | `canvas_id` | 字段 id | type |
+|---|---|---|---|
+| vtd | `vtd-grid` | `vtd-sources` | `textarea` |
+| vtl | `vtl-grid` | `vtl-sources` | `textarea` |
+| vd  | `vd-grid`  | `vd-sources`  | `textarea` |
+
+字段 id 也用复数：单数 `vtl-source` 配多行 textarea 是自相矛盾的写法，而
+下一个读代码的人正是靠 id 判断"这是一路还是 N 路"（vd 页内的音轨分析就是
+靠这个区分取第 1 路 vs 全部）。
+
+**验收别只看"渲染成 textarea"** —— 那只是必要条件。要真的往向导字段里填
+4 行、点向导的「打开」、确认宫格出 4 格。`scripts/verify_frame_judge_ui.py`
+只填了一路，所以红不了这个 bug。
 
 ### 线程模型
 
@@ -579,7 +708,7 @@ VAS 另有一个二值的「自动判帧」。现在**只有一份实现**:
 |---|---|
 | 算法原语 | `wdnav.scene`（RGA NV12-Y 缩略图 + 可注册度量） |
 | 判据策略 | `app/core/video/frame_judge.py`（模式 / 阈值 / 兜底间隔 / 分数环形缓冲） |
-| vd·vtd·vtl 接线 | `app/core/video/session.py`（三者共用 `VideoSession` 单例，判据也只有一份） |
+| vd·vtd·vtl 接线 | 三张卡都 → `app/core/video/multi_session.py`（按 key `"vd"` / `"vtd"` / `"vtl"` 注册的多路会话）。判据实现在 `frame_judge.py` 一份，每路各持一个 `FrameJudge` |
 | VAS 接线 | `app/apps/video_analysis_search/service.py`（自管理 decode 循环，判据挂在它自己身上） |
 | HTTP | `app/core/video/api.py` → `/api/video/judge*`（三张卡共用）；VAS 走 `/api/video-analysis-search/judge*` |
 | 前端 | `app/static/core/frame-judge.{js,css}`，四张卡各 mount 一个实例（按 prefix 索引） |
@@ -891,8 +1020,9 @@ conc · 阈值 10.00 · 实际每 18.0 帧送检 · 兜底 300 帧形同虚设  
 并按 3 参重试 —— 判据分数是附加信息,不该因为它让别人的 sink 失效。
 
 渲染放在共享组件 `FrameJudge.scoreSpan(prefix, ev)` 而不是各卡各写一遍:
-vd / vtd / vtl **共用同一份判据**,只给一张卡显示分数、另两张不显示,用户
-看到同样的配置却拿到不同信息,比不显示更难排查。回归:
+vd / vtd / vtl **共用同一份判据实现**（各自端点、同一份 `frame_judge.py`，
+每路各持一个判据器），**三张卡都要显示分数** —— 只给一张卡显示、另两张不
+显示的话，用户看到同样的配置却拿到不同信息，比不显示更难排查。回归:
 `scripts/verify_event_judge_score.py`(7/7,不依赖 NPU —— 真端到端要算力实例)。
 
 **API 层三条踩过的坑**(都在 `app/core/video/api.py::set_judge`，改这块必读):
@@ -4952,11 +5082,17 @@ rebase 合入上游判据特性后，vtd 页的判据 UI 曾是**控件在、后
 
 ### 端点挂本卡，不共用 /api/video/judge
 
-`/api/video/judge` 操作的是单例 `VideoSession`（vd / vtl 共用），本页走
-`MultiChannelSession`，所以判据端点挂在
-`/api/video-target-detection/judge{,/metrics,/reset}`。理由与 VAS 一致：
+`/api/video/judge` 操作的是单例 `VideoSession`，vtd / vtl / vd 三张多路卡走
+`MultiChannelSession`，所以判据端点分别挂在
+`/api/video-target-detection/judge{,/metrics,/reset}`、
+`/api/video-target-localization/judge*`、
+`/api/video-detection/judge*`。理由与 VAS 一致：
 **自管理解码循环的东西，配置就得落到自己的服务上。** 前端
 `FrameJudge.mount({apiBase})` 指向本卡端点，其余卡片共用同一套组件。
+
+> `FrameJudge.mount()` 的 `canvasId` 要指向**画面容器元素**。多路宫格里没有
+> 单一 canvas，锚在 grid 上（`GRID_EL`）才对。锚一个不存在的 id 不会报错 ——
+> `sync()` 取不到矩形就永远 `hide()`，表现是判据角标和曲线**静默不出现**。
 
 ### 默认 mode = gscore（与单路一致）
 
