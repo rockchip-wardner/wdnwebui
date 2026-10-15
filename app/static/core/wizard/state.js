@@ -21,6 +21,17 @@
     return el;
   }
 
+  /** 字段 id 是否是「视频源」——决定是否自动加浏览/打开/关闭按钮。
+   *
+   *  **必须同时接受 `-source` 与 `-sources`**：多路卡字段是复数。这个判定
+   *  在 `_renderFormStep` 出现两次（inline 循环开关 / 加浏览按钮），各写一份
+   *  正则就一定漏改一处，而漏改是**静默少一个控件** —— 按钮照常渲染，红不了
+   *  任何断言。改判定请改这里，不要就地写正则。
+   */
+  function _isSourceFieldId(id) {
+    return /-sources?$/.test(id || "");
+  }
+
   // ------------------------------------------------------------------ #
   // localStorage 持久化
   // ------------------------------------------------------------------ #
@@ -310,10 +321,10 @@
     body.appendChild(form);
 
     // 找出"会被 inline 进 source 行"的 loop toggle(同 stepDef 内 -loop
-    // 字段),避免后续 forEach 重复渲染
+    // 字段),避免后续 forEach 重复渲染。判定走 _isSourceFieldId。
     const inlineLoopFieldId = (() => {
       const hasSource = (stepDef.fields || []).some(f =>
-        f.type !== "checkbox" && /-source$/.test(f.id));
+        f.type !== "checkbox" && _isSourceFieldId(f.id));
       if (!hasSource) return null;
       const loopField = (stepDef.fields || []).find(f =>
         f.type === "checkbox" && /-loop$/.test(f.id));
@@ -460,19 +471,14 @@
       //   FSModal._commit 对 textarea 是**追加一行**不是整体替换，选一个
       //   文件就是往源列表加一路。此前把 textarea 排除在外，等于多路卡的
       //   向导里浏览按钮直接消失。
-      // * 正则结尾允许复数 `/-sources?$/` —— 三张卡的字段都是 `xxx-sources`，
-      //   只认 `-source` 时整个按钮行都不渲染。
+      // * 复数结尾 —— 见 _isSourceFieldId。
       const isSource = field.type !== "number"
           && field.type !== "checkbox" && field.type !== "select"
-          && /-sources?$/.test(field.id);
+          && _isSourceFieldId(field.id);
       if (isSource && window.VdFsModal) {
         const row = _ce("div", WIZARD_NS + "input-row");
-        // textarea 占满整行（塞进 input-row 会被压成一行宽），按钮行排在它下面。
+        // textarea 占满整行，按钮行排在它下面（塞进同一行会被压成一行宽）。
         (field.type === "textarea" ? wrap : row).appendChild(el);
-        if (inlineLoopFieldId) {
-          const loopField = (stepDef.fields || []).find(f => f.id === inlineLoopFieldId);
-          if (loopField) row.appendChild(_buildToggle(loopField, state));
-        }
         const browseBtn = _ce("button", WIZARD_NS + "browse-btn", "浏览…");
         browseBtn.type = "button";
         browseBtn.title = "选择本地文件或目录";
@@ -486,7 +492,7 @@
         });
         row.appendChild(browseBtn);
         wrap.appendChild(row);
-        // 视频源下方追加"打开 / 关闭"按钮行(wizard.json 的 open_source_button
+        // 视频源下方追加"打开 / 关闭"按钮(wizard.json 的 open_source_button
         // 字段声明应用页面对应的按钮 id;close 按钮 id 按 "*-open → *-close"
         // 约定推断,避免每个 wizard.json 多写一份)。按钮 click 走应用页面
         // 原生按钮(应用页面打开按钮已经把 wizard 的 source/loop 写回 +
@@ -509,17 +515,18 @@
           // 直接挪到 wizard 容器内,后续 ws callback 通过 getElementById 仍能
           // 找到它(节点对象没变,只是父节点换了)— 不重写 ws 推帧逻辑。
           // 画面容器 id：默认按 open_source_button 去掉 -open 加 -canvas 推导。
-          // 多路卡（vtd / vtl / vas）的画面是宫格 div 而不是 canvas，推导出的
+          // 多路卡（vtd / vtl / vd）的画面是宫格 div 而不是 canvas，推导出的
           // `*-canvas` 根本不存在 → 画面永远搬不进向导面板（而且不报错，
           // 静默地什么都不发生）。所以允许 wizard.json 用 `canvas_id` 显式
           // 声明，推导只作为单路老卡片的兜底。
           const canvasId = cfg.canvas_id
             || cfg.open_source_button.replace(/-open$/, "-canvas");
-          // canvas-wrap 容器预先创建,放在 actions-row 后面,
-          // 这样点"打开"搬 canvas 时位置确定;canvasWrap 引用由闭包共享
+          // 「浏览 / 打开 / 关闭」合并进同一个 row —— 与应用页面的按钮行同款。
+          // 原先浏览一行、打开/关闭另一行，中间还留上下边距，读起来像两组
+          // 不相干的控件。canvas-wrap 仍挂在 wrap 上，排在按钮行下方。
+          row.appendChild(actions);
           const canvasWrap = _ce("div", WIZARD_NS + "canvas-wrap");
-          wrap.appendChild(actions);     // 先 actions
-          wrap.appendChild(canvasWrap); // 再 canvas,贴"打开 / 关闭"下方
+          wrap.appendChild(canvasWrap);
 
           // 没播放时:显示拖放区(若 cfg.upload_endpoint 声明了上传端点)
           // 拖动视频文件到此处 → POST 上传 → 把 server 路径写到 source
@@ -626,10 +633,11 @@
           const moveCanvasToWizard = () => {
             const canvas = document.getElementById(canvasId);
             if (!canvas || canvas.parentNode === canvasWrap) return;
-            // 搬之前先记下 canvas 的原 parent,unmount() 时搬回 — 否则
-            // wizard 容器销毁时(已被 move 进去的 canvas 一并销毁)会导致
-            // 应用页面视频画面变黑(后端仍在解码 + ws 仍在推帧)。
+            // 记下原 parent **和它后面的兄弟**，unmount() 据此按原位搬回
+            // （appendChild 只能还原到末尾，见 _restoreCanvas）。不记的话
+            // wizard 容器销毁会带走 canvas，应用页画面变黑。
             const originalParent = canvas.parentNode;
+            const nextSibling = canvas.nextSibling;
             // 把 canvas 搬到 wrap 顶部,移除拖放区
             canvasWrap.appendChild(canvas);
             // 占位元素一律清掉 —— 画面已经在播了,「点击打开开始播放」还
@@ -642,11 +650,12 @@
             if (noUp && noUp.parentNode === canvasWrap) {
               canvasWrap.removeChild(noUp);
             }
-            // 记录到 _active,unmount() 时还原。
-            // (同一 canvas 多次 move 时,以最近一次的 originalParent 为准 —
-            // 但实际上 moveCanvasToWizard 已被 early-return 守过,只走一次)
-            if (_active) {
-              _active.movedCanvas = { canvas, originalParent };
+            // 记录到 _active,unmount() 时按原位还原。
+            // **只记第一次**：切到后面几步再切回来时 body 会重渲染出新的
+            // canvasWrap，画面还挂在旧的、已脱离文档的 wrap 上，此时覆盖
+            // 记录会让 unmount 把画面还原进那个废弃的 wrap，应用页再无画面。
+            if (_active && !_active.movedCanvas) {
+              _active.movedCanvas = { canvas, originalParent, nextSibling };
             }
           };
           openBtn.addEventListener("click", () => {
@@ -671,29 +680,34 @@
           closeBtn.addEventListener("click", () => {
             try {
               document.getElementById(closeId)?.click();
-              // 把 canvas 搬回 page section,让应用页面再次显式拥有
-              const canvas = document.getElementById(canvasId);
-              // app 只能从 state 上取:本函数签名是 (body, foot, cfg, stepDef,
-              // state),闭包里**没有** app 这个变量。此前这里写裸 `app.id`,
-              // 一进 handler 就 ReferenceError,被 catch 吞成一条 warn ——
-              // 表现为「关闭」点了没反应、canvas 永远留在向导里(7 张带向导
-              // 的卡全中)。修好后 console 里不再出现这条 warn。
-              const pageSection = document.getElementById("page-" + state.app.id);
-              if (canvas && pageSection) {
-                const stage = pageSection.querySelector(".vd-stage, .vtd-stage, .vtl-stage")
-                  || pageSection;
-                stage.insertBefore(canvas, stage.firstChild);
-              }
+              // 与 unmount 共用 _restoreCanvas。原先这里另写了一套（现查
+              // .vd-stage 再插到最前），对多路卡是错的：画面已搬进向导、
+              // 根本不在 pageSection 里，querySelector 落空后退化成把画面
+              // 塞成 page 的第一个子元素；没点过「打开」时更是无条件把它从
+              // .vd-stage-col 拽走。
+              // 另：本函数签名是 (body, foot, cfg, stepDef, state)，闭包里
+              // 没有 app —— 此前写裸 `app.id` 一进 handler 就 ReferenceError，
+              // 被 catch 吞成 warn，表现为「关闭」点了没反应。
+              if (_active) _restoreCanvas(_active.movedCanvas);
             } catch (e) {
               console.warn("[wizard-state] close failed:", e);
             }
           });
           actions.appendChild(openBtn);
           actions.appendChild(closeBtn);
-          // wrap.appendChild(actions) 已经在 line 380 处先于 canvasWrap 调过;
-          // 这里不再重复(appendChild 移动语义在同父节点下是 no-op,但代码重复)
+        }
+        // 循环播放开关**追加在按钮行末尾**（浏览 / 打开 / 关闭 之后），与
+        // 应用页面同款顺序。放在 B 之外、B 之后：既要排在 actions 后面，
+        // 又要在没有 open_source_button 的卡上照样出现。
+        if (inlineLoopFieldId) {
+          const loopField = (stepDef.fields || []).find(f => f.id === inlineLoopFieldId);
+          if (loopField) row.appendChild(_buildToggle(loopField, state));
         }
       } else {
+        // **非视频源字段**（判据算法 / 阈值 / 帧间隔、检索问题…）走这里。
+        // 这个 else 归属的是外层 `if (isSource && …)` 而不是
+        // `if (cfg.open_source_button)` —— 挂错的话这些字段会被创建却
+        // 永远不进 DOM：不报错、元素在、页面上就是没有。
         wrap.appendChild(el);
       }
       form.appendChild(wrap);
@@ -872,8 +886,6 @@
   // Finish — applyWizardSnapshot + wait for models running
   // ------------------------------------------------------------------ #
   async function _finish(state) {
-    window._dbg_finish_called = (window._dbg_finish_called || 0) + 1;
-    window._dbg_finish_state = state ? "alive" : "null";
     const { app, cfg } = state;
     _captureValues(cfg, state);
 
@@ -887,14 +899,14 @@
         opts[_fieldKey(app.id, f)] = v;
       });
     });
-    // debug hook
+    // 调试契约：scripts/test_wizard_vd.py 与 verify_wizard_upload_e2e.py
+    // 直接读 window._wd_wizard_opts 断言 finish 构造出的 opts，别删。
     try {
       window._wd_wizard_opts = JSON.parse(JSON.stringify(opts));
       window._wd_wizard_steps_count = cfg.steps.length;
       window._wd_wizard_state_values = JSON.parse(JSON.stringify(state.values));
       window._wd_wizard_cfg_first_step = JSON.stringify(cfg.steps[0]).slice(0, 200);
       window._wd_wizard_cfg_source = JSON.stringify(cfg.steps.find(s => s.id === "source") || {}).slice(0, 500);
-      window._dbg_finish_opts_keys = Object.keys(opts);
     } catch (_) {}
 
     // 2. wait for models running (if swcap_to_model 声明了)
@@ -1133,23 +1145,43 @@
     } catch (_) {}
   }
 
+  /**
+   * 把画面搬回应用页的**原位**，而不是"搬回原来的父节点"。
+   *
+   * 只记 parent 的话还原只能 appendChild —— 那会插到父节点末尾。多路卡的
+   * 画面容器自己就是 .vd-stage，.vd-stage-col 里它后面还排着「视频源 /
+   * 判据 / 控制」几段，于是回到应用页就是「播放器掉到源配置框下面」。
+   *
+   * @param {{canvas:HTMLElement, originalParent:HTMLElement,
+   *          nextSibling:Node|null}|null} mc moveCanvasToWizard 的记录
+   */
+  function _restoreCanvas(mc) {
+    if (!mc || !mc.canvas || !mc.originalParent) return;
+    const { canvas, originalParent, nextSibling } = mc;
+    // 停留向导期间用户切过页，原 parent 可能已随页面卸载 —— 无处可放，
+    // 后端会自然停，不必抢救。
+    if (!originalParent.isConnected) return;
+    try {
+      // nextSibling 指向的节点可能已被重渲染带走（此时已不是 parent 的孩子），
+      // insertBefore 会抛 NotFoundError，退回末尾兜底。
+      if (nextSibling && nextSibling.parentNode === originalParent) {
+        originalParent.insertBefore(canvas, nextSibling);
+      } else {
+        originalParent.appendChild(canvas);
+      }
+    } catch (e) {
+      // parent 已不在 DOM(用户切了 page)— 忽略,后端会自然停
+    }
+  }
+
   function unmount(silent) {
     if (!_active) return;
     const { app, container, intervals, _onNavAway, movedCanvas } = _active;
     intervals.forEach(clearInterval);
     if (_onNavAway) window.removeEventListener("hashchange", _onNavAway);
-    // 还原被 move 进 canvas-wrap 的 canvas 元素 — 否则 wizard 容器销毁
-    // 时会一并删掉 canvas,应用页 video 区域变黑(后端解码 + ws 推帧都
-    // 还在继续,只是 drawVdFrame / drawVtlFrame 找不到 canvas 了)。
-    // 原 parent 通常是 page section 里的 <div class="vd-stage">,append
-    // 回去即可(wizard 已 unmount,canvasWrap 即将被销毁)。
-    if (movedCanvas && movedCanvas.canvas && movedCanvas.originalParent) {
-      try {
-        movedCanvas.originalParent.appendChild(movedCanvas.canvas);
-      } catch (e) {
-        // parent 已不在 DOM(用户切了 page)— 忽略,后端会自然停
-      }
-    }
+    // 还原被 move 进 canvas-wrap 的画面元素。不还原的话 wizard 容器销毁会
+    // 一并带走它，应用页画面变黑（后端解码 + ws 推帧都还在继续）。
+    _restoreCanvas(movedCanvas);
     // 彻底移除 wizard DOM(下次 mount 重建,避免残留 class)
     if (container && container.parentNode) {
       container.parentNode.removeChild(container);

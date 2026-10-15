@@ -258,12 +258,18 @@
   border-color: #9ca3af;
 }
 
-/* 视频源 actions row(打开 / 关闭)— 紧贴 input-row 下方,左对齐 */
+/* 视频源按钮组（打开 / 关闭）。行内 gap 与对齐由 .wd-wizard-input-row 给，
+   flex-shrink 与同行的浏览按钮一致，防止窄屏时按钮组被压扁。 */
 .wd-wizard-source-actions {
   display: flex;
   gap: 8px;
-  margin-top: 8px;
   align-items: center;
+  flex-shrink: 0;
+}
+/* 循环播放开关排在行末，左边距把它和「关闭」分开。 */
+.wd-wizard-input-row > .wd-wizard-toggle {
+  margin-left: 4px;
+  align-self: center;
 }
 .wd-wizard-source-action-btn {
   background: #ffffff;
