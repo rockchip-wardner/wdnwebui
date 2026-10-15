@@ -26,55 +26,16 @@ from app.apps.video_detection.api import router
 LOG = __import__("logging").getLogger("apps.video_detection")
 
 
-# Module-level handle so register_shutdown() can remove the same sink
-# we registered here. The video session singleton outlives the card's
-# shutdown callback, so leaving the sink registered would keep firing
-# on every decoded frame after the detector is closed.
-_VIDEO_DETECTION_FRAME_SINK = None
-
-
-def _make_video_detection_sink():
-    """Return a frame sink ``(frame, frame_pos, frame_b64, judge_score) -> None``
-    that forwards each decoded BGR frame into the VD detector's
-    ``submit_frame`` queue. The detector itself decides whether to drop
-    the frame (when ``_enabled`` is False) and which Nth one to keep
-    (via ``every_n``), so the sink is always-on and cheap.
-
-    ``judge_score`` 是判据在这一帧上的分数，随事件一起落到事件历史 ——
-    没有它就分不清"这条事件是阈值触发的还是兜底触发的"。
-    """
-    from app.core.llm.detector_base import get_detector
-
-    def _sink(frame, frame_pos, frame_b64, judge_score=None):
-        try:
-            get_detector().submit_frame(frame, frame_pos, frame_b64,
-                                        judge_score=judge_score)
-        except Exception as e:  # noqa: BLE001
-            LOG.debug(
-                "video_detection: frame sink raised: %s: %s",
-                type(e).__name__, e,
-            )
-    return _sink
-
-
 def register_api(app: FastAPI) -> None:
     """Mount the card's FastAPI router at ``/api/video-detection``.
 
-    Also:
-      * registers the ``tts_alert`` @Callable tool with the central
-        tool registry. Each card owns its own tools (zero-coupling rule).
-      * wires the VD detector as a frame sink on the shared
-        ``VideoSession`` singleton so every decoded BGR frame is offered
-        to it. This is the link between playback and inference — without
-        it the detector worker thread idles forever because no frames
-        ever arrive in its queue (root cause of the v0.4 regression
-        reported as "启动检测 → 模型未推理"). The sink is a closure
-        over ``get_detector()`` so the detector singleton is resolved
-        lazily on first frame (avoids re-entrancy if ``register_api``
-        is called before ``app.core.llm.detector_base`` is fully
-        imported).
+    Also registers the ``tts_alert`` @Callable tool with the central tool
+    registry. Each card owns its own tools (zero-coupling rule).
+
+    **这里不再把 detector 挂成 ``VideoSession`` 的 frame sink** —— 多路会话
+    自带帧源（见 api.py 模块 docstring），挂在 ``VideoSession`` 上的 sink
+    永远不会被触发，留着只会让人以为"帧是这么喂进去的"。
     """
-    global _VIDEO_DETECTION_FRAME_SINK
     app.include_router(router, prefix="/api/video-detection")
     LOG.info("video_detection: API mounted at /api/video-detection")
     try:
@@ -87,14 +48,6 @@ def register_api(app: FastAPI) -> None:
         LOG.info("video_detection: registered tool 'tts_alert'")
     except Exception as e:
         LOG.warning("video_detection: tts_alert registration failed: %s", e)
-    # Frame sink wiring — see docstring.
-    try:
-        from app.core.video.session import get_session
-        _VIDEO_DETECTION_FRAME_SINK = _make_video_detection_sink()
-        get_session().add_frame_sink(_VIDEO_DETECTION_FRAME_SINK)
-        LOG.info("video_detection: detector registered as video_session frame sink")
-    except Exception as e:
-        LOG.warning("video_detection: frame sink registration failed: %s", e)
 
 
 def register_shutdown() -> None:
@@ -103,7 +56,6 @@ def register_shutdown() -> None:
     Best-effort: each cleanup call is wrapped in try/except so a single
     card's failure does not break the rest of the shutdown sequence.
     """
-    global _VIDEO_DETECTION_FRAME_SINK
     import importlib
     import traceback
     cleanup_targets = []
@@ -128,16 +80,3 @@ def register_shutdown() -> None:
                 except Exception:
                     LOG.warning("video_detection: %s.%s failed", mod.__name__, attr)
                     LOG.debug("%s", traceback.format_exc())
-    # Drop the frame sink we registered in register_api(). The
-    # VideoSession singleton outlives this card's shutdown, so without
-    # this remove, the sink would keep firing on every decoded frame
-    # after the detector is closed (LOG.debug spam, no functional harm
-    # since submit_frame is a no-op when _enabled is False, but cleaner
-    # to detach explicitly).
-    if _VIDEO_DETECTION_FRAME_SINK is not None:
-        try:
-            from app.core.video.session import get_session
-            get_session().remove_frame_sink(_VIDEO_DETECTION_FRAME_SINK)
-        except Exception:
-            LOG.debug("video_detection: remove_frame_sink failed", exc_info=True)
-        _VIDEO_DETECTION_FRAME_SINK = None

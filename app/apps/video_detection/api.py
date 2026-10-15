@@ -1,168 +1,75 @@
-"""Video detection endpoints: REST control + WebSocket frame stream."""
+"""音视频描述 endpoints —— 这张卡的特有部分。
+
+共用的 REST / WS 端点由 :func:`app.core.video.multi_api.build_multi_router`
+生成；这里只留下三样卡片特有的东西：
+
+* detector 单例 :func:`get_detector` —— ``VLMDoc`` **自由文本**描述 + 可选
+  ``tts_alert`` 语音提醒。vtd / vtl 走的是结构化输出（``TargetDoc`` /
+  ``LocatorDoc``），本页不要 bbox，所以工具集合是页面独有的。
+* :func:`_parse_prompt` —— ``enabled_tools`` 白名单 + ``image_size``
+  （下拉框来自 ``/available-vision-sizes``）+ ``model_id``。
+* ``/tools`` 与 ``/available-vision-sizes`` 两个页面独有端点。
+
+**送检尺寸不设死**：与 vtd 同口径走 ``derive_inference_size``（按源算，
+720p → 640），只有 vtl 因为 LocateAnything 硬编码 448 才固定。多路不比
+单路更该在尺寸上将就 —— 送检尺寸决定 VLM 选哪个 vision 变体，送 384 就是
+掉进便宜档换精度降档。
+
+帧怎么到 detector：``MultiChannelSession`` 自带帧源，工厂在 ``POST /prompt``
+里 ``attach_detector`` + ``start_round_robin()``，轮转线程逐路取当前帧提交
+（不再经由 ``VideoSession`` 的 frame sink）。
+"""
 from __future__ import annotations
 
-import asyncio
-import queue
-import shutil
-from pathlib import Path
-
-from fastapi import (
-    APIRouter,
-    File,
-    HTTPException,
-    UploadFile,
-    WebSocket,
-    WebSocketDisconnect,
-)
+from fastapi import HTTPException
 
 from app.core.llm.detector_base import get_detector
-from app.core.config import default_resource_root
-from app.core.video.session import get_session
+from app.core.video.multi_api import MultiCardSpec, PromptPlan, build_multi_router
+from app.core.video.multi_session import MultiChannelSession, get_multi_session
 
-
-router = APIRouter(tags=["video-detection"])
+# 会话单例按卡隔离：vtd / vtl 各自一个 key。共用同一个 key 时，另一张卡的
+# open() 会 close 掉本卡的解码器，表现为「切回上一页画面全黑」。
+SESSION_KEY = "vd"
 
 # 音视频描述页只允许「语音提醒」工具。其他工具即便注册表里有也不
 # 在这里暴露 —— 该页面是面向「描述+提醒」场景的固定工具集。
 ALLOWED_TOOLS = ("tts_alert",)
 
-# 向导模式拖放上传的视频文件落地目录 — 三个视频 app 共用同一目录
-# ``<resource_dir>/uploads``(设备端 ``/userdata/assets/uploads``,off-device
-# ``<HOME>/assets/uploads``)。不再按 app id 分目录,避免每个 app 重复上传
-# 同一份视频占盘;同名文件直接覆盖(``open("wb")`` 截断写)。
-# 路径解析走 :func:`app.core.config.default_resource_root`,
-# 与 ``base.resource_dir`` 写盘真值一致 —— 改前者时这里自动跟着变。
-# mkdir 容错:read-only fs / 权限不够时跳过,首次写文件时再报错。
-UPLOAD_DIR = default_resource_root() / "uploads"
-try:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-except OSError:
-    pass
+
+def _session() -> MultiChannelSession:
+    return get_multi_session(SESSION_KEY)
 
 
-@router.get("/")
-async def get_video_detection() -> dict:
-    return get_session().snapshot()
+def _parse_prompt(payload: dict) -> PromptPlan:
+    """解析 ``POST /prompt`` 的 body。
 
+    ``{prompt: str, every_n: int, enabled_tools: list[str],
+      image_size: int | None, model_id: str | None,
+      rr_interval: float | None}``
 
-# 注:设备端文件浏览 endpoint 已 v0.4 抽出到 ``app/system/api/fs_browser.py``
-# (全局 /api/fs),由 ``window.FSModal`` 模态共用。VD 之前单独的
-# /api/video-detection/fs 已废弃,前端走 /api/fs。
+    ``enabled_tools`` 先校验是 list，再按 :data:`ALLOWED_TOOLS` 过滤 ——
+    前端 UI 已按白名单过滤，这里再卡一层是为了直接 curl 越权。
 
+    ``image_size`` 缺省 / ``None`` = 按帧自动选最近的 vision 变体（保留
+    legacy 行为）；``model_id`` 缺省 / 空串 = auto-pick。
 
-@router.post("/upload")
-async def upload_video(file: UploadFile = File(...)) -> dict:
-    """向导模式拖放上传 → 写到 ``UPLOAD_DIR``(三个 app 共用)。
-
-    同名文件直接覆盖(``open("wb")`` 截断写)—— 不再生成 UUID 后缀,
-    避免每个 app 重复上传同一份视频占盘。``file.filename`` 先经
-    ``Path(...).name`` 规整,剥掉路径穿越成分,只保留 basename;缺扩展名
-    时补 ``.bin``。
-    """
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="empty filename")
-    safe_name = Path(file.filename).name
-    if not safe_name:
-        raise HTTPException(status_code=400, detail="invalid filename")
-    if not Path(safe_name).suffix:
-        safe_name = safe_name + ".bin"
-    dest = UPLOAD_DIR / safe_name
-    try:
-        # 同名覆盖: 先 unlink 再 open("wb"),避免目标文件由其他用户/不可写
-        # 拥有时 ``open("wb")`` 因需 inode 上的写权限而失败
-        # (PermissionError: [Errno 13]);unlink 走的是目录级写权限,与
-        # 新建文件一致。missing_ok=True 容忍首次上传时目标不存在。
-        try:
-            dest.unlink()
-        except FileNotFoundError:
-            pass
-        with dest.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"write failed: {e}")
-    finally:
-        try:
-            file.file.close()
-        except Exception:
-            pass
-    return {
-        "path": str(dest),
-        "name": file.filename,
-        "size": dest.stat().st_size,
-    }
-
-
-@router.post("/open")
-async def open_source(payload: dict) -> dict:
-    source = (payload or {}).get("source")
-    if not source or not isinstance(source, str):
-        raise HTTPException(status_code=400, detail="source required")
-    loop = bool((payload or {}).get("loop", False))
-    try:
-        return get_session().open(source, loop=loop)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/control")
-async def control(payload: dict) -> dict:
-    action = (payload or {}).get("action")
-    if action == "play":
-        return get_session().play()
-    if action == "pause":
-        return get_session().pause()
-    if action == "stop":
-        return get_session().close()
-    raise HTTPException(status_code=400, detail=f"unknown action: {action!r}")
-
-
-@router.post("/close")
-async def close_source() -> dict:
-    return get_session().close()
-
-
-# --------------------------------------------------------------------- #
-# wdnai VLM detection                                                     #
-# --------------------------------------------------------------------- #
-@router.get("/prompt")
-async def get_prompt() -> dict:
-    return get_detector().snapshot()
-
-
-@router.post("/prompt")
-async def set_prompt(payload: dict) -> dict:
-    """Start (or update) VLM detection.
-
-    Body: ``{prompt: str, every_n: int, enabled_tools: list[str],
-            image_size: int | None, model_id: str | None}``
-    — ``prompt`` 必填；``enabled_tools`` 可选，默认 ``[]``，每一项
-    必须是 ``/api/video-detection/tools`` 返回的合法 ``key``；
-    ``image_size`` 可选，指定视觉模型目标尺寸（必须由
-    ``/api/video-detection/available-vision-sizes`` 返回的合法值之
-    一；缺省 / ``None`` = 按帧自动选最近的变体，保留 legacy 行为）；
-    ``model_id`` 可选，从前端下拉框选的 ``swcap_video_describe``
-    实例 id（不传 / 空 = 走 ``get_session`` 的本机优先 auto-pick，
-    与旧行为一致）。
+    ``every_n`` 是遗留字段：多路下由轮转调度器承担节流，工厂锁死为 1。
+    这里仍解析它，但**只用于**老前端没传 ``rr_interval`` 时当「秒/路」
+    解读（页面既有语义），且不做 ``>=1`` 校验 —— 否则前端合法的 0
+    （轮转间隔 0 秒）会被误判非法直接 400。
     """
     payload = payload or {}
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt 不能为空")
-    try:
-        every_n = int(payload.get("every_n", 30))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="every_n 必须为整数")
-    if every_n < 1:
-        raise HTTPException(status_code=400, detail="every_n 必须 >= 1")
-    enabled_tools = payload.get("enabled_tools") or []
-    if not isinstance(enabled_tools, list):
+
+    raw_tools = payload.get("enabled_tools") or []
+    if not isinstance(raw_tools, list):
         raise HTTPException(status_code=400, detail="enabled_tools 必须是列表")
-    # 后端兜底：仅允许白名单内的工具，丢弃其他项。前端 UI 已经按
-    # ``ALLOWED_TOOLS`` 过滤；这里再卡一层避免直接 curl 越权。
-    enabled_tools = [k for k in enabled_tools if k in ALLOWED_TOOLS]
-    # image_size 解析：可选字段，缺省 / ``None`` → auto-pick；非法
-    # 类型 / 不在合法列表 → 400（detector ``start()`` 内部也校验，
-    # 这里提前到 HTTP 层是为了返回更具体的错误消息）。
+    enabled_tools = [k for k in raw_tools if k in ALLOWED_TOOLS]
+
+    # 提前到 HTTP 层校验只是为了给出更具体的消息，合法性 detector.start()
+    # 内部还会再查一遍。
     raw_image_size = payload.get("image_size", None)
     image_size: int | None
     if raw_image_size is None:
@@ -174,7 +81,7 @@ async def set_prompt(payload: dict) -> dict:
         )
     else:
         image_size = raw_image_size
-    # model_id：前端下拉框选中值；None 或 "" 走 auto-pick。
+
     raw_model_id = payload.get("model_id", None)
     if raw_model_id is None or (isinstance(raw_model_id, str)
                                 and not raw_model_id.strip()):
@@ -186,15 +93,46 @@ async def set_prompt(payload: dict) -> dict:
         )
     else:
         model_id = raw_model_id
+
     try:
-        return get_detector().start(
-            prompt, every_n=every_n, enabled_tools=enabled_tools,
-            image_size=image_size, model_id=model_id,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        legacy_every_n = int(payload.get("every_n", 30) or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="every_n 必须为整数")
+
+    raw_interval = payload.get("rr_interval", None)
+    if raw_interval is None:
+        rr_interval = float(legacy_every_n)   # 老前端：every_n 即秒/路
+    else:
+        try:
+            rr_interval = float(raw_interval)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="rr_interval 必须是数字")
+
+    return PromptPlan(
+        start_kwargs={
+            "prompt": prompt,
+            "enabled_tools": enabled_tools,
+            "image_size": image_size,
+            "model_id": model_id,
+        },
+        rr_interval=rr_interval,
+    )
+
+
+router = build_multi_router(
+    MultiCardSpec(
+        session_getter=_session,
+        detector_getter=get_detector,
+        parse_prompt=_parse_prompt,
+    ),
+    tag="video-detection",
+)
+
+
+# --------------------------------------------------------------------- #
+# 本页独有端点                                                          #
+# --------------------------------------------------------------------- #
+# /upload 与其余会话 / 检测 / 诊断 / 判据 / WS 端点都由工厂提供。
 
 
 @router.get("/available-vision-sizes")
@@ -250,7 +188,7 @@ async def list_tools() -> dict:
 
     每条记录包含 ``key`` / ``name`` / ``description`` /
     ``requires_capability`` / ``available`` / ``reason`` / ``fields``。
-    该页只暴露 ``ALLOWED_TOOLS`` 集合里的工具（语音提醒）；其他工具
+    该页只暴露 :data:`ALLOWED_TOOLS` 集合里的工具（语音提醒）；其他工具
     注册在 ``app.services.tools.registry`` 里但不在这里展示。
     """
     from app.core.compute.registry import get_registry
@@ -283,123 +221,3 @@ async def list_tools() -> dict:
             ],
         })
     return {"tools": out}
-
-
-@router.post("/prompt/stop")
-async def stop_prompt() -> dict:
-    return get_detector().stop()
-
-
-@router.get("/events")
-async def list_events() -> dict:
-    det = get_detector()
-    return {
-        "snapshot": det.snapshot(),
-        "events": det.events(),
-        "latest": det.latest(),
-    }
-
-
-@router.post("/events/clear")
-async def clear_events() -> dict:
-    get_detector().clear()
-    return {"ok": True}
-
-
-# --------------------------------------------------------------------- #
-# 诊断端点 (v0.13): 暴露最近 N 次推理的诊断 trace                          #
-# --------------------------------------------------------------------- #
-# 与 ``/api/video-target-detection/diagnostics`` 同源,指向音视频描述页
-# 的 detector 单例 (VLMDoc + tts_alert 工具)。
-@router.get("/diagnostics")
-async def get_diagnostics() -> dict:
-    """Dump the detector's recent inference diagnostics ring buffer.
-
-    字段约定见 ``app/services/detector.py`` ``WdnaiDetector.__init__``
-    里 ``_diag_history`` 的注释。
-    """
-    det = get_detector()
-    items = det.diag_history()
-    items_reversed = list(reversed(items))
-    return {"count": len(items_reversed), "items": items_reversed}
-
-
-@router.post("/diagnostics/clear")
-async def clear_diagnostics() -> dict:
-    get_detector().clear_diagnostics()
-    return {"ok": True}
-
-
-# --------------------------------------------------------------------- #
-@router.websocket("/ws")
-async def stream_ws(ws: WebSocket) -> None:
-    """Push decoded JPEG frames + VLM events to the browser.
-
-    Protocol (server -> client):
-      - JSON text: {"type":"status", ...session snapshot...}
-      - Binary:    raw JPEG bytes for one frame
-      - JSON text: {"type":"eof"} when a file source reaches end
-      - JSON text: {"type":"event", ...detector event...} when a VLM
-                   inference completes
-
-    The connection is one-way (server pushes). Pause / play / stop go
-    through the REST ``/control`` endpoint so the decode thread reacts
-    independently of WS state.
-    """
-    await ws.accept()
-    session = get_session()
-    detector = get_detector()
-    loop = asyncio.get_event_loop()
-    # Per-WS subscriber queue — shared VideoSession can have multiple
-    # WS handlers connected; broadcast lets each receive every frame.
-    sub_q = session.subscribe()
-    last_status = 0.0
-    last_event_id = 0
-    eof_sent = False
-    try:
-        while True:
-            # Push any new detector events first — they have lower
-            # latency tolerance than frames and the user is staring at
-            # the page waiting for them.
-            for ev in detector.events_since(last_event_id):
-                last_event_id = ev["id"]
-                await ws.send_json({"type": "event", **ev})
-
-            try:
-                item = await loop.run_in_executor(
-                    None, lambda: sub_q.get(timeout=0.05)
-                )
-            except queue.Empty:
-                item = None
-            if item is None:
-                now = loop.time()
-                if now - last_status >= 1.0:
-                    snap = session.snapshot()
-                    snap["type"] = "status"
-                    snap["detector"] = detector.snapshot()
-                    await ws.send_json(snap)
-                    last_status = now
-                continue
-            if item is session._EOF:
-                if not eof_sent:
-                    snap = session.snapshot()
-                    snap["type"] = "eof"
-                    await ws.send_json(snap)
-                    eof_sent = True
-                await asyncio.sleep(0.2)
-                continue
-            eof_sent = False
-            await ws.send_bytes(item)
-            now = loop.time()
-            if now - last_status >= 1.0:
-                snap = session.snapshot()
-                snap["type"] = "status"
-                # also include detector snapshot so the UI can show
-                # prompt state without extra round-trips
-                snap["detector"] = detector.snapshot()
-                await ws.send_json(snap)
-                last_status = now
-    except Exception:
-        pass
-    finally:
-        session.unsubscribe(sub_q)

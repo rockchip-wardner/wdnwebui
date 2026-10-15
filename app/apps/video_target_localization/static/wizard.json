@@ -5,13 +5,14 @@
     "swcap_grounding": { "npu_index": 0, "model_id": "LocateAnything-3b" }
   },
   "open_source_button": "vtl-open",
+  "canvas_id": "vtl-grid",
   "upload_endpoint": "/api/video-target-localization/upload",
   "start_buttons": ["vtl-detector-start"],
   "steps": [
     { "id": "env",    "title": "运行环境检查",     "kind": "env_check" },
     { "id": "source", "title": "视频源",           "kind": "form",
       "fields": [
-        { "id": "vtl-source", "ui_key": "source", "label": "视频源 URL / 路径" },
+        { "id": "vtl-sources", "ui_key": "source", "label": "视频源（每行一路，最多 32 路）", "type": "textarea" },
         { "id": "vtl-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox", "default": true },
         { "id": "vtl-judge-mode", "ui_key": "judgeMode", "label": "判帧算法（决定哪些帧送去分析）", "type": "select",
           "options": [

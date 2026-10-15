@@ -6,13 +6,14 @@
     "swcap_audio_understand": { "npu_index": 1, "model_id": "qwen2.5-omni-3b" }
   },
   "open_source_button": "vd-open",
+  "canvas_id": "vd-grid",
   "upload_endpoint": "/api/video-detection/upload",
   "start_buttons": ["vd-detector-start", "vd-audio-start"],
   "steps": [
     { "id": "env",    "title": "运行环境检查",           "kind": "env_check" },
     { "id": "source", "title": "视频源",                 "kind": "form",
       "fields": [
-        { "id": "vd-source", "ui_key": "source", "label": "视频源 URL / 路径" },
+        { "id": "vd-sources", "ui_key": "source", "label": "视频源（每行一路，最多 32 路）", "type": "textarea" },
         { "id": "vd-loop",   "ui_key": "loop",   "label": "循环播放", "type": "checkbox", "default": true },
         { "id": "vd-judge-mode", "ui_key": "judgeMode", "label": "判帧算法（决定哪些帧送去分析）", "type": "select",
           "options": [

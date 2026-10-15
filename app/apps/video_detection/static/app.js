@@ -1,8 +1,7 @@
 (function () {
   "use strict";
   const API_PREFIX = "/api";
-  // core helpers (fmtNum, fmtEventTime, sanitizeEventText, loadModelPick) via app/static/core/*.js
-  const fmtNum = window.fmtNum;
+  // core helpers via app/static/core/*.js
   const fmtEventTime = window.fmtEventTime;
   const sanitizeEventText = window.sanitizeEventText;
   const loadModelPick = window.loadModelPick;
@@ -11,7 +10,8 @@ const VD = {
   ws: null,
   wsRetry: 0,
   wsTimer: null,
-  blobUrl: null,
+  // frame_meta 声明下一条二进制帧属于第几路。
+  pendingFrameIdx: -1,
   inflight: 0,
   tools: [],
   enabledTools: [],
@@ -71,9 +71,10 @@ const AudioAnalysis = {
   },
 
   async onStart() {
-    const sourceEl = document.getElementById("vd-source");
     const promptEl = document.getElementById("vd-audio-prompt");
-    const source = (sourceEl?.value || "").trim();
+    // 音轨分析吃**一路**（同一个视频的音轨），所以取源框的**第 1 路**。
+    // 源框是多行框，不能再整段 `.trim()` 当单路径用。
+    const source = readVdSources()[0] || "";
     const prompt = (promptEl?.value || "").trim();
     if (!source) { alert("请先在上方视频源里打开一个视频文件"); return; }
     if (!prompt) { alert("请输入音频理解提示词"); return; }
@@ -206,10 +207,14 @@ function setVdMeta(snap) {
   const el = document.getElementById("vd-meta");
   if (!el) return;
   const parts = [];
-  if (snap.width && snap.height) parts.push(snap.width + "x" + snap.height);
-  if (snap.fps) parts.push(fmtNum(snap.fps, 2) + " fps");
-  if (snap.frame_pos != null) parts.push("帧 " + snap.frame_pos);
-  if (snap.is_live) parts.push("LIVE");
+  const n = snap.channels || 0;
+  // 送检尺寸比显示尺寸更值得让人看见：它决定 VLM 选哪个 vision 变体
+  // （送 384 就是掉进便宜档换精度降档），运维排查"识别变差"时先看它。
+  if (snap.ana_w && snap.ana_h) parts.push("送检 " + snap.ana_w + "x" + snap.ana_h);
+  if (snap.disp_w && snap.disp_h) parts.push(snap.disp_w + "x" + snap.disp_h);
+  if (n) parts.push(n + " 路");
+  if (snap.total_frames) parts.push("帧 " + snap.total_frames);
+  if (snap.total_errors) parts.push("异常 " + snap.total_errors);
   if (snap.state) parts.push("[" + snap.state + "]");
   el.textContent = parts.join(" · ") || "--";
   VD.lastSnap = snap;
@@ -228,7 +233,7 @@ function setVdAudioMeta(snap) {
   const srcEl = document.getElementById("vd-audio-source");
   if (srcEl) {
     srcEl.textContent = (snap && snap.source)
-      || document.getElementById("vd-source")?.value?.trim()
+      || readVdSources()[0]
       || "—";
   }
   const statusEl = document.getElementById("vd-audio-status");
@@ -274,38 +279,73 @@ function setVdAudioMeta(snap) {
 function setVdProgress(snap) {
   const el = document.getElementById("vd-progress");
   if (!el) return;
-  el.classList.toggle("live", !!snap.is_live);
-  el.style.width = snap.is_live ? "100%" : "0%";
+  // 直播源没有总帧数，宽度不代表"跑了多少"；单路时看 snap.is_live，
+  // 多路下只能逐路看 channel_list[].source。
+  const list = snap.channel_list || [];
+  const anyFile = list.some(c => !c.source?.includes("://")
+                              && !String(c.source || "").startsWith("/dev/"));
+  el.classList.toggle("live", !anyFile && list.length > 0);
+  el.style.width = (list.length > 0 && !anyFile) ? "100%" : "0%";
 }
 
-async function drawVdFrame(jpgBytes) {
-  const canvas = document.getElementById("vd-canvas");
-  if (!canvas || !jpgBytes || !jpgBytes.byteLength) return;
-  const blob = new Blob([jpgBytes], { type: "image/jpeg" });
-  if (VD.blobUrl) URL.revokeObjectURL(VD.blobUrl);
-  VD.blobUrl = URL.createObjectURL(blob);
-  const img = new Image();
-  await new Promise((resolve, reject) => {
-    img.onload = resolve;
-    img.onerror = reject;
-    img.src = VD.blobUrl;
-  });
-  const ctx = canvas.getContext("2d");
-  canvas.width = img.naturalWidth || canvas.width;
-  canvas.height = img.naturalHeight || canvas.height;
-  ctx.drawImage(img, 0, 0);
+/* 宫格（建格 / 分列 / 承帧 / 角标）复用 app/static/core/multi-grid.js，
+ * 与 vtd / vtl 同款；本页只负责传 idx + 提示层文案。 */
+const GRID_EL = "vd-grid";
+const MAX_CHANNELS = 32;
+
+function updateVdTiles(session) {
+  const list = session.channel_list || [];
+  const cur = typeof session.vlm?.current === "number" ? session.vlm.current : -1;
+  const { total, ok, eof } = window.MultiGrid.status(GRID_EL, list, cur);
+  const hint = document.getElementById("vd-channel-hint");
+  if (hint) {
+    if (!total) hint.textContent = "尚未打开视频";
+    else if (ok === total) hint.textContent = `${total} 路视频 · 全部正常`;
+    else hint.textContent = `${total} 路视频 · ${ok} 路正常`;
+  }
+  // 全部路 eof：画面定格在最后一帧，不说的话用户只会当成"画面卡住"。
+  if (eof >= total && total > 0) {
+    setVdOverlay("全部路已播完（EOF）", true);
+  }
 }
 
-/* Strip chatml / vision / control characters that the model may have
- * leaked into desc / text fields. Mirrors the backend
- * ``_sanitize_event_text`` so legacy in-memory events get cleaned too.
+/** 从视频源文本框读出 sources 列表（每行一路，去空行去重）。
  *
- * v0.4+: 本函数定义在 ``app/static/core/format-utils.js``,IIFE 顶部
- * 取得别名 ``const sanitizeEventText = window.sanitizeEventText;`` 后
- * 在此 IIFE 内继续以裸名引用即可。删除下方本地副本,统一 core 版本,
- * 防止其它卡片(尤其 video_target_detection / video_target_localization)
- * 漏拷贝时 ReferenceError 阻塞 DOM 渲染。
- */
+ *  **唯一解析入口**：「打开视频」按钮与向导 applyWizardSnapshot 都走它。
+ *  分成两份就会各自漂，然后在某条路径上退回"整个多行当一路"（向导里填多路
+ *  就异常，填单路反而正常）。 */
+function readVdSources() {
+  const ta = document.getElementById("vd-sources");
+  if (!ta) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of (ta.value || "").split(/\r?\n/)) {
+    const s = raw.trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/** 路数校验（1~32）。返回 `{ok, sources, reason}`。
+ *
+ *  reason 同时喂给 overlay 提示与向导的 open_source_failed：前端先拦一次是
+ *  为了立刻给可读提示，而不是等一个 400 + JSON detail 回来。 */
+function validateVdSources() {
+  const sources = readVdSources();
+  if (!sources.length) {
+    return { ok: false, sources: [], reason: "视频源不能为空" };
+  }
+  if (sources.length > MAX_CHANNELS) {
+    return { ok: false, sources: [],
+             reason: `最多 ${MAX_CHANNELS} 路，当前 ${sources.length} 路` };
+  }
+  return { ok: true, sources, reason: "" };
+}
+
+/* sanitizeEventText 定义在 app/static/core/format-utils.js，此处只取别名：
+ * 保留本地副本会让别的卡片漏拷贝时 ReferenceError 阻塞 DOM 渲染。 */
 
 function connectVdWs() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -318,37 +358,50 @@ function connectVdWs() {
     VD.wsRetry = 0;
     setVdOverlay("", false);
   };
-  ws.onmessage = async (ev) => {
-    if (typeof ev.data === "string") {
-      let snap;
-      try { snap = JSON.parse(ev.data); } catch (_) { return; }
-      if (snap.type === "eof") {
-        setVdOverlay("文件已结束 (EOF)，点 播放 可恢复", true);
-      } else if (snap.type === "error") {
-        setVdOverlay("WS 错误: " + (snap.detail || ""), true);
-      } else if (snap.type === "event") {
-        addVdEvent(snap);
-        showVdEventBadge(snap);
-        return;
-      } else if (snap.type === "status" && snap.detector) {
-        updateVdDetectorStatus(snap.detector);
+  ws.onmessage = (ev) => {
+    // 二进制 JPEG —— 必须排在 JSON 解析之前：frame_meta 声明画哪一路，
+    // 紧跟的这一条二进制帧就归那一路（协议与 vtd / vtl 同款）。
+    if (typeof ev.data !== "string") {
+      const idx = VD.pendingFrameIdx >= 0 ? VD.pendingFrameIdx : 0;
+      try {
+        window.MultiGrid.paint(GRID_EL, idx, new Uint8Array(ev.data));
+      } catch (e) {
+        setVdOverlay("帧渲染失败: " + e, true);
       }
-      setVdMeta(snap);
-      setVdProgress(snap);
-      refreshVdButtons(snap.state);
-      // 浮框 / 曲线靠 tick 里的 judge 字段实时刷新（约 20 次/秒）
-      window.FrameJudge?.update("vd", snap.judge);
-      document.getElementById("data-video-detection").textContent =
-        JSON.stringify(snap, null, 2);
       return;
     }
-  // ...
-    try {
-      await drawVdFrame(new Uint8Array(ev.data));
-      setVdOverlay("", false);
-    } catch (e) {
-      setVdOverlay("帧渲染失败: " + e, true);
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
+    if (msg.type === "frame_meta") {
+      VD.pendingFrameIdx = Number(msg.idx) || 0;
+      return;
     }
+    if (msg.type === "event") { addVdEvent(msg); showVdEventBadge(msg); return; }
+    if (msg.type === "event_history") {
+      // 连接时补一段历史。工厂打包成**一条**发：逐条回放实测 200 条能打满
+      // 浏览器一个核（每条都带 crop_b64）。这里整段替换而不是 append ——
+      // WS 重连会再发一次，append 就成了重复。
+      VDDetector.events = (msg.events || []).slice().reverse();
+      renderVdEventList();
+      return;
+    }
+    if (msg.type === "error") {
+      setVdOverlay("WS 错误: " + (msg.detail || ""), true);
+      return;
+    }
+    // status: {type, session, detector} —— 会话快照在 msg.session 里
+    // （旧单路协议是把它摊平的，所以这里必须解一层）。
+    const snap = msg.session;
+    if (!snap) return;
+    if (msg.detector) updateVdDetectorStatus(msg.detector);
+    setVdMeta(snap);
+    setVdProgress(snap);
+    refreshVdButtons(snap.state);
+    updateVdTiles(snap);
+    // 浮框 / 曲线靠 status 里的 judge 字段刷新（~1Hz）
+    window.FrameJudge?.update("vd", snap.judge);
+    document.getElementById("data-video-detection").textContent =
+      JSON.stringify(msg, null, 2);
   };
   ws.onclose = () => {
     VD.ws = null;
@@ -386,15 +439,18 @@ async function vdAction(action) {
 async function vdStatus() {
   const r = await fetch(API_PREFIX + "/video-detection", { cache: "no-store" });
   if (!r.ok) return null;
-  const snap = await r.json();
+  const body = await r.json();
+  const snap = body.session || body;     // 工厂返回 {session, detector}
+  if (body.detector) updateVdDetectorStatus(body.detector);
   setVdMeta(snap);
   setVdProgress(snap);
   refreshVdButtons(snap.state);
+  updateVdTiles(snap);
   const loopEl = document.getElementById("vd-loop");
   if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
   window.FrameJudge?.update("vd", snap.judge);
   document.getElementById("data-video-detection").textContent =
-    JSON.stringify(snap, null, 2);
+    JSON.stringify(body, null, 2);
   return snap;
 }
 
@@ -602,26 +658,6 @@ async function vdDetectorStart() {
   }
 }
 
-/**
- * Populate a model-pick ``<select>`` (``#vd-model-pick`` /
- * ``#vd-audio-model-pick`` / ``#vtd-model-pick``) with running compute
- * instances exposing ``capability``.
- *
- * Data flow:
- *   - GET /api/compute/instances-by-capability?capability=X returns
- *     ``{capability, instances: [{model_id, label, source, npu_index,
- *     pid, memory_estimate_mb}, ...]}`` sorted local-first (mirrors
- *     ``get_session`` auto-pick semantics).
- *   - Empty list → dropdown 留 "自动 (本机优先)" 单选项 + 灰色禁用,
- *     提示用户当前 capability 没有 running 实例。
- *   - N entries → "自动" + N 实例选项;
- *     用户保存的选择从 localStorage 读,选中回填。
- *   - 用户切换下拉框时也写 localStorage,刷新页面后保留。
- *
- * 控件语义:
- *   - option.value="" → 服务端 get_session auto-pick (默认行为)。
- *   - option.value=model_id → 服务端 get_session_for_model 锁定。
- */
 function vdCollectEnabledTools() {
   const root = document.getElementById("vd-tools-list");
   if (!root) return [];
@@ -757,12 +793,16 @@ function initVideoDetection() {
   loadModelPick("vd-model-pick", "swcap_video_describe", "vd.model_id");
   loadModelPick("vd-audio-model-pick", "swcap_audio_understand", "vd.audio.model_id");
 
-  // 帧判据共享组件：配置区落在 #vd-judge-config，右上角浮框 +（仅向导内）
-  // 的分数曲线由组件自己按 canvas 位置摆。vd / vtd / vtl 共用同一个
-  // VideoSession，所以这里配一次三张卡同时生效。
-  window.FrameJudge?.mount({ prefix: "vd", canvasId: "vd-canvas" });
+  // 帧判据浮层（角标 + 曲线）锚在**画面容器**上，多路宫格里没有单一 canvas。
+  // **apiBase 指向本卡**：判据挂在 MultiChannelSession 上，不是
+  // /api/video/judge 操作的那个单例 VideoSession。
+  window.FrameJudge?.mount({
+    prefix: "vd",
+    canvasId: GRID_EL,
+    apiBase: "/api/video-detection/judge",
+  });
 
-  const sourceEl = document.getElementById("vd-source");
+  const sourceEl = document.getElementById("vd-sources");
   const loopEl   = document.getElementById("vd-loop");
   const openBtn = document.getElementById("vd-open");
   const closeBtn = document.getElementById("vd-close");
@@ -771,23 +811,29 @@ function initVideoDetection() {
   const pauseBtn = document.getElementById("vd-pause");
   const stopBtn = document.getElementById("vd-stop");
 
+  // 多行框里 Enter 是换行，不是提交 —— 提交用 Ctrl/⌘+Enter（与 vtd / vtl 一致）。
   sourceEl.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") openBtn.click();
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openBtn.click(); }
   });
 
   openBtn.addEventListener("click", async () => {
-    const src = (sourceEl.value || "").trim();
-    if (!src) {
-      setVdOverlay("请输入或选择视频源", true);
-      return;
-    }
+    const check = validateVdSources();
+    if (!check.ok) { setVdOverlay(check.reason, true); return; }
     openBtn.disabled = true;
-    setVdOverlay("正在打开 " + src + " …", false);
+    setVdOverlay("正在打开 " + check.sources.length + " 路 …", false);
+    // 先按路数摆好宫格再发请求：失败时用户至少看到"我填的 4 路被认成 4 路"，
+    // 而不是画面还停在上一轮。
+    window.MultiGrid.ensure(GRID_EL, check.sources.length);
     try {
-      const snap = await vdOpen({ source: src, loop: !!(loopEl && loopEl.checked) });
+      const snap = await vdOpen({ sources: check.sources, loop: !!(loopEl && loopEl.checked) });
       setVdMeta(snap);
       setVdProgress(snap);
+      updateVdTiles(snap);
       if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
+      const meta = document.getElementById("vd-source-meta");
+      if (meta) meta.textContent = check.sources.length > 1
+        ? `已打开 ${check.sources.length} 路` : "已选: " + check.sources[0];
+      setVdOverlay("", false);
     } catch (e) {
       setVdOverlay("打开失败: " + e.message, true);
     } finally {
@@ -804,6 +850,9 @@ function initVideoDetection() {
 
   closeBtn.addEventListener("click", async () => {
     try { await vdClose(); } catch (_) {}
+    window.MultiGrid.reset(GRID_EL);
+    const meta = document.getElementById("vd-source-meta");
+    if (meta) meta.textContent = "尚未选择";
     setVdOverlay("已关闭", false);
   });
 
@@ -862,28 +911,12 @@ function initVideoDetection() {
   if (!VD.ws && !VD.wsTimer) connectVdWs();
 }
 
-/* ------------------------------------------------------------------ *
- * 视频目标监控 (Video Target Detection) — TargetDoc 结构化输出           *
- * ------------------------------------------------------------------ *
- * 与音视频描述页 (`VD`) 结构一致；区别：                               *
- *   - API 前缀 `/api/video-target-detection/*`                         *
- *   - 后端 detector 直接走 `session.respond(generating=TargetDoc)`   *
- *     结构化输出拿 `x1, y1, x2, y2` + `desc`，**不**挂任何           *
- *     `@Callable` 工具，因此本页没有工具集合概念，也没有              *
- *     `/video-target-detection/tools` 端点                            *
- *   - 后端 detector 实例独立 (`get_target_detector()`)，与描述页互不   *
- *     干扰                                                              *
- *   - 事件历史：`ev.tool_call === "target_detection"` 用于识别 TargetDoc *
- *     事件；带 `crop_b64` 的事件同时挂缩略图 + 描述文本               *
- * ------------------------------------------------------------------ */
-
-
 initVideoDetection();
 
 // ------------------------------------------------------------------ *
 // 应用向导模式 API — wizard 框架 finish 时调用
 // 契约:opts 字段由 wizard.json 的 steps[].fields[].id 派生(显式 ui_key 决定):
-//   vd-source       → opts.source
+//   vd-sources      → opts.source（**整个多行文本框内容**）
 //   vd-loop         → opts.loop
 //   vd-prompt       → opts.prompt
 //   vd-detect-size  → opts.detectSize
@@ -892,8 +925,7 @@ initVideoDetection();
 //   * open_source_failed    → wizard 回 source 步骤
 //   * detector_start_failed → wizard 弹"启动失败"提示
 //   * audio_start_failed    → wizard 弹"启动失败"提示
-// 全局名固定为 ImApp_<app_id 去掉 hyphen>—— wizard 按这个约定查找,
-//   后续 7 张卡片向导统一沿用同约定(ImApp_video_target_detection 等)。
+// 全局名固定为 ImApp_<app_id 去掉 hyphen>—— wizard 按这个约定查找。
 // ------------------------------------------------------------------ *
 window.ImApp_video_detection = window.ImApp_video_detection || {};
 window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
@@ -901,7 +933,7 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
   const setChk = (id, v) => { const el = document.getElementById(id); if (el != null) el.checked = !!v; };
 
   // 1. 写回非空字段到表单(留给用户回看 + 应用自有 init 也用得到)
-  if (opts.source)      setVal("vd-source", opts.source);
+  if (opts.source)      setVal("vd-sources", opts.source);
   if (opts.loop != null) setChk("vd-loop", opts.loop);
   if (opts.prompt)      setVal("vd-prompt", opts.prompt);
   if (opts.detectSize)  setVal("vd-detect-size", opts.detectSize);
@@ -913,10 +945,16 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
   const result = { source_opened: false, detector_started: false, audio_started: false,
                  judge_applied: !!judge };
 
-  // 2. 打开视频源(仅 source 非空)
+  // 2. 打开视频源(仅 source 非空)。opts.source 是**整个多行文本框**，必须
+  //    先按行拆成 sources[] 再发（见 readVdSources 的注释）。
   if (opts.source) {
+    const check = validateVdSources();
+    if (!check.ok) {
+      throw new Error("WizardSnapshotError:open_source_failed:" + check.reason);
+    }
+    window.MultiGrid.ensure(GRID_EL, check.sources.length);
     try {
-      await vdOpen({ source: opts.source, loop: !!opts.loop });
+      await vdOpen({ sources: check.sources, loop: !!opts.loop });
       result.source_opened = true;
     } catch (e) {
       throw new Error("WizardSnapshotError:open_source_failed:" + (e?.message || e));

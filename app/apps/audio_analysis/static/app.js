@@ -51,7 +51,7 @@ const AudioAnalysis = {
   },
 
   async onStart() {
-    const sourceEl = document.getElementById("vd-source");
+    const sourceEl = document.getElementById("vd-sources");
     const promptEl = document.getElementById("vd-audio-prompt");
     const source = (sourceEl?.value || "").trim();
     const prompt = (promptEl?.value || "").trim();
@@ -208,7 +208,7 @@ function setVdAudioMeta(snap) {
   const srcEl = document.getElementById("vd-audio-source");
   if (srcEl) {
     srcEl.textContent = (snap && snap.source)
-      || document.getElementById("vd-source")?.value?.trim()
+      || document.getElementById("vd-sources")?.value?.trim()
       || "—";
   }
   const statusEl = document.getElementById("vd-audio-status");
@@ -259,7 +259,7 @@ function setVdProgress(snap) {
 }
 
 async function drawVdFrame(jpgBytes) {
-  const canvas = document.getElementById("vd-canvas");
+  const canvas = document.getElementById("vd-grid");
   if (!canvas || !jpgBytes || !jpgBytes.byteLength) return;
   const blob = new Blob([jpgBytes], { type: "image/jpeg" });
   if (VD.blobUrl) URL.revokeObjectURL(VD.blobUrl);

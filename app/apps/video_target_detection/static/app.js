@@ -1,23 +1,17 @@
 (function () {
   "use strict";
   const API_PREFIX = "/api";
-  // core helpers (fmtNum, fmtEventTime, sanitizeEventText, loadModelPick, vtlPaletteRGB, vtlLabelColor) via app/static/core/*.js
-  const fmtNum = window.fmtNum;
+  // core helpers (fmtEventTime, sanitizeEventText, loadModelPick) via app/static/core/*.js
   const fmtEventTime = window.fmtEventTime;
   const sanitizeEventText = window.sanitizeEventText;
   const loadModelPick = window.loadModelPick;
-  const vtlPaletteRGB = window.vtlPaletteRGB;
-  const vtlLabelColor = window.vtlLabelColor;
 
 // ---- 诊断计数器（常驻，开销可忽略；供 DevTools / playwright 读取）----
+// 宫格/解码侧的计数在 window.MultiGridDiag（app/static/core/multi-grid.js），
+// 这里只留本页自己产生的：WS 生命周期 + 二进制帧元数据。
 const VTD_DIAG = {
   wsOpen: 0, wsClose: 0, wsError: 0,
-  frameMeta: 0, binFrames: 0, decoded: 0,
-  drawNoTile: 0, drawEmpty: 0, drawErr: 0,
-  gridBuilds: 0, lastDrawIdx: -1,
-  // decoded=解码并画上 canvas 的帧数，busyDrop=因上一帧在解码而丢弃的帧数，
-  // decodeMs=最近一次解码耗时。仅供 DevTools / 自动化测试，不上界面。
-  busyDrop: 0, decodeMs: 0,
+  frameMeta: 0,
   log: [],
 };
 window.__vtdDiag = VTD_DIAG;
@@ -34,11 +28,7 @@ const VTD = {
   wsTimer: null,
   lastSnap: null,
   detectorSnap: null,
-  // 多路宫格：idx -> {tile, img, label}
-  tiles: new Map(),
-  cols: 1,
   pendingIdx: -1,   // 下一条二进制帧属于哪一路（由 frame_meta 设定）
-  total: 0,
 };
 const VTDDetector = {
   events: [],
@@ -48,6 +38,11 @@ const VTDDetector = {
   refresh() { return refreshVtdDetector(); },
 };
 
+// 宫格实现（建格 / 分列 / 每路单飞解码上屏 / 角标高亮）在共享组件
+// multi-grid.js 里，vd / vtl 共用同一份；本页只负责喂帧和渲染事件列表。
+const GRID_EL = "vtd-grid";
+const chNo = window.MultiGrid.chNo;
+
 function setVtdOverlay(text, isError) {
   const el = document.getElementById("vtd-overlay");
   if (!el) return;
@@ -56,187 +51,12 @@ function setVtdOverlay(text, isError) {
   el.style.display = text ? "" : "none";
 }
 
-/** 通道号对外一律 1 基。内部 idx 是 0 基，此前角标透出 idx（#0）而记录列表
- *  用 idx+1（通道 1），用户按角标对记录会差一路。抽成函数防三处再漂。 */
-function chNo(idx) { return (idx || 0) + 1; }
-
-/** 按通道数调整宫格（1~32 格）。列数按常见监视器比例取。
- *
- *  刻意**增量复用**而不是整格重建：换源 / 改通道数时若 innerHTML="" 全清，
- *  已加载的 <img> 会连同 src 一起被丢掉，所有格子退回空白，直到下一帧
- *  （display_fps 默认 2 → 最长 ~500ms 空白）才重绘。复用已有 tile 可以让
- *  索引不变的路（换源最常见的情况）画面**完全不中断**。 */
-function ensureGrid(n) {
-  const grid = document.getElementById("vtd-grid");
-  if (!grid) return;
-  // 注意：grid 里除了瓦片还有提示层 #vtd-overlay（绝对定位，不参与网格布局），
-  // 所以子节点数**不能**用来数瓦片，必须只数 .vd-tile。
-  const domTiles = grid.querySelectorAll(".vd-tile").length;
-  if (VTD.tiles.size === n && domTiles === n) {
-    VTD.total = n;
-    return;
-  }
-  const cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : n <= 16 ? 4 : n <= 25 ? 5 : 6;
-  // 判据取 **DOM 上的实际生效值**，不能用 JS 侧的 VTD.cols：后者初值是 1，
-  // 而 1 路时算出的 cols 也是 1 → 条件恒假 → gridTemplateColumns 从没被
-  // 设过，grid 退回默认 auto 布局，单列被图片的固有宽度（384px）撑开，
-  // 1 路时只占播放区一小块（实测 1102px 宽的播放区里只用了 386px）。
-  // 6 路时 cols 从 1 变 3 才会设置 —— 所以只有「恰好 1 路」时出错。
-  const colsCss = `repeat(${cols}, 1fr)`;
-  if (grid.style.gridTemplateColumns !== colsCss) {
-    VTD_DIAG.gridBuilds++;
-    VTD.cols = cols;
-    grid.style.gridTemplateColumns = colsCss;
-    grid.dataset.cols = String(cols);
-  }
-  // 别在这里给 grid 设 aspect-ratio 想让格子凑成 16:9：**不生效**。
-  // .vd-layout 是 `align-items: stretch`，.vd-stage-col 是 flex column，
-  // grid 作为 flex 子项会被拉满行高（实测 1 路 1002x586 而不是 16:9 的 564），
-  // 行内 aspect-ratio 直接被覆盖。
-  // 结论：格子高度由 stage 决定、格子宽高比 = (stage 宽/cols) : (stage 高/rows)，
-  // 只有 1 / 4 / 9 / 16 / 25 路（cols==rows）才正好是 16:9。6 路是 3x2，
-  // 必然有上下留边 —— 这是格子数的固有结果，不是 bug，画面交给
-  // object-fit: contain 居中显示即可。
-  // 多出来的格子直接删掉（连同它的 blob URL，避免泄漏）
-  for (const [i, t] of VTD.tiles) {
-    if (i < n) continue;
-    t.dropped = true;          // 让在途解码自己退出，不再往已摘掉的 tile 上画
-    t.tile.remove();
-    VTD.tiles.delete(i);
-  }
-  let created = 0;
-  for (let i = 0; i < n; i++) {
-    if (VTD.tiles.has(i)) continue;      // 复用，保留已加载的画面
-    const tile = document.createElement("div");
-    tile.className = "vd-tile";
-    tile.dataset.idx = String(i);
-    const cv = document.createElement("canvas");
-    const label = document.createElement("div");
-    label.className = "vd-tile-label";
-    label.textContent = "#" + chNo(i);
-    const badge = document.createElement("div");
-    badge.className = "vd-tile-badge";
-    tile.appendChild(cv);
-    tile.appendChild(label);
-    tile.appendChild(badge);
-    grid.appendChild(tile);
-    VTD.tiles.set(i, {
-      tile, canvas: cv, ctx: cv.getContext("2d", { alpha: false }),
-      label, badge,
-      busy: false,        // 是否有一个解码在飞
-      pending: null,      // 在途期间攒下的最新一帧（旧的直接丢）
-      dropped: false,     // 格子已被移除
-      w: 0, h: 0,
-    });
-    created++;
-  }
-  // 补齐顺序（复用的格子已在原位，新增的追加在后面）
-  const ordered = grid.querySelectorAll(".vd-tile");
-  if (ordered.length !== n || ordered[0]?.dataset.idx !== "0") {
-    for (let i = 0; i < n; i++) {
-      const t = VTD.tiles.get(i);
-      if (t) grid.appendChild(t.tile);
-    }
-    VTD_DIAG.gridBuilds++;
-  }
-  VTD.total = n;
-  _diag("grid", `build n=${n} cols=${cols} new=${created}`);
-}
-
-/** 把一路的 JPEG 画进对应瓦片。
- *
- *  为什么是 canvas + createImageBitmap，而不是 `<img>` + blob URL：
- *
- *  `<img>` 方案每帧都要 `img.src = URL.createObjectURL(blob)`。换 src 会
- *  **掐断上一帧还在进行的加载**（浏览器要走一遍 URL loader → 解码 → 上传
- *  纹理）。帧小的时候（384×216 ≈ 12KB）这整套在 40ms 预算里轻松跑完，
- *  看不出问题；帧大的时候（960×540 ≈ 65KB，实测 25fps 就是每帧 40ms 的
- *  硬预算）就有一批加载被下一次赋值中途取消，表现为**画面疯狂闪**——
- *  与「<5 路才闪」的现象完全吻合：1~4 路显示 960×540，5 路以上回落 384×216。
- *
- *  现在改成：createImageBitmap 在**解码线程**上解，不经过 URL loader，
- *  不存在「换源掐断」；并且**每路同时只允许一个解码在飞**，在途期间到达
- *  的新帧直接丢掉（视频语义本来就允许丢帧）。25fps 供 24fps 取，丢的是
- *  那一帧而不是整帧的连贯性。
- */
-function drawVtdFrame(idx, jpgBytes) {
-  VTD_DIAG.binFrames++;
-  VTD_DIAG.lastDrawIdx = idx;
-  if (!jpgBytes || !jpgBytes.byteLength) {
-    VTD_DIAG.drawEmpty++;
-    return;
-  }
-  const t = VTD.tiles.get(idx);
-  if (!t) {
-    VTD_DIAG.drawNoTile++;
-    _diag("draw-no-tile", `idx=${idx} have=${VTD.tiles.size}`);
-    return;
-  }
-  // 只保留最新一帧：pending 已被占用说明上一帧还没开始解码，直接覆盖丢弃
-  if (t.busy) {
-    VTD_DIAG.busyDrop++;
-    t.pending = jpgBytes;
-    return;
-  }
-  _vtdDecode(t, jpgBytes);
-}
-
-async function _vtdDecode(t, jpgBytes) {
-  t.busy = true;
-  const t0 = performance.now();
-  try {
-    const bmp = await createImageBitmap(
-      new Blob([jpgBytes], { type: "image/jpeg" }));
-    if (!t.dropped) {
-      // canvas 尺寸只在真的变了时才写：每帧写 canvas.width 会清空画布并
-      // 重置 ctx 状态，是老实现里一个实打实的每帧浪费。
-      if (t.canvas.width !== bmp.width || t.canvas.height !== bmp.height) {
-        t.canvas.width = bmp.width;
-        t.canvas.height = bmp.height;
-        t.w = bmp.width; t.h = bmp.height;
-      }
-      t.ctx.drawImage(bmp, 0, 0);
-      VTD_DIAG.decoded++;
-    }
-    bmp.close();
-  } catch (e) {
-    VTD_DIAG.drawErr++;
-    console.warn("[vtd] 解码失败", e);
-  } finally {
-    VTD_DIAG.decodeMs = Math.round(performance.now() - t0);
-    t.busy = false;
-    // 在途期间攒下的最新一帧，接着解（丢掉它之前更旧的那些）
-    const next = t.pending;
-    t.pending = null;
-    if (next && !t.dropped) _vtdDecode(t, next);
-  }
-}
-
-/** 1Hz 状态刷新：每格显示 fps / 状态，并高亮当前轮到推理的那一路。 */
 function updateVtdTiles(session) {
   if (!session) return;
   const list = session.channel_list || [];
-  if (list.length !== VTD.total) ensureGrid(list.length);
   const vlm = session.vlm || {};
   const cur = typeof vlm.current === "number" ? vlm.current : -1;
-  let ok = 0, total = 0;
-  for (const c of list) {
-    const t = VTD.tiles.get(c.idx);
-    if (!t) continue;
-    total++;
-    if (c.has_frame && c.state === "playing") ok++;
-    const src = (c.source || "").split("/").pop() || c.source || "";
-    // 正常时角标只显示通道号 —— 帧率是运维信息，不是客户要看的；
-    // 只有出错时才补上状态/告警，客户一眼能看出哪一路有问题。
-    t.label.textContent =
-      `#${chNo(c.idx)}` +
-      (c.state !== "playing" ? ` · ${c.state}` : "") +
-      (c.errors ? ` · ⚠${c.errors}` : "");
-    t.label.title = src;
-    t.tile.classList.toggle("active", c.idx === cur);
-    t.tile.classList.toggle("bad", !!c.error || c.errors > 0);
-    t.badge.textContent = c.idx === cur ? "推理中" : "";
-  }
+  const { total, ok, eof } = window.MultiGrid.status(GRID_EL, list, cur);
   const hint = document.getElementById("vtd-channel-hint");
   const pill = document.getElementById("vtd-pill-video");
   if (hint) {
@@ -252,8 +72,11 @@ function updateVtdTiles(session) {
       if (pill) pill.dataset.state = "warn";
     }
   }
-  // 提示层统一在这里维护：有路全通就清掉；还没路就回到空状态提示
-  if (total && ok === total) setVtdOverlay("", false);
+  // 提示层。文件源播完（loop 未勾）会停在 eof 不再产帧，画面定格在最后一帧 ——
+  // 不说的话就是「画面卡住 + 提示条报 0 路正常」，用户完全无从判断。
+  if (total && eof === total) setVtdOverlay("视频已播完\n\n勾选「循环播放」可自动重播，或点 播放 继续", false);
+  else if (eof) setVtdOverlay(`${eof} 路视频已播完`, false);
+  else if (total && ok === total) setVtdOverlay("", false);
   else if (total) setVtdOverlay("部分视频尚未出画面…", false);
   else setVtdOverlay(VTD_EMPTY_HINT, false);
 }
@@ -280,16 +103,15 @@ function connectVtdWs() {
       let snap;
       try { snap = JSON.parse(ev.data); } catch (_) { return; }
       if (snap.type === "frame_meta") {
-        // 多路协议：二进制帧前先来一条 meta 说明这帧属于哪一路
+        // 多路协议：二进制帧前先来一条 meta，指明这帧属于哪一路
         VTD.pendingIdx = snap.idx;
         VTD_DIAG.frameMeta++;
         return;
       } else if (snap.type === "event_history") {
-        // 连接建立时服务端**一次性**打包发来的历史事件。
-        // 关键：必须走"整体重建"，不能逐条 addVtdEvent —— 逐条会做
-        // N 次 appendVtdEventLi（建 DOM + insertBefore + trim），
-        // 实测 200 条突发能把渲染进程打满一个核、页面直接卡死。
-        // 服务端按 id 升序（旧→新）发，本地数组是新→旧，所以要反转。
+        // 连接建立时服务端**一次性**打包发来的历史事件。必须走"整体重建"，
+        // 不能逐条 addVtdEvent —— 实测 200 条突发能把渲染进程打满一个核、
+        // 页面直接卡死。服务端按 id 升序（旧→新）发，本地数组是新→旧，
+        // 所以要反转。
         const evs = Array.isArray(snap.events) ? snap.events : [];
         VTDDetector.events = evs.slice().reverse();
         VTDDetector.renderedIds.clear();
@@ -322,14 +144,14 @@ function connectVtdWs() {
       return;
     }
     try {
-      drawVtdFrame(VTD.pendingIdx >= 0 ? VTD.pendingIdx : 0,
-                   new Uint8Array(ev.data));
+      window.MultiGrid.paint(GRID_EL, VTD.pendingIdx >= 0 ? VTD.pendingIdx : 0,
+                             new Uint8Array(ev.data));
       // 首帧落地 = 会话真的开始出画面了，清掉「正在打开 N 路 …」。
       // open() 成功只代表解码线程已启动（视频还没解出第一帧），所以这条
       // 是让用户确认"画面出来了"的唯一信号。
       if (VTD.pendingIdx >= 0) setVtdOverlay("", false);
     } catch (e) {
-      VTD_DIAG.drawErr++;
+      window.MultiGridDiag.drawErr++;
       console.error("[vtd] draw 异常", e);
       setVtdOverlay("帧渲染失败: " + e, true);
     }
@@ -347,7 +169,6 @@ function connectVtdWs() {
   };
 }
 
-/** 从「视频源」文本框读出 sources 列表（每行一路，去空行去重）。 */
 function readVtdSources() {
   const ta = document.getElementById("vtd-sources");
   if (!ta) return [];
@@ -387,14 +208,14 @@ async function openVtdFromTextarea() {
   const loopEl = document.getElementById("vtd-loop");
   const openBtn = document.getElementById("vtd-open");
   if (openBtn) openBtn.disabled = true;
-  ensureGrid(srcs.length);
+  window.MultiGrid.ensure(GRID_EL, srcs.length);
   setVtdOverlay(`正在打开 ${srcs.length} 路 …`, false);
   try {
     const snap = await vtdOpen({ sources: srcs, loop: !!(loopEl && loopEl.checked) });
     updateVtdTiles(snap);
     if (loopEl && snap.loop != null) loopEl.checked = !!snap.loop;
-    // open() 只负责起解码线程；这里先撤掉「正在打开」文案换成"等首帧"，
-    // 等第一帧真的到了（WS 分支）才彻底清空。
+    // open() 成功 ≠ 已有画面：这里只把文案换成"等首帧"，真正清空交给 WS
+    // 首帧分支（见 connectVtdWs 的二进制帧分支）。
     const nOpen = (snap.channel_list || []).filter((c) => c.has_frame).length;
     setVtdOverlay(nOpen ? "" : `已启动 ${srcs.length} 路解码，等待首帧…`, false);
     return { ok: true, snap };
@@ -482,7 +303,7 @@ function buildVtdEventLi(ev, isLatest) {
   const tsSpan = document.createElement("span");
   tsSpan.textContent = fmtEventTime(ev.ts);
   meta.appendChild(tsSpan);
-  // 判据分数（共享组件，多路下 judge_score 为空则不渲染）
+  // 判据分数（共享组件算，多路下没有 judge_score 就整块不渲染）
   const jsSpan = window.FrameJudge?.scoreSpan?.("vtd", ev);
   if (jsSpan) meta.appendChild(jsSpan);
   const body = document.createElement("div");
@@ -577,7 +398,6 @@ function showVtdEventBadge(ev) {
   const badge = document.getElementById("vtd-event-badge");
   const text = document.getElementById("vtd-event-badge-text");
   if (!badge || !text) return;
-  // ...
   const raw = (ev.desc && String(ev.desc).trim())
             || (ev.text && String(ev.text).trim())
             || "(空)";
@@ -627,7 +447,7 @@ function updateVtdDetectorStatus(snap, session) {
   const startBtn = document.getElementById("vtd-detector-start");
   const stopBtn  = document.getElementById("vtd-detector-stop");
   if (!snap || !statusEl) return;
-  const chCount = ((session && session.channel_list) || []).length || VTD.total || 0;
+  const chCount = ((session && session.channel_list) || []).length;
   const setState = (s) => { if (pillEl) pillEl.dataset.state = s; };
   if (!snap.available) {
     statusEl.textContent = "模型不可用";
@@ -682,7 +502,6 @@ async function vtdDetectorStart() {
     setVtdOverlay("请先填写检测提示词", true);
     return;
   }
-  // ...
   const sizeVal = sizeEl?.value || "";
   let image_size = null;
   if (sizeVal && sizeVal !== "auto") {
@@ -735,8 +554,6 @@ async function vtdEventsClear() {
   } catch (_) {}
 }
 
-  // ...
-
 function initVideoTargetDetection() {
   if (window.__vtdInit) return;
   window.__vtdInit = true;
@@ -744,11 +561,10 @@ function initVideoTargetDetection() {
   // 空状态：一进页面画面区是黑的，给一句人话告诉用户下一步做什么
   setVtdOverlay(VTD_EMPTY_HINT, false);
 
-  // ...
   loadModelPick("vtd-model-pick", "swcap_video_describe", "vtd.model_id");
   // apiBase 指向本卡判据端点：/api/video/judge 操作的是单例 VideoSession
   // （vd / vtl 共用），本页走 MultiChannelSession，同 VAS 挂自己的 judge_api。
-  window.FrameJudge?.mount({ prefix: "vtd", canvasId: "vtd-canvas",
+  window.FrameJudge?.mount({ prefix: "vtd", canvasId: GRID_EL,
                              apiBase: API_PREFIX + "/video-target-detection/judge" });
 
   const loopEl   = document.getElementById("vtd-loop");
@@ -771,41 +587,20 @@ function initVideoTargetDetection() {
   if (evClearBtn)  evClearBtn.addEventListener("click",  vtdEventsClear);
 
   refreshVtdDetector();
-  // ...
   if (!VTD.ws && !VTD.wsTimer) connectVtdWs();
 }
-
-/* ------------------------------------------------------------------ *
- *  视频目标定位 page (LocateAnything-3b grounding 演示)               *
- * ------------------------------------------------------------------ *
- *   - API 前缀 `/api/video-target-localization/*`                      *
- *   - 后端 detector 直接走 `session.respond(generating=LocatorDoc)`   *
- *     结构化输出拿 `boxes: List[BoundingBox]` (0–1000 归一化) +       *
- *     `text` + `level`，**不**挂任何 `@Callable` 工具                  *
- *   - 后端 detector 实例独立 (`get_localizer_detector()`)，与 VD / VTD  *
- *     互不干扰                                                          *
- *   - 事件：`ev.tool_call === "grounding"` 用于识别多 bbox 定位事件;  *
- *     每事件附 `frame_b64` 整帧 + `boxes[].bbox` 像素坐标 + `label`   *
- *     + `crop_b64` 单独裁图                                            *
- *   - 视觉定位页**不**暴露模型选择 / 尺寸选择（LocateAnything 是单    *
- *     448×448 单变体，单 capability），POST body 只含 `{prompt,        *
- *     every_n}` 两字段                                                  *
- *   - 历史列表项画 bbox overlay（canvas 叠加在原图缩略图上）+ 双击弹   *
- *     `#vtl-frame-modal` 大图预览                                       *
- * ------------------------------------------------------------------ */
 
 initVideoTargetDetection();
 
 // ------------------------------------------------------------------ *
-// 应用向导模式 API — wizard 框架 finish 时调用
-// 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
+// 应用向导模式 API — wizard 框架 finish 时调用。
+// 契约：opts 由 wizard.json 的 steps[].fields[].ui_key 决定
 //   vtd-sources      → opts.source
 //   vtd-loop         → opts.loop
 //   vtd-prompt       → opts.prompt
 //   vtd-detect-size  → opts.detectSize
-// source 非空 → 写回 #vtd-sources 并**按行拆成多路**后调 openVtdFromTextarea
-//（与「打开视频」按钮同一条路径）；prompt 非空 → 模拟点
-// #vtd-detector-start。空字段不触发对应动作。
+// source 非空 → 写回 #vtd-sources 后按行拆成多路再打开；prompt 非空 →
+// 模拟点 #vtd-detector-start。空字段不触发对应动作。
 // 全局名约定 ImApp_<app.id 去掉 hyphen>。
 // ------------------------------------------------------------------ *
 window.ImApp_video_target_detection = window.ImApp_video_target_detection || {};
@@ -813,7 +608,6 @@ window.ImApp_video_target_detection.applyWizardSnapshot = async function (opts) 
   const setVal = (id, v) => { const el = document.getElementById(id); if (el != null) el.value = v; };
   const setChk = (id, v) => { const el = document.getElementById(id); if (el != null) el.checked = !!v; };
 
-  // 多路：向导给的 source 填进 sources 文本框（单值也是合法输入）
   if (opts.source)      setVal("vtd-sources", opts.source);
   if (opts.loop != null) setChk("vtd-loop", opts.loop);
   if (opts.prompt)      setVal("vtd-prompt", opts.prompt);
@@ -824,9 +618,8 @@ window.ImApp_video_target_detection.applyWizardSnapshot = async function (opts) 
   const result = { source_opened: false, detector_started: false, judge_applied: !!judge };
 
   if (opts.source) {
-    // 关键：走 openVtdFromTextarea 而不是 vtdOpen({source: opts.source})。
-    // opts.source 是**整个多行文本**，用单数 key 发过去会被后端当成一路，
-    // 多路就会变成一条带换行的假路径导致解码失败（单路却正常）。
+    // 必须走 openVtdFromTextarea：opts.source 是整个多行文本，单数 key 会被
+    // 后端当成一路假路径（坑见 openVtdFromTextarea 的注释）。
     const r = await openVtdFromTextarea();
     if (!r.ok) {
       throw new Error("WizardSnapshotError:open_source_failed:" + (r.reason || "unknown"));

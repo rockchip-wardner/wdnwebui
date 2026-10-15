@@ -7,8 +7,11 @@
 
         <div class="vd-layout">
           <div class="vd-stage-col">
-            <div class="vd-stage">
-              <canvas id="vd-canvas" width="960" height="540"></canvas>
+            <!-- 宫格 div **自己就是** .vd-stage（不是套在里面）：.vd-stage 的
+                 16:9 是单 canvas 的尺寸基准，宫格靠它给出确定高度再用
+                 grid-auto-rows:1fr 撑满行。提示层放在 grid 内部 —— absolute
+                 不参与网格布局，inset:0 正好罩住画面。 -->
+            <div class="vd-stage vd-grid" id="vd-grid" data-cols="1">
               <div class="vd-overlay" id="vd-overlay"></div>
               <div class="vd-event-badge hidden" id="vd-event-badge">
                 <span class="vd-event-badge-text" id="vd-event-badge-text"></span>
@@ -25,22 +28,27 @@
             <section class="surv-form-section stage-source-bar">
               <header class="surv-form-head">
                 <h3>视频源</h3>
-                <span class="surv-hint">网络流或本地文件/文件夹</span>
+                <span class="surv-hint">每行一路，最多 32 路</span>
               </header>
               <div class="surv-field">
-                <div class="surv-input-row">
-                  <input type="text" id="vd-source" class="surv-input"
-                         placeholder="网络流或本地文件/文件夹" spellcheck="false" />
-                  <button type="button" class="vd-btn" id="vd-browse">浏览…</button>
-                </div>
+                <!-- 多路源：一行一路。id 用复数，与下面「音轨分析」那段区分 ——
+                     它读的是同一段文本的第一路，见 app.js 的
+                     AudioAnalysis.onStart。 -->
+                <textarea id="vd-sources" class="surv-input surv-textarea"
+                          rows="6" spellcheck="false"
+                          placeholder="每行一路，最多 32 路&#10;/userdata/assets/720p/rk-0.mp4&#10;rtsp://192.168.1.10:554/stream1"></textarea>
                 <div class="vd-actions-row">
-                  <button type="button" class="vd-btn vd-btn-primary" id="vd-open">打开</button>
+                  <button type="button" class="vd-btn" id="vd-browse">浏览…</button>
+                  <button type="button" class="vd-btn vd-btn-primary" id="vd-open">打开视频</button>
                   <button type="button" class="vd-btn" id="vd-close">关闭</button>
                   <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
-                    <input type="checkbox" id="vd-loop" />
+                    <input type="checkbox" id="vd-loop" checked />
                     <span>循环播放</span>
                   </label>
                 </div>
+                <span class="surv-hint">「打开视频」= 1~32 路同时出画面（不做描述）；点「启动检测」才逐路轮转推理</span>
+                <span class="vd-meta" id="vd-source-meta">尚未选择</span>
+                <span class="surv-hint" id="vd-channel-hint">尚未打开视频</span>
               </div>
             </section>
 

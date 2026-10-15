@@ -7,9 +7,11 @@
 
         <div class="vd-layout">
           <div class="vd-stage-col">
-            <div class="vd-stage">
-              <canvas id="vtl-canvas" width="960" height="540"></canvas>
+            <div class="vd-stage vd-grid" id="vtl-grid" data-cols="1">
+              <!-- 1~32 格宫格，由 app.js 按通道数重建（共享组件 multi-grid.js） -->
+              <!-- 提示层放在 grid 内部：absolute 定位不参与网格布局，inset:0 正好罩住画面 -->
               <div class="vd-overlay" id="vtl-overlay"></div>
+              <!-- 事件反馈由画面上的 bbox 框承载，这块徽标恒隐藏（不弹空文字黑框） -->
               <div class="vd-event-badge hidden" id="vtl-event-badge">
                 <span class="vd-event-badge-text" id="vtl-event-badge-text"></span>
               </div>
@@ -35,19 +37,19 @@
                   <h3>视频源</h3>
                 </header>
                 <div class="surv-field">
-                  <div class="surv-input-row">
-                    <input type="text" id="vtl-source" class="surv-input"
-                           placeholder="网络流或本地文件/文件夹" spellcheck="false" />
-                    <button type="button" class="vd-btn" id="vtl-browse">浏览…</button>
-                  </div>
+                  <textarea id="vtl-sources" class="surv-input surv-textarea vtl-sources"
+                            rows="6" spellcheck="false"
+                            placeholder="每行一路，最多 32 路&#10;/userdata/assets/720p/rk-0.mp4&#10;rtsp://192.168.1.10:554/stream1"></textarea>
                   <div class="vd-actions-row">
+                    <button type="button" class="vd-btn" id="vtl-browse">浏览…</button>
                     <button type="button" class="vd-btn vd-btn-primary" id="vtl-open">打开</button>
                     <button type="button" class="vd-btn" id="vtl-close">关闭</button>
                     <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
-                      <input type="checkbox" id="vtl-loop" />
+                      <input type="checkbox" id="vtl-loop" checked />
                       <span>循环播放</span>
                     </label>
                   </div>
+                  <span class="surv-hint" id="vtl-channel-hint">尚未打开视频</span>
                   <div id="vtl-judge-config"></div>
                 </div>
               </section>
