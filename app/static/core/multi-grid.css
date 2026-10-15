@@ -1,0 +1,75 @@
+/* ==========================================================================
+   多路宫格共享样式（视频目标监控 / 视频目标定位 / 视频检测 共用）
+   —— 配 app/static/core/multi-grid.js。卡片私有样式另算增量。
+   ========================================================================== */
+
+/* 宫格 div 自己就是 .vd-stage（不是套在 stage 里面），于是它继承了框架单路播放器
+   自带的 `aspect-ratio: 16/9`。宫格是 N 列 × M 行、整体比例是 16:9 × (N/M)，
+   2 行 3 列 ≈ 32:9 —— 容器硬套 16/9 会空出约 40% 高度的黑边。
+   两种解法都试过：(a) stage 跟随内容高度（height:auto + aspect-ratio:auto）在向导
+   挂载期间与 .page 的显隐切换打架，页面迟迟不响应；取 (b) 容器保持确定尺寸、改为
+   **让格子填满行**（grid-auto-rows:1fr + 格子 aspect-ratio:auto）。行高由 stage 定，
+   多余画面交给 object-fit: contain 居中（列数是按 16:9 观感挑的，留边很小）。 */
+.vd-grid {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  grid-auto-rows: 1fr;
+  background: #11141a;
+  justify-content: center;
+  border-radius: 10px;
+}
+.vd-tile {
+  position: relative;
+  aspect-ratio: auto;
+  height: 100%;
+  background: #000;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 6px;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.vd-tile img, .vd-tile canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* 角标刻意**不加 backdrop-filter**：软件渲染（无 GPU 的浏览器 / headless）下
+   backdrop-filter 每帧都要回读并模糊一次背景，画面又是 25fps 持续重绘 —— 实测
+   直接把渲染进程打满 1 核、整页跟着卡住。半透明黑底已经够看了。 */
+.vd-tile-label {
+  position: absolute;
+  left: 6px; top: 6px;
+  padding: 2px 7px;
+  font-size: 11px;
+  line-height: 16px;
+  color: #e5e7eb;
+  background: rgba(0, 0, 0, 0.62);
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+/* 当前正在被分析的那一路 —— 全页**唯一**的高亮边框语义（绿色，用户指定）。 */
+.vd-tile.active { border-color: #30d158; box-shadow: 0 0 0 2px rgba(48, 209, 88, 0.45); }
+.vd-tile.active .vd-tile-badge { opacity: 1; }
+.vd-tile-badge {
+  position: absolute;
+  right: 6px; top: 6px;
+  padding: 2px 7px;
+  font-size: 10px;
+  line-height: 15px;
+  color: #fff;
+  background: rgba(48, 209, 88, 0.92);
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.vd-tile.bad { border-color: #ff453a; }
+.vd-tile.bad .vd-tile-label { color: #ff6b63; }

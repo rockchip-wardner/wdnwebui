@@ -60,15 +60,14 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from wdnav import VideoCapture as _WdnavVideoCapture
 except Exception:  # pragma: no cover - platform-specific load failure
     _WdnavVideoCapture = None
 
-# 帧判据：与 core/video/frame_judge.py 同一份实现，不另写一套。
-# 每路一个独立实例 —— 各摄像头画面不同，共用一个参照帧没有意义。
+# 帧判据：每路一个独立实例 —— 各摄像头画面不同，共用一个参照帧没有意义。
 from app.core.video.frame_judge import (
     DEFAULT_EVERY_N,
     DEFAULT_LONG_SIDE,
@@ -311,7 +310,6 @@ class Channel:
             time.sleep(0.005)
 
     def _publish_inference(self, img) -> None:
-        """解码线程内部调用：存下这一帧的送检图并唤醒等待方。"""
         with self._lock:
             self._ana_bgr = img
             self._ana_seq += 1
@@ -799,14 +797,10 @@ class MultiChannelSession:
     def _rr_loop(self) -> None:
         """VLM 轮转调度：**一路一帧，串行，严格第 1 路 → 第 N 路 → 回第 1 路**。
 
-        语义（就是「逐路巡检」，不是多路同步）：
-
-        * N 路视频各自**独立地持续解码**，播放不受推理影响 —— 解码线程
-          只往 ``latest_bgr`` 写，推理读的是快照，两者互不阻塞。
-        * 轮到第 i 路时，取它**此刻最新的一帧**提交给 detector；
-          等这一路推理完成后，再取第 i+1 路的当前帧。
-        * 第 N 路完成 -> 回到第 1 路开新一轮。每轮都从第 1 路开始、
-          顺序固定，便于对照画面排查。
+        N 路视频各自**独立地持续解码**，播放不受推理影响 —— 解码线程只往
+        ``latest_bgr`` 写，推理读的是快照，两者互不阻塞。轮到第 i 路时取它
+        **此刻最新的一帧**提交，等它推理完成再取第 i+1 路的当前帧。每轮都从
+        第 1 路开始、顺序固定，便于对照画面排查。
 
         **必须串行**：``detector._item_q`` 是 maxsize=1 的 drop-oldest
         队列，N 路同时挤只有最后进去的那路能跑，其余静默丢弃。所以靠
@@ -970,7 +964,6 @@ class MultiChannelSession:
         return self.judge_snapshot()
 
     def reset_judge(self) -> dict:
-        """清空各路判据的参照帧（不动配置）。"""
         with self._lock:
             channels = [ch for ch in self._channels if ch.judge is not None]
         for ch in channels:
@@ -1068,26 +1061,42 @@ class MultiChannelSession:
         }
 
 
-_session: Optional[MultiChannelSession] = None
+_sessions: Dict[str, "MultiChannelSession"] = {}
 _session_lock = threading.Lock()
 
 
-def get_multi_session() -> MultiChannelSession:
-    """本页多路会话单例（与 ``app.core.video.session`` 的单例互不相干）。"""
-    global _session
+def get_multi_session(
+    key: str = "default",
+    factory: Optional[Callable[[], "MultiChannelSession"]] = None,
+) -> MultiChannelSession:
+    """按 key 取多路会话单例（与 ``app.core.video.session`` 的单例互不相干）。
+
+    **必须按 key 隔离**：多张卡跑在同一个 uvicorn 进程里，若共用一个
+    实例，用户在 vtd 开 32 路再切到 vtl 开 32 路，后者调 ``open()`` 会
+    把前者的 ``VideoCapture`` 全部 ``close()`` 掉 —— 表现为「切回上一页
+    画面全黑」。每张卡传自己的 key（``"vtd"`` / ``"vtl"`` / ``"vd"``）。
+
+    ``factory`` 只在该 key **首次**创建时用（vtl 传
+    ``analysis_size=448``：它的 vision 硬编码 448×448，送更大只是让
+    RGA 白缩一遍）。key 已存在时忽略 —— 实例已开跑，改尺寸无意义，
+    换源请走 ``open()``。
+    """
     with _session_lock:
-        if _session is None:
-            _session = MultiChannelSession()
-        return _session
+        s = _sessions.get(key)
+        if s is None:
+            s = _sessions[key] = (factory() if factory
+                                  else MultiChannelSession())
+        return s
 
 
-def reset_multi_session() -> None:
-    """测试用：丢弃单例。"""
-    global _session
+def reset_multi_session(key: Optional[str] = None) -> None:
+    """测试用：丢弃单例。``key=None`` 清掉全部。"""
     with _session_lock:
-        if _session is not None:
-            _session.close()
+        targets = list(_sessions.items()) if key is None else \
+            [(key, _sessions[key])] if key in _sessions else []
+        for k, s in targets:
+            s.close()
             # 会话对象即将被丢弃，此时才允许清订阅名单（close() 不能清，
             # 否则 open() 复用单例时会摘掉已连接的 WebSocket —— 见 close 注释）
-            _session._drain_subs()
-        _session = None
+            s._drain_subs()
+            _sessions.pop(k, None)
