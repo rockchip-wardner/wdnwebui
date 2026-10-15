@@ -40,7 +40,7 @@ def main():
         page.wait_for_timeout(800)
 
         # 写 source
-        page.evaluate(f"(() => {{ const s = document.getElementById('vtd-source'); if (s) s.value = {VIDEO!r}; }})()")
+        page.evaluate(f"(() => {{ const s = document.getElementById('vtd-sources'); if (s) s.value = {VIDEO!r}; }})()")
         page.wait_for_timeout(300)
 
         # 点 打开
@@ -49,7 +49,7 @@ def main():
 
         # 阶段 1:canvas 应被搬到 wizard canvas-wrap
         s1 = page.evaluate("""() => {
-            const c = document.getElementById('vtd-canvas');
+            const c = document.getElementById('vtd-grid');
             const wrap = document.querySelector('.wd-wizard-canvas-wrap');
             const inPage = !!(c && wrap && c.parentNode === wrap);
             return {inWrap: inPage, hasWizard: !!document.querySelector('.wd-wizard-section')};
@@ -65,12 +65,13 @@ def main():
         page.wait_for_timeout(500)
 
         s2 = page.evaluate("""() => {
-            const c = document.getElementById('vtd-canvas');
+            const c = document.getElementById('vtd-grid');
             const pageSection = document.getElementById('page-video-target-detection');
             const stages = Array.from(document.querySelectorAll('.vd-stage'));
             return {
                 exists: !!c,
-                inPageStage: stages.some(s => pageSection?.contains(s) && s.contains(c)),
+                // 宫格容器自身就是 .vd-stage（不被 stage 包着），两种都接受。
+                inPageStage: stages.some(s => pageSection?.contains(s) && (s === c || s.contains(c))),
                 parentClass: c?.parentNode?.className || null,
                 hasWizard: !!document.querySelector('.wd-wizard-section'),
                 pageSectionVisible: pageSection && !pageSection.classList.contains('hidden'),

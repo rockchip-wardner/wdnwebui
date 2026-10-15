@@ -24,7 +24,13 @@ import sys
 from playwright.async_api import async_playwright
 
 BASE = "http://localhost:8000"
-VIDEO = "/home/rockchip/test/test/carplant_29132868.mp4"
+# 素材路径曾写死，板子上文件清掉后脚本就永远红着（且看不出是环境还是布局问题）。
+VIDEO_CANDIDATES = [
+    "/home/rockchip/test/test/carplant_29132868.mp4",
+    "/userdata/assets/720p/rk-0.mp4",
+]
+VIDEO = next((p for p in VIDEO_CANDIDATES if os.path.exists(p)),
+             VIDEO_CANDIDATES[0])
 SKIP = "跳过向导"
 
 # card_id -> (前缀, 画布 id, 源输入框 id, 打开按钮 id, 侧栏 sel, 舞台列 sel,
@@ -33,7 +39,7 @@ CASES = [
     # v0.20：vd（音视频描述）按用户要求把两条栏搬到视频正下方；VAS 保持原样
     # （在左侧控制台里竖排）—— 两者都进脚本，搬走的那张不能靠"另一张没变"
     # 来证明自己变了，反过来也一样。
-    ("video-detection",       "vd",  "vd-canvas",  "vd-source",  "vd-open",
+    ("video-detection",       "vd",  "vd-grid",    "vd-sources", "vd-open",
      ".vd-side", ".vd-stage-col", True),
     ("video-analysis-search", "vas", "vcs-canvas", "vcs-source", "vcs-open",
      ".vcs-layout > .surv-form", ".vcs-layout > .vd-stage-col", False),
@@ -176,7 +182,11 @@ async def main() -> int:
             await page.wait_for_timeout(3500)
             opened = await page.evaluate("""([src, cv]) => {
               const el = document.getElementById(src);
-              const c = document.getElementById(cv);
+              // 宫格容器是 div，像素在每格的 canvas 上，取第一格代表。
+              const box = document.getElementById(cv);
+              const c = box && box.tagName === 'CANVAS'
+                ? box
+                : (box && box.querySelector('.vd-tile canvas')) || null;
               let px = -1;
               try {
                 const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;

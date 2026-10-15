@@ -9,7 +9,7 @@
     完整链路能落到后端真实返回的 path 上(排除 mock 掩盖契约问题的可能)。
 
 同时覆盖 BUG 的**失败模式**:先把 source 填成旧 rtsp 地址,再拖新视频,
-若仍会"沿用旧 url",最终 #vd-source 就会是 rtsp 而不是 uploads 路径。
+若仍会"沿用旧 url",最终 #vd-sources 就会是 rtsp 而不是 uploads 路径。
 
 用法:
   .venv/bin/python scripts/verify_wizard_upload_e2e.py [视频路径]
@@ -76,7 +76,7 @@ def main():
 
         # 清掉历史 localStorage,避免上一轮实验值干扰;再故意填"旧源"
         page.evaluate("() => localStorage.clear()")
-        page.locator("#wd-wizard-body input[data-field-id='vd-source']").fill(OLD_SOURCE)
+        page.locator("#wd-wizard-body textarea[data-field-id='vd-sources']").fill(OLD_SOURCE)
 
         # 真实上传:直接 POST 到真实 endpoint(与 handleUpload 同一契约),
         # 拿到后端真实 path,再断言 wizard 采纳它。
@@ -106,13 +106,13 @@ def main():
         page.evaluate(DROP_FILE, [".wd-wizard-canvas-wrap", "wizard-e2e-real.mp4"])
         # 等真实上传落地(后端会覆盖同名文件,故 path 与预先探测的一致)
         page.wait_for_function(
-            """(want) => ((window._wd_wizard_values || {})["vd-source"] === want)""",
+            """(want) => ((window._wd_wizard_values || {})["vd-sources"] === want)""",
             arg=real_path, timeout=30000)
 
         vals = page.evaluate("() => window._wd_wizard_values || {}")
-        got = vals.get("vd-source")
+        got = vals.get("vd-sources")
         check("wizard 采纳后端真实路径(非旧 rtsp)", got == real_path,
-              f"vd-source={got!r} vs backend={real_path!r}")
+              f"vd-sources={got!r} vs backend={real_path!r}")
 
         # 一路点「下一步」到 finish,确认中途不被旧值污染
         for _ in range(8):

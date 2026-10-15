@@ -26,11 +26,13 @@ VIDEO = "/home/rockchip/test/test/carplant_29132868.mp4"
 
 # card_id -> (页面 id 前缀, 画布 id, 源输入框 id, 判据 API)
 CASES = [
-    ("video-analysis-search",     "vas", "vcs-canvas", "vcs-source",
+    ("video-analysis-search",     "vas", "vcs-canvas",  "vcs-source",
      "/api/video-analysis-search/judge"),
-    ("video-detection",           "vd",  "vd-canvas",  "vd-source",  "/api/video/judge"),
-    ("video-target-detection",    "vtd", "vtd-canvas", "vtd-source", "/api/video/judge"),
-    ("video-target-localization", "vtl", "vtl-canvas", "vtl-source", "/api/video/judge"),
+    ("video-detection",           "vd",  "vd-grid",    "vd-sources", "/api/video-detection/judge"),
+    ("video-target-detection",    "vtd", "vtd-grid",   "vtd-sources",
+     "/api/video-target-detection/judge"),
+    ("video-target-localization", "vtl", "vtl-grid",   "vtl-sources",
+     "/api/video-target-localization/judge"),
 ]
 
 NEXT = "下一步"

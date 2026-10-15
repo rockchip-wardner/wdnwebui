@@ -97,7 +97,7 @@ def main():
         ok("T9: 进入步骤 2 (视频源)")
 
         # 填一个 video source
-        page.fill("input[data-field-id='vd-source']", "rtsp://test.local/stream")
+        page.fill("textarea[data-field-id='vd-sources']", "rtsp://test.local/stream")
         # loop 默认已勾选(toggle UI 自带 default=true);不需手动 click
         # 验证 loop toggle 状态(确认默认勾选生效)
         loop_checked = page.evaluate("""
@@ -125,7 +125,7 @@ def main():
         if not ls_value:
             fail("T9: localStorage 未写入")
         ls = json.loads(ls_value)
-        if ls.get("vd-source") != "rtsp://test.local/stream":
+        if ls.get("vd-sources") != "rtsp://test.local/stream":
             fail(f"T9: localStorage 值 {ls}")
         if ls.get("vd-loop") is not True:
             fail(f"T9: localStorage loop 值 {ls}")
@@ -151,7 +151,7 @@ def main():
         """)
         page.wait_for_timeout(400)
         # 此时 source 输入框应已预填
-        source_val = page.input_value("input[type=text][data-field-id='vd-source']")
+        source_val = page.input_value("textarea[data-field-id='vd-sources']")
         if source_val != "rtsp://test.local/stream":
             fail(f"T10: 预填值 '{source_val}',期望 'rtsp://test.local/stream'")
         loop_checked = page.evaluate("""
@@ -169,7 +169,7 @@ def main():
         # ============================================================ #
         print("\n=== T5: 完成配置 → applyWizardSnapshot ===")
         # 当前在 source,继续往下
-        page.fill("input[data-field-id='vd-source']", "/tmp/test.mp4")
+        page.fill("textarea[data-field-id='vd-sources']", "/tmp/test.mp4")
         # 不勾 loop(toggle 默认勾选,显式切到 unchecked)
         page.evaluate("""
           (() => {
@@ -223,7 +223,7 @@ def main():
         # finish click 前 — 直接看 wizard state.values 是否完整累积
         final_values = page.evaluate("window._wd_wizard_values || {}")
         print(f"  debug final state.values: {final_values}")
-        for k in ["vd-source", "vd-loop", "vd-prompt", "vd-audio-prompt"]:
+        for k in ["vd-sources", "vd-loop", "vd-prompt", "vd-audio-prompt"]:
             if k not in final_values:
                 fail(f"T5: state.values 缺少 {k}(填入后应累积)")
 

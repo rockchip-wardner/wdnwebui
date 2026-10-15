@@ -112,7 +112,7 @@ def main():
         page.evaluate(INSTALL_GATE, [UPLOAD_URL, NEW_PATH])
 
         # t0:source input 里填"旧"视频源(用户上一次用的)
-        page.locator("#wd-wizard-body input[data-field-id='vd-source']").fill(OLD_SOURCE)
+        page.locator("#wd-wizard-body textarea[data-field-id='vd-sources']").fill(OLD_SOURCE)
 
         # t1:拖入新视频 → upload 在途
         res = page.evaluate(DROP_FILE, [".wd-wizard-canvas-wrap", "brand-new-clip.mp4"])
@@ -129,7 +129,7 @@ def main():
               f"disabled={nxt.is_disabled()}")
 
         # C3 上传在途时「打开」disabled
-        openbtn = page.locator("#wd-wizard-source-open-vd-source")
+        openbtn = page.locator("#wd-wizard-source-open-vd-sources")
         has_open = openbtn.count() > 0
         check("C3 上传在途时「打开」disabled",
               has_open and openbtn.is_disabled(),
@@ -145,14 +145,14 @@ def main():
         # t3:放行上传
         page.evaluate("() => window.__releaseUpload()")
         page.wait_for_function(
-            "() => (window._wd_wizard_values||{})['vd-source']"
-            " && window._wd_wizard_values['vd-source'].includes('wizard_upload_fix')",
+            "() => (window._wd_wizard_values||{})['vd-sources']"
+            " && window._wd_wizard_values['vd-sources'].includes('wizard_upload_fix')",
             timeout=8000)
 
         # C4 权威值 = 新上传路径,不是旧 url
-        got = page.evaluate("() => (window._wd_wizard_values||{})['vd-source']")
+        got = page.evaluate("() => (window._wd_wizard_values||{})['vd-sources']")
         check("C4 上传后 wizard 值为新上传路径", got == NEW_PATH,
-              f"vd-source={got!r} (旧值 {OLD_SOURCE!r})")
+              f"vd-sources={got!r} (旧值 {OLD_SOURCE!r})")
 
         # C5 上传完成后「下一步」恢复可用
         page.wait_for_timeout(300)

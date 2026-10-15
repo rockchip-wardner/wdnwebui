@@ -453,14 +453,22 @@
       // toggle / 复合容器(已经设了 data-field-id)无需再设
       if (!el.dataset.fieldId) el.dataset.fieldId = field.id;
       _bindFieldLive(cfg, state, field, el);
-      // 视频源字段(text 类型且 id 以 -source 结尾)自动追加"浏览…"按钮
-      // + 同 stepDef 内 -loop toggle 移到 source input 与 browse 之间
-      const isSource = field.type !== "textarea" && field.type !== "number"
+      // 视频源字段自动追加"浏览…"按钮 + 同 stepDef 内 -loop toggle。
+      //
+      // 两个约束缺一不可：
+      // * **textarea 也要给按钮** —— 多路视频源是一行一路的文本框，而
+      //   FSModal._commit 对 textarea 是**追加一行**不是整体替换，选一个
+      //   文件就是往源列表加一路。此前把 textarea 排除在外，等于多路卡的
+      //   向导里浏览按钮直接消失。
+      // * 正则结尾允许复数 `/-sources?$/` —— 三张卡的字段都是 `xxx-sources`，
+      //   只认 `-source` 时整个按钮行都不渲染。
+      const isSource = field.type !== "number"
           && field.type !== "checkbox" && field.type !== "select"
-          && /-source$/.test(field.id);
+          && /-sources?$/.test(field.id);
       if (isSource && window.VdFsModal) {
         const row = _ce("div", WIZARD_NS + "input-row");
-        row.appendChild(el);
+        // textarea 占满整行（塞进 input-row 会被压成一行宽），按钮行排在它下面。
+        (field.type === "textarea" ? wrap : row).appendChild(el);
         if (inlineLoopFieldId) {
           const loopField = (stepDef.fields || []).find(f => f.id === inlineLoopFieldId);
           if (loopField) row.appendChild(_buildToggle(loopField, state));
@@ -496,12 +504,17 @@
           openBtn.type = "button";
           openBtn.id = WIZARD_NS + "source-open-" + field.id;
           // 点击"打开"后,wizard 容器内需要展示视频。应用页面的 canvas 元素
-          // (id 形如 <prefix>-canvas,如 vd-canvas / vtd-canvas / vtl-canvas)
+          // (id 形如 <prefix>-canvas；多路卡用 wizard.json 的 canvas_id 显式声明)
           // 在 page section 内、被 wizard hidden;点击"打开"时把 canvas 元素
           // 直接挪到 wizard 容器内,后续 ws callback 通过 getElementById 仍能
           // 找到它(节点对象没变,只是父节点换了)— 不重写 ws 推帧逻辑。
-          // canvas 元素 id 推导规则:open_source_button 去掉 -open 加 -canvas。
-          const canvasId = cfg.open_source_button.replace(/-open$/, "-canvas");
+          // 画面容器 id：默认按 open_source_button 去掉 -open 加 -canvas 推导。
+          // 多路卡（vtd / vtl / vas）的画面是宫格 div 而不是 canvas，推导出的
+          // `*-canvas` 根本不存在 → 画面永远搬不进向导面板（而且不报错，
+          // 静默地什么都不发生）。所以允许 wizard.json 用 `canvas_id` 显式
+          // 声明，推导只作为单路老卡片的兜底。
+          const canvasId = cfg.canvas_id
+            || cfg.open_source_button.replace(/-open$/, "-canvas");
           // canvas-wrap 容器预先创建,放在 actions-row 后面,
           // 这样点"打开"搬 canvas 时位置确定;canvasWrap 引用由闭包共享
           const canvasWrap = _ce("div", WIZARD_NS + "canvas-wrap");

@@ -232,7 +232,15 @@
     // （如视频分析检索页的「路径 ↔ 历史选中」互斥）。
     _commit(el, p) {
       if (!el) return;
-      el.value = p;
+      // textarea 一行一路，整体替换会把其它已填的路全抹掉 → 追加一行
+      // （同一条不重复加）。input 语义是"这一格就是一个源"，仍整体替换。
+      if (el.tagName === "TEXTAREA") {
+        const lines = (el.value || "").split("\n").map((s) => s.trim()).filter(Boolean);
+        if (!lines.includes(p)) lines.push(p);
+        el.value = lines.join("\n");
+      } else {
+        el.value = p;
+      }
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
     },

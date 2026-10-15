@@ -277,7 +277,7 @@ console.log("\n【C】_fieldKey：wizard.json 的 ui_key 优先");
   // 带前缀的 camelCase（vcs-source → vcsSource）。各卡因此每个字段都显式
   // 写了 ui_key。
   check("显式 ui_key 优先于 id 推导",
-    priv._fieldKey("video-target-localization", { id: "vtl-source", ui_key: "source" }) === "source");
+    priv._fieldKey("video-target-localization", { id: "vtl-sources", ui_key: "source" }) === "source");
   check("前缀不匹配时不剥（video-analysis-search 同款短前缀）",
     priv._fieldKey("video-analysis-search", { id: "vcs-chunk-seconds" }) === "vcsChunkSeconds");
   check("前缀匹配时才剥",
