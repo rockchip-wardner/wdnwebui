@@ -343,10 +343,9 @@ function vasUpdateButtons() {
   // 未勾选「检索」→ 清空检索缓存勾选（checkbox 由 vcsApplyHistDisabled /
   // vcsApplyMutualExclusion 同步置灰），避免残留 key 让 anyChecked 计数失真。
   if (!wantSearch && VAS_SEARCH.cacheSel.size) VAS_SEARCH.cacheSel.clear();
-  // 问题文本框：检索问题 / 分析要求 —— 两者都必填（后端 query_multi 与
-  // VAS open 都校验非空）。留空时「开始」不可点。
+  // 问题文本框：检索问题必填（后端 query_multi 校验非空）。留空时「开始」
+  // 不可点。分析提问已固化为服务端常量，前端不再收集。
   const qSearch = (vcsEl("vcs-text")?.value || "").trim();
-  const qAnalyze = (vcsEl("vas-prompt")?.value || "").trim();
   const extracting = st === "extracting";
   const vasActive = VAS.state === "opening" || VAS.state === "running"
                  || VAS.state === "summarizing";
@@ -367,7 +366,6 @@ function vasUpdateButtons() {
     if (selSearchRun && !qSearch) canStart = false;
   } else {
     canStart = (analyzeRun || searchRun) && !running;
-    if (analyzeRun && !qAnalyze) canStart = false;
     if (searchRun && !qSearch) canStart = false;
   }
   if (startBtn) {
@@ -389,8 +387,6 @@ function vasUpdateButtons() {
         }
       } else if (!analyzeRun && !searchRun) {
         reason = "请选择视频文件，或在历史记录里勾选已缓存视频";
-      } else if (analyzeRun && !qAnalyze) {
-        reason = "请填写「分析」的分析要求";
       } else if (searchRun && !qSearch) {
         reason = "请填写「检索」的检索问题";
       } else if (extracting) {
@@ -706,12 +702,6 @@ function vasAnalysisRowHtml(it, an) {
   const meta = `${sampleText} · ${an.frame_count || 0} 帧`
              + ` · ${an.state || "unknown"}`
              + (an.summary ? " · 有综述" : "");
-  // 提示词摘要（去掉追加的 schema hint，截 16 字）—— 同 every_n 不同
-  // 提示词的记录可区分。
-  const pShort = (an.prompt || "").split("【输出格式")[0].trim();
-  const pPart = pShort
-    ? ` · 提示词: ${pShort.slice(0, 16)}${pShort.length > 16 ? "…" : ""}`
-    : "";
   // 用 checkbox（不是 radio）—— radio 语义上无法"再点一次取消"，用户
   // 选中一条分析记录后就没有退路（实测反馈）。checkbox 允许取消，选中
   // 逻辑仍是"单条"：由 JS 在选中时清掉其它条目的勾选（见 change handler）。
@@ -724,7 +714,7 @@ function vasAnalysisRowHtml(it, an) {
       `<input type="checkbox" class="vas-run-radio"` +
         ` data-run-id="${vcsEsc(runId)}"${checked} />` +
       `<span class="vas-hist-badge vas-hist-badge-run">分析</span>` +
-      `<span class="vcs-cache-meta">${vcsEsc(meta + pPart)}</span>` +
+      `<span class="vcs-cache-meta">${vcsEsc(meta)}</span>` +
       `<button class="vcs-cache-del" type="button" data-run-id="${vcsEsc(runId)}"` +
         ` title="删除此分析记录（不可恢复）">删除</button>` +
     "</div>"
@@ -1463,7 +1453,6 @@ async function vasStart() {
   const wantSearch = !!vcsEl("vas-mode-search")?.checked;
   const anyChecked = VAS_SEARCH.cacheSel && VAS_SEARCH.cacheSel.size > 0;
   const qSearch = (vcsEl("vcs-text")?.value || "").trim();
-  const qAnalyze = (vcsEl("vas-prompt")?.value || "").trim();
   // 勾选态不再被 modeAvail 抖动自动清掉（见 vasUpdateButtons），故在点开始
   // 这一刻校验"选中的功能是否真的可用"——算力未启用时明确提示，而不是让
   // 请求打到后端 502/503 才报。
@@ -1508,9 +1497,6 @@ async function vasStart() {
   if (searchRun && avail.search === false) {
     vcsShowError(`「检索」功能未启用 —— 请先在「算力配置」启用 ${VAS_MODE_LABEL.search}`);
     return;
-  }
-  if (analyzeRun && !qAnalyze) {
-    vcsShowError("请填写「分析」的分析要求"); return;
   }
   if (searchRun && !qSearch) {
     vcsShowError("请填写「检索」的检索问题"); return;
@@ -1762,9 +1748,8 @@ function initVideoSearch() {
     vcsStopPlayback();
   });
 
-  // 50 字计数（检索问题 / 分析要求共用同一绑定）
+  // 50 字计数（检索问题）
   bindTaCounter(textEl, vcsEl("vcs-ta-count"));
-  bindTaCounter(vcsEl("vas-prompt"), vcsEl("vas-ta-count"));
 
   const topKEl = vcsEl("vcs-top-k");
   const lenKEl = vcsEl("vcs-lenient-k");
@@ -2342,22 +2327,19 @@ function connectVfaWs() {
 async function vasStartAnalyze() {
   // 合并页共用视频源输入框（#vcs-source）。
   const sourceEl = document.getElementById("vcs-source");
-  const promptEl = document.getElementById("vas-prompt");
   const source = (sourceEl?.value || "").trim();
-  const prompt = (promptEl?.value || "").trim();
   // 判据（算法 / 阈值 / 帧间隔）由共享组件持有，这里只读取值拼请求体 ——
   // 组件自己在用户改控件时就已经 POST 落库了，这里是把同一份配置告诉
-  // 服务端"本轮按这个跑"。
+  // 服务端"本轮按这个跑"。分析提问已固化为服务端常量，不再随请求发送。
   const judge = window.FrameJudge?.config("vas") ||
                 { mode: "manual", every_n: 30, threshold: 6 };
   if (!source)  { vasShowError("请先选择视频源"); return; }
-  if (!prompt)  { vasShowError("请填写分析要求"); return; }
   if (!Number.isInteger(judge.every_n) || judge.every_n < 1) {
     vasShowError(judge.mode === "manual" ? "采样间隔必须为正整数" : "最长间隔必须为正整数");
     return;
   }
   const body = {
-    source, prompt,
+    source,
     every_n: judge.every_n,
     sample_mode: judge.mode,
   };
@@ -3212,10 +3194,11 @@ initVideoAnalysisSearch();
 // ------------------------------------------------------------------ *
 //  应用向导模式 API — wizard 框架 finish 时调用
 // 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
-//   vcs-source → opts.source   vas-prompt → opts.prompt
-//   vas-every-n → opts.everyN  vcs-text → opts.searchText
-// source/prompt/everyN 三字段齐全才点 #vas-start（统一入口按功能勾选并行
-// 发起分析/检索）；searchText 非空时额外勾选「检索」功能并写入问题框。
+//   vcs-source → opts.source   vcs-text → opts.searchText
+//   vas-judge-mode/threshold/every-n → opts.judgeMode/judgeThreshold/judgeEveryN
+// source 齐全才点 #vas-start（统一入口按功能勾选并行发起分析/检索）；
+// searchText 非空时额外勾选「检索」功能并写入问题框。分析提问已固化为
+// 服务端常量，不再由向导收集。
 // 写值后统一补发 input/change —— 卡片内源框 / 勾选框的监听依赖它们。
 // 全局名约定 ImApp_<app.id 去掉 hyphen>。
 // ------------------------------------------------------------------ *
@@ -3236,7 +3219,7 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
 
   if (opts.source) setVal("vcs-source", opts.source);
   if (opts.loop != null) setChecked("vcs-loop", !!opts.loop);
-  if (opts.prompt) setVal("vas-prompt", opts.prompt);
+  // 分析提问已固化为服务端常量，向导不再收集（原 opts.prompt 忽略）。
   // 判据（算法 / 阈值 / 帧间隔）交给共享组件：fromWizard 会同步控件并 POST
   // 落库。VAS 的判据是"下次开始分析生效"，所以这里必须 await 完成，否则
   // 紧接着的 vas-start 可能带着上一套参数开跑。
@@ -3259,9 +3242,9 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
   if (opts.chunkOverlap != null && opts.chunkOverlap !== "") {
     setVal("vcs-chunk-overlap", String(opts.chunkOverlap));
   }
-  const baseReady = !!(opts.source && opts.prompt);
+  const baseReady = !!opts.source;
   if (!baseReady) {
-    return { source_set: !!opts.source, prompt_set: !!opts.prompt,
+    return { source_set: !!opts.source,
              judge_set: !!judgeApplied,
              search_set: hasSearch, chunk_set: hasChunk, started: false };
   }
@@ -3276,10 +3259,10 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
   if (btn) {
     try { btn.click(); }
     catch (e) { throw new Error("WizardSnapshotError:vas_start_failed:" + (e?.message || e)); }
-    return { source_set: true, prompt_set: true, judge_set: !!judgeApplied,
+    return { source_set: true, judge_set: !!judgeApplied,
              search_set: hasSearch, chunk_set: hasChunk, started: true };
   }
-  return { source_set: true, prompt_set: true, judge_set: !!judgeApplied,
+  return { source_set: true, judge_set: !!judgeApplied,
            search_set: hasSearch, chunk_set: hasChunk, started: false };
 };
 

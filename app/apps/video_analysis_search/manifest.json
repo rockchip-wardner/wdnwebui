@@ -82,7 +82,7 @@
         "label": "VLMDoc.level 字段描述"
       }
     ],
-    "prompt_template": "请用中文描述视频中正在发生的事件。"
+    "prompt_template": "请对画面内容进行分析总结"
   },
   "requires_core": [
     "compute.registry",

@@ -213,8 +213,11 @@ async def list_events() -> dict:
 async def open_analysis(payload: dict) -> dict:
     """启动一次文件级 VLM 分析。
 
-    Body: ``{source: str, prompt: str, every_n: int,
-    sample_mode: str, change_threshold: float}``
+    Body: ``{source: str, every_n: int, sample_mode: str,
+    change_threshold: float}``
+
+    分析提问已固化为服务端常量（``service.ANALYSIS_PROMPT``），body 里即使
+    带 ``prompt`` 也会被忽略。
 
     ``sample_mode``：
       * ``"manual"``（默认）= 固定间隔，每 ``every_n`` 帧送检一次（原行为）；
@@ -224,11 +227,8 @@ async def open_analysis(payload: dict) -> dict:
     """
     payload = payload or {}
     source = (payload.get("source") or "").strip()
-    prompt = (payload.get("prompt") or "").strip()
     if not source:
         raise HTTPException(status_code=400, detail="source 不能为空")
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt 不能为空")
     try:
         every_n = int(payload.get("every_n", 30))
     except (TypeError, ValueError):
@@ -260,7 +260,7 @@ async def open_analysis(payload: dict) -> dict:
                 status_code=400,
                 detail="change_threshold 必须在 (0, 1000] 区间")
     try:
-        return get_service().start(source, prompt, every_n,
+        return get_service().start(source, every_n=every_n,
                                    sample_mode=sample_mode,
                                    change_threshold=change_threshold)
     except ValueError as e:

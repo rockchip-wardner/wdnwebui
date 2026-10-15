@@ -4177,12 +4177,17 @@ RIFF header by hand.
   - `GET  /api/video-analysis-search`             — 当前快照（state / 总帧 /
     进度 / 综述 / available / init_error）。
   - `GET  /api/video-analysis-search/events`      — per-frame events + summary。
-  - `POST /api/video-analysis-search/analysis/open` `{source, prompt,
+  - `POST /api/video-analysis-search/analysis/open` `{source,
     every_n, sample_mode, change_threshold}` — 启动一次；400
-    source/prompt/every_n/sample_mode 校验失败（`sample_mode` 收
-    `manual` 或 `frame_judge.metrics()` 里的度量名，当前只有 `conc`；
-    **已下架的 `z_mad` / 字面量 `auto` 放行并迁移到 conc 且丢弃旧阈值**，
+    source/every_n/sample_mode 校验失败（`sample_mode` 收
+    `manual` 或 `frame_judge.metrics()` 里的度量名，当前只有 `gscore`；
+    **已下架的 `z_mad` / 字面量 `auto` 放行并迁移到 gscore 且丢弃旧阈值**，
     不要给老客户端报 400 —— 升级后一点「开始」就报错比静默失效更难排查）；
+    503 wdnai 不可用 / 功能未启用。
+    **分析提问已固化为服务端常量** `service.ANALYSIS_PROMPT`
+    （`"请对画面内容进行分析总结"`）：body 里即使带 `prompt` 也被忽略，
+    前端不再收集（见下「前端」段）。改问法只改该常量 —— prompt_hash
+    随之变化，旧分析缓存会失配、同视频重跑一次即可重建。
     503 wdnai 不可用 / 功能未启用。
     历史 run 恢复（`service.py:_restore`）走同一套迁移，否则落库的
     `sample_mode` / 缓存键会与真正在跑的判据对不上。
@@ -4208,8 +4213,11 @@ RIFF header by hand.
     已停止 / 错误`），状态色随 `data-state` 切换；分析中显示"已读 N/M · 已
     分析 X/Y · LLM 队列 Z"。
   - 左侧表单：视频源（"浏览…"复用 `VdFsModal._sourceTarget = sourceEl` 机制，
-    current 项目已有，写路径回到 `#vcs-source`）+ 分析要求 textarea + 隔 N
-    帧采样输入 + 开始 / 停止 / 清空记录按钮。
+    current 项目已有，写路径回到 `#vcs-source`）+ 帧判据控件 + 开始 / 停止 /
+    清空记录按钮。**分析提问不在此页**：已固化为服务端常量
+    `service.ANALYSIS_PROMPT`，页面与向导都不再收集（`#vas-prompt`
+    textarea 与向导「分析要求」步骤均已删除）；历史分析子行也不再显示
+    「提示词: …」摘要（固化后恒定，无区分意义）。
   - 右侧综述框 + 历史分析列表（每条带状态徽章 + `加载 / 反查 / 删除`
     三个按钮横排，删除用 `margin-left:auto` 推到最右避免误点）。
   - 下方 `<details open>` 逐帧分析列表（默认折叠，新事件抵达时只 push、

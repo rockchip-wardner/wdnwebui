@@ -31,11 +31,6 @@
           "placeholder": "默认 600" }
       ]
     },
-    { "id": "prompt", "title": "分析要求",     "kind": "form",
-      "fields": [
-        { "id": "vas-prompt", "ui_key": "prompt", "label": "例:请对整段视频进行内容总结,给出主题、关键事件与时间线", "summary_label": "分析要求", "type": "textarea" }
-      ]
-    },
     { "id": "search", "title": "检索问题",     "kind": "form",
       "fields": [
         { "id": "vcs-text", "ui_key": "searchText", "label": "例:视频里有没有车辆驶出停车场", "summary_label": "检索问题", "type": "textarea" }

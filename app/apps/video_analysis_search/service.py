@@ -1274,6 +1274,12 @@ class FrameEvent:
         return out
 
 
+# 分析提问固化 —— 前端不再让用户填写，服务端恒用这一条。
+# 需要调整问法时只改这里（prompt_hash 随之变化 → 旧分析缓存失配，同一视频
+# 重跑一次即可重建）。
+ANALYSIS_PROMPT = "请对画面内容进行分析总结"
+
+
 # 综述 prompt 模板
 #
 # Qwen3-VL-4B 的 ``max_position_embeddings = 8192``，单次 prompt+output
@@ -1579,7 +1585,7 @@ class VideoAnalysisSearchService:
     # ------------------------------------------------------------------ #
     # 控制
     # ------------------------------------------------------------------ #
-    def start(self, source: str, prompt: str, every_n: int = 30,
+    def start(self, source: str, prompt: str = ANALYSIS_PROMPT, every_n: int = 30,
                  sample_mode: str = "manual",
                  change_threshold: Optional[float] = None) -> dict:
         ok, _, wdnai_err = _load_wdnai()
@@ -1589,8 +1595,9 @@ class VideoAnalysisSearchService:
             raise RuntimeError("wdnav.VideoCapture 不可用：原生库缺失")
         if not (source or "").strip():
             raise ValueError("source 不能为空")
-        if not (prompt or "").strip():
-            raise ValueError("prompt 不能为空")
+        # 分析提问已固化到 ``ANALYSIS_PROMPT``：忽略调用方传入值（前端不再
+        # 收集），保证 prompt / prompt_hash / 落库文本三者恒定一致。
+        prompt = ANALYSIS_PROMPT
         try:
             every_n = max(1, int(every_n))
         except (TypeError, ValueError):
