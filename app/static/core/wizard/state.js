@@ -35,8 +35,15 @@
   // ------------------------------------------------------------------ #
   // localStorage 持久化
   // ------------------------------------------------------------------ #
-  function _lsKey(appId, cfg) {
-    return cfg.localStorage_key || ("wdnwebui.wizard." + appId + ".values");
+  // 同一份 (appId, cfg) 下三块独立键,共享 base + 不同 suffix:
+  //   *.values    —— 各步骤字段已填值
+  //   *.step      —— 上次停留的步骤 idx(导航中途切走 / reboot 后恢复)
+  //   *.completed —— applyWizardSnapshot 成功调过一次,后续自动 mount 跳过
+  function _lsBase(appId, cfg) {
+    return cfg.localStorage_key || ("wdnwebui.wizard." + appId);
+  }
+  function _lsKey(appId, cfg, suffix) {
+    return _lsBase(appId, cfg) + "." + (suffix || "values");
   }
   function _lsLoad(appId, cfg) {
     try {
@@ -48,6 +55,70 @@
     try {
       localStorage.setItem(_lsKey(appId, cfg), JSON.stringify(values));
     } catch (_) { /* ignore quota */ }
+  }
+
+  // currentStep 持久化:用户填到第 3 步中途切走 / reboot / 重新打开
+  // 软件,下次 mount 应该回到第 3 步,而不是第 1 步(把已填值都丢了的
+  // 既视感)。边界:超过 cfg.steps.length 视为 0(配置缩步骤时回退)。
+  function _lsLoadStep(appId, cfg) {
+    try {
+      const raw = localStorage.getItem(_lsKey(appId, cfg, "step"));
+      if (raw == null) return 0;
+      const n = parseInt(raw, 10);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    } catch (_) { return 0; }
+  }
+  function _lsSaveStep(appId, cfg, step) {
+    try {
+      localStorage.setItem(_lsKey(appId, cfg, "step"), String(step));
+    } catch (_) { /* ignore quota */ }
+  }
+  function _lsClearStep(appId, cfg) {
+    try { localStorage.removeItem(_lsKey(appId, cfg, "step")); }
+    catch (_) {}
+  }
+
+  // 完成标记:_finish() 里 applyWizardSnapshot 成功后置 1。
+  // 之后 tryMount 会跳过自动挂载,直到用户点"向导模式"按钮显式
+  // 重置(走 force=true 同时清掉 step + completed)。
+  function _lsLoadCompleted(appId, cfg) {
+    try {
+      return localStorage.getItem(_lsKey(appId, cfg, "completed")) === "1";
+    } catch (_) { return false; }
+  }
+  function _lsSaveCompleted(appId, cfg, completed) {
+    try {
+      localStorage.setItem(_lsKey(appId, cfg, "completed"),
+                           completed ? "1" : "0");
+    } catch (_) { /* ignore quota */ }
+  }
+  function _lsClearCompleted(appId, cfg) {
+    try { localStorage.removeItem(_lsKey(appId, cfg, "completed")); }
+    catch (_) {}
+  }
+
+  // "退出应用" 兜底:framework 在 back-home 按钮 handler 里调。
+  // 把该 app 的整个 wizard 状态(values / step / completed)从
+  // localStorage 抹掉,下次进入时 wizard 就像首次启动一样 —— 从
+  // 第 1 步、空字段开始。**仅按 appId 清**:cfg 决定了 key 形
+  // 式,缺 cfg 时按默认 base "wdnwebui.wizard.<appId>" 匹配;目前
+  // 没有 card 设 cfg.localStorage_key,所以默认 base 已能覆盖所有
+  // 卡。如未来加了 custom prefix,这里要扩成"已知 base 表"再迭代。
+  function _lsClearAllFor(appId) {
+    const base = "wdnwebui.wizard." + appId;
+    const suffixes = ["values", "step", "completed"];
+    try {
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (!k) continue;
+        for (const s of suffixes) {
+          if (k === base + "." + s) {
+            localStorage.removeItem(k);
+            break;
+          }
+        }
+      }
+    } catch (_) { /* ignore */ }
   }
 
   // ------------------------------------------------------------------ //
@@ -1003,6 +1074,9 @@
     const { cfg, container, app } = _active;
     if (idx < 0 || idx >= cfg.steps.length) return;
     _active.currentStep = idx;
+    // 落盘:用户切走 / reboot 后下次 mount 跳回这里。写盘失败不
+    // 影响本次 UI(只是个 best-effort 提示)。
+    _lsSaveStep(app.id, cfg, idx);
     _renderStepper(_q("#" + WIZARD_NS + "stepper", container), cfg, idx);
     const body = _q("#" + WIZARD_NS + "body", container);
     const foot = _q("#" + WIZARD_NS + "foot", container);
@@ -1095,6 +1169,12 @@
       }
       throw e;
     }
+    // applyWizardSnapshot 成功落到了下游 → 此向导视为"已完成"。
+    // 写盘后下次 tryMount(自动挂载路径)读到 completed=1,不再弹
+    // 向导;用户想重新配置必须显式点"向导模式"按钮(force=true)。
+    // 故意写在 unmount() 之前,这样即使用户紧接着切走,wizard
+    // DOM 销毁也不影响这个标记已落盘。
+    _lsSaveCompleted(state.app.id, state.cfg, true);
     unmount();
   }
 
@@ -1269,16 +1349,22 @@
 
     const values = _lsLoad(app.id, cfg);
     const envCheck = await _probeEnv(cfg, app);
+    // 恢复上次停留的步骤:用户填到第 3 步中途切走 / reboot 后再回
+    // 同一张卡,wizard 应跳回第 3 步而不是强制第 1 步。超过当前 cfg
+    // .steps.length 视为配置变更(步骤被剪了)→ 回 0。
+    const stepCount = (cfg.steps || []).length;
+    const restored = _lsLoadStep(app.id, cfg);
+    const startStep = (restored > 0 && restored < stepCount) ? restored : 0;
 
     _active = {
       app, cfg, container,
-      currentStep: 0,
+      currentStep: startStep,
       values,
       envCheck,
       intervals: [],
     };
     _renderShell(container, app, cfg);
-    _gotoStep(0);
+    _gotoStep(startStep);
 
     // 监听 hashchange / 自定义 pagechange:用户在 wizard 模式下点 sidebar
     // 切到其他应用 / 系统页面时,自动 unmount 避免 wizard DOM 残留
@@ -1365,13 +1451,30 @@
     } catch (_) {}
   }
 
-  window.WizardState = { mount, unmount, stepForward, stepBackward, skip };
+  // isCompleted / clearCompleted / clearStep 由 registry.tryMount 在
+  // auto-mount 路径上读、"向导模式"按钮路径上写。三个 API 都以
+  // (app, cfg) 形式传入,因为 localStorage key 含 cfg.suffix。
+  //
+  // clearAll(appId) 是 framework 在 back-home "退出应用" 兜底里
+  // 调,把整张卡的 wizard 状态全清(无 cfg,按默认 base 匹配)——
+  // 配合 ActivateManager._exit() 让"退出应用" = 完全回到首装状态。
+  window.WizardState = {
+    mount, unmount, stepForward, stepBackward, skip,
+    isCompleted: (app, cfg) => _lsLoadCompleted(app.id, cfg),
+    clearCompleted: (app, cfg) => _lsClearCompleted(app.id, cfg),
+    clearStep: (app, cfg) => _lsClearStep(app.id, cfg),
+    clearAll: (appId) => _lsClearAllFor(appId),
+  };
 
   // ------------------------------------------------------------------ #
   // window.enterWizardMode(appId) — 应用页面左上角"向导模式"按钮调用入口
   // 从 window.__APP_MANIFESTS__ 找 manifest,先 unmount 现有 wizard(以防
   // 重复挂),再调 registry.tryMount 挂新 wizard。若应用未在主页面 manifest
   // 中(极端情况),仅 console.warn 不抛错。
+  //
+  // 注意:传 {force: true}。用户主动点这个按钮 = 显式想重新配置,
+  // 即便之前已完成也要重挂,且要从第 1 步重新走一遍。force=true 由
+  // registry.tryMount 兜底:清掉 completed + step。
   // ------------------------------------------------------------------ #
   window.enterWizardMode = function (appId) {
     const cards = (window.__APP_MANIFESTS__ && window.__APP_MANIFESTS__.cards) || [];
@@ -1382,7 +1485,7 @@
     }
     try { unmount(); } catch (_) { /* 可能没有挂载,忽略 */ }
     if (window.WizardRegistry && window.WizardRegistry.tryMount) {
-      window.WizardRegistry.tryMount(manifest);
+      window.WizardRegistry.tryMount(manifest, { force: true });
     } else {
       console.warn("[wizard-state] enterWizardMode: WizardRegistry not loaded");
     }

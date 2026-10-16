@@ -837,6 +837,37 @@
   }
 
   // ─────────────────────────────────────────────────────────────────────
+  // "向导模式" 按钮 — 各 app template.html 里
+  //   <button class="wizard-mode-btn" data-wizard-mode
+  //           data-page-id="<id>">向导模式</button>
+  // 之前是 dead UI:DOM 在、样式在、`enterWizardMode` 全局函数也在,
+  // 但没有任何 JS 把 click 接到那个函数。后果是用户完成向导后,
+  // 该按钮看起来可点、实际无反应;真要重开 wizard 只能走
+  // bootRestore 之前的旧路径(已被 v0.22 改后失效)。
+  //
+  // 事件委托挂 document,而不是每个 button 各挂 —— 模板里 6 张卡都
+  // 有这按钮,各 app.js 也不要重复 wire。
+  // ─────────────────────────────────────────────────────────────────────
+
+  function wireWizardModeButtons() {
+    document.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-wizard-mode]");
+      if (!btn) return;
+      const appId = btn.getAttribute("data-page-id");
+      if (!appId) return;
+      ev.preventDefault();
+      if (typeof window.enterWizardMode === "function") {
+        window.enterWizardMode(appId);
+      } else {
+        // 理论不可能:wizard/registry.js 比 framework 早 boot,
+        // WizardState 加载顺位也在 enterWizardMode 之前。但留个
+        // 兜底,避免真出现时静默失败。
+        console.warn("[framework] enterWizardMode not loaded yet");
+      }
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
   // Bootstrap
   // ─────────────────────────────────────────────────────────────────────
 
@@ -942,6 +973,9 @@
     _registerCardsFromManifest();
     injectBackHomeButtons();
     wireAppsPanel();
+    // 各 app template.html 里的"向导模式"按钮统一委托(见
+    // wireWizardModeButtons 注释):6 张卡都靠这按钮重开 wizard。
+    wireWizardModeButtons();
     updateBackHomeLabels();
     onHashChange();
     // Boot 后端记着的 active_app(若有)→ 直接跳过去。必须在第一次
