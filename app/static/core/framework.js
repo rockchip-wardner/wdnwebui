@@ -778,6 +778,19 @@
         // 失败吞掉 —— best-effort,不能因为清状态失败就拦用户的"退出"
         // 动作。location.hash 必须无条件设,用户期望总是回到 home。
         _exitClearWizardByCfg(cp).catch(() => {});
+        // 第三道兜底(终极):直接按默认 base + 三个 suffix 删,
+        // 不依赖 WizardState / fetch / 函数调用栈,即使前两道因
+        // 任何原因失败,这一道也保证 .completed 一定被清 —— 这是
+        // 用户能进 wizard 的**最关键**字段。其他两个 suffix 漏清只
+        // 是体验问题(默认值会回填),这个漏了 wizard 根本不弹。
+        try {
+          const base = "wdnwebui.wizard." + cp;
+          localStorage.removeItem(base + ".completed");
+          localStorage.removeItem(base + ".values");
+          localStorage.removeItem(base + ".step");
+        } catch (_) { /* best-effort */ }
+        console.warn("[back-home DEBUG] ls-final:",
+                     Object.keys(localStorage).filter(k => k.includes(cp)));
         location.hash = "#/";
       });
     });
