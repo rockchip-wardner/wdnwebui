@@ -72,6 +72,16 @@ class MultiCardSpec:
     upload_dir: Path = UPLOAD_DIR
 
 
+class JudgeChannelPayload(BaseModel):
+    """单路判据配置（多路下每路独立）。
+
+    字段缺失 = 沿用当前值（与 :class:`JudgePayload` 同契约）。
+    """
+    mode: Optional[str] = None
+    every_n: Optional[int] = Field(default=None, ge=1, le=3600)
+    threshold: Optional[float] = Field(default=None, gt=0, le=1000)
+
+
 class JudgePayload(BaseModel):
     """``POST /judge`` 的请求体。
 
@@ -79,13 +89,25 @@ class JudgePayload(BaseModel):
     签名变成字符串 ``"JudgePayload"``，FastAPI 解析时只查模块 globals ——
     定义在 :func:`build_multi_router` 局部作用域里会抛
     ``PydanticUserError: ForwardRef('JudgePayload') is not fully defined``。
+
+    **多路语义**（v0.23 起）：
+    - 顶层 ``mode`` / ``every_n`` / ``threshold`` 仍接受 —— 视为对**所有路**
+      一次性下发（兼容单路老用法 / 向导批量设）；
+    - 顶层 ``channels`` 是 ``{channel_idx: JudgeChannelPayload}`` 字典，按路
+      精细覆盖（v0.23 UI 上点 tile → 改阈值的入口）。
+    - 同一字段：``channels`` 里的该路配置**覆盖**顶层（merge 顺序：先顶层、
+      再按 idx 覆盖）。``None`` 字段跳过 = 沿用当前值。
     """
-    mode: str = Field(default=EXPOSED_METRICS[0],
-                      description="manual（手动跳帧）或任一暴露的度量名")
-    every_n: int = Field(default=DEFAULT_EVERY_N, ge=1, le=3600,
-                         description="兜底帧间隔")
+    mode: Optional[str] = Field(default=None,
+                                description="manual 或任一暴露的度量名；不传=沿用")
+    every_n: Optional[int] = Field(default=None, ge=1, le=3600,
+                                   description="兜底帧间隔；不传=沿用")
     threshold: Optional[float] = Field(default=None, gt=0, le=1000,
-                                       description="变化阈值（不传=按模式规则）")
+                                       description="变化阈值；不传=沿用")
+    channels: Optional[Dict[int, JudgeChannelPayload]] = Field(
+        default=None,
+        description="按路精细覆盖。例：{2: {threshold: 8.0}} 只改第 3 路阈值。",
+    )
 
 
 def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
@@ -299,13 +321,33 @@ def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
 
         靠 ``model_fields_set`` 判断 Pydantic 是不是替我们填了 default：
         这些字段的 default 全都非空，直接透传会把用户调好的值冲掉。
+
+        **v0.23 多路独立配置**：
+        - 顶层 mode/every_n/threshold 同字段缺失语义
+        - ``channels`` 字典 = 按路精细下发（每路 JudgeChannelPayload
+          自身也是"字段缺失 = 沿用该路当前值"）
+        - channels 内部以 idx 索引；不在字典里的路不受影响
         """
         f = payload.model_fields_set
-        raw = str(payload.mode).strip().lower() if "mode" in f else ""
+        # 顶层 mode：模型 default 是 None，字段缺失时 model_fields_set
+        # 不会包含它（用 default）。但显式 "" 也想"保留当前"，所以 raw 不空就传
+        raw = str(payload.mode).strip().lower() if "mode" in f else None
+        # payload.channels 字段缺失 → None（按入参 model_fields_set 判定；
+        # Pydantic v2 不再靠 default 区分）。
+        # channels 内的子元素是 JudgeChannelPayload（Pydantic 模型），
+        # 走 model_dump 拿 dict；exclude_none 跳过"未指定字段"，让后端按
+        # 每路当前值沿用。
+        if "channels" in f and payload.channels:
+            chs = {idx: c.model_dump(exclude_none=True)
+                   for idx, c in payload.channels.items()}
+        else:
+            chs = None
         return spec.session_getter().configure_judge(
-            mode=raw or None,                       # 显式 mode="" 也保留当前
+            mode=raw or None,
             every_n=payload.every_n if "every_n" in f else None,
-            threshold=payload.threshold if "threshold" in f else None)
+            threshold=payload.threshold if "threshold" in f else None,
+            channels=chs,
+        )
 
     @router.post("/judge/reset")
     async def reset_judge() -> dict:

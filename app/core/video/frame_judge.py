@@ -600,6 +600,40 @@ class FrameJudge:
         self._commit(pos, score, changed)
         return changed
 
+    def decide_take_for_rr(self, current_pos: int) -> bool:
+        """轮转线程专用：读最近一次 ``observe()`` 留下的状态，决定本路要不要送 VLM。
+
+        设计动机：解码线程**每帧**调一次 ``observe()`` 持续算分（让浮框/曲线
+        不依赖启动检测就能实时刷新），但 ``observe()`` 自身有写副作用
+        （``_last_pos`` / ``_last_luma`` / ``_evaluated``）—— 不能两个线程并发
+        调同一个实例。轮转线程改用本方法**只读**，避免双写。
+
+        判定语义与 ``observe()`` 内的 ``take`` 逻辑**逐字一致**：
+
+        - ``score > threshold`` —— 真变化
+        - 或 ``gap >= every_n and score >= threshold * 0.5`` —— 兜底
+          （画面静止时满 every_n 也送一次，但前提是"确实变了点"，与
+          ``observe()`` 内部 ``fallback`` 同取舍）
+
+        读侧用 ``_lock`` 拿一致快照，避免被解码线程正在写的 ``_commit`` 撕开。
+
+        ``current_pos`` 应传本路已解码帧数（与原 ``observe(frame_pos)`` 同口径）。
+
+        返回 True = 送 VLM；False = 跳过本路。
+        """
+        with self._lock:
+            cur = self._cur
+            thr = self._threshold
+            n = self._every_n
+            last_pos = self._last_pos
+        if cur is None:
+            # 还没打过分（首帧 / 参照帧还没建）—— 放行一次，让首帧进推理
+            # 之后判据就有得分了。下一次 observe() 会写 _cur。
+            return True
+        gap = (int(current_pos) - last_pos) if last_pos >= 0 else int(current_pos)
+        fallback = gap >= n and cur >= thr * 0.5
+        return bool(cur > thr or fallback)
+
     def _commit(self, pos: int, score: Optional[float], changed: bool) -> None:
         """记一笔观测结果。分数与计数统一在这里收口，便于 snapshot 读取。
 

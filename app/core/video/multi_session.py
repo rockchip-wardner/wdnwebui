@@ -467,6 +467,33 @@ class Channel:
                 except Exception:  # noqa: BLE001
                     pass
 
+                # 帧判据：每路解码线程**每帧**调一次 observe，持续打分。
+                # 让向导/预览页的浮框 / 曲线在「只 open 视频、未启动检测」
+                # 时也能实时刷新 —— 与单路 VideoSession 行为对齐。单路路径
+                # 是 session.py 解码循环里持续调 observe() 的，多路在
+                # v0.22 时只把 ch.judge 复制到每路，但 observe() 调用仍留在
+                # 轮转线程里 → 必须先启动检测才打分，浮框永远 "--"。
+                #
+                # 成本：RGA 缩到 judge.long_side（默认 160）+ cv2 灰度 +
+                # gscore 实测 < 0.5ms/帧/路。N=32 路合计 ~16ms/s，可忽略
+                # （已经在 decode 热路径上）。observe 自身有 every_n 节流算
+                # 分（auto 模式下手动门控），不是每帧都重算 gscore。
+                #
+                # 与 _rr_loop 的关系：observe 有写副作用（_last_pos / _last_luma
+                # / _evaluated），不能并发。**解码线程独占 observe**，
+                # 轮转线程改读 FrameJudge.decide_take_for_rr（只读不写），
+                # 详见 _rr_loop 注释。
+                if self.judge is not None and self.judge.is_auto:
+                    thumb = self.snapshot_gray_for_judge(self.judge.long_side)
+                    if thumb is not None:
+                        try:
+                            self.judge.observe(thumb, self.frames)
+                        except Exception as exc:  # noqa: BLE001
+                            # 与 _rr_loop 同样"宁可多送不可漏检"：打分失败时
+                            # 不影响解码主循环，下一帧重试。
+                            LOG.warning("mc-ch%02d 解码侧判据异常，下帧重试: %s",
+                                        self.idx, exc)
+
                 # 只有到 display_fps 的点才做 JPEG 编码（实测 384x216 只要
                 # 0.77ms/次，很便宜）。
                 #
@@ -842,23 +869,26 @@ class MultiChannelSession:
                 judge_pos = ch.frames
                 judge_score: Optional[float] = None
                 # 判据门控只在自动模式下走，manual 整段跳过（不缩缩略图也
-                # 不算分），此时行为与接入判据前一致。先判据后取送检图，
-                # 被挡下时连 384 的那次 RGA 都省掉。
+                # 不算分），此时行为与接入判据前一致。
+                #
+                # **这里只读不写**。解码线程已每帧调过 ``ch.judge.observe()``
+                # 写好了 _cur / _changed / _last_pos（让浮框/曲线实时刷新），
+                # 轮转线程如果再调 observe 会双写、污染参照帧。用
+                # ``decide_take_for_rr(pos)`` 读最近一次 observe 留下的状态
+                # 决定本路要不要送 VLM —— 判定语义与 observe() 内部 take 逐字
+                # 一致（``score > thr`` 或 ``gap >= every_n && score >= thr/2``）。
                 if ch.judge is not None and ch.judge.is_auto:
-                    thumb = ch.snapshot_gray_for_judge(
-                        ch.judge.long_side)
-                    if thumb is not None:
-                        try:
-                            take = ch.judge.observe(thumb, judge_pos)
-                        except Exception as exc:  # noqa: BLE001
-                            LOG.warning("mc-ch%02d 判据异常，按放行处理: %s",
-                                        ch.idx, exc)
-                            take = True
-                        if not take:
-                            with self._lock:
-                                self._rr_judge_skips += 1
-                            continue
-                        judge_score = ch.judge.current_score
+                    try:
+                        take = ch.judge.decide_take_for_rr(judge_pos)
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning("mc-ch%02d 判据读侧异常，按放行处理: %s",
+                                    ch.idx, exc)
+                        take = True
+                    if not take:
+                        with self._lock:
+                            self._rr_judge_skips += 1
+                        continue
+                    judge_score = ch.judge.current_score
 
                 # 请求本路在**下一次解码**上多出一张送检尺寸的图（同一次
                 # 解码的 DMA-BUF 多跑一次 RGA），然后等它交接。没有出帧就
@@ -939,28 +969,76 @@ class MultiChannelSession:
     # ------------------------------------------------------------------ #
     # 帧判据（每路一个独立判据器）
     # ------------------------------------------------------------------ #
-    def configure_judge(self, mode: Optional[str] = None,
-                        every_n: Optional[int] = None,
-                        threshold: Optional[float] = None) -> dict:
+    def configure_judge(
+        self,
+        mode: Optional[str] = None,
+        every_n: Optional[int] = None,
+        threshold: Optional[float] = None,
+        channels: Optional[Dict[int, Dict[str, Any]]] = None,
+    ) -> dict:
         """配置判据，对**已在跑**的各路立刻生效。
 
         归一化全交给 ``_judge_proto.reconfigure()``（迁移表、模式换了换默认
         阈值都在那里），这里只负责把结果下发到每一路 —— 与单路
         ``VideoSession.configure_judge`` 语义相同，差别只在这里有 N 份要同步。
+
+        **三种下发模式**（互斥语义，但实现上可叠加）：
+
+        * 顶层 ``mode/every_n/threshold`` 全 None + ``channels`` 不传 → no-op。
+        * 顶层字段非空 + ``channels`` 为空 → 把当前配置当"新默认"，下发到
+          **所有路**（覆盖各路现有值）。这是向导批量设 + 「应用到所有路」
+          按钮的入口。
+        * 顶层全 None + ``channels`` 非空 → **只动 channels 字典里**的
+          那些路；其他路**保持现状，绝不被 reconfigure 冲回**。这一条是关键：
+          之前对未指定路也跑了一次 ``reconfigure(proto_thr)``，等价于"用
+          proto 当前值"把它们之前单独设的阈值冲回 —— 4 路下改 ch2 阈值会
+          顺手把 ch0 之前单独设的 5.5 冲成 10，实测踩过。
+
+        顶层与 ``channels`` 都给：把顶层当 fallback，下发所有路。
         """
-        self._judge_proto.reconfigure(mode=mode, every_n=every_n,
-                                      threshold=threshold)
         with self._lock:
-            channels = [ch for ch in self._channels if ch.judge is not None]
-        for ch in channels:
-            # reconfigure 会清参照帧与分数历史：阈值/算法变了之后，旧参照帧
-            # 是按旧口径选出来的，继续用会把新旧分数混在一份曲线里。
-            ch.judge.reconfigure(mode=self._judge_proto.mode,
-                                 every_n=self._judge_proto.every_n,
-                                 threshold=self._judge_proto.threshold)
-        LOG.info("mc-judge: mode=%s every_n=%d threshold=%.2f → %d 路",
-                 self._judge_proto.mode, self._judge_proto.every_n,
-                 self._judge_proto.threshold, len(channels))
+            chs = [ch for ch in self._channels if ch.judge is not None]
+
+        per_overrides: Dict[int, Dict[str, Any]] = {}
+        if channels:
+            for idx, cfg in channels.items():
+                per_overrides[int(idx)] = {
+                    "mode": cfg.get("mode"),
+                    "every_n": cfg.get("every_n"),
+                    "threshold": cfg.get("threshold"),
+                }
+
+        top_has = mode is not None or every_n is not None or threshold is not None
+        if top_has and not per_overrides:
+            # 1) 顶层下发所有路 —— 走 proto 拿到归一化结果
+            self._judge_proto.reconfigure(mode=mode, every_n=every_n,
+                                          threshold=threshold)
+            proto_mode = self._judge_proto.mode
+            proto_every = self._judge_proto.every_n
+            proto_thr = self._judge_proto.threshold
+            for ch in chs:
+                ch.judge.reconfigure(mode=proto_mode, every_n=proto_every,
+                                     threshold=proto_thr)
+            LOG.info("mc-judge: %d 路下发 proto=mode=%s thr=%s",
+                     len(chs), proto_mode, proto_thr)
+        elif per_overrides:
+            # 2) 仅按路下发 —— proto **不动**（用户没显式要改它），每路从
+            #    当前值 + per_overrides 增量合并；channels 之外的 ch 跳过。
+            for ch in chs:
+                ov = per_overrides.get(ch.idx)
+                if ov is None:
+                    continue
+                cur = ch.judge
+                ov_mode = ov.get("mode") or cur.mode
+                ov_every = ov.get("every_n") or cur.every_n
+                ov_thr = ov.get("threshold") if ov.get("threshold") is not None else cur.threshold
+                # reconfigure 会清参照帧与分数历史：阈值/算法变了之后，旧参照帧
+                # 是按旧口径选出来的，继续用会把新旧分数混在一份曲线里。
+                cur.reconfigure(mode=ov_mode, every_n=ov_every,
+                                threshold=ov_thr)
+            LOG.info("mc-judge: %d 路精细下发", len(per_overrides))
+        else:
+            LOG.info("mc-judge: no-op")
         return self.judge_snapshot()
 
     def reset_judge(self) -> dict:
@@ -1000,9 +1078,17 @@ class MultiChannelSession:
             if s["cur"] is not None:
                 cur = s["cur"]
                 changed = s["changed"]
-            per.append({"channel": ch.idx, "evaluated": s["evaluated"],
-                        "sampled": s["sampled"], "cur": s["cur"],
-                        "changed": s["changed"]})
+            per.append({
+                "channel": ch.idx,
+                "evaluated": s["evaluated"],
+                "sampled": s["sampled"],
+                "cur": s["cur"],
+                "changed": s["changed"],
+                # v0.23 每路独立配置：前端按路渲染判据配置
+                "mode": ch.judge.mode,
+                "every_n": ch.judge.every_n,
+                "threshold": ch.judge.threshold,
+            })
         recent.sort(key=lambda x: x[0])
         del recent[:-200]
         return {
