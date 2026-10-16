@@ -1,0 +1,37 @@
+/* ==========================================================================
+   多卡实例选择器 + 事件卡号角标（视频目标监控 / 视频目标定位 共用）
+   —— 配 app/static/core/model-pick.js。卡片私有样式另算增量。
+   ========================================================================== */
+
+/* 实例勾选列表：每个勾选框 = 一张卡上的一个推理 slot。远端实例禁用但仍列
+ * 出来 —— 列表是"现在能选什么"的唯一来源，藏起来用户不知道为什么选不到。 */
+.vtd-inst-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+}
+.vtd-inst-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.vtd-inst-row input[type="checkbox"] { margin: 0; flex: 0 0 auto; }
+.vtd-inst-row.is-remote { cursor: not-allowed; opacity: 0.55; }
+.vtd-inst-row.is-remote .vtd-inst-label { color: var(--muted); }
+.vtd-inst-empty { font-size: 0.75rem; color: var(--muted); }
+
+/* 事件来源卡号：多卡并行时用来区分"这条是 NPU0 还是 NPU1 算出来的"。
+   通道号只说明"看的是第几路"，看不出"谁算的" —— 排查"是不是只有一张卡
+   在干活"时这行是唯一线索。 */
+.vd-event-npu {
+  font-size: 0.7rem;
+  color: var(--muted);
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+  border-radius: 3px;
+  padding: 0 0.25rem;
+}

@@ -2,7 +2,7 @@
   "enabled": true,
   "wizard_title": "视频目标定位快速配置",
   "swcap_to_model": {
-    "swcap_grounding": { "npu_index": 0, "model_id": "LocateAnything-3b" }
+    "swcap_grounding": { "npu_index": [0, 1], "model_id": "LocateAnything-3b" }
   },
   "open_source_button": "vtl-open",
   "canvas_id": "vtl-grid",

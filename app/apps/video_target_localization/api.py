@@ -15,7 +15,12 @@ from __future__ import annotations
 from fastapi import HTTPException
 
 from app.core.llm.detector_base import get_localizer_detector
-from app.core.video.multi_api import MultiCardSpec, PromptPlan, build_multi_router
+from app.core.video.multi_api import (
+    MultiCardSpec,
+    PromptPlan,
+    build_multi_router,
+    parse_models_field,
+)
 from app.core.video.multi_session import MultiChannelSession, get_multi_session
 
 # 会话单例按卡隔离（见 get_multi_session 的 docstring）。
@@ -59,9 +64,10 @@ def _parse_prompt(payload: dict) -> PromptPlan:
        :func:`_build_vtl_prompt` 负责）
 
     ``prompts`` 给了就以它为准（空 list 也算给了）；没给才回落老 ``prompt``。
-    本页不接受 ``image_size``（vision 固定 448，size picker 无意义）与
-    ``model_id``（``swcap_grounding`` 只有 1 个 preset）；``enabled_tools``
-    恒为空 —— 该页只走 ``LocatorDoc``。
+    本页不接受 ``image_size``（vision 固定 448，size picker 无意义）；
+    ``enabled_tools`` 恒为空 —— 该页只走 ``LocatorDoc``。
+
+    ``models`` 是勾选的**实例**列表（多卡并行推理），缺省 = 单实例自动挑。
     """
     legacy_prompt = payload.get("prompt")
     prompts_list = payload.get("prompts")
@@ -106,7 +112,8 @@ def _parse_prompt(payload: dict) -> PromptPlan:
             raise HTTPException(status_code=400, detail="rr_interval 必须是数字")
 
     return PromptPlan(
-        start_kwargs={"prompt": prompt, "enabled_tools": []},
+        start_kwargs={"prompt": prompt, "enabled_tools": [],
+                      "models": parse_models_field(payload)},
         rr_interval=rr_interval,
     )
 

@@ -62,6 +62,52 @@ class PromptPlan:
     rr_interval: float = 0.0
 
 
+def parse_models_field(payload: dict) -> Optional[list]:
+    """解析多卡并行的 ``models`` 字段 → ``[{"model_id","npu_index"}, ...]``。
+
+    勾选粒度是**实例**而不是模型：同一个 model_id 出现在不同 npu_index 上就是
+    「同一个模型跑多张卡并行」，每条各占一个推理 slot。只传 model_id 的话后端
+    只能拿到一个卡号，多卡整个退化成单卡。
+
+    字段缺省 / 为 null → 返回 None，调用方走单实例旧路径。
+
+    Raises:
+        HTTPException: 400 —— 类型不对、空数组、项不是 dict、重复实例。
+    """
+    raw = payload.get("models", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(
+            status_code=400, detail=f"models 必须是非空数组: {raw!r}")
+    out: list = []
+    seen: set = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"models 每项必须是 {{model_id, npu_index}}: {item!r}")
+        mid = item.get("model_id")
+        if not isinstance(mid, str) or not mid.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"models[].model_id 必须是非空字符串: {item!r}")
+        npu = item.get("npu_index")
+        if npu is not None and (isinstance(npu, bool) or not isinstance(npu, int)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"models[].npu_index 必须是整数或 null: {item!r}")
+        key = (mid.strip(), npu)
+        # 同一实例勾两次 = 两条线程挤同一个 worker 进程，句柄不可重入
+        if key in seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"models 含重复实例 model_id={mid!r} npu_index={npu!r}")
+        seen.add(key)
+        out.append({"model_id": mid.strip(), "npu_index": npu})
+    return out
+
+
 @dataclass(frozen=True)
 class MultiCardSpec:
     """一张多路视频卡接入本工厂要提供的东西。"""

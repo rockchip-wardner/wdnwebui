@@ -11,7 +11,12 @@ from __future__ import annotations
 from fastapi import HTTPException
 
 from app.core.llm.detector_base import get_target_detector
-from app.core.video.multi_api import MultiCardSpec, PromptPlan, build_multi_router
+from app.core.video.multi_api import (
+    MultiCardSpec,
+    PromptPlan,
+    build_multi_router,
+    parse_models_field,
+)
 from app.core.video.multi_session import get_multi_session
 
 # 会话单例按卡隔离：同一进程里 vd / vtl 各用一个 key，否则 vtl 的 open()
@@ -75,47 +80,8 @@ def _parse_prompt(payload: dict) -> PromptPlan:
     else:
         model_id = raw_model_id
 
-    # models: 勾选的**实例**列表 [{"model_id","npu_index"}, ...]。同一个
-    # model_id 可出现多次（npu_index 不同 = 同模型跑两张卡），每条一个推理
-    # slot。缺省则退回单实例 model_id 路径。
-    raw_models = payload.get("models", None)
-    models = None
-    if raw_models is not None:
-        if not isinstance(raw_models, list) or not raw_models:
-            raise HTTPException(
-                status_code=400,
-                detail=f"models 必须是非空数组: {raw_models!r}",
-            )
-        models = []
-        seen = set()
-        for item in raw_models:
-            if not isinstance(item, dict):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"models 每项必须是 {{model_id, npu_index}}: {item!r}",
-                )
-            mid = item.get("model_id")
-            if not isinstance(mid, str) or not mid.strip():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"models[].model_id 必须是非空字符串: {item!r}",
-                )
-            npu = item.get("npu_index")
-            if npu is not None and (isinstance(npu, bool)
-                                    or not isinstance(npu, int)):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"models[].npu_index 必须是整数或 null: {item!r}",
-                )
-            key = (mid.strip(), npu)
-            # 同一实例勾两次 = 两条线程挤同一个 worker 进程，句柄不可重入
-            if key in seen:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"models 含重复实例 model_id={mid!r} npu_index={npu!r}",
-                )
-            seen.add(key)
-            models.append({"model_id": mid.strip(), "npu_index": npu})
+    # models: 勾选的**实例**列表，缺省则退回单实例 model_id 路径。
+    models = parse_models_field(payload)
 
     raw_interval = payload.get("rr_interval", None)
     if raw_interval is None:

@@ -30,6 +30,7 @@ const VTLDetector = {
 // 宫格实现（建格 / 分列 / 每路单飞解码上屏 / 角标高亮）在共享组件里；
 // bbox 叠加通过 paint 的 overlay 回调交回本页。
 const GRID_EL = "vtl-grid";
+const PICK_ID = "vtl-model-pick";
 const chNo = window.MultiGrid.chNo;
 
 function setVtlOverlay(text, isError) {
@@ -131,8 +132,8 @@ function updateVtlTiles(session) {
   if (!session) return;
   const list = session.channel_list || [];
   const vlm = session.vlm || {};
-  const cur = typeof vlm.current === "number" ? vlm.current : -1;
-  const { total, ok, eof } = window.MultiGrid.status(GRID_EL, list, cur);
+  const { total, ok, eof } = window.MultiGrid.status(
+    GRID_EL, list, window.MultiCard.activeChannels(vlm));
   // 通道数缩小时清掉多出来的冻结态，否则残留的 base64 会一直占着内存。
   for (const idx of Array.from(VTL.frozen.keys())) {
     if (idx >= total) VTL.frozen.delete(idx);
@@ -377,6 +378,8 @@ function buildVtlEventLi(ev, isLatest) {
   chSpan.className = "tag";
   chSpan.textContent = "通道 " + chNo(ev.channel);
   meta.appendChild(chSpan);
+  const npuSpan = window.MultiCard.npuBadge(ev, VTL.detectorSnap, PICK_ID);
+  if (npuSpan) meta.appendChild(npuSpan);
   // 判据分数：区分「超阈值触发」和「兜底间隔触发」。三张卡共用同一份判据，
   // 所以三处都要显示 —— 只给一张卡加就是"同样的配置、不同的信息"。
   const jsSpan = window.FrameJudge?.scoreSpan?.("vtl", ev);
@@ -590,8 +593,9 @@ function updateVtlDetectorStatus(snap) {
   } else if (snap.init_error) {
     statusEl.textContent = "模型加载失败: " + snap.init_error;
   } else if (snap.enabled && snap.session_ready) {
+    const slots = snap.slot_count > 1 ? ` · ${snap.slot_count} 张卡并行` : "";
     statusEl.textContent =
-      `运行中 · 每 ${snap.judge?.every_n ?? snap.every_n} 帧 · 队列 ${snap.queue_size} · 视觉定位`;
+      `运行中 · 每 ${snap.judge?.every_n ?? snap.every_n} 帧 · 队列 ${snap.queue_size} · 视觉定位${slots}`;
   } else if (snap.enabled) {
     statusEl.textContent =
       `已启动，加载模型… (首次约 30s，队列 ${snap.queue_size})`;
@@ -636,12 +640,17 @@ async function vtlDetectorStart() {
     return;
   }
   try {
+    const models = window.MultiCard.selectedModels(PICK_ID);
+    if (!models) {
+      setVtlOverlay("请先勾选至少一个模型实例", true);
+      return;
+    }
     // 只发原始 `prompts` 条目，前缀与分隔符由后端拼；老的单串 `prompt`
     // 与它互斥（后端强制），所以这里不发。
     const r = await fetch(API_PREFIX + "/video-target-localization/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompts: items, every_n }),
+      body: JSON.stringify({ prompts: items, every_n, models }),
     });
     if (!r.ok) {
       const detail = await r.text().catch(() => "");
@@ -735,6 +744,8 @@ function initVideoTargetLocalization() {
                              apiBase: API_PREFIX + "/video-target-localization/judge" });
   if (window.__vtlInit) return;
   window.__vtlInit = true;
+
+  loadInstancePickMulti(PICK_ID, "swcap_grounding", "vtl.instances");
 
   const sourceEl = document.getElementById("vtl-sources");
   const loopEl   = document.getElementById("vtl-loop");
@@ -1008,6 +1019,14 @@ window.ImApp_video_target_localization.applyWizardSnapshot = async function (opt
 
   // prompts 写入后再点启动按钮(start handler 读 #vtl-prompt-rows 当前内容)
   if (promptsApplied) {
+    // 必须先重拉勾选器：页面初始化时模型还没起，列表是空的，直接点会因
+    // "一个都没勾"静默中止（向导 finish 的顺序是「等模型 ready → 这里」）。
+    try {
+      await window.loadInstancePickMulti?.(PICK_ID, "swcap_grounding",
+                                            "vtl.instances");
+    } catch (e) {
+      throw new Error("WizardSnapshotError:detector_start_failed:" + (e?.message || e));
+    }
     const btn = document.getElementById("vtl-detector-start");
     if (btn) {
       try { btn.click(); result.detector_started = true; }

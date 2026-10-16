@@ -93,36 +93,6 @@
 .vtd-label-inline { flex: 1 1 0; }
 .vtd-label-inline .vtd-label-k { white-space: nowrap; }
 .vtd-label-u { font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
-/* 实例勾选列表：每个勾选框 = 一张卡上的一个推理 slot。远端实例默认不勾但
- * 仍然列出来 —— 列表是"现在能选什么"的唯一来源，藏起来用户不知道为什么
- * 选不到。 */
-.vtd-inst-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
-  border-radius: 6px;
-  padding: 0.4rem 0.5rem;
-}
-.vtd-inst-row {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-size: 0.8rem;
-  cursor: pointer;
-}
-.vtd-inst-row input[type="checkbox"] { margin: 0; flex: 0 0 auto; }
-.vtd-inst-row.is-remote { cursor: not-allowed; opacity: 0.55; }
-.vtd-inst-row.is-remote .vtd-inst-label { color: var(--muted); }
-.vtd-inst-empty { font-size: 0.75rem; color: var(--muted); }
-/* 事件来源卡号：多卡并行时用来区分"这条是 NPU0 还是 NPU1 算出来的" */
-.vd-event-npu {
-  font-size: 0.7rem;
-  color: var(--muted);
-  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
-  border-radius: 3px;
-  padding: 0 0.25rem;
-}
 /* 数字输入框 + 单位并排，单位不要掉到下一行 */
 .vtd-inline-row { display: flex; align-items: center; gap: 0.4rem; }
 .vtd-inline-row input[type="number"] { flex: 1 1 auto; min-width: 0; }

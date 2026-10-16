@@ -198,6 +198,57 @@
       .map((cb) => _parseKey(cb.value));
   }
 
+  /* ------------------------------------------------------------------
+   * MultiCard —— 双卡并行推理的前端助手（视频目标监控 / 视频目标定位 共用）。
+   *
+   * 两张卡的差异只有「勾选器容器 id」，逻辑逐字相同，所以统一放这而不是
+   * 各写一份。
+   */
+
+  /** 「正在推理」的通道集合，传给 MultiGrid.status 打绿框。
+   *
+   *  多卡时后端上报 inflight_channels（K 条 feeder 各占一路）；单卡路径没有
+   *  这个字段，退回 vlm.current。 */
+  function activeChannels(vlm) {
+    vlm = vlm || {};
+    if (Array.isArray(vlm.inflight_channels) && vlm.inflight_channels.length) {
+      return vlm.inflight_channels;
+    }
+    return typeof vlm.current === "number" ? [vlm.current] : [];
+  }
+
+  /** 勾选的实例 → 后端 models[]。一个都没勾返回 null，由调用方提示。
+   *
+   *  同一个 model_id 出现在两个 npu_index 上就是「同模型跑两张卡并行」，也
+   *  就是 models[] 的语义；只传 model_id 的话多卡整个退化成单卡。 */
+  function selectedModels(containerId) {
+    const models = (window.getSelectedInstances?.(containerId) || [])
+      .map((m) => ({ model_id: m.model_id, npu_index: m.npu_index }));
+    return models.length ? models : null;
+  }
+
+  /** 多卡模式？slot_count 是后端权威值；还没启动检测时退回数勾选框，
+   *  让用户在点启动之前就知道自己是多卡模式。 */
+  function isMultiCard(snap, containerId) {
+    const n = snap?.slot_count;
+    if (typeof n === "number" && n > 0) return n > 1;
+    return (window.getSelectedInstances?.(containerId) || []).length > 1;
+  }
+
+  /** 事件行的 NPU 角标元素；单卡返回 null（调用方直接不 append）。
+   *
+   *  通道号只说明"看的是第几路"，看不出"谁算的" —— 排查"是不是只有一张卡
+   *  在干活"时这行是唯一线索。 */
+  function npuBadge(ev, snap, containerId) {
+    if (!isMultiCard(snap, containerId)) return null;
+    const el = document.createElement("span");
+    el.className = "vd-event-npu";
+    el.textContent = (typeof ev.npu_index === "number" && ev.npu_index >= 0)
+      ? "NPU" + ev.npu_index : "NPU?";
+    return el;
+  }
+
   window.loadInstancePickMulti = loadInstancePickMulti;
   window.getSelectedInstances = getSelectedInstances;
+  window.MultiCard = { activeChannels, selectedModels, isMultiCard, npuBadge };
 })();
