@@ -37,8 +37,14 @@
       _loadingConfig = _loadConfig(manifest.wizard_config);
       const cfg = await _loadingConfig;
       _loadingConfig = null;
-      if (!cfg) return;
-      if (cfg.enabled === false) return;
+      if (!cfg) {
+        _notifySkipped(manifest, "config_missing");
+        return;
+      }
+      if (cfg.enabled === false) {
+        _notifySkipped(manifest, "disabled");
+        return;
+      }
       if (opts.force) {
         // 显式重开路径("向导模式" 按钮触发):无论之前是否完成都强制挂,
         // 并清掉"已完成"标记 + 上次停留的步骤,让用户从第 1 步重配。
@@ -51,18 +57,36 @@
         // _finish (applyWizardSnapshot 成功落到了下游),再次进入不应
         // 自动弹向导,避免"已完成的应用每次切回都重弹第 1 步"的既视
         // 感 —— 这正是 v0.22 之前那个老 bug。
+        // 必须 _notifySkipped:否则 framework 那张 wd-loading-section
+        // 会一直挂着等 wizard:mounted,而我们根本没 mount,30s 兜底之前
+        // 用户看到的就是"正在加载 视频目标监控…"然后卡住的假死。
+        _notifySkipped(manifest, "completed");
         return;
       }
       if (!window.WizardState || !window.WizardState.mount) {
         console.warn(LOG_PREFIX, "WizardState not loaded — skip mount");
+        _notifySkipped(manifest, "wizard_state_missing");
         return;
       }
       await window.WizardState.mount(manifest, cfg);
     } catch (e) {
       console.warn(LOG_PREFIX, "tryMount failed:", e && (e.message || e));
+      _notifySkipped(manifest, "error");
     } finally {
       _loadingConfig = null;
     }
+  }
+
+  // tryMount 各种早退路径的统一通知。framework 那张 wd-loading-section
+  // 必须被立刻 dismiss,否则 30s 兜底之前用户看到的"正在加载 ..."卡顿
+  // 就是这个事件的缺失。detail.appId 让 framework 知道是哪张卡的"放弃
+  // 挂载"事件,detail.reason 方便日志/未来区分(目前 framework 不区分)。
+  function _notifySkipped(manifest, reason) {
+    try {
+      window.dispatchEvent(new CustomEvent("wizard:skipped", {
+        detail: { appId: manifest && manifest.id, reason: reason },
+      }));
+    } catch (_) { /* old browser */ }
   }
 
   function unmount() {

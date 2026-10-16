@@ -539,6 +539,25 @@
     _dismissCardLoading();
   });
 
+  // wizard:skipped —— tryMount 早退时的对偶事件。已完成的卡片被 sidebar
+  // 应用面板带回时,tryMount 看到 WizardState.isCompleted 直接 return,
+  // 不会调 mount,wizard:mounted 永远不会 fire;但 _prepareCardEntry
+  // 早已把 page 藏了 + 把 wd-loading-section 亮出来"正在加载 ...",用户
+  // 看到的就是"切换其他页回来,卡在加载页"的假死(实测 30s 兜底之前一
+  // 直挂着)。这个事件让 tryMount 在每个早退路径上(已完成 / cfg 缺失 /
+  // cfg.enabled=false / WizardState 未加载 / 内部异常)都同步通知 framework
+  // 把 loading 收掉,并把 _prepareCardEntry 藏起来的 page 还回来。
+  // 还原 page 用 currentPage() === appId 守门 —— 用户若在事件到
+  // 达前已切到别处,新 page 才是 visible,旧 page 必须保持 hidden。
+  window.addEventListener("wizard:skipped", (ev) => {
+    _dismissCardLoading();
+    const appId = ev?.detail?.appId;
+    if (appId && currentPage() === appId) {
+      const ps = document.getElementById("page-" + appId);
+      if (ps) ps.classList.remove("hidden");
+    }
+  });
+
   // 向导卸载时只清 _wizardMounted 标记，**不**动 _loadedApps —— 否则
   // ROUTER 认为卡片未加载、重新注入 <script>（IIFE 重跑 → 监听器在复用
   // DOM 上累积、模块状态归零）。下次切回该页时 showPage 看到
