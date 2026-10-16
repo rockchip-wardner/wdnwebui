@@ -772,6 +772,12 @@
       if (judgeWraps.length && anchorWrap) {
         // fieldset + legend（hint 文字放 legend 里 —— 浏览器原生"嵌入框上沿"）
         const fs = _ce("fieldset", WIZARD_NS + "judge-fs");
+        // **稳定 id** —— frame-judge.js 的 mountInWizard(prefix) 用这个 id
+        // 找到这个 fieldset，把 .vj-curve 元素从 body 搬进来（曲线原本是
+        // position:fixed 浮在画布下面，要让它跟着 fieldset 自然流动才
+        // 能进 wizard 的判据框）。id 必须有 prefix —— 同页面不会撞车，
+        // 多次 mount 也总是最新的那个生效（旧的 wizard 卸载时 DOM 一起没了）。
+        fs.id = prefix + "-wizard-judge-fs";
         const lg = _ce("legend", WIZARD_NS + "judge-legend");
         lg.appendChild(_ce("span", WIZARD_NS + "channel-hint-label",
                            "当前在编辑："));
@@ -824,6 +830,21 @@
         };
         attachOnSelect();
       }
+
+      // 把实时分数曲线搬进 fieldset。FrameJudge 的曲线元素原本挂在
+      // document.body 末尾 + position:fixed（功能页不需要它，但向导里
+      // 用来给用户即时反馈判据效果）—— 现在 wizard 形态变了，曲线要进
+      // 判据框里跟 "当前在编辑 [x, y] 路" 一起显示。mountInWizard 把曲线
+      // 从 body 搬到 fieldset、改成普通流式布局、随后按 _selectedChannel
+      // 过滤 recent 数据。
+      const attachCurve = () => {
+        if (!window.FrameJudge || !window.FrameJudge.mountInWizard) {
+          setTimeout(attachCurve, 30);
+          return;
+        }
+        window.FrameJudge.mountInWizard(prefix);
+      };
+      attachCurve();
     }
 
     _renderFootNext(foot, cfg, state, true);

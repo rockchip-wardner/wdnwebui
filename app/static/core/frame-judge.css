@@ -182,6 +182,10 @@
 }
 
 /* ---- 实时曲线（视频正下方，仅向导内可见）---- */
+/* 默认按 position:fixed 浮在画布下沿 —— VAS 这类单路老卡片还在用这条路径。
+ * .wd-wizard-judge-fs 里的曲线会被 mountInWizard() 重置成 position:static
+ * （直接由 JS 写 style 覆盖），靠 fieldset 容器的流式布局接管。
+ */
 .vj-curve {
   position: fixed;
   z-index: 55;
@@ -206,4 +210,24 @@
 .vj-curve-spacer {
   width: 100%;
   pointer-events: none;
+}
+
+/* fieldset 内的曲线：去掉 fixed/z-index/外边距，跟随 fieldset 流式。
+ * 直接 selector 而非靠 JS 改 style —— 减少内联样式副作用，方便外部样式覆写。
+ */
+.wd-wizard-judge-fs > .vj-curve {
+  position: static;
+  z-index: auto;
+  pointer-events: auto;
+  border: none;
+  border-radius: 0;
+  padding: 6px 0 2px;
+  margin-top: 10px;
+  background: transparent;
+}
+.wd-wizard-judge-fs > .vj-curve > .vj-curve-canvas {
+  height: 88px;
+  border: 1px solid var(--border, #cbd5e1);
+  border-radius: 6px;
+  background: #fff;
 }
