@@ -1,4 +1,4 @@
-"""视频分析检索：REST + WebSocket（分析 + 检索合并卡片）。
+"""监控分析检索：REST + WebSocket（分析 + 检索合并卡片）。
 
 v0.15 起合并页顶部多了一个『视频源预览』区 —— 向导模式（v0.4 wizard）
 在 source 步骤里把 app 自己的 #vcs-canvas 搬到 wizard 内嵌预览，

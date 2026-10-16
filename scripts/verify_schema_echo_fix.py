@@ -1,7 +1,7 @@
 """verify_schema_echo_fix.py — Regression test for VAS schema-echo detection in all paths.
 
 User-reported bug (2026-09):
-  在"视频分析检索"页面对 /userdata/video_test/rk-0.mp4 等部分视频进行分析时,
+  在"监控分析检索"页面对 /userdata/video_test/rk-0.mp4 等部分视频进行分析时,
   逐帧分析列表概率性显示
     ``"scene 户外街道 actors action objects text"``
   —— 实质上是 Qwen3-VL-4B 在 RKNN3 上的 schema-echo 退化输出:模型把 user

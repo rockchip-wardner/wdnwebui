@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证 视频分析检索 wizard mount + stepForward + applyWizardSnapshot。
+"""验证 监控分析检索 wizard mount + stepForward + applyWizardSnapshot。
 
 不依赖真模型启动(直接 mount wizard,绕过 env)。
 """

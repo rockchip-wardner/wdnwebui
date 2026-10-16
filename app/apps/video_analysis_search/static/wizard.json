@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "wizard_title": "视频分析检索快速配置",
+  "wizard_title": "监控分析检索快速配置",
   "swcap_to_model": {
     "swcap_video_describe":  { "npu_index": 0, "model_id": "qwen3-vl-4b" },
     "swcap_video_retrieval": { "npu_index": 1, "model_id": "qwen3-vl-embedding-2b" }

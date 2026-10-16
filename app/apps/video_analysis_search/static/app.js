@@ -13,7 +13,7 @@
   const fmtEventTime = window.fmtEventTime;
 
 /* ------------------------------------------------------------------ *
- *  video-analysis-search page（视频分析检索：分析 + 检索合并页）                            *
+ *  video-analysis-search page（监控分析检索：分析 + 检索合并页）                            *
  *                                                                    *
  *  后端: app/core/video/search.py —— PyAV 抽帧 + embedding 切片索引,   *
  *  文本查询余弦检索；REST + WS 拉进度/推送。本模块的归一化层          *

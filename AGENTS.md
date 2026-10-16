@@ -2455,7 +2455,7 @@ wdnwebui/
 │   │   ├── audio_analysis/             # 音频理解(嵌入音视频描述页)
 │   │   ├── text_chat/                  # 文本对话 (swcap_text_chat)
 │   │   ├── tts/                        # 语音生成 (swcap_audio_tts)
-│   │   ├── video_analysis_search/      # 视频分析检索 (swcap_video_describe + swcap_video_retrieval)
+│   │   ├── video_analysis_search/      # 监控分析检索 (swcap_video_describe + swcap_video_retrieval)
 │   │   ├── video_detection/            # 音视频描述 (+ tts_alert 工具)
 │   │   ├── video_target_detection/     # 视频目标检测 (TargetDoc)
 │   │   └── video_target_localization/  # 视频目标定位 (LocatorDoc)
@@ -2749,7 +2749,7 @@ class AudioEvent:
 
 > **本节描述的是 v0.4 之前的 16 路 4×4 网格监控页面;v0.4 起已下线。**
 > 视频能力整合进微信视频检索管线 (`app/system/im_bridge/video_manager.py`)
-> 与 视频分析检索页 (`app/apps/video_analysis_search/`)。
+> 与 监控分析检索页 (`app/apps/video_analysis_search/`)。
 >
 > 以下内容作为**历史决策记录**保留 —— 16 路共享一个 LLMSession(避免 16×3.5 GB)
 > 的设计仍有参考价值。当前不需要在 v0.4 复现该页面;若未来要重建,
@@ -3872,7 +3872,7 @@ to taste.
 format-3; for inspection, use ``soundfile.read(...)`` or parse the
 RIFF header by hand.
 
-## Video analysis search (视频分析检索) page
+## Video analysis search (监控分析检索) page
 
 `#page-video-analysis-search`（卡片 id `video-analysis-search`，`app/apps/video_analysis_search/`）
 是演示页第 4 项，**一张卡片承载两种能力**（页面顶部 checkbox 勾选，可同时开）：

@@ -563,7 +563,7 @@ def _seek_frame_jpeg(source: str, t: float) -> Optional[bytes]:
 async def list_unified_history() -> dict:
     """统一历史记录（检索缓存 + 分析历史，按视频 md5 聚合）。
 
-    前端「视频分析检索」页的历史列表数据源 —— 一个视频一行，行内
+    前端「监控分析检索」页的历史列表数据源 —— 一个视频一行，行内
     ``retrieval`` 是该视频的检索索引档位列表、``analysis`` 是其分析
     记录列表（含 run_id，供加载 / 反查 / 删除）。按 ``updated_at``
     倒序；``frame_enabled`` 按源文件是否仍在本机判定（决定能否取帧 /
