@@ -550,6 +550,8 @@
   // 还原 page 用 currentPage() === appId 守门 —— 用户若在事件到
   // 达前已切到别处,新 page 才是 visible,旧 page 必须保持 hidden。
   window.addEventListener("wizard:skipped", (ev) => {
+    console.warn("[wizard:skipped DEBUG] reason=", ev?.detail?.reason,
+                 "appId=", ev?.detail?.appId);
     _dismissCardLoading();
     const appId = ev?.detail?.appId;
     if (appId && currentPage() === appId) {
