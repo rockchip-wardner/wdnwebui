@@ -129,31 +129,33 @@
   window.DemoGuard = DemoGuard;
 
   // ─────────────────────────────────────────────────────────────────────
-  // ActivateManager — 把"用户当前所在 app"同步到后端 config.jsonc
-  //   * 用户进入某张卡片、且该卡片所有 software_capabilities 都有
-  //     **local** running 实例（不依赖远端 adopted peer）承载时 →
-  //     PUT /api/compute/active-app。后端把当前承载该 app 的
-  //     (model, npu_index) 增量写进 compute.autostart —— 下次
-  //     reboot 时 worker 自动 spawn，用户不用再走一遍 wizard 才
-  //     让卡片进入"模型就绪"状态。
-  //   * 用户离开卡片（切到 home / 系统页 / 另一张卡）→ DELETE，
-  //     让 autostart 仍保留但 active_app 标记清掉。
-  //   * 后端会在 reboot 后的第一次 GET 看到 active_app 非空 → 前端
-  //     拿到该值后直接跳到对应 #<id>，不再让用户重新点卡片。
+  // ActivateManager — "用户最后进入的卡片页" ↔ 后端 config.jsonc
+  //   * 任何"进入卡片页" → 更新 in-memory _current(= last entered card)。
+  //     这就是用户视角的"我在这"——和模型 running 状态脱钩,这样:
+  //       - 进了 app 还在 wizard 中(模型未 running),sidebar 应用面板
+  //         也能跳回这张卡;
+  //       - 切到系统页 / home 一眼再回,_current 不丢;
+  //       - 只有 back-home 按钮显式 _exit() 才清。
+  //   * caps 全 local running 时额外 PUT /api/compute/active-app。后端
+  //     把当前承载该 app 的 (model, npu_index) 增量写进 compute.autostart
+  //     —— 下次 reboot 时 worker 自动 spawn。caps 未 ready 时**不**PUT
+  //     (后端会 409),但 in-memory _current 仍设;轮询 1Hz 跟进 caps
+  //     状态,一旦 ready 立刻补 PUT。
+  //   * 后端 reboot 后的第一次 GET 看到 active_app 非空 → 前端
+  //     拿到该值后直接跳到对应 #<id>,不再让用户重新点卡片。
+  //   * beforeunload 不再 DELETE —— 用户关 tab / 刷页是常见操作,不该
+  //     把 "我在这" 也一起擦掉;持久化跨 tab 保持,直到用户显式 _exit。
   //
-  // 与 DemoGuard 的边界：
-  //   * DemoGuard 判定"页面在跑后台"（session.state in {playing,...}），
+  // 与 DemoGuard 的边界:
+  //   * DemoGuard 判定"页面在跑后台"(session.state in {playing,...}),
   //     控制离开时是否弹 confirm。语义是"runtime 状态"。
-  //   * ActivateManager 判定"模型已加载"（capability 有 local running
-  //     实例），决定是否把"我在这"持久化到 config。语义是"模型就绪"。
-  //     这两者通常同步但不一定 —— 例如 video-target-detection 配完
-  //     流后 session 才开始 playing，而 video-detection 的 detector 一
-  //     启动 session.state 就已是 opening；ActivateManager 不看 session，
-  //     只看模型层 readiness，所以它会比 DemoGuard 早触发。
+  //   * ActivateManager 判定"用户最后进入的卡片",决定 sidebar 应用面
+  //     板的目标 & reboot 后的恢复目标。语义是"我在这"(用户视角,
+  //     不看模型层)。
   // ─────────────────────────────────────────────────────────────────────
 
   const ActivateManager = {
-    _current:   null,        // 当前 _active_app 同步给后端的 app_id
+    _current:   null,        // 用户最后进入的卡片 app_id(用户视角,与模型 running 无关)
     _pollHandle: null,       // 1Hz 轮询 handle,仅在卡片页启用
     _inFlight:  false,       // 防重入（_evaluate 本身是 async）
     _bootDone:  false,       // 启动期 bootRestore 是否已跑过
@@ -199,18 +201,18 @@
     },
 
     async _set(appId) {
+      // 把 app_id PUT 到后端(后端在 caps 全 local running 时落盘
+      // active_app + 增量写 autostart)。失败时不动 _current —— _current
+      // 是用户视角的 last entered card,PUT 失败(409 caps 未 ready)不
+      // 影响 sidebar / reboot 恢复的语义,等下次 _evaluate caps ready
+      // 再补 PUT。
       try {
         const r = await fetch("/api/compute/active-app", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ app_id: appId }),
         });
-        if (r.ok) {
-          this._current = appId;
-        } else {
-          // 409 = 后端校验不过(cap 没 local running / app 不存在);
-          // 此时不应在 _current 留 stale 值。
-          this._current = null;
+        if (!r.ok) {
           let detail = "";
           try { detail = (await r.json()).detail || ""; } catch (_) {}
           if (r.status !== 404) {
@@ -224,11 +226,17 @@
       }
     },
 
-    async _clear() {
-      // 同步:本端先清 _current,再异步发 DELETE(网络挂了也无所谓)
+    // 显式退出:用户在卡片页点 back-home / "退出应用" 时调用。
+    // 同步清掉 _current + 异步发 DELETE。下次 sidebar 应用面板 → apps
+    // 列表;reboot 后 bootRestore 也不再跳到这张卡。
+    _exit() {
       this._current = null;
       try {
-        await fetch("/api/compute/active-app", { method: "DELETE" });
+        // keepalive:back-home 紧跟着 location.hash="#/" 切页,普通 fetch
+        // 可能被中断;DELETE 是幂等的,即便本次没送达下次 _evaluate 也会
+        // 重新 PUT(那时 _current 已经 null,_evaluate 不会再写)。
+        fetch("/api/compute/active-app",
+              { method: "DELETE", keepalive: true });
       } catch (_) { /* best-effort */ }
     },
 
@@ -244,8 +252,9 @@
       }
     },
 
-    // 在 ROUTER.showPage 之后由框架调用。当前页是"可追踪卡片"才轮询,
-    // 否则停轮询并清掉 active_app(用户去了 home / 系统页 / 不可见卡片)。
+    // 在 ROUTER.showPage 之后由框架调用。每进一张卡片都更新 _current
+    // (用户视角的 last entered card),不因切到系统页 / home / 另一张卡
+    // 而清除 —— 只有显式 _exit() 才清。
     async _evaluate() {
       if (!this._bootDone) return;
       if (this._inFlight) return;
@@ -255,40 +264,36 @@
         const m = this._isTrackableCard(this._findManifest(page))
           ? this._findManifest(page) : null;
         if (!m) {
-          // 不在卡片页 → 静默停轮询并清掉 active_app。
-          // (注意:用户从卡片去"系统页"系统按 DemoGuard 语义会
-          // silent keep 模型运行,但 _active_app 标记仍应清掉 —— 因为
-          // 我们说"用户在 X 卡片"的语义,要看到 X 页面才算。)
+          // 非卡片页(home / 系统页 / 不可见卡片):停轮询,**不动 _current**。
+          // 用户中途看一眼系统页或回到 home 不算"退出当前 app"——
+          // sidebar 应用面板仍应能跳回 _current;reboot 后 bootRestore 也
+          // 应能恢复 _current。DemoGuard 的 silent keep 已经在另一层把
+          // 模型跑着保留了下来,这里再清 active_app 就是双重惩罚。
           this._stopPolling();
-          if (this._current !== null) {
-            await this._clear();
-          }
           return;
         }
+        // 任何"进入卡片页"都把 _current 推到这张卡。
+        // 不论 caps running 与否都设 —— 用户视角的"我在这"和模型层
+        // readiness 是两回事;wizard 中 / cap loading 中 sidebar 也应
+        // 能跳回这里。
+        this._current = m.id;
         const caps = this._requiredCaps(m);
         if (caps.length === 0) {
           // 卡片声明无 software_capabilities(纯静态页 / 仅配置类) →
-          // 不进入 active_app 模式;保持现状。
+          // 后端 autostart 不适用(cap 为空写不进 autostart),in-memory
+          // _current 已设好,sidebar / reboot 恢复都按 _current 走。
           this._stopPolling();
-          if (this._current !== null) {
-            await this._clear();
-          }
           return;
         }
         const snap = await this._fetchSnapshot();
         if (!snap) return;  // 网络挂了,下个 tick 再来
         if (this._capsAllLocalRunning(caps, snap)) {
-          if (this._current !== m.id) {
-            await this._set(m.id);
-          }
-        } else {
-          // 当前页是这张卡但 cap 还没全 running(可能在 wizard 中、
-          // 模型 loading、用户刚停掉)→ 清掉 _active_app。
-          // 等下个 tick 1s 后再判定,避免 wizard 还在跑时反复刷盘。
-          if (this._current !== null) {
-            await this._clear();
-          }
+          // caps 已 ready → 落盘 active_app + 增量写 autostart(幂等)。
+          await this._set(m.id);
         }
+        // cap 未全 running(wizard 中、模型 loading、用户刚停掉):不 PUT
+        // 后端会 409,但**不**清 _current。等下个 tick 1s 后再判定,
+        // caps 一 ready 立刻补 PUT。
       } finally {
         this._inFlight = false;
       }
@@ -309,16 +314,12 @@
       }
     },
 
-    // 关 tab / 刷页时 best-effort 清 active_app。用 keepalive 让请求
-    // 在 beforeunload 后还能送达;完全送不到是浏览器限制,这里承诺
-    // 不了,reboot 之后该 app 的 worker 仍会 autostart 起来。
+    // 关 tab / 刷页时**不**清 active_app —— 用户中途关 tab 是常见操作,
+    // 不该把"我在这"也一起擦掉;reboot 后 bootRestore 要靠它把用户跳
+    // 回原卡片。显式退出只发生在 back-home 按钮(_exit()),那里才会
+    // DELETE 后端。reboot 时 autostart 仍会 spawn 该 app 需要的 worker,
+    // 二者配合即"重开软件继续进入这个应用并开启他所需的 worker"。
     onBeforeUnload() {
-      if (this._current !== null) {
-        try {
-          fetch("/api/compute/active-app",
-                { method: "DELETE", keepalive: true });
-        } catch (_) { /* beforeunload, ignore */ }
-      }
       this._stopPolling();
     },
 
@@ -715,10 +716,28 @@
       meta.appendChild(back);
       back.addEventListener("click", async (ev) => {
         if (!DemoGuard._isDemoPage(currentPage())) return;
-        if (!DemoGuard.isActive(currentPage())) return;
         ev.preventDefault();
-        await DemoGuard.stopAndClear(currentPage());
+        // 不再以 DemoGuard.isActive 当门:用户即便没在跑后台、只是
+        // 开着 wizard 看了一眼,点这个按钮的语义也是"我要离开这张卡"。
+        // 只在真的有 running session 时顺手 stopAndClear 释放算力;
+        // 没有的话直接走清状态 + 切回首页。
+        if (DemoGuard.isActive(currentPage())) {
+          await DemoGuard.stopAndClear(currentPage());
+        }
         DemoGuard._activeApp = null;
+        // 显式退出:
+        //  * _current 清掉、后端 DELETE —— 下次 sidebar 应用面板
+        //    → apps 列表;reboot 不再恢复这张卡;
+        //  * WizardState.clearAll 把整张卡的 wizard 状态
+        //    (values / step / completed) 从 localStorage 抹掉。
+        //    没有这一步:用户进卡 → tryMount 仍看到 completed=1
+        //    → 不挂 wizard,直接落进功能页。这是 v0.22 修完后的
+        //    副作用 —— "退出应用" 应该等于"fresh install"。
+        ActivateManager._exit();
+        const cp = currentPage();
+        if (window.WizardState?.clearAll) {
+          window.WizardState.clearAll(cp);
+        }
         location.hash = "#/";
       });
     });
@@ -805,7 +824,13 @@
     if (!appsNav) return;
     appsNav.addEventListener("click", (ev) => {
       ev.preventDefault();
-      const target = DemoGuard._activeApp || "apps";
+      // 用 "用户最后进入的卡片" 而不是 DemoGuard._activeApp:后者只在
+      // 模型/session running 时才非空,wizard 中 / 刚打开未加载模型
+      // 时是 null,会让 sidebar 跳到 apps 面板而不是回到那张卡。
+      // ActivateManager._current 由 _evaluate 在每次进入卡片页时设,
+      // 只在显式 back-home 退出时清,正符合"除非点了返回才展示应用列表"
+      // 的语义。
+      const target = ActivateManager._current || "apps";
       if (currentPage() === target) return;
       location.hash = "#" + target;
     });
