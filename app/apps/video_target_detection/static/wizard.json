@@ -2,7 +2,7 @@
   "enabled": true,
   "wizard_title": "视频目标监控快速配置",
   "swcap_to_model": {
-    "swcap_video_describe": { "npu_index": 0, "model_id": "qwen3-vl-4b" }
+    "swcap_video_describe": { "npu_index": [0, 1], "model_id": "qwen3-vl-4b" }
   },
   "open_source_button": "vtd-open",
   "canvas_id": "vtd-grid",

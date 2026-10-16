@@ -204,7 +204,9 @@
 
   /** 按快照刷新每格的角标 / 高亮 / 错误态，返回 {total, ok, eof}。
    *
-   *  `cur` 是当前正在推理的 idx（session.vlm.current），用来打绿框 +「推理中」；
+   *  `cur` 是"正在推理"的通道，可以是单个 idx（session.vlm.current，单卡）
+   *  也可以是数组（session.vlm.inflight_channels，多卡：K 条 feeder 各占一路，
+   *  同时有 K 格该打绿框）。传数组是为了多卡并行时每一路都看得见。
    *  `eof` 是已播完（未循环）的路数 —— 文件源播完会停在 EOF 不再产帧，卡片要
    *  据此提示，否则表现为"画面静止 + 全部异常"，用户无从判断。角标正常时**只显示
    *  通道号** —— 帧率是运维信息不是客户要看的，只有出错时才补状态/告警。 */
@@ -212,6 +214,9 @@
     const g = _state(container);
     if (!g) return { total: 0, ok: 0, eof: 0 };
     if (list.length !== g.total) ensure(container, list.length);
+    const active = new Set(
+      Array.isArray(cur) ? cur
+        : (typeof cur === "number" && cur >= 0 ? [cur] : []));
     let ok = 0, total = 0, eof = 0;
     for (const c of list) {
       const t = g.tiles.get(c.idx);
@@ -225,7 +230,7 @@
         (c.state !== "playing" ? ` · ${c.state}` : "") +
         (c.errors ? ` · ⚠${c.errors}` : "");
       t.label.title = src;
-      t.tile.classList.toggle("active", c.idx === cur);
+      t.tile.classList.toggle("active", active.has(c.idx));
       t.tile.classList.toggle("bad", !!c.error || c.errors > 0);
       // 不再让 status 写 t.badge 文字 —— 那是判据角标专用位，由
       // frame-judge.js 走 setBadge() 写入，避免两套逻辑抢同一个 DOM 节点。

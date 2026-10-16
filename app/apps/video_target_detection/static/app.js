@@ -55,8 +55,12 @@ function updateVtdTiles(session) {
   if (!session) return;
   const list = session.channel_list || [];
   const vlm = session.vlm || {};
-  const cur = typeof vlm.current === "number" ? vlm.current : -1;
-  const { total, ok, eof } = window.MultiGrid.status(GRID_EL, list, cur);
+  // 多卡并行时 K 条 feeder 各占一路，绿框要同时框住**所有**在推理的通道。
+  // inflight_channels 为空（单卡路径）时退回 vlm.current。
+  const inflight = Array.isArray(vlm.inflight_channels)
+                  && vlm.inflight_channels.length ? vlm.inflight_channels
+                  : (typeof vlm.current === "number" ? [vlm.current] : []);
+  const { total, ok, eof } = window.MultiGrid.status(GRID_EL, list, inflight);
   const hint = document.getElementById("vtd-channel-hint");
   const pill = document.getElementById("vtd-pill-video");
   if (hint) {
@@ -301,6 +305,15 @@ function buildVtdEventLi(ev, isLatest) {
   const tsSpan = document.createElement("span");
   tsSpan.textContent = fmtEventTime(ev.ts);
   meta.appendChild(tsSpan);
+  // 这条是**哪张卡**上的实例算出来的。通道号只说明"看的是第几路"，看不出
+  // "谁算的"—— 排查"是不是只有一张卡在干活"时这行是唯一线索。
+  if (multiCardVtd()) {
+    const npuSpan = document.createElement("span");
+    npuSpan.className = "vd-event-npu";
+    npuSpan.textContent = (typeof ev.npu_index === "number" && ev.npu_index >= 0)
+      ? "NPU" + ev.npu_index : "NPU?";
+    meta.appendChild(npuSpan);
+  }
   // 判据分数（共享组件算，多路下没有 judge_score 就整块不渲染）
   const jsSpan = window.FrameJudge?.scoreSpan?.("vtd", ev);
   if (jsSpan) meta.appendChild(jsSpan);
@@ -439,6 +452,14 @@ function showVtdCropPopup(cropB64, w, h) {
     }, 600);
   }, 4600);
 }
+function multiCardVtd() {
+  // slot_count 是后端上报的权威值；还没启动检测时退回数勾选框，让用户在点
+  // 「启动检测」之前就知道自己是多卡模式。
+  const n = VTD.detectorSnap?.slot_count;
+  if (typeof n === "number" && n > 0) return n > 1;
+  return (window.getSelectedInstances?.("vtd-model-pick") || []).length > 1;
+}
+
 function updateVtdDetectorStatus(snap, session) {
   const statusEl = document.getElementById("vtd-detector-status");
   const pillEl   = document.getElementById("vtd-pill-det");
@@ -456,8 +477,9 @@ function updateVtdDetectorStatus(snap, session) {
     console.warn("[vtd] 模型加载失败:", snap.init_error);
   } else if (snap.enabled && snap.session_ready) {
     // 面向终端客户：只说"在跑 / 正在看几路"，不暴露队列、尺寸、轮次等内部状态
+    const slots = snap.slot_count > 1 ? `（${snap.slot_count} 张卡并行）` : "";
     statusEl.textContent = chCount
-      ? `检测中 · 正在巡检 ${chCount} 路`
+      ? `检测中 · 正在巡检 ${chCount} 路${slots}`
       : "检测中 · 等待视频";
     setState(chCount ? "run" : "warn");
   } else if (snap.enabled) {
@@ -510,7 +532,15 @@ async function vtdDetectorStart() {
     }
   }
   try {
-    const model_id = (document.getElementById("vtd-model-pick")?.value || "") || null;
+    // 勾选的每个**实例** = 一个推理 slot。同一 model 出现在两个 npu_index
+    // 上就是「同一个模型跑两张卡并行」，也就是后端 models[] 的语义；只传
+    // model_id 的话多卡整个退化成单卡。
+    const models = (window.getSelectedInstances?.("vtd-model-pick") || [])
+      .map((m) => ({ model_id: m.model_id, npu_index: m.npu_index }));
+    if (models.length === 0) {
+      setVtdOverlay("请先勾选至少一个模型实例", true);
+      return;
+    }
     const r = await fetch(API_PREFIX + "/video-target-detection/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -518,7 +548,7 @@ async function vtdDetectorStart() {
         prompt,
         rr_interval: Number.isFinite(rr_interval) ? rr_interval : 0,
         image_size: Number.isFinite(image_size) ? image_size : null,
-        model_id: model_id,
+        models: models,
       }),
     });
     if (!r.ok) {
@@ -559,7 +589,7 @@ function initVideoTargetDetection() {
   // 空状态：一进页面画面区是黑的，给一句人话告诉用户下一步做什么
   setVtdOverlay(VTD_EMPTY_HINT, false);
 
-  loadModelPick("vtd-model-pick", "swcap_video_describe", "vtd.model_id");
+  loadInstancePickMulti("vtd-model-pick", "swcap_video_describe", "vtd.instances");
   // apiBase 指向本卡判据端点：/api/video/judge 操作的是单例 VideoSession
   // （vd / vtl 共用），本页走 MultiChannelSession，同 VAS 挂自己的 judge_api。
   window.FrameJudge?.mount({ prefix: "vtd", canvasId: GRID_EL,
@@ -627,6 +657,15 @@ window.ImApp_video_target_detection.applyWizardSnapshot = async function (opts) 
   }
 
   if (opts.prompt) {
+    // 必须先重拉勾选器：页面初始化时模型还没起，列表是空的，直接点会因
+    // "一个都没勾"静默中止（向导 finish 的顺序是「等模型 ready → 这里」）。
+    try {
+      await window.loadInstancePickMulti?.("vtd-model-pick",
+                                           "swcap_video_describe",
+                                           "vtd.instances");
+    } catch (e) {
+      throw new Error("WizardSnapshotError:detector_start_failed:" + (e?.message || e));
+    }
     const btn = document.getElementById("vtd-detector-start");
     if (btn) {
       try { btn.click(); result.detector_started = true; }

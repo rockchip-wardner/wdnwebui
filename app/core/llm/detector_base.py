@@ -592,6 +592,10 @@ class DetectorEvent:
     # 视频目标监控页(多路)专用：事件来自第几路。单路恒为 0，前端一套
     # 渲染代码同时覆盖单路/多路，旧消费者忽略即可。
     channel: int = 0
+    # 多卡并行推理：这条事件由哪个 worker 实例产出。同一个 model_id 可以同时
+    # 跑在多张卡上，光看 model_id 分不出来，得带卡号。
+    model_id: str = ""
+    npu_index: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -616,6 +620,8 @@ class DetectorEvent:
             "frame_h":          self.frame_h,
 "judge_score":      self.judge_score,
             "channel":          self.channel,
+            "model_id":         self.model_id,
+            "npu_index":        self.npu_index,
         }
 
 
@@ -1069,6 +1075,50 @@ def _crop_and_encode(
     return base64.b64encode(buf.tobytes()).decode("ascii"), crop.shape[1], crop.shape[0]
 
 # --------------------------------------------------------------------------- #
+class _InferSlot:
+    """一个推理 slot —— 绑一个 worker 实例，各带 1 格队列 + 1 个线程。
+
+    同一张卡不能同时加载两份同一个模型，但同一个模型可以同时跑在多张卡上。
+    要吃满两张卡就得有 K 条互相独立的推理线程各钉一个 worker 进程 ——
+    单条队列 + 单线程在物理上无法并行。
+
+    slot 只管搬运：事件表 / 诊断 ring buffer / 工具状态仍由 detector 单份
+    持有，否则多卡下事件会被拆成 K 份、前端还得合并排序。
+    """
+
+    __slots__ = ("model_id", "npu_index", "q", "pending", "thread",
+                 "_retired")
+
+    def __init__(self, model_id: str = "", npu_index: Optional[int] = None,
+                 maxsize: int = 1):
+        self.model_id = model_id or ""
+        self.npu_index = npu_index
+        self.q: "queue.Queue" = queue.Queue(maxsize=maxsize)
+        # 本 slot 有帧在排队或正在推理。每 slot 一份：K>1 时必然有 slot 在忙，
+        # 用 detector 级的那一个会把全部 slot 一起判成忙。
+        self.pending = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        # 已摘掉、正在退出的 slot。_apply_slots 复用时要跳过，否则会把一条
+        # 正在收 sentinel 的线程捞回来。
+        self._retired = False
+
+    @property
+    def pin(self) -> Optional[tuple]:
+        """``(model_id, npu_index)``；未指定卡时返回 None（走自动挑）。"""
+        return (self.model_id, self.npu_index) if self.model_id else None
+
+    def label(self) -> str:
+        if not self.model_id:
+            return "auto"
+        if self.npu_index is None:
+            return self.model_id
+        return "%s@%d" % (self.model_id, self.npu_index)
+
+    def __repr__(self) -> str:
+        return "<_InferSlot %s>" % self.label()
+
+
+# --------------------------------------------------------------------------- #
 class WdnaiDetector:
     """Single VLM session shared by the video-detection page.
 
@@ -1158,10 +1208,10 @@ class WdnaiDetector:
         self._events_lock = threading.Lock()
         self._latest: Optional[dict] = None
         self._next_event_id = 1
-        self._item_q: "queue.Queue" = queue.Queue(maxsize=self.ITEM_QUEUE_MAX)
-        # 有帧在排队或正在推理。多路轮转用 wait_idle() 等它清零做背压。
-        self._pending = threading.Event()
-        self._worker: Optional[threading.Thread] = None
+        # 推理 slot：默认一条（不指定模型 = 自动挑），单卡页与 vd 走的就是它。
+        # 多卡并行时 start(models=[...]) 按勾选的实例数扩成 K 条。
+        self._slots: List[_InferSlot] = [
+            _InferSlot(maxsize=self.ITEM_QUEUE_MAX)]
         self._stop_event = threading.Event()
         self._broadcaster_lock = threading.Lock()
         self._broadcasters: List[Callable[[dict], None]] = []
@@ -1197,6 +1247,10 @@ class WdnaiDetector:
         # 都按这个值走,允许用户在不重启 worker 的前提下切换底层实例
         # (例如两个 qwen3-vl-4b 不同 NPU,或本机 vs LAN peer)。
         self._chosen_model_id: str = ""
+        # _item_q / _pending / _worker 是 slot 0 的转发别名，K=1 时语义与
+        # 改造前逐字相同。多卡调用点必须显式带 slot_idx —— slot 0 空闲不代表
+        # 别的 slot 也空闲。
+        self._sync_slot0()
         # ``_last_bbox_raw`` —— ``_build_target_event`` 把模型原始
         # bbox（未归一化）写入此处；``_infer_sync`` 在写 _diag_history
         # 前读出 → 给 ``bbox_raw`` 字段，排查"模型到底输出 0-1 还是
@@ -1204,7 +1258,15 @@ class WdnaiDetector:
         # 程串行保证。
         self._last_bbox_raw: Optional[list] = None
 
+    @property
+    def slot_count(self) -> int:
+        """并发推理 slot 数 = 勾选的实例数；K=1 时与单卡行为一致。"""
+        return len(self._slots)
 
+    def slot_pins(self) -> list[dict]:
+        """slot 清单（给前端 / 诊断看，不含 session 对象）。"""
+        return [{"model_id": s.model_id, "npu_index": s.npu_index}
+                for s in self._slots]
     # ------------------------------------------------------------------ #
     @property
     def available(self) -> bool:
@@ -1312,7 +1374,11 @@ class WdnaiDetector:
                 "model":                  "",  # UI 不再展示模型名，仅作
                                                 # snapshot shape 兼容位
                 "session_ready":          session_ready,
+                # K>1 时 worker_alive / queue_size 只代表 slot 0，真实并发度看
+                # slot_count / slots。
                 "worker_alive":           self._worker is not None and self._worker.is_alive(),
+                "slot_count":             self.slot_count,
+                "slots":                  self.slot_pins(),
                 "queue_size":             self._item_q.qsize(),
                 "enabled_tools":          list(self._enabled_tools),
                 # 数据驱动：UI ``#vd-detect-size`` 下拉框从这里读。
@@ -1333,7 +1399,14 @@ class WdnaiDetector:
     def start(self, prompt: str, every_n: int = 30,
               enabled_tools: Optional[List[str]] = None,
               image_size: Optional[int] = None,
-              model_id: Optional[str] = None) -> dict:
+              model_id: Optional[str] = None,
+              models: Optional[List[dict]] = None) -> dict:
+        """``models``: 勾选的实例列表 ``[{"model_id","npu_index"}, ...]``。
+
+        同一个 model_id 可以出现多次，只要 npu_index 不同 —— 这是唯一的并行
+        维度：K 条线程各钉一个 worker 进程。K=1 时与只传 ``model_id`` 的旧
+        行为等价。
+        """
         if not self.available:
             raise RuntimeError("wdnai 不可用")
         if not (prompt or "").strip():
@@ -1462,6 +1535,40 @@ class WdnaiDetector:
                     get_registry().get_session(spec.requires_capability)
                 except RuntimeError as e:
                     raise RuntimeError(str(e)) from e
+        # 解析要跑的实例清单 → 逐个校验 running + 暴露 capability。缺省/空 =
+        # 退回单实例(model_id 或自动挑)，即今天的形态。
+        pins: List[dict] = []
+        if models:
+            if not isinstance(models, list):
+                raise ValueError(f"models 必须是 list 或 None: {models!r}")
+            seen_pins = set()
+            for m in models:
+                if not isinstance(m, dict):
+                    raise ValueError(
+                        f"models 每项必须是 {{model_id, npu_index}}: {m!r}")
+                mid = m.get("model_id")
+                if not isinstance(mid, str) or not mid.strip():
+                    raise ValueError(f"models[].model_id 必须是非空字符串: {m!r}")
+                npu = m.get("npu_index")
+                if npu is not None and (isinstance(npu, bool)
+                                        or not isinstance(npu, int)):
+                    raise ValueError(
+                        f"models[].npu_index 必须是整数或 null: {m!r}")
+                key = (mid.strip(), npu)
+                if key in seen_pins:
+                    # 同一实例勾两次 = 两条线程挤同一个 worker 进程，
+                    # 底层句柄不可重入。
+                    raise ValueError(
+                        f"models 含重复实例 model_id={mid!r} npu_index={npu!r}")
+                seen_pins.add(key)
+                # 提前探一次：start 早失败好过跑起来之后每帧才发现「功能未启用」。
+                registry.get_session_for_model(
+                    self._required_capability(), mid.strip(), npu)
+                pins.append({"model_id": mid.strip(), "npu_index": npu})
+        else:
+            # 单实例路径：model_id 已在上面校验过 running；没给就自动挑。
+            pins = [{"model_id": chosen_model_id, "npu_index": None}]
+
         with self._lock:
             self._enabled = True
             self._prompt = prompt
@@ -1470,19 +1577,64 @@ class WdnaiDetector:
             self._image_size = image_size  # None → backend auto-pick
             self._chosen_model_id = chosen_model_id
             self._frame_count = 0
-        if self._worker is None or not self._worker.is_alive():
-            self._stop_event.clear()
-            self._worker = threading.Thread(
-                target=self._worker_loop,
-                name="wdnai-detect",
-                daemon=True,
-            )
-            self._worker.start()
+        self._apply_slots(pins)
         return self.snapshot()
+
+    def _apply_slots(self, pins: List[dict]) -> None:
+        """按 ``pins`` 重建 slot 列表并拉起对应数量的推理线程。
+
+        复用同签名的 slot，所以改勾选后重启检测不会丢掉正在跑的线程。
+        """
+        self._stop_event.clear()
+        wanted = [(p.get("model_id") or "", p.get("npu_index"))
+                  for p in pins] or [("", None)]
+        old = self._slots
+        new_slots: List[_InferSlot] = []
+        for mid, npu in wanted:
+            reused = next(
+                (s for s in old
+                 if s.model_id == mid and s.npu_index == npu
+                 and (s.thread is None or s.thread.is_alive())
+                 and not s._retired), None)
+            new_slots.append(reused or _InferSlot(
+                model_id=mid, npu_index=npu, maxsize=self.ITEM_QUEUE_MAX))
+        # 没被复用的旧 slot：发 sentinel 让线程退出
+        for s in old:
+            if s in new_slots:
+                continue
+            s._retired = True
+            try:
+                s.q.put_nowait(None)
+            except queue.Full:
+                pass
+        self._slots = new_slots
+        for idx, slot in enumerate(new_slots):
+            if slot.thread is None or not slot.thread.is_alive():
+                slot.thread = threading.Thread(
+                    target=self._worker_loop, args=(idx,),
+                    name="wdnai-detect-%s" % slot.label(),
+                    daemon=True,
+                )
+                slot.thread.start()
+        # 必须在线程起完之后再同步：_worker 是 slot 0 的 thread 引用，先同步
+        # 会记到 None，snapshot() 的 worker_alive 永远是 False。
+        self._sync_slot0()
+
+    def _sync_slot0(self) -> None:
+        """把 slot 0 的引用转给 ``_item_q`` / ``_pending``（只读属性）。"""
+        s0 = self._slots[0]
+        self.__dict__.pop("_item_q", None)
+        self.__dict__.pop("_pending", None)
+        self.__dict__.pop("_worker", None)
+        self._item_q = s0.q
+        self._pending = s0.pending
+        self._worker = s0.thread
 
     def stop(self) -> dict:
         with self._lock:
             self._enabled = False
+        for slot in self._slots:
+            slot._retired = True
         try:
             self._item_q.put_nowait(None)
         except queue.Full:
@@ -1516,27 +1668,51 @@ judge_score: Optional[float] = None,
 
         ``judge_score`` = 判据器在这一帧上的分数(手动跳帧模式为 None);
         ``channel`` = 第几路(单路恒为 0)。两者同帧共用,故都走本签名。
+
+        投递到 **slot 0**。多卡轮转要用
+        :meth:`submit_frame_to`（见那里的每 N 帧节流说明）。
         """
+        self.submit_frame_to(0, frame_bgr, frame_pos, frame_b64,
+                             judge_score, channel)
+
+    def submit_frame_to(self, slot_idx: int,
+                        frame_bgr: "np.ndarray",
+                        frame_pos: int,
+                        frame_b64: str = "",
+                        judge_score: Optional[float] = None,
+                        channel: int = 0) -> bool:
+        """把一帧投给指定的推理 slot；返回是否真的进了队列。
+
+        **每 N 帧节流只在 slot 0 上做**：那个门槛是给单路页面的，多卡下节流
+        职责属于轮转调度器（它本身就是一 slot 一帧）。沿用默认 every_n=30 会
+        让 30 次投递只有 1 次真进队列，其余次 wait_slot_idle 亚毫秒返回 ——
+        轮转退化成空转，而 round / 事件数照涨，看着一切正常。
+        """
+        if slot_idx >= len(self._slots):
+            return False
+        slot = self._slots[slot_idx]
         with self._lock:
             if not (self._enabled and self._prompt):
-                return
-            self._frame_count += 1
-            if self._frame_count % self._every_n != 0:
-                return
+                return False
+            if slot_idx == 0:
+                self._frame_count += 1
+                if self._frame_count % self._every_n != 0:
+                    return False
             prompt = self._prompt
         try:
             while True:
-                self._item_q.get_nowait()
+                slot.q.get_nowait()
         except queue.Empty:
             pass
         try:
-            self._item_q.put_nowait(
+            slot.q.put_nowait(
 # 6 元组：(帧, 帧号, prompt, jpeg, 判据分数, 通道号)
                 (frame_bgr, frame_pos, prompt, frame_b64, judge_score, channel),
             )
         except queue.Full:
-            pass
-        self._pending.set()
+            return False
+        slot.pending.set()
+        return True
 
     def wait_idle(self, timeout: float = 30.0) -> bool:
         """等当前这帧推理完（或超时）。仅多路轮转调用。
@@ -1560,6 +1736,26 @@ judge_score: Optional[float] = None,
             time.sleep(min(0.005, remain))
 
     # ------------------------------------------------------------------ #
+    def wait_slot_idle(self, slot_idx: int = 0,
+                       timeout: float = 30.0) -> bool:
+        """等**指定**推理 slot 空闲。轮转调度器调用。
+
+        ``timeout=0`` 是非阻塞探询（抢路之前先问一次"我这条路让了吗"），
+        返回 False 只表示现在还忙，退避多久由调用方决定。
+        """
+        if slot_idx >= len(self._slots):
+            return True                     # slot 已不存在 = 没有活要干
+        deadline = time.monotonic() + max(0.0, timeout)
+        pending = self._slots[slot_idx].pending
+        while True:
+            if not pending.is_set():
+                return True
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                return False
+            # 5ms 轮询 + time.sleep（释放 GIL），理由同 wait_idle
+            time.sleep(min(0.005, remain))
+
     def events(self) -> list:
         with self._events_lock:
             return [ev.to_dict() if hasattr(ev, "to_dict") else dict(ev) for ev in self._events]
@@ -1609,8 +1805,12 @@ judge_score: Optional[float] = None,
         prompt: str,
         frame_pos: int = -1,
         frame_b64: str = "",
+        pin: Optional[tuple] = None,
     ) -> List[DetectorEvent]:
         """Run a multi-turn tool loop on one frame; return a list of events.
+
+        ``pin`` = ``(model_id, npu_index)``，由调用它的 slot 提供；``None``
+        走 ``_chosen_model_id`` / 自动挑，与改造前一致。
 
         每帧开头 ``sess.reset()`` 清一次 KV cache（保留原帧间隔离语
         义）；之后循环 ``sess.respond``：
@@ -1666,9 +1866,16 @@ judge_score: Optional[float] = None,
         # user sees in the VTL events history.
         _required_cap = self._required_capability()
         try:
+            # 惰性导入（与本文件其余 registry 调用一致）：registry 反过来要拿
+            # detector 的类型，模块顶层双向 import 会成环。
             from app.core.compute.registry import get_registry
             _registry = get_registry()
-            if self._chosen_model_id:
+            if pin:
+                # slot 钉死的实例：同一 worker 进程的句柄不可重入，K 条线程
+                # 挤一个实例等于串行。
+                sess = _registry.get_session_for_model(
+                    _required_cap, pin[0], pin[1])
+            elif self._chosen_model_id:
                 sess = _registry.get_session_for_model(
                     _required_cap, self._chosen_model_id)
             else:
@@ -1780,10 +1987,11 @@ judge_score: Optional[float] = None,
             )
             if letterbox_resize_with_meta is not None:
                 try:
-                    frame_attachment = Attachment(
-                        letterbox_resize_with_meta(frame_bgr, target_size)[0]
-                    )
-                    lbox_meta = letterbox_resize_with_meta(frame_bgr, target_size)[1]
+                    # 一次调用同时拿 canvas 和 meta。原来分两次调用只为取
+                    # [0] 和 [1]，每帧白白多跑一遍 RGA + cv2.resize。
+                    canvas, lbox_meta = letterbox_resize_with_meta(
+                        frame_bgr, target_size)
+                    frame_attachment = Attachment(canvas)
                 except Exception as e:  # noqa: BLE001
                     LOG.warning(
                         "frame infer: letterbox failed (%s) — falling back "
@@ -2718,11 +2926,15 @@ judge_score: Optional[float] = None,
         )
 
     # ------------------------------------------------------------------ #
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, slot_idx: int = 0) -> None:
+        # K=1 时恒为 slot 0，走的是同一条通道。
+        slot = self._slots[slot_idx] if slot_idx < len(self._slots) else None
+        if slot is None:
+            return
         # 诊断 (v0.13): 入口 / watchdog 日志 + BaseException 兜底
         LOG.info(
-            "worker_loop[%s] started (generating_cls=%s)",
-            self._generating_cls.__name__ if self._generating_cls else "?",
+            "worker_loop[%s] started (slot=%d generating_cls=%s)",
+            slot.label(), slot_idx,
             self._generating_cls.__name__ if self._generating_cls else "?",
         )
         _last_seen_event_ts = time.monotonic()
@@ -2731,15 +2943,15 @@ judge_score: Optional[float] = None,
         while not self._stop_event.is_set():
             _loop_iter += 1
             try:
-                item = self._item_q.get(timeout=1.0)
+                item = slot.q.get(timeout=1.0)
             except queue.Empty:
                 # 诊断 (v0.13): 每 30 次空轮询 (~30s) 触发 watchdog 检测,
                 # 如果从最后一次事件时间戳算起超过 _WATCHDOG_IDLE_SECONDS
                 # (默认 120s) 没事件 → LOG.warning 给上游排查源是否还在
                 # 推帧。注意: video_session 一旦源 EOF 或文件短,frame_pos
                 # 停滞是正常行为,warning 让用户区分"框架空闲" vs "源停了"。
-                if not self._pending.is_set():
-                    self._pending.clear()
+                if not slot.pending.is_set():
+                    slot.pending.clear()
                 if _loop_iter % _WATCHDOG_CHECK_EVERY == 0:
                     _now = time.monotonic()
                     _idle = _now - _last_seen_event_ts
@@ -2748,7 +2960,7 @@ judge_score: Optional[float] = None,
                             "worker_loop[%s] idle for %.0fs (last event "
                             "_last_seen_event_ts ago, source 可能停了 / "
                             "submit_frame 未被调用 / every_n 太大)",
-                            self._generating_cls.__name__ if self._generating_cls else "?",
+                            slot.label(),
                             _idle,
                         )
                 continue
@@ -2756,9 +2968,9 @@ judge_score: Optional[float] = None,
                 # explicit stop sentinel
                 LOG.info(
                     "worker_loop[%s] received stop sentinel — exiting",
-                    self._generating_cls.__name__ if self._generating_cls else "?",
+                    slot.label(),
                 )
-                self._pending.clear()
+                slot.pending.clear()
                 return
             judge_score = None
             channel = 0
@@ -2773,7 +2985,8 @@ judge_score: Optional[float] = None,
                 frame_b64 = item[3] if len(item) >= 4 else ""
             _t0_infer = time.monotonic()
             try:
-                events = self._infer_sync(frame_bgr, prompt, frame_pos, frame_b64)
+                events = self._infer_sync(frame_bgr, prompt, frame_pos,
+                                          frame_b64, pin=slot.pin)
                 # 判据分数在这一帧上是**所有事件共用的**（一次推理一帧，
                 # 一帧里的多个事件分数一样），所以统一在这里回填，而不是
                 # 在每个 DetectorEvent(...) 构造点都加一遍参数 —— 那些点
@@ -2797,7 +3010,7 @@ judge_score: Optional[float] = None,
                 )
                 # 失败也要解 pending，否则 wait_idle() 等到超时，
                 # 该路之后的所有路都被卡住。
-                self._pending.clear()
+                slot.pending.clear()
                 continue
             _infer_ms = (time.monotonic() - _t0_infer) * 1000.0
             _video_ts = 0.0
@@ -2845,6 +3058,8 @@ judge_score: Optional[float] = None,
                     ev.id = self._next_event_id
                     ev.frame_pos = frame_pos
                     ev.channel = channel
+                    ev.model_id = slot.model_id
+                    ev.npu_index = slot.npu_index
                     ev.ts = _video_ts
                     ev.video_ts = _video_ts
                     self._next_event_id += 1
@@ -2856,7 +3071,7 @@ judge_score: Optional[float] = None,
                 # 顺序仍是 frame_pos 内 id 倒序（最新在前）。
             for ev in events:
                 self._broadcast(ev.to_dict())
-            self._pending.clear()   # 唤醒 wait_idle() 的轮询方
+            slot.pending.clear()   # 唤醒 wait_idle() 的轮询方
             # 诊断 (v0.13): 每帧处理耗时日志 (DEBUG 级别,高频不刷屏)
             LOG.debug(
                 "worker_loop[%s] frame_pos=%d events=%d it_infer=%.0fms",

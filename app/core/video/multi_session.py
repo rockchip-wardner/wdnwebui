@@ -107,6 +107,15 @@ ANA_WAIT_TIMEOUT = 1.0
 # 一次「已完成的推理」耗时下限（毫秒）。正常单路 850~1900ms，远大于此；
 # 若 wait_idle 亚毫秒返回，说明这一帧压根没进队列（见 _rr_loop 的退避分支）。
 RR_MIN_INFER_MS = 100.0
+# feeder 等自己 slot 空闲的最长阻塞。多卡下这是"排队"不是"推理"，给短一点：
+# 等太久会让所有 feeder 一起睡着，退化成串行。
+RR_SLOT_IDLE_WAIT = 0.5
+# 连续多少次「帧没进队列」后判定为异常空转并退避。单次亚毫秒返回可能是正常
+# 的（队列正好满），连续十几次说明 feeder 在对着没人消费的队列空转。
+RR_SPIN_STREAK_LIMIT = 10
+RR_SPIN_BACKOFF = 0.5
+# 本次既没推理也没空转（判据挡下 / 没拿到送检帧）时的退避。
+RR_NO_PROGRESS_WAIT = 0.3
 
 STATE_IDLE = "idle"
 STATE_OPENING = "opening"
@@ -575,7 +584,14 @@ class MultiChannelSession:
         self._error = ""
         self._loop = True
         self._detector: Any = None
-        self._rr_thread: Optional[threading.Thread] = None
+        self._rr_threads: List[threading.Thread] = []
+        # 轮转代号：start / stop 都自增，拿着旧代号的 feeder 自行退出
+        self._rr_gen = 0
+        # 多卡共享的取路状态。取路与占用必须同一把锁，否则两个 feeder 会拿到
+        # 同一路、同一帧被两个模型同时推理。
+        self._ch_lock = threading.Lock()
+        self._ch_cursor = 0
+        self._ch_inflight: set = set()
         self._rr_current = -1
         self._rr_lock = threading.Lock()
         self._rr_round = 0
@@ -585,6 +601,9 @@ class MultiChannelSession:
         self._rr_interval = 0.0
         # 累计跳过的路次（推理超时 = 这一路没等到结果，不阻塞整轮）
         self._rr_skips = 0
+        # 「帧压根没进队列」的累计空转次数（已被退避挡下，不会以每秒几千次
+        # 的速率刷）。与 _rr_skips 分开：那个是"等满推理超时才跳过"。
+        self._rr_spins = 0
         # 累计被帧判据挡下的路次（判为"这一帧不值得送检"）。与 _rr_skips 分开
         # 计数：前者是判据在省算力（好事），后者是推理卡住了（坏事）。
         self._rr_judge_skips = 0
@@ -692,9 +711,11 @@ class MultiChannelSession:
     def close(self) -> dict:
         self._stop_evt.set()
         self._play_evt.set()  # 放行卡在 play wait 上的线程
-        rr = self._rr_thread
-        self._rr_thread = None
-        if rr is not None:
+        with self._rr_lock:
+            self._rr_gen += 1
+            rrs = list(self._rr_threads)
+            self._rr_threads = []
+        for rr in rrs:
             rr.join(timeout=2.0)
         channels: List[Channel] = []
         with self._lock:
@@ -705,6 +726,7 @@ class MultiChannelSession:
             # open() 开头会调 close()，所以新一轮的计数天然从 0 起。
             self._rr_round = 0
             self._rr_skips = 0
+            self._rr_spins = 0
             self._rr_judge_skips = 0
             self._rr_current = -1
             self._rr_infer_ms = 0.0
@@ -787,20 +809,39 @@ class MultiChannelSession:
     # VLM 轮转调度
     # ------------------------------------------------------------------ #
     def attach_detector(self, detector) -> None:
-        """把 WdnaiDetector 接上，轮转线程随即按 ch0..chN-1 依次提交。"""
+        """把 WdnaiDetector 接上，轮转线程随即开始提交。"""
         with self._lock:
             self._detector = detector
 
     def start_round_robin(self) -> None:
-        """起轮转线程，至多一个在跑。无条件新建并先换掉引用，旧线程靠
-        "自己不再是 _rr_thread" 自查退出 —— 若改用"旧线程还活着就
-        return"+stop 置 None，stop→start 后旧线程的退出判据永远不成立，
-        两个线程一起转（详见 AGENTS.md）。"""
+        """起轮转线程，**每个推理 slot 一条**（K 条），至多一组在跑。
+
+        退出靠 ``_rr_gen`` 代号而非线程身份：线程身份判据在"停一次立刻再起"
+        下不成立（旧线程可能还没被调度到、引用就被换掉了），AGENTS.md 记过
+        由此引发的"两个线程一起转、轮转顺序乱成 1,2,1,3,4,2"。
+        """
+        self.stop_round_robin()
+        with self._lock:
+            detector = self._detector
+        k = 1
+        if detector is not None:
+            try:
+                k = max(1, int(getattr(detector, "slot_count", 1)))
+            except Exception:  # noqa: BLE001
+                k = 1
         with self._rr_lock:
-            t = threading.Thread(
-                target=self._rr_loop, name="mc-vlm-rr", daemon=True)
-            self._rr_thread = t
+            self._rr_gen += 1
+            gen = self._rr_gen
+            self._rr_threads = [
+                threading.Thread(
+                    target=self._rr_loop, args=(gen, i),
+                    name="mc-vlm-rr-%d" % i, daemon=True)
+                for i in range(k)
+            ]
+            threads = list(self._rr_threads)
+        for t in threads:
             t.start()
+        LOG.info("mc-vlm-rr 起了 %d 条 feeder（slot 数 = %d）", k, k)
 
     def set_round_robin_interval(self, seconds: float) -> float:
         """设置「轮转间隔」秒/路。返回实际生效值。
@@ -817,31 +858,48 @@ class MultiChannelSession:
 
     def stop_round_robin(self) -> None:
         with self._rr_lock:
-            self._rr_thread = None
+            self._rr_gen += 1          # 让所有旧 feeder 自行退出
+            self._rr_threads = []
         with self._lock:
             self._rr_current = -1
+            self._ch_inflight.clear()
 
-    def _rr_loop(self) -> None:
-        """VLM 轮转调度：**一路一帧，串行，严格第 1 路 → 第 N 路 → 回第 1 路**。
+    def _take_channel(self, channels) -> Optional[Any]:
+        """原子地从共享游标取一路并登记占用。返回 None = 全被占用。
 
-        N 路视频各自**独立地持续解码**，播放不受推理影响 —— 解码线程只往
-        ``latest_bgr`` 写，推理读的是快照，两者互不阻塞。轮到第 i 路时取它
-        **此刻最新的一帧**提交，等它推理完成再取第 i+1 路的当前帧。每轮都从
-        第 1 路开始、顺序固定，便于对照画面排查。
-
-        **必须串行**：``detector._item_q`` 是 maxsize=1 的 drop-oldest
-        队列，N 路同时挤只有最后进去的那路能跑，其余静默丢弃。所以靠
-        ``detector.wait_idle()`` 做背压 —— 同一模型句柄不可重入。
-
-        一轮 = N 次推理。6 路 x ~1.9s ≈ 11s/轮 —— 这是单模型句柄串行的
-        固有代价，不是缺陷。想拉长观察间隔用「轮转间隔」秒/路。
+        **K=1 退化成严格 0→1→…→N-1**：只有一个 feeder 时任何时刻至多一路被
+        占用，游标又只增不回退 —— 与多卡化之前的轮转语义逐字相同。
         """
+        with self._ch_lock:
+            n = len(channels)
+            for _ in range(n):
+                idx = self._ch_cursor % n
+                self._ch_cursor += 1
+                if idx in self._ch_inflight:
+                    continue
+                self._ch_inflight.add(idx)
+                return channels[idx]
+        return None
+
+    def _release_channel(self, idx: int) -> None:
+        with self._ch_lock:
+            self._ch_inflight.discard(idx)
+
+    def _rr_loop(self, gen: int, slot_idx: int = 0) -> None:
+        """VLM 轮转调度：每个推理 slot 一条 feeder，**共享一路游标**。
+
+        每条 feeder：等自己的 slot 空闲 → 从共享游标抢下一路 → 取该路**此刻
+        最新的一帧**提交 → 等推理完释放该路。
+
+        **抢下一路**而不是按 ``ch % K == slot`` 静态分配：路数不能被 K 整除时
+        静态分配会永久失衡（3 路 2 卡 → 卡0 干 2/3 的活）。共享游标 + 「谁先
+        空闲谁先取」让跑得快的卡自动多干活。取路时登记进 ``_ch_inflight``，
+        同一路不会被两个 slot 同时推理。
+        """
+        spin_streak = 0
         while not self._stop_evt.is_set():
             with self._rr_lock:
-                # 用**线程身份**判定退出，而不是「引用是不是 None」。
-                # 被 stop 摘掉、或被新一轮 start 取代的线程都会在这里
-                # 自行退出，保证任何时刻只有一个轮转线程在提交。
-                if self._rr_thread is not threading.current_thread():
+                if gen != self._rr_gen:
                     return
             with self._lock:
                 channels = list(self._channels)
@@ -851,120 +909,155 @@ class MultiChannelSession:
                 self._stop_evt.wait(0.2)
                 continue
 
-            analyzed = 0
-            spin = 0
-            # 一轮固定从第 1 路（index 0）开始，顺序 0 -> 1 -> ... -> N-1
-            for ch in channels:
-                if self._stop_evt.is_set():
-                    return
-                # 每路都要复查身份：判据只放 while 顶部的话，被取代的
-                # 旧线程要跑完整轮才退出，期间两线程同时提交、顺序乱掉。
-                with self._rr_lock:
-                    if self._rr_thread is not threading.current_thread():
-                        return
-                # 判据帧号必须单调：不能用 ch.frame_pos（cap.frame_pos 循环重播时归零，
-                # gap 会变负；every_n 大于视频长度时循环之后彻底静默）。
-                # 单路 VideoSession 同样传 cap.frame_pos 却没事 —— 它在循环
-                # 点调了 judge.reset()，把 _last_pos 重新播种成 0 与之同步。
-                judge_pos = ch.frames
-                judge_score: Optional[float] = None
-                # 判据门控只在自动模式下走，manual 整段跳过（不缩缩略图也
-                # 不算分），此时行为与接入判据前一致。
-                #
-                # **这里只读不写**。解码线程已每帧调过 ``ch.judge.observe()``
-                # 写好了 _cur / _changed / _last_pos（让浮框/曲线实时刷新），
-                # 轮转线程如果再调 observe 会双写、污染参照帧。用
-                # ``decide_take_for_rr(pos)`` 读最近一次 observe 留下的状态
-                # 决定本路要不要送 VLM —— 判定语义与 observe() 内部 take 逐字
-                # 一致（``score > thr`` 或 ``gap >= every_n && score >= thr/2``）。
-                if ch.judge is not None and ch.judge.is_auto:
-                    try:
-                        take = ch.judge.decide_take_for_rr(judge_pos)
-                    except Exception as exc:  # noqa: BLE001
-                        LOG.warning("mc-ch%02d 判据读侧异常，按放行处理: %s",
-                                    ch.idx, exc)
-                        take = True
-                    if not take:
-                        with self._lock:
-                            self._rr_judge_skips += 1
-                        continue
-                    judge_score = ch.judge.current_score
-
-                # 请求本路在**下一次解码**上多出一张送检尺寸的图（同一次
-                # 解码的 DMA-BUF 多跑一次 RGA），然后等它交接。没有出帧就
-                # 跳过本路。等待窗口要宽于一个解码帧周期。
-                ch.request_inference()
-                frame = ch.take_inference(timeout=ANA_WAIT_TIMEOUT)
-                if frame is None:
+            # 等自己的 slot 空闲（多卡下不能用 detector 的全局 pending）
+            try:
+                if slot_idx >= getattr(detector, "slot_count", 1):
+                    self._stop_evt.wait(0.2)
                     continue
-                with self._lock:
-                    self._rr_current = ch.idx
-                t0 = time.perf_counter()
-                try:
-                    detector.submit_frame(frame, ch.frame_pos,
-                                          judge_score=judge_score,
-                                          channel=ch.idx)
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning("mc-vlm-rr ch%02d submit 失败: %s",
-                                ch.idx, exc)
-                    continue
-                # 等这一路推理完再轮下一路。单路卡死时不等满上限：
-                # 超时就跳过继续轮，否则一路挂住会把整个轮转拖死。
-                try:
-                    done = detector.wait_idle(timeout=RR_INFER_TIMEOUT)
-                except Exception:  # noqa: BLE001
-                    done = False
-                dt = (time.perf_counter() - t0) * 1000.0
-                with self._lock:
-                    self._rr_infer_ms = dt
-                    self._rr_last_ts = time.time()
-                if done and dt >= RR_MIN_INFER_MS:
-                    analyzed += 1
-                    spin = 0
-                elif done:
-                    # dt 接近 0 = 这帧根本没进队列（submit_frame 在门槛
-                    # 上直接 return，_pending 都不设，wait_idle 秒回 True）。
-                    # 不识别就会 15 次/秒空转：烧核、一帧没推理，round 却
-                    # 照涨，看着像"在正常工作"。
-                    spin += 1
-                    if spin in (10, 60, 300):
-                        LOG.warning(
-                            "mc-vlm-rr 连续 %d 次提交被丢弃（detector 未启用？"
-                            "），已降速", spin)
-                    if spin >= 10:
-                        self._stop_evt.wait(min(1.0, 0.05 * spin))
-                else:
-                    spin = 0
-                    with self._lock:
-                        self._rr_skips += 1
-                    LOG.warning("mc-vlm-rr ch%02d 推理超时 %.1fs，跳过",
-                                ch.idx, RR_INFER_TIMEOUT)
-                # 「轮转间隔」：上一路结束后额外等一会儿再轮下一路
-                if interval > 0:
-                    self._stop_evt.wait(interval)
+                detector.wait_slot_idle(slot_idx, timeout=RR_SLOT_IDLE_WAIT)
+            except Exception as exc:  # noqa: BLE001
+                # 这里不能静默 pass：detector 上若缺 wait_slot_idle，
+                # AttributeError 被吞掉后 feeder 立刻空转 —— 每秒几千次、
+                # round 恒 0，现象和"模型没返回"一模一样。
+                LOG.warning("mc-vlm-rr slot%d 等 slot 空闲失败: %s",
+                            slot_idx, exc)
+                self._stop_evt.wait(0.5)
+                continue
 
-            # 一轮跑完才计数（上一版在第一次 submit 后就 +1，轮数会虚高）
-            with self._lock:
-                if analyzed:
+            ch = self._take_channel(channels)
+            if ch is None:
+                # 全被别的 feeder 占着 —— 短暂退避，别空转烧核
+                self._stop_evt.wait(0.05)
+                continue
+
+            try:
+                analyzed, spin = self._run_one_channel(ch, detector, slot_idx,
+                                                        interval)
+            finally:
+                self._release_channel(ch.idx)
+            if analyzed:
+                spin_streak = 0
+                with self._lock:
                     self._rr_round += 1
+            elif spin:
+                # 连续空转（帧压根没进队列）要**跨轮累计**才退避：亚毫秒返回时
+                # 一轮就是几毫秒，不退避就是每秒几千次空转，烧一个核且一帧
+                # 没推理，而 round 不涨、事件不涨，从外面看"一切正常"。
+                spin_streak += 1
+                if spin_streak >= RR_SPIN_STREAK_LIMIT:
+                    LOG.warning(
+                        "mc-vlm-rr slot%d 连续 %d 次空转（帧未进队列），退避",
+                        slot_idx, spin_streak)
+                    with self._lock:
+                        self._rr_spins += spin_streak
+                    spin_streak = 0
+                    self._stop_evt.wait(RR_SPIN_BACKOFF)
+            else:
+                # 判据挡下 / 没拿到送检帧：同样得退避，否则 feeder 会在
+                # 「判据 + 缩略图」上 tight-loop。
+                self._stop_evt.wait(RR_NO_PROGRESS_WAIT)
+
+    def _run_one_channel(self, ch, detector, slot_idx: int,
+                          interval: float) -> tuple:
+        """跑一路：判据门控 → 取送检帧 → 投给 slot → 等推理完。"""
+        with self._lock:
+            self._rr_current = ch.idx
+        try:
+            # 判据帧号必须单调：不能用 ch.frame_pos（cap.frame_pos 循环重播时归零，
+            # gap 会变负；every_n 大于视频长度时循环之后彻底静默）。
+            judge_pos = ch.frames
+            judge_score: Optional[float] = None
+            # 判据门控只在自动模式下走，manual 整段跳过（不缩缩略图也不
+            # 算分），此时行为与接入判据前一致。
+            #
+            # **这里只读不写**。解码线程已每帧调过 ``ch.judge.observe()`` 写好了
+            # _cur / _changed / _last_pos（让浮框与曲线实时刷新），轮转线程再调
+            # observe 会双写、污染参照帧。改用 ``decide_take_for_rr(pos)`` 读最近
+            # 一次 observe 留下的状态决定本路要不要送 VLM —— 判定语义与
+            # observe() 内部 take 逐字一致。
+            if ch.judge is not None and ch.judge.is_auto:
+                try:
+                    take = ch.judge.decide_take_for_rr(judge_pos)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("mc-ch%02d 判据读侧异常，按放行处理: %s",
+                                ch.idx, exc)
+                    take = True
+                if not take:
+                    with self._lock:
+                        self._rr_judge_skips += 1
+                    return False, 0
+                judge_score = ch.judge.current_score
+
+            # 请求本路在**下一次解码**上多出一张送检尺寸的图（同一次
+            # 解码的 DMA-BUF 多跑一次 RGA），然后等它交接。没有出帧就
+            # 跳过本路。等待窗口要宽于一个解码帧周期。
+            ch.request_inference()
+            frame = ch.take_inference(timeout=ANA_WAIT_TIMEOUT)
+            if frame is None:
+                return False, 0
+
+            t0 = time.perf_counter()
+            try:
+                ok = detector.submit_frame_to(
+                    slot_idx, frame, ch.frame_pos,
+                    judge_score=judge_score, channel=ch.idx)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("mc-vlm-rr ch%02d submit 失败: %s", ch.idx, exc)
+                return False, 0
+            if not ok:
+                # 没进队列（detector 没启用 / 队列满）—— 不算推理，别白等
+                return False, 0
+            # 等**本 slot**推理完。单路卡死时不等满上限：超时就跳过继续轮，
+            # 否则一个 slot 挂住会拖慢它那一路。
+            try:
+                done = detector.wait_slot_idle(slot_idx,
+                                               timeout=RR_INFER_TIMEOUT)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("mc-vlm-rr slot%d 等推理结束失败: %s",
+                            slot_idx, exc)
+                done = False
+            dt = (time.perf_counter() - t0) * 1000.0
+            with self._lock:
+                self._rr_infer_ms = dt
+                self._rr_last_ts = time.time()
+            if done and dt >= RR_MIN_INFER_MS:
+                spin = 0
+            elif done:
+                # dt 接近 0 = 这一帧压根没进队列。退避由调用方按连续次数统一
+                # 做，这里只上报"本次是空转"。
+                spin = 1
+            else:
+                spin = 0
+                with self._lock:
+                    self._rr_skips += 1
+                LOG.warning("mc-vlm-rr slot%d ch%02d 推理超时 %.1fs，跳过",
+                            slot_idx, ch.idx, RR_INFER_TIMEOUT)
+            # 「轮转间隔」：本路结束后额外等一会儿再抢下一路
+            if interval > 0:
+                self._stop_evt.wait(interval)
+            return bool(done and dt >= RR_MIN_INFER_MS), spin
+        finally:
+            with self._lock:
                 self._rr_current = -1
-            if not analyzed:
-                self._stop_evt.wait(0.3)
 
     def vlm_snapshot(self) -> dict:
         with self._lock:
-            return {
-                "attached": self._detector is not None,
-                "running": bool(
-                    self._rr_thread is not None and self._rr_thread.is_alive()
-                ),
-                "current": self._rr_current,
-                "round": self._rr_round,
-                "interval": self._rr_interval,
-                "skips": self._rr_skips,
-                "last_infer_ms": round(self._rr_infer_ms, 1),
-                "last_ts": self._rr_last_ts,
-            }
+            threads = list(self._rr_threads)
+            inflight = sorted(self._ch_inflight)
+        return {
+            "attached": self._detector is not None,
+            "running": any(t.is_alive() for t in threads),
+            # 多卡并行：每个推理 slot 一条 feeder，K = 勾选的实例数
+            "feeder_count": len(threads),
+            "inflight_channels": inflight,
+            "current": self._rr_current,
+            "round": self._rr_round,
+            "interval": self._rr_interval,
+            "skips": self._rr_skips,
+            "spins": self._rr_spins,
+            "last_infer_ms": round(self._rr_infer_ms, 1),
+            "last_ts": self._rr_last_ts,
+        }
 
     # ------------------------------------------------------------------ #
     # 帧判据（每路一个独立判据器）

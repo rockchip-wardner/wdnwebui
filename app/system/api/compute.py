@@ -111,11 +111,13 @@ class InstanceRequest(BaseModel):
 
 
 class StopInstanceRequest(BaseModel):
-    """``DELETE /compute/instances`` 入参：只需要 model_id。
+    """``DELETE /compute/instances`` 入参。
 
-    删除不需要 npu_index（registry 内部按 model 唯一索引）。
+    ``npu_index`` 缺省 = 停掉该模型的全部实例；给了卡号就只停那一张（多卡
+    并行推理时用户要能「停掉 NPU1 那份、留着 NPU0」）。
     """
     model: str
+    npu_index: Optional[int] = None
 
     @field_validator("model")
     @classmethod
@@ -124,6 +126,13 @@ class StopInstanceRequest(BaseModel):
             raise ValueError(
                 f"未知 model: {v!r}（可选: {sorted(MODEL_PRESETS.keys())}）"
             )
+        return v
+
+    @field_validator("npu_index")
+    @classmethod
+    def _card_id(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError(f"npu_index 必须是非负整数: {v!r}")
         return v
 
 
@@ -160,8 +169,8 @@ class AutostartEntry(BaseModel):
     校验规则：
     * ``model`` 必须在 ``MODEL_PRESETS`` 中存在（否则 422）；
     * ``npu_index`` 必须是非负整数（否则 422）；
-    * 同一模型只允许一条（多于一条 → 422）：一张卡一个模型，反悔就在
-      算力页手动换卡；
+    * 同一模型允许写多条，只要 ``npu_index`` 不同（跨卡并行推理）；同一张
+      卡上重复同模型 → 422；
     * 旧 ``services[]`` 的 ``label`` / ``device`` 字段已删除 —— label
       归 ``workers/<id>.json``，卡号直接写 ``npu_index``。带上旧字段会
       被当成未知字段报错，而不是被静默忽略。
@@ -195,7 +204,7 @@ class AutostartEntry(BaseModel):
 class ComputeConfigPayload(BaseModel):
     """``PUT /api/compute/config`` 入参。
 
-    ``autostart`` 每条由 :class:`AutostartEntry` 校验；同一模型只允许一条。
+    ``autostart`` 每条由 :class:`AutostartEntry` 校验；(model, npu_index) 组合唯一。
 
     其它字段（hardware_capabilities / app.prompts /
     tool_call_max_iters 等）按现有语义落盘；未知字段被 ``extra="ignore"``
@@ -227,15 +236,17 @@ class ComputeConfigPayload(BaseModel):
     @field_validator("autostart")
     @classmethod
     def _unique_models(cls, v: list[AutostartEntry]) -> list[AutostartEntry]:
-        seen: set[str] = set()
+        """唯一性按 (model, npu_index)：跨卡重复是并行推理要的，同卡重复才是冲突。"""
+        seen: set[tuple[str, int]] = set()
         for entry in v:
-            if entry.model in seen:
+            key = (entry.model, entry.npu_index)
+            if key in seen:
                 raise ValueError(
-                    f"compute.autostart 含重复 model: {entry.model!r}；"
-                    "同一模型只允许一条（一个模型一张卡；要跑第二张卡请在"
-                    "算力页手动启用）"
+                    f"compute.autostart 含重复条目: model={entry.model!r} "
+                    f"npu_index={entry.npu_index}；同一张卡上不能挂两份同一个"
+                    "模型（同卡叠模型会加载失败），换卡请写不同的 npu_index。"
                 )
-            seen.add(entry.model)
+            seen.add(key)
         return v
 
 
@@ -408,15 +419,17 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
     卡片在用）仍然只 unload 不杀进程。别把它们当成同一个语义。
 
     Raises:
-        404: model 不在 registry。
+        404: model（+ npu_index）不在 registry。
         403: 实例来自远端 peer。
         400: registry 侧停止失败。
     """
     reg = get_registry()
-    inst = reg._find_by_model(req.model)
+    inst = (reg._instances_of(req.model, req.npu_index) or [None])[0]
     if inst is None:
+        where = f" (npu_index={req.npu_index})" if req.npu_index is not None else ""
         raise HTTPException(
-            status_code=404, detail=f"{req.model} 不在 registry")
+            status_code=404,
+            detail=f"{req.model}{where} 不在 registry")
     # 安全护栏:adopted 来自其他板子的 DDS peer worker,本机无权限
     # 启停(每块板子只能管理自己的本地算力)。若允许 DELETE,后端会
     # 通过 RPC 通知对端 worker 卸载 LLMSession,误关其他板子的 NPU
@@ -434,7 +447,7 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
             ),
         )
     try:
-        reg.stop_instance_local(req.model)
+        reg.stop_instance_local(req.model, req.npu_index)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "snapshot": reg.snapshot()}

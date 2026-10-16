@@ -75,6 +75,48 @@ def _parse_prompt(payload: dict) -> PromptPlan:
     else:
         model_id = raw_model_id
 
+    # models: 勾选的**实例**列表 [{"model_id","npu_index"}, ...]。同一个
+    # model_id 可出现多次（npu_index 不同 = 同模型跑两张卡），每条一个推理
+    # slot。缺省则退回单实例 model_id 路径。
+    raw_models = payload.get("models", None)
+    models = None
+    if raw_models is not None:
+        if not isinstance(raw_models, list) or not raw_models:
+            raise HTTPException(
+                status_code=400,
+                detail=f"models 必须是非空数组: {raw_models!r}",
+            )
+        models = []
+        seen = set()
+        for item in raw_models:
+            if not isinstance(item, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"models 每项必须是 {{model_id, npu_index}}: {item!r}",
+                )
+            mid = item.get("model_id")
+            if not isinstance(mid, str) or not mid.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"models[].model_id 必须是非空字符串: {item!r}",
+                )
+            npu = item.get("npu_index")
+            if npu is not None and (isinstance(npu, bool)
+                                    or not isinstance(npu, int)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"models[].npu_index 必须是整数或 null: {item!r}",
+                )
+            key = (mid.strip(), npu)
+            # 同一实例勾两次 = 两条线程挤同一个 worker 进程，句柄不可重入
+            if key in seen:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"models 含重复实例 model_id={mid!r} npu_index={npu!r}",
+                )
+            seen.add(key)
+            models.append({"model_id": mid.strip(), "npu_index": npu})
+
     raw_interval = payload.get("rr_interval", None)
     if raw_interval is None:
         rr_interval = float(legacy_every_n)   # 老前端：every_n 即秒/路
@@ -90,6 +132,7 @@ def _parse_prompt(payload: dict) -> PromptPlan:
             "enabled_tools": [],      # 该页不挂工具，显式置空
             "image_size": image_size,
             "model_id": model_id,
+            "models": models,
         },
         rr_interval=rr_interval,
     )

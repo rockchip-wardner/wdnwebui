@@ -1185,8 +1185,22 @@
     unmount();
   }
 
+  /** (model_id, npu_index) 的稳定字符串键 —— 进度行 data 属性 + statusMap 用。
+   *  ``npu_index`` 为 null = 任意一张卡起来即可；那种 target 不能拿去和
+   *  "model@npu" 比 —— 键永远对不上，finish 会一路等到 90s 超时。 */
+  function _targetKey(t) {
+    return t.model_id + "@" + t.npu_index;
+  }
+
   async function _waitForModelsRunning(cfg) {
-    const targets = Object.entries(cfg.swcap_to_model).map(([cap, m]) => m.model_id);
+    // 展开成 (model_id, npu_index) 对：只按 model_id 判的话，多卡场景下
+    // "任意一张卡起来了"就算齐，用户要两张卡却只等到一张，推理退化成单卡
+    // 还不报错。
+    const targets = [];
+    for (const [, m] of Object.entries(cfg.swcap_to_model || {})) {
+      const cards = Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index];
+      for (const n of cards) targets.push({ model_id: m.model_id, npu_index: n });
+    }
     if (targets.length === 0) return;
     const statusBox = _q("#" + WIZARD_NS + "finish-error");
     if (!statusBox) return;
@@ -1212,12 +1226,12 @@
       for (const m of targets) {
         const row = document.createElement("div");
         row.className = WIZARD_NS + "progress-row";
-        row.dataset.modelId = m;
+        row.dataset.modelId = _targetKey(m);
         const head = document.createElement("div");
         head.className = WIZARD_NS + "progress-row-head";
         const label = document.createElement("span");
         label.className = WIZARD_NS + "progress-row-label";
-        label.textContent = m;
+        label.textContent = _targetKey(m);   // 带卡号：看得出是哪张卡在加载
         const pctEl = document.createElement("span");
         pctEl.className = WIZARD_NS + "progress-row-pct";
         head.appendChild(label);
@@ -1241,11 +1255,11 @@
         if (h) h.textContent = `模型加载进度 (${doneCount}/${targets.length})`;
       }
       for (const m of targets) {
-        const info = statusMap[m];
+        const info = statusMap[_targetKey(m)];
         if (!info) continue;
         // CSS.escape 防御连字符 / 点号(model_id 限定 a-z0-9- 但保留)
         const row = statusBox.querySelector(
-          `[data-model-id="${CSS.escape(m)}"]`
+          `[data-model-id="${CSS.escape(_targetKey(m))}"]`
         );
         if (!row) continue;
         const fill = row.querySelector("." + WIZARD_NS + "progress-bar-fill");
@@ -1279,10 +1293,15 @@
           // _probeEnv 一致;_wizardBringUpModels 已保证 POST 成功 = 本机就绪。
           const instances = (data.instances || [])
             .filter((i) => i._source !== "adopted");
-          const runningSet = new Set(
-            instances.filter((i) => i.status === "running").map((i) => i.model_id)
-          );
-          if (targets.every((m) => runningSet.has(m))) {
+          // 就绪判据分两种：声明了卡号的要**那张卡**running；没声明卡号的
+          // （多数卡片的旧写法）任意一张卡 running 即可。
+          const running = instances.filter((i) => i.status === "running");
+          const runningExact = new Set(running.map((i) => _targetKey(
+            { model_id: i.model_id, npu_index: i.npu_index })));
+          const runningAny = new Set(running.map((i) => i.model_id));
+          if (targets.every((t) => (t.npu_index == null
+                ? runningAny.has(t.model_id)
+                : runningExact.has(_targetKey(t))))) {
             // 模型全部就绪 → 清空 statusBox,避免误导用户"是不是出错了"
             clearBox();
             return;
@@ -1294,21 +1313,24 @@
           const statusMap = {};
           let doneCount = 0;
           for (const m of targets) {
-            const est = perModel[m] != null ? perModel[m] : defaultEst;
-            const inst = instances.find((i) => i.model_id === m);
+            const key = _targetKey(m);
+            const est = perModel[m.model_id] != null
+              ? perModel[m.model_id] : defaultEst;
+            const inst = instances.find((i) => i.model_id === m.model_id
+              && (m.npu_index == null || i.npu_index === m.npu_index));
             if (!inst) {
               // POST 后 1s 内 worker 还没上报 status;显式 "等待启动…" 而
               // 非 0%,避免和真 0% 加载混淆
-              statusMap[m] = { status: "wait", barPct: 0, label: "等待启动…" };
+              statusMap[key] = { status: "wait", barPct: 0, label: "等待启动…" };
               continue;
             }
             if (inst.status === "running") {
-              statusMap[m] = { status: "done", barPct: 100, label: "✓ 100%" };
+              statusMap[key] = { status: "done", barPct: 100, label: "✓ 100%" };
               doneCount++;
               continue;
             }
             if (inst.status === "error") {
-              statusMap[m] = {
+              statusMap[key] = {
                 status: "error", barPct: 0,
                 label: `✗ ${inst.error || "未知错误"}`,
               };
@@ -1318,7 +1340,7 @@
             const elapsed = Math.max(0, now - startTs);
             const pct = Math.min(99, Math.max(0, Math.round((elapsed / est) * 100)));
             const remaining = Math.max(0, Math.round(est - elapsed));
-            statusMap[m] = {
+            statusMap[key] = {
               status: "loading", barPct: pct,
               label: `${pct}% (~${remaining}s 剩余)`,
             };

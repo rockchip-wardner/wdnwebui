@@ -530,8 +530,9 @@ def _parse_autostart_config(raw) -> list[dict]:
     * list entry not a dict → **raise** ``ValueError``
     * ``model`` not in ``MODEL_PRESETS`` → **raise** ``ValueError``
     * ``npu_index`` not a non-negative int → **raise** ``ValueError``
-    * duplicate ``model`` → **raise** ``ValueError`` (one card per model;
-      a second entry for the same model could only fight the first one)
+    * duplicate ``(model, npu_index)`` → **raise** ``ValueError``. 同一模型
+      跑多张卡是并行推理要的形态；同一张卡上重复才是真冲突（同卡叠两个模型
+      会 rc=-6）。
 
     Rejecting loudly matters here: a typo in this file means a model the
     operator expects to be up at boot is silently not there.
@@ -539,7 +540,7 @@ def _parse_autostart_config(raw) -> list[dict]:
     if not isinstance(raw, list):
         return []
     out: list[dict] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, int]] = set()
     for idx, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ValueError(
@@ -563,11 +564,6 @@ def _parse_autostart_config(raw) -> list[dict]:
                 f"compute.autostart[{idx}].model={model!r} 不在 "
                 f"MODEL_PRESETS {sorted(MODEL_PRESETS.keys())} 中"
             )
-        if model in seen:
-            raise ValueError(
-                f"compute.autostart 含重复 model={model!r}；一个模型只允许"
-                "一条（一条卡；同一模型跑第二张卡请在算力页手动启用）")
-        seen.add(model)
         npu_index = entry.get("npu_index")
         if not isinstance(npu_index, int) or isinstance(npu_index, bool):
             raise ValueError(
@@ -577,6 +573,13 @@ def _parse_autostart_config(raw) -> list[dict]:
             raise ValueError(
                 f"compute.autostart[{idx}].npu_index={npu_index} 非法；"
                 "必须是 0 起的实际卡号（主控 NPU 用 0）")
+        key = (model, int(npu_index))
+        if key in seen:
+            raise ValueError(
+                f"compute.autostart 含重复条目 model={model!r} "
+                f"npu_index={npu_index}；同一张卡上不能挂两份同一个模型"
+                "（同卡叠模型会加载失败），换卡请写不同的 npu_index")
+        seen.add(key)
         out.append({"model": model, "npu_index": int(npu_index)})
     return out
 
@@ -2459,8 +2462,11 @@ class ComputeRegistry:
                     "unload %s (npu=%s): rpc_client teardown deferred to caller",
                     model_id, inst.npu_index)
 
-    def stop_instance_local(self, model_id: str) -> None:
+    def stop_instance_local(self, model_id: str,
+                            npu_index: Optional[int] = None) -> None:
         """Unload → RPC shutdown → SIGTERM → wait 3 s → kill -9.
+
+        ``npu_index`` 缺省停该模型全部实例；给了卡号只停那一张。
 
         The order is load-bearing, and reversing any two steps breaks
         something real:
@@ -2492,7 +2498,7 @@ class ComputeRegistry:
         :meth:`unload_instance` — a model loaded on two cards must not
         leave one of them running behind the UI's back.
         """
-        targets = self._instances_of(model_id)
+        targets = self._instances_of(model_id, npu_index)
         if not targets:
             raise RuntimeError(f"{model_id} 不在 registry")
         t0 = time.time()
@@ -3122,6 +3128,15 @@ class ComputeRegistry:
             with self._lock:
                 already = [i for i in self._instances.values()
                            if i.model_id == model_id]
+                # 本地在这张卡 = 已有，别重复启；本地在别的卡 = 并行推理的
+                # 第二份，照常再启一个（原来只看「该模型有没有实例」，配了
+                # 两张卡也只启一份，配了却不生效还不报错）。
+                local_here = [i for i in already
+                              if i.npu_index == npu_index
+                              and i._source in ("spawned", "adopted_local")]
+                local_elsewhere = [i for i in already
+                                   if i.npu_index != npu_index
+                                   and i._source in ("spawned", "adopted_local")]
             for inst in already:
                 # config no longer overrides labels (that lives in the
                 # manifest), but the autostart card is still the right
@@ -3130,17 +3145,22 @@ class ComputeRegistry:
                     inst._default_npu_index = npu_index
                 if not inst._autostart:
                     inst._autostart = "enabled"
-            if already:
-                LOG.info("boot: %s 已在 registry（%s），跳过 adopt/spawn",
-                         model_id, already[0]._source)
+            if local_here or (already and not local_elsewhere):
+                LOG.info("boot: %s 已在 registry 的 npu=%d（%s），"
+                         "跳过 adopt/spawn",
+                         model_id, npu_index,
+                         (local_here or already)[0]._source)
                 continue
 
             adopted = None
-            try:
-                adopted = self._adopt_existing_worker(model_id)
-            except Exception as e:  # noqa: BLE001
-                LOG.warning("boot peer-adopt failed for %s: %s",
-                            model_id, e)
+            # adopt 只在本机一张都没跑时做：peer worker 与 entry 指定的卡号
+            # 无关，卡对不上不如自己 spawn 一个。
+            if not local_elsewhere:
+                try:
+                    adopted = self._adopt_existing_worker(model_id)
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning("boot peer-adopt failed for %s: %s",
+                                model_id, e)
             if adopted is not None:
                 adopted._default_npu_index = npu_index
                 adopted._autostart = "enabled"
