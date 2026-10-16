@@ -53,6 +53,12 @@
         try { window.WizardState?.clearCompleted?.(manifest, cfg); } catch (_) {}
         try { window.WizardState?.clearStep?.(manifest, cfg); } catch (_) {}
       } else if (window.WizardState?.isCompleted?.(manifest, cfg)) {
+        // 临时诊断 —— 排查"退出应用后重进不进 wizard"bug。
+        console.warn("[tryMount DEBUG] isCompleted=true for",
+                     manifest.id,
+                     "ls:",
+                     Object.keys(localStorage).filter(
+                       k => k.includes(manifest.id)));
         // 自动挂载路径(framework 在 showPage 里调):用户之前已经走完
         // _finish (applyWizardSnapshot 成功落到了下游),再次进入不应
         // 自动弹向导,避免"已完成的应用每次切回都重弹第 1 步"的既视

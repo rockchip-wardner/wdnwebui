@@ -754,6 +754,11 @@
         //    副作用 —— "退出应用" 应该等于"fresh install"。
         ActivateManager._exit();
         const cp = currentPage();
+        // 临时诊断 —— 用户报"退出应用后重进不进 wizard"复现不到,
+        // 加日志看哪一步没生效。
+        console.warn("[back-home DEBUG] cp=", cp,
+                     "ls-before:",
+                     Object.keys(localStorage).filter(k => k.includes(cp)));
         if (window.WizardState?.clearAll) {
           // 第一道:扫 localStorage 删该 appId 命名空间下所有 wizard
           // 状态(目前所有卡都走默认 base "wdnwebui.wizard.<appId>",
@@ -761,6 +766,8 @@
           // 会漏,见下面第二道兜底)
           window.WizardState.clearAll(cp);
         }
+        console.warn("[back-home DEBUG] ls-after-clearAll:",
+                     Object.keys(localStorage).filter(k => k.includes(cp)));
         // 第二道兜底:从 manifest 反查 wizard_config,fetch 拿到 cfg,
         // 走 WizardState.clearCompleted / clearStep 的精确路径。
         // 第一道已经把"默认 base"覆盖了,这条主要兜未来
