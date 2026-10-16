@@ -233,14 +233,22 @@
       // 上门闩：POST 之前飞出去的旧快照不能把刚设的值改回去（见 _acceptSync）。
       this._awaitSync = { mode, every_n: every, threshold: thr };
       // change 与 blur 各触发一次同一个值；配置没变就别重复 POST。
-      const sig = mode + "|" + every + "|" + thr;
+      // v0.23 多路：选了一路 → 只发 channels[idx]；没选 → 顶层下发到所有路。
+      // 顶层字段**绝对不能**和 channels 同时发：后端把顶层当成"所有路默认"，
+      // 选了一路后只想改 ch0 的 threshold=5.5，却把 5.5 广播给了 ch1/2/3 —— 实测
+      // 4 路下改 ch0 一并把另外 3 路也改了的根因。
+      const ch = this._selectedChannel;
+      const sig = (ch == null ? "*" : "#" + ch) + "|" + mode + "|" + every + "|" + thr;
       if (sig === this._appliedSig) return;
       this._appliedSig = sig;
+      const body = ch != null
+        ? { channels: { [ch]: { mode, every_n: every, threshold: thr } } }
+        : { mode, every_n: every, threshold: thr };
       try {
         const r = await fetch(this.api, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode, every_n: every, threshold: thr }),
+          body: JSON.stringify(body),
         });
         if (r.ok) {
           this.update(await r.json());
@@ -295,8 +303,12 @@
     // 2. 浮框 + 3. 曲线（都挂在 body 上，跟随画布矩形）
     // ---------------------------------------------------------------- //
     _buildFloats() {
+      // v0.23 起判据角标走每路 tile.badge（multi-grid.js 提供）。
+      // 全局 vj-badge 仍保留 DOM 节点（兼容旧卡片引用），但默认隐藏、
+      // 不再 sync() 摆位 —— 否则会盖在画面右下与 tile.badge 重叠。
       const badge = ce("div", "vj-badge");
       badge.id = this.prefix + "-judge-badge";
+      badge.style.display = "none";
       badge.innerHTML =
         '<span class="vj-badge-main">' +
         '<span class="vj-dot"></span>' +
@@ -373,6 +385,22 @@
         if (this.badge) this.badge.style.display = "none";
         if (this.curve) this.curve.style.display = "none";
       };
+      // **fieldset 内曲线**：不论 canvas 0 高度都显示。frame-judge 在
+      // wizard 里**唯一**关心的是"曲线当前在哪"，跟画布是否可见无关
+      // —— 因为它的容器已经跟画布解耦了（fieldset 始终在文档流里）。
+      // canvas 不存在 / 0 尺寸时只调 _drawCurve（自适应容器宽度），
+      // 不 hide。tag: v0.25 wizard 曲线搬入判据框。
+      const inFs = this.curve && this.curve.parentNode &&
+        this.curve.parentNode.id &&
+        this.curve.parentNode.id.endsWith("-wizard-judge-fs");
+      if (inFs) {
+        if (this.curveCanvas.height !== CURVE_H) {
+          this.curveCanvas.height = CURVE_H;
+        }
+        this.curve.style.display = "";
+        this._drawCurve();
+        return;
+      }
       if (!r || r.width < 4 || r.height < 4) { hide(); return; }
       const vw = window.innerWidth, vh = window.innerHeight;
       if (r.right <= 0 || r.left >= vw) { hide(); return; }     // 横向滚出屏幕
@@ -380,7 +408,9 @@
       const visBottom = Math.min(r.bottom, vh);
       if (visBottom - visTop < 24) { hide(); return; }          // 几乎滚没了
 
-      if (this.badge) {
+      // v0.23: 不再 show 全局 badge —— 每路 tile.badge 接管。
+      // 保留 this.badge DOM 节点是为了 setBadge(idx) 旧卡片 / 测试仍能拿到元素。
+      if (false && this.badge) {  // disabled
         this.badge.style.display = "";
         this.badge.style.left = (r.right - this.badge.offsetWidth - BADGE_PAD) + "px";
         // 贴画布**下沿**而不是上沿：右上角是各卡检测结果的落点（视频目标
@@ -399,14 +429,27 @@
       if (this.curve) {
         const inWizard = !!c.closest(".wd-wizard-canvas-wrap");
         if (!inWizard) { this.curve.style.display = "none"; this._reserve(false, c); return; }
-        // 只要画布下沿还在屏上就画 —— 它落在 _reserve 占好的槽位里，压不到别的
-        // 控件上；下沿掉出屏幕（往下滚走了）就跟着藏。
-        // **不要**要求"整条曲线都得放得下才画"：视频靠下时曲线本来就会超出
-        // 视口底部（视口会把它裁掉，用户往下滚就能看到），用那条规则反而让
-        // 曲线在正常窗口下永远不出现。
+        // **已搬到 fieldset 里**（曲线 parent === 该 prefix 的 -wizard-judge-fs）：
+        // 不再做 fixed 摆位。容器宽度 = fieldset 宽度，跟着页面流式布局走；
+        // 高度固定 CURVE_H。每次 sync 只重画 + 自适应容器宽。_reserve 也不
+        // 需要了 —— fieldset 已经把位置管好了。
+        const fs = c.closest(".wd-wizard-root-video-detection, .wd-wizard-root-video-target-detection, .wd-wizard-root-video-target-localization");
+        const inFieldset = fs && this.curve.parentNode
+          && this.curve.parentNode.id && this.curve.parentNode.id.endsWith("-wizard-judge-fs");
+        if (inFieldset) {
+          if (this.curveCanvas.height !== CURVE_H) {
+            this.curveCanvas.height = CURVE_H;
+          }
+          this.curve.style.display = "";
+          this._drawCurve();
+          return;
+        }
+        // **legacy 路径**：曲线还在 body（早期 wizard state.js 没搬到 fieldset
+        // 之前的中间状态；以及非 multi-card 的老 wizard 用法 —— VAS 等）——
+        // 仍按 fixed 摆位，跟 canvas 下沿贴合。
         if (r.bottom <= 0) {
           this.curve.style.display = "none";
-          this._reserve(true, c);     // 占位仍留着：控件别跳回曲线底下
+          this._reserve(true, c);
           return;
         }
         const top = r.bottom + CURVE_GAP;
@@ -437,17 +480,75 @@
       }
       this.judge = j;
       if (j.applied === false) this.applied = false;
-      // 只在用户没在编辑时回写控件，避免把正在输入的数字抹掉。
+
+      // v0.23 多路：按路把分值喂到 tile.badge。
+      // 顶层 j 仍是聚合视图（cur / changed / per_channel 数组都存在）；
+      // 兼容 v0.22 单路：per_channel 空 → 用顶层。
+      const per = Array.isArray(j.per_channel) && j.per_channel.length
+        ? j.per_channel : [{channel: 0, cur: j.cur, changed: j.changed,
+                            mode: j.mode, every_n: j.every_n, threshold: j.threshold}];
+      this._paintPerChannel(per);
+
+      // 控件只反映**当前选中路**的状态。v0.22 单路 / 未选路时用顶层。
+      const sel = this._selectedChannel;
+      const src = sel != null
+        ? per.find((p) => p.channel === sel) || j
+        : j;
+      const jsel = {
+        mode: src.mode || j.mode,
+        every_n: src.every_n || j.every_n,
+        threshold: src.threshold != null ? src.threshold : j.threshold,
+        cur: src.cur,
+        changed: src.changed,
+      };
       if (this.syncControls &&
           document.activeElement !== this.selMode &&
           document.activeElement !== this.inpThr &&
           document.activeElement !== this.inpEvery &&
-          this._acceptSync(j)) {
-        this.setConfig({ mode: j.mode, every_n: j.every_n, threshold: j.threshold });
+          this._acceptSync(jsel)) {
+        this.setConfig({ mode: jsel.mode, every_n: jsel.every_n,
+                         threshold: jsel.threshold });
       }
-      this._paintBadge(j);
       this._paintHint();
-      this.sync();
+      // 不再调 sync() 摆全局 badge —— v0.23 起 badge 走 per-tile DOM
+    }
+
+    /**
+     * v0.23 多路：cards 侧 tile click → setSelectedChannel(idx)
+     * 1) 调 MultiGrid.setSelected 加 .selected 蓝框
+     * 2) 设 this._selectedChannel，下一次 update() 会按这路回写控件
+     * 3) 触发 onSelectChannel 钩子（cards 侧更新"当前是 [x, y] 路"提示）
+     */
+    setSelectedChannel(idx) {
+      this._selectedChannel = (idx == null) ? null : idx;
+      const MG = window.MultiGrid;
+      if (MG && this.canvasId) MG.setSelected(this.canvasId, idx);
+      if (typeof this._onSelectChannel === "function") {
+        this._onSelectChannel(idx);
+      }
+      // 选路切了 → 立刻按新路重画曲线（_drawCurve 已按 _selectedChannel 过滤
+      // recent）。update() 也会调 _drawCurve 但那是 ~1Hz WS tick，用户点完
+      // tile 不想等那一秒。
+      if (this.curve && this.curve.style.display !== "none" &&
+          typeof this._drawCurve === "function") {
+        this._drawCurve();
+      }
+    }
+
+    /**
+     * 把 per_channel 数据写到对应 tile 的 badge 上。
+     * 通过 window.MultiGrid.setBadge 注入。per_channel 是 [{channel,
+     * cur, changed, ...}, ...]；空 / 未启动判据 → 设 null 让 tile 角标藏起来。
+     */
+    _paintPerChannel(per) {
+      const MG = window.MultiGrid;
+      if (!MG) return;
+      const gridId = this.canvasId;  // 多路下 canvasId 是 grid id
+      for (const p of per) {
+        const state = p.cur == null ? null
+                    : p.changed ? "changed" : "idle";
+        MG.setBadge(gridId, p.channel, { state, score: p.cur });
+      }
     }
 
     /**
@@ -500,18 +601,48 @@
     _drawCurve() {
       const ctx = this.curveCtx;
       const cv = this.curveCanvas;
-      const W = cv.width, H = cv.height;
+      // 自适应容器宽度：曲线在 fieldset 里时容器是 fieldset，在画布下
+      // 时容器宽 = 画布宽。优先读 offsetParent（fieldset），fallback 到
+      // canvasId 元素本身（功能页路径）。
+      const host = this.curve.offsetParent && this.curve.offsetParent.id
+        ? this.curve.offsetParent
+        : ($(this.canvasId) || this.curve.offsetParent);
+      const targetW = host ? host.clientWidth : cv.width;
+      const W = (targetW > 0 ? targetW : 640) - 12;  // 留 6px padding
+      const H = cv.height;
+      if (cv.width !== W) cv.width = W;
       ctx.clearRect(0, 0, W, H);
       const j = this.judge;
       if (!j) return;
-      const pts = j.recent || [];
+      let pts = j.recent || [];
+      // **按选中路过滤**：recent 形如 [pos, score, ch_idx]（multi_session
+      // judge_snapshot 里 extend 时加的 ch.idx），点哪路就画哪路的曲线。
+      // 未选路（v0.22 单路兼容 / 还没点 tile）→ 用顶层（ch_idx === undefined
+      // 兜底：全显示 —— 旧 v0.22 模式 per_channel 是空数组，recent 也没
+      // ch_idx，过滤后剩空，画 "采集中…" 提示就行）。
+      const ch = this._selectedChannel;
+      if (ch != null) {
+        pts = pts.filter((p) => Number(p[2]) === Number(ch));
+      } else {
+        // 未选路：只保留没有 ch_idx 标记的（旧格式 / 测试 stub）
+        pts = pts.filter((p) => p[2] == null);
+      }
       if (j.manual || pts.length < 2) {
         ctx.fillStyle = "#94a3b8";
         ctx.font = "12px sans-serif";
-        ctx.fillText(j.manual ? "手动跳帧：不比对画面，无分数曲线" : "采集中…", 10, H / 2);
+        const label = j.manual
+          ? "手动跳帧：不比对画面，无分数曲线"
+          : (ch != null ? "通道 " + (ch + 1) + " 采集中…" : "采集中…");
+        ctx.fillText(label, 10, H / 2);
         return;
       }
-      let ymax = Math.max(...pts.map((p) => p[1]), j.threshold * 1.2, 0.5) * 1.1;
+      // 阈值参考线用 **当前选中路** 的阈值（如果 per 里能找到）；找不到
+      // 退到顶层 proto 阈值。
+      const perSrc = (Array.isArray(j.per_channel) ? j.per_channel : [])
+        .find((p) => Number(p.channel) === Number(ch));
+      const thr = perSrc && perSrc.threshold != null ? perSrc.threshold
+              : (j.threshold != null ? j.threshold : 0);
+      let ymax = Math.max(...pts.map((p) => p[1]), thr * 1.2, 0.5) * 1.1;
       const xOf = (i) => (i / Math.max(pts.length - 1, 1)) * (W - 6) + 3;
       const yOf = (v) => H - 16 - (v / ymax) * (H - 26);
 
@@ -519,13 +650,14 @@
       ctx.strokeStyle = "#dc2626";
       ctx.setLineDash([4, 3]);
       ctx.beginPath();
-      ctx.moveTo(0, yOf(j.threshold));
-      ctx.lineTo(W, yOf(j.threshold));
+      ctx.moveTo(0, yOf(thr));
+      ctx.lineTo(W, yOf(thr));
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.fillStyle = "#dc2626";
       ctx.font = "10px sans-serif";
-      ctx.fillText("阈值", 2, Math.max(9, yOf(j.threshold) - 3));
+      ctx.fillText("阈值 " + (+thr).toFixed(2),
+                   2, Math.max(9, yOf(thr) - 3));
 
       // 分数折线
       ctx.strokeStyle = "#2563eb";
@@ -539,9 +671,9 @@
 
       ctx.fillStyle = "#64748b";
       ctx.font = "10px sans-serif";
-      ctx.fillText(pts[0][0] + " 帧", 3, H - 3);
+      ctx.fillText("通道 " + (ch + 1) + " · " + pts[0][0] + " 帧", 3, H - 3);
       const last = pts[pts.length - 1];
-      ctx.fillText(pts.length + " 点 · 当前 " + (+last[1]).toFixed(2), W - 110, H - 3);
+      ctx.fillText(pts.length + " 点 · 当前 " + (+last[1]).toFixed(2), W - 130, H - 3);
     }
   }
 
@@ -615,6 +747,60 @@
       if (!inst) return false;
       inst.setConfig(cfg);
       await inst._apply();
+      return true;
+    },
+    /**
+     * v0.23 多路：cards 侧 tile click → 切"当前在设置的路"。
+     * 1) inst.setSelectedChannel(idx) 调 MultiGrid.setSelected 高亮蓝框
+     * 2) 设 _selectedChannel，下一次 update() 按这路回写控件
+     * 3) 触发 _onSelectChannel 钩子（cards 侧更新"当前是 [x, y] 路"提示）
+     *
+     * `null` = 清除选中（v0.22 单路兼容模式）
+     */
+    setSelectedChannel(prefix, idx) {
+      const inst = registry.get(prefix);
+      if (inst) inst.setSelectedChannel(idx);
+    },
+    /** 注册 tile click 钩子（cards 侧传一个 (idx)=>void） */
+    setOnSelectChannel(prefix, handler) {
+      const inst = registry.get(prefix);
+      if (inst) inst._onSelectChannel = handler;
+    },
+    /** 取当前选中路 idx（cards 侧读用） */
+    getSelectedChannel(prefix) {
+      const inst = registry.get(prefix);
+      return inst ? inst._selectedChannel : null;
+    },
+    /**
+     * 把实时分数曲线搬进 wizard 的判据 fieldset 里。
+     *
+     * 调用时机：wizard state.js 在 fieldset 挂上 ``<prefix>-wizard-judge-fs``
+     * id 之后调一次（短轮询保证 FrameJudge 已就绪）。曲线原本是
+     * position:fixed 浮在画布下面，进了 wizard 之后画布是 wizard canvas-wrap
+     * 里的多路 grid，曲线不能再贴画布下沿 —— 改成判据框内的"普通流式布局"，
+     * 跟"当前在编辑 [x, y] 路" 一起显示。
+     *
+     * 搬完之后 _drawCurve 会按 inst._selectedChannel 过滤 recent
+     * （每条 recent 形如 ``[pos, score, ch_idx]``，后端 judge_snapshot 里
+     * 已经把通道号塞进点里），切路时 setSelectedChannel 触发重画。
+     */
+    mountInWizard(prefix) {
+      const inst = registry.get(prefix);
+      if (!inst || !inst.curve) return false;
+      const fs = document.getElementById(prefix + "-wizard-judge-fs");
+      if (!fs) return false;
+      if (inst.curve.parentNode === fs) {
+        inst.curve.style.display = "";
+        return true;
+      }
+      // 从 body 搬到 fieldset。position/left/top/width 由 frame-judge.css 里
+      // 的 ``.wd-wizard-judge-fs > .vj-curve`` 选择器统一覆盖为 static +
+      // 100% 宽 —— 不在这里写 inline style，避免内联样式压过 CSS 选择器
+      // （外部调试 / 改皮肤时只动 CSS 即可）。
+      fs.appendChild(inst.curve);
+      inst.curve.style.display = "";
+      // 重画一次 —— 容器宽度变了 + 已有 j.recent 数据
+      if (typeof inst._drawCurve === "function") inst._drawCurve();
       return true;
     },
     /**

@@ -50,7 +50,14 @@
                     </label>
                   </div>
                   <span class="surv-hint" id="vtl-channel-hint">尚未打开视频</span>
-                  <div id="vtl-judge-config"></div>
+<section class="surv-form-section vtl-judge-section" id="vtl-judge-section">
+  <header class="surv-form-head">
+    <h3>判帧算法</h3>
+    <span class="surv-hint" id="vtl-judge-selected">当前在设置的是 <b id="vtl-judge-selected-idx">--</b> 路 (<span id="vtl-judge-selected-no">--</span>) · 模式 <span id="vtl-judge-selected-mode">--</span> · 阈值 <span id="vtl-judge-selected-thr">--</span> · 帧间隔 <span id="vtl-judge-selected-every-n">--</span></span>
+    <button type="button" class="vd-btn" id="vtl-judge-apply-all" hidden>应用到所有路</button>
+  </header>
+  <div id="vtl-judge-config" data-judge-layout="inline"></div>
+</section>
                 </div>
               </section>
 

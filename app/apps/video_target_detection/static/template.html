@@ -42,7 +42,14 @@
                       <span>循环播放</span>
                     </label>
                   </div>
-                  <div id="vtd-judge-config"></div>
+<section class="surv-form-section vtd-judge-section" id="vtd-judge-section">
+  <header class="surv-form-head">
+    <h3>判帧算法</h3>
+    <span class="surv-hint" id="vtd-judge-selected">当前在设置的是 <b id="vtd-judge-selected-idx">--</b> 路 (<span id="vtd-judge-selected-no">--</span>) · 模式 <span id="vtd-judge-selected-mode">--</span> · 阈值 <span id="vtd-judge-selected-thr">--</span> · 帧间隔 <span id="vtd-judge-selected-every-n">--</span></span>
+    <button type="button" class="vd-btn" id="vtd-judge-apply-all" hidden>应用到所有路</button>
+  </header>
+  <div id="vtd-judge-config" data-judge-layout="inline"></div>
+</section>
                 </div>
               </section>
 

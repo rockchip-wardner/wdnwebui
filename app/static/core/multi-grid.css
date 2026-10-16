@@ -56,20 +56,40 @@
   text-overflow: ellipsis;
   max-width: 100%;
 }
-/* 当前正在被分析的那一路 —— 全页**唯一**的高亮边框语义（绿色，用户指定）。 */
+/* 当前正在被分析的那一路 —— 全页**唯一**的高亮边框语义（绿色，用户指定）。
+   「选中路」由 .vd-tile.selected 标（用户手动点瓦片），独立于 .active，
+   避免混淆"系统在算"和"用户在编辑"两件事。 */
 .vd-tile.active { border-color: #30d158; box-shadow: 0 0 0 2px rgba(48, 209, 88, 0.45); }
-.vd-tile.active .vd-tile-badge { opacity: 1; }
+.vd-tile.selected { border-color: #38bdf8; box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.45); }
 .vd-tile-badge {
+  /* 每路判据角标 —— **右下角**，默认显示「无变化 xx.xx」式压缩文案。
+     内容由 frame-judge.js → MultiGrid.setBadge(idx, {state, score}) 写入。 */
   position: absolute;
-  right: 6px; top: 6px;
+  right: 6px; bottom: 6px;
   padding: 2px 7px;
   font-size: 10px;
   line-height: 15px;
-  color: #fff;
-  background: rgba(48, 209, 88, 0.92);
+  color: #cbd5e1;
+  background: rgba(0, 0, 0, 0.62);
   border-radius: 4px;
+  opacity: 1;
+  transition: background-color 0.15s, color 0.15s;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.vd-tile-badge.empty {
+  /* 还没打过分：藏起来不打扰 */
   opacity: 0;
-  transition: opacity 0.15s;
+  pointer-events: none;
+}
+.vd-tile-badge.changed {
+  /* 判为"画面变化"—— 颜色高亮（橙色，与旧单页浮框同款） */
+  background: #f59e0b;
+  color: #ffffff;
+}
+.vd-tile-badge.idle {
+  /* "无变化" + 分数 = 0 → 灰一点，避免每帧都跳数字看着慌 */
+  color: #94a3b8;
 }
 .vd-tile.bad { border-color: #ff453a; }
 .vd-tile.bad .vd-tile-label { color: #ff6b63; }

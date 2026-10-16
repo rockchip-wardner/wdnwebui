@@ -678,12 +678,10 @@ async function vtlEventsClear() {
 function readVtlSources() {
   const ta = document.getElementById("vtl-sources");
   if (!ta) return [];
-  const seen = new Set();
   const out = [];
   for (const raw of (ta.value || "").split(/\r?\n/)) {
     const s = raw.trim();
-    if (!s || seen.has(s)) continue;
-    seen.add(s);
+    if (!s) continue;
     out.push(s);
   }
   return out;
@@ -1021,3 +1019,120 @@ window.ImApp_video_target_localization.applyWizardSnapshot = async function (opt
 };
 
 })();
+
+/* v0.23 多路判据 UI 接线 */
+function _paintSelectedChannelUi(pfx, idx, per_channel) {
+  const idxEl = document.getElementById(pfx + "-judge-selected-idx");
+  const noEl = document.getElementById(pfx + "-judge-selected-no");
+  const modeEl = document.getElementById(pfx + "-judge-selected-mode");
+  const thrEl = document.getElementById(pfx + "-judge-selected-thr");
+  const everyEl = document.getElementById(pfx + "-judge-selected-every-n");
+  if (!idxEl) return;
+  if (idx == null) {
+    idxEl.textContent = "--";
+    if (noEl) noEl.textContent = "--";
+    if (modeEl) modeEl.textContent = "--";
+    if (thrEl) thrEl.textContent = "--";
+    if (everyEl) everyEl.textContent = "--";
+    return;
+  }
+  // [x, y] 坐标写法：x = 0 基 idx（程序员语境），y = 1 基通道号（用户语境）。
+  // 把 x 加粗是因为"哪个 channel"是个常被复述的索引。
+  idxEl.textContent = "[" + idx + ", " + (idx + 1) + "]";
+  if (noEl) noEl.textContent = String(idx + 1);
+  const per = (per_channel || []).find(p => p.channel === idx);
+  if (per) {
+    if (modeEl) modeEl.textContent = per.mode || "--";
+    if (thrEl) thrEl.textContent = per.threshold != null ? (+per.threshold).toFixed(2) : "--";
+    if (everyEl) everyEl.textContent = per.every_n != null ? "每 " + per.every_n + " 帧" : "--";
+  } else {
+    if (modeEl) modeEl.textContent = "--";
+    if (thrEl) thrEl.textContent = "--";
+    if (everyEl) everyEl.textContent = "--";
+  }
+}
+
+/**
+ * 取当前卡片对应的 judge API base。vd / vtd / vtl 各自一条 endpoint。
+ * 卡片 side 跟后端路由前缀对齐——见 app/__init__.py 的 include_router。
+ */
+function _judgeApiFor(pfx) {
+  if (pfx === "vd") return "/api/video-detection";
+  if (pfx === "vtd") return "/api/video-target-detection";
+  if (pfx === "vtl") return "/api/video-target-localization";
+  return null;
+}
+
+function _bindCardPerChannelJudge(pfx, gridId) {
+  const MG = window.MultiGrid;
+  if (!MG) return;
+  const apiBase = _judgeApiFor(pfx);
+  MG.bindSelect(gridId, async (idx) => {
+    if (window.FrameJudge) window.FrameJudge.setSelectedChannel(pfx, idx);
+    // **不要等下一条 WS tick**：用户点了 tile 就想立刻看见这路当前的
+    // mode / threshold / every_n —— 否则"我改的是哪路"的反馈要拖 1 秒，
+    // 体感是判据栏"反应迟钝"。直接 GET /judge 拿最新 per_channel 填 UI。
+    if (idx == null || !apiBase) {
+      _paintSelectedChannelUi(pfx, idx, null);
+      return;
+    }
+    let per_channel = null;
+    try {
+      const j = await fetch(apiBase + "/judge", { cache: "no-store" })
+                    .then(r => r.json());
+      per_channel = j.per_channel || [];
+      _paintSelectedChannelUi(pfx, idx, per_channel);
+    } catch (_) {
+      _paintSelectedChannelUi(pfx, idx, null);
+    }
+    // 立刻把选中路的当前值推到 selMode/inpThr/inpEvery —— 等 WS tick
+    // 要 ~1 秒，且若 _awaitSync 门闩或 activeElement 焦点命中 update()
+    // 路径会**根本不推**。tile click 是"我要切这路"最强的信号，不能让
+    // 控件卡住。setConfig 只写控件显示、不发 POST，所以"看一眼不动"的
+    // 查看意图不会被误当成"修改提交"。
+    if (per_channel && window.FrameJudge) {
+      const per = per_channel.find((p) => p.channel === idx);
+      if (per && per.mode != null) {
+        window.FrameJudge.setConfig(pfx, {
+          mode: per.mode, every_n: per.every_n, threshold: per.threshold,
+        });
+        // **同步写到 wizard 内的同名字段**。FrameJudge.setConfig 只动功能页
+        // 那组 (selMode/inpThr/inpEvery)，但 wizard source step 里也有
+        // ``id="<pfx>-judge-mode/-judge-threshold/-judge-every-n"`` 的
+        // 独立 <input>/<select>（wizard state.js 渲染）—— 用户在向导里点
+        // tile 看不到任何变化就是因为这组是孤儿。仅在 wizard 容器存在时
+        // 同步写一份 DOM value；不动 wizard 的 state.values（避免覆盖
+        // 用户手填的字段值，wizard 「完成」会按 state.values 推后端）。
+        const wizRoot = document.getElementById("wd-wizard-root-" +
+          (pfx === "vd" ? "video-detection"
+           : pfx === "vtd" ? "video-target-detection"
+           : "video-target-localization"));
+        if (wizRoot) {
+          // wizard state.js 创建字段元素时只设 class 不设 id，定位靠
+          // el.dataset.fieldId（state.js 末尾赋的，匹配 wizard.json 的
+          // field.id）。下面三个 query 跨 step 通用：source step 把这些
+          // 字段排在「视频源」下、detect / audio / … step 也可能用到。
+          const wizMode = wizRoot.querySelector(
+            "select[data-field-id=\"" + pfx + "-judge-mode\"]");
+          const wizThr  = wizRoot.querySelector(
+            "input[data-field-id=\"" + pfx + "-judge-threshold\"]");
+          const wizEv   = wizRoot.querySelector(
+            "input[data-field-id=\"" + pfx + "-judge-every-n\"]");
+          if (wizMode && per.mode != null) {
+            if (![...wizMode.options].some((o) => o.value === per.mode)) {
+              const o = document.createElement("option");
+              o.value = per.mode; o.textContent = per.mode;
+              wizMode.appendChild(o);
+            }
+            wizMode.value = per.mode;
+          }
+          if (wizThr && per.threshold != null) wizThr.value = String(per.threshold);
+          if (wizEv  && per.every_n  != null) wizEv.value  = String(per.every_n);
+        }
+      }
+    }
+  });
+  _paintSelectedChannelUi(pfx, null, null);
+}
+_bindCardPerChannelJudge("vtl", "vtl-grid");
+

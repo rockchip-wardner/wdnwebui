@@ -90,10 +90,15 @@
       label.className = "vd-tile-label";
       label.textContent = "#" + chNo(i);
       const badge = document.createElement("div");
-      badge.className = "vd-tile-badge";
+      badge.className = "vd-tile-badge empty";   // 启动时还没打分 → 藏起来
       tile.appendChild(cv);
       tile.appendChild(label);
       tile.appendChild(badge);
+      // tile click → 选中该路。bindSelect() 会挂 handler；没有 handler 就当
+      // 是纯展示（保持向后兼容：旧卡片不绑 handler 时 click 啥也不做）。
+      tile.addEventListener("click", (ev) => {
+        if (g.onSelect) g.onSelect(i, ev);
+      });
       grid.appendChild(tile);
       g.tiles.set(i, {
         tile, canvas: cv, ctx: cv.getContext("2d", { alpha: false }),
@@ -222,9 +227,62 @@
       t.label.title = src;
       t.tile.classList.toggle("active", c.idx === cur);
       t.tile.classList.toggle("bad", !!c.error || c.errors > 0);
-      t.badge.textContent = c.idx === cur ? "推理中" : "";
+      // 不再让 status 写 t.badge 文字 —— 那是判据角标专用位，由
+      // frame-judge.js 走 setBadge() 写入，避免两套逻辑抢同一个 DOM 节点。
     }
     return { total, ok, eof };
+  }
+
+  /** 写某一路的判据角标。payload 形态：
+   *    {state: 'changed' | 'idle' | null, score: number|null}
+   *  - state='changed' → 加 .changed 类（橙色高亮）
+   *  - state='idle'    → 普通灰底
+   *  - state=null/undefined 且 score=null → .empty（角标藏起来）
+   *
+   *  文案刻意压短到「变化 12.9」「无变化 3.2」两段，4 路宫格每路 200~400px 宽
+   *  也要能放下。分数超 99 时切 1 位小数（不让 100.0 这种"刚好"把角标撑炸）。
+   */
+  function setBadge(container, idx, payload) {
+    const g = _state(container);
+    const t = g && g.tiles.get(idx);
+    if (!t) return;
+    const score = payload && payload.score;
+    const state = payload && payload.state;
+    const b = t.badge;
+    if (score == null || state == null) {
+      b.classList.add("empty");
+      b.classList.remove("changed", "idle");
+      b.textContent = "";
+      return;
+    }
+    b.classList.remove("empty");
+    const label = state === "changed" ? "变化" : "无变化";
+    const s = Number(score);
+    const txt = s >= 100 ? `${label} ${s.toFixed(0)}`
+                : s >= 10 ? `${label} ${s.toFixed(1)}`
+                : `${label} ${s.toFixed(2)}`;
+    b.textContent = txt;
+    b.classList.toggle("changed", state === "changed");
+    b.classList.toggle("idle", state === "idle" && s < 0.5);
+  }
+
+  /** 标记某一路为"被用户选中"（蓝色边框）。可与 .active 叠加——
+   *  .active 是 VLM 推理中（系统高亮，绿色），.selected 是用户在编辑（蓝色）。
+   *  两者正交不互斥。 */
+  function setSelected(container, idx) {
+    const g = _state(container);
+    if (!g) return;
+    for (const [i, t] of g.tiles) {
+      t.tile.classList.toggle("selected", i === idx);
+    }
+  }
+
+  /** tile click → 派发 `multi-grid:select` 自定义事件（带 idx, tileId）。
+   *  cards 侧 listen 后改自己的 selectedChannel 状态。 */
+  function bindSelect(container, handler) {
+    const g = _state(container);
+    if (!g) return;
+    g.onSelect = handler;
   }
 
   function reset(container) {
@@ -240,6 +298,7 @@
 
   window.MultiGrid = {
     chNo, ensure, paint, status, reset,
+    setBadge, setSelected, bindSelect,
     diag: DIAG,
     tiles: (container) => (_state(container) || { tiles: new Map() }).tiles,
   };

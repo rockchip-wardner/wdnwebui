@@ -52,7 +52,14 @@
               </div>
             </section>
 
-            <div id="vd-judge-config" data-judge-layout="inline"></div>
+<section class="surv-form-section vd-judge-section" id="vd-judge-section">
+  <header class="surv-form-head">
+    <h3>判帧算法</h3>
+    <span class="surv-hint" id="vd-judge-selected">当前在设置的是 <b id="vd-judge-selected-idx">--</b> 路 (<span id="vd-judge-selected-no">--</span>) · 模式 <span id="vd-judge-selected-mode">--</span> · 阈值 <span id="vd-judge-selected-thr">--</span> · 帧间隔 <span id="vd-judge-selected-every-n">--</span></span>
+    <button type="button" class="vd-btn" id="vd-judge-apply-all" hidden>应用到所有路</button>
+  </header>
+  <div id="vd-judge-config" data-judge-layout="inline"></div>
+</section>
 
             <div class="vd-controls">
               <button id="vd-play"  class="vd-btn">▶ 播放</button>
