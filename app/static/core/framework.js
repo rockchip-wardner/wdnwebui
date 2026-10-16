@@ -755,11 +755,59 @@
         ActivateManager._exit();
         const cp = currentPage();
         if (window.WizardState?.clearAll) {
+          // 第一道:扫 localStorage 删该 appId 命名空间下所有 wizard
+          // 状态(目前所有卡都走默认 base "wdnwebui.wizard.<appId>",
+          // 这条足够覆盖;未来有卡走 custom cfg.localStorage_key
+          // 会漏,见下面第二道兜底)
           window.WizardState.clearAll(cp);
         }
+        // 第二道兜底:从 manifest 反查 wizard_config,fetch 拿到 cfg,
+        // 走 WizardState.clearCompleted / clearStep 的精确路径。
+        // 第一道已经把"默认 base"覆盖了,这条主要兜未来
+        // cfg.localStorage_key 场景;以及作为 fail-safe 防止
+        // 第一道因任何 localStorage 异常没删干净。
+        // 失败吞掉 —— best-effort,不能因为清状态失败就拦用户的"退出"
+        // 动作。location.hash 必须无条件设,用户期望总是回到 home。
+        _exitClearWizardByCfg(cp).catch(() => {});
         location.hash = "#/";
       });
     });
+  }
+
+  // back-home 兜底:从 manifest 反查 wizard_config,fetch 拿 cfg,
+  // 走 WizardState.clearCompleted / clearStep 的精确路径。配合
+  // _lsClearAllFor 的扫 localStorage 实现,两道互为冗余:
+  //   * 第一道(同步,无网络):覆盖默认 base 的所有卡
+  //   * 第二道(异步,fetch wizard.json):覆盖任何 cfg.localStorage_key
+  //     自定义 key 的卡;并作为 fail-safe 防止第一道任何 localStorage
+  //     异常(quota / private mode / 浏览器策略等)漏删导致 completed
+  //     残留,用户下次进卡时 wizard 不弹
+  // fetch 失败 / manifest 没 wizard_config / WizardState 缺 API,
+  // 全部吞掉 —— back-home "退出" 动作不依赖本步骤成功。
+  async function _exitClearWizardByCfg(appId) {
+    if (!appId || !window.WizardState) return;
+    const m = (window.__APP_MANIFESTS__?.cards || [])
+      .find((x) => x && x.id === appId);
+    if (!m || !m.wizard_config) return;
+    try {
+      const url = m.wizard_config.startsWith("/")
+        ? m.wizard_config
+        : `/static/apps/${appId}/${m.wizard_config}`;
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) return;
+      const cfg = await r.json();
+      // app 对象传入时 WizardState 的 API 期望 {id, ...} 形式 —— 构造一个
+      const app = { id: appId };
+      try { window.WizardState.clearCompleted(app, cfg); } catch (_) {}
+      try { window.WizardState.clearStep(app, cfg); } catch (_) {}
+      // values 也清:用户既然点了"退出应用",期望"完全回到首装状态",
+      // 不留任何已填的痕迹;下次进 wizard 是空白起步。
+      try { localStorage.removeItem(_lsBaseForKey(appId, cfg) + ".values"); } catch (_) {}
+    } catch (_) { /* fetch / parse 失败吞掉,不影响 back-home 主流程 */ }
+  }
+  // cfg → base key(与 wizard/state.js 的 _lsBase 同语义)
+  function _lsBaseForKey(appId, cfg) {
+    return (cfg && cfg.localStorage_key) || ("wdnwebui.wizard." + appId);
   }
 
   function updateBackHomeLabels() {

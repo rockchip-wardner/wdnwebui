@@ -98,24 +98,31 @@
   }
 
   // "退出应用" 兜底:framework 在 back-home 按钮 handler 里调。
-  // 把该 app 的整个 wizard 状态(values / step / completed)从
-  // localStorage 抹掉,下次进入时 wizard 就像首次启动一样 —— 从
-  // 第 1 步、空字段开始。**仅按 appId 清**:cfg 决定了 key 形
-  // 式,缺 cfg 时按默认 base "wdnwebui.wizard.<appId>" 匹配;目前
-  // 没有 card 设 cfg.localStorage_key,所以默认 base 已能覆盖所有
-  // 卡。如未来加了 custom prefix,这里要扩成"已知 base 表"再迭代。
+  // 把该 app 的整个 wizard 状态从 localStorage 抹掉,下次进入时
+  // wizard 就像首次启动一样 —— 从第 1 步、空字段开始。
+  //
+  // 实现:扫 localStorage,删所有"默认 base 命名空间"下的 key。
+  //  * 默认 base = "wdnwebui.wizard.<appId>"(目前所有卡都走这个)
+  //  * 严格匹配 values / step / completed 三把;同时支持 future-proof
+  //    前缀匹配 —— 万一未来加了 step-history 之类的 suffix,也不会
+  //    漏删
+  //  * 不动 cfg.localStorage_key 路径:目前没有任何卡设,如果
+  //    未来有,framework 那边需要扩成"先 load cfg 再调 clearCompleted
+  //    + clearStep"的两段式清
   function _lsClearAllFor(appId) {
+    if (!appId) return;
     const base = "wdnwebui.wizard." + appId;
-    const suffixes = ["values", "step", "completed"];
+    const knownSuffixes = new Set(["values", "step", "completed"]);
     try {
+      // 倒序遍历 —— 中途 removeItem 不影响未访问的 idx
       for (let i = localStorage.length - 1; i >= 0; i--) {
         const k = localStorage.key(i);
-        if (!k) continue;
-        for (const s of suffixes) {
-          if (k === base + "." + s) {
-            localStorage.removeItem(k);
-            break;
-          }
+        if (!k || !k.startsWith(base + ".")) continue;
+        const suffix = k.slice(base.length + 1);
+        if (knownSuffixes.has(suffix) || suffix.length > 0) {
+          // 已知 suffix 必删;未知 suffix 也按命名空间删,避免
+          // 漏清导致下次进入时残留状态复活。
+          localStorage.removeItem(k);
         }
       }
     } catch (_) { /* ignore */ }
