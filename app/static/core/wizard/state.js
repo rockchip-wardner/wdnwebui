@@ -122,7 +122,30 @@
 
     const title = cfg.wizard_title || app.title;
     const head = _ce("div", WIZARD_NS + "head");
-    head.appendChild(_ce("h2", WIZARD_NS + "title", title));
+    // head 现在是 flex：title 在左、返回按钮在右。h2 单独不设 width，
+    // 借助 head flex 把按钮顶到右边。
+    const titleEl = _ce("h2", WIZARD_NS + "title", title);
+    head.appendChild(titleEl);
+    // 「返回」按钮 —— 跳回应用列表（不是回到当前 app 的功能页）。
+    //
+    // 不要走 skip() 路径：skip 走 unmount(false) 会**显示原 page**（让用户
+    // 回到 vd / vtd / vtl 的功能页）。本按钮语义是"放弃向导、回首页" —
+    // — 一是方便用户在多卡之间切换，二是让主动离开的路径跟 sidebar 点
+    // 应用卡片同源。
+    //
+    // 实现：先 _captureValues 把已填字段落 localStorage，再 ``location.hash
+    // = ""`` 触发 hashchange。state.js mount 末尾已经挂了 hashchange
+    // listener（见 _onNavAway），它会调 unmount(true) 自动卸载 wizard
+    // —— silent=true 表示用户已经离开，unmount 不再 unhidden 原 page。
+    const backBtn = _ce("button", WIZARD_NS + "head-back-btn", "返回");
+    backBtn.type = "button";
+    backBtn.title = "返回应用列表（已填字段会保留）";
+    backBtn.addEventListener("click", () => {
+      if (!_active) return;
+      _captureValues(_active.cfg, _active);
+      location.hash = "";   // → 触发 hashchange → onNavAway → unmount(true)
+    });
+    head.appendChild(backBtn);
     container.appendChild(head);
 
     const stepper = _ce("div", WIZARD_NS + "stepper");
@@ -713,6 +736,96 @@
       form.appendChild(wrap);
     });
 
+    // **多路视频卡 source step 末尾追加 channel hint + 判据分组**：
+    // 用户在向导内点 tile (vd-grid / vtd-grid / vtl-grid) 想立刻看到"当前
+    // 在编辑 [x, y] 路"，否则 tile 切换没有可见反馈。仅当 stepDef 含视频源
+    // 字段（_isSourceFieldId）且声明了 canvas_id 时才挂；单路老卡片、纯
+    // 文本 form step 都跳过。
+    //
+    // **判据字段分组**（mode / threshold / every_n）→ 用 ``<fieldset>`` 把
+    // 它们围起来；channel hint 放进 ``<legend>``，浏览器原生"嵌入框上沿"的
+    // 视觉，不用 CSS hack 模拟。三步：(1) 找已渲染的 -judge-* wrap；
+    // (2) 创建 fieldset + legend + 三个 wrap；(3) fieldset 插到原第一个
+    // judge-wrap 的位置 + 删掉原三个 wrap。如果 stepDef 里压根没判据字段
+    // （老卡片、字段名自定义），channel hint 不挂；剩下的判据字段留在原
+    // 位（不强行搬）。
+    const hasSourceField = (stepDef.fields || []).some(
+      (f) => f && _isSourceFieldId(f.id));
+    if (hasSourceField && cfg.canvas_id) {
+      const prefix = String(cfg.canvas_id).replace(/-grid$/, "");
+      const judgeFieldIds = [
+        prefix + "-judge-mode",
+        prefix + "-judge-threshold",
+        prefix + "-judge-every-n",
+      ];
+      // 找已渲染的判据 wrap（按 data-field-id）+ 它们的插入锚点
+      const judgeWraps = judgeFieldIds
+        .map((fid) => {
+          // data-field-id 设在 input/select 自身（不是 wrap），先找到 input
+          // 再 closest 到 .wd-wizard-field 拿 wrap。直接搬 input 会让
+          // label 留在 form 原位、视觉上 label/input 分离（已踩过这个坑）。
+          const inp = form.querySelector("[data-field-id=\"" + fid + "\"]");
+          return inp ? inp.closest("." + WIZARD_NS + "field") : null;
+        })
+        .filter(Boolean);
+      const anchorWrap = judgeWraps[0];
+      if (judgeWraps.length && anchorWrap) {
+        // fieldset + legend（hint 文字放 legend 里 —— 浏览器原生"嵌入框上沿"）
+        const fs = _ce("fieldset", WIZARD_NS + "judge-fs");
+        const lg = _ce("legend", WIZARD_NS + "judge-legend");
+        lg.appendChild(_ce("span", WIZARD_NS + "channel-hint-label",
+                           "当前在编辑："));
+        const val = _ce("span", WIZARD_NS + "channel-hint-value",
+                        "未选中（点画面里任一格）");
+        val.id = prefix + "-wizard-channel-value";
+        lg.appendChild(val);
+        fs.appendChild(lg);
+        // 关键顺序：先 insertBefore(fs, anchorWrap) —— 此时 anchorWrap 还在
+        // form 里（wrap 在兄弟节点位置上的引用有效），fs 被插到 anchorWrap
+        // 之前；再 forEach 搬 wrap 进 fs，anchorWrap 被搬走、fs 顺势顶到
+        // 原 anchorWrap 的位置。视觉上 fs 替换了 anchorWrap 的"行首位置"。
+        // 不能用 anchorWrap.nextSibling 路径：HTML 源码里 wrap 之间有
+        // 换行 / 空白 TextNode，TextNode.parentNode 是 form 本应 OK，但
+        // anchorWrap 被搬走时 form 节点结构变化会让 nextSibling 校验失败。
+        form.insertBefore(fs, anchorWrap);
+        judgeWraps.forEach((w) => fs.appendChild(w));
+      } else {
+        // 没找到任何判据字段（罕见，比如 wizard.json 改了字段名），仍挂一
+        // 个独立 hint 行 —— 不要因为判据字段缺失就不显示"当前在编辑"，否则
+        // 用户连这个反馈都没有。
+        const hint = _ce("div", WIZARD_NS + "channel-hint");
+        hint.id = prefix + "-wizard-channel-hint";
+        hint.dataset.pfx = prefix;
+        hint.appendChild(_ce("span", WIZARD_NS + "channel-hint-label",
+                             "当前在编辑："));
+        const val = _ce("span", WIZARD_NS + "channel-hint-value",
+                        "未选中（点画面里任一格）");
+        val.id = prefix + "-wizard-channel-value";
+        hint.appendChild(val);
+        form.appendChild(hint);
+      }
+      // 拼 frame-judge 的 setOnSelectChannel —— 用户在向导内点 tile 即时
+      // 更新。FrameJudge 是按页面加载的异步模块，wizard 打开时它可能还没
+      // 装好 → 短轮询挂上，避免竞态。注意：上面 if/else 分支里 val.id
+      // 都设了同一个 prefix + "-wizard-channel-value"，handler 一定能找到
+      // 对应节点（fieldset 的 legend 在文档中依然是 #val 节点可被查到）。
+      const channelValueEl = document.getElementById(prefix + "-wizard-channel-value");
+      if (channelValueEl) {
+        const attachOnSelect = () => {
+          if (!window.FrameJudge || !window.FrameJudge.setOnSelectChannel) {
+            setTimeout(attachOnSelect, 30);
+            return;
+          }
+          window.FrameJudge.setOnSelectChannel(prefix, (idx) => {
+            channelValueEl.textContent = idx == null
+              ? "未选中（点画面里任一格）"
+              : "[" + idx + ", " + (idx + 1) + "] 路";
+          });
+        };
+        attachOnSelect();
+      }
+    }
+
     _renderFootNext(foot, cfg, state, true);
   }
 
@@ -769,6 +882,17 @@
     const skipBtn = _ce("button", WIZARD_NS + "skip-btn", "跳过向导");
     skipBtn.addEventListener("click", () => skip());
     foot.appendChild(skipBtn);
+
+    // 「上一步」按钮 —— currentStep > 0 才显示（不能回退到 -1）。
+    // 放在跳过向导和下一步之间：视觉顺序 = 左 (上一步) | 中 (跳过) | 右 (下一步)。
+    // index 0 时直接不创建 —— DOM 留空比 disabled 更干净（不让用户点
+    // 一个永远灰的按钮）。
+    if (state.currentStep > 0) {
+      const backBtn = _ce("button", WIZARD_NS + "back-btn", "上一步");
+      backBtn.id = WIZARD_NS + "back-btn";
+      backBtn.addEventListener("click", () => stepBackward());
+      foot.appendChild(backBtn);
+    }
 
     if (state.currentStep < cfg.steps.length - 1) {
       const nextBtn = _ce("button", WIZARD_NS + "primary-btn", "下一步");
@@ -874,6 +998,19 @@
     if (_active.uploadBusy) { _flashUploadHint(); return; }
     _captureValues(cfg, _active);   // 先 capture 当前步骤 body
     _gotoStep(_active.currentStep + 1);
+  }
+
+  /**
+   * 「上一步」按钮的入口。语义与 stepForward 对称：先 capture 当前步骤
+   * 已填的字段（不让用户已经输入的内容在回到前一步时被「重渲染清空」），
+   * 再回退一格；index=0 时按钮 disabled（不能回退到「-1」）。
+   */
+  function stepBackward() {
+    if (!_active) return;
+    if (_active.uploadBusy) { _flashUploadHint(); return; }
+    if (_active.currentStep <= 0) return;
+    _captureValues(_active.cfg, _active);
+    _gotoStep(_active.currentStep - 1);
   }
 
   function skip() {
@@ -1207,7 +1344,7 @@
     } catch (_) {}
   }
 
-  window.WizardState = { mount, unmount, stepForward, skip };
+  window.WizardState = { mount, unmount, stepForward, stepBackward, skip };
 
   // ------------------------------------------------------------------ #
   // window.enterWizardMode(appId) — 应用页面左上角"向导模式"按钮调用入口

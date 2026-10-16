@@ -17,9 +17,39 @@
   box-sizing: border-box;
 }
 
-/* 顶部 head */
+/* 顶部 head —— flex 容器，h2 在左、返回按钮在右 */
 .wd-wizard-head {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #e5e7eb;
+}
+.wd-wizard-head > h2.wd-wizard-title {
+  margin: 0;
+  flex: 1;          /* 占满中间，撑开布局 */
+  min-width: 0;     /* 允许文字过长被截断 */
+}
+/* head 右上角「返回」按钮：弱化视觉（白底灰边 + 灰字 + 小尺寸），
+ * 不抢 h2 标题的注意力。 */
+.wd-wizard-head-back-btn {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid #d1d5db;
+  color: #6b7280;
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  margin-left: 12px;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.wd-wizard-head-back-btn:hover {
+  background: #f3f4f6;
+  color: #374151;
+  border-color: #9ca3af;
+}  display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 32px;
@@ -289,6 +319,58 @@
   background: #e5e7eb;
 }
 
+/* 多路视频卡 source step 末尾的"当前在编辑"提示：点 tile 时即时刷新。
+ * 跟 vd-judge-section 那段 [x, y] 路提示是同一语义，wizard 这里没有那段
+ * section、又没有 tile.badge 高亮可参考，加这一行够直观。 */
+.wd-wizard-channel-hint {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #475569;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wd-wizard-channel-hint-label {
+  color: #64748b;
+}
+.wd-wizard-channel-hint-value {
+  font-weight: 600;
+  color: #2563eb;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 判据字段组：把 -judge-mode/-judge-threshold/-judge-every-n 三个字段用
+ * <fieldset> 包起来，<legend> 嵌入"当前在编辑：[x, y] 路"——浏览器原生
+ * "legend 在框上沿"的视觉，比 div+absolute 模拟稳得多。
+ *
+ * 关键样式：fieldset 默认 padding/border 在 Chromium / Firefox 都有差异，
+ * 显式重置一遍；legend 不强制 inline，让"当前在编辑"标签与"路号"在
+ * 同一行且有 8px 左右留白。 */
+.wd-wizard-judge-fs {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 8px 16px 12px 16px;
+  margin: 16px 0 8px 0;
+  background: #f8fafc;
+}
+.wd-wizard-judge-fs > .wd-wizard-field {
+  margin-top: 6px;
+}
+.wd-wizard-judge-legend {
+  /* 浏览器默认 legend 会带 padding/font-size/font-weight 差异，这里统一
+   * 一下；display:contents 让 legend 的子元素直接参与父布局，省得
+   * "当前在编辑："与"路号"之间被 legend 自身 padding 推开。 */
+  display: contents;
+  font-size: 13px;
+  color: #475569;
+}
+.wd-wizard-judge-legend .wd-wizard-channel-hint-label {
+  /* legend 内部 label 默认是 legend 文字一部分，不要粗体化 label 整体
+   * —— label 是「当前在编辑：」半段，value 是真正的路号（用户最关心）。
+   * 之前 .wd-wizard-channel-hint-value 已用 600 weight，足够突出。 */
+  color: #64748b;
+}
+
 /* 视频 canvas 容器(wizard 内显示)— 居中、圆角、深色背景 */
 .wd-wizard-canvas-wrap {
   margin-top: 16px;
@@ -504,6 +586,26 @@
   margin-right: auto; /* 推到最左 */
 }
 .wd-wizard-skip-btn:hover {
+  background: #f3f4f6;
+  color: #374151;
+}
+/* 「上一步」按钮 —— 复用 skip-btn 的次要风格（白底灰边 + 灰字），但
+ * margin-right 改 auto：跳过向导是「真正在最左」（margin-right:auto）、
+ * 上一步紧贴它右边；下一步还在最右。这样三键布局永远是
+ * 「上一步 | 跳过向导 | 下一步」左→右。currentStep=0 时该按钮不存在，
+ * skip-btn 的 margin-right:auto 把它独自顶到最左。 */
+.wd-wizard-back-btn {
+  background: transparent;
+  border: 1px solid #d1d5db;
+  color: #6b7280;
+  padding: 8px 18px;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  /* 跳过向导用 margin-right:auto 已经把整个左半边推开 —— 上一步只是
+   * skip 旁边的次要按钮，不需要再推 */
+}
+.wd-wizard-back-btn:hover {
   background: #f3f4f6;
   color: #374151;
 }
