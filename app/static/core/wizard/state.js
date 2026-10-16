@@ -1337,9 +1337,6 @@
   // ------------------------------------------------------------------ #
   async function mount(app, cfg) {
     if (_active) unmount();
-    console.warn("[mount DEBUG] enter mount for", app.id,
-                 "ls-completed:",
-                 localStorage.getItem(_lsKey(app.id, cfg, "completed")));
     // 隐藏原应用 page
     const pageSection = document.getElementById("page-" + app.id);
     if (pageSection) pageSection.classList.add("hidden");
@@ -1388,7 +1385,6 @@
     window.addEventListener("hashchange", onNavAway);
     _active._onNavAway = onNavAway;
 
-    console.warn("[mount DEBUG] mount about to dispatch wizard:mounted for", app.id);
     // B 方案:通知 framework 隐藏 wd-loading-section(同步在 showPage
     // 期间挂上的 loading 占位)。失败路径(tryMount catch / fetch
     // wizard.json 404 / mount 抛错)不会到这里,framework 那边有 30s
@@ -1398,7 +1394,6 @@
         detail: { appId: app.id, action: "mount" },
       }));
     } catch (_) {}
-    console.warn("[mount DEBUG] mount completed for", app.id);
   }
 
   /**

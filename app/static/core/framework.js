@@ -410,7 +410,7 @@
       return "stop";
     },
 
-    showPage(page) {
+    async showPage(page) {
       document.querySelectorAll(".page").forEach((p) => {
         p.classList.toggle("hidden", p.dataset.page !== page);
       });
@@ -433,8 +433,19 @@
           const m = (window.__APP_MANIFESTS__?.cards || [])
             .find((x) => x.id === page);
           if (m) {
-            window.WizardRegistry.tryMount(m);
-            DemoGuard._wizardMounted.add(page);
+            // 关键:tryMount 返回 boolean —— true 表示 wizard 真挂上了;
+            // false 表示走了 skipped 路径(已完成 / cfg 缺失等),wizard
+            // DOM 实际**不存在**。_wizardMounted 跟踪"wizard 当前 mounted"
+            // 状态,只有真挂上才标 true。如果无脑在 tryMount 之后 add,
+            // 下次进卡 _wizardMounted.has(page)=true → 整个 else if
+            // 跳过 → tryMount 永远不被调,wizard 永远不弹,即使
+            // localStorage 里 completed=1 已被 back-home 兜底清掉
+            // 也救不回来。这是 v0.23 复现的那个"退出应用后重进不进
+            // wizard"bug 的真根因。
+            const mounted = await window.WizardRegistry.tryMount(m);
+            if (mounted) {
+              DemoGuard._wizardMounted.add(page);
+            }
           }
         }
       }
@@ -458,8 +469,8 @@
       if (DemoGuard._loading[page]) {
         try { await DemoGuard._loading[page]; } catch (_) { return; }
         if (!DemoGuard._wizardMounted.has(page) && window.WizardRegistry?.tryMount) {
-          window.WizardRegistry.tryMount(m);
-          DemoGuard._wizardMounted.add(page);
+          const mounted = await window.WizardRegistry.tryMount(m);
+          if (mounted) DemoGuard._wizardMounted.add(page);
         }
         return;
       }
@@ -480,9 +491,11 @@
         DemoGuard._loadedApps.add(page);
         // v0.4 向导模式:挂载 wizard(读 m.wizard_config;缺失 → 零开销跳过)。
         // 不维护"已注册 wizard 应用"清单,完全 manifest 字段驱动。
+        // 关键:tryMount 返回 true 才 add _wizardMounted,否则下次进卡
+        // 会跳过整个 else if 块,wizard 永远不弹。
         if (window.WizardRegistry?.tryMount) {
-          window.WizardRegistry.tryMount(m);
-          DemoGuard._wizardMounted.add(page);
+          const mounted = await window.WizardRegistry.tryMount(m);
+          if (mounted) DemoGuard._wizardMounted.add(page);
         }
       } catch (e) {
         console.error("[router] failed to load card JS:", e);
@@ -550,8 +563,6 @@
   // 还原 page 用 currentPage() === appId 守门 —— 用户若在事件到
   // 达前已切到别处,新 page 才是 visible,旧 page 必须保持 hidden。
   window.addEventListener("wizard:skipped", (ev) => {
-    console.warn("[wizard:skipped DEBUG] reason=", ev?.detail?.reason,
-                 "appId=", ev?.detail?.appId);
     _dismissCardLoading();
     const appId = ev?.detail?.appId;
     if (appId && currentPage() === appId) {
@@ -756,11 +767,6 @@
         //    副作用 —— "退出应用" 应该等于"fresh install"。
         ActivateManager._exit();
         const cp = currentPage();
-        // 临时诊断 —— 用户报"退出应用后重进不进 wizard"复现不到,
-        // 加日志看哪一步没生效。
-        console.warn("[back-home DEBUG] cp=", cp,
-                     "ls-before:",
-                     Object.keys(localStorage).filter(k => k.includes(cp)));
         if (window.WizardState?.clearAll) {
           // 第一道:扫 localStorage 删该 appId 命名空间下所有 wizard
           // 状态(目前所有卡都走默认 base "wdnwebui.wizard.<appId>",
@@ -768,8 +774,6 @@
           // 会漏,见下面第二道兜底)
           window.WizardState.clearAll(cp);
         }
-        console.warn("[back-home DEBUG] ls-after-clearAll:",
-                     Object.keys(localStorage).filter(k => k.includes(cp)));
         // 第二道兜底:从 manifest 反查 wizard_config,fetch 拿到 cfg,
         // 走 WizardState.clearCompleted / clearStep 的精确路径。
         // 第一道已经把"默认 base"覆盖了,这条主要兜未来
@@ -789,8 +793,6 @@
           localStorage.removeItem(base + ".values");
           localStorage.removeItem(base + ".step");
         } catch (_) { /* best-effort */ }
-        console.warn("[back-home DEBUG] ls-final:",
-                     Object.keys(localStorage).filter(k => k.includes(cp)));
         location.hash = "#/";
       });
     });

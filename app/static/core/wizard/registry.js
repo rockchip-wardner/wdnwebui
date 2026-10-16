@@ -32,18 +32,18 @@
   async function tryMount(manifest, opts) {
     opts = opts || {};
     try {
-      if (!manifest || !manifest.wizard_config) return;       // 零开销跳过:无 wizard_config
+      if (!manifest || !manifest.wizard_config) return false;  // 零开销跳过:无 wizard_config
       _currentAppId = manifest.id;
       _loadingConfig = _loadConfig(manifest.wizard_config);
       const cfg = await _loadingConfig;
       _loadingConfig = null;
       if (!cfg) {
         _notifySkipped(manifest, "config_missing");
-        return;
+        return false;
       }
       if (cfg.enabled === false) {
         _notifySkipped(manifest, "disabled");
-        return;
+        return false;
       }
       if (opts.force) {
         // 显式重开路径("向导模式" 按钮触发):无论之前是否完成都强制挂,
@@ -53,12 +53,6 @@
         try { window.WizardState?.clearCompleted?.(manifest, cfg); } catch (_) {}
         try { window.WizardState?.clearStep?.(manifest, cfg); } catch (_) {}
       } else if (window.WizardState?.isCompleted?.(manifest, cfg)) {
-        // 临时诊断 —— 排查"退出应用后重进不进 wizard"bug。
-        console.warn("[tryMount DEBUG] isCompleted=true for",
-                     manifest.id,
-                     "ls:",
-                     Object.keys(localStorage).filter(
-                       k => k.includes(manifest.id)));
         // 自动挂载路径(framework 在 showPage 里调):用户之前已经走完
         // _finish (applyWizardSnapshot 成功落到了下游),再次进入不应
         // 自动弹向导,避免"已完成的应用每次切回都重弹第 1 步"的既视
@@ -66,18 +60,25 @@
         // 必须 _notifySkipped:否则 framework 那张 wd-loading-section
         // 会一直挂着等 wizard:mounted,而我们根本没 mount,30s 兜底之前
         // 用户看到的就是"正在加载 视频目标监控…"然后卡住的假死。
+        // return false:不要让 framework 把 _wizardMounted 标 true,因为
+        // wizard DOM 没真挂上,否则下次进卡 _wizardMounted.has(page)=true
+        // 整个 else if 跳过,tryMount 永远不被调,wizard 永远不弹(在
+        // back-home 把 completed 清掉后也无济于事,这是 v0.23 修的
+        // "退出应用后重进不进 wizard"bug 的真根因)。
         _notifySkipped(manifest, "completed");
-        return;
+        return false;
       }
       if (!window.WizardState || !window.WizardState.mount) {
         console.warn(LOG_PREFIX, "WizardState not loaded — skip mount");
         _notifySkipped(manifest, "wizard_state_missing");
-        return;
+        return false;
       }
       await window.WizardState.mount(manifest, cfg);
+      return true;  // 真正 mount 成功
     } catch (e) {
       console.warn(LOG_PREFIX, "tryMount failed:", e && (e.message || e));
       _notifySkipped(manifest, "error");
+      return false;
     } finally {
       _loadingConfig = null;
     }
