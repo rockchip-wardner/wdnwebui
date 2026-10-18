@@ -144,6 +144,7 @@ function updateVtlTiles(session) {
     else if (ok === total) hint.textContent = `${total} 路视频 · 全部正常`;
     else hint.textContent = `${total} 路视频 · ${ok} 路正常`;
   }
+  window.ZoomFrame?.tick(GRID_EL, session, total);
   // 提示层。文件源播完（loop 未勾）会停在 eof 不再产帧，画面定格在最后一帧 ——
   // 不说的话就是「画面卡住 + 提示条报 0 路正常」，用户完全无从判断。
   if (total && eof === total) setVtlOverlay("视频已播完\n\n勾选「循环播放」可自动重播，或点 播放 继续", false);
@@ -152,6 +153,13 @@ function updateVtlTiles(session) {
   else if (total) setVtlOverlay("部分视频尚未出画面…", false);
   else setVtlOverlay("尚未打开视频\n\n在右侧填入视频地址后点击「打开」", false);
 }
+
+// 宫格放大的接线。attach 必须在 IIFE 内：onError 要用私有的 setVtlOverlay。
+window.ZoomFrame?.attach({
+  gridEl: GRID_EL,
+  apiBase: API_PREFIX + "/video-target-localization",
+  onError: (msg) => setVtlOverlay(msg, true),
+});
 
 function connectVtlWs() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1087,6 +1095,8 @@ function _bindCardPerChannelJudge(pfx, gridId) {
   if (!MG) return;
   const apiBase = _judgeApiFor(pfx);
   MG.bindSelect(gridId, async (idx) => {
+    // 必须在 setSelectedChannel 之前：它同步写 .selected，之后再判二次点击恒真
+    window.ZoomFrame?.onTileClick(gridId, idx);
     if (window.FrameJudge) window.FrameJudge.setSelectedChannel(pfx, idx);
     // **不要等下一条 WS tick**：用户点了 tile 就想立刻看见这路当前的
     // mode / threshold / every_n —— 否则"我改的是哪路"的反馈要拖 1 秒，

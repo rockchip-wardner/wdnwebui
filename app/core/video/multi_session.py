@@ -172,6 +172,9 @@ def derive_inference_size(src_w: int, src_h: int,
 DISPLAY_LONG_EDGE_HIGH = 960
 DISPLAY_LONG_EDGE_LOW = 384
 DISPLAY_HIGH_MAX_CHANNELS = 4
+# 放大态那一路的显示最长边 —— 720p。只加在**被放大的一路**：8.9 倍像素
+# 全员升档会把 RGA + JPEG 预算吃穿。
+DISPLAY_LONG_EDGE_ZOOM = 1280
 
 
 def derive_display_size(n_channels: int, src_w: int, src_h: int,
@@ -371,6 +374,8 @@ class Channel:
             "opens": self.opens,
             "errors": len(self.errors),
             "last_frame_ts": self.last_frame_ts,
+            "disp_w": self._disp_w,
+            "disp_h": self._disp_h,
             "has_frame": self.snapshot_bgr() is not None,
         }
 
@@ -583,6 +588,7 @@ class MultiChannelSession:
         self._state = STATE_IDLE
         self._error = ""
         self._loop = True
+        self._zoomed: Optional[int] = None
         self._detector: Any = None
         self._rr_threads: List[threading.Thread] = []
         # 轮转代号：start / stop 都自增，拿着旧代号的 feeder 自行退出
@@ -683,6 +689,8 @@ class MultiChannelSession:
                     self._stop_evt, self._play_evt)
             for i, src in enumerate(cleaned)
         ]
+        # 换源 = 新的通道表，放大态不再指向有意义的通道 → 回全屏。
+        self._zoomed = None
         # 每路一个独立判据器（参照帧必须是本路的图）。重建通道 = 重建判据：
         # 旧参照帧是旧视频源的内容，换源后继续用等于拿 A 源的图判 B 源。
         proto = self._judge_proto
@@ -731,6 +739,9 @@ class MultiChannelSession:
             self._rr_current = -1
             self._rr_infer_ms = 0.0
             self._rr_last_ts = 0.0
+            # 通道表已清空，_zoomed 留着就是指向不存在通道的悬空下标 ——
+            # 前端读到会朝幽灵值发还原请求。
+            self._zoomed = None
         for ch in channels:
             if ch.thread is not None:
                 ch.thread.join(timeout=2.0)
@@ -1208,6 +1219,42 @@ class MultiChannelSession:
         with self._lock:
             return [c.snapshot() for c in self._channels]
 
+    # ------------------------------------------------------------------ #
+    # 放大态（纯显示）                                                  #
+    # ------------------------------------------------------------------ #
+    def set_zoom(self, idx: int, zoomed: bool) -> dict:
+        """把第 ``idx`` 路切到 / 退出放大显示档。
+
+        只改这一路的 ``_disp_w/_disp_h``。解码循环每帧都读 ``self._disp_w``，
+        所以下一帧就是新尺寸，不需要重开解码器。
+
+        Raises:
+            ValueError: idx 不在范围内。
+        """
+        with self._lock:
+            if not (0 <= idx < len(self._channels)):
+                raise ValueError(
+                    f"channel {idx} 不存在（共 {len(self._channels)} 路）")
+            ch = self._channels[idx]
+            if zoomed:
+                src_long = max(ch.width, ch.height)
+                # min(720p, max(源长边, 当前档))：不封顶则一路能吃掉整个
+                # RGA/JPEG 预算；而只用源长边也不够 —— 非放大档本身就会放大源
+                # （608 的源在 ≤4 路档下已渲成 960），照源 clamp 会让放大后
+                # 清晰度反降。
+                cur_long = max(self._disp_w, self._disp_h)
+                long_edge = min(DISPLAY_LONG_EDGE_ZOOM,
+                                max(src_long, cur_long))
+                size = derive_analysis_size(ch.width, ch.height, long_edge)
+            else:
+                size = (self._disp_w, self._disp_h)
+            # 写的是 Channel 自己的槽位，赋值即生效
+            ch._disp_w, ch._disp_h = size
+            self._zoomed = idx if zoomed else None
+        LOG.info("zoom: ch%d -> %s (%dx%d)", idx,
+                 "放大" if zoomed else "还原", size[0], size[1])
+        return self.snapshot()
+
     def snapshot(self) -> dict:
         with self._lock:
             state = self._state
@@ -1218,11 +1265,14 @@ class MultiChannelSession:
         total_frames = sum(c["frames"] for c in chans)
         started = min((c["last_frame_ts"] for c in chans if c["frames"]),
                       default=0.0)
+        with self._lock:
+            zoomed = self._zoomed
         return {
             "state": state,
             "error": err,
             "channels": n,
             "loop": loop,
+            "zoomed": zoomed,
             "disp_w": self._disp_w,
             "disp_h": self._disp_h,
             "analysis_size": self.analysis_size,

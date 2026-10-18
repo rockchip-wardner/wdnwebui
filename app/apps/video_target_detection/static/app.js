@@ -80,8 +80,15 @@ function updateVtdTiles(session) {
   else if (total && ok === total) setVtdOverlay("", false);
   else if (total) setVtdOverlay("部分视频尚未出画面…", false);
   else setVtdOverlay(VTD_EMPTY_HINT, false);
+  window.ZoomFrame?.tick(GRID_EL, session, total);
 }
 
+// 宫格放大的接线。attach 必须在 IIFE 内：onError 要用私有的 setVtdOverlay。
+window.ZoomFrame?.attach({
+  gridEl: GRID_EL,
+  apiBase: API_PREFIX + "/video-target-detection",
+  onError: (msg) => setVtdOverlay(msg, true),
+});
 
 function connectVtdWs() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -703,6 +710,8 @@ function _bindCardPerChannelJudge(pfx, gridId) {
   if (!MG) return;
   const apiBase = _judgeApiFor(pfx);
   MG.bindSelect(gridId, async (idx) => {
+    // 必须在 setSelectedChannel 之前：它同步写 .selected，之后再判二次点击恒真
+    window.ZoomFrame?.onTileClick(gridId, idx);
     if (window.FrameJudge) window.FrameJudge.setSelectedChannel(pfx, idx);
     // **不要等下一条 WS tick**：用户点了 tile 就想立刻看见这路当前的
     // mode / threshold / every_n —— 否则"我改的是哪路"的反馈要拖 1 秒，

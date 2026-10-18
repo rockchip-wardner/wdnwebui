@@ -5138,3 +5138,172 @@ rebase 合入上游判据特性后，vtd 页的判据 UI 曾是**控件在、后
 
 这一点与单路不同（单路每帧都判，every_n 是主力），共享前端组件看不出来，
 **排查「为什么限流没生效」时别拿单路的直觉套多路**。
+
+## 多路宫格「点开放大到整个播放器」（v0.24，vd / vtd / vtl 三张卡）
+
+单击某一路 = 选中（既有语义：切判据编辑通道），**再点同一路** = 等比例放大
+到整个播放器。退出方式三选一都成立：再点同一路 / ESC / 点另一路。
+
+三张多路视频卡（音视频描述 vd / 视频目标监控 vtd / 视频目标定位 vtl）行为
+完全一致：**后端**一份 `set_zoom()` + 工厂里的一个 `/zoom` 路由，**布局**
+一份 `multi-grid.js`，**卡片侧接线**一份 `static/core/zoom-frame.js`。
+
+### 为什么放大是「纯布局」，后端只换那一路的显示分辨率
+
+画面就是 tile 里那块 `<canvas>`，canvas 内容与 CSS 布局完全解耦 —— 放大
+只需要 `gridTemplateColumns: 1fr` + 其余格子 `display:none`，剩下的行高由
+`grid-auto-rows:1fr` 撑满 `.vd-stage`，等比例由 canvas 自己的
+`object-fit: contain` 保证。**不用重建格子、不用重绘画布**。
+
+分辨率那半段走 `MultiChannelSession.set_zoom()`（通用方法），路由
+`POST /zoom` 定义在 `multi_api.build_multi_router` 里，三张卡自动都拿到。
+后端只改 `Channel._disp_w/_disp_h`，不动解码 fps、不动送检尺寸
+（`_ana_*`）、不动其它路；解码循环每帧读 `self._disp_w`，**下一帧即生效**，
+不需要重开解码器。
+
+> `ZoomPayload` 必须**模块级**定义（同 `JudgePayload`）：`from __future__
+> import annotations` 下端点签名是字符串，FastAPI 只查模块 globals。
+
+### 卡片侧接线为什么单独一个 core 模块
+
+`notify`（放大态变化 → POST /zoom）与 `reconcile`（刷新后对账）这两段
+**三张卡逐字相同**，差别只有「本卡的 API base」和「本卡的 overlay 提示」。
+放在 `static/core/zoom-frame.js`（纯逻辑，无对应 css，注册在
+`index.html.template` 里 `multi-grid.js` **之后** —— `attach()` 要往
+`MultiGrid.onZoom` 上挂回调）。各卡只留三处一行调用：
+
+```js
+// 1) IIFE 内，注册回调（onError 要用卡片私有的 setXdOverlay）
+ZoomFrame.attach({gridEl: GRID_EL, apiBase: API_PREFIX + "/video-detection",
+                  onError: (m) => setVdOverlay(m, true)});
+// 2) IIFE 内，状态快照 handler；另在 bindSelect handler 第一行（IIFE 外）
+ZoomFrame.tick(GRID_EL, session, total);
+ZoomFrame.onTileClick(gridId, idx);
+```
+
+`tick()` 收编了「有路 → 对账 / 无路 → 清宫格」这个分支，调用方只管传
+`total`，分支本身只留一份。
+
+> 抽出来还有一个直接原因：这几段逻辑的**对账方向曾经写反过**（见下）。三份
+> 副本意味着同样的 bug 要修三遍、且必然漏掉一张。与 `window.MultiCard`
+> 消灭双卡勾选器的 4 处重复是同一个动机。
+
+### 放大档位：`min(720p, max(源长边, 当前档长边))`
+
+```python
+long_edge = min(DISPLAY_LONG_EDGE_ZOOM, max(src_long, cur_long))
+```
+
+两个 max/min 各挡一种退化，**两个都不能省**：
+
+* **只按源长边 clamp 会让清晰度不升反降。** 非放大档本身就会放大源 —— 608
+  宽的源在 ≤4 路档下已经渲成 960。只按 `min(1280, src_long)` 算的话，
+  点开放大反而从 960 掉回 608，用户看到的是「放大 = 更糊」。
+* **不封顶则一路能吃掉整个 RGA / JPEG 预算。** 720p 是给「单看一路」够用
+  的规格，不是给 32 路宫格全员升档的。
+
+竖屏源按 `derive_analysis_size` 走自己的宽高比（576x1280 → 576x1280），
+不硬编码 16:9。
+
+### 踩过的坑：`wasSelected` 必须在 `setSelectedChannel()` **之前**取
+
+单击的既有语义是「选中」，由 `FrameJudge.setSelectedChannel()` 打
+`.selected` —— 而它**同步**生效。放在它之后读 `.selected`，读到的永远是
+`true`，于是**首次点击就被当成二次点击直接放大**，「先选中、再点开放大」
+两步并成了一步，判据编辑通道根本来不及用。
+
+所以 `MultiGrid.toggleZoom(container, idx, wasSelected)` 的第三个参数由调用
+方在正确时机取好传进来，**函数内部不许现读**。
+
+### 踩过的坑：`_fireZoom` 静默吞异常 → 通知链路整条失灵
+
+放大接线一开始写在 app.js 的 IIFE **外面**（v0.23
+多路判据接线那一片），引用不到 IIFE 私有的 `API_PREFIX` / `GRID_EL` /
+`setVtlOverlay` → 运行时 `ReferenceError`。布局照切、画面照放大，**后端一次
+都收不到通知**，而 `onZoom` 回调外面裹着 `try/catch {}`，连 pageerror 都不
+会有 —— 表现为「功能好像做了，就是不生效」，没有任何线索。
+
+现在 `_fireZoom` 的 catch 打 `console.warn`。**这类"通知失败但界面正常"的
+链路，异常必须出声**；静默 catch 只会把一个 5 分钟的 bug 变成两小时。
+
+判据：`app/apps/<card>/static/app.js` 的 IIFE（`})();`）之外那一段能看见的
+标识符只有**外层**声明的那些。凡是要用卡片私有常量（`API_PREFIX` /
+`GRID_EL` / `setVtlOverlay`）的函数，一律放进 IIFE 内。
+
+### 踩过的坑：对账方向反了 → 用户刚点的放大 1 秒后被自己撤掉
+
+硬刷新会丢本地 zoom 态而后端那一路还停在 720p，所以需要一个对账。但
+**方向只能是「后端有、本地没有」**：
+
+* 反向（本地有、后端说还没有）绝不能自动还原 —— `POST /zoom` 是异步的，
+  用户刚点开放大、请求还在路上时就可能先收到一条 `zoomed=null` 的旧
+  WS 快照，照着还原等于把用户刚要的升档在 1 秒内自己撤掉。
+* 正向只在刷新后成立（本地为 null 时用户没有正在进行的 zoom 请求），
+  且不会与用户操作打架。
+
+配套：`open()`（换源）和 `close()`（清通道表）都必须把 `_zoomed` 清成
+`None` —— 否则会留下指向不存在通道的悬空下标。
+
+### 踩过的坑：关会话要清放大态，而且**四条关闭路径都得覆盖**
+
+放大态是**会话内**的状态。会话关了但 `g.zoomed` 留着，下次 `open()` 的
+`ensure()` 会拿残留值重新套上放大 —— 用户看到的是「刚打开 6 路，却只剩一格
+放大、另外 5 格不见了」。
+
+关键在于**关会话有四条路径**，不是一条：
+
+1. 卡片自己的「关闭」按钮；
+2. 离开页面时的 `DemoGuard.stopAndClear`；
+3. `beforeunload` 的 `sendBeacon` / `fetch({keepalive:true})`；
+4. 外部（含 `watchdog`、curl）直接打 `POST /close`。
+
+只在按钮里 `MultiGrid.reset()` 覆盖不全，另外三条都会漏。所以清空由**状态
+快照**驱动：`MultiGrid.resetIfClosed(gridEl, session)` —— 由
+`ZoomFrame.tick()` 在 `total === 0` 时调，三张卡不直接碰它。
+
+只认 `state === "idle"`：`opening` 阶段 `channel_list` 可能短暂为空，那时清
+会把刚建好的格子拆了再重建；`error` 阶段格子上的红框 / ⚠N 是有用的诊断
+信息，不该被抹掉 —— 真要清 error 会话，点「关闭」走 `close()` 就变 idle 了。
+
+（v0.24 之前只有 vd 在按钮里 reset，vtd / vtl 压根没有 —— 这个不对称就是
+本条坑的来源。加新卡片状态时记得跟着加这一行。）
+
+### ESC 监听器按需挂载
+
+`_bindEsc` 只在放大时 `addEventListener`、退出时 `removeEventListener`。
+常驻的全局 keydown 会在别的卡片抢输入时也生效。`reset()` 里**必须先清
+`g.zoomed` 再摘监听** —— 反了的话 `_bindEsc` 看到 `zoomed != null` 直接
+return，监听器就永久留在 document 上了。
+
+### 真机实测（本机 RK3588）
+
+**交互**（`scripts/verify_zoom_tile.py`，6 路，真实浏览器 + 真实 WS）：
+
+| 项 | 结果 |
+|---|---|
+| 单击 → 只选中不放大 | ✅ 不发 `/zoom` |
+| 二次点击 → 放大 | ✅ 其余 5 格隐藏、`gridTemplateColumns: 1fr`、角标 13px→18px |
+| 放大 → 通知后端 | ✅ `{channel:0,zoomed:true}` |
+| 再点同一路 → 还原 | ✅ 通知 `{channel:0,zoomed:false}` |
+| ESC → 退出且**保留选中** | ✅ |
+| 点另一路 → 退出并选中那一路 | ✅ 通知的是**被放大的那一路**，不是新选中的 |
+| vtd / vd 冒烟（共用 multi-grid） | ✅ 无 zoom 副作用，无 pageerror |
+
+**性能**（`scripts/measure_zoom_perf.py`，6 路 × 576x1280 竖屏素材，
+`LocateAnything-3b` 跑在 npu0，检测运行中；被放大那一路 176x384 → 576x1280，
+**11 倍像素**）：
+
+| 状态 | 合计解码 fps | 其它路均值 fps | 轮转 | 解码错误 |
+|---|---|---|---|---|
+| 基线 | 149.07 | 24.84 | 0.050/s | 0 |
+| 放大 ch1 | 148.98 | 24.83 | 0.050/s | 0 |
+| 还原 | 148.93 | 24.82 | 0.100/s | 0 |
+
+**结论：总吞吐掉 0.09 fps（0.1%），其它路每路帧率与轮转速率均无变化。**
+一路升档是**单路多花 CPU**，不会抢走其它路的预算 —— 这与 AGENTS 里
+「wait_idle 忙等饿死解码」「每路 fps 按总预算摊分」那两次事故不同：那两次
+是**所有路一起塌**，本次实测其它路 24.83fps 一路没掉。
+
+> 但别因此推论「全员升档也无所谓」：6 路各升 11 倍是 66 倍的 RGA + JPEG
+> 开销，`MAX_TOTAL_DECODE_FPS` / `MAX_TOTAL_DISPLAY_FPS` 会被直接吃穿。
+> 「只升被放大那一路」是**必须**的，不是优化。

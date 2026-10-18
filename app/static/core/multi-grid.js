@@ -36,7 +36,7 @@
     if (!el) return null;
     let g = _grids.get(el);
     if (!g) {
-      g = { el, tiles: new Map(), cols: 1, total: 0 };
+      g = { el, tiles: new Map(), cols: 1, total: 0, zoomed: null };
       _grids.set(el, g);
     }
     return g;
@@ -64,12 +64,16 @@
     // grid 退回默认 auto 布局被 canvas 固有宽度（384px）撑开（实测 1102px 宽的
     // 播放区只用了 386px）—— 所以只有「恰好 1 路」时出错。
     const colsCss = `repeat(${cols}, 1fr)`;
-    if (grid.style.gridTemplateColumns !== colsCss) {
+    // 放大态下必须写 1 列而不是 cols 列 —— ensure() 会在换源 / 路数变化时重跑，
+    // 直接写 colsCss 会把用户的放大状态冲掉。cols 始终更新（哪怕样式没变，
+    // 否则退出放大时会用回一个陈旧的列数）。
+    const wantCss = (g.zoomed == null) ? colsCss : "1fr";
+    if (grid.style.gridTemplateColumns !== wantCss) {
       DIAG.gridBuilds++;
-      g.cols = cols;
-      grid.style.gridTemplateColumns = colsCss;
+      grid.style.gridTemplateColumns = wantCss;
       grid.dataset.cols = String(cols);
     }
+    g.cols = cols;
     // 别在 grid 上设 aspect-ratio：**不生效**（.vd-layout 是 align-items:stretch，
     // grid 作为 flex 子项会被拉满行高，1 路实测 1002x586 而不是 564）。6 路是 3x2，
     // 必然有上下留边 —— 格子数的固有结果，不是 bug，交给 object-fit: contain 居中。
@@ -112,6 +116,9 @@
       created++;
     }
     g.total = n;
+    // 新建的格子要立刻套上放大态的隐藏标记 —— ensure() 是唯一会增删 tile
+    // 的地方，不在这里补，后面就没有机会了。
+    if (g.zoomed != null) _applyZoom(g);
     _diag("grid", `build n=${n} cols=${cols} new=${created}`);
     return cols;
   }
@@ -290,20 +297,129 @@
     g.onSelect = handler;
   }
 
+  /* ------------------------------------------------------------------
+   * 放大态：把某一路等比例放大到整个播放器。**纯布局操作** —— 画面就是 tile
+   * 里那块 canvas，内容与 CSS 布局解耦，放大只是「grid 只剩 1 格 1 行 + 其余
+   * 格子 display:none」，等比例由 canvas 的 object-fit: contain 保证。
+   *
+   * 不碰解码 / 送检 / 检测；要换更高分辨率是卡片侧的事（见 zoom-frame.js）。
+   * ------------------------------------------------------------------ */
+
+  function _applyZoom(g) {
+    const z = g.zoomed;
+    g.el.classList.toggle("is-zoomed", z != null);
+    g.el.style.gridTemplateColumns =
+      (z == null) ? `repeat(${g.cols}, 1fr)` : "1fr";
+    for (const [i, t] of g.tiles) {
+      t.tile.classList.toggle("is-hidden", z != null && i !== z);
+    }
+  }
+
+  function isSelected(container, idx) {
+    const g = _state(container);
+    const t = g && g.tiles.get(idx);
+    return !!(t && t.tile.classList.contains("selected"));
+  }
+
+  /** 注册 zoom 态变化回调 `(next, prev) => {}`。布局是本模块的事，但被放大
+   *  那一路要换更高分辨率是后端的事 —— 只回抛状态，不自己去发请求。 */
+  function onZoom(container, handler) {
+    const g = _state(container);
+    if (g) g.onZoom = handler;
+  }
+
+  function _fireZoom(g, prev) {
+    if (typeof g.onZoom !== "function") return;
+    // 不静默吞：回调里引用错作用域会炸 ReferenceError，布局还是切了、
+    // 后端永远收不到通知，而页面上看不出任何异常。
+    try { g.onZoom(g.zoomed, prev); }
+    catch (e) { console.warn("MultiGrid onZoom 回调抛错", e); }
+  }
+
+  /** 点开放大 / 关闭放大。返回 true = 现在是放大了这一路。
+   *
+   *  `wasSelected` 由调用方传入，**不能在函数里现读**：调用方会先调
+   *  FrameJudge.setSelectedChannel() 同步打上 .selected，之后再读恒为 true，
+   *  于是首次点击也被当成二次点击直接放大。
+   *
+   *  点没选中过的路 = 退出放大 + 选中它（想看清别的路时不该被挡在放大态）。 */
+  function toggleZoom(container, idx, wasSelected) {
+    const g = _state(container);
+    if (!g || !g.tiles.has(idx)) return false;
+    const prev = g.zoomed;
+    if (wasSelected && prev === idx) g.zoomed = null;  // 再点同一路 → 还原宫格
+    else if (wasSelected) g.zoomed = idx;               // 二次点击 → 放大
+    else g.zoomed = null;                               // 点别的路 → 退出放大
+    _applyZoom(g);
+    _bindEsc(g);
+    _diag("zoom", `idx=${idx} was=${!!wasSelected} -> ` +
+                  (g.zoomed == null ? "grid" : "zoom " + g.zoomed));
+    _fireZoom(g, prev);
+    return g.zoomed === idx;
+  }
+
+  /** 放大态下按 ESC 退出。监听器只在放大时挂上、退出时摘掉 —— 常驻的全局
+   *  keydown 会在别的卡片抢输入时也生效。 */
+  function _bindEsc(g) {
+    if (g.zoomed == null) {
+      if (g.onEsc) { document.removeEventListener("keydown", g.onEsc); g.onEsc = null; }
+      return;
+    }
+    if (g.onEsc) return;
+    g.onEsc = (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault();
+      const prev = g.zoomed;
+      g.zoomed = null;
+      _applyZoom(g);
+      _bindEsc(g);
+      _diag("zoom", `esc from ${prev} -> grid`);
+      _fireZoom(g, prev);
+    };
+    document.addEventListener("keydown", g.onEsc);
+  }
+
+  function zoomedIndex(container) {
+    const g = _state(container);
+    return g ? g.zoomed : null;
+  }
+
+  /** 会话已关闭时清空宫格（含放大态）。由状态快照驱动，不放 close 按钮里 ——
+   *  关会话有**四条**路径（按钮 / DemoGuard / beforeunload beacon / 外部
+   *  `/close`），只补按钮必然漏；漏掉的后果是下次 open() 的 ensure() 拿残留
+   *  的 `g.zoomed` 重新放大，用户看到「刚打开 6 路却只剩一格」。
+   *
+   *  只认 idle：opening 阶段 channel_list 可能短暂为空，那时清会拆了重建；
+   *  error 阶段格子上的红框 / ⚠N 是有用的诊断，不该抹。 */
+  function resetIfClosed(container, session) {
+    if (!session || session.state !== "idle") return false;
+    const g = _state(container);
+    if (!g || (!g.total && g.zoomed == null)) return false;
+    reset(container);
+    return true;
+  }
+
   function reset(container) {
     const g = _state(container);
     if (!g) return;
+    // 顺序要紧：先清 zoomed 再摘监听，否则 _bindEsc 看到 zoomed != null 会
+    // 直接 return，监听器就永久留在 document 上了。
+    g.zoomed = null;
+    _bindEsc(g);
     for (const [, t] of g.tiles) {
       t.dropped = true;
       t.tile.remove();
     }
     g.tiles.clear();
     g.total = 0;
+    g.el.classList.remove("is-zoomed");
+    g.el.style.gridTemplateColumns = "";
   }
 
   window.MultiGrid = {
     chNo, ensure, paint, status, reset,
-    setBadge, setSelected, bindSelect,
+    setBadge, setSelected, isSelected, bindSelect,
+    toggleZoom, zoomedIndex, onZoom, resetIfClosed,
     diag: DIAG,
     tiles: (container) => (_state(container) || { tiles: new Map() }).tiles,
   };

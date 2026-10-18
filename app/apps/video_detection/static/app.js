@@ -307,7 +307,15 @@ function updateVdTiles(session) {
   if (eof >= total && total > 0) {
     setVdOverlay("全部路已播完（EOF）", true);
   }
+  window.ZoomFrame?.tick(GRID_EL, session, total);
 }
+
+// 宫格放大的接线。attach 必须在 IIFE 内：onError 要用私有的 setVdOverlay。
+window.ZoomFrame?.attach({
+  gridEl: GRID_EL,
+  apiBase: API_PREFIX + "/video-detection",
+  onError: (msg) => setVdOverlay(msg, true),
+});
 
 /** 从视频源文本框读出 sources 列表（每行一路，去空行去重）。
  *
@@ -1030,6 +1038,8 @@ function _bindCardPerChannelJudge(pfx, gridId) {
   if (!MG) return;
   const apiBase = _judgeApiFor(pfx);
   MG.bindSelect(gridId, async (idx) => {
+    // 必须在 setSelectedChannel 之前：它同步写 .selected，之后再判二次点击恒真
+    window.ZoomFrame?.onTileClick(gridId, idx);
     if (window.FrameJudge) window.FrameJudge.setSelectedChannel(pfx, idx);
     // **不要等下一条 WS tick**：用户点了 tile 就想立刻看见这路当前的
     // mode / threshold / every_n —— 否则"我改的是哪路"的反馈要拖 1 秒，

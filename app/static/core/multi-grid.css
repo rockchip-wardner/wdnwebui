@@ -93,3 +93,22 @@
 }
 .vd-tile.bad { border-color: #ff453a; }
 .vd-tile.bad .vd-tile-label { color: #ff6b63; }
+
+/* 放大态。逻辑在 multi-grid.js 的 toggleZoom()，这里只管长相。 */
+
+/* 用 display:none 而非 visibility/opacity：grid 只剩一格一行，
+   grid-auto-rows:1fr 就撑满 stage。且不清 canvas，退出立刻恢复最后一帧。 */
+.vd-tile.is-hidden { display: none; }
+
+/* 角标 / 通道号是固定 px，格子大几倍后不跟着放会显得很小。判据浮层自己
+   按 canvas 尺寸重算，不用在这里动。 */
+.vd-grid.is-zoomed .vd-tile-label {
+  font-size: 18px;
+  line-height: 26px;
+  padding: 3px 10px;
+  left: 12px; top: 12px;
+}
+.vd-grid.is-zoomed .vd-tile-badge {
+  font-size: 14px;
+  padding: 3px 8px;
+}

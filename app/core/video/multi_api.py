@@ -108,6 +108,16 @@ def parse_models_field(payload: dict) -> Optional[list]:
     return out
 
 
+class ZoomPayload(BaseModel):
+    """``POST /zoom`` 入参：第 ``channel`` 路（0 基）切到 / 退出放大显示档。
+
+    必须模块级，理由同 :class:`JudgePayload`。
+    """
+
+    channel: int
+    zoomed: bool = True
+
+
 @dataclass(frozen=True)
 class MultiCardSpec:
     """一张多路视频卡接入本工厂要提供的东西。"""
@@ -252,6 +262,24 @@ def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
         sess = spec.session_getter()
         sess.stop_round_robin()
         return sess.close()
+
+    @router.post("/zoom")
+    async def set_zoom(payload: ZoomPayload) -> dict:
+        """切换某一路的放大显示档。纯显示：只改那一路的显示分辨率，不碰
+        解码 fps / 送检尺寸 / 检测。前端布局纯 CSS 先切，这里异步补帧。
+
+        Raises:
+            400: channel 为负，或不在已打开的通道范围内。
+        """
+        if payload.channel < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"channel 必须非负: {payload.channel}")
+        try:
+            return spec.session_getter().set_zoom(payload.channel,
+                                                   payload.zoomed)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     # ----------------------------------------------------------------- #
     # 检测                                                              #

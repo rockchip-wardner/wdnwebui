@@ -126,3 +126,5 @@ router = build_multi_router(
     ),
     tag="video-target-localization",
 )
+# POST /zoom（宫格点开放大）已挪进 multi_api.build_multi_router —— v0.24 起
+# vd / vtd / vtl 三张卡共用一份实现，不再各卡挂一份副本。
