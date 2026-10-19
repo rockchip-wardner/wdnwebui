@@ -1627,34 +1627,13 @@ class VideoAnalysisSearchService:
         if not (0.0 < change_threshold <= 1000.0):
             raise ValueError("change_threshold 必须在 (0, 1000] 区间")
 
-        # v0.10 关键修复：用户传 "describe scene" 这种英文 prompt 时，
-        # qwen3-vl-4b 会输出 700+ 字的英文段落描述（"This is a close-up
-        # photograph of a white bowl..."），而不是 SceneFrame JSON schema。
-        # SDK 的 schema hint 被忽略，每帧都触发 _split_scene_frame_result
-        # 的"text 字段乱码"兜底，event 全是 dirty=True 的空事件。
-        #
-        # v0.10.2 泛化：原版只针对车牌 / 车辆属性这类误读 prompt 的输出做了
-        # 约束，但 Qwen3-VL 在不同类型视频上有不同 hallucinate 模式：
-        #   - 车辆视频：把 prompt 误读成 attribute-extraction，输出
-        #     "粤B·88888" / "车牌颜色：蓝色" / "车型:小型轿车" 等
-        #   - 监控视频：只输出时间戳 / ID 编号
-        #   - 体育视频：只输出比分 / 球员名
-        #   - 产品视频：只输出 SKU / 颜色 / 材质
-        # 通用规则是：模型**只描述看到了什么 + 在发生什么**，不要做属性抽取。
-        # 这里给通用 SceneFrame schema 描述 + 一个中性示例（不绑车型）。
-        if "json" not in prompt.lower() and "schema" not in prompt.lower():
-            prompt = (
-                prompt.rstrip("。. \n")
-                + "\n\n【输出格式（严格按 JSON schema）】\n"
-                "请输出一个 JSON 对象，必须且只能有以下 5 个字段：\n"
-                "{\n"
-                '  "scene":   "<场景地点或环境，2-12 字中文，如 \"厨房\"、\"户外街道\"、\"小区入口\">",\n'
-                '  "actors":  ["<人物或主体1>", "<人物或主体2>"],   // 字符串数组，无则 []，最多 3 项\n'
-                '  "action":  "<正在发生的动作或事件，2-20 字中文一句话>",\n'
-                '  "objects": ["<关键物体1>", "<关键物体2>"],       // 字符串数组，无则 []，最多 4 项\n'
-                '  "text":    "<30-80 字中文自然语言描述：场景 + 动作 + 关键物体综合>"  \n'
-                "}\n"
-            )
+        # 不追加手工 JSON 指令：SDK 会按 ``generating=SceneFrame`` 自动注入
+        # 完整 JSON Schema（含字段 description），再叠一份手写「请输出 JSON
+        # 对象 + 示例」会形成"两份指令打架"。实测（RK3588 + qwen3-vl-4b）：
+        # 手写指令示例里的值（"户外街道" 等）会被模型当模板抄成输出 —— 对
+        # 停车场 / 小区大门画面一律回 "城市街道、斑马线、商店橱窗"，与画面
+        # 无关。删掉后模型正常按图描述。详见 ``_build_scene_frame_schema``
+        # 与 ``_call_llm`` 的说明。
 
         # 业务级校验：算力是否就绪
         from app.core.compute.registry import get_registry
