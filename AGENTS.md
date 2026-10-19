@@ -4164,6 +4164,18 @@ RIFF header by hand.
     让模型输出 5 字段结构化 JSON（`text` / `scene` / `actors` / `action` /
     `objects`）；SDK 解析失败时 `_split_scene_frame_result` 五分支兜底
     （dict 归一化 → JSON parse → markdown regex → raw str）。
+    **⚠️ class docstring 会进 prompt（分析幻觉陷阱）**：
+    `@Generable` 类在 wdnai 里被转成 pydantic BaseModel，**class docstring
+    会成为 `model_json_schema()` 的顶层 `description`**，随
+    `session._schema_hint_section` → `_safe_schema` 注入每条 prompt。
+    SceneFrame 原先那段 48 行 docstring（含一处"❌ 反例"
+    `{"text": "scene 小区入口 actors …"}`）经此路径被 4B 模型当模板抄成
+    输出 —— 用户报的"小区入口"/"城市街道"等与画面无关的逐帧结果就是这么
+    来的。**规矩**：class docstring 只留一句中性描述；
+    字段顺序 / 长度约束 / schema-echo 说明一律放函数 `#` 注释，**绝不在
+    docstring / Field description 里写具体示例值或反例**。
+    schema 大小实测由 2591 → 944 字符（字段/类型/maxLength/required
+    逐字段不变，结构化输出填充率正常，scene 74% / text 78%）。
   - **Apollo 三段式综述**：场景检测（cv2 HSV 直方图 + Bhattacharyya 距离）
     → per-scene chunk 小结（每段 ≤120 字，`max_new_tokens=200`）→ 最终综述
     （`max_new_tokens=400`）。每完成一个 chunk 广播 `state` 进度，

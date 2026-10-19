@@ -142,57 +142,57 @@ def _build_scene_frame_schema():
     from wdnai import Generable, Field
     from pydantic import BaseModel as _PydBaseModel
 
+    # 单帧视频的结构化分析 —— 反查 / 检索 / 报告生成的数据基础。
+
+    # **字段顺序刻意设计**（关键修复：解决"视频文件分析 vs 视频目标检测"
+    # 在相同视频/提示词下乱码率差异的根因）：
+
+    # 1. scene / actors / action / objects 是**约束型字段**（短字符串 +
+    #    数组，token 候选空间小），**先输出** → 模型在生成阶段就被
+    #    "锚定"在 JSON 语法 + 短 token 模式里。
+    # 2. text（最长的 CJK 序列）放到**最末** → 此时 decoder 已 anchor，
+    #    RKNN3 quantization noise 让首 token 漂移到 Latin/Cyrillic
+    #    subword 的概率显著降低（VTD 的 TargetDoc 之所以不乱码就是
+    #    这个原理 —— 4 个数字字段把 decoder 锚定在数字 + 标点 token
+    #    空间，~30% 输出 token 是数字/标点，相当于隐式 stabilizer）。
+    # 3. note 仍是 optional（保持向后兼容）。
+
+    # **字段长度约束**（pydantic Field(max_length=...) → schema hint 暴露
+    # 给模型）：
+
+    # - scene:   ≤12 字（短场景标识，类似 TargetDoc x1 的"数字约束"）
+    # - action:  ≤20 字（短动作描述）
+    # - actors:  ≤3 项（数组约束）
+    # - objects: ≤4 项（数组约束）
+    # - text:    ≤80 字（比改前 ~30-100 字略缩，drift 窗口减小）
+    # - note:    ≤30 字
+
+    # **总字数约束（v0.15 wire 安全）**：5 字段 JSON-encoded 后总长度
+    # ≤ ~200B，留 55B 余量在 FastCDR ComputeReply.text 255B 硬截断
+    # 内（参考 compute_worker.py text SHM path-list 阈值 200B）——
+    # 减少触发 /dev/shm path-list 兜底频率，常规 inline 走 wire。
+    # 实际渲染时 SDK 用 ``str(dict)``（不是 ``json.dumps(indent=2)``）
+    # 节省 ~30% 体积，但保守起见按 ≤ 200B 预算。每个字段都在上面
+    # max_length 范围内，5 字段自然落在 150 字以内。
+
+    # **❌ 反例（schema-echo 防御，v0.15）**：Qwen3-VL-4B RKNN3 首
+    # token 不稳定时（约 ~46% schema-echo 概率，5c33fb3 提到的）
+    # 偶发把字段名本身当 JSON 值 echo 出来。**严禁**按下方反例输出：
+
+    # ``{"text": "scene 小区入口 actors action objects text", "scene": "", ...}``
+
+    # ↑ 字段名 (scene/actors/action/objects/text) 本身被当 value，
+    # 完全没描述画面内容 —— 这是错误输出。text 字段必须是真正
+    # 描述画面的自然语言（30-80 字中文，含场景/动作/物体），不是
+    # 字段名拼接。即使 image 难描述时也必须给出有意义的描述，
+    # 宁可空字段 ("scene": ""，"text": "画面模糊难以辨认") 也
+    # 不要把字段名当 value 填充。
+
+    # text 仍承担反查模糊匹配（``?text=...``）的主来源 —— 80 字足够
+    # 覆盖"含场景、人物动作、关键物体"的简洁描述。
     @Generable
     class SceneFrame(_PydBaseModel):
-        """单帧视频的结构化分析 —— 反查 / 检索 / 报告生成的数据基础。
-
-        **字段顺序刻意设计**（关键修复：解决"视频文件分析 vs 视频目标检测"
-        在相同视频/提示词下乱码率差异的根因）：
-
-          1. scene / actors / action / objects 是**约束型字段**（短字符串 +
-             数组，token 候选空间小），**先输出** → 模型在生成阶段就被
-             "锚定"在 JSON 语法 + 短 token 模式里。
-          2. text（最长的 CJK 序列）放到**最末** → 此时 decoder 已 anchor，
-             RKNN3 quantization noise 让首 token 漂移到 Latin/Cyrillic
-             subword 的概率显著降低（VTD 的 TargetDoc 之所以不乱码就是
-             这个原理 —— 4 个数字字段把 decoder 锚定在数字 + 标点 token
-             空间，~30% 输出 token 是数字/标点，相当于隐式 stabilizer）。
-          3. note 仍是 optional（保持向后兼容）。
-
-        **字段长度约束**（pydantic Field(max_length=...) → schema hint 暴露
-        给模型）：
-
-          - scene:   ≤12 字（短场景标识，类似 TargetDoc x1 的"数字约束"）
-          - action:  ≤20 字（短动作描述）
-          - actors:  ≤3 项（数组约束）
-          - objects: ≤4 项（数组约束）
-          - text:    ≤80 字（比改前 ~30-100 字略缩，drift 窗口减小）
-          - note:    ≤30 字
-
-        **总字数约束（v0.15 wire 安全）**：5 字段 JSON-encoded 后总长度
-        ≤ ~200B，留 55B 余量在 FastCDR ComputeReply.text 255B 硬截断
-        内（参考 compute_worker.py text SHM path-list 阈值 200B）——
-        减少触发 /dev/shm path-list 兜底频率，常规 inline 走 wire。
-        实际渲染时 SDK 用 ``str(dict)``（不是 ``json.dumps(indent=2)``）
-        节省 ~30% 体积，但保守起见按 ≤ 200B 预算。每个字段都在上面
-        max_length 范围内，5 字段自然落在 150 字以内。
-
-        **❌ 反例（schema-echo 防御，v0.15）**：Qwen3-VL-4B RKNN3 首
-        token 不稳定时（约 ~46% schema-echo 概率，5c33fb3 提到的）
-        偶发把字段名本身当 JSON 值 echo 出来。**严禁**按下方反例输出：
-
-          ``{"text": "scene 小区入口 actors action objects text", "scene": "", ...}``
-
-        ↑ 字段名 (scene/actors/action/objects/text) 本身被当 value，
-        完全没描述画面内容 —— 这是错误输出。text 字段必须是真正
-        描述画面的自然语言（30-80 字中文，含场景/动作/物体），不是
-        字段名拼接。即使 image 难描述时也必须给出有意义的描述，
-        宁可空字段 ("scene": ""，"text": "画面模糊难以辨认") 也
-        不要把字段名当 value 填充。
-
-        text 仍承担反查模糊匹配（``?text=...``）的主来源 —— 80 字足够
-        覆盖"含场景、人物动作、关键物体"的简洁描述。
-        """
+        """单帧视频的结构化分析结果。"""
         # 1. 场景（短字符串先输出 → 锚定 decoder）
         scene: str = Field(
             description="场景类别（地点 + 上下文，≤12 字）",
