@@ -15,8 +15,8 @@
   固定文案零 LLM 成本）；拉取侧工具返回实时 progress。
 * **不复用 UI 页 VCS 单例**：``VideoContentSearchService`` 是全局
   单源状态机，多用户多视频会互相覆盖。本模块复用其底层函数
-  （``_probe_video_meta`` / ``_read_chunk_frames`` /
-  ``_write_frames_to_shm`` / ``_cosine_similarity``），维护独立的多
+   （``_probe_video_meta`` / ``_read_chunk_frames`` /
+   ``_cosine_similarity``），维护独立的多
   用户注册表；UI 页互不干扰。
 
 切片参数：4s 片 / 1s 重叠（与 VCS 页默认值对齐）。检索：threshold
@@ -38,8 +38,6 @@ import numpy as np
 
 from app.core.video.utils import (
     _read_chunk_frames,
-    _write_frames_to_shm,
-    cleanup_shm_session as _cleanup_shm_session,
     compute_slices,
     cosine_similarity as _cosine_similarity,
     probe_video_meta as _probe_video_meta,
@@ -490,9 +488,8 @@ class WechatVideoManager:
         self._notify(user_id, f"⏳ 开始分析 {entry.filename}"
                               f"（{duration_s:.0f} 秒，共 {total} 段）…")
 
-        # ---- 4. 切片 embedding（复用 VCS 底层函数 + SHM 帧传递；
-        #         session/lock 已在步骤 0.5 获取）----
-        shm_session_id = f"wxv{seq:x}"
+        # ---- 4. 切片 embedding（复用 VCS 底层函数；session/lock 已在
+        #         步骤 0.5 获取）----
         chunk_idx = 0
         start = 0.0
         failures: list = []
@@ -508,13 +505,12 @@ class WechatVideoManager:
                     f"c{chunk_idx}: PyAV 解码 0 帧 @ {start:.0f}s")
                 break
             end_time = start + len(frames)
-            frame_paths = _write_frames_to_shm(frames, shm_session_id, chunk_idx)
             try:
                 vec = None
                 for _attempt in range(2):
                     try:
                         with lock:
-                            vec = session.embed_video(frame_paths, prompt="")
+                            vec = session.embed_video(frames, prompt="")
                         break
                     except RuntimeError as rpc_err:
                         if ("timeout" not in str(rpc_err).lower()
@@ -547,17 +543,10 @@ class WechatVideoManager:
                 failures.append(f"c{chunk_idx}: {chunk_err}")
                 _LOG.warning("wechat video: chunk %d/%d embed failed: %s",
                              chunk_idx, total, chunk_err)
-            finally:
-                for _p in frame_paths:
-                    try:
-                        os.unlink(_p)
-                    except OSError:
-                        pass
             chunk_idx += 1
             start += step
             if end_time >= duration_s:
                 break
-        _cleanup_shm_session(shm_session_id)
 
         # ---- 5. 终态判定 + 完成通知 ----
         if self._superseded(user_id, seq):

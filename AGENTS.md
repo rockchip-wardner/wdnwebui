@@ -2329,8 +2329,11 @@ compute_worker 子进程**里，跨进程通过 `wdndds` cshim RPC
     serialize / 反序列化（builtin TCPv4 兜底虽能塞但每帧一遍不便宜）。
 
   用途覆盖：`WdnaiDetector`（音视频描述 / 视频目标检测）+ 视频文件分析
-  共用同一 `RpcSessionProxy`，都走 path-list。视频内容检索（embed_video）
-  走自己的 `wdndds_vcs_*` path-list（基于 JPEG，嵌入模型对像素抖动不敏感）。
+  共用同一 `RpcSessionProxy`，都走 path-list。视频内容检索（embed_video，
+  VAS 页 + 微信管线）也走同一条 `_bgr_to_path` / `decode_attachments`
+  raw-BGR path-list —— **必须传 ndarray 帧列表**；传路径字符串会被 worker
+  端 `decode_attachments` 当 base64 解析失败 → `TextAttachment` → 被
+  `ImageAttachment` 过滤 → `frames=[]` → `0/N` 全失败（详见检索侧章节）。
   音频走 base64（PCM bytes 不是图）。
   串行化同一 instance 的并发请求。
 * **`boot_compute_services` 在 boot 默认开启**。`app/main.py`
@@ -4271,12 +4274,27 @@ RIFF header by hand.
     `embed_text` / `embed_video` 的 `reset() + respond` 类推理必须
     `with lock:` 包住（embedding 的 `embed_*` 也是 NPU 推理，同样要
     与 VLM 端串行化）。
-  - **切片 embedding**：PyAV 按 `[start, start+chunk_seconds)` 时间窗
-    推进（步进 = chunk_seconds - overlap），每片取 `chunk_seconds` 个
-    等距帧（1 秒/帧）缩放到 576×576，`embed_video` 得 2048 维 L2
-    归一化向量，存内存 `List[{video_path, start_time, end_time,
-    chunk_idx, fps, vec}]`。逐片推进 `slices_embedded` 并 WS 广播
-    `progress`。`_probe_video_meta` 用 PyAV 探测 fps / 总帧数 / 时长。
+   - **切片 embedding**：PyAV 按 `[start, start+chunk_seconds)` 时间窗
+     推进（步进 = chunk_seconds - overlap），每片取 `chunk_seconds` 个
+     等距帧（1 秒/帧）缩放到 576×576，`embed_video` 得 2048 维 L2
+     归一化向量，存内存 `List[{video_path, start_time, end_time,
+     chunk_idx, fps, vec}]`。逐片推进 `slices_embedded` 并 WS 广播
+     `progress`。`_probe_video_meta` 用 PyAV 探测 fps / 总帧数 / 时长。
+     **⚠️ `embed_video` 必须传 ndarray 帧列表，绝不能传 `/dev/shm` 路径
+     字符串**：worker 端 `_base.py` 把 `payload["frames"]` 交给
+     `decode_attachments`，而后者对 **str** 的语义是"能 base64 解码就是
+     图片，否则当文本前缀" —— 文件路径不是 base64 → `TextAttachment`
+     → 被 `isinstance(ImageAttachment)` 过滤 → `frames=[]` →
+     `{"status":"error","error":"no decodable frame in payload"}` → 每个
+     chunk 都失败 → **`0/N` 切片成功**（用户报的
+     "提取完成但 0/10 切片成功 embedding"）。传 ndarray 时 wdndds client
+     经 `_bgr_to_path` 写 raw-BGR 描述符、worker `decode_attachments` 的
+     dict 分支 `np.frombuffer().reshape(h,w,3)` 正好接住，且在 RPC 返回后
+     自动 unlink。**VAS 页（`core/video/search.py`）与微信管线
+     （`im_bridge/video_manager.py`）共用同一契约，改一处必须同步另一处。**
+     （历史：曾用 `_write_frames_to_shm` 写 JPEG 路径列表，与 worker 契约
+     不一致而从没稳定工作过；该函数与其配套 `cleanup_shm_session` /
+     `_shm_session_id` 已整体移除。）
   - **检索**：`embed_text` 编码查询 → 遍历索引算余弦相似度 → 阈值
     过滤（默认 `sim_threshold=0.4`）+ `top_k`（默认 10）截断。索引为
     空时直接返回空命中。

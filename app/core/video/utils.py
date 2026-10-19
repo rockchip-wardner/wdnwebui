@@ -1,8 +1,7 @@
 """Shared video utility helpers (extracted from video_search).
 
 Originally the private helpers ``_cosine_similarity`` /
-``_probe_video_meta`` / ``_cleanup_shm_session`` /
-``_read_chunk_frames`` / ``_write_frames_to_shm`` lived inside
+``_probe_video_meta`` / ``_read_chunk_frames`` lived inside
 ``app/services/video_search.py``. Both ``video_search``
 and ``im_bridge`` consumed them — a pre-existing cross-coupling that the
 zero-coupling rule prohibits. They've been moved here so either card can
@@ -71,25 +70,6 @@ def probe_video_meta(source: str) -> Optional[dict]:
     except Exception as e:  # noqa: BLE001
         LOG.warning("probe_video_meta failed for %s: %s", source, e)
         return None
-
-
-def cleanup_shm_session(shm_session_id: str) -> int:
-    """Cleanup the /dev/shm fastdds / wdnwebui_vd_<id> file backing this session.
-
-    Returns the number of files removed (0 or 1).
-    """
-    import glob
-    if not shm_session_id:
-        return 0
-    pattern = f"/dev/shm/wdnwebui_vd_{shm_session_id}.bin"
-    removed = 0
-    for path in glob.glob(pattern):
-        try:
-            os.unlink(path)
-            removed += 1
-        except OSError:
-            pass
-    return removed
 
 
 # ── Chunking helpers — shared by video_search + im_bridge ──
@@ -205,48 +185,5 @@ def _read_chunk_frames(source: str, start_s: float, chunk_seconds: int,
         return frames
     finally:
         container.close()
-
-
-
-
-def _write_frames_to_shm(frames: List[np.ndarray], shm_session_id: str,
-                        chunk_idx: int) -> List[str]:
-    """Encode frames as JPEG and write to /dev/shm (tmpfs, RAM-backed).
-
-    Returns a list of *absolute* paths the worker can ``cv2.imread()``.
-    Filenames are deterministic from (session_id, chunk_idx, frame_idx) so
-    a re-run of the same chunk overwrites cleanly. JPEG q=85 is fine
-    because the per-frame file is ~50 KiB and the *list of paths* sent
-    over cshim is only ~50 bytes total — well under the 64 KiB UDP /
-    SHM transport limit that blocks the original inline base64 payload.
-    """
-    import cv2 as _cv2
-    out_dir = "/dev/shm"
-    paths: List[str] = []
-    for fi, fr in enumerate(frames):
-        p = f"{out_dir}/wdndds_vcs_{shm_session_id}_c{chunk_idx:04d}_f{fi:02d}.jpg"
-        ok, buf = _cv2.imencode(".jpg", fr, [int(_cv2.IMWRITE_JPEG_QUALITY), 85])
-        if not ok:
-            raise RuntimeError(f"cv2.imencode failed for chunk {chunk_idx} frame {fi}")
-        try:
-            with open(p, "wb") as f:
-                f.write(buf.tobytes())
-        except OSError as exc:
-            raise RuntimeError(
-                f"/dev/shm 写入失败 {p}（fd 耗尽或 tmpfs 异常）: {exc}") from exc
-        # fail-loud 自校验：写即 stat。tmpfs 同机对 worker 应立即可见；
-        # 若此刻文件已消失/为空，说明存在外部清扫或写穿透假象 ——
-        # 与其让 worker 端 imread 间接报错，不如在写端留真因铁证。
-        try:
-            st = os.stat(p)
-            if st.st_size == 0:
-                raise RuntimeError(
-                    f"/dev/shm 写入后文件为空（可能被外部截断）: {p}")
-            LOG.info("vcs: shm write ok %s (%d bytes)", p, st.st_size)
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"/dev/shm 写入后文件立即消失（存在外部清理者）: {p}") from exc
-        paths.append(p)
-    return paths
 
 

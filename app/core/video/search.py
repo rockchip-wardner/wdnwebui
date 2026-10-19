@@ -22,9 +22,8 @@ LLMSession 从 ComputeRegistry 取（``swcap_video_retrieval`` capability），
 v0.8：从 ``app/apps/video_search/service.py`` 平移到
 ``app/core/video/search.py`` —— ``video_analysis_search`` 卡片（分析 +
 检索合并页）通过 ``app.core.*`` 引用检索能力，遵守卡片零跨卡片 import
-规则。原文件缺失的 ``compute_slices`` / ``_read_chunk_frames`` /
-``_write_frames_to_shm`` 三个 import 在平移时补齐（此前只在 worker
-线程里才触发 NameError）。
+规则。原文件缺失的 ``compute_slices`` / ``_read_chunk_frames``
+两个 import 在平移时补齐（此前只在 worker 线程里才触发 NameError）。
 """
 from __future__ import annotations
 
@@ -32,7 +31,6 @@ import logging
 import os
 import threading
 import time
-import uuid
 from typing import Callable, Iterator, List, Optional
 
 import numpy as np
@@ -43,8 +41,6 @@ from app.core.compute.registry import (
 )
 from app.core.video.utils import (
     _read_chunk_frames,
-    _write_frames_to_shm,
-    cleanup_shm_session as _cleanup_shm_session,
     compute_slices,
     cosine_similarity as _cosine_similarity,
     probe_video_meta as _probe_video_meta,
@@ -300,13 +296,6 @@ class VideoSearchService:
             self._fps = 0.0
             self._duration_s = 0.0
             self._md5 = ""
-            # 新开一次 video 时给帧的 /dev/shm 临时文件分配新 session id。
-            # 旧的 session 文件被 _cleanup_shm_session 清掉（保险起见——
-            # 正常路径每个 chunk 结束或 close() 都会清各自的 frame 文件）。
-            old_sid = getattr(self, "_shm_session_id", None)
-            if old_sid:
-                _cleanup_shm_session(old_sid)
-            self._shm_session_id = uuid.uuid4().hex[:12]
         self._broadcast({"type": "state", **self.snapshot()})
         return self.snapshot()
 
@@ -560,13 +549,6 @@ class VideoSearchService:
             self._query = None
             self._hits = []
             self._index = []
-            # 清理 /dev/shm 临时帧文件（正常路径 _worker_loop 在
-            # 每个 chunk 结束都会 unlink，但 crash/timeout 可能遗漏）
-            sid = getattr(self, "_shm_session_id", None)
-            if sid:
-                n = _cleanup_shm_session(sid)
-                if n:
-                    LOG.info("vas-search: close() cleaned %d stale shm files for session %s", n, sid)
 
     # ------------------------------------------------------------------ #
     # 后台 worker：切片 + embedding
@@ -620,18 +602,10 @@ class VideoSearchService:
             # 帧采样间隔 1 秒/帧（demo 语义），所以实际覆盖秒数 = 帧数；
             # 短尾片截断时 end_time 按实际帧数计
             end_time = start + len(frames)
-            LOG.debug("vas-search: chunk %d/%d [%.2fs-%.2fs, %d frames] — writing to /dev/shm",
+            LOG.debug("vas-search: chunk %d/%d [%.2fs-%.2fs, %d frames]",
                       chunk_idx, self._slices_total, start, end_time, len(frames))
-            # FastDDS 3.6.2 SHM transport 的 cshim write() 在 >500 KiB 的
-            # payload（base64 帧数组）上 hang 死。把帧先写到 /dev/shm
-            # tmpfs（RAM-backed，速度 = SHM），RPC payload 只传文件路径
-            # 列表（~50 字节）。Worker 端 cv2.imread() 读图。
-            # 每个 extract session 生成一个唯一 ID，所有 chunk 的临时
-            # 文件在同一 ID 命名空间下，extract 结束统一清理。
-            frame_paths = _write_frames_to_shm(frames, self._shm_session_id, chunk_idx)
             try:
-                LOG.debug("vas-search: chunk %d — calling embed_video (frame_paths)",
-                          chunk_idx)
+                LOG.debug("vas-search: chunk %d — calling embed_video", chunk_idx)
                 import time as _time
                 t_chunk = _time.time()
                 vec = None
@@ -640,7 +614,7 @@ class VideoSearchService:
                 for _attempt in range(2):
                     try:
                         with lock:
-                            vec = session.embed_video(frame_paths, prompt="")
+                            vec = session.embed_video(frames, prompt="")
                         break
                     except RuntimeError as rpc_err:
                         if "timeout" not in str(rpc_err).lower() or _attempt == 1:
@@ -673,13 +647,6 @@ class VideoSearchService:
                 LOG.warning(
                     "vas-search: chunk %d [%.2fs-%.2fs] embedding failed after %.2fs: %s — skipping",
                     chunk_idx, start, end_time, _time.time() - t_chunk, chunk_err)
-            finally:
-                # 即便 embed_video 失败也要清理 /dev/shm 临时文件
-                for _p in frame_paths:
-                    try:
-                        os.unlink(_p)
-                    except OSError:
-                        pass
             chunk_idx += 1
             start += step
             if end_time >= duration_s:
