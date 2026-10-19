@@ -435,13 +435,16 @@ def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
     async def stream_ws(ws: WebSocket) -> None:
         """帧流 + 事件流。协议（server -> client）：
 
-          - ``{"type":"status","session":…,"detector":…}`` ~1Hz：会话快照
-            （含每路 state / fps / frame_pos / error）+ detector 快照 +
+          - ``{"type":"status","session":…,"detector":…,"ws":…}`` ~1Hz：
+            会话快照（含每路 state / fps / frame_pos / error）+ detector 快照 +
             VLM 轮转游标（``vlm.current`` = 当前在推理第几路，``vlm.round``
-            = 已完成轮数）
-          - ``{"type":"frame_meta","idx":N}`` 紧跟其后是第 N 路的一张
-            JPEG **二进制**帧 —— 多路下浏览器必须先知道这帧属于哪一路，
-            所以每帧前插一条极小的 meta（比在二进制里塞头部更省）
+            = 已完成轮数）+ ``ws.sent`` = 本连接累计发出的帧数（对同一连接
+            与订阅队列的丢弃计数做差，即可判断帧丢在服务端还是浏览器）
+          - **第 1 字节是通道号、其后是 JPEG** 的二进制帧。多路下浏览器必须
+            先知道这帧属于哪一路；塞进二进制头而不是单独发一条 meta，是为了
+            把满负载时的 WS 消息数减半（每帧多一条消息就多一次 json.dumps
+            + 一次 WS 写）。1 字节够用是因为多路上限 32，越界时退回 0 而不
+            截断 —— 截断会把画面画到错的路上。
           - ``{"type":"event", …, "channel":N}``  命中（``channel`` 标明
             来自第几路）
           - ``{"type":"event_history","events":[…]}``  **仅连接时发一次**
@@ -457,6 +460,7 @@ def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
         sub_q = session.subscribe()
         last_status = 0.0
         last_event_id = 0
+        sent = 0
         history = detector.events_since(0)
         if history:
             last_event_id = history[-1]["id"]      # 已发过的后面不再单发
@@ -477,8 +481,8 @@ def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
 
                 if item is not None:
                     idx, jpg = item
-                    await ws.send_json({"type": "frame_meta", "idx": idx})
-                    await ws.send_bytes(jpg)
+                    await ws.send_bytes(bytes((idx,)) + jpg)
+                    sent += 1
 
                 now = loop.time()
                 if now - last_status >= 1.0:
@@ -486,6 +490,7 @@ def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
                         "type": "status",
                         "session": session.snapshot(),
                         "detector": detector.snapshot(),
+                        "ws": {"sent": sent},
                     })
                     last_status = now
                 if item is None:

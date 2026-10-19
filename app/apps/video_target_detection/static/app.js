@@ -11,7 +11,6 @@
 // 这里只留本页自己产生的：WS 生命周期 + 二进制帧元数据。
 const VTD_DIAG = {
   wsOpen: 0, wsClose: 0, wsError: 0,
-  frameMeta: 0,
   log: [],
 };
 window.__vtdDiag = VTD_DIAG;
@@ -28,7 +27,6 @@ const VTD = {
   wsTimer: null,
   lastSnap: null,
   detectorSnap: null,
-  pendingIdx: -1,   // 下一条二进制帧属于哪一路（由 frame_meta 设定）
 };
 const VTDDetector = {
   events: [],
@@ -110,12 +108,7 @@ function connectVtdWs() {
     if (typeof ev.data === "string") {
       let snap;
       try { snap = JSON.parse(ev.data); } catch (_) { return; }
-      if (snap.type === "frame_meta") {
-        // 多路协议：二进制帧前先来一条 meta，指明这帧属于哪一路
-        VTD.pendingIdx = snap.idx;
-        VTD_DIAG.frameMeta++;
-        return;
-      } else if (snap.type === "event_history") {
+      if (snap.type === "event_history") {
         // 连接建立时服务端**一次性**打包发来的历史事件。必须走"整体重建"，
         // 不能逐条 addVtdEvent —— 实测 200 条突发能把渲染进程打满一个核、
         // 页面直接卡死。服务端按 id 升序（旧→新）发，本地数组是新→旧，
@@ -152,12 +145,9 @@ function connectVtdWs() {
       return;
     }
     try {
-      window.MultiGrid.paint(GRID_EL, VTD.pendingIdx >= 0 ? VTD.pendingIdx : 0,
-                             new Uint8Array(ev.data));
-      // 首帧落地 = 会话真的开始出画面了，清掉「正在打开 N 路 …」。
-      // open() 成功只代表解码线程已启动（视频还没解出第一帧），所以这条
-      // 是让用户确认"画面出来了"的唯一信号。
-      if (VTD.pendingIdx >= 0) setVtdOverlay("", false);
+      // 通道号在二进制头第 1 字节（见 multi_api 的 stream_ws）
+      const idx = ev.data.byteLength ? new Uint8Array(ev.data, 0, 1)[0] : 0;
+      window.MultiGrid.paint(GRID_EL, idx, new Uint8Array(ev.data, 1));
     } catch (e) {
       window.MultiGridDiag.drawErr++;
       console.error("[vtd] draw 异常", e);

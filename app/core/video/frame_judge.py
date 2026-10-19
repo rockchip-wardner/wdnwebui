@@ -15,7 +15,7 @@
   判定"变了"满 ``every_n`` 帧时，若分数**至少到阈值的一半**也判为"变了"——
   兜底不是无条件送检，静止画面因此彻底安静（详见 :meth:`FrameJudge.observe`）。
 * **分数留痕**。把每帧分数写进环形缓冲，前端据此画实时分数曲线、右上角
-  浮框据��显示"这一帧变了没有"。
+  浮框据此显示"这一帧变了没有"。
 
 为什么自己写决策而不用 ``FrameDiffer.should_sample()``
 --------------------------------------------------------
@@ -62,6 +62,13 @@ DEFAULT_LONG_SIDE = 160
 # 默认帧间隔。与三张视频卡历史上 detector 的 every_n 默认值一致，所以把
 # 节流从 detector 移到判据器**不改变**开箱行为（同样每 30 帧送一次）。
 DEFAULT_EVERY_N = 30
+
+# 解码线程**多久算一次分**（帧）。不是送检节流 —— 那是 every_n 的事。
+# 必须有间隔：算分前要先 RGA 缩一张 long_side 缩略图，而 RGA 是全机共享的
+# 串行队列（32 线程并发时吞吐恒在 ~1050 次/秒，加线程只加排队）。每帧多打
+# 一次 RGA，32 路总吞吐从 774 掉到 265 帧/秒。取 25 是因为 25fps 源上正好
+# ~1s 一次，与 WS 状态 1Hz 推送同频 —— 角标与曲线本来每秒才刷一次。
+DEFAULT_SAMPLE_EVERY = 25
 
 # 分数环形缓冲长度。200 点够画一条有起伏的曲线，又不至于让每帧快照变大。
 HISTORY_MAX = 200
@@ -428,15 +435,21 @@ class FrameJudge:
                  mode: str = MODE_MANUAL,
                  every_n: int = 600,
                  threshold: Optional[float] = None,
-                 long_side: int = DEFAULT_LONG_SIDE) -> None:
+                 long_side: int = DEFAULT_LONG_SIDE,
+                 sample_every: int = DEFAULT_SAMPLE_EVERY) -> None:
         mode, threshold = _migrate(mode, threshold)
         self._mode = normalize_mode(mode)
-        self._lock = threading.Lock()
+        # RLock 而非 Lock：observe() 可能被两个线程调（向导模式下解码线程采样
+        # 打分，应用页面模式下轮转线程在送检时打分，见 multi_session 的
+        # rr_owns_judge），且它尾部要调同样持锁的 _commit() —— 普通 Lock 不可
+        # 重入，直接死锁。
+        self._lock = threading.RLock()
         self._history: Deque[List] = deque(maxlen=HISTORY_MAX)
         self._every_n = max(1, int(every_n))
         self._threshold = float(
             default_threshold(self._mode) if threshold is None else threshold)
         self._long_side = int(long_side)
+        self._sample_every = max(1, int(sample_every))
         self._evaluated = 0
         self._sampled = 0
         self._cur: Optional[float] = None
@@ -476,6 +489,13 @@ class FrameJudge:
         就直接出目标尺寸的 Y 平面 ndarray，wdnwebui 侧不再二次缩放。
         """
         return self._long_side
+
+    @property
+    def sample_every(self) -> int:
+        """解码线程多少帧算一次分。video/multi_session.py 读它传给每路的
+        FrameJudge —— 原型是单例，各路共用同一份间隔配置。
+        """
+        return self._sample_every
 
     @property
     def current_score(self) -> Optional[float]:
@@ -522,20 +542,50 @@ class FrameJudge:
 
     def reset(self) -> None:
         """新一轮分析前清空判帧状态 —— **必须调用**，否则上一轮的参照帧会
-        污染新 run 的首帧判定（用户点「开始」后迟迟没结果）。"""
-        self._last_pos = -1
-        self._cur = None
-        self._changed = False
-        self._above = 0
-        self._evaluated = 0
-        self._sampled = 0
+        污染新 run 的首帧判定（用户点「开始」后迟迟没结果）。
+
+        整个函数体持锁：归属切换（multi_session._set_judge_owner）会和
+        解码线程 / 轮转线程的 observe() 撞上，不加锁会出现「参照帧刚被
+        丢掉、又被另一个线程写回去」。
+        """
         with self._lock:
+            self._last_pos = -1
+            self._cur = None
+            self._changed = False
+            self._above = 0
+            self._evaluated = 0
+            self._sampled = 0
             self._history.clear()
-        self._drop_reference()
+            self._drop_reference()
+
+    # ------------------------------------------------------------------ #
+    def should_sample(self, frame_pos: int) -> bool:
+        """**向导模式**下解码线程问「这一帧要不要算分」——**必须问在 RGA 之前**。
+
+        判据的缩略图是 RGA 出来的，问晚了就不是「少算一次分」而是多打一次
+        RGA，32 路能吃掉 2/3 的吞吐（见 :data:`DEFAULT_SAMPLE_EVERY`）。
+        首帧必采：``observe`` 靠它建参照帧，跳掉会让第一次打分推迟一整个间隔。
+
+        应用页面（检测在跑）**不走这里** —— 那时由轮转线程在送检那一刻调
+        :meth:`observe`，参照帧语义不同。见 :meth:`observe` 的说明。
+        """
+        if not self.is_auto:
+            return True
+        p = int(frame_pos)
+        return p <= 1 or p % self._sample_every == 0
 
     # ------------------------------------------------------------------ #
     def observe(self, frame, frame_pos: int) -> bool:
-        """该帧是否应该送去做后续推理。**每帧调用（decode 单线程）。**
+        """该帧是否应该送去做后续推理。
+
+        **两套规则，同一时刻只有一个线程在调**（由 multi_session 的
+        ``Channel.rr_owns_judge`` 保证，切换时参照帧会被丢掉重建）：
+        * 向导模式（未启动检测）：解码线程按 ``sample_every`` 采样调用，只为
+          让浮框/曲线动起来，门控在 :meth:`should_sample`。
+        * 应用页面（检测在跑）：轮转线程在**送检那一刻**调用，比较的是
+          「上一次送检的帧 vs 当前帧」。
+
+        整个函数体持锁，切换窗口内两个线程各进一次也不会把 _last_luma 写花。
 
         ``frame`` 期望是**已经缩到 long_side 的 2D 灰度 ndarray**（Y 平面）。
         video/session.py 在 ``cap.read0(w=..., h=..., fmt='NV12').numpy()``
@@ -550,7 +600,8 @@ class FrameJudge:
         任何异常都返回 True —— 宁可多送检，不可漏检（与
         ``FrameDiffer.should_sample`` 同一取舍）。
         """
-        pos = int(frame_pos)
+        with self._lock:
+            pos = int(frame_pos)
         self._evaluated += 1
         if not self.is_auto:
             # 手动跳帧：逐位保持历史行为（``pos > 0 and pos % n == 0``），
@@ -601,14 +652,13 @@ class FrameJudge:
         return changed
 
     def decide_take_for_rr(self, current_pos: int) -> bool:
-        """轮转线程专用：读最近一次 ``observe()`` 留下的状态，决定本路要不要送 VLM。
+        """轮转线程**只读**版门控：读解码线程 ``observe()`` 留下的状态。
 
-        设计动机：解码线程**每帧**调一次 ``observe()`` 持续算分（让浮框/曲线
-        不依赖启动检测就能实时刷新），但 ``observe()`` 自身有写副作用
-        （``_last_pos`` / ``_last_luma`` / ``_evaluated``）—— 不能两个线程并发
-        调同一个实例。轮转线程改用本方法**只读**，避免双写。
+        仅在 ``rr_owns_judge=False`` 的回退路径上用（正常路径由轮转线程自己
+        调 ``observe()``）。只读是为了避免和解码线程并发写 ``_last_luma`` /
+        ``_last_pos`` / ``_evaluated``。
 
-        判定语义与 ``observe()`` 内的 ``take`` 逻辑**逐字一致**：
+        判定语义与 ``observe()`` 内的逻辑**逐字一致**：
 
         - ``score > threshold`` —— 真变化
         - 或 ``gap >= every_n and score >= threshold * 0.5`` —— 兜底

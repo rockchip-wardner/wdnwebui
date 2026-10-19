@@ -10,8 +10,6 @@ const VD = {
   ws: null,
   wsRetry: 0,
   wsTimer: null,
-  // frame_meta 声明下一条二进制帧属于第几路。
-  pendingFrameIdx: -1,
   inflight: 0,
   tools: [],
   enabledTools: [],
@@ -365,12 +363,12 @@ function connectVdWs() {
     setVdOverlay("", false);
   };
   ws.onmessage = (ev) => {
-    // 二进制 JPEG —— 必须排在 JSON 解析之前：frame_meta 声明画哪一路，
-    // 紧跟的这一条二进制帧就归那一路（协议与 vtd / vtl 同款）。
+    // 二进制 JPEG —— 必须排在 JSON 解析之前。通道号在**头 1 字节**，
+    // 不用再等一条 frame_meta（协议与 vtd / vtl 同款）。
     if (typeof ev.data !== "string") {
-      const idx = VD.pendingFrameIdx >= 0 ? VD.pendingFrameIdx : 0;
+      const idx = ev.data.byteLength ? new Uint8Array(ev.data, 0, 1)[0] : 0;
       try {
-        window.MultiGrid.paint(GRID_EL, idx, new Uint8Array(ev.data));
+        window.MultiGrid.paint(GRID_EL, idx, new Uint8Array(ev.data, 1));
       } catch (e) {
         setVdOverlay("帧渲染失败: " + e, true);
       }
@@ -378,10 +376,6 @@ function connectVdWs() {
     }
     let msg;
     try { msg = JSON.parse(ev.data); } catch (_) { return; }
-    if (msg.type === "frame_meta") {
-      VD.pendingFrameIdx = Number(msg.idx) || 0;
-      return;
-    }
     if (msg.type === "event") { addVdEvent(msg); showVdEventBadge(msg); return; }
     if (msg.type === "event_history") {
       // 连接时补一段历史。工厂打包成**一条**发：逐条回放实测 200 条能打满

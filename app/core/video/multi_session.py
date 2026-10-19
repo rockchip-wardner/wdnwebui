@@ -240,6 +240,15 @@ class Channel:
         "_disp_w", "_disp_h", "_stop", "_play", "_live", "_publish",
         "judge", "_ana_w", "_ana_h", "_ana_due", "_ana_bgr",
         "_ana_seq", "_ana_seen",
+        # 解码→广播那一段的三个计数器（判「解码出来却没推出去」丢在哪）：
+        # _disp_skip 显示节流没到点而故意不推 / _disp_err JPEG 编码失败 /
+        # _pub_exc publish_frame 抛异常。decode_fps == display_fps 时都应是 0。
+        "_disp_skip", "_disp_err", "_pub_exc",
+        # 判据归谁打分：False = 向导模式（解码线程按 sample_every 采样打分，
+        # 只为让浮框/曲线动起来），True = 应用页面（轮转线程在送检时打分，
+        # 参照帧 = 上一次送检的帧）。由 session 的 _set_judge_owner 切换，
+        # 切换时必须丢掉参照帧 —— 两种模式的参照帧语义不同。
+        "rr_owns_judge",
     )
 
     def __init__(
@@ -282,6 +291,12 @@ class Channel:
         self._ana_bgr: Any = None
         self._ana_seq = 0        # 解码线程每产出一张送检图 +1
         self._ana_seen = 0       # 轮转线程已消费到的序号
+        # 解码→广播的三个计数器，见 __slots__ 处的说明
+        self._disp_skip = 0
+        self._disp_err = 0
+        self._pub_exc = 0
+        # 判据归属：默认向导模式（解码线程采样打分）
+        self.rr_owns_judge = False
         self._stop = stop_evt
         self._play = play_evt
         # 帧广播回调（由 MultiChannelSession 注入），把 JPEG 推给 WS 订阅者
@@ -334,8 +349,10 @@ class Channel:
         的 buf2 一致（**不要**改用 ``frame[..., 0]``，那是 B 通道不是 Y，
         分数刻度会偏）。
 
-        只在轮转提交那一瞬调用（每路 ~2s 一次），不是每帧 —— 否则 N 路都要
-        多一次 RGA，32 路时直接撞吞吐上限。
+        调用频率由 :meth:`FrameJudge.should_sample` 决定（默认每
+        :data:`~app.core.video.frame_judge.DEFAULT_SAMPLE_EVERY` 帧一次），
+        且调用方必须在**动手缩之前**先问 —— 这里每次调用都是一次 RGA，而 RGA
+        是全机串行队列，32 路逐帧调会让总吞吐掉到 1/3。
         """
         frame = self.snapshot_bgr()
         if frame is None:
@@ -373,6 +390,9 @@ class Channel:
             "decode_fps": round(self.frames / el, 2),
             "opens": self.opens,
             "errors": len(self.errors),
+            "disp_skip": self._disp_skip,
+            "disp_err": self._disp_err,
+            "pub_exc": self._pub_exc,
             "last_frame_ts": self.last_frame_ts,
             "disp_w": self._disp_w,
             "disp_h": self._disp_h,
@@ -396,8 +416,10 @@ class Channel:
 
         cap = None
         period = 1.0 / decode_fps if decode_fps > 0 else 0.0
-        disp_period = 1.0 / display_fps if display_fps > 0 else 0.0
-        next_disp = 0.0
+        # 显示节流按**帧数**，见解码循环里那段注释（时间节流在这里是错的工具）。
+        # 每 N 帧发一次 = 每秒发 decode_fps/N ≈ display_fps。
+        disp_every = (max(1, int(round(decode_fps / display_fps)))
+                      if (display_fps and display_fps > 0) else 1)
         t0 = time.monotonic()
         target = 0
         try:
@@ -434,8 +456,7 @@ class Channel:
                     self.error = ""
                     t0 = time.monotonic()
                     target = 0
-                    # 与 t0 同源，固定步进才不会第一帧就疯狂追平
-                    next_disp = t0
+                    # 显示节流已改成按帧数，重开解码器时不需要重置任何显示状态
 
                 # 绝大多数帧只出显示尺寸；轮转要图的那一帧才多跑一次 RGA
                 want_ana = self._ana_due.is_set()
@@ -481,23 +502,17 @@ class Channel:
                 except Exception:  # noqa: BLE001
                     pass
 
-                # 帧判据：每路解码线程**每帧**调一次 observe，持续打分。
-                # 让向导/预览页的浮框 / 曲线在「只 open 视频、未启动检测」
-                # 时也能实时刷新 —— 与单路 VideoSession 行为对齐。单路路径
-                # 是 session.py 解码循环里持续调 observe() 的，多路在
-                # v0.22 时只把 ch.judge 复制到每路，但 observe() 调用仍留在
-                # 轮转线程里 → 必须先启动检测才打分，浮框永远 "--"。
+                # 帧判据 —— **向导模式专用**（未启动检测），只为让浮框/曲线
+                # 实时刷新。应用页面（rr_owns_judge=True）改由轮转线程在送检
+                # 那一刻打分，参照帧语义不同，见 _run_one_channel。
                 #
-                # 成本：RGA 缩到 judge.long_side（默认 160）+ cv2 灰度 +
-                # gscore 实测 < 0.5ms/帧/路。N=32 路合计 ~16ms/s，可忽略
-                # （已经在 decode 热路径上）。observe 自身有 every_n 节流算
-                # 分（auto 模式下手动门控），不是每帧都重算 gscore。
-                #
-                # 与 _rr_loop 的关系：observe 有写副作用（_last_pos / _last_luma
-                # / _evaluated），不能并发。**解码线程独占 observe**，
-                # 轮转线程改读 FrameJudge.decide_take_for_rr（只读不写），
-                # 详见 _rr_loop 注释。
-                if self.judge is not None and self.judge.is_auto:
+                # 采样门控必须问在 RGA 之前：缩略图是 RGA 出来的，而 RGA 是全机
+                # 串行队列（每帧多打一次，32 路 RGA 从 1.000 涨到 2.000 次/帧，
+                # 吞吐掉 62%）。所以下面三行的顺序不能调换。rr_owns_judge 也
+                # 要一起判，否则两个线程会让参照帧在两种语义之间来回跳。
+                if (self.judge is not None and self.judge.is_auto
+                        and not self.rr_owns_judge
+                        and self.judge.should_sample(self.frames)):
                     thumb = self.snapshot_gray_for_judge(self.judge.long_side)
                     if thumb is not None:
                         try:
@@ -508,35 +523,44 @@ class Channel:
                             LOG.warning("mc-ch%02d 解码侧判据异常，下帧重试: %s",
                                         self.idx, exc)
 
-                # 只有到 display_fps 的点才做 JPEG 编码（实测 384x216 只要
-                # 0.77ms/次，很便宜）。
+                # 显示节流：**按帧数**（`self.frames % disp_every`），不是按时间。
                 #
-                # 这里**必须按固定步长推进 next_disp**，不能写成
-                # `next_disp = now + disp_period`：当 display_fps == decode_fps
-                # （低路数时的正常取值）两个节流是**同一个周期**，帧到达时刻
-                # 相对阈值有毫秒级抖动，`now >= next_disp` 就会隔帧不成立 ——
-                # 实测请求 25fps 只推出 15.6fps（帧被白白丢掉一半）。固定步进
-                # + 追平能保证「到了显示时刻就一定推」。
+                # 时间节流在这里是错的工具：解码循环每轮的检查时刻是
+                # `t0 + k*period + body`（body = 那一轮的活干完的时刻），
+                # 两条链只差一个 body 偏移，相位永远对不齐。滑动阈值在
+                # body 一抖动时就隔帧不成立（实测请求 25fps 只推出 15.6fps）；
+                # 固定步长从 t0 推则更糟 —— body < period 时**每一帧**都落在
+                # 「下一个理想槽点之前」被全部跳掉（32 路实测 _disp_skip =
+                # 248 帧/秒，占解码 34%，白丢的帧下游补不回来）。
+                #
+                # 按帧数没有相位问题：解码被 throttle 限死在 decode_fps，
+                # 「每 N 帧发一次」天然就是 display_fps，且不会超发。本仓库
+                # derive_decode_fps / derive_display_fps 共用一个预算 780，
+                # 所以 disp_every 恒为 1，这个节流器实际从不丢帧。
                 now = time.monotonic()
                 jpg = None
-                if disp_period <= 0 or now >= next_disp:
-                    next_disp += disp_period
-                    while next_disp <= now:
-                        next_disp += disp_period
+                if disp_every <= 1 or self.frames % disp_every == 0:
                     try:
                         ok, buf = cv2.imencode(
                             ".jpg", frame,
                             [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
                         )
                         jpg = bytes(buf) if ok else None
+                        if not ok:
+                            self._disp_err += 1
                     except Exception:  # noqa: BLE001
                         jpg = None
+                        self._disp_err += 1
+                else:
+                    # 故意不推这一帧。与 imencode 失败分开计数：那个是错误，
+                    # 这个是帧率整形；32 路下 decode_fps == display_fps 时不该发生。
+                    self._disp_skip += 1
                 self.set_frame(frame)
                 if jpg is not None and self._publish is not None:
                     try:
                         self._publish(self.idx, jpg)
                     except Exception:  # noqa: BLE001
-                        pass
+                        self._pub_exc += 1
 
                 if period:
                     target += 1
@@ -584,7 +608,19 @@ class MultiChannelSession:
         self._stop_evt = threading.Event()
         self._play_evt = threading.Event()
         self._subscribers: List[queue.Queue] = []
+        # 订阅名单的**不可变快照**。publish_frame 是被 32 个解码线程各调一次
+        # 的热路径，原来每帧 list(self._subscribers) 要加锁 + 拷列表，还要和
+        # subscribe/unsubscribe 抢同一把锁。名单只在连接增减时变动，维护一份
+        # 快照即可 —— publish 只读引用，**不拿锁**。
+        self._subs_snapshot: Tuple["queue.Queue", ...] = ()
         self._subs_lock = threading.Lock()
+        # 广播侧计数。**按通道分槽**而不是一个全局 int：`self._pub_frames += 1`
+        # 在 32 个解码线程上**不是原子的**（CPython 的 `+=` 是 LOAD/ADD/STORE
+        # 三条字节码），实测 770 次/秒下会丢 7~15% 的更新。每路的解码线程是
+        # 该槽位的**唯一写者**，所以分槽即无竞争，汇总时再相加。dropped 是
+        # 稀疏事件，保持全局计即可。
+        self._pub_per_ch: List[int] = [0] * MAX_CHANNELS
+        self._pub_drops = 0
         self._state = STATE_IDLE
         self._error = ""
         self._loop = True
@@ -697,7 +733,8 @@ class MultiChannelSession:
         for ch in channels:
             ch.judge = FrameJudge(mode=proto.mode, every_n=proto.every_n,
                                   threshold=proto.threshold,
-                                  long_side=proto.long_side)
+                                  long_side=proto.long_side,
+                                  sample_every=proto.sample_every)
         with self._lock:
             self._channels = channels
             self._eff_decode_fps = eff_decode
@@ -785,6 +822,7 @@ class MultiChannelSession:
         q: "queue.Queue" = queue.Queue(maxsize=MAX_CHANNELS * 2)
         with self._subs_lock:
             self._subscribers.append(q)
+            self._subs_snapshot = tuple(self._subscribers)
         return q
 
     def unsubscribe(self, q: "queue.Queue") -> None:
@@ -793,20 +831,36 @@ class MultiChannelSession:
                 self._subscribers.remove(q)
             except ValueError:
                 pass
+            self._subs_snapshot = tuple(self._subscribers)
 
     def _drain_subs(self) -> None:
         with self._subs_lock:
             self._subscribers.clear()
+            self._subs_snapshot = ()
 
     def publish_frame(self, idx: int, jpg: bytes) -> None:
-        """由解码线程调用，把 (idx, jpg) 广播给所有订阅者（drop-oldest）。"""
+        """由解码线程调用，把 (idx, jpg) 广播给所有订阅者（drop-oldest）。
+
+        订阅名单读 `_subs_snapshot`（一次属性读，CPython 下是原子的），**不加
+        锁** —— 见 __init__ 里为什么维护快照。队列满时丢最旧的一帧：实时流
+        宁可少一帧也不能攒成延迟。
+
+        `_pub_drops` 是「解码到了但没能推出去」的帧数，与浏览器侧的
+        `busyDrop`（收到了但没画）配对，两个数一比就知道丢在哪一段。
+        """
+        subs = self._subs_snapshot
+        if not subs:
+            return
         item = (idx, jpg)
-        with self._subs_lock:
-            subs = list(self._subscribers)
+        drops = 0
         for q in subs:
             try:
                 q.put_nowait(item)
             except queue.Full:
+                # 正常路径就是**这里**：队列满 = 订阅者跟不上。必须在这里计数 ——
+                # 早先只在「丢完还塞不进去」的二次失败上计数，于是 32 路下明明
+                # 每秒丢掉一两百帧，pub_drops 却一直是 0。
+                drops += 1
                 try:
                     q.get_nowait()
                 except queue.Empty:
@@ -815,6 +869,11 @@ class MultiChannelSession:
                     q.put_nowait(item)
                 except queue.Full:
                     pass
+        if 0 <= idx < MAX_CHANNELS:
+            # 唯一写者 → 天然无竞争（见 __init__ 里的注释）
+            self._pub_per_ch[idx] += 1
+        if drops:
+            self._pub_drops += drops
 
     # ------------------------------------------------------------------ #
     # VLM 轮转调度
@@ -824,6 +883,28 @@ class MultiChannelSession:
         with self._lock:
             self._detector = detector
 
+    def _set_judge_owner(self, rr_owns: bool) -> None:
+        """切换判据由谁打分。
+
+        ``False``（向导模式，未启动检测）：解码线程按 ``sample_every`` 采样
+        打分，参照帧 = 上一次判变的**采样**帧。``True``（应用页面）：轮转线程
+        在送检那一刻打分，参照帧 = 上一次**送检**的帧。
+
+        **切换时必须丢掉参照帧**：两种模式的参照帧语义不同，混用会算出
+        「上次的采样帧 vs 本次的送检帧」这种没意义的对比（采样帧可能来自
+        半分钟前）。走 ``FrameJudge.reset()`` 而非只清 _last_luma —— 曲线
+        上的历史点也是按旧口径算的。
+        """
+        with self._lock:
+            channels = list(self._channels)
+        for ch in channels:
+            ch.rr_owns_judge = bool(rr_owns)
+            if ch.judge is not None:
+                try:
+                    ch.judge.reset()
+                except Exception:  # noqa: BLE001
+                    LOG.warning("mc-ch%02d 判据重置失败", ch.idx, exc_info=True)
+
     def start_round_robin(self) -> None:
         """起轮转线程，**每个推理 slot 一条**（K 条），至多一组在跑。
 
@@ -831,7 +912,7 @@ class MultiChannelSession:
         下不成立（旧线程可能还没被调度到、引用就被换掉了），AGENTS.md 记过
         由此引发的"两个线程一起转、轮转顺序乱成 1,2,1,3,4,2"。
         """
-        self.stop_round_robin()
+        self.stop_round_robin(judge_owner=False)   # 只停线程，判据归属随后统一切
         with self._lock:
             detector = self._detector
         k = 1
@@ -840,6 +921,8 @@ class MultiChannelSession:
                 k = max(1, int(getattr(detector, "slot_count", 1)))
             except Exception:  # noqa: BLE001
                 k = 1
+        # 进「应用页面」语义：判据改由轮转线程在送检时打分。
+        self._set_judge_owner(True)
         with self._rr_lock:
             self._rr_gen += 1
             gen = self._rr_gen
@@ -867,13 +950,24 @@ class MultiChannelSession:
             self._rr_interval = v
         return v
 
-    def stop_round_robin(self) -> None:
+    def stop_round_robin(self, *, judge_owner: Optional[bool] = None) -> None:
+        """停轮转线程。
+
+        ``judge_owner``：是否同时把判据交回解码线程（向导模式）。默认
+        ``None`` = 交回。``start_round_robin()`` 内部传 ``False`` 保持不动，
+        否则「先 stop（交回 + 重置参照帧）再 start（改成轮转 + 再重置）」
+        会把归属来回 toggle，中间解码线程有机会用向导语义抢建参照帧。
+        """
         with self._rr_lock:
             self._rr_gen += 1          # 让所有旧 feeder 自行退出
             self._rr_threads = []
         with self._lock:
             self._rr_current = -1
             self._ch_inflight.clear()
+        if judge_owner is not False:
+            # 顺序在 _rr_gen 递增之后 —— 旧 feeder 可能正跑到判据那一行，
+            # 但它们下一步会因代号过期退出，且 observe 内部持 RLock 不会写花。
+            self._set_judge_owner(False)
 
     def _take_channel(self, channels) -> Optional[Any]:
         """原子地从共享游标取一路并登记占用。返回 None = 全被占用。
@@ -981,16 +1075,22 @@ class MultiChannelSession:
             # 判据门控只在自动模式下走，manual 整段跳过（不缩缩略图也不
             # 算分），此时行为与接入判据前一致。
             #
-            # **这里只读不写**。解码线程已每帧调过 ``ch.judge.observe()`` 写好了
-            # _cur / _changed / _last_pos（让浮框与曲线实时刷新），轮转线程再调
-            # observe 会双写、污染参照帧。改用 ``decide_take_for_rr(pos)`` 读最近
-            # 一次 observe 留下的状态决定本路要不要送 VLM —— 判定语义与
-            # observe() 内部 take 逐字一致。
+            # **应用页面模式下判据在这里自己打分**（rr_owns_judge=True）：
+            # 比较的是「上一次送检的帧 vs 当前帧」，参照帧语义才是对的
+            # —— 用户明确要求进入应用页面后按送检间隔算，而不是向导模式
+            # 那个固定 25 帧的采样节奏。顺带还省掉了解码线程每帧的 RGA。
+            # 回退分支（rr_owns_judge=False）才用只读的 decide_take_for_rr
+            # 读解码线程留下的状态。
             if ch.judge is not None and ch.judge.is_auto:
                 try:
-                    take = ch.judge.decide_take_for_rr(judge_pos)
+                    if ch.rr_owns_judge:
+                        thumb = ch.snapshot_gray_for_judge(ch.judge.long_side)
+                        take = (True if thumb is None
+                                else ch.judge.observe(thumb, judge_pos))
+                    else:
+                        take = ch.judge.decide_take_for_rr(judge_pos)
                 except Exception as exc:  # noqa: BLE001
-                    LOG.warning("mc-ch%02d 判据读侧异常，按放行处理: %s",
+                    LOG.warning("mc-ch%02d 判据异常，按放行处理: %s",
                                 ch.idx, exc)
                     take = True
                 if not take:
@@ -1283,6 +1383,11 @@ class MultiChannelSession:
             "decode_fps_cap": self.decode_fps,
             "total_frames": total_frames,
             "total_errors": sum(c["errors"] for c in chans),
+            # 广播侧计数：pub_frames=进广播的帧数（按通道汇总，各槽唯一写者
+            # 所以无竞争），pub_drops=订阅队列满被丢的帧数。
+            # drops>0 说明「后端解出来了但推不出去」。
+            "pub_frames": sum(self._pub_per_ch),
+            "pub_drops": self._pub_drops,
             "last_frame_ts": started,
             "vlm": self.vlm_snapshot(),
             "judge": self.judge_snapshot(),

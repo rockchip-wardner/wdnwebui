@@ -1773,9 +1773,13 @@ judge_score: Optional[float] = None,
         with self._events_lock:
             out = []
             for ev in self._events:
-                d = ev.to_dict() if hasattr(ev, "to_dict") else dict(ev)
-                if d["id"] > since_id:
-                    out.append(d)
+                # **只为读 id，不要顺手把整条 to_dict 一遍。** 本函数被 WS 循环
+                # 每帧调一次，而 _events 最多攒 HISTORY_MAX 条 —— 一次调用就是
+                # 几百次 22 字段的 dict 构造，全在事件循环线程里跟 N 个解码线程
+                # 抢 GIL。只给真正要发的条目做 to_dict。
+                eid = ev["id"] if isinstance(ev, dict) else getattr(ev, "id", None)
+                if eid is not None and eid > since_id:
+                    out.append(ev.to_dict() if hasattr(ev, "to_dict") else dict(ev))
             return out
 
     def register_broadcaster(self, fn: Callable[[dict], None]) -> None:

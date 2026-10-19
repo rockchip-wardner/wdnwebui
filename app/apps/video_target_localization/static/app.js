@@ -12,7 +12,6 @@ const VTL = {
   wsTimer: null,
   lastSnap: null,
   detectorSnap: null,
-  pendingIdx: -1,   // 下一条二进制帧属于哪一路（由 frame_meta 设定）
   // 每路各自冻结：idx -> {snap, boxes, frameW, frameH, until}。
   // 不能是单份全局状态 —— 32 路轮转时每 ~2.4s 就有一路命中，
   // 全局冻结会把**所有**画面按在同一张旧帧上，看起来就是"整个画面卡住不动"。
@@ -175,11 +174,7 @@ function connectVtlWs() {
     if (typeof ev.data === "string") {
       let snap;
       try { snap = JSON.parse(ev.data); } catch (_) { return; }
-      if (snap.type === "frame_meta") {
-        // 多路协议：二进制帧前先来一条 meta 说明这帧属于哪一路
-        VTL.pendingIdx = snap.idx;
-        return;
-      } else if (snap.type === "event_history") {
+      if (snap.type === "event_history") {
         // 连接建立时服务端一次性打包发来的历史事件。必须走**整体重建**：
         // 逐条 addVtlEvent 实测 200 条突发能把渲染进程打满一个核。
         // 服务端按 id 升序（旧→新）发，本地数组是新→旧，所以要反转。
@@ -216,9 +211,11 @@ function connectVtlWs() {
       return;
     }
     try {
-      paintVtlFrame(VTL.pendingIdx >= 0 ? VTL.pendingIdx : 0,
-                    new Uint8Array(ev.data));
-      setVtlOverlay("", false);
+      // 通道号在二进制头第 1 字节（见 multi_api 的 stream_ws）。取法注意：
+      // ArrayBuffer 没有 getUint8（那是 DataView 的），要开 1 字节视图才零拷贝。
+      const buf = ev.data;
+      const idx = buf.byteLength ? new Uint8Array(buf, 0, 1)[0] : 0;
+      paintVtlFrame(idx, new Uint8Array(buf, 1));
     } catch (e) {
       setVtlOverlay("帧渲染失败: " + e, true);
     }

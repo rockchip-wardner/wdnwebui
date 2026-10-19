@@ -582,6 +582,11 @@ def main() -> None:
     # VAS_SEARCH extract over a long source runs 50-75s; uvicorn's default 20s WS
     # ping often times the connection out mid-extract so the progress bar
     # only resyncs on reconnect (visible as a single 0% → 100% jump).
+    # **不要**加 ws_per_message_deflate=False。曾按「JPEG 本来就是 deflate
+    # 产物，再压纯浪费 CPU」加过，实测是反的：关掉后 32 路客户端实收从
+    # 18.8 掉到 16.0 fps/路（解码 24.2 → 18.7），两个互不相干的 commit 上
+    # 方向一致，而 deflate 对 JPEG 几乎没有体积收益。机制未查清，先保持
+    # 默认开启；systemd 那条 ExecStart 同样别加 --ws-per-message-deflate。
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
