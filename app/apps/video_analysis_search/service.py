@@ -2037,13 +2037,18 @@ class VideoAnalysisSearchService:
     # 持久化：LanceDB（wechat_video_cache 的 kind='analysis' 行）
     # ------------------------------------------------------------------ #
     def _maybe_persist(self) -> None:
-        """在没有 run_id 或 state 仍为 idle 时跳过；其余都落库。"""
+        """**仅当分析成功（STATE_DONE）时落库。**
+
+        error / stopped 等中断态的逐帧结果不完整：落库后会被
+        ``lookup_analysis`` 命中并复用残缺结果，且历史列表出现"失败但
+        有缓存"的条目。只有完整跑完 done 才是可复用的结果。
+        """
         with self._lock:
             run_id = self._run_id
             state = self._state
         if not run_id:
             return
-        if state == self.STATE_IDLE:
+        if state != self.STATE_DONE:
             return
         try:
             self._persist()
@@ -2097,11 +2102,12 @@ class VideoAnalysisSearchService:
             source = self._source
             fps = self._fps
             total_frames = self._total_frames
-            from_cache = self._from_cache
             state = self._state
-        # 缓存命中恢复的 run：逐帧来自缓存（已完整），非 done 终态不写库
-        # —— 避免 stop / error 把缓存行 state 覆盖掉导致后续失配。
-        if from_cache and state != "done":
+        # 第二道防线：只有分析成功（done）才落库。error / stopped 等中断态
+        # 结果不完整，写库会被 lookup_analysis 命中并复用残缺结果、且污染
+        # 历史列表。正常路径已由 _maybe_persist 拦住，这里兜住将来绕过它
+        # 直接调用 _persist 的入口。
+        if state != self.STATE_DONE:
             return False
         with self._events_lock:
             events = [ev.to_dict() for ev in self._events]

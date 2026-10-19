@@ -4180,9 +4180,13 @@ RIFF header by hand.
     → per-scene chunk 小结（每段 ≤120 字，`max_new_tokens=200`）→ 最终综述
     （`max_new_tokens=400`）。每完成一个 chunk 广播 `state` 进度，
     前端用 `summary_progress: [done, total]` 显示 N/M。
-  - **持久化**：每次 `start()` 分配新 `run_id`（uuid4 hex），结束 / 停止 /
-    出错都落盘到 LanceDB（`app/core/video/cache.py` 的 `kind='analysis'`
-    行，`WechatVideoCache.save_analysis` / `list_analysis`）。
+  - **持久化**：每次 `start()` 分配新 `run_id`（uuid4 hex），**只有分析成功
+    （done）才落盘**到 LanceDB（`app/core/video/cache.py` 的
+    `kind='analysis'` 行，`WechatVideoCache.save_analysis` / `list_analysis`）。
+    error / stopped 等中断态的逐帧结果不完整：落库会被 `lookup_analysis`
+    命中并复用残缺结果，历史列表还会出现"失败但有缓存"的条目 —— 所以
+    `service._maybe_persist` / `_persist` 对非 done 状态直接短路，
+    `cache.save_analysis` 另校验 `payload["state"]`（缓存层最后防线）。
     JSON 含 `events[]` + `summary` + `fps` + `total_frames`。**老 run 没
     `fps` 字段时** `list_runs` 走 PyAV 探测自愈并回填。
 * **API** (`app/apps/video_analysis_search/api.py`):

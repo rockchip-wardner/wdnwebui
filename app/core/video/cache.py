@@ -563,6 +563,18 @@ class WechatVideoCache:
         """
         if not md5 or not run_id:
             return False
+        # 契约：只有分析成功（done）的结果才允许入库。调用方应自行确认
+        # 终态，这里是最后一道防线 —— error / stopped 等中断态会写入
+        # state 列（本方法硬编码 "done"），一旦落库就会被 lookup_analysis
+        # 命中并复用残缺结果，且历史列表出现"失败但有缓存"的条目。
+        if isinstance(payload, dict):
+            pstate = payload.get("state")
+            if pstate is not None and pstate != "done":
+                _LOG.warning(
+                    "wechat video cache: save_analysis rejected non-done "
+                    "result for %s (state=%s, run=%s)", md5[:12], pstate,
+                    str(run_id)[:8])
+                return False
         table = self._ensure_table()
         if table is None:
             return False
