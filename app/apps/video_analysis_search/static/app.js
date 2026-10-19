@@ -40,6 +40,8 @@ const VAS_SEARCH = {
   // 向导模式 / 手动预览 — 复用 vd 单例 VideoSession 的 WS 帧流
   previewWs: null,
   previewGen: 0,
+  previewPlaying: false,   // preview 的播放/暂停态（true=推流中，false=暂停）
+  previewPaused: false,
   // 状态回调:wizard 在 _renderFormStep 里 setSourceMeta 用同款渲染,
   // 但 wizard 内 _vcsSourceStatus 是空(预渲染阶段无后端 status)。
   // 真实接入点是 initVideoSearch 末尾注册,接收后端 /source 快照。
@@ -1066,6 +1068,10 @@ function vcsPlaySegment(hit, opts) {
       li.classList.toggle("active", Number(li.dataset.mi) === opts.miIndex);
     });
   }
+  vcsClosePreviewWs();   // 抢占 canvas：关掉视频源预览（含其按钮态）
+  VAS_SEARCH.previewPlaying = false;
+  VAS_SEARCH.previewPaused = false;
+  vcsRestoreSegmentUI();  // 预览隐藏过进度条/时间，播片段前还原
   vcsSyncCanvasSize();
   vcsOpenPlayWs(source, start, end);
   if (typeof DemoGuard !== "undefined") {
@@ -1157,6 +1163,10 @@ async function vcsOpenPreview(source, loop) {
     vcsShowError("");
     vcsSetSourceMeta("已选: " + source);
     vcsConnectPreviewWs();
+    // 打开即播放：启用 暂停/停止，隐藏进度条与时间（实时流无时长）。
+    VAS_SEARCH.previewPlaying = true;
+    VAS_SEARCH.previewPaused = false;
+    vcsSetPreviewUI(true);
     if (VAS_SEARCH._vcsSourceStatus) VAS_SEARCH._vcsSourceStatus(snap);
   } catch (e) {
     vcsShowError("打开失败: " + (e?.message || e));
@@ -1168,6 +1178,10 @@ async function vcsClosePreview() {
   try {
     await fetch(API_PREFIX + "/video-analysis-search/source/close", { method: "POST" });
   } catch (_) { /* ignore */ }
+  VAS_SEARCH.previewPlaying = false;
+  VAS_SEARCH.previewPaused = false;
+  vcsClearCanvas();
+  vcsSetPreviewUI(false);
   vcsSetSourceMeta("尚未选择");
   if (VAS_SEARCH._vcsSourceStatus) VAS_SEARCH._vcsSourceStatus(null);
 }
@@ -1215,6 +1229,92 @@ async function vcsClosePreviewWs() {
     URL.revokeObjectURL(VAS_SEARCH.lastImg);
     VAS_SEARCH.lastImg = null;
   }
+}
+
+// 清空播放画面（画黑 + 释放上一帧 objectURL）。关闭 / 停止预览与停止
+// 片段回放都走这里 —— 之前 preview 路径只关 WS 不擦屏，导致关闭后画面
+// 残留最后一帧。
+function vcsClearCanvas() {
+  const canvas = vcsEl("vcs-canvas");
+  const ctx = canvas && canvas.getContext("2d");
+  if (ctx) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  if (VAS_SEARCH.lastImg) {
+    URL.revokeObjectURL(VAS_SEARCH.lastImg);
+    VAS_SEARCH.lastImg = null;
+  }
+}
+
+// 播放器控制区显隐 —— 视频源预览是实时流、没有天然时长，预览时隐藏
+// 进度条与时间，只留「预览中」标签。
+function vcsSetPreviewUI(on) {
+  const bar = vcsEl("vcs-player-progress");
+  const timeEl = vcsEl("vcs-player-time");
+  const play = vcsEl("vcs-play");
+  const pause = vcsEl("vcs-pause");
+  const stop = vcsEl("vcs-stop-play");
+  if (bar && bar.parentElement) bar.parentElement.hidden = !!on;
+  if (timeEl) timeEl.hidden = !!on;
+  if (play) play.disabled = true;          // 打开即播放 → 「播放」暂不可点
+  if (pause) pause.disabled = !on;
+  if (stop) stop.disabled = !on;
+  const tag = vcsEl("vcs-player-tag");
+  if (tag) tag.textContent = on ? "预览中" : "未播放";
+}
+
+// 恢复片段回放所需的 UI（进度条 / 时间可见）。预览隐藏过它们后，播片段
+// 前必须还原，否则片段进度条不显示。
+function vcsRestoreSegmentUI() {
+  const bar = vcsEl("vcs-player-progress");
+  const timeEl = vcsEl("vcs-player-time");
+  if (bar && bar.parentElement) bar.parentElement.hidden = false;
+  if (timeEl) timeEl.hidden = false;
+}
+
+// 视频源预览的播放 / 暂停 / 停止 —— 后端 VideoSession，与 vd 页同一套
+// 语义（stop == close）。
+async function vcsPreviewControl(action) {
+  try {
+    await fetch(API_PREFIX + "/video-analysis-search/source/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+  } catch (_) { /* ignore */ }
+}
+
+async function vcsPlayPreview() {
+  if (!VAS_SEARCH.previewWs || !VAS_SEARCH.previewPaused) return;
+  await vcsPreviewControl("play");
+  VAS_SEARCH.previewPaused = false;
+  VAS_SEARCH.previewPlaying = true;
+  vcsEl("vcs-play").disabled = true;
+  vcsEl("vcs-pause").disabled = false;
+  if (typeof DemoGuard !== "undefined") vasReport();
+}
+
+async function vcsPausePreview() {
+  if (!VAS_SEARCH.previewWs || !VAS_SEARCH.previewPlaying) return;
+  await vcsPreviewControl("pause");
+  VAS_SEARCH.previewPaused = true;
+  VAS_SEARCH.previewPlaying = false;
+  vcsEl("vcs-play").disabled = false;
+  vcsEl("vcs-pause").disabled = true;
+  if (typeof DemoGuard !== "undefined") vasReport();
+}
+
+async function vcsStopPreview() {
+  await vcsPreviewControl("stop");
+  await vcsClosePreviewWs();
+  VAS_SEARCH.previewPlaying = false;
+  VAS_SEARCH.previewPaused = false;
+  vcsClearCanvas();
+  vcsSetPreviewUI(false);
+  vcsSetSourceMeta("尚未选择");
+  if (VAS_SEARCH._vcsSourceStatus) VAS_SEARCH._vcsSourceStatus(null);
+  if (typeof DemoGuard !== "undefined") vasReport();
 }
 
 // 把 vcs-canvas 像素尺寸同步为播放器区域（.vd-stage）显示尺寸，
@@ -1318,12 +1418,7 @@ function vcsStopPlayback() {
   vcsEl("vcs-play").disabled = true;
   vcsEl("vcs-pause").disabled = true;
   vcsEl("vcs-stop-play").disabled = true;
-  const canvas = vcsEl("vcs-canvas");
-  const ctx = canvas && canvas.getContext("2d");
-  if (ctx) {
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-  }
+  vcsClearCanvas();
   if (typeof DemoGuard !== "undefined") {
     vasReport();
   }
@@ -1760,8 +1855,10 @@ function initVideoSearch() {
   topKEl?.addEventListener("input", syncLenientK);
   syncLenientK();
 
-  // 播放器按钮
+  // 播放器按钮 —— 按当前模式分派：视频源预览（previewWs）走 VideoSession
+  // 控制（播放/暂停/停止，与 vd 页同款），检索片段回放走 /search/play。
   vcsEl("vcs-play").addEventListener("click", () => {
+    if (VAS_SEARCH.previewWs) { vcsPlayPreview(); return; }
     if (!VAS_SEARCH.seg || VAS_SEARCH.playing) return;
     // 暂停中恢复：发 WS resume
     if (VAS_SEARCH.playPaused && VAS_SEARCH.playWs && VAS_SEARCH.playWs.readyState === 1) {
@@ -1791,8 +1888,14 @@ function initVideoSearch() {
       }
     }
   });
-  vcsEl("vcs-pause").addEventListener("click", vcsPausePlayback);
-  vcsEl("vcs-stop-play").addEventListener("click", vcsStopPlayback);
+  vcsEl("vcs-pause").addEventListener("click", () => {
+    if (VAS_SEARCH.previewWs) { vcsPausePreview(); return; }
+    vcsPausePlayback();
+  });
+  vcsEl("vcs-stop-play").addEventListener("click", () => {
+    if (VAS_SEARCH.previewWs) { vcsStopPreview(); return; }
+    vcsStopPlayback();
+  });
 
   vcsRefresh();
   if (!VAS_SEARCH.ws && !VAS_SEARCH.wsTimer) connectVcsWs();

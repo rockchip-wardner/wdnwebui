@@ -135,6 +135,24 @@ async def close_source() -> dict:
     return get_session().close()
 
 
+@preview_router.post("/source/control")
+async def control_source(payload: dict) -> dict:
+    """向导模式预览:播放 / 暂停 / 停止(复用 vd 单例 VideoSession)。
+
+    与 vd 的 ``/control`` 完全同款 —— ``play`` → ``VideoSession.play()``,
+    ``pause`` → ``pause()``,``stop`` → ``close()``(vd 的 stop 即为关源,
+    这里保持一致,故 停止 与 关闭 等价)。
+    """
+    action = (payload or {}).get("action")
+    if action == "play":
+        return get_session().play()
+    if action == "pause":
+        return get_session().pause()
+    if action == "stop":
+        return get_session().close()
+    raise HTTPException(status_code=400, detail=f"unknown action: {action!r}")
+
+
 @preview_router.get("/source")
 async def get_source_snapshot() -> dict:
     """向导模式预览:取当前预览 session 快照(状态 / 尺寸 / fps / loop)。"""
