@@ -1355,6 +1355,20 @@ SCENE_HIST_BINS            = (50, 60)        # H×S 直方图格子数
 SCENE_BHATTACHARYYA_THRESH = 0.5             # Bhattacharyya 距离阈值
 SCENE_DECAY_ALPHA          = 0.1             # accumulateWeighted 衰减
 
+# 解码完整性阈值：硬件解码器（Rockchip MPP）遇到不支持的码流时会在中途
+# 停止产帧（日志 ``h264d_sei: parse payload_size error`` / ``h264d_init:
+# [h264d_reset_error]``），但 PyAV demux 仍会走完整段码流 —— ``read()``
+# 于是表现为"正常 EOF"。实测某火灾素材：PyAV 软解 2567 帧，MPP 只出 417
+# 帧（16%），而 wdnwebui 侧只看到"已完成 共分析 6 帧"，用户完全意识不到
+# 是解码失败。这里用 ``frame_pos / total_frames`` 兜底：解出比例低于该
+# 阈值即判定为"解码不完整"并报错，而不是静默 done。
+#
+# 阈值取 0.5（**不是** 0.9）：实测 MPP 对多支素材都有不同程度的丢帧 ——
+# 停车场 97.5%、小车大门 73.8%、火灾 16.2%。0.9 会把一直在正常使用的
+# 73.8% 素材也误判为失败。只有"不到一半"才算真正不可用（火灾 16%），
+# 此时逐帧分析的内容基本没有代表性，报 error 比出一份残缺综述更有意义。
+DECODE_INCOMPLETE_RATIO    = 0.5
+
 CHUNK_SUMMARY_PROMPT = (
     "以下是一段视频中按时间顺序的 {frame_count} 帧描述（起止帧号 {first_frame}~{last_frame}）。"
     "请用不超过 120 字总结这段内容的关键信息（人物、动作、场景、事件）。"
@@ -2488,6 +2502,24 @@ class VideoAnalysisSearchService:
                 self._broadcast({"type": "state", **self.snapshot()})
                 return
             if not ret or frame is None:
+                # 解码完整性检测（见 DECODE_INCOMPLETE_RATIO 注释）：硬件
+                # 解码器中途停止产帧时 demux 仍会走完，read() 表现为"正常
+                # EOF"。不检测的话用户看到"已完成 共分析 N 帧"（N 远小于
+                # 总帧数），意识不到是解码失败。
+                with self._lock:
+                    decoded = self._frame_pos
+                    expected = self._total_frames
+                    is_live = self._is_live
+                if (not is_live and expected > 0
+                        and decoded < expected * DECODE_INCOMPLETE_RATIO):
+                    self._fail(
+                        "视频解码错误：仅解出 %d/%d 帧（%.0f%%）。解码器"
+                        "可能不支持该视频的编码特性或参数集，解码在"
+                        "中途停止。请换用其它视频，或转码后再试。"
+                        % (decoded, expected, 100.0 * decoded / expected)
+                    )
+                    self._broadcast({"type": "state", **self.snapshot()})
+                    return
                 # 自然 EOF —— 必须把 sentinel 真的塞进队列，否则 worker
                 # 永远等不到综述触发。满了就等 worker 拉走再重试。
                 while True:

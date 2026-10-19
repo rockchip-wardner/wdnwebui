@@ -642,6 +642,7 @@ class WechatVideoCache:
         if table is None:
             return None
         where = (f"md5 = '{md5}' AND kind = '{_KIND_ANALYSIS}' AND "
+                 f"state = 'done' AND "
                  f"every_n = {int(every_n)} AND "
                  f"prompt_hash = '{prompt_hash}' AND "
                  f"sample_key = '{sample_key or ''}'")
