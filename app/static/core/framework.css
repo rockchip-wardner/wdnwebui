@@ -5564,6 +5564,16 @@ body.dg-modal-open .back-home-btn {
   white-space: nowrap;
   padding-top: 0.1rem;
 }
+/* 通道号：多路下「哪一路」是定位结果的必要上下文（与视频检测事件的
+   「通道 N」标签同款，1 基显示）。 */
+.vd-audio-ch {
+  flex: 0 0 auto;
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.78rem;
+  color: var(--accent, #3b82f6);
+  white-space: nowrap;
+  padding-top: 0.1rem;
+}
 .vd-audio-text {
   flex: 1 1 auto;
   white-space: pre-wrap;

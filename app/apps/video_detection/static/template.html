@@ -121,7 +121,7 @@
                 </header>
                 <div class="surv-field">
                   <div class="vd-audio-hint">
-                    当前视频源：<code id="vd-audio-source">—</code>
+                    音频源：<code id="vd-audio-source">—</code>
                   </div>
                   <div class="vd-model-pick-row">
                     <label class="vd-detector-label">模型
@@ -140,6 +140,7 @@
                             id="vd-audio-stop" disabled>停止</button>
                   </div>
                   <div class="vd-audio-meta" id="vd-audio-progress"></div>
+                  <span class="surv-hint">对上方**全部 N 路**音轨按 6 秒切片逐段推理，严格按通道顺序轮流送模型（单路 Omni 实例，32 路一圈约 22 秒）。文件源顺序扫完整条音轨后该路结束；RTSP 源持续轮转直到停止。音轨分析是单遍的，不受「循环播放」影响。</span>
                 </div>
               </section>
 
@@ -178,7 +179,7 @@
             <button id="vd-audio-events-clear" class="vd-btn">清空</button>
           </header>
           <ol class="vd-audio-events" id="vd-audio-events">
-            <li class="vd-audio-empty">启动音频分析后，按 6 秒切片逐段推理，结果显示在这里。</li>
+            <li class="vd-audio-empty">启动音频分析后，按 6 秒切片逐段推理（多路时每段带「通道 N」标签），结果显示在这里。</li>
           </ol>
         </section>
 

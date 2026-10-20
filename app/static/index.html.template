@@ -709,5 +709,6 @@
   <!-- 宫格放大的卡片侧接线。必须在 multi-grid.js 之后：attach() 要往
        MultiGrid.onZoom 挂回调。纯逻辑，无对应 css。 -->
   <script src="/static/core/zoom-frame.js" defer></script>
+  <script src="/static/core/audio-analysis.js" defer></script>
 </body>
 </html>

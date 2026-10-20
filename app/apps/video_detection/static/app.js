@@ -26,172 +26,27 @@ const VDDetector = {
 };
 
   // ...
-const AudioAnalysis = {
-  ws: null,
-  wsRetry: 0,
-  wsTimer: null,
-  events: [],
-  init() {
-    const startBtn = document.getElementById("vd-audio-start");
-    const stopBtn  = document.getElementById("vd-audio-stop");
-    const clearBtn = document.getElementById("vd-audio-events-clear");
-    if (startBtn) startBtn.onclick = () => AudioAnalysis.onStart();
-    if (stopBtn)  stopBtn.onclick  = () => AudioAnalysis.onStop();
-    if (clearBtn) clearBtn.onclick = () => AudioAnalysis.onClear();
-    this.ensureWs();
-    this.refresh();
-  },
-
-  async refresh() {
-    try {
-      const r = await fetch(API_PREFIX + "/audio-analysis", { cache: "no-store" });
-      if (!r.ok) return;
-      const snap = await r.json();
-      setVdAudioMeta(snap);
-  // ...
-      const audioModelEl = document.getElementById("vd-audio-model-pick");
-      if (audioModelEl && audioModelEl.disabled) {
-        loadModelPick("vd-audio-model-pick",
-                      "swcap_audio_understand", "vd.audio.model_id");
-      }
-      return snap;
-    } catch (_) { return null; }
-  },
-
-  async hydrateEvents() {
-    try {
-      const r = await fetch(API_PREFIX + "/audio-analysis/events", { cache: "no-store" });
-      if (!r.ok) return;
-      const data = await r.json();
-      this.events = Array.isArray(data.events) ? data.events.slice() : [];
-      this.render();
-    } catch (_) { /* best-effort */ }
-  },
-
-  async onStart() {
-    const promptEl = document.getElementById("vd-audio-prompt");
-    // 音轨分析吃**一路**（同一个视频的音轨），所以取源框的**第 1 路**。
-    // 源框是多行框，不能再整段 `.trim()` 当单路径用。
-    const source = readVdSources()[0] || "";
-    const prompt = (promptEl?.value || "").trim();
-    if (!source) { alert("请先在上方视频源里打开一个视频文件"); return; }
-    if (!prompt) { alert("请输入音频理解提示词"); return; }
-    this.events = [];
-    this.render();
-    try {
-      const model_id = (document.getElementById("vd-audio-model-pick")?.value || "") || null;
-      const r = await fetch(API_PREFIX + "/audio-analysis/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source, prompt, model_id }),
-      });
-      if (!r.ok) {
-        const e = await r.json().catch(() => ({}));
-        alert(`启动音频分析失败: ${e.detail || r.status}`);
-        return;
-      }
-      const snap = await r.json();
-      setVdAudioMeta(snap);
-    } catch (e) {
-      alert("启动音频分析失败: " + e.message);
-    }
-  },
-
-  async onStop() {
-    try {
-      await fetch(API_PREFIX + "/audio-analysis/stop", { method: "POST" });
-    } catch (_) { /* best-effort */ }
-    this.refresh();
-  },
-
-  async onClear() {
-    try {
-      await fetch(API_PREFIX + "/audio-analysis/events/clear", { method: "POST" });
-    } catch (_) { /* best-effort */ }
-    this.events = [];
-    this.render();
-  },
-
-  ensureWs() {
-    if (this.ws && this.ws.readyState <= 1) return;
-    this.wsRetry = Math.min(this.wsRetry + 1, 6);
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}${API_PREFIX}/audio-analysis/ws`;
-    try {
-      this.ws = new WebSocket(url);
-    } catch (_) {
-      this.wsTimer = setTimeout(() => this.ensureWs(),
-        Math.min(1000 * (1 << (this.wsRetry - 1)), 30000));
-      return;
-    }
-    this.ws.onmessage = (ev) => AudioAnalysis.onWsMessage(ev);
-    this.ws.onclose = () => {
-      AudioAnalysis.ws = null;
-      const wait = Math.min(1000 * (1 << (AudioAnalysis.wsRetry - 1)), 30000);
-      AudioAnalysis.wsTimer = setTimeout(() => AudioAnalysis.ensureWs(), wait);
-    };
-    this.ws.onerror = () => { try { this.ws && this.ws.close(); } catch (_) {} };
-  },
-
-  onWsMessage(ev) {
-    let m;
-    try { m = JSON.parse(ev.data); } catch (_) { return; }
-    if (m.type === "hello") {
-      this.hydrateEvents();
-      setVdAudioMeta(m);
-    } else if (m.type === "state") {
-      setVdAudioMeta(m);
-  // ...
-      if (m.state === "done" || m.state === "error" || m.state === "stopped") {
-        this.hydrateEvents();
-      }
-    } else if (m.type === "progress") {
-      setVdAudioMeta({
-        state: VD.audioSnap ? VD.audioSnap.state : "extracting",
-        progress: [m.done, m.total],
-        source: VD.audioSnap && VD.audioSnap.source,
-        events_count: this.events.length,
-      });
-    } else if (m.type === "event" && m.event) {
-      this.events.push(m.event);
-      this.render();
-      const cntEl = document.getElementById("vd-audio-events-count");
-      if (cntEl) cntEl.textContent = `${this.events.length} 段`;
-    }
-  },
-
-  render() {
-    const ol = document.getElementById("vd-audio-events");
-    if (!ol) return;
-    if (!this.events.length) {
-      ol.innerHTML = '<li class="vd-audio-empty">启动音频分析后，按 6 秒切片逐段推理，结果显示在这里。</li>';
-      return;
-    }
-    ol.innerHTML = "";
-    this.events.forEach((ev) => {
-      const li = document.createElement("li");
-      const errClass = ev.level === "error" ? " vd-audio-ev--err" : "";
-      li.className = "vd-audio-ev" + errClass;
-      const ts = document.createElement("span");
-      ts.className = "vd-audio-ts";
-      ts.textContent = `[${fmtTime(ev.start_s)}–${fmtTime(ev.end_s)}]`;
-      const tx = document.createElement("span");
-      tx.className = "vd-audio-text";
-      tx.textContent = sanitizeEventText(ev.text || "");
-      li.append(ts, tx);
-      ol.appendChild(li);
-    });
-    const cntEl = document.getElementById("vd-audio-events-count");
-    if (cntEl) cntEl.textContent = `${this.events.length} 段`;
-  },
-};
-
-function fmtTime(s) {
-  if (s == null || isNaN(s)) return "--:--";
-  const m = Math.floor(s / 60);
-  const r = Math.round(s % 60);
-  return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
-}
+// 音轨分析面板。**实现在 app/static/core/audio-analysis.js** ——
+// app/apps/audio_analysis/static/app.js 原来也有一份拷贝，两份必然漂
+// （多路改造只改一份，另一份就退回「只分析第 1 路」）。
+const AudioAnalysis = window.AudioAnalysisCore
+  ? window.AudioAnalysisCore.mount({
+      apiPrefix: API_PREFIX,
+      getSources: () => readVdSources(),
+      onSnapshot: (snap) => {
+        VD.audioSnap = snap || null;
+        // DemoGuard 靠这个上报判断「本页在跑」——离开页面时要能停掉
+        // 音轨分析。共享模块只管渲染，上报留给调用方。
+        if (typeof DemoGuard !== "undefined") {
+          DemoGuard.report("video-detection", {
+            session:  VD.lastSnap,
+            detector: VD.detectorSnap,
+            audio:    VD.audioSnap,
+          });
+        }
+      },
+    })
+  : {};
 
 function setVdOverlay(text, isError) {
   const el = document.getElementById("vd-overlay");
@@ -226,54 +81,6 @@ function setVdMeta(snap) {
 }
 
   // ...
-function setVdAudioMeta(snap) {
-  VD.audioSnap = snap || null;
-  const srcEl = document.getElementById("vd-audio-source");
-  if (srcEl) {
-    srcEl.textContent = (snap && snap.source)
-      || readVdSources()[0]
-      || "—";
-  }
-  const statusEl = document.getElementById("vd-audio-status");
-  const startBtn = document.getElementById("vd-audio-start");
-  const stopBtn  = document.getElementById("vd-audio-stop");
-  if (statusEl) {
-    const s = snap && snap.state;
-    if (s === "extracting") {
-      const [done, total] = (snap.progress || [0, 0]);
-      statusEl.textContent = `分析中 ${done}/${total}`;
-    } else if (s === "done") {
-      statusEl.textContent = `完成 · ${snap.events_count || 0} 段`;
-    } else if (s === "stopped") {
-      statusEl.textContent = "已停止";
-    } else if (s === "error") {
-      statusEl.textContent = "错误: " + (snap.error || "");
-    } else {
-      statusEl.textContent = (snap && snap.available === false)
-        ? "功能未启用"
-        : "未启动";
-    }
-  }
-  if (startBtn) startBtn.disabled = !!(snap && snap.state === "extracting");
-  if (stopBtn)  stopBtn.disabled  = !(snap && snap.state === "extracting");
-  const progEl = document.getElementById("vd-audio-progress");
-  if (progEl) {
-    if (snap && snap.state === "extracting") {
-      const [done, total] = (snap.progress || [0, 0]);
-      progEl.textContent = total > 0 ? `已处理 ${done} / ${total} 段（每段 ≤ 6 秒）` : "";
-    } else {
-      progEl.textContent = "";
-    }
-  }
-  if (typeof DemoGuard !== "undefined") {
-    DemoGuard.report("video-detection", {
-      session:  VD.lastSnap,
-      detector: VD.detectorSnap,
-      audio:    VD.audioSnap,
-    });
-  }
-}
-
 function setVdProgress(snap) {
   const el = document.getElementById("vd-progress");
   if (!el) return;
@@ -816,6 +623,10 @@ function initVideoDetection() {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openBtn.click(); }
   });
 
+  // 源变了 → 音轨面板的「音频源」标签要跟着变（几路、哪一路）。共享模块
+  // 不会自己盯源框（core 不该知道具体控件），由本页在这里通知它刷新。
+  sourceEl.addEventListener("input", () => { AudioAnalysis.refreshSource?.(); });
+
   openBtn.addEventListener("click", async () => {
     const check = validateVdSources();
     if (!check.ok) { setVdOverlay(check.reason, true); return; }
@@ -907,7 +718,8 @@ function initVideoDetection() {
   // ...
   refreshVdDetector();
   vdLoadTools();
-  AudioAnalysis.init();
+  // 音轨面板由共享模块在 mount() 时自装配（按钮 + WS + 首次快照），
+  // 这里不再调 init()。
   if (!VD.ws && !VD.wsTimer) connectVdWs();
 }
 

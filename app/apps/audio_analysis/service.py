@@ -1,41 +1,38 @@
-"""音轨理解：视频音轨 → 6s 切片 → Qwen2.5-Omni-3B 推理 → 段落事件。
+"""音轨理解：视频/流音轨 → 6s 切片 → Qwen2.5-Omni-3B 推理 → 段落事件。
 
-Omni-3B 单次 ``run_audio`` 上限 **6.0 秒**（wdnai/backends/omni.py 硬限制）；
-超过会被 ``mel[:, :n_frame]`` 静默截断。>6s 音频必须先切片。
+支持 **1~32 路**：每一路是一个音频源（文件 / RTSP），会话按**严格 0→N-1
+顺序轮转**，轮流把每一路的一段音频送去推理。取音频与送推理是**两级解耦**
+的（见 :mod:`app.core.audio.multi_session` 与 :mod:`app.core.audio.source`）。
+
+6s 上限：Omni-3B 单次 ``run_audio`` 上限 **6.0 秒** —— 那是 RKNN 音频编码器的
+**编译期输入形状** ``[1, 128, 600]``（600 帧 × 160 / 16000 = 6.000s），不是
+运行时可调的参数。超长音频会被 ``mel[:, :600]`` **静默截断**（不报错、不
+告警），所以切片责任在调用方。
 
 事件形状::
 
-    {id, chunk_idx, start_s, end_s, ts, prompt, text, level}
+    {id, channel, chunk_idx, start_s, end_s, duration_s, captured_at,
+     lag_s, ts, prompt, text, level}
+
+``channel`` 是 0 基的通道号；``start_s``/``end_s`` 是该段在**源时间轴**上的
+位置；``lag_s`` = 推理完成时刻 − 该段被**产出**的时刻（文件源 = 预取排队 +
+推理；RTSP 源 ≈ 推理本身）。
 
 WS 推 ``hello / event / progress / state`` 四种帧。
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
 import re
 import threading
-import time
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
-from app.core.compute.registry import (
-    get_registry,
-    get_session_call_lock,
-)
+from app.core.audio.multi_session import MAX_CHANNELS, MultiAudioSession
+from app.core.compute.registry import get_registry
 
 LOG = logging.getLogger("wdnwebui.audio_analysis")
-
-
-# Omni-3B 单次 run_audio 上限：omni.py AUDIO_SHAPES 最大 n_frame=600
-# × HOP_LENGTH=160 / SAMPLE_RATE=16000 = 6.0s。
-CHUNK_SECONDS = 6.0
-SAMPLE_RATE   = 16000
-SAMPLE_WIDTH  = 2        # s16le
-N_CHANNELS    = 1        # mono
-MAX_NEW_TOKENS = 512
 
 
 _STATE_IDLE       = "idle"
@@ -43,6 +40,15 @@ _STATE_EXTRACTING = "extracting"
 _STATE_DONE       = "done"
 _STATE_STOPPED    = "stopped"
 _STATE_ERROR      = "error"
+
+# MultiAudioSession 的状态 → 本服务的状态。
+_SESSION_STATE_MAP = {
+    "idle": _STATE_IDLE,
+    "running": _STATE_EXTRACTING,
+    "done": _STATE_DONE,
+    "stopped": _STATE_STOPPED,
+    "error": _STATE_ERROR,
+}
 
 
 @dataclass
@@ -56,13 +62,18 @@ class AudioEvent:
     prompt:    str
     text:      str
     level:     Optional[str] = None
+    # ---- 多路新增（旧调用方忽略即可）----
+    channel:     int = 0
+    duration_s:  float = 0.0
+    captured_at: float = 0.0
+    lag_s:       float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 class AudioAnalysisService:
-    """音轨理解 singleton（lazy）。NPU 互斥通过 ``get_session_call_lock()``。"""
+    """音轨理解 singleton（lazy）。多路会话由 :class:`MultiAudioSession` 承载。"""
 
     HISTORY_MAX = 200
 
@@ -72,35 +83,49 @@ class AudioAnalysisService:
         self._lock = threading.RLock()
         self._broadcasters: List[Callable[[dict], None]] = []
         self._broadcaster_lock = threading.Lock()
-        self._stop_event: threading.Event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
 
         self._state: str = _STATE_IDLE
         self._error: str = ""
-        self._source: str = ""
+        self._sources: List[str] = []
         self._prompt: str = ""
-        self._progress: tuple = (0, 0)
         # 用户从下拉框选中的 swcap_audio_understand 实例 model_id;
         # 空串 = auto-pick (与旧行为一致)。
         self._chosen_model_id: str = ""
-        self._next_id: int = 1
         self._closed = False
 
+        self._session = MultiAudioSession(
+            on_event=self._on_session_event,
+            on_state=self._on_session_state,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 状态
+    # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
+        sess = self._session.snapshot()
         with self._lock:
+            done = sum(c["chunks_done"] for c in sess["per_channel"])
+            total = sum(c["total_chunks"] or 0 for c in sess["per_channel"])
             return {
                 "state":        self._state,
                 "error":        self._error,
-                "source":       self._source,
+                # 旧字段：单路时的那个 source。多路下取第一路，向后兼容。
+                "source":       self._sources[0] if self._sources else "",
+                "sources":      list(self._sources),
                 "prompt":       self._prompt,
-                "progress":     list(self._progress),
+                # 旧字段：(已完成段数, 总段数)。多路下是**合计**。
+                "progress":     [done, total or done],
                 "model_id":     self._chosen_model_id,
-                "events_count": self._events_count_unlocked(),
+                "events_count": len(self._events),
                 "available":    self._probe_capability_available(),
+                # ---- 多路新增 ----
+                "channels":     sess["channels"],
+                "round":        sess["round"],
+                "current":      sess["current"],
+                "inferred":     sess["inferred"],
+                "errors":       sess["errors"],
+                "per_channel":  sess["per_channel"],
             }
-
-    def _events_count_unlocked(self) -> int:
-        return len(self._events)
 
     def list_events(self) -> List[dict]:
         with self._events_lock:
@@ -109,15 +134,23 @@ class AudioAnalysisService:
     def clear_events(self) -> None:
         with self._events_lock:
             self._events.clear()
-        # 不重置 _next_id —— id 全局单调递增
 
     def _probe_capability_available(self) -> bool:
+        """能力是否可用。
+
+        **用 list_sessions 而不是 get_session**：get_session 每次都会打一条
+        ``LOG.info("get_session(...)")``，而 snapshot() 在多路下每次 progress
+        帧都要跑（160 段 = 160 条日志噪音）。list_sessions 是纯查询。
+        """
         try:
-            get_registry().get_session("swcap_audio_understand")
-            return True
-        except RuntimeError:
+            return bool(get_registry().list_sessions(
+                "swcap_audio_understand", include_remote=True))
+        except Exception:  # noqa: BLE001
             return False
 
+    # ------------------------------------------------------------------ #
+    # 广播
+    # ------------------------------------------------------------------ #
     def register_broadcaster(self, fn: Callable[[dict], None]) -> None:
         with self._broadcaster_lock:
             self._broadcasters.append(fn)
@@ -145,316 +178,141 @@ class AudioAnalysisService:
             snap = self.snapshot()
         self._broadcast({"type": "state", **snap})
 
-    def start(self, source: str, prompt: str,
-              model_id: Optional[str] = None) -> dict:
-        """启动一次音频理解。失败 → ValueError / FileNotFoundError / RuntimeError
-        由 API 层映射到 400 / 404 / 502。
+    # ------------------------------------------------------------------ #
+    # 会话回调
+    # ------------------------------------------------------------------ #
+    def _on_session_event(self, raw: dict) -> None:
+        """MultiAudioSession 每产出一段就调这里 → 转成事件 + 广播。"""
+        text = _sanitize(raw.get("text") or "")
+        if not text and not raw.get("level"):
+            text = "(空)"
+        ev = AudioEvent(
+            id=raw["id"],
+            chunk_idx=raw["chunk_idx"],
+            start_s=raw["start_s"],
+            end_s=raw["end_s"],
+            ts=raw["ts"],
+            prompt=raw.get("prompt", ""),
+            text=text,
+            level=raw.get("level"),
+            channel=raw.get("channel", 0),
+            duration_s=raw.get("duration_s", 0.0),
+            captured_at=raw.get("captured_at", 0.0),
+            lag_s=raw.get("lag_s", 0.0),
+        )
+        with self._events_lock:
+            self._events.append(ev)
+        self._broadcast({"type": "event", "event": ev.to_dict()})
+        self._broadcast({"type": "progress", **self._progress_payload()})
 
-        ``model_id``：前端下拉框选中的 ``swcap_audio_understand``
-        实例 id。``None`` 或 ``""`` = 走 ``get_session`` 的本机优先
-        auto-pick (默认行为,与旧版本一致)。
+    def _on_session_state(self, sess_state: str) -> None:
+        """会话状态变化（全部放完 → done；连续失败熔断 → error）。"""
+        mapped = _SESSION_STATE_MAP.get(sess_state, sess_state)
+        if mapped == _STATE_EXTRACTING:
+            return
+        # 会话自己的错误文案要透出来（熔断时的「Omni worker 可能已失联」），
+        # 否则前端只看到「错误: 」后面是空的。
+        err = ""
+        if mapped == _STATE_ERROR:
+            err = (self._session.snapshot().get("error") or "")
+        self._set_state(mapped, err)
+
+    def _progress_payload(self) -> dict:
+        sess = self._session.snapshot()
+        done = sum(c["chunks_done"] for c in sess["per_channel"])
+        total = sum(c["total_chunks"] or 0 for c in sess["per_channel"])
+        return {
+            "done": done,
+            "total": total or done,
+            "current": sess["current"],
+            "round": sess["round"],
+            # 路数也得带上：state 帧可能在 open 之前就发过（channels=0），
+            # 只靠继承上一份快照会把 0 一直传下去。
+            "channels": sess["channels"],
+        }
+
+    # ------------------------------------------------------------------ #
+    # 生命周期
+    # ------------------------------------------------------------------ #
+    def start(self, source: Union[str, List[str]], prompt: str,
+              model_id: Optional[str] = None) -> dict:
+        """启动音频理解（1~32 路）。
+
+        ``source`` 传字符串 = 单路（向后兼容）；传列表 = 多路。
+        失败 → ValueError / FileNotFoundError / RuntimeError 由 API 层映射到
+        400 / 404 / 502。
+
+        ``model_id``：前端下拉框选中的 ``swcap_audio_understand`` 实例 id。
+        ``None`` 或 ``""`` = 走 ``get_session`` 的本机优先 auto-pick。
         """
-        source = (source or "").strip()
+        srcs = ([source] if isinstance(source, str)
+                else list(source or []))
+        srcs = [(s or "").strip() for s in srcs]
+        srcs = [s for s in srcs if s]
         prompt = (prompt or "").strip()
-        if not source:
+        if not srcs:
             raise ValueError("source 不能为空")
+        if len(srcs) > MAX_CHANNELS:
+            raise ValueError(f"最多 {MAX_CHANNELS} 路，当前 {len(srcs)} 路")
         if not prompt:
             raise ValueError("prompt 不能为空")
         if model_id is not None and (not isinstance(model_id, str)
                                      or not model_id.strip()):
             raise ValueError(f"model_id 必须是字符串或 None: {model_id!r}")
-        if not os.path.isfile(source):
-            raise FileNotFoundError(f"视频源不存在: {source!r}")
 
         # 预检 capability —— 不等 worker 探测才报错
-        # 显式 model_id 时校验该实例是否 running,失败抛 RuntimeError。
         if model_id:
             get_registry().get_session_for_model(
                 "swcap_audio_understand", model_id.strip())
         else:
             get_registry().get_session("swcap_audio_understand")
 
-        self._stop_event.set()
-        old = self._thread
-        if old is not None and old.is_alive():
-            old.join(timeout=2.0)
+        # 停掉上一轮（旧的单路 worker 也一并收掉）
+        self._stop_session()
 
         with self._lock:
-            self._stop_event = threading.Event()
-            self._source = source
+            self._sources = srcs
             self._prompt = prompt
-            self._progress = (0, 0)
             self._error = ""
             self._closed = False
             self._chosen_model_id = (model_id.strip()
-                                    if model_id and isinstance(model_id, str)
-                                    else "")
+                                     if model_id and isinstance(model_id, str)
+                                     else "")
         self.clear_events()
 
         self._set_state(_STATE_EXTRACTING)
-        self._thread = threading.Thread(
-            target=self._worker_loop, name="audio-analysis-worker", daemon=True,
-        )
-        self._thread.start()
+        try:
+            self._session.open(srcs, prompt, self._chosen_model_id)
+        except Exception as exc:  # noqa: BLE001
+            # open() 失败（源不存在 / 超过 32 路 / 会话已占用）→ 状态回 error，
+            # 异常继续往外抛由 API 层映射状态码。
+            self._set_state(_STATE_ERROR, error=f"{type(exc).__name__}: {exc}")
+            raise
+        # **open 之后补一次 state 广播**：上面那次是在 open 之前发的，那时
+        # 会话还没有路，channels=0。WS 客户端拿到的 state 帧比 POST 响应更
+        # 晚到（要再走一次网络），会把 POST 响应里正确的 channels 覆盖成 0
+        # —— 状态栏就永远显示不出「N 路 / 第几轮 / 当前通道」。
+        self._set_state(_STATE_EXTRACTING)
+        self._broadcast({"type": "progress", **self._progress_payload()})
         return self.snapshot()
 
+    def _stop_session(self) -> None:
+        try:
+            self._session.close()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("停止音频会话失败: %s", exc)
+
     def stop(self) -> dict:
-        """用户中途停止 —— 只翻 state + 触发 worker 早退；session 不释放。"""
-        self._stop_event.set()
+        """用户中途停止 —— 停轮转 + 停所有采集线程；session 不释放。"""
+        self._stop_session()
         self._set_state(_STATE_STOPPED)
         return self.snapshot()
 
     def close(self) -> None:
         """app shutdown 钩子 —— stop + 等线程退出。"""
         self._closed = True
-        self._stop_event.set()
-        t = self._thread
-        if t is not None and t.is_alive():
-            t.join(timeout=2.0)
-
-    def _worker_loop(self) -> None:
-        """PyAV 解码 → 6s 切片 → 逐段 omni 推理；单段失败 → 写 error event + 继续。"""
-        try:
-            chunks = self._decode_audio_track()
-            if self._stop_event.is_set() or self._closed:
-                return
-
-            total_samples_per_chunk = int(CHUNK_SECONDS * SAMPLE_RATE)
-            total_samples = len(chunks) // SAMPLE_WIDTH
-            n_chunks = (total_samples + total_samples_per_chunk - 1) // total_samples_per_chunk
-            if n_chunks == 0:
-                n_chunks = 1
-
-            with self._lock:
-                self._progress = (0, n_chunks)
-            self._broadcast({"type": "progress", "done": 0, "total": n_chunks})
-
-            for idx in range(n_chunks):
-                if self._stop_event.is_set() or self._closed:
-                    return
-
-                start_sample = idx * total_samples_per_chunk
-                end_sample   = min(start_sample + total_samples_per_chunk, total_samples)
-                chunk_pcm    = chunks[start_sample * SAMPLE_WIDTH:
-                                       end_sample   * SAMPLE_WIDTH]
-                start_s = start_sample / SAMPLE_RATE
-                end_s   = end_sample   / SAMPLE_RATE
-
-                ev = self._infer_one_chunk(idx, chunk_pcm, start_s, end_s)
-                with self._events_lock:
-                    self._events.append(ev)
-                with self._lock:
-                    self._progress = (idx + 1, n_chunks)
-                self._broadcast({
-                    "type": "event",
-                    "event": ev.to_dict(),
-                })
-                self._broadcast({
-                    "type": "progress",
-                    "done": idx + 1, "total": n_chunks,
-                })
-
-            if self._stop_event.is_set() or self._closed:
-                return
-            self._set_state(_STATE_DONE)
-
-        except Exception as e:                                # noqa: BLE001
-            LOG.exception("audio_analysis worker failed")
-            self._set_state(_STATE_ERROR,
-                            error=f"{type(e).__name__}: {e}")
-
-    def _decode_audio_track(self) -> bytes:
-        """PyAV 解码 → 16kHz mono s16le PCM bytes。无音轨 / 空解码抛 RuntimeError。"""
-        import av
-
-        with self._lock:
-            source = self._source
-
-        container = av.open(source, timeout=(2.0, 5.0))
-        try:
-            audio_streams = list(container.streams.audio)
-            if not audio_streams:
-                raise RuntimeError("视频无音轨")
-
-            resampler = av.AudioResampler(
-                format="s16", layout="mono", rate=SAMPLE_RATE,
-            )
-
-            pcm_chunks: List[bytes] = []
-            try:
-                for frame in container.decode(audio=0):
-                    if self._stop_event.is_set() or self._closed:
-                        return b""
-                    resampled = resampler.resample(frame)
-                    items = resampled if isinstance(resampled, list) else [resampled]
-                    for r in items:
-                        if r is None:
-                            continue
-                        arr = r.to_ndarray()  # shape (1, N) 或 (N,) s16
-                        pcm_chunks.append(arr.tobytes())
-            finally:
-                try:
-                    resampler.close()
-                except Exception:                            # noqa: BLE001
-                    pass
-
-            if not pcm_chunks:
-                raise RuntimeError("音轨解码为空")
-            return b"".join(pcm_chunks)
-        finally:
-            try:
-                container.close()
-            except Exception:                                # noqa: BLE001
-                pass
-
-    def _infer_one_chunk(self, idx: int, chunk_pcm: bytes,
-                          start_s: float, end_s: float) -> AudioEvent:
-        """单段 omni 推理。NPU 互斥走进程级 ``_llm_session_call_lock``。"""
-        from wdnai import Attachment
-
-        ts = time.time()
-        ev_id = self._next_id_and_inc()
-
-        try:
-            # 用户从下拉框选了特定实例时,锁定到该 instance;
-            # 否则走 ``get_session`` 的本机优先 auto-pick。
-            if self._chosen_model_id:
-                sess = get_registry().get_session_for_model(
-                    "swcap_audio_understand", self._chosen_model_id)
-            else:
-                sess = get_registry().get_session("swcap_audio_understand")
-        except RuntimeError as e:
-            return AudioEvent(
-                id=ev_id, chunk_idx=idx,
-                start_s=round(start_s, 2), end_s=round(end_s, 2),
-                ts=ts, prompt=self._prompt,
-                text=f"[错误] 功能未启用: {e}",
-                level="error",
-            )
-
-        # 隔离线程 + 新 event loop 跑 async respond()，避免与主进程
-        # event loop 共享 thread pool（与 VFA 同模板）。
-        coro = sess.respond(
-            prompt=self._prompt,
-            attachment=[Attachment(chunk_pcm, kind="audio")],
-            sample_rate=SAMPLE_RATE,
-            n_channels=N_CHANNELS,
-            sample_width=SAMPLE_WIDTH,
-            max_new_tokens=MAX_NEW_TOKENS,
-        )
-        result_holder: List[Any] = [None]
-        error_holder: List[Optional[BaseException]] = [None]
-        finished: List[bool] = [False]
-
-        def _runner() -> None:
-            loop = asyncio.new_event_loop()
-            try:
-                result_holder[0] = loop.run_until_complete(
-                    asyncio.wait_for(coro, timeout=60.0)
-                )
-            except asyncio.TimeoutError:
-                error_holder[0] = "timeout"
-            except Exception as ex:                           # noqa: BLE001
-                error_holder[0] = ex
-            finally:
-                try:
-                    loop.close()
-                except Exception:                            # noqa: BLE001
-                    pass
-                finished[0] = True
-
-        try:
-            with get_session_call_lock():
-                sess.reset()
-                t = threading.Thread(target=_runner, daemon=True,
-                                     name=f"audio-infer-{idx}")
-                t.start()
-                t.join(timeout=65.0)
-        except Exception as e:                                # noqa: BLE001
-            LOG.warning("audio chunk %d failed (lock/reset): %s", idx, e)
-            return AudioEvent(
-                id=ev_id, chunk_idx=idx,
-                start_s=round(start_s, 2), end_s=round(end_s, 2),
-                ts=ts, prompt=self._prompt,
-                text=f"[错误] {type(e).__name__}: {e}",
-                level="error",
-            )
-
-        if not finished[0]:
-            LOG.warning("audio chunk %d: SDK 超时（60s 内未返回）", idx)
-            return AudioEvent(
-                id=ev_id, chunk_idx=idx,
-                start_s=round(start_s, 2), end_s=round(end_s, 2),
-                ts=ts, prompt=self._prompt,
-                text="[错误] 推理超时：60s 内 SDK 未响应",
-                level="error",
-            )
-        if error_holder[0] == "timeout":
-            return AudioEvent(
-                id=ev_id, chunk_idx=idx,
-                start_s=round(start_s, 2), end_s=round(end_s, 2),
-                ts=ts, prompt=self._prompt,
-                text="[错误] 推理超时",
-                level="error",
-            )
-        if error_holder[0] is not None:
-            err = error_holder[0]
-            LOG.warning("audio chunk %d failed: %s", idx, err)
-            return AudioEvent(
-                id=ev_id, chunk_idx=idx,
-                start_s=round(start_s, 2), end_s=round(end_s, 2),
-                ts=ts, prompt=self._prompt,
-                text=f"[错误] {type(err).__name__}: {err}",
-                level="error",
-            )
-
-        result = result_holder[0]
-        # 诊断：AudioAnalysis 是纯文本输出，不传 generating，所以 ``respond()``
-        # 只可能回 str（正常，或 SDK 的 raw-text fallback）。这里仍按"先
-        # 看 .text，再看是不是 str，最后才 str(result)"的顺序兜底，
-        # 是为了容忍将来有人给它挂上 schema —— 那时 result 会是个
-        # BaseModel，``.text`` 才有意义。
-        LOG.info(
-            "audio chunk %d: post-respond result_type=%s "
-            "has_text_attr=%s repr_len=%d",
-            idx,
-            type(result).__name__,
-            isinstance(getattr(result, "text", None), str),
-            len(repr(result)) if result is not None else -1,
-        )
-        text_attr = getattr(result, "text", None)
-        if isinstance(text_attr, str):
-            text_out = text_attr
-        elif isinstance(result, str):
-            text_out = result
-        elif result is None:
-            text_out = ""
-        else:
-            text_out = str(result)
-
-        # 空文本 → 打诊断日志（区分"模型没生成" vs "SDK 返回类型识别错"）。
-        if not text_out:
-            LOG.warning(
-                "audio chunk %d: empty model output (result_type=%s, "
-                "raw_repr=%r)",
-                idx, type(result).__name__, repr(result)[:200],
-            )
-
-        text_out = _sanitize(text_out)
-        if not text_out:
-            text_out = "(空)"
-
-        return AudioEvent(
-            id=ev_id, chunk_idx=idx,
-            start_s=round(start_s, 2), end_s=round(end_s, 2),
-            ts=ts, prompt=self._prompt, text=text_out,
-        )
-
-    def _next_id_and_inc(self) -> int:
-        with self._lock:
-            i = self._next_id
-            self._next_id += 1
-            return i
+        self._stop_session()
+        self._set_state(_STATE_STOPPED)
 
 
 _singleton: Optional[AudioAnalysisService] = None
