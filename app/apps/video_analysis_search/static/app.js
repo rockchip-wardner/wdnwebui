@@ -1716,7 +1716,7 @@ function initVideoSearch() {
   startBtn?.addEventListener("click", vasStart);
   stopBtn?.addEventListener("click", vasStop);
 
-  // 帧判据可视化（分数浮框）—— 与 vd / vtd / vtl 共用同一份组件
+  // 帧判据状态接入（VAS 不渲染判据 UI）—— 与 vd / vtd / vtl 共用同一份组件
   // （app/static/core/frame-judge.js）。VAS 走自己的判据端点，因为它的
   // 判据挂在 VideoAnalysisService 上而不是共用的 VideoSession。
   // VAS 的判据参数（算法 / 阈值 / 帧间隔）已固化为服务端常量：
@@ -1724,7 +1724,9 @@ function initVideoSearch() {
   //   * showCurve:false  → 不渲染「实时分数曲线」（参数不可调，曲线没有
   //     调参价值；且向导视频源步的「打开」只是共享 VideoSession 的预览，
   //     不创建 VAS 判据器，曲线只会停在「采集中…」）
-  // 只保留分数浮框。
+  // 浮框同样不存在：v0.23 起浮框由宫格 tile 角标（MultiGrid.setBadge）
+  // 承载，而 VAS 是单块 canvas、不是宫格。这里仍 mount 只为让 update()
+  // 继续接收本轮判据状态（供后续诊断 / 扩展），不产生可见 UI。
   // syncControls:false —— 每 tick 推来的是**本轮真实**判据状态，不能回写。
   window.FrameJudge?.mount({
     prefix: "vas",
@@ -2095,8 +2097,9 @@ function vasApplySnapshot(snap) {
   // 作分母（采样数事前不可知，见 vasUpdateProgress 的 auto 分支）。
   VAS.meta.sampleMode  = String(snap.sample_mode || "manual");
   VAS.meta.framePos    = Number(snap.frame_pos) || 0;
-  // 浮框 + 曲线：judge 是**本轮真实**的判据状态（分数环形缓冲 + 当前判定），
-  // 与 vd / vtd / vtl 的 snap.judge 同结构，共享组件直接吃。
+  // judge 快照：**本轮真实**的判据状态（分数环形缓冲 + 当前判定），
+  // 与 vd / vtd / vtl 的 snap.judge 同结构。VAS 当前不渲染曲线 / 浮框，
+  // 仍喂给组件以保持状态同步（不产生可见 UI）。
   window.FrameJudge?.update("vas", snap.judge);
   VAS.meta.started_at   = Number(snap.started_at) || 0;
   VAS.meta.finished_at  = Number(snap.finished_at) || 0;
@@ -2398,7 +2401,7 @@ function connectVfaWs() {
       vasSetSummary(msg.summary || "");
     } else if (msg.type === "judge") {
       // 判据专用推送（decode 侧 0.5s 节流）。state 要等 VLM 回来才推，
-      // 解码却早就跑出去几百帧 —— 曲线和浮框靠这一路才跟得上。
+      // 解码却早就跑出去几百帧 —— 判据状态（曲线 / 角标）靠这一路才跟得上。
       window.FrameJudge?.update("vas", msg.judge);
     } else if (msg.type === "state" || msg.type === "hello") {
       vasApplySnapshot(msg);

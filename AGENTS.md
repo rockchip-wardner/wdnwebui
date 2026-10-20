@@ -960,7 +960,7 @@ VAS 另有一个二值的「自动判帧」。现在**只有一份实现**:
 | 算法原语 | `wdnav.scene`（RGA NV12-Y 缩略图 + 可注册度量） |
 | 判据策略 | `app/core/video/frame_judge.py`（模式 / 阈值 / 兜底间隔 / 分数环形缓冲） |
 | vd·vtd·vtl 接线 | 三张卡都 → `app/core/video/multi_session.py`（按 key `"vd"` / `"vtd"` / `"vtl"` 注册的多路会话）。判据实现在 `frame_judge.py` 一份，每路各持一个 `FrameJudge` |
-| VAS 接线 | `app/apps/video_analysis_search/service.py`（自管理 decode 循环，判据挂在它自己身上）。**VAS 判据参数已固化**为 `VAS_JUDGE_MODE="gscore"` / `VAS_JUDGE_THRESHOLD=10.0` / `VAS_JUDGE_EVERY_N=600`，每次 `start()` 强制覆盖调用方传入值；页面与向导都不暴露算法 / 阈值 / 帧间隔，并隐藏分数浮框（`FrameJudge.mount({showConfig:false, showCurve:false})`） |
+| VAS 接线 | `app/apps/video_analysis_search/service.py`（自管理 decode 循环，判据挂在它自己身上）。判据输入与三张卡一致：`_judge_thumb_gray()` **RGA 缩到长边 160 + `BGR2GRAY`**（manual 模式跳过 RGA；RGA 失败传 `None`，按"送检"处理）。**判据前有跳帧**：`VAS_JUDGE_FRAME_STRIDE=60` —— 每 60 帧才进一次判据，`0`=不跳；只作用于本页判据 / 送检（解码与场景检测仍每帧），**不进缓存键**。**VAS 判据参数已固化**为 `VAS_JUDGE_MODE="gscore"` / `VAS_JUDGE_THRESHOLD=10.0` / `VAS_JUDGE_EVERY_N=600`，每次 `start()` 强制覆盖调用方传入值；页面与向导都不暴露算法 / 阈值 / 帧间隔，**不渲染任何判据 UI**（配置 / 曲线 / 浮框都没有 —— VAS 不是宫格，v0.23 起浮框由宫格 tile 角标承载）；仍 mount 只为让 `update()` 接收本轮判据状态（`FrameJudge.mount({showConfig:false, showCurve:false})`） |
 | HTTP | `app/core/video/api.py` → `/api/video/judge*`（三张卡共用）；VAS 走 `/api/video-analysis-search/judge*` |
 | 前端 | `app/static/core/frame-judge.{js,css}`，四张卡各 mount 一个实例（按 prefix 索引） |
 
@@ -1341,7 +1341,8 @@ mode**;而跨卡共用的配置(判据只有一份,三张卡共用 `VideoSession
    暴露配置控件；`configure_judge` / `/api/video-analysis-search/judge*`
    端点保留供脚本调试与后续算法扩展，但每次 `start()` 都会重置为常量。
    前端 VAS 实例仍用 `syncControls: false` —— 每 tick 推来的是**本轮真实**
-   判据状态，不能拿去回写任何配置。VAS 分数浮框将被隐藏（`showCurve:false`）。
+   判据状态，不能拿去回写任何配置。VAS 不渲染任何判据 UI（`showConfig:false`
+   + `showCurve:false`；浮框也因不是宫格而不存在）。
 3. **曲线只在向导里出现**（用户明确要求），功能页只留配置 + 右上角浮框。
    **VAS 例外：不渲染曲线**（`showCurve:false`）—— 判据参数不可调，曲线
    没有调参用途；而向导「视频源」步的「打开」走的是共享 `VideoSession`
@@ -1500,7 +1501,7 @@ v0.4 起,6 张带 `wizard.json` 的卡(`text-chat` / `tts` / `video-detection` /
 **VAS 例外**：判据参数固化为 `service.VAS_JUDGE_*`，
 `wizard.json` 的 source 步只剩视频源 + 循环播放；页面也不再 mount 配置
 控件（`showConfig:false`），也不渲染曲线（`showCurve:false`，理由见上
-「曲线只在向导里出现」段的 VAS 例外），只保留分数浮框。改 VAS 判据只改
+「曲线只在向导里出现」段的 VAS 例外），不渲染任何判据 UI（无曲线、无浮框）。改 VAS 判据只改
 `app/apps/video_analysis_search/service.py` 里的常量。
 
 三条实测过的规矩:
@@ -4247,8 +4248,8 @@ RIFF header by hand.
     `service.ANALYSIS_PROMPT` / `service.VAS_JUDGE_*`，页面与向导都不
     收集（`#vas-prompt` textarea、向导「分析要求」步骤、判据三字段均已
     删除）；历史分析子行也不显示「提示词: …」摘要（固化后恒定，无区分
-    意义）。判据只保留分数浮框（`mount({showConfig:false, showCurve:false})`，
-    曲线理由见「曲线只在向导里出现」段的 VAS 例外）。
+    意义）。判据不渲染任何 UI（`mount({showConfig:false, showCurve:false})`；
+    浮框由宫格 tile 角标承载，VAS 不是宫格，所以也没有浮框）。
   - 左侧「功能配置」区保留标题与算力未启用提示；**「分析」「检索」两个
     启用勾选搬到了各自 subsection 的标题旁**（`#vas-mode-analyze` /
     `#vas-mode-search`，id 不变，`vasUpdateButtons` 逻辑照旧）。

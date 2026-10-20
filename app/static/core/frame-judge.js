@@ -9,6 +9,10 @@
  *   3. **实时曲线**：视频正下方、与视频等宽的分数曲线。**只在向导里出现**
  *      —— 功能页不画（用户明确要求），进功能页就只剩配置和浮框。
  *
+ * **VAS 例外**：`showConfig` / `showCurve` 均为 false，且它不是宫格（没有
+ * tile 角标承载浮框），因此配置区 / 浮框 / 曲线三者都不渲染；仍 mount 只是
+ * 为了让 `update()` 继续接收本轮判据状态。
+ *
  * 为什么浮框 / 曲线用 position:fixed 跟着画布走，而不是塞进画布容器
  * ----------------------------------------------------------------
  * 向导会把 `<canvas>` **本身**搬进自己的容器（state.js 的
@@ -49,7 +53,7 @@
       // 使然，若让 tick 覆盖控件，用户改完的阈值会被本轮的旧值悄悄抹掉。
       this.syncControls = opts.syncControls !== false;
       // 配置区是否渲染。VAS 的判据参数已固化为服务端常量（gscore/10/600），
-      // 它传 false 跳过 _buildConfig()，只保留分数浮框。
+      // 它传 false 跳过 _buildConfig()。
       this.showConfig = opts.showConfig !== false;
       // 曲线是否创建。VAS 传 false：它的判据参数不可调，曲线没有调参价值；
       // 而向导「视频源」步打开的是共享 VideoSession 的预览（不建 VAS 的

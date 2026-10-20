@@ -1285,6 +1285,23 @@ VAS_JUDGE_MODE = "gscore"
 VAS_JUDGE_THRESHOLD = 10.0
 VAS_JUDGE_EVERY_N = 600
 
+# 跳帧间隔（**只作用于本页的帧判据 / VLM 送检**，其它卡片不受影响）。
+#
+#   * ``> 1`` —— 只有 ``frame_pos % stride == 0`` 的帧才进入 gscore 判定，
+#     判定通过才送 VLM。其余帧照常解码、照常跑场景检测（综述切段需要逐帧
+#     边界），但**不做 RGA 缩略图、不进判据、不入推理队列** —— 于是 60 帧
+#     里最多只有 1 帧消耗 NPU 推理。
+#   * ``0``（或 1）—— 不跳帧，每帧都进判据（与引入本常量前的行为一致）。
+#
+# 与 ``VAS_JUDGE_EVERY_N`` 是两个独立概念：本常量是"**取帧率**"，决定判据
+# 多久被调用一次；``every_n`` 是判据内部的"**兜底间隔**"，决定画面一直没
+# 变化时最长多少帧补送一次。两者相乘才是极端情况下的事件间隔。
+#
+# 注意：本常量**不进分析缓存键**（``analysis_sample_key`` 只看算法 /
+# 阈值）。同一视频改 stride 后仍可能命中旧缓存 —— 需要新结果时请先在
+# 「历史记录」里删除对应条目或清空缓存。
+VAS_JUDGE_FRAME_STRIDE = 60
+
 
 # 综述 prompt 模板
 #
@@ -1387,6 +1404,38 @@ FINAL_SUMMARY_PROMPT = (
     "包含：主题、按时间顺序的关键事件。"
     "\n\n{parts}"
 )
+
+
+def _judge_thumb_gray(frame_bgr):
+    """判据缩略图：RGA 缩到长边 ``DEFAULT_LONG_SIDE`` + ``BGR2GRAY``。
+
+    与 vd / vtd / vtl 的 ``MultiChannelSession.snapshot_gray_for_judge``
+    同口径（RGA 缩放、``cv2.COLOR_BGR2GRAY``）。**不要**退化成
+    ``frame[..., 0]``（那是 B 通道不是 Y，分数刻度会偏）或 ``cv2.resize``
+    （项目铁律：缩放走 wdnav / RGA，不做软缩放）。
+
+    返回 ``None`` 表示缩放失败 —— 调用方把 ``None`` 交给
+    ``ChangeDetector.should_sample()``，``observe()`` 会按"送检"处理
+    （宁可多送不可漏检）。
+    """
+    try:
+        import cv2
+
+        from app.core.video.multi_session import derive_analysis_size
+        from wdnav.rga import resize_bgr
+    except Exception as e:  # pragma: no cover - platform-specific
+        LOG.warning("vas judge thumb: 依赖不可用: %s", e)
+        return None
+    try:
+        fh, fw = frame_bgr.shape[0], frame_bgr.shape[1]
+        tw, th = derive_analysis_size(fw, fh, DEFAULT_LONG_SIDE)
+        small = (resize_bgr(frame_bgr, tw, th)
+                 if (fw, fh) != (tw, th) else frame_bgr)
+        return (cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                if getattr(small, "ndim", 2) == 3 else small)
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("vas judge thumb: 缩略图失败: %s", e)
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -2526,10 +2575,20 @@ class VideoAnalysisSearchService:
                 change_detector = self._change_detector
             # 场景检测 —— 每帧调用（cv2 操作很便宜）
             self._update_scene_detection(frame, cur_pos)
+            # 跳帧（只作用于判据 / 送检）：第 stride 帧才进 gscore，其余帧
+            # 解码 + 场景检测照跑，但不做 RGA 缩略图、不进判据、不入队。
+            # 0 = 不跳帧；首两帧放行以便建立判据的参照帧。
+            _stride = VAS_JUDGE_FRAME_STRIDE
+            if _stride > 0 and cur_pos > 1 and cur_pos % _stride != 0:
+                continue
             # 取样判定交给 ChangeDetector：手动模式走固定间隔（逐位不变、
             # 零额外开销），自动模式走毫秒级判帧（变化 或 满 every_n 帧
             # 兜底才送）。它内部已把异常降级为"送检"，不静默丢帧。
-            take = change_detector.should_sample(frame, cur_pos)
+            # 判据输入与 vd / vtd / vtl 一致：RGA 缩到长边 160 + 灰度
+            # （manual 模式 observe() 不看 frame，跳过这次 RGA）。
+            judge_frame = (_judge_thumb_gray(frame)
+                           if change_detector.is_auto else None)
+            take = change_detector.should_sample(judge_frame, cur_pos)
             # 判据单独推一路（每 0.5s 最多一次）。只靠 state 推送的话，
             # 解码已经跑出去几百帧而 VLM 才回来一帧 —— 曲线会一跳一大段，
             # 浮框里的"这一帧变了没有"也严重滞后。手动模式无分数可推，跳过。
