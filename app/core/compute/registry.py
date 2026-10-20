@@ -109,6 +109,30 @@ HARDWARE_CAPABILITIES: list[dict] = [
         "label":           "HDMI 显示输出",
         "description":     "把视频 / 画面推送到 HDMI 显示设备。",
     },
+    {
+        # RK3588 的 HDMI-RX 控制器（驱动 rk_hdmirx，对应 /dev/video0），
+        # 通过 wdnav.v4l2.V4L2Capture 抓 PC 输出画面。该 capability 是
+        # "AI 操作电脑" 卡片（app/apps/usb_hid/）的硬性依赖：没启用
+        # 时卡片显示不可用。PCIe 板卡上不一定有这个节点，所以放在
+        # capability 后面挂开关，比硬编码更通用。
+        "capability_type": "hwcap_hdmiin",
+        "class_name":      "HWHDMIInput",
+        "category":        "video",
+        "label":           "HDMI 输入 (rk_hdmirx)",
+        "description":     "通过 RK3588 HDMI-RX 控制器采集 PC 端画面。",
+    },
+    {
+        # USB Gadget HID (configfs /sys/kernel/config/usb_gadget/g1
+        # + /dev/hidg{0,1})。与 hwcap_hdmiin 解耦: hdmiin 是视频
+        # 输入源, gadget 是输出通道; 任一缺失都会让卡片显示不可用
+        # 但 wizard / page 应分别提示。板子无 OTG controller 时
+        # 把这个关掉即可彻底隐藏 HID 链路。
+        "capability_type": "hwcap_hid_gadget",
+        "class_name":      "HWHIDGadget",
+        "category":        "usb",
+        "label":           "USB Gadget HID (OTG)",
+        "description":     "通过 configfs + OTG UDC 暴露 boot 键盘 + digitizer。",
+    },
 ]
 
 

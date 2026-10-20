@@ -613,6 +613,7 @@
       {% card_slot "video-analysis-search" %}
       {% card_slot "tts" %}
       {% card_slot "text-chat" %}
+      {% card_slot "usb-hid" %}
       <section id="page-system-logs"     class="page hidden" data-page="system-logs">
         <header class="page-header">
           <h2>系统日志</h2>

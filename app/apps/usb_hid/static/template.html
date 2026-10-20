@@ -1,0 +1,86 @@
+      <section id="page-usb-hid" class="page hidden" data-page="usb-hid">
+        <header class="page-header">
+          <h2>智能电脑控制</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="usb-hid-status-line">未检查</span>
+            <button class="wizard-mode-btn" data-wizard-mode data-page-id="usb-hid">向导模式</button>
+            <button class="refresh-btn" id="usb-hid-refresh">刷新状态</button>
+          </div>
+        </header>
+
+        <div id="usb-hid-unavailable" class="tts-banner tts-banner-error hidden">
+          <span class="tts-banner-icon" aria-hidden="true">⚠</span>
+          <span class="tts-banner-text" id="usb-hid-unavailable-reason">
+            Gadget 未就绪
+          </span>
+        </div>
+
+        <!-- HDMI-IN live preview grid. The hdmiin capture is owned by
+             the app (init() kicks it), not by a wizard step — so the
+             grid lives directly in the page section and renders as
+             soon as the page becomes visible (post-wizard or after
+             refresh).
+
+             The grid is ALSO the digitizer surface: clicking inside it
+             maps the click position to host screen coordinates and
+             forwards it to the USB HID digitizer endpoint, so the
+             user's PC receives the click as if they were using its
+             own touchscreen. tabindex="0" makes the grid keyboard-
+             focusable; once focused, every key press is forwarded to
+             the HID keyboard tap endpoint (Escape blurs to drop focus). -->
+        <div id="usb-hid-grid" class="vd-stage usb-hid-grid"
+             tabindex="0" role="application" aria-label="PC 桌面（点击透传到 HID）">
+          <div class="usb-hid-grid-tile">
+            <div class="usb-hid-grid-coord" id="usb-hid-grid-coord">HDMI-IN · 未连接</div>
+            <img class="usb-hid-grid-img" id="usb-hid-grid-img"
+                 draggable="false"
+                 alt="HDMI-IN 实时画面（rk_hdmirx 抓帧）"
+                 src="" />
+            <div class="usb-hid-grid-placeholder" id="usb-hid-grid-placeholder">
+              <div class="usb-hid-grid-placeholder-icon" aria-hidden="true">📺</div>
+              <div class="usb-hid-grid-placeholder-title">未连接 HDMI-IN</div>
+              <div class="usb-hid-grid-placeholder-text">
+                把 PC 端通过 HDMI 线接到 RK3588 的 HDMI-IN 端口<br>
+                （Type-C 旁边那个 HDMI-in，不是 OTG Type-C）
+              </div>
+            </div>
+            <div class="usb-hid-grid-hint" id="usb-hid-grid-hint">
+              点击 = 触屏点击；激活后键盘按键直透传 PC（Esc 退出激活）
+            </div>
+          </div>
+        </div>
+
+        <!-- Compact status row -->
+        <div class="tts-card">
+          <div class="tts-card-head">
+            <h3>HDMI-IN 状态</h3>
+            <span class="tts-meta-inline" id="usb-hid-hdmiin-summary">未探测</span>
+            <span class="tts-meta-inline" id="usb-hid-pointer-pos">x=0 y=0</span>
+          </div>
+          <div class="tts-card-body">
+            <div class="usb-hid-hdmiin-row">
+              <label>设备</label>
+              <span class="usb-hid-hdmiin-val" id="usb-hid-hdmiin-device">—</span>
+              <label>驱动</label>
+              <span class="usb-hid-hdmiin-val" id="usb-hid-hdmiin-driver">—</span>
+              <label>状态</label>
+              <span class="usb-hid-hdmiin-val" id="usb-hid-hdmiin-link">—</span>
+            </div>
+            <div class="usb-hid-hdmiin-row">
+              <label>分辨率</label>
+              <span class="usb-hid-hdmiin-val" id="usb-hid-hdmiin-res">—</span>
+              <label>格式</label>
+              <span class="usb-hid-hdmiin-val" id="usb-hid-hdmiin-pixfmt">—</span>
+            </div>
+            <div class="tts-row" style="margin-top:0.4rem">
+              <span class="tts-status" id="usb-hid-hdmiin-reason"></span>
+            </div>
+          </div>
+        </div>
+
+          <!-- Raw snapshot (matches tts pattern) -->
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-usb-hid"></pre>
+        </details>
+      </section>

@@ -1,0 +1,194 @@
+/* usb-hid — page-scoped styles.
+ * Inherits .tts-stage / .tts-card / .tts-row from tts/app.css so the
+ * page reads as part of the same family. Adds only what's unique to
+ * the digitizer canvas.
+ */
+
+.hidden { display: none !important; }
+
+/* Wizard source step — 固定源样式。wizard 框架把 input 渲染成可写
+ * 文本框，但 hdmiin 是硬件固定源，不可改。app.js 在 source step
+ * 渲染时给 input 加 .is-fixed-source + readonly=true，并隐藏浏览
+ * 按钮 + 删掉 channel-hint。这里给 fixed input 一个稍暗的背景让
+ * "不可编辑"语义更明显，但保留文本可读。*/
+.wd-wizard-input.is-fixed-source {
+  background: #f3f4f6;
+  color: #4b5563;
+  cursor: not-allowed;
+  border-style: solid;
+  border-color: #e5e7eb;
+}
+
+/* HDMI-IN 实时画面 = digitizer + 键盘透传激活面。
+ * cursor: crosshair 让用户清楚这里是"点 PC 桌面";
+ * :focus 状态加重 outline + 顶部加 "激活中" 角标,
+ * 提醒用户此时键盘输入会被透传到 PC 而非本页面表单。
+ *
+ * touch-action: none — 阻止浏览器把触屏手势解析成页面滚动
+ *   或系统级捏合/双击放大,这些手势一旦发生,浏览器会"偷走"
+ *   pointer events 让我们的 pointerdown/move/up handler 收不
+ *   到拖动轨迹。设了 none 之后,所有 pointer events 都按"原始"
+ *   方式投递,完全由我们控制。
+ * user-select / -webkit-user-select: none — 同理阻止长按选字
+ *   弹出系统选区。*/
+.usb-hid-grid {
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  outline: none;
+}
+.usb-hid-grid:focus,
+.usb-hid-grid:focus-visible {
+  outline: 3px solid #2563eb;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.3);
+}
+.usb-hid-grid:focus .usb-hid-grid-hint {
+  opacity: 1;
+  background: rgba(37, 99, 235, 0.9);
+}
+.usb-hid-grid-hint {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px 10px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #f3f4f6;
+  font-size: 0.78rem;
+  border-radius: 4px;
+  opacity: 0.7;
+  transition: opacity 0.15s, background 0.15s;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* HDMI-IN live preview grid (target of wizard.json canvas_id)
+ *
+ * 尺寸要点：在 wizard 内 grid 是 .wd-wizard-canvas-wrap 的子元素，那个
+ * wrap 是 flex 居中容器，<div> 没有 intrinsic width，flex 会把它收缩
+ * 到 0 高度。`width:100%` 让 grid 拉满 wrap 宽度、配合 aspect-ratio
+ * (继承自 .vd-stage) 拿到正确高度。在功能页直接展开时也是 100% 父
+ * 容器宽度。*/
+.usb-hid-grid {
+  position: relative;
+  width: 100%;
+  margin-bottom: 1rem;
+}
+
+.usb-hid-grid-tile {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #0c0f12;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.usb-hid-grid-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: none;
+  /* The <img> inside the digitizer grid must NOT capture mouse /
+   * touch events — its default draggable=true + the browser's
+   * HTML5 drag-and-drop heuristic (mousedown+mousemove = drag)
+   * would otherwise swallow the gesture, fire dragstart instead
+   * of click, and show a "ghost image" being moved instead of a
+   * real touchscreen drag on the host. Setting pointer-events:none
+   * on the img makes every event flow straight to the grid below,
+   * which then routes it through our pointerdown/move/up handlers.
+   * -webkit-user-drag: none is the legacy WebKit-specific mirror for
+   * older Chromium / Safari builds. */
+  pointer-events: none;
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
+}
+
+.usb-hid-grid-img.is-active {
+  display: block;
+}
+
+.usb-hid-grid-coord {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  color: #1abc54;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  background: rgba(0, 0, 0, 0.4);
+  padding: 2px 8px;
+  border-radius: 3px;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.usb-hid-grid-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.55);
+  text-align: center;
+}
+
+.usb-hid-grid-placeholder-icon {
+  font-size: 3rem;
+  margin-bottom: 0.6rem;
+}
+
+.usb-hid-grid-placeholder-title {
+  font-size: 1.05rem;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.usb-hid-grid-placeholder-text {
+  font-size: 0.85rem;
+  margin-top: 0.4rem;
+  line-height: 1.5;
+}
+
+.usb-hid-grid.has-image .usb-hid-grid-placeholder {
+  display: none;
+}
+
+.usb-hid-hdmiin-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.8rem;
+  font-size: 0.9rem;
+  padding: 0.25rem 0;
+}
+
+.usb-hid-hdmiin-row label {
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 0.8rem;
+  min-width: 3.2rem;
+}
+
+.usb-hid-hdmiin-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 2px 8px;
+  border-radius: 3px;
+  min-width: 5rem;
+  display: inline-block;
+}
+
+.usb-hid-hdmiin-val.is-ok {
+  color: #1abc54;
+}
+
+.usb-hid-hdmiin-val.is-err {
+  color: #e74c3c;
+}
+
+#usb-hid-status-line[style*="1abc54"]  { color: #1abc54; }
+#usb-hid-status-line[style*="e74c3c"]  { color: #e74c3c; }

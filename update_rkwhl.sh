@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 更新 .venv/src 下以 editable 模式安装的 wdnav / wdnai / wdndds
+# 更新 .venv/src 下以 editable 模式安装的 wdnav / wdnai / wdndds / wdnhid
 # 用法：./update_rkwhl.sh
 #
 # 每个包的流程（v1.3 起）：
@@ -84,6 +84,11 @@ verify_outputs() {
             ;;
         wdnai)
             # wdnai 是 pure-Python，无 .so 产物；HEAD 推进就当 OK。
+            return 0
+            ;;
+        wdnhid)
+            # wdnhid 是 pure-Python（USB Gadget HID bindings），无 .so 产物。
+            # wdnwebui 卡片侧 import wdnhid，必须保证本包可用即可。
             return 0
             ;;
     esac
@@ -287,9 +292,10 @@ run_pkg() {
 run_pkg wdnav  "git+ssh://git@10.10.10.10/wardner/wdnav.git#egg=wdnav"
 run_pkg wdnai  "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
 run_pkg wdndds "git+ssh://git@10.10.10.10/wardner/wdndds.git#egg=wdndds"
+run_pkg wdnhid "git+ssh://git@10.10.10.10/wardner/wdnhid.git#egg=wdnhid"
 
 if [ ${#FAILED_PKGS[@]} -eq 0 ]; then
-    echo "更新完成（wdnav / wdnai / wdndds 全部成功）。"
+    echo "更新完成（wdnav / wdnai / wdndds / wdnhid 全部成功）。"
     exit 0
 fi
 

@@ -765,6 +765,14 @@
         //    没有这一步:用户进卡 → tryMount 仍看到 completed=1
         //    → 不挂 wizard,直接落进功能页。这是 v0.22 修完后的
         //    副作用 —— "退出应用" 应该等于"fresh install"。
+        //  * **先 unmount wizard** —— 不然 _wizardMounted 标记残留,
+        //    下次进卡 showPage 的 else if 分支看到
+        //    _loadedApps.has && _wizardMounted.has 会短路,不再调
+        //    tryMount,wizard 不弹。localStorage 清掉的是"是否完成过",
+        //    unmount 清掉的是"wizard 是否还挂在 DOM 上",二者都得做。
+        if (window.WizardState?.unmount) {
+          try { window.WizardState.unmount(); } catch (_) {}
+        }
         ActivateManager._exit();
         const cp = currentPage();
         if (window.WizardState?.clearAll) {

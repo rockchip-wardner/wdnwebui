@@ -1,0 +1,25 @@
+# udev rules for the wdnwebui USB HID gadget.
+#
+# After running scripts/setup_usb_hid_gadget.sh the kernel exposes
+# /dev/hidg0 (boot keyboard) and /dev/hidg1 (digitizer / tablet).
+# These character devices default to mode 600, owner root — which
+# means the wdnwebui service (typically running as 'rockchip' or
+# 'wdnwebui' under systemd) can't open them. The wdnwebui HTTP
+# endpoints need to write HID reports, so we relax the perms and
+# group-ownership to a known set.
+#
+# Install with:
+#   sudo cp scripts/99-wdnwebui-usb-hid-gadget.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Override WDNWEBUI_USB_HID_GID in the env if your service group
+# differs (default 1000, matching the 'rockchip' user).
+
+ENV{ID_VENDOR_ID}=="1d6b", ENV{ID_MODEL_ID}=="0103", \
+    ENV{DRIVER}=="g_hid", \
+    SUBSYSTEM=="hidg", \
+    GROUP="rockchip", MODE="0660"
+
+# Fallback: any /dev/hidgN created by the configfs gadget.
+SUBSYSTEM=="hidg", KERNEL=="hidg[0-9]*", \
+    GROUP="rockchip", MODE="0660"

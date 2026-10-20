@@ -22,3 +22,11 @@ pyarrow==25.0.1
 # wechatbot-sdk powers the im-bridge (微信 iLink) page — its Wechat
 # wrapper lives in app/services/wechat_bot.py (inlined from the old
 # wdndds.Wechat in 0.5+).
+#
+# wdnhid（私有包，USB Gadget HID bindings for Linux /dev/hidgN）
+#   与 wdnav/wdnai/wdndds 同级，放在 .venv/src/wdnhid/ 下；通过
+#   update_rkwhl.sh 的 `run_pkg wdnhid ...` 入口 git pull + reinstall
+#   维护。usb-hid 卡片（app/apps/usb_hid/）import wdnhid，缺包时启动
+#   报 ModuleNotFoundError 而非 fallback —— 没有 hid 桥就无法上报键鼠，
+#   静默缺失更糟。`purelib` Python 包，无 .so 产物，HEAD 一变就重装
+#   一次，代价小。

@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "wizard_title": "智能电脑控制 — 快速配置",
+  "swcap_to_model": {},
+  "start_buttons": [],
+  "steps": [
+    { "id": "env",    "title": "运行环境检查",   "kind": "env_check" },
+    { "id": "finish", "title": "完成配置",       "kind": "finish" }
+  ]
+}
