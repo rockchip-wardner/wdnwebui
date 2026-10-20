@@ -37,12 +37,11 @@ from typing import Callable, List, Optional
 
 from app.core.video.change_detector import (
     DEFAULT_CHANGE_THRESHOLD,
-    SAMPLE_MODE_AUTO,
     SAMPLE_MODE_MANUAL,
     ChangeDetector,
 )
 from app.core.video.frame_judge import (DEFAULT_LONG_SIDE, LEGACY_MODE_ALIASES,
-                                       metrics, normalize_mode)
+                                       normalize_mode)
 
 
 try:
@@ -1279,6 +1278,13 @@ class FrameEvent:
 # 重跑一次即可重建）。
 ANALYSIS_PROMPT = "请对画面内容进行分析总结"
 
+# 判据参数固化 —— 页面与向导不再暴露，服务端恒用这一组值。
+# 需要切换算法时只改 ``VAS_JUDGE_MODE``（前提是该度量已在
+# ``frame_judge.EXPOSED_METRICS`` 放行）；阈值/帧间隔同理。
+VAS_JUDGE_MODE = "gscore"
+VAS_JUDGE_THRESHOLD = 10.0
+VAS_JUDGE_EVERY_N = 600
+
 
 # 综述 prompt 模板
 #
@@ -1414,13 +1420,12 @@ class VideoAnalysisSearchService:
         self._error = ""
         self._source = ""
         self._prompt = ""
-        self._every_n = 30
-        # 采样模式：``manual`` 固定间隔（原行为，零额外开销）/ 其余为
-        # ``frame_judge.metrics()`` 暴露的判帧算法名，按画面
-        # 变化采样。自动模式下 ``_every_n`` 语义变为"**最长间隔上限**"
-        # （兜底：静止画面太久也强制送检，防止 VLM 结果永不刷新）。
-        self._sample_mode = SAMPLE_MODE_AUTO
-        self._change_threshold = DEFAULT_CHANGE_THRESHOLD
+        self._every_n = VAS_JUDGE_EVERY_N
+        # 判据固定为 ``VAS_JUDGE_MODE``（gscore）：``_every_n`` 是
+        # "**最长间隔上限**"兜底（静止画面太久也强制送检，防止 VLM 结果
+        # 永不刷新）。页面与向导不再暴露算法 / 阈值 / 帧间隔。
+        self._sample_mode = VAS_JUDGE_MODE
+        self._change_threshold = VAS_JUDGE_THRESHOLD
         # 本轮真正在用的判帧器；手动模式下是 FrameJudge(manual) 实例，
         # 它不做差分、不跑 RGA，所以构造它本身没有开销。
         self._change_detector = None
@@ -1599,8 +1604,8 @@ class VideoAnalysisSearchService:
     # ------------------------------------------------------------------ #
     # 控制
     # ------------------------------------------------------------------ #
-    def start(self, source: str, prompt: str = ANALYSIS_PROMPT, every_n: int = 30,
-                 sample_mode: str = "manual",
+    def start(self, source: str, prompt: str = ANALYSIS_PROMPT, every_n: int = 0,
+                 sample_mode: str = "",
                  change_threshold: Optional[float] = None) -> dict:
         ok, _, wdnai_err = _load_wdnai()
         if not ok:
@@ -1609,37 +1614,12 @@ class VideoAnalysisSearchService:
             raise RuntimeError("wdnav.VideoCapture 不可用：原生库缺失")
         if not (source or "").strip():
             raise ValueError("source 不能为空")
-        # 分析提问已固化到 ``ANALYSIS_PROMPT``：忽略调用方传入值（前端不再
-        # 收集），保证 prompt / prompt_hash / 落库文本三者恒定一致。
+        # 分析提问与判据参数均**已固化**：忽略调用方传入值（前端不再收集）。
+        # 保证 prompt / prompt_hash / 缓存键 / 落库文本恒定一致。
         prompt = ANALYSIS_PROMPT
-        try:
-            every_n = max(1, int(every_n))
-        except (TypeError, ValueError):
-            raise ValueError("every_n 必须为整数")
-
-        # 采样模式校验。``manual`` = 固定 every_n 帧（原行为，零额外开销）；
-        # 其余是判帧算法名（见 ``frame_judge.metrics``）。老前端可能仍传
-        # 字面量 ``auto``（历史上它硬编码走已下架的 z_mad），这里显式映射，
-        # 不靠兼容层兜。
-        mode_in = str(sample_mode or "manual").strip().lower()
-        sample_mode = normalize_mode(mode_in)
-        if sample_mode != mode_in and mode_in not in LEGACY_MODE_ALIASES:
-            raise ValueError(
-                "sample_mode 必须是 manual 或 %s 之一" % "/".join(metrics()))
-        if mode_in in LEGACY_MODE_ALIASES:
-            # 存量配置带着**旧刻度**的阈值（z_mad 是灰阶口径，线上实测 1.0），
-            # 直接套到 conc 上会几乎每帧都触发 —— 比漏检更糟。这里丢掉它，
-            # 走 conc 的默认值，而不是给老客户端一个 400（那会让"升级后点开始
-            # 就报错"，比静默失效还难排查）。
-            change_threshold = None
-        if change_threshold is None:
-            change_threshold = DEFAULT_CHANGE_THRESHOLD
-        try:
-            change_threshold = float(change_threshold)
-        except (TypeError, ValueError):
-            raise ValueError("change_threshold 必须是数字")
-        if not (0.0 < change_threshold <= 1000.0):
-            raise ValueError("change_threshold 必须在 (0, 1000] 区间")
+        every_n = VAS_JUDGE_EVERY_N
+        sample_mode = VAS_JUDGE_MODE
+        change_threshold = VAS_JUDGE_THRESHOLD
 
         # 不追加手工 JSON 指令：SDK 会按 ``generating=SceneFrame`` 自动注入
         # 完整 JSON Schema（含字段 description），再叠一份手写「请输出 JSON
@@ -1690,9 +1670,7 @@ class VideoAnalysisSearchService:
                          len(entry.get("events") or []))
                 return self._start_from_cache(
                     entry, source=source, prompt=prompt, every_n=every_n,
-                    md5=md5, prompt_hash=prompt_hash,
-                    sample_mode=sample_mode,
-                    change_threshold=change_threshold)
+                    md5=md5, prompt_hash=prompt_hash)
 
         # 同一服务串行：若还在跑，先强制收尾（不抛错）。同时把上一
         # 轮的快照落盘（run_id 不同），避免被覆盖丢失。
@@ -1786,9 +1764,7 @@ class VideoAnalysisSearchService:
         return self.snapshot()
 
     def _start_from_cache(self, entry: dict, *, source: str, prompt: str,
-                          every_n: int, md5: str, prompt_hash: str,
-                          sample_mode: str = "manual",
-                          change_threshold: Optional[float] = None) -> dict:
+                          every_n: int, md5: str, prompt_hash: str) -> dict:
         """缓存命中路径：恢复逐帧结果 + 场景边界，只跑综述。
 
         **跳过** decode / 采样 / 逐帧 VLM 三段（昂贵的 NPU 逐帧推理），
@@ -1796,9 +1772,12 @@ class VideoAnalysisSearchService:
         ``STATE_SUMMARIZING``；综述完成时 ``_persist`` 按
         ``(md5, every_n, prompt_hash, sample_key)`` 幂等覆盖同一缓存行 →
         不产生重复历史条目。
+
+        判据参数固化（``VAS_JUDGE_*``），这里按常量恢复元数据，不接受
+        调用方传入（缓存命中只可能发生在同参数下）。
         """
-        if change_threshold is None:
-            change_threshold = DEFAULT_CHANGE_THRESHOLD
+        sample_mode = VAS_JUDGE_MODE
+        change_threshold = VAS_JUDGE_THRESHOLD
         if self._state in (self.STATE_RUNNING, self.STATE_OPENING,
                            self.STATE_DONE, self.STATE_STOPPED,
                            self.STATE_ERROR, self.STATE_SUMMARIZING):
@@ -1976,8 +1955,10 @@ class VideoAnalysisSearchService:
         值**，不重建 ChangeDetector。JudgePayload default = "manual"（向
         后兼容），但前端只改 every_n 的请求 body 里 mode 字段是空字符串，
         judge_api 把它转 None 传进来 —— 这条路径不再误把 mode 强制设成
-        manual。ChangeDetector 本身也用 SAMPLE_MODE_AUTO（gscore）当默认
-        sample_mode，新装服务从一开始就是 gscore。
+        manual。
+
+        **VAS 页面不调用本方法**（判据固化为 ``VAS_JUDGE_*``，每次
+        ``start()`` 都会重置为常量）。端点保留供脚本调试 / 后续算法扩展。
         """
         with self._lock:
             cur_mode = self._sample_mode

@@ -47,67 +47,30 @@
                 <span class="surv-hint">勾选即启用对应功能</span>
               </header>
               <div class="surv-field">
-                <div class="vas-mode-row">
-                  <label class="vas-mode" id="vas-mode-analyze-label">
-                    <input type="checkbox" id="vas-mode-analyze" />
-                    <span>分析</span>
-                  </label>
-                  <label class="vas-mode" id="vas-mode-search-label">
-                    <input type="checkbox" id="vas-mode-search" />
-                    <span>检索</span>
-                  </label>
-                </div>
                 <div class="vas-mode-hint" id="vas-mode-hint" hidden></div>
               </div>
 
               <div class="vas-subsection" id="vas-sub-analyze">
                 <header class="vas-sub-head">
                   <h4>分析</h4>
-                  <span class="surv-hint">逐帧分析 + 综述</span>
+                  <span class="surv-hint">内容分析</span>
+                  <label class="vas-mode" id="vas-mode-analyze-label">
+                    <input type="checkbox" id="vas-mode-analyze" />
+                    <span>启用</span>
+                  </label>
                 </header>
-                <div class="surv-field">
-                  <div id="vas-judge-config"></div>
-                </div>
               </div>
 
               <div class="vas-subsection" id="vas-sub-search">
                 <header class="vas-sub-head">
                   <h4>检索</h4>
-                  <span class="surv-hint">视频切片 + 语义检索</span>
+                  <span class="surv-hint">内容反查</span>
+                  <label class="vas-mode" id="vas-mode-search-label">
+                    <input type="checkbox" id="vas-mode-search" />
+                    <span>启用</span>
+                  </label>
                 </header>
                 <div class="surv-field">
-                  <div class="surv-detect-row">
-                    <label class="surv-input-split">
-                      <span>切片时长</span>
-                      <select id="vcs-chunk-seconds" class="surv-input">
-                        <option value="3">3 秒</option>
-                        <option value="4" selected>4 秒</option>
-                        <option value="5">5 秒</option>
-                        <option value="6">6 秒</option>
-                      </select>
-                    </label>
-                    <label class="surv-input-split">
-                      <span>重叠</span>
-                      <select id="vcs-chunk-overlap" class="surv-input">
-                        <option value="1" selected>1 秒</option>
-                        <option value="2">2 秒</option>
-                      </select>
-                    </label>
-                  </div>
-                </div>
-                <div class="surv-field">
-                  <div class="surv-detect-row">
-                    <label class="surv-input-split">
-                      <span>匹配阈值 (0–1.0)</span>
-                      <input type="number" id="vcs-threshold" class="surv-input"
-                             min="0" max="1" step="0.01" value="0.40" />
-                    </label>
-                    <label class="surv-input-split">
-                      <span>检索上限 (1–10)</span>
-                      <input type="number" id="vcs-top-k" class="surv-input"
-                             min="1" max="10" step="1" value="10" />
-                    </label>
-                  </div>
                   <div class="vcs-ta-wrap">
                     <textarea id="vcs-text" class="surv-input surv-textarea" maxlength="50"
                               placeholder="例如：有人在搬箱子 / 货车驶入 / 穿红色衣服的人"></textarea>
@@ -115,7 +78,7 @@
                   </div>
                   <label class="vcs-lenient-row">
                     <input type="checkbox" id="vcs-lenient" />
-                    <span>宽松匹配（所有选中视频合计无命中时，全局补回最接近的 top-<span id="vcs-lenient-k">10</span> 条，无视阈值，标"低于阈值"）</span>
+                    <span>宽松匹配（直接采集 10 条得分最高的结果，不符合阈值预期的将会被标记"低于阈值"）</span>
                   </label>
                 </div>
               </div>

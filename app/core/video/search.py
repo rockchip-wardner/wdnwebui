@@ -3,13 +3,14 @@
 流程（对齐 vl_rag_demo 的语义，但为**单视频 + 内存索引**版本）：
 
 1. ``open(source)`` —— 记录视频文件路径，校验存在。
-2. ``start_extract(chunk_seconds, chunk_overlap_seconds)`` —— 后台 daemon
+2. ``start_extract()`` —— 切片参数固化为 4s / 重叠 1s，后台 daemon
    线程用 PyAV 按固定时间窗切片，每片取等距帧缩放到 576×576，经 wdnai
    ``LLMSession.embed_video`` 得到 2048 维归一化向量，存内存
    ``List[{start_time, end_time, chunk_idx, fps, vec}]``。逐片推进
    ``slices_embedded`` 并 WS 广播 ``progress``。
-3. ``query(text, sim_threshold, top_k)`` —— ``LLMSession.embed_text`` 编码
-   查询向量，遍历内存索引算余弦相似度，阈值过滤 + top_k 截断。
+3. ``query(text)`` —— 匹配阈值固定 0.40、检索上限固定 10，
+   ``LLMSession.embed_text`` 编码查询向量，遍历内存索引算余弦相似度，
+   阈值过滤 + top_k 截断。
 
 LLMSession 从 ComputeRegistry 取（``swcap_video_retrieval`` capability），
 与 detector / VAS 分析侧共用进程级 ``get_session_call_lock`` 串行化。
@@ -57,6 +58,15 @@ _STATE_ERROR = "error"
 # embedding 模型的 vision 输入边长（Qwen3-VL-Embedding-2B 固定 576×576）
 _VISION_SIZE = 576
 _EMBED_DIM = 2048
+
+# 检索参数固化 —— 页面与向导不暴露；需要调整时直接改这里的值。
+# 取值经 ``start_extract`` / ``query`` 强制覆盖调用方传入值（与
+# ``service.ANALYSIS_PROMPT`` 的固化方式一致），保证落盘缓存键与检索口径
+# 恒定；历史缓存条目仍按自身记录的切片参数检索。
+FIXED_CHUNK_SECONDS = 4
+FIXED_CHUNK_OVERLAP_SECONDS = 1
+FIXED_SIM_THRESHOLD = 0.40
+FIXED_TOP_K = 10
 
 
 def _score_hits(qvec: np.ndarray, index: List[dict], sim_threshold: float,
@@ -214,8 +224,8 @@ class VideoSearchService:
         self._error: str = ""
         self._source: str = ""
         self._source_exists: Optional[bool] = None
-        self._chunk_seconds: int = 4
-        self._chunk_overlap_seconds: int = 1
+        self._chunk_seconds: int = FIXED_CHUNK_SECONDS
+        self._chunk_overlap_seconds: int = FIXED_CHUNK_OVERLAP_SECONDS
         self._slices_total: int = 0
         self._slices_embedded: int = 0
         self._query: Optional[dict] = None
@@ -299,7 +309,13 @@ class VideoSearchService:
         self._broadcast({"type": "state", **self.snapshot()})
         return self.snapshot()
 
-    def start_extract(self, chunk_seconds: int, chunk_overlap_seconds: int) -> dict:
+    def start_extract(
+            self,
+            chunk_seconds: int = FIXED_CHUNK_SECONDS,
+            chunk_overlap_seconds: int = FIXED_CHUNK_OVERLAP_SECONDS) -> dict:
+        # 切片参数固化：调用方传入值一律忽略，改参数请改模块常量。
+        chunk_seconds = FIXED_CHUNK_SECONDS
+        chunk_overlap_seconds = FIXED_CHUNK_OVERLAP_SECONDS
         # 预检：实例未启用时立即抛 RuntimeError，由 API 层转 503，
         # 避免用户点"开始提取"后还要等 worker 探测元数据才报错。
         # worker 里仍保留二次 _ensure_session 兜底（幂等）。
@@ -405,6 +421,10 @@ class VideoSearchService:
 
     def query(self, text: str, sim_threshold: float, top_k: int,
              min_results: int = 0, debug: bool = False) -> dict:
+        # 阈值 / 上限固化：调用方传入值一律忽略，改参数请改模块常量。
+        # ``min_results``（宽松匹配兜底条数）仍由调用方决定。
+        sim_threshold = FIXED_SIM_THRESHOLD
+        top_k = FIXED_TOP_K
         text = (text or "").strip()
         if not text:
             raise ValueError("检索问题不能为空")

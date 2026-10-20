@@ -39,6 +39,8 @@ CASES = [
     # v0.20：vd（音视频描述）按用户要求把两条栏搬到视频正下方；VAS 保持原样
     # （在左侧控制台里竖排）—— 两者都进脚本，搬走的那张不能靠"另一张没变"
     # 来证明自己变了，反过来也一样。
+    # 注：VAS 的判据参数已固化为服务端常量，页面上不再有判据配置栏
+    # （`#vas-judge-config` 不存在），此处的反向断言只验"没有被误搬"。
     ("video-detection",       "vd",  "vd-grid",    "vd-sources", "vd-open",
      ".vd-side", ".vd-stage-col", True),
     ("video-analysis-search", "vas", "vcs-canvas", "vcs-source", "vcs-open",
@@ -161,7 +163,8 @@ async def main() -> int:
                 # data-judge-layout 开关写坏，把所有卡都摊开）。
                 chk(m["inSide"], "视频源仍在侧栏内（未误搬）")
                 chk(not m["inStage"], "判据栏不在舞台列内（未误搬）")
-                chk(not m["judgeInline"], f"判据栏仍竖排 .vj-inline={m['judgeInline']}")
+                chk(m["judge"] is None,
+                    "VAS 页无判据配置栏（判据参数已固化为服务端常量）")
                 chk(m["bar"] is None, "页面上没有多余的 .stage-source-bar")
 
             # 5. 右栏不高于左栏，也不溢出（两种布局都得成立）

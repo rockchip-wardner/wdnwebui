@@ -2,8 +2,9 @@
 
 由卡片 ``__init__.py`` 挂载到 ``/api/video-analysis-search/search/*``。
 业务逻辑在 ``app.core.video.search``（遵守卡片零跨卡片 import 规则）。
-字段名（``chunk_seconds`` / ``sim_threshold`` / ``top_k`` / ``start_time``
-等）与前端契约保持不变。
+字段名（``chunk_seconds`` / ``start_time`` 等）与前端契约保持不变；切片
+时长 / 重叠 / 匹配阈值 / 检索上限固化为服务端常量（见
+``app/core/video/search.py`` 的 ``FIXED_*``），页面与向导不暴露。
 """
 from __future__ import annotations
 
@@ -16,7 +17,11 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
-from app.core.video.search import get_service
+from app.core.video.search import (
+    FIXED_SIM_THRESHOLD,
+    FIXED_TOP_K,
+    get_service,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -86,8 +91,11 @@ async def delete_cache_entry(payload: dict) -> dict:
 async def query_multi(payload: dict) -> dict:
     """对**一组已缓存条目**依次做文本检索（勾选路径，多选）。
 
-    Body: ``{text, sim_threshold?, top_k?, min_results?,
-    entries: [{md5, chunk_seconds, chunk_overlap_seconds}]}``。
+    Body: ``{text, min_results?, entries: [{md5, chunk_seconds,
+    chunk_overlap_seconds}]}``。匹配阈值固定 0.40、检索上限固定 10
+    （``sim_threshold`` / ``top_k`` 即使传入也会被忽略）。``entries``
+    里的切片参数是缓存条目主键，按条目自身记录检索（历史条目可能是
+    4s/1s 之外的参数）。
 
     无状态批量语义：``embed_text`` 只算一次，然后逐条目从 lance
     还原向量做余弦检索 —— 不触碰当前单例的内存索引 / 状态机
@@ -112,8 +120,9 @@ async def query_multi(payload: dict) -> dict:
         raise HTTPException(status_code=400, detail="entries 不能为空")
 
     try:
-        sim_threshold = float(payload.get("sim_threshold", 0.4))
-        top_k = int(payload.get("top_k", 10))
+        # 阈值 / 上限固化（忽略 body 传入值，改参数请改 search.py 常量）。
+        sim_threshold = FIXED_SIM_THRESHOLD
+        top_k = FIXED_TOP_K
         min_results = int(payload.get("min_results", 0) or 0)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="参数类型错误")
@@ -268,19 +277,13 @@ async def open_source(payload: dict) -> dict:
 async def start_extract(payload: dict) -> dict:
     """开始切片 embedding 提取。
 
-    Body: ``{chunk_seconds: int, chunk_overlap_seconds: int,
-    chunk_prompt?: str}``。参数值域以**前端档位**为准：
-    chunk_seconds ∈ {3,4,5,6}，chunk_overlap_seconds ∈ {1,2}。
+    Body 不接受切片参数：``chunk_seconds`` / ``chunk_overlap_seconds``
+    即使传入也会被忽略（改参数请改 ``app/core/video/search.py`` 的
+    ``FIXED_CHUNK_SECONDS`` / ``FIXED_CHUNK_OVERLAP_SECONDS``）。
     """
     LOG.info("vcs API: POST /extract payload=%s", payload)
-    payload = payload or {}
     try:
-        chunk_seconds = int(payload.get("chunk_seconds", 4))
-        chunk_overlap_seconds = int(payload.get("chunk_overlap_seconds", 1))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="切片参数必须为整数")
-    try:
-        return get_service().start_extract(chunk_seconds, chunk_overlap_seconds)
+        return get_service().start_extract()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
@@ -296,25 +299,31 @@ async def stop_extract() -> dict:
 
 @router.post("/query")
 async def query_video(payload: dict) -> dict:
-    """文本检索。Body: ``{text, sim_threshold, top_k, min_results?, debug?}``。
+    """文本检索（匹配阈值固定 0.40、检索上限固定 10）。
 
-    ``sim_threshold`` 严格过滤相似度：返回的每条 hit 都满足
-    ``similarity >= sim_threshold``。当 **没有任何** hit 达到阈值，
+    Body: ``{text, min_results?, debug?}``。``sim_threshold`` /
+    ``top_k`` 即使传入也会被忽略（改参数请改 ``app/core/video/search.py``
+    的 ``FIXED_SIM_THRESHOLD`` / ``FIXED_TOP_K``）。
+
+    固定阈值严格过滤相似度，返回的每条 hit 都满足
+    ``similarity >= 0.40``。当 **没有任何** hit 达到阈值，
     默认返回空列表；调用方如果想看"最佳猜测"（即使低于阈值），
-    显式传 ``min_results=N`` 启用 fallback 模式。
+    显式传 ``min_results=N`` 启用 fallback 模式（页面「宽松匹配」用
+    N=10）。
     """
     payload = payload or {}
     text = (payload.get("text") or "").strip()
     debug = bool(payload.get("debug", False))
     try:
-        sim_threshold = float(payload.get("sim_threshold", 0.4))
-        top_k = int(payload.get("top_k", 10))
+        # 阈值 / 上限固化：忽略 body 传入值，改参数请改模块常量。
+        sim_threshold = FIXED_SIM_THRESHOLD
+        top_k = FIXED_TOP_K
         # 默认 0 = 严格模式，没有达到阈值的片段就返回空。
         # 设为 N>0 时启用 fallback：阈值过滤完后无命中时，
-        # 补回 top-N（无视阈值），用于自检 / 调阈值。
+        # 补回 top-N（无视阈值）。
         min_results = int(payload.get("min_results", 0))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="阈值/上限必须为数值")
+        raise HTTPException(status_code=400, detail="min_results 必须为数值")
     # embed_text 是同步 NPU 推理：挪到线程池执行（不阻塞 event loop），
     # 并加 35s 超时兜底 —— SDK 卡死时前端不会无限 pending（对齐 VFA 做法）。
     loop = asyncio.get_event_loop()

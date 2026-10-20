@@ -48,6 +48,13 @@
       // 而每 tick 推来的是**本轮真实**判据状态 —— 两者短暂不一致是设计
       // 使然，若让 tick 覆盖控件，用户改完的阈值会被本轮的旧值悄悄抹掉。
       this.syncControls = opts.syncControls !== false;
+      // 配置区是否渲染。VAS 的判据参数已固化为服务端常量（gscore/10/600），
+      // 它传 false 跳过 _buildConfig()，只保留分数浮框。
+      this.showConfig = opts.showConfig !== false;
+      // 曲线是否创建。VAS 传 false：它的判据参数不可调，曲线没有调参价值；
+      // 而向导「视频源」步打开的是共享 VideoSession 的预览（不建 VAS 的
+      // 判据器），曲线只会停在「采集中…」。vd / vtd / vtl 保持默认 true。
+      this.showCurve = opts.showCurve !== false;
       this.applied = true;        // 配置是否已真正作用在当前 run 上
       this._awaitSync = null;     // 待后端确认的配置（门闩，见 _acceptSync）
       this._gen = null;            // 已见过的最新配置代次（过期快照直接丢）
@@ -60,7 +67,7 @@
     mount() {
       if (this._built) return;
       this._built = true;
-      this._buildConfig();
+      if (this.showConfig) this._buildConfig();
       this._buildFloats();
       this._load();
       // 画布位置会因向导搬运 / 窗口缩放 / 滚动而变，三路都重摆一次。
@@ -220,6 +227,9 @@
 
     /** 把控件当前值推到后端（真节流）。 */
     async _apply() {
+      // 无配置区（showConfig:false，如 VAS 固化判据）时不要 POST ——
+      // 否则会用这里的兜底值（manual/30）把服务端判据改掉。
+      if (!this.selMode) return;
       const mode = this.selMode?.value || "manual";
       const every = Math.max(1, parseInt(this.inpEvery?.value || "30", 10) || 30);
       const dflt = this._defaultThreshold(mode);
@@ -322,16 +332,18 @@
       this.badgeNum = badge.querySelector(".vj-badge-num");
       this.badgeSub = badge.querySelector(".vj-badge-sub");
 
-      const curve = ce("div", "vj-curve");
-      curve.id = this.prefix + "-judge-curve-wrap";
-      curve.style.display = "none";
-      const cv = ce("canvas", "vj-curve-canvas");
-      curve.appendChild(cv);
-      curve.appendChild(ce("div", "vj-curve-hint", "实时分数曲线"));
-      document.body.appendChild(curve);
-      this.curve = curve;
-      this.curveCanvas = cv;
-      this.curveCtx = cv.getContext("2d");
+      if (this.showCurve) {
+        const curve = ce("div", "vj-curve");
+        curve.id = this.prefix + "-judge-curve-wrap";
+        curve.style.display = "none";
+        const cv = ce("canvas", "vj-curve-canvas");
+        curve.appendChild(cv);
+        curve.appendChild(ce("div", "vj-curve-hint", "实时分数曲线"));
+        document.body.appendChild(curve);
+        this.curve = curve;
+        this.curveCanvas = cv;
+        this.curveCtx = cv.getContext("2d");
+      }
     }
 
     /**
@@ -599,6 +611,9 @@
     }
 
     _drawCurve() {
+      // showCurve:false（VAS）时不创建曲线 DOM —— 这里及静态 draw() 的
+      // 调用点都可能是无条件的，统一在入口短路。
+      if (!this.curve || !this.curveCanvas || !this.curveCtx) return;
       const ctx = this.curveCtx;
       const cv = this.curveCanvas;
       // 自适应容器宽度：曲线在 fieldset 里时容器是 fieldset，在画布下

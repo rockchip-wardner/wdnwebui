@@ -5264,6 +5264,9 @@ body.dg-modal-open .back-home-btn {
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
+  /* 「历史记录」栏的高度上限：条目少时仍由 flex 撑满（与右侧等高），
+     条目多到超过这个上限后不再把左栏/整页撑长，改由内部滚动条查看。 */
+  max-height: min(55vh, 640px);
 }
 #page-video-analysis-search .vd-grow .surv-field {
   flex: 1 1 auto;
@@ -5278,6 +5281,8 @@ body.dg-modal-open .back-home-btn {
 }
 
 #page-video-analysis-search .vd-grow .vcs-cache-window {
+  /* 填满「历史记录」栏剩余空间；条目在窗口内累加，超出窗口后内部滚动，
+     窗口本身不随条目数增长（rows 的 min-height:0 是这件事的关键）。 */
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
@@ -5285,15 +5290,11 @@ body.dg-modal-open .back-home-btn {
 }
 #page-video-analysis-search .vd-grow .vcs-cache-rows {
   flex: 1 1 auto;
+  min-height: 0;
+  /* 覆盖通用规则的 168px —— 高度改由父级 flex 决定（填满窗口）；
+     min-height:0 保证条目多时是**内部滚动**，而不是把窗口撑高。 */
   max-height: none;
   overflow-y: auto;
-}
-
-/* 切片参数 / 检索参数双列布局 */
-#page-video-analysis-search .surv-detect-row {
-  flex-direction: row;
-  align-items: flex-end;
-  gap: 0.5rem;
 }
 
 /* 检索问题字数统计（右下角悬浮） */
@@ -6280,12 +6281,6 @@ body.dg-modal-open .back-home-btn {
     display: none;
   }
 }/* ---- 合并页「视频检索分析」：功能配置 + 统一历史 ---- */
-.vas-mode-row {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-}
-
 .vas-mode {
   display: inline-flex;
   align-items: center;
@@ -6321,13 +6316,22 @@ body.dg-modal-open .back-home-btn {
   transition: opacity .15s;
 }
 
-.vas-subsection--off { opacity: 0.45; }
+/* 未启用的功能只把**内容区**置灰；标题栏里的启用勾选必须保持全不透明、
+   可点 —— 否则用户勾掉之后找不到地方再勾回来（opacity 会向下相乘，
+   给 header 覆盖 opacity 是撤不回来的）。 */
+.vas-subsection--off > :not(.vas-sub-head) { opacity: 0.45; }
 
 .vas-sub-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 6px;
+}
+
+.vas-sub-head .vas-mode {
+  font-size: 12px;
+  color: var(--muted);
 }
 
 .vas-sub-head h4 {

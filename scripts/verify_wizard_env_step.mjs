@@ -279,7 +279,7 @@ console.log("\n【C】_fieldKey：wizard.json 的 ui_key 优先");
   check("显式 ui_key 优先于 id 推导",
     priv._fieldKey("video-target-localization", { id: "vtl-sources", ui_key: "source" }) === "source");
   check("前缀不匹配时不剥（video-analysis-search 同款短前缀）",
-    priv._fieldKey("video-analysis-search", { id: "vcs-chunk-seconds" }) === "vcsChunkSeconds");
+    priv._fieldKey("video-analysis-search", { id: "vcs-source" }) === "vcsSource");
   check("前缀匹配时才剥",
     priv._fieldKey("text-chat", { id: "text-chat-prompt" }) === "prompt");
   // 全卡扫描：任何一张卡的 form 字段漏写 ui_key 都要被抓出来 —— opts key

@@ -960,7 +960,7 @@ VAS 另有一个二值的「自动判帧」。现在**只有一份实现**:
 | 算法原语 | `wdnav.scene`（RGA NV12-Y 缩略图 + 可注册度量） |
 | 判据策略 | `app/core/video/frame_judge.py`（模式 / 阈值 / 兜底间隔 / 分数环形缓冲） |
 | vd·vtd·vtl 接线 | 三张卡都 → `app/core/video/multi_session.py`（按 key `"vd"` / `"vtd"` / `"vtl"` 注册的多路会话）。判据实现在 `frame_judge.py` 一份，每路各持一个 `FrameJudge` |
-| VAS 接线 | `app/apps/video_analysis_search/service.py`（自管理 decode 循环，判据挂在它自己身上） |
+| VAS 接线 | `app/apps/video_analysis_search/service.py`（自管理 decode 循环，判据挂在它自己身上）。**VAS 判据参数已固化**为 `VAS_JUDGE_MODE="gscore"` / `VAS_JUDGE_THRESHOLD=10.0` / `VAS_JUDGE_EVERY_N=600`，每次 `start()` 强制覆盖调用方传入值；页面与向导都不暴露算法 / 阈值 / 帧间隔，并隐藏分数浮框（`FrameJudge.mount({showConfig:false, showCurve:false})`） |
 | HTTP | `app/core/video/api.py` → `/api/video/judge*`（三张卡共用）；VAS 走 `/api/video-analysis-search/judge*` |
 | 前端 | `app/static/core/frame-judge.{js,css}`，四张卡各 mount 一个实例（按 prefix 索引） |
 
@@ -1337,12 +1337,17 @@ mode**;而跨卡共用的配置(判据只有一份,三张卡共用 `VideoSession
    `frame_judge._GEN`(进程级单调递增,**不能**改成每实例从 0 开始 ——
    VAS 每次 `start()` 都新建判据器,按实例计数会让前端记住的 gen 比新 run
    的还大，之后所有快照都被当过期丢掉，浮框和曲线直接冻住)。
-2. **VAS 的判据配置是「下次开始分析生效」**（`configure_judge` 在运行中只
-   暂存到 `_pending_judge`）。中途换阈值会让本轮的帧集混用两把尺子，落库的
-   `sample_mode` 与缓存键也会按新值写、按旧值采。对应地前端 VAS 实例用
-   `syncControls: false` —— 每 tick 推来的是**本轮真实**判据状态，不能拿去
-   回写「下次生效」的配置控件。
+2. **VAS 的判据参数固化**（`VAS_JUDGE_*`，见上表），页面与向导都不
+   暴露配置控件；`configure_judge` / `/api/video-analysis-search/judge*`
+   端点保留供脚本调试与后续算法扩展，但每次 `start()` 都会重置为常量。
+   前端 VAS 实例仍用 `syncControls: false` —— 每 tick 推来的是**本轮真实**
+   判据状态，不能拿去回写任何配置。VAS 分数浮框将被隐藏（`showCurve:false`）。
 3. **曲线只在向导里出现**（用户明确要求），功能页只留配置 + 右上角浮框。
+   **VAS 例外：不渲染曲线**（`showCurve:false`）—— 判据参数不可调，曲线
+   没有调参用途；而向导「视频源」步的「打开」走的是共享 `VideoSession`
+   预览（`/source/open`），不创建 VAS 的 `ChangeDetector`，`recent` 恒空
+   → 曲线只会停在「采集中…」；真正有分数要等 `vas-start` 开始分析，那时
+   向导已关闭、曲线本就不显示。留着它只会让用户困惑。
    实现上曲线是 `position: fixed` 的浮层，每 500ms 按
    `canvas.getBoundingClientRect()` 跟随摆位 —— 因为向导把 `<canvas>` **本身**
    搬进自己的容器（`state.js:moveCanvasToWizard`），浮框做成 canvas 的兄弟
@@ -1399,8 +1404,8 @@ mode**;而跨卡共用的配置(判据只有一份,三张卡共用 `VideoSession
 |---|---|---|
 | `scripts/verify_frame_judge_metrics.py` | **判据选型的不变式**（不靠素材也能跑大半）：目标分必须高于正常帧 p95 / 稀疏微变不炸 / 全局变化被归一 / 面积单调性 + 10% 天花板 / 阈值操作点 | 37/37 |
 | `scripts/verify_vas_change_detector.py` | ChangeDetector/FrameJudge 单元 + 真实视频采样密度 + 只暴露 conc + 存量 z_mad/auto 迁移 | 60/60 |
-| `scripts/verify_judge_bar_layout.py` | 真浏览器两张卡**分别**断言：vd 的视频源 + 判据是否摊在视频正下方（DOM 归属 / 横排 / 与黑框同起点同宽 / 右栏不溢出）、VAS 是否**保持**侧栏竖排没被误搬；含填源 + 点打开的真实交互 | 20/20 |
-| `scripts/verify_frame_judge_ui.py` | 真浏览器 4 张卡：向导内改判据立刻落库 / 曲线与画布等宽 / **曲线不压判据控件** / 下拉只含 manual+conc 且标注实测耗时 / 过期配置不复活 / 无 pageerror | 52/52 |
+| `scripts/verify_judge_bar_layout.py` | 真浏览器两张卡**分别**断言：vd 的视频源 + 判据是否摊在视频正下方（DOM 归属 / 横排 / 与黑框同起点同宽 / 右栏不溢出）、VAS 是否**保持**侧栏竖排没被误搬且**无判据配置栏**（参数已固化）；含填源 + 点打开的真实交互 | 20/20 |
+| `scripts/verify_frame_judge_ui.py` | 真浏览器 3 张多路卡（VAS 已无判据控件）：向导内改判据立刻落库 / 曲线与画布等宽 / **曲线不压判据控件** / 下拉只含 manual+conc 且标注实测耗时 / 过期配置不复活 / 无 pageerror | 52/52 |
 | `scripts/verify_vas_judge_e2e.py --mode conc` | 真视频 + 真 NPU：WS 判据推送 / 分数曲线 / 真节流 | 5/5（683 帧看 / 26 送检，3.8%） |
 | `scripts/verify_vas_judge_e2e.py --mode manual` | 同上，手动模式 ≈ 每 30 帧送一次、无分数曲线 | 3/3（510 帧 → 17 送检） |
 | `scripts/verify_wizard_env_step.mjs` | 6 张卡的向导结构（判据并进 source 步后 57/57） | 57/57 |
@@ -1486,11 +1491,17 @@ v0.4 起,6 张带 `wizard.json` 的卡(`text-chat` / `tts` / `video-detection` /
 
 ### 判据配置放在向导的「视频源」步（不单独占一步）
 
-4 张视频卡(vd / vtd / vtl / vas)的 `wizard.json` 都把判据三个字段
+三张多路视频卡(vd / vtd / vtl)的 `wizard.json` 都把判据三个字段
 (`judgeMode` / `judgeThreshold` / `judgeEveryN`)并进 **source 步**的
 `fields`,而不是另开一步 —— 曲线画在向导的视频源步里(canvas 那时才被搬进
 向导),配置与它同屏才说得通。改完由 `FrameJudge.fromWizard(prefix, opts)`
 在「完成配置」时落库。
+
+**VAS 例外**：判据参数固化为 `service.VAS_JUDGE_*`，
+`wizard.json` 的 source 步只剩视频源 + 循环播放；页面也不再 mount 配置
+控件（`showConfig:false`），也不渲染曲线（`showCurve:false`，理由见上
+「曲线只在向导里出现」段的 VAS 例外），只保留分数浮框。改 VAS 判据只改
+`app/apps/video_analysis_search/service.py` 里的常量。
 
 三条实测过的规矩:
 
@@ -4196,24 +4207,23 @@ RIFF header by hand.
   - `GET  /api/video-analysis-search`             — 当前快照（state / 总帧 /
     进度 / 综述 / available / init_error）。
   - `GET  /api/video-analysis-search/events`      — per-frame events + summary。
-  - `POST /api/video-analysis-search/analysis/open` `{source,
-    every_n, sample_mode, change_threshold}` — 启动一次；400
-    source/every_n/sample_mode 校验失败（`sample_mode` 收
-    `manual` 或 `frame_judge.metrics()` 里的度量名，当前只有 `gscore`；
-    **已下架的 `z_mad` / 字面量 `auto` 放行并迁移到 gscore 且丢弃旧阈值**，
-    不要给老客户端报 400 —— 升级后一点「开始」就报错比静默失效更难排查）；
-    503 wdnai 不可用 / 功能未启用。
-    **分析提问已固化为服务端常量** `service.ANALYSIS_PROMPT`
-    （`"请对画面内容进行分析总结"`）：body 里即使带 `prompt` 也被忽略，
-    前端不再收集（见下「前端」段）。改问法只改该常量 —— prompt_hash
-    随之变化，旧分析缓存会失配、同视频重跑一次即可重建。
-    503 wdnai 不可用 / 功能未启用。
-    历史 run 恢复（`service.py:_restore`）走同一套迁移，否则落库的
-    `sample_mode` / 缓存键会与真正在跑的判据对不上。
+  - `POST /api/video-analysis-search/analysis/open` `{source}` — 启动一次；
+    400 source 为空；503 wdnai 不可用 / 功能未启用。
+    **分析提问与判据参数均已固化为服务端常量**：
+    `service.ANALYSIS_PROMPT`（`"请对画面内容进行分析总结"`）+
+    `service.VAS_JUDGE_MODE/THRESHOLD/EVERY_N`（`gscore` / `10.0` / `600`）。
+    body 里即使带 `prompt` / `every_n` / `sample_mode` / `change_threshold`
+    也会被忽略，前端不再收集（见下「前端」段）。改问法只改
+    `ANALYSIS_PROMPT` —— prompt_hash 随之变化，旧分析缓存会失配、同视频
+    重跑一次即可重建；改判据只改 `VAS_JUDGE_*`（切换算法前需先在
+    `frame_judge.EXPOSED_METRICS` 放行该度量）。
+    历史 run 恢复（`service.py:_restore`）仍兼容存量 `sample_mode="manual"`
+    等旧字段，否则历史列表 / 缓存键会读错。
   - `GET/POST /api/video-analysis-search/judge[ /metrics]` — VAS 自己的
     帧判据配置（与三张卡共用的 `/api/video/judge` **分开**：判据挂在
-    VideoAnalysisService 上，不在共用的 VideoSession 里）。运行中改配置
-    只暂存，下次 `open` 才生效。
+    VideoAnalysisService 上，不在共用的 VideoSession 里）。**页面已不再
+    调用**（参数固化）；端点保留供脚本调试与后续算法扩展，每次 `start()`
+    都会重置为 `VAS_JUDGE_*`。
   - `POST /api/video-analysis-search/stop`        — 用户中途停止（不出综述）。
   - `POST /api/video-analysis-search/close`       — 彻底关闭。
   - `POST /api/video-analysis-search/events/clear` — 清空内存 events + summary。
@@ -4232,11 +4242,16 @@ RIFF header by hand.
     已停止 / 错误`），状态色随 `data-state` 切换；分析中显示"已读 N/M · 已
     分析 X/Y · LLM 队列 Z"。
   - 左侧表单：视频源（"浏览…"复用 `VdFsModal._sourceTarget = sourceEl` 机制，
-    current 项目已有，写路径回到 `#vcs-source`）+ 帧判据控件 + 开始 / 停止 /
-    清空记录按钮。**分析提问不在此页**：已固化为服务端常量
-    `service.ANALYSIS_PROMPT`，页面与向导都不再收集（`#vas-prompt`
-    textarea 与向导「分析要求」步骤均已删除）；历史分析子行也不再显示
-    「提示词: …」摘要（固化后恒定，无区分意义）。
+    current 项目已有，写路径回到 `#vcs-source`）+ 开始 / 停止 / 清空记录
+    按钮。**分析提问与判据参数都不在此页**：固化为服务端常量
+    `service.ANALYSIS_PROMPT` / `service.VAS_JUDGE_*`，页面与向导都不
+    收集（`#vas-prompt` textarea、向导「分析要求」步骤、判据三字段均已
+    删除）；历史分析子行也不显示「提示词: …」摘要（固化后恒定，无区分
+    意义）。判据只保留分数浮框（`mount({showConfig:false, showCurve:false})`，
+    曲线理由见「曲线只在向导里出现」段的 VAS 例外）。
+  - 左侧「功能配置」区保留标题与算力未启用提示；**「分析」「检索」两个
+    启用勾选搬到了各自 subsection 的标题旁**（`#vas-mode-analyze` /
+    `#vas-mode-search`，id 不变，`vasUpdateButtons` 逻辑照旧）。
   - 右侧综述框 + 历史分析列表（每条带状态徽章 + `加载 / 反查 / 删除`
     三个按钮横排，删除用 `margin-left:auto` 推到最右避免误点）。
   - 下方 `<details open>` 逐帧分析列表（默认折叠，新事件抵达时只 push、
@@ -4274,7 +4289,10 @@ RIFF header by hand.
     `embed_text` / `embed_video` 的 `reset() + respond` 类推理必须
     `with lock:` 包住（embedding 的 `embed_*` 也是 NPU 推理，同样要
     与 VLM 端串行化）。
-   - **切片 embedding**：PyAV 按 `[start, start+chunk_seconds)` 时间窗
+   - **切片 embedding**：参数固化为模块常量（`FIXED_CHUNK_SECONDS = 4`
+     / `FIXED_CHUNK_OVERLAP_SECONDS = 1`），`start_extract()` 用它们
+     覆盖调用方传入值（对齐 `service.ANALYSIS_PROMPT` 的固化方式，调参
+     改常量即可）。PyAV 按 `[start, start+chunk_seconds)` 时间窗
      推进（步进 = chunk_seconds - overlap），每片取 `chunk_seconds` 个
      等距帧（1 秒/帧）缩放到 576×576，`embed_video` 得 2048 维 L2
      归一化向量，存内存 `List[{video_path, start_time, end_time,
@@ -4296,8 +4314,9 @@ RIFF header by hand.
      不一致而从没稳定工作过；该函数与其配套 `cleanup_shm_session` /
      `_shm_session_id` 已整体移除。）
   - **检索**：`embed_text` 编码查询 → 遍历索引算余弦相似度 → 阈值
-    过滤（默认 `sim_threshold=0.4`）+ `top_k`（默认 10）截断。索引为
-    空时直接返回空命中。
+    过滤（固定 `FIXED_SIM_THRESHOLD = 0.40`）+ `top_k`（固定
+    `FIXED_TOP_K = 10`）截断；同样由 `query()` 覆盖调用方传入值，
+    页面与向导不暴露这两个参数。索引为空时直接返回空命中。
   - **`iter_segment_jpeg(source, start_s, end_s, paced=...)`**：按播放
     顺序生成区间内每帧 JPEG（PyAV seek 到 keyframe + 顺序 decode +
     cv2 编码）；`paced=True` 时按源视频 fps 节流（**绝对时钟对齐**，
@@ -4306,13 +4325,12 @@ RIFF header by hand.
   - `GET  /api/video-analysis-search` — 快照（state / 进度 / query /
     hits / fps / source_exists）。
   - `POST /api/video-analysis-search/open` `{source}` — 选单个视频文件。
-  - `POST /api/video-analysis-search/extract` `{chunk_seconds,
-    chunk_overlap_seconds}` — 开始切片 embedding；chunk_seconds ∈
-    {3,4,5,6}、overlap ∈ {1,2}（Pydantic/service 校验，非法 400）；
-    实例未启用 503。
+  - `POST /api/video-analysis-search/extract` — 开始切片 embedding；
+    切片参数固化为 4s / 重叠 1s（body 里传了也会被忽略）；实例未启用 503。
   - `POST /api/video-analysis-search/extract/stop` — 中途停止（退回 idle）。
-  - `POST /api/video-analysis-search/query` `{text, sim_threshold,
-    top_k}` — 文本检索；`embed_text` 同步 NPU 推理挪
+  - `POST /api/video-analysis-search/query` `{text, min_results?}` — 文本
+    检索；匹配阈值固定 0.40、检索上限固定 10（body 里传了也会被忽略）；
+    `embed_text` 同步 NPU 推理挪
     `run_in_executor` + **35s 超时**（SDK 卡死返 504，不阻塞 event
     loop；对齐 VAS 做法）。
   - `WS   /api/video-analysis-search/ws` — server→client：`hello`
@@ -4328,7 +4346,8 @@ RIFF header by hand.
     `t` 秒附近取帧 JPEG（命中卡片缩略图），失败 404。
 * **前端** (`app/apps/video_analysis_search/static/app.js` `VAS_SEARCH` 模块 + `#page-video-analysis-search`)：
   - 左侧表单：视频源（"浏览…"复用 `VdFsModal._sourceTarget` 机制）+
-    切片档位（3/4/5/6s，重叠 1/2s）+ 提取按钮；中间进度条 + 阶段标签。
+    检索问题；切片参数（4s / 重叠 1s）、匹配阈值（0.40）、检索上限（10）
+    均固化为服务端常量，页面与向导不暴露；中间进度条 + 阶段标签。
   - 右侧命中结果列表（相似度降序，每条带开始/结束时间），点卡片 →
     `vcsPlaySegment` 连 play WS 真实帧播放：等比 contain 填满播放
     窗口（`vcsSyncCanvasSize` 把 canvas 像素同步为 `.vd-stage` 显示
@@ -5118,8 +5137,11 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     选框全 disabled；勾选 ≥1 → `#vcs-source` / `#vcs-browse` /
     `#vcs-start` disabled。
   - **多选检索**：检索按钮在勾选 ≥1 时分叉
-    `POST /query_multi {text, sim_threshold, top_k, min_results,
-    entries[]}` —— **embed_text 只算一次**、逐条目 LanceDB lookup
+    `POST /query_multi {text, min_results, entries[]}` —— 匹配阈值
+    固定 0.40、检索上限固定 10（body 里传了也会被忽略）；`entries[]`
+    里的 `chunk_seconds` / `chunk_overlap_seconds` 是缓存条目主键，
+    按条目自身记录的参数检索（历史条目可能是 4s/1s 之外的档位）。
+    **embed_text 只算一次**、逐条目 LanceDB lookup
     向量做余弦（`_score_hits` 与单视频 query 共用）；返回
     `groups[{filename, source_path, chunk params, hits, top_score,
     frame_enabled, miss}]`，前端 `vcsRenderMultiGroups` 按视频小节

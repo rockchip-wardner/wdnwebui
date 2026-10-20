@@ -3,8 +3,7 @@
 
 不依赖真模型启动(直接 mount wizard,绕过 env)。
 
-向导步骤(与 wizard.json 一致):env → source(含判据) → search → chunk → finish。
-分析提问已固化为服务端常量,不再有「分析要求」步骤。
+向导步骤(与 wizard.json 一致):env → source(含判据) → search → finish。
 """
 from playwright.sync_api import sync_playwright
 
@@ -29,13 +28,13 @@ def main():
         })""")
         print(f"=== 1) wizard mount ===")
         print(f"  {basic}")
-        if basic['sections'] == 1 and basic['dots'] == 5 and basic['ImApp'] == 'function':
+        if basic['sections'] == 1 and basic['dots'] == 4 and basic['ImApp'] == 'function':
             print(f"  ✅ wizard mount OK")
             ok += 1
         else:
             print(f"  ❌ FAIL")
 
-        # 测试 2:source 步骤(视频源 + 判据字段)
+        # 测试 2:source 步骤(视频源；判据参数已固化 → 不应再出现判据字段)
         page.evaluate("window.WizardState.stepForward()")
         page.wait_for_timeout(400)
         s2 = page.evaluate("""() => ({
@@ -46,8 +45,10 @@ def main():
         })""")
         print(f"\n=== 2) source step ===")
         print(f"  {s2}")
-        if s2['hasSourceInput'] and s2['hasBrowseBtn'] and s2['stepTitle'] == '视频源':
-            print(f"  ✅ source 步骤 OK")
+        if (s2['hasSourceInput'] and s2['hasBrowseBtn']
+                and s2['stepTitle'] == '视频源'
+                and not s2['hasJudgeMode']):
+            print(f"  ✅ source 步骤 OK(且无判据字段)")
             ok += 1
         else:
             print(f"  ❌ FAIL")
@@ -68,39 +69,25 @@ def main():
         else:
             print(f"  ❌ FAIL")
 
-        # 测试 4:chunk 步骤(切片参数)
+        # 测试 4:finish 步骤
         page.evaluate("window.WizardState.stepForward()")
         page.wait_for_timeout(300)
         s4 = page.evaluate("""() => ({
             stepTitle: document.querySelector('.wd-wizard-step-title')?.textContent,
-            hasChunkSelect: !!document.querySelector('[data-field-id="vcs-chunk-seconds"]'),
-            hasOverlapSelect: !!document.querySelector('[data-field-id="vcs-chunk-overlap"]'),
-        })""")
-        print(f"\n=== 4) chunk step ===")
-        print(f"  {s4}")
-        if s4['hasChunkSelect'] and s4['hasOverlapSelect'] and s4['stepTitle'] == '切片参数':
-            print(f"  ✅ chunk 步骤 OK")
-            ok += 1
-        else:
-            print(f"  ❌ FAIL")
-
-        # 测试 5:finish 步骤
-        page.evaluate("window.WizardState.stepForward()")
-        page.wait_for_timeout(300)
-        s5 = page.evaluate("""() => ({
-            stepTitle: document.querySelector('.wd-wizard-step-title')?.textContent,
             hasFinishBtn: !!document.getElementById('wd-wizard-finish-btn'),
             hasFinishErrorHidden: !!document.getElementById('wd-wizard-finish-error'),
+            hasChunkField: !!document.querySelector('[data-field-id="vcs-chunk-seconds"]'),
         })""")
-        print(f"\n=== 5) finish step ===")
-        print(f"  {s5}")
-        if s5['hasFinishBtn'] and s5['stepTitle'] == '完成配置':
-            print(f"  ✅ finish 步骤 OK")
+        print(f"\n=== 4) finish step ===")
+        print(f"  {s4}")
+        if (s4['hasFinishBtn'] and s4['stepTitle'] == '完成配置'
+                and not s4['hasChunkField']):
+            print(f"  ✅ finish 步骤 OK(且无切片参数字段)")
             ok += 1
         else:
             print(f"  ❌ FAIL")
 
-        # 测试 6:applyWizardSnapshot 写回源(分析提问已固化 → 不再要求 prompt)
+        # 测试 5:applyWizardSnapshot 写回源
         page.evaluate("""(async () => {
                 try { window.WizardState.unmount(); } catch(_) {}
                 const cards = window.__APP_MANIFESTS__?.cards || [];
@@ -115,9 +102,9 @@ def main():
             const sourceVal = document.getElementById('vcs-source')?.value;
             return {result: r, sourceVal};
         })""")
-        print(f"\n=== 6) applyWizardSnapshot (仅 source) ===")
+        print(f"\n=== 5) applyWizardSnapshot (仅 source) ===")
         print(f"  {result}")
-        # prompt 已固化 → 有 source 即可启动分析(started=true)
+        # prompt 固化 → 有 source 即可启动分析(started=true)
         if result['result']['source_set'] and result['sourceVal'] == '/tmp/test.mp4':
             print(f"  ✅ 源字段写回 OK")
             ok += 1
@@ -125,8 +112,8 @@ def main():
             print(f"  ❌ FAIL")
 
         browser.close()
-        print(f"\n=== 总结: {ok}/6 ===")
-        if ok == 6:
+        print(f"\n=== 总结: {ok}/5 ===")
+        if ok == 5:
             print("✅ 全部通过")
             return 0
         return 1

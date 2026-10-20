@@ -20,7 +20,8 @@
  *  （normalizeHits）和播放器帧源接口与后端契约对齐。                   *
  *                                                                    *
  *  协议字段对齐 demo 语义：hits = {video_path, start_time, end_time,  *
- *  chunk_idx, similarity}；query 参数 = {text, sim_threshold, top_k}。*
+ *  chunk_idx, similarity}；query 参数 = {text, min_results?}（阈值/上限 *
+ *  固化为服务端常量）。                                              *
  * ------------------------------------------------------------------ */
 const VAS_SEARCH = {
   ws: null,
@@ -765,16 +766,10 @@ function vcsApplyMutualExclusion() {
   }
   if (sourceEl) sourceEl.disabled = anyChecked;
   if (browseBtn) browseBtn.disabled = anyChecked;
-  // 勾选缓存（多视频）路径：切片参数由缓存条目固化（query_multi 用条目自身
-  // 的 chunk_seconds / chunk_overlap），页面下拉框不参与 → 置灰避免误导。
-  const chunkEl = vcsEl("vcs-chunk-seconds");
-  const overlapEl = vcsEl("vcs-chunk-overlap");
-  if (chunkEl) chunkEl.disabled = anyChecked;
-  if (overlapEl) overlapEl.disabled = anyChecked;
   vasUpdateButtons();
 }
 
-async function vcsQueryMulti(text, simThreshold, topK, minResults) {
+async function vcsQueryMulti(text, minResults) {
   // 勾选路径：按窗口选中顺序（窗口行序 = analyzed_at 倒序）检索。
   const entries = [];
   const win = vcsEl("vcs-cache-window");
@@ -807,8 +802,7 @@ async function vcsQueryMulti(text, simThreshold, topK, minResults) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        text, sim_threshold: simThreshold, top_k: topK,
-        min_results: minResults || 0, entries,
+        text, min_results: minResults || 0, entries,
       }),
     });
     if (!r.ok) {
@@ -817,7 +811,7 @@ async function vcsQueryMulti(text, simThreshold, topK, minResults) {
       return;
     }
     const d = await r.json();
-    vcsRenderMultiGroups(d.groups || [], text, topK, simThreshold);
+    vcsRenderMultiGroups(d.groups || [], text);
   } catch (e) {
     vcsShowError("query_multi 请求失败：" + e);
   } finally {
@@ -834,7 +828,7 @@ async function vcsQueryMulti(text, simThreshold, topK, minResults) {
   }
 }
 
-function vcsRenderMultiGroups(groups, text, topK, threshold) {
+function vcsRenderMultiGroups(groups, text) {
   const list = vcsEl("vcs-results-list");
   const count = vcsEl("vcs-results-count");
   if (!list) return;
@@ -1480,8 +1474,6 @@ async function vcsRefresh() {
 async function vcsStartExtract() {
   const source = (vcsEl("vcs-source")?.value || "").trim();
   if (!source) { vcsShowError("请先选择视频文件"); return; }
-  const chunkSeconds = Number(vcsEl("vcs-chunk-seconds")?.value || 4);
-  const overlap = Number(vcsEl("vcs-chunk-overlap")?.value || 1);
   try {
     const r = await fetch(API_PREFIX + "/video-analysis-search/search/open", {
       method: "POST",
@@ -1496,10 +1488,11 @@ async function vcsStartExtract() {
     return;
   }
   try {
+    // 切片参数（4s / 重叠 1s）固化为服务端常量，前端不收集。
     const r = await fetch(API_PREFIX + "/video-analysis-search/search/extract", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chunk_seconds: chunkSeconds, chunk_overlap_seconds: overlap }),
+      body: JSON.stringify({}),
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || "HTTP " + r.status);
@@ -1628,6 +1621,11 @@ async function vasStop() {
 // 检索进行中可取消（40s 超时兜底，即使后端极端卡死也能反馈）
 let vcsQueryAbort = null;
 
+// 匹配阈值(0.40) / 检索上限(10) / 切片参数(4s, 重叠 1s) 固化为服务端
+// 常量（app/core/video/search.py 的 FIXED_*），页面不收集。这里只保留
+// 「宽松匹配」的兜底条数，与服务端检索上限保持一致。
+const VCS_LENIENT_TOP_K = 10;
+
 async function vcsQuery() {
   const text = (vcsEl("vcs-text")?.value || "").trim();
   // 兜底校验：「开始」在问题为空时已被 vasUpdateButtons 禁用，但本函数
@@ -1636,8 +1634,6 @@ async function vcsQuery() {
   // 后端（否则提示退化成 "启动失败: HTTP 400 检索问题不能为空"）。
   if (!text) { vcsShowError("请输入检索问题"); return; }
   if (vcsQueryAbort) return;  // 已在检索中，防重复点击
-  const threshold = Number(vcsEl("vcs-threshold")?.value || 0.4);
-  const topK = Number(vcsEl("vcs-top-k")?.value || 10);
   // 注意：合并页没有独立的"检索"按钮（检索由统一「开始」触发，#vas-start
   // 的可用性 / 文案由 vasUpdateButtons 统一维护）。这里曾误用
   // vcsEl("vas-query") —— 那是「分析反查」的 modal 容器 div，给它赋
@@ -1652,18 +1648,18 @@ async function vcsQuery() {
   // LanceDB、不触碰单例的内存索引；ready 状态下取消勾选再检索，
   // 单例索引原样可用。
   if (VAS_SEARCH.cacheSel && VAS_SEARCH.cacheSel.size > 0) {
-    await vcsQueryMulti(text, threshold, topK, lenient ? topK : 0);
+    await vcsQueryMulti(text, lenient ? VCS_LENIENT_TOP_K : 0);
     return;
   }
   vcsQueryAbort = new AbortController();
   const timer = setTimeout(() => vcsQueryAbort.abort(), 40000);
   if (countEl) countEl.textContent = "检索中…";
   try {
-    const body = { text, sim_threshold: threshold, top_k: topK };
-    // 严格模式（默认）：阈值过滤后无命中就返回空。
-    // 勾选"宽松匹配" → min_results=topK，启用 fallback：
-    //   阈值过滤完后无命中时补回 top-N（无视阈值，标"低于阈值"）。
-    if (lenient) body.min_results = topK;
+    const body = { text };
+    // 严格模式（默认）：固定阈值 0.40 过滤后无命中就返回空。
+    // 勾选"宽松匹配" → min_results=10，启用 fallback：
+    //   阈值过滤完后无命中时补回 top-10（无视阈值，标"低于阈值"）。
+    if (lenient) body.min_results = VCS_LENIENT_TOP_K;
     const r = await fetch(API_PREFIX + "/video-analysis-search/search/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1720,17 +1716,23 @@ function initVideoSearch() {
   startBtn?.addEventListener("click", vasStart);
   stopBtn?.addEventListener("click", vasStop);
 
-  // 帧判据（算法 / 阈值 / 帧间隔）—— 与 vd / vtd / vtl 共用同一份组件
+  // 帧判据可视化（分数浮框）—— 与 vd / vtd / vtl 共用同一份组件
   // （app/static/core/frame-judge.js）。VAS 走自己的判据端点，因为它的
   // 判据挂在 VideoAnalysisService 上而不是共用的 VideoSession。
-  // syncControls:false —— 每 tick 推来的是**本轮真实**判据状态，而这里
-  // 的控件是"下次运行生效"的配置，两者不能互相覆盖（否则用户改完的阈值
-  // 会被本轮旧值抹掉）。
+  // VAS 的判据参数（算法 / 阈值 / 帧间隔）已固化为服务端常量：
+  //   * showConfig:false → 不渲染配置控件
+  //   * showCurve:false  → 不渲染「实时分数曲线」（参数不可调，曲线没有
+  //     调参价值；且向导视频源步的「打开」只是共享 VideoSession 的预览，
+  //     不创建 VAS 判据器，曲线只会停在「采集中…」）
+  // 只保留分数浮框。
+  // syncControls:false —— 每 tick 推来的是**本轮真实**判据状态，不能回写。
   window.FrameJudge?.mount({
     prefix: "vas",
     canvasId: "vcs-canvas",
     apiBase: "/api/video-analysis-search/judge",
     syncControls: false,
+    showConfig: false,
+    showCurve: false,
   });
 
   // 向导模式 / 手动预览 — 复用 vd 单例 VideoSession 跑连续预览帧流。
@@ -1845,15 +1847,6 @@ function initVideoSearch() {
 
   // 50 字计数（检索问题）
   bindTaCounter(textEl, vcsEl("vcs-ta-count"));
-
-  const topKEl = vcsEl("vcs-top-k");
-  const lenKEl = vcsEl("vcs-lenient-k");
-  const syncLenientK = () => {
-    const k = Number(topKEl?.value || 10);
-    if (lenKEl) lenKEl.textContent = String(k);
-  };
-  topKEl?.addEventListener("input", syncLenientK);
-  syncLenientK();
 
   // 播放器按钮 —— 按当前模式分派：视频源预览（previewWs）走 VideoSession
   // 控制（播放/暂停/停止，与 vd 页同款），检索片段回放走 /search/play。
@@ -2431,28 +2424,10 @@ async function vasStartAnalyze() {
   // 合并页共用视频源输入框（#vcs-source）。
   const sourceEl = document.getElementById("vcs-source");
   const source = (sourceEl?.value || "").trim();
-  // 判据（算法 / 阈值 / 帧间隔）由共享组件持有，这里只读取值拼请求体 ——
-  // 组件自己在用户改控件时就已经 POST 落库了，这里是把同一份配置告诉
-  // 服务端"本轮按这个跑"。分析提问已固化为服务端常量，不再随请求发送。
-  const judge = window.FrameJudge?.config("vas") ||
-                { mode: "manual", every_n: 30, threshold: 6 };
+  // 分析提问与判据参数（算法 / 阈值 / 帧间隔）均已固化为服务端常量，
+  // 请求体只带视频源。
   if (!source)  { vasShowError("请先选择视频源"); return; }
-  if (!Number.isInteger(judge.every_n) || judge.every_n < 1) {
-    vasShowError(judge.mode === "manual" ? "采样间隔必须为正整数" : "最长间隔必须为正整数");
-    return;
-  }
-  const body = {
-    source,
-    every_n: judge.every_n,
-    sample_mode: judge.mode,
-  };
-  if (judge.mode !== "manual") {
-    const thr = judge.threshold;
-    if (!Number.isFinite(thr) || thr <= 0 || thr > 1000) {
-      vasShowError("变化阈值必须是 (0, 1000] 之间的数字"); return;
-    }
-    body.change_threshold = thr;
-  }
+  const body = { source };
   vasShowError("");
   VAS.events = [];
   vasRenderEventList();
@@ -3298,10 +3273,9 @@ initVideoAnalysisSearch();
 //  应用向导模式 API — wizard 框架 finish 时调用
 // 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
 //   vcs-source → opts.source   vcs-text → opts.searchText
-//   vas-judge-mode/threshold/every-n → opts.judgeMode/judgeThreshold/judgeEveryN
 // source 齐全才点 #vas-start（统一入口按功能勾选并行发起分析/检索）；
-// searchText 非空时额外勾选「检索」功能并写入问题框。分析提问已固化为
-// 服务端常量，不再由向导收集。
+// searchText 非空时额外勾选「检索」功能并写入问题框。分析提问与判据参数
+// （算法 / 阈值 / 帧间隔）均已固化为服务端常量，不再由向导收集。
 // 写值后统一补发 input/change —— 卡片内源框 / 勾选框的监听依赖它们。
 // 全局名约定 ImApp_<app.id 去掉 hyphen>。
 // ------------------------------------------------------------------ *
@@ -3322,34 +3296,17 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
 
   if (opts.source) setVal("vcs-source", opts.source);
   if (opts.loop != null) setChecked("vcs-loop", !!opts.loop);
-  // 分析提问已固化为服务端常量，向导不再收集（原 opts.prompt 忽略）。
-  // 判据（算法 / 阈值 / 帧间隔）交给共享组件：fromWizard 会同步控件并 POST
-  // 落库。VAS 的判据是"下次开始分析生效"，所以这里必须 await 完成，否则
-  // 紧接着的 vas-start 可能带着上一套参数开跑。
-  // 老 wizard.json 的 sampleMode / everyN / changeThreshold 仍接受（兼容）。
-  const jMode = opts.judgeMode || opts.sampleMode;
-  const jEvery = opts.judgeEveryN || opts.everyN;
-  const jThr = opts.judgeThreshold || opts.changeThreshold;
-  const judgeApplied = await window.FrameJudge?.fromWizard("vas", {
-    judgeMode: jMode, judgeEveryN: jEvery, judgeThreshold: jThr,
-  }) ?? null;
+  // 分析提问与判据参数（算法 / 阈值 / 帧间隔）均已固化为服务端常量，
+  // 向导不再收集（老 wizard.json 的 judgeMode 等字段即使存在也会被忽略）。
   // 检索问题可选:填了才启用「检索」功能并写入问题框(勾选动作统一放到
   // 算力刷新之后,见下)
   const hasSearch = !!(opts.searchText && String(opts.searchText).trim());
   if (hasSearch) setVal("vcs-text", String(opts.searchText));
-  // 切片参数(检索提取用):select 默认 4s / 1s,wizard 采集后写回
-  const hasChunk = !!(opts.chunkSeconds || opts.chunkOverlap);
-  if (opts.chunkSeconds != null && opts.chunkSeconds !== "") {
-    setVal("vcs-chunk-seconds", String(opts.chunkSeconds));
-  }
-  if (opts.chunkOverlap != null && opts.chunkOverlap !== "") {
-    setVal("vcs-chunk-overlap", String(opts.chunkOverlap));
-  }
+  // 切片参数固化为服务端常量（4s / 重叠 1s），向导不再收集。
   const baseReady = !!opts.source;
   if (!baseReady) {
     return { source_set: !!opts.source,
-             judge_set: !!judgeApplied,
-             search_set: hasSearch, chunk_set: hasChunk, started: false };
+             search_set: hasSearch, started: false };
   }
   // 分析是向导主路径 —— 勾选前先主动刷新一次算力可用性。向导在
   // _waitForModelsRunning 之后立即回调,而前端 modeAvail 走 5s 周期,此刻
@@ -3362,11 +3319,11 @@ window.ImApp_video_analysis_search.applyWizardSnapshot = async function (opts) {
   if (btn) {
     try { btn.click(); }
     catch (e) { throw new Error("WizardSnapshotError:vas_start_failed:" + (e?.message || e)); }
-    return { source_set: true, judge_set: !!judgeApplied,
-             search_set: hasSearch, chunk_set: hasChunk, started: true };
+    return { source_set: true,
+             search_set: hasSearch, started: true };
   }
-  return { source_set: true, judge_set: !!judgeApplied,
-           search_set: hasSearch, chunk_set: hasChunk, started: false };
+  return { source_set: true,
+           search_set: hasSearch, started: false };
 };
 
 })();
