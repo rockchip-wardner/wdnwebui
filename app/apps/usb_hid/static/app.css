@@ -6,6 +6,50 @@
 
 .hidden { display: none !important; }
 
+/* 主屏/副屏切换提示 — info 蓝色横幅,放在 grid 之后。沿用 .tts-banner 的
+ * flex 节奏 (icon + text),配色照抄 .tts-banner-error 的浅底方案
+ * (浅底 + 1px 边框 + 深色文字) 只是把红换成蓝 —— 本页 body 是浅灰底
+ * (.tts-stage 那套),深底配色会让文字彻底看不见。链接给一个比正文
+ * 更深的蓝 + underline,保证和正文有明确的层级差。*/
+.usb-hid-tip {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 6px;
+  margin-bottom: 0.7rem;
+  font-size: 0.86rem;
+  line-height: 1.5;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1e3a8a;
+}
+.usb-hid-tip-icon { font-size: 1.1rem; flex: 0 0 auto; color: #2563eb; }
+.usb-hid-tip a {
+  color: #1d4ed8;
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.usb-hid-tip a:hover { color: #1e40af; }
+
+/* 自然语言任务输入卡 — “开发中” 占位。本卡全部内容 (textarea + 提交
+ * 按钮) 都 disabled，仅作为视觉占位让用户看到后续接线的位置。卡片
+ * 与 HDMI-IN 状态卡共用 .tts-card 样式，提交按钮用 .vd-btn / .vd-btn-primary
+ * (来自 framework.css，与 tts 卡片的主按钮同款)，复用其 :disabled
+ * 自带的 opacity 0.5 + cursor:not-allowed。*/
+.usb-hid-task-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.55rem;
+}
+.usb-hid-task-hint {
+  font-size: 0.78rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
 /* Wizard source step — 固定源样式。wizard 框架把 input 渲染成可写
  * 文本框，但 hdmiin 是硬件固定源，不可改。app.js 在 source step
  * 渲染时给 input 加 .is-fixed-source + readonly=true，并隐藏浏览

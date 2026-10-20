@@ -50,6 +50,43 @@
           </div>
         </div>
 
+        <!-- 主屏/副屏切换说明 -->
+        <div class="usb-hid-tip">
+          <span class="usb-hid-tip-icon" aria-hidden="true">ℹ</span>
+          <span class="usb-hid-tip-text">
+            Windows 默认把触摸屏输入绑定到单台显示器。要把触屏点击切换到另一台显示器，参见
+            <a href="https://learn.microsoft.com/zh-tw/answers/questions/3884307/2?spm=5176.28103460.0.0.96a02988BVXDKW&amp;forum=windows-all&amp;referrer=answers"
+               target="_blank" rel="noopener noreferrer">微软 Learn 教程：如何切换 Windows 上触摸屏控制的主屏/副屏</a>。
+          </span>
+        </div>
+
+        <!-- 自然语言任务输入。功能未接线 —— 显示一个清晰的“开发中”角标
+             让用户立刻知道这不是给生产用的入口,而只是为后续接入 LLM
+             任务循环预留的占位卡片。整个卡片的内容（textarea + 按钮）
+             全部 disabled，鼠标点击不会触发任何请求。-->
+        <div class="tts-card">
+          <div class="tts-card-head">
+            <h3>自然语言任务</h3>
+            <span class="badge warn" aria-label="开发中">开发中</span>
+          </div>
+          <div class="tts-card-body">
+            <textarea id="usb-hid-task-input"
+                      class="tts-text"
+                      rows="2"
+                      placeholder="请输入需要做什么"
+                      disabled></textarea>
+            <div class="usb-hid-task-row">
+              <button class="vd-btn vd-btn-primary" type="button" disabled>
+                提交任务
+              </button>
+              <span class="usb-hid-task-hint">
+                后续接入 LLM 任务循环：先识别用户意图 →
+                截屏取画面 → 调用 VLM 规划点击轨迹 → 透传到 HID 数字板。
+              </span>
+            </div>
+          </div>
+        </div>
+
         <!-- Compact status row -->
         <div class="tts-card">
           <div class="tts-card-head">

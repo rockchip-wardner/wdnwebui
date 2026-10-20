@@ -37,6 +37,6 @@
   },
   "requires_core": [],
   "uploads_dir": "",
-  "display_order": 1,
+  "display_order": 50,
   "wizard_config": "wizard.json"
 }
