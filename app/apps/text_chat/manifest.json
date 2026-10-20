@@ -52,6 +52,6 @@
     "compute.registry"
   ],
   "uploads_dir": "uploads/text_chat",
-  "display_order": 6,
+  "display_order": 70,
   "wizard_config": "wizard.json"
 }

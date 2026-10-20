@@ -68,6 +68,6 @@
     "video.session"
   ],
   "uploads_dir": "uploads/video_target_detection",
-  "display_order": 2,
+  "display_order": 20,
   "wizard_config": "wizard.json"
 }
