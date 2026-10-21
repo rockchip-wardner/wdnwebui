@@ -3,7 +3,7 @@
 用真实页面验证单卡降级在浏览器里成立：
   * vd  → 出现「完整功能需要 2 张计算卡」+ 二选一 radio，切换后只加载
            选中的那个模型，且落在 NPU0
-  * vas → 出现「本应用无法使用」+ 「下一步」禁用 + 没有「一键开启」按钮
+  * vr  → 单 capability 应用：无提示、不阻断，「一键开启」把模型落 NPU0
   * text_chat → 单卡提示 + 模型落 NPU0
 
 用例之间必须**互不污染**：每个用例前把本机模型停干净，并强制 reload
@@ -151,29 +151,32 @@ def main():
               and len(snap.get("model_cards") or []) == 1,
               f"cards={len(snap.get('cards') or [])}")
 
-        # ---------- 2. vas → 阻断（先做，避免被 vd 的模型状态污染） ----------
-        print("\n【2】监控分析检索（vas）—— 单卡不可用")
+        # ---------- 2. 监控反查（vr）→ 单 capability，不提示不阻断 ----------
+        print("\n【2】监控反查（vr）—— 单 capability 应用，单卡正常")
         reset_local_models(page)
-        open_wizard(page, "video-analysis-search")
+        open_wizard(page, "video-retrieval")
         check("页面上只有一个向导容器",
               wizard_container_count(page) == 1,
               str(wizard_container_count(page)))
         txt = body_text(page)
         check("停在第 1 步（env_check）", "软件能力 / 模型" in txt,
               " / ".join(txt.split("\n")[:3]))
-        check("出现阻断提示",
-              "本应用无法使用" in txt or "不可用" in txt,
-              " / ".join(txt.split("\n")[:3]))
-        check("两个 capability 都列为未满足",
-              "✗ swcap_video_describe" in txt
-              and "✗ swcap_video_retrieval" in txt,
-              " | ".join(r for r in rows(page) if r.startswith("✗")))
-        check("没有「一键开启所需模型」按钮",
-              page.locator(f"#{NS}env-bring-btn").count() == 0)
-        nxt = page.locator(f"#{NS}next-btn")
-        check("「下一步」被禁用",
-              nxt.count() == 1 and nxt.is_disabled(),
-              f"count={nxt.count()}")
+        check("没有单卡提示块（单 capability 应用不打扰用户）",
+              page.locator(f".{NS}single-notice").count() == 0,
+              f"count={page.locator(f'.{NS}single-notice').count()}")
+        check("只列自己的 capability",
+              any("swcap_video_retrieval" in r for r in rows(page)),
+              " | ".join(rows(page)))
+        check("有「一键开启所需模型」按钮",
+              page.locator(f"#{NS}env-bring-btn").count() == 1,
+              f"count={page.locator(f'#{NS}env-bring-btn').count()}")
+        # 「下一步」的禁用状态只跟 **env 检查**（模型是否就绪）有关，跟单卡
+        # 无关 —— 阻断与否看上面两条：无单卡提示块 + 有「一键开启」按钮
+        # （阻断时按钮不渲染）。所以这里不断言禁用状态：模型跑没跑是
+        # 另一件事，断言它只会让测试依赖模型加载时序。
+        check("「下一步」按钮在",
+              page.locator(f"#{NS}next-btn").count() == 1,
+              f"count={page.locator(f'#{NS}next-btn').count()}")
         check("「跳过向导」仍在（用户能离开）",
               page.locator(f".{NS}skip-btn").count() == 1)
 

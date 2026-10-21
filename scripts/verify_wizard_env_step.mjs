@@ -282,12 +282,12 @@ console.log("\n【C】_fieldKey：wizard.json 的 ui_key 优先");
   // 真实契约：_fieldKey 只在 field.id 以 "<appId>-" 开头时才剥前缀。
   // 实际 7 张卡里**没有一张**用 "<appId>-" 前缀（都用 2~3 字母的短前缀），
   // 所以剥前缀分支实际是死路 —— opts key 完全由 ui_key 决定，缺失时退化成
-  // 带前缀的 camelCase（vr-source → vcsSource）。各卡因此每个字段都显式
+  // 带前缀的 camelCase（vr-source → vrSource）。各卡因此每个字段都显式
   // 写了 ui_key。
   check("显式 ui_key 优先于 id 推导",
     priv._fieldKey("video-target-localization", { id: "vtl-sources", ui_key: "source" }) === "source");
   check("前缀不匹配时不剥（video-retrieval 同款短前缀）",
-    priv._fieldKey("video-retrieval", { id: "vr-source" }) === "vcsSource");
+    priv._fieldKey("video-retrieval", { id: "vr-source" }) === "vrSource");
   check("前缀匹配时才剥",
     priv._fieldKey("text-chat", { id: "text-chat-prompt" }) === "prompt");
   // 全卡扫描：任何一张卡的 form 字段漏写 ui_key 都要被抓出来 —— opts key

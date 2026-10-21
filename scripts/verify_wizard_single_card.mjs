@@ -2,11 +2,11 @@
  * 单计算卡降级策略回归 —— 纯 Node + 最小 DOM shim，**不需要 playwright**。
  *
  * 背景：一张 RK1828 协卡放不下两个模型（AGENTS.md v0.17 实测：同卡叠两个
- * 模型 rc=-6）。双卡板上 vd / vas 各跑两个模型；单卡板上必须降级：
+ * 模型 rc=-6）。双卡板上 vd 跑两个模型；单卡板上必须降级：
  *
  *   * 单 capability 的应用 —— 模型照常加载，只是落到唯一那张卡上（NPU0）。
- *   * 多 capability 的应用 —— 要么让用户二选一（vd），要么直接不可用
- *     （vas 刚需两个模型同时在位）。
+ *   * 多 capability 的应用 —— 让用户二选一（vd）。
+ *   * 多 capability 且没声明 single_card_pick —— 刚需多模型，单卡不可用。
  *
  * **双卡路径必须逐字不变** —— 这是本次改动最硬的约束，所以每个用例都
  * 成对断言「双卡 vs 单卡」两套结果。
@@ -310,7 +310,7 @@ console.log("【A】双卡路径 —— 必须与改动前逐字一致（无单�
 {
   for (const appId of ["text_chat", "tts", "video_target_detection",
                        "video_target_localization", "video_detection",
-                       "video_analysis_search"]) {
+                       "video_retrieval"]) {
     const r = await mountEnv(appId, 2, [0, 1]);
     check(`${appId}: 无单卡提示块`, noticeBlocks(r.body).length === 0,
       `count=${noticeBlocks(r.body).length}`);
@@ -399,26 +399,29 @@ console.log("\n【D】单卡 —— vd 多 capability 二选一");
     && posts[0].npu_index === 0, JSON.stringify(posts));
 }
 
-console.log("\n【E】单卡 —— vas 刚需两个模型，直接不可用");
+console.log("\n【E】单卡 —— 单 capability 的检索卡（监控反查）不提示、不阻断");
 {
-  const r = await mountEnv("video_analysis_search", 1, [0]);
-  check("vas: 出现阻断提示块", noticeBlocks(r.body).length === 1);
-  const txt = noticeText(r.body);
-  check("vas: 提示写明无法使用",
-    txt.includes("无法使用") || txt.includes("不可用"), txt.replace(/\n/g, " | "));
-  check("vas: 没有「一键开启所需模型」按钮", bringBtn(r.body) === null);
-  check("vas: 「下一步」被禁用", nextBtnDisabled(r.foot) === true,
+  // 监控反查（video_retrieval）只有 1 个 capability（swcap_video_retrieval）
+  // —— 单卡下它跟普通单 capability 应用一样：模型落到唯一卡位，功能不变。
+  // 早期版本的「监控分析检索」是刚需两个模型（分析+检索）才会被单卡阻断，
+  // 卡片改名后那个前提已不存在。
+  const r = await mountEnv("video_retrieval", 1, [0]);
+  check("vr: 单 capability 应用**不显示**任何单卡提示块",
+    noticeBlocks(r.body).length === 0,
+    `count=${noticeBlocks(r.body).length}`);
+  check("vr: 单卡策略生效（模型落到唯一卡位）",
+    r.single !== null && r.single.active === true
+    && r.single.blocked === false);
+  check("vr: swcap_to_model 被裁成单卡（卡号=0）",
+    r.state.cfg.swcap_to_model["swcap_video_retrieval"].npu_index === 0,
+    JSON.stringify(r.state.cfg.swcap_to_model));
+  check("vr: 「下一步」不被禁用", nextBtnDisabled(r.foot) !== true,
     String(nextBtnDisabled(r.foot)));
-  check("vas: 两个 capability 都列为未满足",
-    r.body.text().includes("✗ swcap_video_describe")
-    && r.body.text().includes("✗ swcap_video_retrieval"),
-    r.body.text().split("\n").filter((l) => l.startsWith("✗")).join(" | "));
-  // 关键：被阻断的应用绝不能发出任何启停请求
-  posts = []; deletes = [];
+  posts = [];
   await globalThis.window._wizardBringUpModels(r.state.cfg);
-  check("vas: 不产生任何启停请求",
-    posts.length === 0 && deletes.length === 0,
-    `posts=${posts.length} deletes=${deletes.length}`);
+  check("vr: 一键开启只 POST 检索模型 @ npu0",
+    posts.length === 1 && posts[0].model === "qwen3-vl-embedding-2b"
+    && posts[0].npu_index === 0, JSON.stringify(posts));
 }
 
 console.log("\n【F】探测失败 / 后端没给 card_count —— 不得误判成单卡");

@@ -304,8 +304,8 @@
     const single = state.single || null;
     const singleOn = !!(single && single.active);
     const blocked = !!(singleOn && single.blocked);
-    // 单卡下 capability 集合可能被裁剪：vd 二选一只留选中的那条；vas
-    // 不可用时两条都列出来,说明为什么不可用。
+    // 单卡下 capability 集合可能被裁剪：vd 二选一只留选中的那条；多
+    // capability 又没声明二选一时,两条都列出来,说明为什么不可用。
     const swRequired = singleOn
       ? (single.requiredCaps || [])
       : (state.envCheck.swRequired || []);
@@ -539,11 +539,11 @@
   // 单卡策略（v0.24）                                                   //
   // ------------------------------------------------------------------ //
   // 一张 RK1828 协卡放不下两个模型（AGENTS.md v0.17 实测：同卡叠两个
-  // 模型 rc=-6）。双卡板上 vd / vas 各跑两个模型；单卡板上必须降级：
+  // 模型 rc=-6）。单卡板上必须降级：
   //
   //   * 单 capability 的应用 —— 模型照常加载，只是落到唯一那张卡上。
   //   * 多 capability 的应用 —— 要么让用户二选一（vd），要么直接不可用
-  //     （vas 刚需两个模型同时在位，单卡承载不了）。
+  //     （刚需两个模型同时在位，单卡承载不了）。
   //
   // 实现手法：单卡时把 `_active.cfg` 换成一份**裁剪过的副本** ——
   // `swcap_to_model` 只留本应用单卡下真正要用的那条，`npu_index` 指向
@@ -574,7 +574,7 @@
 
     // 多 capability：应用自己声明「单卡下能二选一的是哪两个」（wizard.json
     // 的 single_card_pick，可带 skip_steps）。声明了就让用户选；没声明
-    // = 刚需多模型（如 vas）→ 单卡不可用。
+    // = 刚需多模型 → 单卡不可用。
     const pick = Array.isArray(cfg.single_card_pick) ? cfg.single_card_pick : [];
     const usable = pick.filter(
       (p) => p && p.cap && cfg.swcap_to_model && cfg.swcap_to_model[p.cap]);
