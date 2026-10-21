@@ -1177,7 +1177,21 @@
 
     const finishBtn = _ce("button", WIZARD_NS + "primary-btn", "完成配置");
     finishBtn.id = WIZARD_NS + "finish-btn";
-    foot.innerHTML = "";
+    // footer 复用 _renderFootNext —— 它按 currentStep 决定给不给
+    // 「上一步」,并因为 finish 是最后一步自动不给「下一步」,同时
+    // 始终给「跳过向导」。
+    //
+    // 为什么必须复用(不要再 foot.innerHTML="" 只挂 finishBtn):
+    // _gotoStep 会把当前步骤号落 localStorage(`wdnwebui.wizard.<id>.step`),
+    // mount 时 _lsLoadStep 恢复到该步。于是"走到过 finish 但没点完成
+    // 配置就离开"(比如点右上角返回,那条路径只 captureValues + 改 hash,
+    // **故意不清 step**)会让下次进卡直接停在 finish 页 —— 而旧实现
+    // 的 finish 页只有一个「完成配置」按钮,没有任何回退出口,用户既回
+    // 不到前面的步骤,也去不了应用页,成了死胡同(用户实测)。
+    //
+    // 注意按钮顺序:skip-btn 带 margin-right:auto 被顶到最左,
+    // back-btn 紧贴其右,primary(完成配置)留在最右 —— 与其它步骤一致。
+    _renderFootNext(foot, cfg, state, false);
     foot.appendChild(finishBtn);
 
     finishBtn.addEventListener("click", async () => {
@@ -1297,10 +1311,23 @@
     const { cfg, container, app } = _active;
     if (idx < 0 || idx >= cfg.steps.length) return;
     _active.currentStep = idx;
-    // 落盘:用户切走 / reboot 后下次 mount 跳回这里。存**步骤 id**而不是
-    // 下标 —— 单卡下步骤表会被裁剪,下标会错位(见 _lsLoadStep 注释)。
     const stepDef = cfg.steps[idx];
-    _lsSaveStep(app.id, cfg, (stepDef && stepDef.id) || idx);
+    // 落盘:用户切走 / reboot 后下次 mount 跳回这里。写盘失败不
+    // 影响本次 UI(只是个 best-effort 提示)。存**步骤 id**而不是下标
+    // —— 单卡下步骤表会被裁剪,下标会错位(见 _lsLoadStep 注释)。
+    //
+    // **finish 步骤刻意不落盘**。落盘的意义是"用户填到第 N 步中途
+    // 切走,下次别把已填的值丢了的既视感" —— 但 finish 步没有任何
+    // 输入框,用户停在它上面不代表"填了一半",只代表他走到了最后
+    // 一步。把它当"停留位置"存下来,后果是:用户没点完成配置就离开
+    // (点右上角返回走的是 captureValues + location.hash,故意不清
+    // step)→ 下次进卡 mount 恢复到 finish → 一进来就是完成配置页。
+    // 对"填了一半"的表单步恢复是对的,对终点步恢复只是噪音。
+    //
+    // 注意与"存 id"是叠加关系而不是替代:该存的表单步仍然存 id,
+    // 只是终点步改走 clear。
+    if ((stepDef || {}).kind === "finish") _lsClearStep(app.id, cfg);
+    else _lsSaveStep(app.id, cfg, (stepDef && stepDef.id) || idx);
     _renderStepper(_q("#" + WIZARD_NS + "stepper", container), cfg, idx);
     const body = _q("#" + WIZARD_NS + "body", container);
     const foot = _q("#" + WIZARD_NS + "foot", container);
