@@ -148,6 +148,19 @@ class HdmiInCapture:
         self._encode_errors: int = 0
         self._started_at: float = 0.0
         self._lock = threading.Lock()
+        # ---- AI-control side channel ---------------------------------- #
+        # ``latest_jpeg`` is all the browser preview needs, but the
+        # 智能电脑控制 agent has to hand a *pixel* frame to the VLM and
+        # must see the exact same frame the operator is looking at.
+        # Keeping every frame would cost a 6 MB copy × 30 fps forever,
+        # so this is a strict one-shot request channel: the agent sets
+        # ``_bgr_wanted``, the capture thread copies the *next* dequeued
+        # frame (the same one it is about to JPEG-encode) into
+        # ``_latest_bgr`` and bumps ``_bgr_seq``. No requester → the
+        # flag stays False and the hot path is untouched.
+        self._bgr_wanted: bool = False
+        self._latest_bgr: Optional[np.ndarray] = None
+        self._bgr_seq: int = 0
         # Captured at start(): driver / card / QUERYCAP / negotiated fmt.
         # probe() reads this when the capture is running so it doesn't have
         # to call V4L2Capture again (which would compete for /dev/video0
@@ -171,9 +184,97 @@ class HdmiInCapture:
         return self._device
 
     @property
+    def running(self) -> bool:
+        """Is the capture thread actually dequeuing frames?
+
+        The AI-control agent uses this to tell "the capture isn't up"
+        apart from "the PC sent black frames", which are two very
+        different user-facing errors.
+        """
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
     def latest_jpeg(self) -> Optional[bytes]:
         with self._lock:
             return self._latest_jpeg
+
+    def grab_bgr(self, *, timeout: float = 5.0) -> Optional[np.ndarray]:
+        """Block until a frame captured **after this call** is available.
+
+        Returns a private ``(h, w, 3)`` BGR ndarray at the V4L2 native
+        resolution (1920×1080 on this board), or ``None`` when the
+        capture isn't running / nothing arrives within ``timeout``.
+
+        Why native resolution and not the 1280×720 preview JPEG:
+
+        * No JPEG decode, no second downscale — the agent hands the
+          array straight to ``wdnai.utils.letterbox_resize_with_meta``,
+          which produces the square canvas the vision RKNN wants.
+          Downscaling here would throw away exactly the small-UI-element
+          detail that GUI grounding lives or dies on, for nothing.
+        * The frame is the *same* dequeue the preview JPEG comes from,
+          so the coordinates the model outputs always refer to what the
+          operator is looking at.
+
+        The returned array is freshly allocated and never mutated after
+        publication (``_latest_bgr`` is replaced, not written into), so
+        the caller can hold it for the whole inference without copying.
+        """
+        if not (self._thread and self._thread.is_alive()):
+            return None
+        with self._lock:
+            start_seq = self._bgr_seq
+            self._bgr_wanted = True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                if self._bgr_seq != start_seq and self._latest_bgr is not None:
+                    return self._latest_bgr
+            if time.monotonic() >= deadline:
+                # Give the request back so a dead capture thread can't
+                # leave the flag armed forever.
+                with self._lock:
+                    self._bgr_wanted = False
+                return None
+            # ``time.sleep`` and not ``Event.wait`` — see the wait_idle()
+            # note in AGENTS.md: the capture thread's dequeue + memcpy
+            # needs the GIL to make progress.
+            time.sleep(0.01)
+
+    def _maybe_snapshot_bgr(self, plane: np.ndarray) -> None:
+        """One-shot private copy of ``plane`` for :meth:`grab_bgr`.
+
+        Called from :meth:`_run` *before* the frame is requeued, and
+        only when :meth:`grab_bgr` has armed the request — so the 30 fps
+        preview loop pays nothing when no agent is running.
+        """
+        with self._lock:
+            if not self._bgr_wanted:
+                return
+            self._bgr_wanted = False
+        try:
+            h, w = self._cap.height, self._cap.width
+            if plane.ndim == 1:
+                plane = plane.reshape(h, w, 3)
+            # ``plane`` is a view onto the V4L2 mmap'd buffer, which the
+            # driver overwrites the moment we requeue it — hence the
+            # copy. No resize happens here on purpose (see
+            # :meth:`grab_bgr`), so no RGA pass is involved either.
+            #
+            # ``.copy()`` and NOT ``np.ascontiguousarray(plane)``: the
+            # plane is already C-contiguous (it's a flat view reshaped
+            # back to (h, w, 3)), and ascontiguousarray documents
+            # "no copy is performed if the array is already
+            # C-contiguous" — it would hand back the *same* aliasing
+            # view. The agent would then be looking at memory the
+            # driver is free to overwrite mid-inference.
+            frame = plane.copy()
+        except Exception as e:  # noqa: BLE001
+            _LOG.warning("hdmiin bgr snapshot failed: %s", e)
+            return
+        with self._lock:
+            self._latest_bgr = frame
+            self._bgr_seq += 1
 
     @property
     def stats(self) -> dict:
@@ -365,6 +466,10 @@ class HdmiInCapture:
                 continue
             empty_count = 0
             starved_since = None
+            # Same frame the preview JPEG is about to encode, so the AI
+            # and the operator are looking at one identical picture.
+            # No-op unless grab_bgr() armed the one-shot request.
+            self._maybe_snapshot_bgr(buf.plane_arrays[0])
             try:
                 jpeg = self._encode_jpeg(buf.plane_arrays[0])
             except Exception as e:  # noqa: BLE001

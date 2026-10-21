@@ -29,6 +29,19 @@ Endpoint summary
 * ``POST /api/usb-hid/digitizer/leave``  — pen off the tablet.
 * ``POST /api/usb-hid/reset``            — release all keys +
                                             tip_up, for panic-stop.
+* ``POST /api/usb-hid/task/start``       — ``{task, max_steps?,
+                                            settle_s?}`` → start the
+                                            AI-control loop on a
+                                            background thread. 409 when
+                                            one is already running, 502
+                                            when
+                                            ``swcap_computer_control``
+                                            has no instance, 503 when
+                                            hwcap_hdmiin is off.
+* ``POST /api/usb-hid/task/stop``        — stop the loop, release the
+                                            host. Idempotent.
+* ``GET  /api/usb-hid/task/status``      — state / elapsed / per-step
+                                            log for the UI.
 * ``POST /api/usb-hid/desk``             — ``{width, height}`` →
                                             store the host screen size
                                             so future pixel-typed calls
@@ -49,6 +62,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from app.apps.usb_hid import agent as agent_mod
 from app.apps.usb_hid.service import (
     get_digitizer,
     get_keyboard,
@@ -133,6 +147,21 @@ class _Desk(BaseModel):
     model_config = {"extra": "ignore"}
     width: int = Field(ge=1, le=65535)
     height: int = Field(ge=1, le=65535)
+
+
+class _TaskStart(BaseModel):
+    model_config = {"extra": "ignore"}
+    task: str = Field(min_length=1, max_length=500)
+    #: Step budget. Clamped to ``[1, HARD_MAX_STEPS]`` server-side — the
+    #: number exists so an operator can give a long multi-window job
+    #: room, not so a runaway loop can burn the NPU overnight.
+    max_steps: int = Field(default=agent_mod.DEFAULT_MAX_STEPS,
+                           ge=1, le=agent_mod.HARD_MAX_STEPS)
+    #: Seconds to let the PC repaint between an action and the next
+    #: screenshot. Exposed because "network app is slow" is the single
+    #: most common reason a GUI agent looks like it's stuck.
+    settle_s: float = Field(default=agent_mod.DEFAULT_SETTLE_S,
+                            ge=0.0, le=10.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -482,6 +511,63 @@ async def post_reset() -> dict[str, Any]:
     except manager.GadgetError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return {"ok": True, "keyboard_bytes": kb, "digitizer_bytes": dig}
+
+
+# --------------------------------------------------------------------------- #
+# AI 电脑控制 — natural-language task loop
+#
+# These three endpoints are the *only* long-lived background thing on
+# this card, which means the manifest's ``demo_guard`` block is no
+# longer empty (see manifest.json) — DemoGuard has to stop this on
+# in-app navigation and on beforeunload, or the PC ends up being driven
+# by a model while the operator thinks the page is idle.
+# --------------------------------------------------------------------------- #
+@router.post("/task/start")
+async def post_task_start(payload: _TaskStart) -> dict[str, Any]:
+    """Start the agent loop on a background thread. Returns immediately.
+
+    409 when a task is already running (two loops writing the same HID
+    endpoints would interleave into garbage on the host).
+
+    503 when ``hwcap_hdmiin`` is off — without a screenshot the agent
+    has nothing to look at, and letting it start would only produce a
+    confusing failure on step 1.
+
+    502 when ``swcap_computer_control`` has no running instance. Per
+    AGENTS.md 设计原则 4 the registry raises
+    ``RuntimeError("功能未启用: ...")``; it is translated here into the
+    same 502 the other cards use so the frontend renders one uniform
+    "go enable the model" message.
+    """
+    if not _hdmiin_capability_enabled():
+        raise HTTPException(status_code=503, detail="hdmiin 未启用")
+    ag = agent_mod.get_agent()
+    # Probe the capability *before* spawning the thread so an
+    # unconfigured model is a synchronous, actionable error instead of
+    # a loop that dies one second later with an opaque error string.
+    try:
+        ag._get_session()  # noqa: SLF001
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    try:
+        return ag.start(payload.task, max_steps=payload.max_steps,
+                        settle_s=payload.settle_s)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/task/stop")
+async def post_task_stop() -> dict[str, Any]:
+    """Stop the loop and leave the host clean. Idempotent."""
+    return agent_mod.get_agent().stop()
+
+
+@router.get("/task/status")
+async def get_task_status() -> dict[str, Any]:
+    """Poll the loop: state, elapsed, and the per-step log."""
+    return agent_mod.get_agent().status()
 
 
 @router.post("/desk")

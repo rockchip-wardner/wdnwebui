@@ -33,11 +33,10 @@
 }
 .usb-hid-tip a:hover { color: #1e40af; }
 
-/* 自然语言任务输入卡 — “开发中” 占位。本卡全部内容 (textarea + 提交
- * 按钮) 都 disabled，仅作为视觉占位让用户看到后续接线的位置。卡片
- * 与 HDMI-IN 状态卡共用 .tts-card 样式，提交按钮用 .vd-btn / .vd-btn-primary
- * (来自 framework.css，与 tts 卡片的主按钮同款)，复用其 :disabled
- * 自带的 opacity 0.5 + cursor:not-allowed。*/
+/* 自然语言任务卡 — AI 自动控制。与 HDMI-IN 状态卡共用 .tts-card 样式，
+ * 提交按钮用 .vd-btn / .vd-btn-primary(来自 framework.css，与 tts
+ * 卡片的主按钮同款)，复用其 :disabled 自带的 opacity 0.5 +
+ * cursor:not-allowed。卡片与 HDMI-IN 状态卡共用 .tts-card 样式。*/
 .usb-hid-task-row {
   display: flex;
   align-items: center;
@@ -48,6 +47,69 @@
   font-size: 0.78rem;
   color: var(--muted);
   line-height: 1.45;
+  margin-top: 0.5rem;
+}
+.usb-hid-task-steps-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.usb-hid-task-steps {
+  width: 5rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 4px;
+  background: var(--bg, #fff);
+  color: inherit;
+}
+
+/* 逐步日志。刻意用 <ol> + 序号而非表格：步数多的时候（默认上限 12，
+ * 可调到 60）编号本身就是"走到第几步"的第一信息，表格反而要多看一列。*/
+.usb-hid-task-log {
+  list-style: none;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  max-height: 16rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.usb-hid-task-log:empty { display: none; }
+.usb-hid-task-log li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.3rem 0.5rem;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+.usb-hid-task-log li.is-error {
+  background: rgba(231, 76, 60, 0.12);
+}
+.usb-hid-task-idx {
+  flex: 0 0 1.8rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted);
+}
+.usb-hid-task-act {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+.usb-hid-task-log li.is-error .usb-hid-task-act { color: #e74c3c; }
+.usb-hid-task-target {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #2563eb;
+}
+.usb-hid-task-thought {
+  flex: 1 1 auto;
+  color: var(--muted);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* Wizard source step — 固定源样式。wizard 框架把 input 渲染成可写

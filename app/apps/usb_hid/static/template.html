@@ -60,30 +60,43 @@
           </span>
         </div>
 
-        <!-- 自然语言任务输入。功能未接线 —— 显示一个清晰的“开发中”角标
-             让用户立刻知道这不是给生产用的入口,而只是为后续接入 LLM
-             任务循环预留的占位卡片。整个卡片的内容（textarea + 按钮）
-             全部 disabled，鼠标点击不会触发任何请求。-->
-        <div class="tts-card">
+        <!-- 自然语言任务 —— AI 自动控制。循环在服务端
+             （app/apps/usb_hid/agent.py），前端只做三件事：提交任务、
+             轮询 /task/status、把逐步日志画出来。
+
+             页面卸载 / 切走时 DemoGuard 会 POST /task/stop（见
+             manifest.json 的 demo_guard），所以这里不需要自己绑
+             beforeunload —— 绑了也是重复触发。 -->
+        <div class="tts-card" id="usb-hid-task-card">
           <div class="tts-card-head">
             <h3>自然语言任务</h3>
-            <span class="badge warn" aria-label="开发中">开发中</span>
+            <span class="badge" id="usb-hid-task-badge" hidden>运行中</span>
+            <span class="tts-meta-inline" id="usb-hid-task-elapsed">—</span>
           </div>
           <div class="tts-card-body">
             <textarea id="usb-hid-task-input"
                       class="tts-text"
                       rows="2"
-                      placeholder="请输入需要做什么"
-                      disabled></textarea>
+                      placeholder="例如：打开记事本，输入 hello world 并保存"></textarea>
             <div class="usb-hid-task-row">
-              <button class="vd-btn vd-btn-primary" type="button" disabled>
-                提交任务
+              <label class="usb-hid-task-steps-label" for="usb-hid-task-max-steps">
+                最大步数
+              </label>
+              <input id="usb-hid-task-max-steps" class="usb-hid-task-steps"
+                     type="number" min="1" max="60" step="1" value="12" />
+              <button class="vd-btn vd-btn-primary" id="usb-hid-task-start"
+                      type="button">开始执行</button>
+              <button class="vd-btn" id="usb-hid-task-stop" type="button" disabled>
+                停止
               </button>
-              <span class="usb-hid-task-hint">
-                后续接入 LLM 任务循环：先识别用户意图 →
-                截屏取画面 → 调用 VLM 规划点击轨迹 → 透传到 HID 数字板。
-              </span>
             </div>
+            <div class="usb-hid-task-hint" id="usb-hid-task-hint">
+              AI 每执行一步都会重新截一次屏并重新判断，所以耗时取决于步数
+              （每步 = 截屏 + 模型推理 + 等 PC 反应）。需要模型时请到
+              「算力配置」确认 qwen3.5-4b 已启动。
+            </div>
+            <div class="tts-status" id="usb-hid-task-status"></div>
+            <ol class="usb-hid-task-log" id="usb-hid-task-log"></ol>
           </div>
         </div>
 

@@ -6,7 +6,9 @@
   "version": "0.1.0",
   "preview_video": "/static/apps/usb-hid/preview.mp4",
   "preview_image": "",
-  "software_capabilities": [],
+  "software_capabilities": [
+    "swcap_computer_control"
+  ],
   "hardware_capabilities": [
     "hwcap_hdmiin",
     "hwcap_hid_gadget"
@@ -26,9 +28,13 @@
     ]
   },
   "demo_guard": {
-    "active_state_keys": [],
-    "stop_endpoints": [],
-    "stop_sync_endpoints": []
+    "active_state_keys": ["running", "state"],
+    "stop_endpoints": [
+      { "method": "POST", "path": "/api/usb-hid/task/stop" }
+    ],
+    "stop_sync_endpoints": [
+      { "method": "POST", "path": "/api/usb-hid/task/stop" }
+    ]
   },
   "prompts": {
     "schema_class": "",

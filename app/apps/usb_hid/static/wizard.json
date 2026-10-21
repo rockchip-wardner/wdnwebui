@@ -1,10 +1,20 @@
 {
   "enabled": true,
   "wizard_title": "智能电脑控制 — 快速配置",
-  "swcap_to_model": {},
+  "swcap_to_model": {
+    "swcap_computer_control": { "npu_index": 0, "model_id": "qwen3.5-vl-4b" }
+  },
   "start_buttons": [],
   "steps": [
     { "id": "env",    "title": "运行环境检查",   "kind": "env_check" },
+    { "id": "task",   "title": "要完成的任务",   "kind": "form",
+      "fields": [
+        { "id": "usb-hid-task", "ui_key": "task", "label": "让 AI 在电脑上做什么（一句话，可留空后到页面里再填）", "type": "textarea" },
+        { "id": "usb-hid-max-steps", "ui_key": "maxSteps", "label": "最大执行步数", "type": "number",
+          "default": 12, "min": "1", "max": "60",
+          "placeholder": "默认 12；每一步 = 一次截屏 + 一次模型推理 + 一次动作下发" }
+      ]
+    },
     { "id": "finish", "title": "完成配置",       "kind": "finish" }
   ]
 }

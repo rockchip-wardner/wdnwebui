@@ -939,6 +939,7 @@ app/apps/<card_id>/
 | `video-detection` | `swcap_video_describe` | `app.apps.video_detection` (+ `tts_alert` 工具) |
 | `video-target-detection` | `swcap_video_describe` | `app.apps.video_target_detection` (TargetDoc) |
 | `video-target-localization` | `swcap_grounding` | `app.apps.video_target_localization` (LocatorDoc) |
+| `usb-hid` | `swcap_computer_control` | `app.apps.usb_hid`（手动透传 + AI 任务循环 `agent.py`） |
 
 `scene-threshold-tuner`(曾用名「阈值标定」,显示名「视频画面变更阈值测试」)
 已在 v0.18 **整卡下线**:它的能力(帧间差异判定)不再需要单独一张卡 ——
@@ -948,6 +949,221 @@ app/apps/<card_id>/
 `FrameJudge` 的默认),代码已删除。
 
 新增卡片示例(如加一个"图像 OCR"应用):只需 `mkdir app/apps/ocr && 写 manifest.json + api.py + service.py + __init__.py + static/`,`display_order` 自动出现在侧栏,**不动** `app/main.py` 或任何 core 模块。
+
+## AI 电脑控制（usb-hid 的任务循环）
+
+`usb-hid` 卡从 v0.25 起不只是「手动把点击/按键透传给 PC」，还多了一条
+**自然语言 → AI 自主操作 PC** 的回路（`app/apps/usb_hid/agent.py`）：
+
+```
+截屏(HDMI-IN) → prompt(任务 + 已执行动作历史) → VLM 输出一个动作
+              → 0-1000 → 帧像素 → PC 虚拟桌面像素 → 写 HID
+              → 等 PC 反应(1.2s) → 下一轮，直到 done / 停止 / 步数上限
+```
+
+### 为什么单独开一个 swcap
+
+`get_session(capability)` 命中多实例时按「本机优先 + 卡号升序」取第一个
+（`registry.py::get_session`）。`swcap_video_describe` 同时被 qwen3-vl-4b 和
+qwen3.5-vl-4b 声明 —— 电脑控制拿到哪个模型取决于卡号排列，用户不可控。
+`swcap_computer_control` **只**挂在 `workers/qwen3.5-vl-4b.json` 上，取到的
+永远是那一个。不新开 worker manifest：电脑控制要的也是「吃一张图 + 出文本」，
+与 qwen3.5-vl-4b 能力同构。
+
+> `config.jsonc` 已在 `compute.autostart` 里加上 `qwen3.5-vl-4b`（npu0），
+> 但该文件是 **.gitignore 的**（per-user 配置），换机器要手动加一行。
+
+### worker 端一行语义都不能有
+
+action 的 schema、0-1000→帧像素→PC 像素的两次换算、键名解析、所有 HID 副作用
+**全部在主进程**（设计原则 6）。除了「worker 是 detach 进程不能 reload」这个
+老理由，还因为同一份 RKNN 会挂多个 capability，action 语义必须跟着**调用方**
+走。相应地**不要调 `sess.reset()`**：qwen3.5-vl-4b 这个实例同时挂着
+`swcap_text_chat`（微信对话）和 `swcap_computer_control`，每轮 prompt 都是
+自包含的不依赖 worker 侧会话历史，reset 只会把并发的微信对话历史一起清掉。
+
+### `@Generable` schema 的两条老规矩（沿用 TargetDoc）
+
+1. 继承 pydantic `BaseModel`，**不继承 `LMOutput`** —— 后者带
+   `attachment: List[Attachment]` 字段，`model_json_schema()` 会抛
+   `PydanticInvalidForJsonSchema`，SDK catch 后返回**空串**，模型看不到任何
+   字段说明。
+2. **不能有 class docstring** —— pydantic 会把它渲染进 schema 顶层
+   `description`，模型就把真字段整个包进 `{"description": {...}}`。
+
+另外 `action` 用 `Literal[...]` 而不是自由字符串：enum 原样进 JSON schema，
+4B 模型在 enum 上的服从率远高于"自己挑一个动词"。
+
+### 踩过的坑：`np.ascontiguousarray` 不复制（症状：截图在推理中途自己变了）
+
+`HdmiInCapture._maybe_snapshot_bgr` 要把 V4L2 的 mmap 帧拷一份给 agent。
+最初写成 `np.ascontiguousarray(plane)` —— 它文档里明写
+"**no copy is performed if the array is already C-contiguous**"，而
+`plane` 是 mmap 的 flat view，`reshape(h, w, 3)` 之后**本来就是 C-contiguous**，
+于是它原样返回同一个 view。`cap.requeue(buf)` 之后驱动随时可以覆写这块内存，
+agent 于是拿着**推理过程中被改写的帧**去算坐标 —— 不崩溃、不报错，只是点击
+位置莫名其妙漂几像素。
+
+**必须写 `plane.copy()`。** 单测里唯一能抓住它的断言是
+`np.shares_memory(got, mmap)` 必须为 False：形状/类型/内容全对，只有这个能证
+明"拷了"。
+
+### 坐标三次空间
+
+模型看到的是 `letterbox_resize_with_meta` 产出的**方形画布（含灰边）**，输出
+0–1000 —— 与 TargetDoc 契约完全一致：
+
+```
+0-1000(方画布) --unletterbox_point--> 帧像素 --×host_w/frame_w--> PC 虚拟桌面像素 --chardev--> 0..32767
+```
+
+第 2 步**按实测帧尺寸算，不写死 ×1920/1000**：截图 1920×1080、PC 也 1920×1080
+时两者恰好相等，但 PC 换分辨率后写死的系数会让每次点击系统性偏移。
+实测 1080p 全图往返误差 **0 px**（`scripts/` 外的自测脚本已覆盖）。
+
+### 防跑飞三道闸
+
+真实 PC 上一个 4B 模型会卡在同一个按钮上反复点：
+
+* 步数上限（默认 12，硬上限 60）；
+* 连续 3 次**完全相同**的动作（action + 坐标 + 文本都一致）→ 判卡死中止，
+  并把**中止的那一步**也记进 step log（用户能看到是哪一步断的）；
+* `stop()` / `register_shutdown()` / 循环 `finally` 都调
+  `keyboard.release()` + `digitizer.up()`，保证宿主机不会看到一根卡住的键
+  或一根停在半空的触点。
+
+### 踩过的坑：AI 的点击打在主屏，网页手动点击打在副屏
+
+坐标换算两边**已经**一致（见上文"坐标三次空间"），但同一次点击写进 HID 的
+**字节不一样** —— 差异只在 release 帧：
+
+```
+网页:  down -> 010100400040   (count=1 tip=1 X=16384 Y=16384)
+       up   -> 000000000000   (count=0 tip=0 X=0     Y=0    )
+AI:    down -> 010100400040   同上
+       up   -> 000000400040   (count=0 tip=0 X=16384 Y=16384)  ← 只有这里不同
+```
+
+AI 当时用的是 `DigitizerWriter.click()`，它**保留 release 帧的 X/Y**
+（[service.py:271](/home/rockchip/wdnwebui/app/apps/usb_hid/service.py)），
+而网页路径走 `down()` + `up()`，`up()` 发的是 0×0。
+
+`up()` 的 docstring 早就写明为什么要这样：
+
+> Sends 0x0 so the host sees "pen left the tablet" instead of "**pen
+> teleported to origin**" — a teleport **spuriously fires a click on
+> whichever screen element happens to be at (0, 0) on the host**.
+
+也就是说 **release 帧是宿主要按位置处理的一份报告**。抬手时再报一遍
+真实坐标，宿主就按那个点去路由 —— 双屏下自然落到另一块屏。
+
+→ AI 现在走 `_tap()` = `down()` + `sleep` + `up()`，与网页路径
+**逐字节相同**（回归里直接比对 byte 序列，不只是比对坐标）。
+
+**教训**：这条 bug 的症状是"打到另一块屏"，很容易被误判成坐标算错，
+于是去查 letterbox / 坐标系 —— 而坐标系当时是对的。**多屏环境下"落点
+不对"要先把两条路径的字节 dump 出来比**，坐标对了就往 HID 报告内容上
+想。`click()` 这种"看起来等价"的便利封装，正是这类问题的来源。
+
+### 动作集里没有 `move`（只移动不点击）
+
+`DigitizerWriter.move(tip_down=False)` 的 docstring 写着 "Win PT drivers
+silently discard this" —— 宿主**不认悬停帧**。保留它只有一个后果：白白
+烧掉一步推理，模型还以为鼠标动了。网页路径也不发悬停帧（没有按键时
+`movePress` 直接 return）。触屏数字板表达不了"移动但不按"，所以动作集
+里**删掉**了 `move`，要移动就用 `drag`。
+
+### 踩过的坑：`click` 动作点了 (0,0)，看起来"点了但没反应"
+
+实测：输「打开记事本」，第 1 步就点在 host `(0, 0)`。`(0,0)` 在 Windows
+桌面上是屏幕左上角，那里**什么都没有**，所以表现就是"点了没反应"，
+而步日志里 click 的 status 恰恰是 `ok`。
+
+成因不是一个而是**两个**，而且第二个一直在掩盖第一个：
+
+**① schema 让"没有坐标的 click"合法。** 原来的
+``AgentAction`` 是 `required: ["action"]`、`x/y` 带 `default=0.0`，于是模型
+吐一个 `{"action":"click","thought":"点开始菜单"}` 完全通过校验，pydantic
+**静默补 0**。→ 现在 `x` / `y` 必填，且 JSON 恢复路径
+（`_normalize_action`）对"缺失"和"0"也必须分开判
+（`_as_float(v, default=None)`，默认 None 而不是 0）。
+
+> 注意 `_as_float` / `_as_int` 的 default 只能是 **None**。0 本身是合法
+> 坐标，一旦把缺省写成 0，"没说"和"说了 0"就再也分不开 —— 而这正是
+> 下面 `(0,0)` 三条来路无法区分的根源。
+
+**② 从来没告诉模型它看的是带灰边的正方形。** 1920×1080 letterbox 进
+768×768 的 vision 变体后，**只有 y∈[219, 781] 这一段是真实画面**（上下各
+168 行灰边）。不说明的话模型就有两个同样说得通的"0-1000"：
+
+| 模型给的 y（按"这就是块屏幕"理解） | 本意 host y | 按方图理解的 host y | 误差 |
+|---|---|---|---|
+| 100 | 108 | 0 | -108 |
+| 250 | 270 | 60 | **-210** |
+| 500 | 500 | 540 | 0 |
+| 750 | 810 | 1020 | **+210** |
+
+顶部/底部因为后面会 clamp 看起来"还挺准"，把中部的错误完全盖住 ——
+症状是"有时候点得准有时候差很远"，几乎无法归因。
+→ 现在 `_geometry_block(meta)` 从当帧的 meta **现算**这条 band 并写进
+prompt（换 384 变体时数字自动跟着变，不写死）。
+
+### `(0, 0)` 的三条来路必须一起堵
+
+它们 clamp 到同一个像素，步日志里长得一模一样：
+
+1. 模型漏了 x/y，被 schema 补成 0 → **已堵**（x/y 必填）
+2. 模型字面输出 0,0 → **已堵**（`_is_degenerate_origin`，≤8px 判为退化）
+3. 模型按桌面坐标系把"灰色留边顶部"当成 y=0 → **已堵**（prompt 写明 band）
+
+代价：真要点屏幕左上角 8px 内也会被拒。值得 —— 丢一次边缘点击远比
+静默空点三步强，而且 [app.js:160-163](/home/rockchip/wdnwebui/app/apps/usb_hid/static/app.js)
+早就写明 tip-up 不带 X/Y 会"把笔瞬移到原点，点到 (0,0) 处的任何东西"，
+全卡对 (0,0) 的处理本来就是一致的。
+
+### 失败必须写进步日志，不能只有一句总括
+
+`{"action":"click"}`（漏坐标）和 `I cannot help with that`（吐废话）
+如果都收敛成"模型没有给出可执行的动作"，页面就是一个**空 step 列表**
+加一句通用报错 —— 上面那个 bug 查不动，正是因为两者从外面看一模一样。
+现在 `_ask_model` 返回 `(action, reason)`，`reason` 由
+`_parse_action_json` / `_normalize_action` 沿 `why` 列表收集
+（区分"没有坐标"/"没有 JSON"/"不认识的动作"），`_loop` 先 append 一条
+error step 再收工。
+
+### 全黑 / 纯色画面必须在送推理之前停
+
+没信号时 `std ≈ 0`，此时 **(0,0) 是模型唯一能给的答案**，于是每一步都点
+在桌面左上角 —— 和上面的 bug 症状一模一样，排查方向却完全不同（该动
+的是 HDMI 源，不是 prompt 或模型）。
+
+→ `_is_blank_frame(frame)` 在 `_loop` 里、送检之前拦，报"PC 没有真正输出
+到 HDMI-IN"。判据是 `max <= 3`（近黑）**或 `std < 2`**（任何亮度的纯色：
+HDMI 的 No Signal OSD 常常是纯蓝/纯白，只判黑会漏掉一整类）。真实桌面
+哪怕是纯黑壁纸 + 小窗口，std 也在 20~80，离 2 差两个数量级，不会误判。
+抽样算 + uint8，单帧约 1.4 ms。
+
+> 这个检查**必须放在 `_loop` 而不是 `_grab_screenshot` 里**：后者是可以被
+> 替换/打桩的，守卫跟着一起消失，测试和将来任何新的取帧方式都绕得过去。
+> "帧从哪来"和"帧能不能用"是两件事。
+
+### DemoGuard：这张卡的 `active` 曾经是恒真的
+
+usb-hid 的 app.js 里原来有 `DemoGuard.register(id, {active: () => true, stop: noop})`，
+**它覆盖了 manifest 里的 demo_guard** —— 因为
+`DemoGuard.register` 就是 `_registry[id] = handlers`，而 `_registerCardsFromManifest()`
+在 onReady 里是**同步**跑的，卡片 IIFE 要等 framework 注入的 `<script>` 从网络
+回来才执行（`_preloadCardScripts` 挂在 Promise 链上）。结果：用户在这页点任何
+sidebar 链接都弹"确认离开?"，而 stop 是空函数 —— 拦住了又什么都不停。
+
+现在卡片只 `DemoGuard.report("usb-hid", snapshot)`，配置一律以 manifest 为准
+（`active_state_keys: ["running","state"]` + `stop_endpoints: /task/stop`）。
+**report 必须整体上报服务端快照**：active 判定读的就是 `running` / `state`
+这两个键，漏报等于告诉框架"没在跑"，于是用户切页时不会被拦，PC 会在用户已经
+离开的页面上继续被点。
+
+`hdmiin` 采集本身**不**算 active —— 那是跨页保持的预览流，正是用户想要的，
+拦它反而是回归。
 
 ## 帧判据(v0.18 下沉到 4 张视频卡)
 

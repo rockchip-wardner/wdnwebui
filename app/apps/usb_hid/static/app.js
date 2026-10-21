@@ -42,6 +42,9 @@
       // for the host-screen mapping + key routing logic.
       this.bindGridInteraction();
 
+      // AI 电脑控制卡（服务端循环 + 1Hz 轮询）。
+      this.bindTaskCard();
+
       this.refresh();
     },
 
@@ -532,6 +535,192 @@
      * has focus and forwards those directly, which never touched those
      * three handlers. */
 
+    // ------------------------------------------------------------------
+    // 自然语言任务 — AI 自动控制（服务端循环，前端只提交 + 轮询 + 渲染）
+    //
+    // 循环本身在 app/apps/usb_hid/agent.py：截屏 → VLM 出动作 → 写 HID。
+    // 一轮要几秒，所以轮询 1Hz 足够，不是忙轮询。
+    //
+    // DemoGuard 联动：每次 render 都把服务端快照 **整个** report 上去
+    // （manifest.json 的 demo_guard.active_state_keys 就是
+    // ["running", "state"]）。必须整体上报而不是只 report 一个精简对象
+    // —— active 判定读的就是快照里这两个键，漏报等于告诉框架"没在跑"，
+    // 于是用户切页时不会被拦，PC 会在用户已经离开的页面上继续被点。
+    bindTaskCard() {
+      const $ = (id) => document.getElementById(id);
+      this.taskInput = $("usb-hid-task-input");
+      this.taskSteps = $("usb-hid-task-max-steps");
+      this.taskStartBtn = $("usb-hid-task-start");
+      this.taskStopBtn = $("usb-hid-task-stop");
+      this.taskBadge = $("usb-hid-task-badge");
+      this.taskElapsed = $("usb-hid-task-elapsed");
+      this.taskStatus = $("usb-hid-task-status");
+      this.taskLog = $("usb-hid-task-log");
+
+      this.taskTimer = null;
+
+      this.taskStartBtn?.addEventListener("click", () => this.startTask());
+      this.taskStopBtn?.addEventListener("click", () => this.stopTask());
+
+      // 恢复：刷新页面 / 从别的页切回来时，后端可能还有一个任务在跑
+      // （离开时的 sendBeacon 只是 best-effort，浏览器可能丢掉）。
+      // 同步拉一次，有任务就接着轮询，没有就把 UI 归位。
+      this.syncTask();
+    },
+
+    async syncTask() {
+      const snap = await this._fetchTaskStatus();
+      if (!snap) return;
+      this.renderTask(snap);
+      if (snap.running) this.startTaskPolling();
+      else this.applyTaskIdle(snap);
+    },
+
+    async startTask() {
+      const task = (this.taskInput?.value || "").trim();
+      if (!task) {
+        this.setTaskStatus("请先填写要让 AI 完成的任务。", true);
+        return;
+      }
+      const maxSteps = parseInt(this.taskSteps?.value || "12", 10);
+      this.taskStartBtn.disabled = true;
+      this.setTaskStatus("正在启动…");
+      try {
+        const r = await fetch(API_PREFIX + "/usb-hid/task/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            task,
+            max_steps: Number.isFinite(maxSteps) ? maxSteps : 12,
+          }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          // 502 = 模型没开（功能未启用），503 = hdmiin 没开，409 = 已在跑。
+          // 三者可执行动作不同，所以把后端 detail 原样透出。
+          this.setTaskStatus(`启动失败：${body.detail || "HTTP " + r.status}`, true);
+          this.taskStartBtn.disabled = false;
+          return;
+        }
+        this.setTaskStatus("");
+        this.renderTask(body);
+        this.startTaskPolling();
+      } catch (e) {
+        this.setTaskStatus("启动失败：" + (e && e.message ? e.message : e), true);
+        this.taskStartBtn.disabled = false;
+      }
+    },
+
+    async stopTask() {
+      this.taskStopBtn.disabled = true;
+      try {
+        await fetch(API_PREFIX + "/usb-hid/task/stop", { method: "POST" });
+      } catch (_e) {
+        // 用户已经点了停止；即便请求丢了，1Hz 轮询也会看到 running=false。
+      }
+      await this.syncTask();
+    },
+
+    startTaskPolling() {
+      if (this.taskTimer) return;
+      this.taskTimer = setInterval(() => this.pollTask(), 1000);
+      this.pollTask();
+    },
+
+    stopTaskPolling() {
+      if (!this.taskTimer) return;
+      clearInterval(this.taskTimer);
+      this.taskTimer = null;
+    },
+
+    async pollTask() {
+      const snap = await this._fetchTaskStatus();
+      if (!snap) return;
+      this.renderTask(snap);
+      // 快照即终态时停表 —— 不再有事会发生，继续轮询只是白刷。
+      if (!snap.running) {
+        this.stopTaskPolling();
+        this.applyTaskIdle(snap);
+      }
+    },
+
+    async _fetchTaskStatus() {
+      try {
+        const r = await fetch(API_PREFIX + "/usb-hid/task/status", { cache: "no-store" });
+        if (!r.ok) return null;
+        return await r.json();
+      } catch (_e) {
+        return null;
+      }
+    },
+
+    renderTask(snap) {
+      if (window.DemoGuard) window.DemoGuard.report("usb-hid", snap);
+
+      const running = !!snap.running;
+      if (this.taskBadge) {
+        this.taskBadge.hidden = !running;
+        this.taskBadge.textContent = "运行中";
+        this.taskBadge.className = running ? "badge ok" : "badge";
+      }
+      if (this.taskElapsed) {
+        this.taskElapsed.textContent = snap.step_count
+          ? `第 ${snap.step_count}/${snap.max_steps} 步 · ${snap.elapsed_s}s`
+          : "—";
+      }
+      if (this.taskStartBtn) this.taskStartBtn.disabled = running;
+      if (this.taskStopBtn) this.taskStopBtn.disabled = !running;
+
+      this.renderTaskLog(snap.steps || []);
+      if (snap.error) this.setTaskStatus(snap.error, snap.state === "error");
+    },
+
+    applyTaskIdle(snap) {
+      if (this.taskStartBtn) this.taskStartBtn.disabled = false;
+      if (this.taskStopBtn) this.taskStopBtn.disabled = true;
+      if (snap.state === "done") this.setTaskStatus("任务已完成。", false);
+      else if (snap.state === "stopped") this.setTaskStatus("已停止。", false);
+    },
+
+    renderTaskLog(steps) {
+      if (!this.taskLog) return;
+      // 每次全量重画：步数上限 60，DOM 量可以忽略，而增量 diff 要额外
+      // 记住上一帧的键序，徒增状态。
+      // textContent 而不是 innerHTML —— step 里的 thought / text / summary
+      // 全是模型或主机拼出来的字符串，拼进 HTML 就是一条注入通道。
+      const frag = document.createDocumentFragment();
+      for (const s of steps) {
+        const li = document.createElement("li");
+        if (s.status === "error") li.className = "is-error";
+        const idx = document.createElement("span");
+        idx.className = "usb-hid-task-idx";
+        idx.textContent = "#" + s.idx;
+        const act = document.createElement("span");
+        act.className = "usb-hid-task-act";
+        act.textContent = s.action || "?";
+        const target = document.createElement("span");
+        target.className = "usb-hid-task-target";
+        target.textContent = s.summary || "";
+        const thought = document.createElement("span");
+        thought.className = "usb-hid-task-thought";
+        thought.textContent = s.status === "error"
+          ? (s.detail || "执行失败")
+          : (s.thought || "");
+        li.append(idx, act, target, thought);
+        frag.appendChild(li);
+      }
+      this.taskLog.replaceChildren(frag);
+      // 保持在最底部：轮询反复 replaceChildren，视口默认跟着回顶，用户
+      // 就永远只能看到第 1 步 —— 长任务最该看的恰恰是最新那一步。
+      this.taskLog.scrollTop = this.taskLog.scrollHeight;
+    },
+
+    setTaskStatus(text, isErr) {
+      if (!this.taskStatus) return;
+      this.taskStatus.textContent = text || "";
+      this.taskStatus.style.color = isErr ? "#e74c3c" : "";
+    },
+
   };
 
   // ---- Hook into the global page-init lifecycle ---- //
@@ -542,36 +731,46 @@
   // because all of #page-usb-hid's elements are already in the DOM
   // (the <section> is part of the main HTML, not lazy-injected).
   //
-  // DemoGuard: hdmiin capture + USB gadget are *long-running* state
-  // that the user explicitly wants to keep alive across page navigations
-  // and browser refreshes. We model that as `active: () => true` so
-  // the framework's back-home button shows the "⏏ 退出应用" label
-  // (instead of the generic "返回首页") and `_exit()` clears the
-  // wizard's localStorage completed flag — meaning the next time the
-  // user opens this card, they go through the wizard from step 1
-  // (matching the rest of the apps' exit semantics).
-  if (window.DemoGuard) {
-    window.DemoGuard.register("usb-hid", {
-      active: () => true,            // hdmiin capture always running
-      stop: async () => {},          // nothing to stop on the demo side
-      stopSync: () => {},            // (USB gadget teardown is out of scope
-                                    //  for the in-app "退出应用" gesture;
-                                    //  users with sudo do that via the
-                                    //  teardown script)
-      label: "智能电脑控制",
-    });
-  }
+  // DemoGuard: **不再在这里 register**。
+  //
+  // 这里原来有一个 `register("usb-hid", {active: () => true, stop: ...})`，
+  // 本意是让"hdmiin 一直在跑"体现在导航守卫上。实际效果恰好相反，而且很糟：
+  //
+  // 谁后跑谁赢 —— `DemoGuard.register` 就是 `this._registry[id] = handlers`。
+  // 顺序上 `_registerCardsFromManifest()`(onReady 第 3 步)是**同步**跑的，
+  // 而本文件要等 framework 同步注入的 `<script>` 从网络回来才执行
+  // (_preloadCardScripts 挂在 Promise 链上，chain.then)，所以**app.js 反而
+  // 是后写的那个**，覆盖掉了 manifest 里的配置。于是 active 恒为真：
+  //   * 用户在这页点任何 sidebar 链接都会弹"确认离开?"，而 stop 是空
+  //     函数 —— 拦住了又什么都不停，纯打扰；
+  //   * 返回首页按钮被打上"⏏ 退出应用"字样。
+  // 也就是说 manifest 里的 demo_guard 对这张卡一直是无效配置。
+  //
+  // 现在改成只让 manifest 说话（framework.js 里那句"manifest 是 single
+  // source of truth, 各 card 的 app.js 不用再单独 register"说的就是这个）：
+  // 空闲时不再误拦，只有 AI 任务真在跑时才拦并真的 /task/stop。
+  // 返回首页按钮在空闲时显示"← 返回首页"，点它的**行为不变** ——
+  // framework 的 click handler 不看 isActive，只看 isDemoPage，
+  // 照样清 wizard 状态 + 回首页（framework.js:749-755 的注释）。
 
   // Wizard finish hook. The wizard framework calls
   // `ImApp_<id>.applyWizardSnapshot(opts)` to apply the wizard's collected
-  // values to the backend. USB HID has no per-user config (the source is
-  // fixed at /dev/video0), so this is a no-op — we only need it to
-  // exist so the framework writes the `completed=1` flag and stops
-  // re-popping the wizard on subsequent entries. _exit() (the
-  // "⏏ 退出应用" button) clears that flag, restoring the wizard on
-  // the next entry — see the lifecycle note above.
+  // values. USB HID has no per-user backend config (the source is fixed at
+  // /dev/video0), so all we do is prefill the task card — the actual task
+  // still has to be launched from the page, because starting it means
+  // "start driving this person's PC", which should be a deliberate click
+  // and not a side effect of finishing a wizard.
   window.ImApp_usb_hid = window.ImApp_usb_hid || {};
-  window.ImApp_usb_hid.applyWizardSnapshot = async function (_opts) {
+  window.ImApp_usb_hid.applyWizardSnapshot = async function (opts) {
+    const o = opts || {};
+    if (o.task) {
+      const el = document.getElementById("usb-hid-task-input");
+      if (el) el.value = o.task;
+    }
+    if (o.maxSteps != null) {
+      const el = document.getElementById("usb-hid-task-max-steps");
+      if (el) el.value = o.maxSteps;
+    }
     return { ok: true };
   };
 
