@@ -6,7 +6,7 @@
 
   1. 跳��向导后进功能页；
   2. 断言 #<prefix>-source 在画布**下方**、#<prefix>-judge-config 横排
-     （.vj-inline）且两者都在 .vd-stage-col / .vcs-stage-col 里；
+     （.vj-inline）且两者都在 .vd-stage-col / .vr-stage-col 里；
   3. 量右侧栏 / 左侧栏高度 —— 右栏内容不该再溢出（scrollHeight 不超
      clientHeight 太多），右栏不该比左栏高；
   4. 视频源栏与画布同起点同宽（看着才像"贴在画面下面"）；
@@ -14,7 +14,7 @@
   6. 截屏留证。
 
 跑法：.venv/bin/python scripts/verify_judge_bar_layout.py
-      ONLY=video-detection,video-analysis-search .venv/bin/python ...
+      ONLY=video-detection,video-retrieval .venv/bin/python ...
 """
 import asyncio
 import json
@@ -36,15 +36,15 @@ SKIP = "跳过向导"
 # card_id -> (前缀, 画布 id, 源输入框 id, 打开按钮 id, 侧栏 sel, 舞台列 sel,
 #              是否期望"视频源 + 判据"摊在视频正下方)
 CASES = [
-    # v0.20：vd（音视频描述）按用户要求把两条栏搬到视频正下方；VAS 保持原样
+    # v0.20：vd（音视频描述）按用户要求把两条栏搬到视频正下方；VR 保持原样
     # （在左侧控制台里竖排）—— 两者都进脚本，搬走的那张不能靠"另一张没变"
     # 来证明自己变了，反过来也一样。
-    # 注：VAS 的判据参数已固化为服务端常量，页面上不再有判据配置栏
-    # （`#vas-judge-config` 不存在），此处的反向断言只验"没有被误搬"。
+    # 注：VR 的判据参数已固化为服务端常量，页面上不再有判据配置栏
+    # （`#vr-judge-config` 不存在），此处的反向断言只验"没有被误搬"。
     ("video-detection",       "vd",  "vd-grid",    "vd-sources", "vd-open",
      ".vd-side", ".vd-stage-col", True),
-    ("video-analysis-search", "vas", "vcs-canvas", "vcs-source", "vcs-open",
-     ".vcs-layout > .surv-form", ".vcs-layout > .vd-stage-col", False),
+    ("video-retrieval", "vr", "vr-canvas", "vr-source", "vr-open",
+     ".vr-layout > .surv-form", ".vr-layout > .vd-stage-col", False),
 ]
 
 
@@ -114,7 +114,7 @@ async def main() -> int:
                 src: R(document.getElementById(src)),
                 // **必须按卡片作用域查**：所有卡的 DOM 都同时挂在同一个文档
                 // 里（切页靠 .hidden），全局 querySelector 会量到别的卡 —— 那时
-                // VAS 会"看到" vd 的 .stage-source-bar，报出一个不存在的红。
+                // VR 会"看到" vd 的 .stage-source-bar，报出一个不存在的红。
                 bar: R(q('#page-' + appId + ' .stage-source-bar')),
                 judge: R(document.getElementById(jc)),
                 judgeInline: !!document.getElementById(jc)?.classList.contains('vj-inline'),
@@ -164,7 +164,7 @@ async def main() -> int:
                 chk(m["inSide"], "视频源仍在侧栏内（未误搬）")
                 chk(not m["inStage"], "判据栏不在舞台列内（未误搬）")
                 chk(m["judge"] is None,
-                    "VAS 页无判据配置栏（判据参数已固化为服务端常量）")
+                    "VR 页无判据配置栏（判据参数已固化为服务端常量）")
                 chk(m["bar"] is None, "页面上没有多余的 .stage-source-bar")
 
             # 5. 右栏不高于左栏，也不溢出（两种布局都得成立）

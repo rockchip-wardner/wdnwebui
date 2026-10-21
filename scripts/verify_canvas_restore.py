@@ -7,7 +7,7 @@
 **下面**。所以断言的是 **(父节点, 兄弟下标)** 与搬走之前逐字相同。
 
 覆盖四张卡：三张多路（画面容器 = grid 容器 = .vd-stage）+ 一张单路
-（VAS 的 <canvas> 套在 .vd-stage 里），后者防的是「为多路改坏单路」。
+（VR 的 <canvas> 套在 .vd-stage 里），后者防的是「为多路改坏单路」。
 """
 import sys
 
@@ -21,7 +21,7 @@ CARDS = [
     ("video-detection", "vd-grid", "vd-sources"),
     ("video-target-detection", "vtd-grid", "vtd-sources"),
     ("video-target-localization", "vtl-grid", "vtl-sources"),
-    ("video-analysis-search", "vcs-canvas", "vcs-source"),   # 无 canvas_id，推导
+    ("video-retrieval", "vr-canvas", "vr-source"),   # 无 canvas_id，推导
 ]
 
 # 画面在哪 + 在第几位。必须连父节点一起记，只记「第 0 位」会漏掉
@@ -122,8 +122,8 @@ def run(page, app_id, cid, src_id, errs):
             fails.append(f"位置错了: 第 {before['index']} 位 → 第 {after['index']} 位"
                          f"（共 {after['total']} 个兄弟）")
     # 只清当前这张卡。会话不清会让下一张卡带着上一张的解码器跑。
-    # VAS 的关闭端点是 /source/close（单路预览用），多路三张才是 /close。
-    close_path = ("/api/video-analysis-search/source/close" if app_id == "video-analysis-search"
+    # VR 的关闭端点是 /source/close（单路预览用），多路三张才是 /close。
+    close_path = ("/api/video-retrieval/source/close" if app_id == "video-retrieval"
                   else "/api/%s/close" % app_id)
     page.evaluate("""(p) => { try {
         fetch(p, {method: 'POST', headers: {'Content-Type': 'application/json'},

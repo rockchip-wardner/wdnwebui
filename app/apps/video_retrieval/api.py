@@ -1,6 +1,6 @@
-"""视频内容检索路由（video_analysis_search 卡片的检索侧）。
+"""监控反查（video-retrieval）路由：检索 + 向导预览。
 
-由卡片 ``__init__.py`` 挂载到 ``/api/video-analysis-search/search/*``。
+由卡片 ``__init__.py`` 挂载到 ``/api/video-retrieval/*``（扁平，无 /search 子前缀）。
 业务逻辑在 ``app.core.video.search``（遵守卡片零跨卡片 import 规则）。
 字段名（``chunk_seconds`` / ``start_time`` 等）与前端契约保持不变；切片
 时长 / 重叠 / 匹配阈值 / 检索上限固化为服务端常量（见
@@ -11,12 +11,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import queue
+import shutil
 import threading
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (APIRouter, File, HTTPException, UploadFile, WebSocket,
+                    WebSocketDisconnect)
 from fastapi.responses import Response
 
+from app.core.config import default_resource_root
+from app.core.video.session import get_session
 from app.core.video.search import (
     FIXED_SIM_THRESHOLD,
     FIXED_TOP_K,
@@ -25,7 +31,180 @@ from app.core.video.search import (
 
 
 LOG = logging.getLogger(__name__)
-router = APIRouter(tags=["video-analysis-search"])
+router = APIRouter(tags=["video-retrieval"])
+
+
+preview_router = APIRouter(tags=["video-retrieval-preview"])
+
+# 向导模式拖放上传的视频文件落地目录 — 三个视频 app 共用同一目录
+# ``<resource_dir>/uploads``(设备端 ``/userdata/assets/uploads``)。
+# 与 vd / vtd / vtl 完全一致;同名文件直接覆盖(``open("wb")`` 截断写)。
+UPLOAD_DIR = default_resource_root() / "uploads"
+try:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+
+
+# --------------------------------------------------------------------- #
+# 向导模式预览 — 复用 vd 单例 VideoSession（vd / vtd / vtl / vr 共享）
+# --------------------------------------------------------------------- #
+@preview_router.post("/upload")
+async def upload_video(file: UploadFile = File(...)) -> dict:
+    """向导模式拖放上传 → 写到 ``UPLOAD_DIR``(与 vd / vtd / vtl 共用)。
+
+    与 vd 的 ``/api/video-detection/upload`` 行为完全一致(由
+    ``app.core.uploads`` 兜底),保证用户从任一视频应用拖放上传,
+    在另一应用里直接用同一绝对路径不会再产生第二份副本。
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="empty filename")
+    safe_name = Path(file.filename).name
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if not Path(safe_name).suffix:
+        safe_name = safe_name + ".bin"
+    dest = UPLOAD_DIR / safe_name
+    try:
+        # 同名覆盖: 先 unlink 再 open("wb"),避免目标文件由其他用户/不可写
+        # 拥有时 ``open("wb")`` 因需 inode 上的写权限而失败
+        # (PermissionError: [Errno 13]);unlink 走的是目录级写权限,与
+        # 新建文件一致。missing_ok=True 容忍首次上传时目标不存在。
+        try:
+            dest.unlink()
+        except FileNotFoundError:
+            pass
+        with dest.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"write failed: {e}")
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
+    return {
+        "path": str(dest),
+        "name": file.filename,
+        "size": dest.stat().st_size,
+    }
+
+
+@preview_router.post("/source/open")
+async def open_source(payload: dict) -> dict:
+    """向导模式预览:打开视频源(复用 vd 单例 VideoSession)。
+
+    与 vd 的 ``/open`` 行为一致 —— ``get_session()`` 拿到的是 vd
+    / vtd / vtl / vcs 四页共享的同一个 ``VideoSession`` 单例;vcs
+    仅消费 WS 帧流、不注册 frame sink,不会与 vd 的 detector 抢帧。
+    视频源路径可以是本地文件 / RTSP / RTMP / HLS / 摄像头,统一
+    走 :func:`VideoSession.open` 路由。
+    """
+    payload = payload or {}
+    source = (payload.get("source") or "").strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="source required")
+    loop = bool(payload.get("loop", False))
+    try:
+        return get_session().open(source, loop=loop)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"open failed: {e}")
+
+
+@preview_router.post("/source/close")
+async def close_source() -> dict:
+    """向导模式预览:关闭视频源。
+
+    与 vd 的 ``/close`` 等价;只是清理共享 session,不会杀掉分析侧
+    / 检索侧的解码 / VLM 任务。
+    """
+    return get_session().close()
+
+
+@preview_router.post("/source/control")
+async def control_source(payload: dict) -> dict:
+    """向导模式预览:播放 / 暂停 / 停止(复用 vd 单例 VideoSession)。
+
+    与 vd 的 ``/control`` 完全同款 —— ``play`` → ``VideoSession.play()``,
+    ``pause`` → ``pause()``,``stop`` → ``close()``(vd 的 stop 即为关源,
+    这里保持一致,故 停止 与 关闭 等价)。
+    """
+    action = (payload or {}).get("action")
+    if action == "play":
+        return get_session().play()
+    if action == "pause":
+        return get_session().pause()
+    if action == "stop":
+        return get_session().close()
+    raise HTTPException(status_code=400, detail=f"unknown action: {action!r}")
+
+
+@preview_router.get("/source")
+async def get_source_snapshot() -> dict:
+    """向导模式预览:取当前预览 session 快照(状态 / 尺寸 / fps / loop)。"""
+    return get_session().snapshot()
+
+
+@preview_router.websocket("/source/ws")
+async def ws_source(ws: WebSocket) -> None:
+    """向导模式预览:JPEG 帧流(由 ``VideoSession`` 广播给每个订阅者)。
+
+    与 ``/api/video-detection/ws`` 走同一个 ``VideoSession.subscribe()``,
+    因此 vr 向导预览的实时性和 vd / vtd / vtl 严格一致(共享一份解码 +
+    编码线程;每路 WS 各自一个订阅队列,broadcast 模式)。
+    """
+    await ws.accept()
+    session = get_session()
+    loop = asyncio.get_event_loop()
+    sub_q = session.subscribe()
+    last_status = 0.0
+    eof_sent = False
+    try:
+        while True:
+            try:
+                item = await loop.run_in_executor(
+                    None, lambda: sub_q.get(timeout=0.05)
+                )
+            except queue.Empty:
+                item = None
+            if item is None:
+                now = loop.time()
+                if now - last_status >= 1.0:
+                    snap = session.snapshot()
+                    snap["type"] = "status"
+                    await ws.send_json(snap)
+                    last_status = now
+                continue
+            if item is session._EOF:
+                if not eof_sent:
+                    snap = session.snapshot()
+                    snap["type"] = "eof"
+                    await ws.send_json(snap)
+                    eof_sent = True
+                await asyncio.sleep(0.2)
+                continue
+            eof_sent = False
+            await ws.send_bytes(item)
+            now = loop.time()
+            if now - last_status >= 1.0:
+                snap = session.snapshot()
+                snap["type"] = "status"
+                await ws.send_json(snap)
+                last_status = now
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        LOG.warning("vr source/ws: abnormal disconnect", exc_info=True)
+    finally:
+        try:
+            session.unsubscribe(sub_q)
+        except Exception:
+            pass
+
+
+
 
 
 @router.get("/")
@@ -430,7 +609,7 @@ async def vcs_play_ws(ws: WebSocket) -> None:
                 _push_bytes(jpeg)
             _push_json({"type": "eof"})
         except BaseException as e:
-            LOG.warning("vcs-play reader error: %s", e)
+            LOG.warning("vr-play reader error: %s", e)
             _push_json({"type": "error", "detail": f"播放取帧失败: {e}"})
 
     try:
@@ -453,7 +632,7 @@ async def vcs_play_ws(ws: WebSocket) -> None:
             return
 
         thread = threading.Thread(
-            target=_reader, args=(source, start, end), name="vcs-play", daemon=True
+            target=_reader, args=(source, start, end), name="vr-play", daemon=True
         )
         thread.start()
 
@@ -562,7 +741,7 @@ def _seek_frame_jpeg(source: str, t: float) -> Optional[bytes]:
                 )
                 return bytes(buf) if ok else None
     except Exception as e:  # pragma: no cover - defensive
-        LOG.debug("vas-search: 取帧 %s t=%s 失败: %s", source, t, e)
+        LOG.debug("video-retrieval: 取帧 %s t=%s 失败: %s", source, t, e)
     finally:
         container.close()
     return None
@@ -572,7 +751,7 @@ def _seek_frame_jpeg(source: str, t: float) -> Optional[bytes]:
 async def list_unified_history() -> dict:
     """统一历史记录（检索缓存 + 分析历史，按视频 md5 聚合）。
 
-    前端「监控分析检索」页的历史列表数据源 —— 一个视频一行，行内
+    前端「监控反查」页的历史列表数据源 —— 一个视频一行，行内
     ``retrieval`` 是该视频的检索索引档位列表、``analysis`` 是其分析
     记录列表（含 run_id，供加载 / 反查 / 删除）。按 ``updated_at``
     倒序；``frame_enabled`` 按源文件是否仍在本机判定（决定能否取帧 /

@@ -107,8 +107,7 @@ class _TextChatManager:
     HISTORY_MAX        = 200          # deque maxlen
     MAX_NEW_TOKENS     = 2048         # spec max_new_tokens
     # 对话窗口上限。**必须 ≤ 实际服务模型的 max_context_len**，否则
-    # 裁剪会放进一个装不下的历史 —— 症状不是报错，而是 rknn3 在
-    # prefill 阶段长挂（见 VAS ``_call_llm`` 的同款诊断注释）。
+    # 裁剪会放进一个装不下的历史 —— 症状不是报错，而是 rknn3 在 prefill 阶段长挂
     #
     # 4096 是 ``swcap_text_chat`` 唯一 provider
     # ``qwen3.5-vl-4b`` 的真实窗口（原 qwen3-4b 专用文本 worker 已

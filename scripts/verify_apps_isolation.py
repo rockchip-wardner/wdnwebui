@@ -35,7 +35,7 @@ EXPECTED_APPS = [
     "audio-analysis",
     "text-chat",
     "tts",
-    "video-analysis-search",
+    "video-retrieval",
     "video-detection",
     "video-target-detection",
     "video-target-localization",

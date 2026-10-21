@@ -1,0 +1,68 @@
+{
+  "id": "video-retrieval",
+  "title": "监控反查",
+  "category": "video",
+  "description": "上传视频建立检索索引，用自然语言反查命中片段。",
+  "version": "0.3.0",
+  "preview_video": "/static/apps/video-retrieval/preview.mp4",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_video_retrieval"
+  ],
+  "hardware_capabilities": [
+    "hwcap_video_input"
+  ],
+  "backend": {
+    "module": "app.apps.video_retrieval",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/video-retrieval/template.html",
+    "js": [
+      "/static/apps/video-retrieval/app.js"
+    ],
+    "css": [
+      "/static/apps/video-retrieval/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "search.state",
+      "busy"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-retrieval/extract/stop"
+      },
+      {
+        "method": "POST",
+        "path": "/api/video-retrieval/source/close"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/video-retrieval/extract/stop"
+      },
+      {
+        "method": "POST",
+        "path": "/api/video-retrieval/source/close"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "",
+    "editable_fields": [],
+    "prompt_template": ""
+  },
+  "requires_core": [
+    "compute.registry",
+    "video.session",
+    "video.search"
+  ],
+  "uploads_dir": "uploads",
+  "display_order": 40,
+  "wizard_config": "wizard.json"
+}

@@ -1195,9 +1195,9 @@ async function loadPageData(name) {
     return;
   }
 
-  if (name === "video-analysis-search") {
-    if (window.VAS && typeof window.VAS.refresh === "function") {
-      window.VAS.refresh();
+  if (name === "video-retrieval") {
+    if (window.VR && typeof window.VR.refresh === "function") {
+      window.VR.refresh();
     }
     return;
   }

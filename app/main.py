@@ -272,8 +272,8 @@ def create_app() -> FastAPI:
 
     # 3b. 帧判据共享 API —— vd / vtd / vtl 共用 VideoSession 单例，
     #     所以判据配置也只有一份。三张卡各自暴露端点会走样（改一处漏
-    #     两处），故挂在 core 层由三张卡共用。VAS 不在此列：它自管理
-    #     VideoCapture，配置走自己的 /api/video-analysis-search/*。
+    #     两处），故挂在 core 层由三张卡共用。video-retrieval（监控反查）
+    #     只保留检索，没有判据，不在此列。
     from app.core.video.api import register_judge_api
     register_judge_api(app)
 

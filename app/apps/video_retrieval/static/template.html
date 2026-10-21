@@ -1,0 +1,155 @@
+      <section id="page-video-retrieval" class="page hidden" data-page="video-retrieval">
+        <header class="page-header">
+          <h2>监控反查</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="vr-status">检索: 未启动</span>
+            <button class="wizard-mode-btn" data-wizard-mode data-page-id="video-retrieval">向导模式</button>
+            <button class="refresh-btn" id="vr-refresh">刷新</button>
+          </div>
+        </header>
+
+        <div id="vr-error-banner" class="vr-error-banner hidden" role="alert">
+          <span class="vr-error-icon" aria-hidden="true">⚠</span>
+          <span class="vr-error-text" id="vr-error-text"></span>
+          <button class="vr-error-close" id="vr-error-close" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <div class="vr-layout">
+          <!-- 左控制台 -->
+          <form class="surv-form" id="vr-form" autocomplete="off" onsubmit="return false;">
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>视频源</h3>
+                <span class="surv-hint">本地文件</span>
+              </header>
+              <div class="surv-field">
+                <div class="surv-input-row">
+                  <input type="text" id="vr-source" class="surv-input"
+                         placeholder="例如 /userdata/test/clips/sample.mp4" spellcheck="false" />
+                  <button type="button" class="vd-btn" id="vr-browse">浏览…</button>
+                </div>
+                <div class="vd-actions-row">
+                  <button type="button" class="vd-btn vd-btn-primary" id="vr-open">打开</button>
+                  <button type="button" class="vd-btn" id="vr-close">关闭</button>
+                  <label class="vd-loop-toggle" title="文件源播放完后自动从头重播；直播无效">
+                    <input type="checkbox" id="vr-loop" />
+                    <span>循环播放</span>
+                  </label>
+                  <span class="vd-meta" id="vr-source-meta">尚未选择</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>功能配置</h3>
+                <span class="surv-hint">检索模型就绪后自动启用</span>
+              </header>
+              <div class="surv-field">
+                <div class="vr-mode-hint" id="vr-mode-hint" hidden></div>
+              </div>
+
+              <div class="vr-subsection" id="vr-sub-search">
+                <header class="vr-sub-head">
+                  <h4>检索</h4>
+                  <span class="surv-hint">内容反查</span>
+                </header>
+                <div class="surv-field">
+                  <div class="vr-ta-wrap">
+                    <textarea id="vr-text" class="surv-input surv-textarea" maxlength="50"
+                              placeholder="例如：有人在搬箱子 / 货车驶入 / 穿红色衣服的人"></textarea>
+                    <span class="vr-ta-count" id="vr-ta-count">0 / 50</span>
+                  </div>
+                  <label class="vr-lenient-row">
+                    <input type="checkbox" id="vr-lenient" />
+                    <span>宽松匹配（直接采集 10 条得分最高的结果，不符合阈值预期的将会被标记"低于阈值"）</span>
+                  </label>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section vd-grow">
+              <header class="surv-form-head">
+                <h3>历史记录</h3>
+                <span class="surv-hint">已缓存视频</span>
+              </header>
+              <div class="surv-field">
+                <div class="vr-cache-window" id="vr-cache-window">
+                  <div class="vr-cache-head">
+                    <span>共 <span id="vr-cache-count">0</span> 条</span>
+                    <div class="vr-cache-actions">
+                      <button type="button" class="vr-cache-clear" id="vr-clear-cache"
+                              title="一键删除全部已缓存的视频检索结果（含微信渠道条目；清空后需重新提取）">清空缓存</button>
+                      <button type="button" class="vr-cache-refresh" id="vr-cache-refresh"
+                              title="刷新列表" tabindex="-1">⭘</button>
+                    </div>
+                  </div>
+                  <div class="vr-cache-rows" id="vr-cache-rows"></div>
+                  <div class="vr-cache-empty" id="vr-cache-empty">
+                    加载中…
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="surv-form-section">
+              <header class="surv-form-head">
+                <h3>操作</h3>
+                <span class="surv-hint" id="vr-runtime">未启动</span>
+              </header>
+              <div class="surv-field">
+                <div class="vd-actions-row">
+                  <button type="button" class="vd-btn vd-btn-primary" id="vr-start">开始</button>
+                  <button type="button" class="vd-btn" id="vr-stop" disabled>停止</button>
+                </div>
+                <div class="vr-progress" id="vr-progress" hidden>
+                  <div class="vr-progress-meta">
+                    <span class="vr-progress-label" id="vr-progress-label">检索: 已嵌入 0/0 切片</span>
+                    <span class="vr-progress-pct" id="vr-progress-pct">0%</span>
+                  </div>
+                  <div class="vr-track">
+                    <div class="vr-track-fill" id="vr-progress-fill"></div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </form>
+
+          <!-- 右工作区 -->
+          <div class="vd-stage-col">
+            <div class="vd-stage">
+              <canvas id="vr-canvas" width="960" height="540"></canvas>
+              <div class="vd-overlay" id="vr-overlay" hidden></div>
+            </div>
+
+            <div class="vd-controls">
+              <button id="vr-play"     class="vd-btn" disabled>▶ 播放</button>
+              <button id="vr-pause"    class="vd-btn" disabled>⏸ 暂停</button>
+              <button id="vr-stop-play" class="vd-btn" disabled>⏹ 停止</button>
+              <span class="vd-meta" id="vr-player-tag">未播放</span>
+              <span class="vd-spacer"></span>
+              <span class="vd-meta" id="vr-player-time">--</span>
+            </div>
+            <div class="vd-progress">
+              <div class="vd-progress-bar" id="vr-player-progress"></div>
+            </div>
+
+            <section class="vr-results">
+              <header class="vd-section-head">
+                <h3>检索结果</h3>
+                <span class="vd-spacer"></span>
+                <span class="vd-meta" id="vr-results-count">0 条</span>
+                <button class="vd-btn" id="vr-results-clear">清空</button>
+              </header>
+              <ol class="vr-results-list" id="vr-results-list">
+                <li class="vr-results-empty">完成检索后，命中片段显示在这里。</li>
+              </ol>
+            </section>
+          </div>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON（检索）</summary>
+          <pre class="payload" id="data-video-retrieval"></pre>
+        </details>
+      </section>

@@ -8,7 +8,7 @@ CASES = [
     ("video-target-detection",   "detect", "vtd-prompt"),
     ("text-chat",                "prompt", "tc-prompt"),
     ("tts",                      "text",   "tts-text"),
-    ("video-analysis-search",    "search", "vcs-text"),
+    ("video-retrieval",          "search", "vr-text"),
 ]
 
 async def main():

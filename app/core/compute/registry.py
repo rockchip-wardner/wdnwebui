@@ -3858,7 +3858,7 @@ class ComputeRegistry:
         ``capability_type``. Raises RuntimeError if none.
 
         本机优先：默认只在 spawned / adopted_local 里挑（视频类消费方
-        （VAS_SEARCH / wechat_video_manager）走 ``/dev/shm`` path-list 传帧，
+        （VR / wechat_video_manager）走 ``/dev/shm`` path-list 传帧，
         跨机 Worker 读不到本机 tmpfs，命中远端会逐片 imread 失败；本机
         NPU 延迟也远低于 LAN RPC）。无本机实例时才退回 LAN peer。
 
@@ -4170,7 +4170,7 @@ def get_registry() -> ComputeRegistry:
 # In the v0.4 per-subprocess RPC refactor the call lock is no longer needed     #
 # in the main process (server-side lock in compute_worker serializes per       #
 # instance). This module-level lock is kept so existing call sites             #
-# (video_analysis_search.py, video_search.py, audio_analysis.py) keep    #
+# (video_retrieval/, video_search.py, audio_analysis.py) keep    #
 # compiling. It is a no-op in practice because nothing else in the main        #
 # process ever acquires it.                                                    #
 # --------------------------------------------------------------------------- #

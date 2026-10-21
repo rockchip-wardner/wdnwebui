@@ -34,8 +34,8 @@ def register_api(app: FastAPI) -> None:
     并带着正确的 ``channel``。
 
     历史上有过一份挂在单例 ``VideoSession`` 上的 sink，它不只是白费——
-    ``VideoSession`` 现在仍被 ``video_analysis_search`` 的 ``/source/open``
-    单路预览使用，于是「vtl 开着检测 → 切到 VAS 点打开」会把 **VAS 的帧以
+    ``VideoSession`` 现在仍被 ``video_retrieval`` 的 ``/source/open``
+    单路预览使用，于是「vtl 开着检测 → 切到 VR 点打开」会把 **VR 的帧以
     channel=0 灌进 vtl 的检测器**（``submit_frame`` 只在 detector 未启用时
     才 no-op），事件被错记到第 1 路。删掉它同时省掉一次无谓的每帧调用。
     """

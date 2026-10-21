@@ -9,9 +9,8 @@
 22.4s，某一路的描述必然比它的音频晚二十几秒。不是缺陷，前端显式显示。
 
 NPU 互斥：**不用** ``get_session_call_lock()``。那把锁是进程级的，被音频分析
-/ VAS 视频描述 / VCS 视频检索 / 微信视频检索共用，而 Omni 与 VLM 是两个不同
-的 session、worker 进程和 NPU，不需要互斥。共用它的代价实测过：32 路音频
-轮转时每段持锁 700ms，期间 VAS 的视频描述一把锁都拿不到、整段卡死。这里改用
+/ VR 视频检索 / 微信视频检索共用，而 Omni 与 VLM 是两个不同
+的 session、worker 进程和 NPU，不需要互斥。这里改用
 一把 **Omni 专属的模块级锁**，只保护「同一 Omni session 上的 reset() +
 respond() 不并发」。
 
@@ -70,8 +69,7 @@ STATE_DONE = "done"
 STATE_STOPPED = "stopped"
 STATE_ERROR = "error"
 
-# Omni 专属互斥锁。**不是** get_session_call_lock() —— 那把是进程级的，
-# 会把 VAS 视频描述一起卡住（见模块 docstring）。
+# Omni 专属互斥锁。**不是** get_session_call_lock()
 _omni_call_lock = threading.Lock()
 
 

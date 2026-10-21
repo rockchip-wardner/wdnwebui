@@ -13,15 +13,15 @@
    阈值过滤 + top_k 截断。
 
 LLMSession 从 ComputeRegistry 取（``swcap_video_retrieval`` capability），
-与 detector / VAS 分析侧共用进程级 ``get_session_call_lock`` 串行化。
+与 detector 共用进程级 ``get_session_call_lock`` 串行化。
 
 命中项字段（对齐 demo 语义，前端契约不变）：
     {video_path, start_time, end_time, chunk_idx, similarity}
-缩略图：由 ``GET /api/video-analysis-search/search/frame`` 端点按
+缩略图：由 ``GET /api/video-retrieval/frame`` 端点按
 ``video_path + start_time`` 实时取帧（PyAV seek + RGA 缩放）。
 
 v0.8：从 ``app/apps/video_search/service.py`` 平移到
-``app/core/video/search.py`` —— ``video_analysis_search`` 卡片（分析 +
+``app/core/video/search.py`` —— ``video_retrieval`` 卡片（监控反查，只检索）
 检索合并页）通过 ``app.core.*`` 引用检索能力，遵守卡片零跨卡片 import
 规则。原文件缺失的 ``compute_slices`` / ``_read_chunk_frames``
 两个 import 在平移时补齐（此前只在 worker 线程里才触发 NameError）。
@@ -60,9 +60,8 @@ _VISION_SIZE = 576
 _EMBED_DIM = 2048
 
 # 检索参数固化 —— 页面与向导不暴露；需要调整时直接改这里的值。
-# 取值经 ``start_extract`` / ``query`` 强制覆盖调用方传入值（与
-# ``service.ANALYSIS_PROMPT`` 的固化方式一致），保证落盘缓存键与检索口径
-# 恒定；历史缓存条目仍按自身记录的切片参数检索。
+# 取值经 ``start_extract`` / ``query`` 强制覆盖调用方传入值，保证落盘缓存键
+# 与检索口径恒定；历史缓存条目仍按自身记录的切片参数检索。
 FIXED_CHUNK_SECONDS = 4
 FIXED_CHUNK_OVERLAP_SECONDS = 1
 FIXED_SIM_THRESHOLD = 0.40
@@ -96,7 +95,7 @@ def _score_hits(qvec: np.ndarray, index: List[dict], sim_threshold: float,
     if not hits and fallback:
         hits = fallback[:top_k]
         fallback_used = True
-        LOG.info("vas-search: query threshold %.2f filtered all hits — fallback "
+        LOG.info("video-retrieval: query threshold %.2f filtered all hits — fallback "
                  "top-%d (best sim=%.3f)", sim_threshold, len(hits),
                  hits[0][0] if hits else 0.0)
     out = [{
@@ -130,7 +129,7 @@ def iter_segment_jpeg(source: str, start_s: float, end_s: float,
 
     PyAV 打开一次容器，seek 到 start_s 附近 keyframe 后顺序 decode 到
     end_s；每帧 ``to_ndarray(format="bgr24")`` + cv2 编码 JPEG。供
-    ``/api/video-analysis-search/play`` WS 推帧用。生成器在取帧/编码
+    ``/api/video-retrieval/play`` WS 推帧用。生成器在取帧/编码
     异常时提前结束（由 WS handler 补发 error 帧）。
 
     ``paced=True`` 时按源视频 fps 节流（首帧立即出，后续每帧间隔
@@ -319,7 +318,7 @@ class VideoSearchService:
         # 预检：实例未启用时立即抛 RuntimeError，由 API 层转 503，
         # 避免用户点"开始提取"后还要等 worker 探测元数据才报错。
         # worker 里仍保留二次 _ensure_session 兜底（幂等）。
-        LOG.info("vas-search: start_extract requested (chunk=%ds, overlap=%ds, source=%s)",
+        LOG.info("video-retrieval: start_extract requested (chunk=%ds, overlap=%ds, source=%s)",
                  chunk_seconds, chunk_overlap_seconds, self._source)
         self._ensure_session()
         with self._lock:
@@ -373,7 +372,7 @@ class VideoSearchService:
                         md5_hex, model_id, chunk_seconds,
                         chunk_overlap_seconds)
                 except Exception as exc:  # noqa: BLE001
-                    LOG.warning("vas-search: cache lookup failed (treat as "
+                    LOG.warning("video-retrieval: cache lookup failed (treat as "
                                 "miss): %s", exc)
             if cached:
                 base = os.path.basename(self._source)
@@ -389,7 +388,7 @@ class VideoSearchService:
                     self._slices_embedded = cached["slices_embedded"]
                     self._state = _STATE_READY
                     self._error = ""
-                LOG.info("vas-search: cache hit md5=%s (%d segments, "
+                LOG.info("video-retrieval: cache hit md5=%s (%d segments, "
                          "chunk=%ds/overlap=%ds) — restored, skipped "
                          "embedding", md5_hex[:12],
                          len(cached["index"]), chunk_seconds,
@@ -401,7 +400,7 @@ class VideoSearchService:
         with self._lock:
             self._md5 = md5_hex
             self._worker = threading.Thread(
-                target=self._worker_loop, name="vcs-extract-worker", daemon=True
+                target=self._worker_loop, name="vr-extract-worker", daemon=True
             )
             self._worker.start()
         self._broadcast({"type": "state", **self.snapshot()})
@@ -436,7 +435,7 @@ class VideoSearchService:
             raise ValueError("上限必须在 1–10 之间")
         if min_results < 0:
             min_results = 0
-        LOG.info("vas-search: query text=%r threshold=%.2f top_k=%d min_results=%d "
+        LOG.info("video-retrieval: query text=%r threshold=%.2f top_k=%d min_results=%d "
                  "debug=%s (index_size=%d)",
                  text, sim_threshold, top_k, min_results, debug,
                  len(self._index) if hasattr(self, "_index") else 0)
@@ -622,10 +621,10 @@ class VideoSearchService:
             # 帧采样间隔 1 秒/帧（demo 语义），所以实际覆盖秒数 = 帧数；
             # 短尾片截断时 end_time 按实际帧数计
             end_time = start + len(frames)
-            LOG.debug("vas-search: chunk %d/%d [%.2fs-%.2fs, %d frames]",
+            LOG.debug("video-retrieval: chunk %d/%d [%.2fs-%.2fs, %d frames]",
                       chunk_idx, self._slices_total, start, end_time, len(frames))
             try:
-                LOG.debug("vas-search: chunk %d — calling embed_video", chunk_idx)
+                LOG.debug("video-retrieval: chunk %d — calling embed_video", chunk_idx)
                 import time as _time
                 t_chunk = _time.time()
                 vec = None
@@ -639,7 +638,7 @@ class VideoSearchService:
                     except RuntimeError as rpc_err:
                         if "timeout" not in str(rpc_err).lower() or _attempt == 1:
                             raise
-                        LOG.warning("vas-search: chunk %d embed_video timeout "
+                        LOG.warning("video-retrieval: chunk %d embed_video timeout "
                                     "(reply discovery race), retrying", chunk_idx)
                 vec = np.asarray(vec, dtype=np.float32)
                 norm = float(np.linalg.norm(vec))
@@ -660,12 +659,12 @@ class VideoSearchService:
                             "embedded": self._slices_embedded,
                             "total": self._slices_total,
                         })
-                LOG.debug("vas-search: chunk %d done in %.2fs (slices_embedded=%d/%d)",
+                LOG.debug("video-retrieval: chunk %d done in %.2fs (slices_embedded=%d/%d)",
                           chunk_idx, _time.time() - t_chunk,
                           self._slices_embedded, self._slices_total)
             except Exception as chunk_err:  # noqa: BLE001
                 LOG.warning(
-                    "vas-search: chunk %d [%.2fs-%.2fs] embedding failed after %.2fs: %s — skipping",
+                    "video-retrieval: chunk %d [%.2fs-%.2fs] embedding failed after %.2fs: %s — skipping",
                     chunk_idx, start, end_time, _time.time() - t_chunk, chunk_err)
             chunk_idx += 1
             start += step
@@ -685,7 +684,7 @@ class VideoSearchService:
                 else:
                     self._state = _STATE_READY
                     self._error = ""
-        LOG.info("vas-search: extract done — %d/%d slices embedded in %.1fs wall",
+        LOG.info("video-retrieval: extract done — %d/%d slices embedded in %.1fs wall",
                  self._slices_embedded, self._slices_total,
                  time.time() - self._started_at)
         self._broadcast({"type": "state", **self.snapshot()})
@@ -710,9 +709,9 @@ class VideoSearchService:
                         "chunk_overlap_seconds": self._chunk_overlap_seconds,
                     })
                 except Exception as exc:  # noqa: BLE001
-                    LOG.warning("vas-search: cache save failed (skipped): %s", exc)
+                    LOG.warning("video-retrieval: cache save failed (skipped): %s", exc)
         elif self._slices_embedded < self._slices_total:
-            LOG.warning("vas-search: partial extraction (%d/%d) — not saved to "
+            LOG.warning("video-retrieval: partial extraction (%d/%d) — not saved to "
                         "cache; re-extract to complete",
                         self._slices_embedded, self._slices_total)
 

@@ -25,9 +25,9 @@ BASE = "http://localhost:8000"
 VIDEO = "/home/rockchip/test/test/carplant_29132868.mp4"
 
 # card_id -> (页面 id 前缀, 画布 id, 源输入框 id, 判据 API)
-# VAS 不在列表里：它的判据参数已固化为服务端常量（gscore/10/600），
+# VR 不在列表里：它的判据参数已固化为服务端常量（gscore/10/600），
 # 页面只保留分数浮框与曲线，没有可操作的判据控件（见 app.js 的
-# FrameJudge.mount({showConfig:false})）。
+# 三张卡都走默认 mount（渲染配置区）。
 CASES = [
     ("video-detection",           "vd",  "vd-grid",    "vd-sources", "/api/video-detection/judge"),
     ("video-target-detection",    "vtd", "vtd-grid",   "vtd-sources",

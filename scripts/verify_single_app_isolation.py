@@ -32,7 +32,7 @@ APPS = sorted([
     ("audio_analysis",      "audio-analysis",          True),   # (dir_name, id, hidden)
     ("text_chat",           "text-chat",               False),
     ("tts",                 "tts",                     False),
-    ("video_analysis_search","video-analysis-search",  False),
+    ("video_retrieval",     "video-retrieval",         False),
     ("video_detection",     "video-detection",         False),
     ("video_target_detection","video-target-detection",False),
     ("video_target_localization","video-target-localization",False),

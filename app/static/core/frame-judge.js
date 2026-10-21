@@ -1,17 +1,14 @@
-/* 帧判据共享组件 —— vd / vtd / vtl / vas 四张视频卡共用。
+/* 帧判据共享组件 —— vd / vtd / vtl / vr 四张视频卡共用。
  *
  * 一张卡一个实例（按 prefix 索引）。组件做三件事：
  *
  *   1. **配置区**：算法下拉（手动跳帧 / 判帧算法）+ 阈值 + 帧间隔，
  *      落到卡片模板里的 `<prefix>-judge-config` 容器里。改完 POST 到
- *      `/api/video/judge`（VAS 传自己的 apiBase）—— 真节流，立刻生效。
+ *      `/api/video/judge`（VR 传自己的 apiBase）—— 真节流，立刻生效。
  *   2. **浮框**：视频右上角显示「这一帧判为变化还是没变化」+ 当前分数。
  *   3. **实时曲线**：视频正下方、与视频等宽的分数曲线。**只在向导里出现**
  *      —— 功能页不画（用户明确要求），进功能页就只剩配置和浮框。
- *
- * **VAS 例外**：`showConfig` / `showCurve` 均为 false，且它不是宫格（没有
- * tile 角标承载浮框），因此配置区 / 浮框 / 曲线三者都不渲染；仍 mount 只是
- * 为了让 `update()` 继续接收本轮判据状态。
+
  *
  * 为什么浮框 / 曲线用 position:fixed 跟着画布走，而不是塞进画布容器
  * ----------------------------------------------------------------
@@ -28,7 +25,6 @@
   const DEFAULT_API = "/api/video/judge";
   const CURVE_H = 88;          // 曲线像素高
   const CURVE_GAP = 6;         // 曲线与画布底边的间距
-  const BADGE_PAD = 10;        // 浮框距画布边缘
 
   /** prefix -> 实例 */
   const registry = new Map();
@@ -48,17 +44,10 @@
       this.canvasId = opts.canvasId;
       this.api = opts.apiBase || DEFAULT_API;
       this.judge = null;          // 后端判据快照
-      // 配置区是否由 update() 回写。VAS 传 false：它的配置是"下次运行生效"，
+      // 配置区是否由 update() 回写。部分卡片的配置是"下次运行生效"，
       // 而每 tick 推来的是**本轮真实**判据状态 —— 两者短暂不一致是设计
       // 使然，若让 tick 覆盖控件，用户改完的阈值会被本轮的旧值悄悄抹掉。
       this.syncControls = opts.syncControls !== false;
-      // 配置区是否渲染。VAS 的判据参数已固化为服务端常量（gscore/10/600），
-      // 它传 false 跳过 _buildConfig()。
-      this.showConfig = opts.showConfig !== false;
-      // 曲线是否创建。VAS 传 false：它的判据参数不可调，曲线没有调参价值；
-      // 而向导「视频源」步打开的是共享 VideoSession 的预览（不建 VAS 的
-      // 判据器），曲线只会停在「采集中…」。vd / vtd / vtl 保持默认 true。
-      this.showCurve = opts.showCurve !== false;
       this.applied = true;        // 配置是否已真正作用在当前 run 上
       this._awaitSync = null;     // 待后端确认的配置（门闩，见 _acceptSync）
       this._gen = null;            // 已见过的最新配置代次（过期快照直接丢）
@@ -71,7 +60,7 @@
     mount() {
       if (this._built) return;
       this._built = true;
-      if (this.showConfig) this._buildConfig();
+      this._buildConfig();
       this._buildFloats();
       this._load();
       // 画布位置会因向导搬运 / 窗口缩放 / 滚动而变，三路都重摆一次。
@@ -231,8 +220,7 @@
 
     /** 把控件当前值推到后端（真节流）。 */
     async _apply() {
-      // 无配置区（showConfig:false，如 VAS 固化判据）时不要 POST ——
-      // 否则会用这里的兜底值（manual/30）把服务端判据改掉。
+      // 没有配置控件时不要 POST（防御：控件尚未构建）。
       if (!this.selMode) return;
       const mode = this.selMode?.value || "manual";
       const every = Math.max(1, parseInt(this.inpEvery?.value || "30", 10) || 30);
@@ -336,18 +324,16 @@
       this.badgeNum = badge.querySelector(".vj-badge-num");
       this.badgeSub = badge.querySelector(".vj-badge-sub");
 
-      if (this.showCurve) {
-        const curve = ce("div", "vj-curve");
-        curve.id = this.prefix + "-judge-curve-wrap";
-        curve.style.display = "none";
-        const cv = ce("canvas", "vj-curve-canvas");
-        curve.appendChild(cv);
-        curve.appendChild(ce("div", "vj-curve-hint", "实时分数曲线"));
-        document.body.appendChild(curve);
-        this.curve = curve;
-        this.curveCanvas = cv;
-        this.curveCtx = cv.getContext("2d");
-      }
+      const curve = ce("div", "vj-curve");
+      curve.id = this.prefix + "-judge-curve-wrap";
+      curve.style.display = "none";
+      const cv = ce("canvas", "vj-curve-canvas");
+      curve.appendChild(cv);
+      curve.appendChild(ce("div", "vj-curve-hint", "实时分数曲线"));
+      document.body.appendChild(curve);
+      this.curve = curve;
+      this.curveCanvas = cv;
+      this.curveCtx = cv.getContext("2d");
     }
 
     /**
@@ -424,23 +410,6 @@
       const visBottom = Math.min(r.bottom, vh);
       if (visBottom - visTop < 24) { hide(); return; }          // 几乎滚没了
 
-      // v0.23: 不再 show 全局 badge —— 每路 tile.badge 接管。
-      // 保留 this.badge DOM 节点是为了 setBadge(idx) 旧卡片 / 测试仍能拿到元素。
-      if (false && this.badge) {  // disabled
-        this.badge.style.display = "";
-        this.badge.style.left = (r.right - this.badge.offsetWidth - BADGE_PAD) + "px";
-        // 贴画布**下沿**而不是上沿：右上角是各卡检测结果的落点（视频目标
-        // 框 / 描述文案都从那儿起），浮框摆上沿会直接压住它们。下沿是
-        // 画面本体，通常是空的；压到视频上也只是半透明浮层，不像上沿
-        // 那样和结果文字抢位置。
-        //
-        // 画布下沿滚出视野时退到**可见下沿**，再兜一次视口 —— 否则浮框
-        // 会飘到画布下方那些无关控件上面。
-        const visBot = Math.min(r.bottom, vh);
-        let top = visBot - this.badge.offsetHeight - BADGE_PAD;
-        if (top < visTop + BADGE_PAD) top = visTop + BADGE_PAD;
-        this.badge.style.top = top + "px";
-      }
       // 曲线**只在向导里**：向导会把 canvas 搬进 .wd-wizard-canvas-wrap。
       if (this.curve) {
         const inWizard = !!c.closest(".wd-wizard-canvas-wrap");
@@ -461,7 +430,7 @@
           return;
         }
         // **legacy 路径**：曲线还在 body（早期 wizard state.js 没搬到 fieldset
-        // 之前的中间状态；以及非 multi-card 的老 wizard 用法 —— VAS 等）——
+        // 之前的中间状态；以及非 multi-card 的老 wizard 用法 —— VR 等）——
         // 仍按 fixed 摆位，跟 canvas 下沿贴合。
         if (r.bottom <= 0) {
           this.curve.style.display = "none";
@@ -570,7 +539,7 @@
     /**
      * `_awaitSync` 期间**不**用 tick 回写控件 —— 防的是"刚 POST 的新值被
      * 同一 gen 的旧快照覆盖"。带 gen 的过期快照已在 update() 开头拦掉；
-     * 这里补的是 gen 缺席的场景（VAS 的配置视图不带 gen）。
+     * 这里补的是 gen 缺席的场景（部分旧快照不带 gen）。
      */
     _acceptSync(j) {
       if (!this._awaitSync) return true;
@@ -583,40 +552,8 @@
       return false;
     }
 
-    _paintBadge(j) {
-      const manual = j.manual;
-      const on = !manual && j.changed;
-      const cur = j.cur;
-      this.badge.classList.toggle("on", !!on);
-      this.badge.classList.toggle("manual", !!manual);
-      if (manual) {
-        this.badgeTxt.textContent = "手动跳帧";
-        this.badgeNum.textContent = `每 ${j.every_n} 帧送检`;
-        this.badgeSub.textContent =
-          `${j.mode} · 固定间隔 · 不比对画面`;
-        return;
-      }
-      this.badgeTxt.textContent = on ? "画面变化" : "无变化";
-      this.badgeNum.textContent = cur != null ? (+cur).toFixed(2) : "--";
-      // **主行是"当前这一帧"的判定，绝大多数帧都是"无变化"** —— 用户盯着
-      // 浮框看只会得到"判据没生效"的错误结论，而实际上检测器可能正忙成一团。
-      // 所以副行必须报**实测送检间隔**：它直接回答"我把帧间隔设成 300，
-      // 为什么还在一秒钟一次"。实测间隔远小于兜底间隔 = 阈值把几乎每一帧
-      // 都放行了、兜底根本轮不上（材料噪声底高于阈值时就是这个形态）。
-      const eff = j.every_n_eff;
-      const effTxt = (eff != null && eff < 1e9)
-        ? `实际每 ${eff >= 100 ? Math.round(eff) : eff.toFixed(1)} 帧送检`
-        : "实际每 -- 帧送检";
-      const starve = (eff != null && j.every_n > 0 && eff <= Math.max(2, j.every_n / 5));
-      this.badge.classList.toggle("warn", !!starve);
-      this.badgeSub.textContent =
-        `${j.mode} · 阈值 ${(+j.threshold).toFixed(2)} · ${effTxt}`
-        + (starve ? ` · 兜底 ${j.every_n} 帧形同虚设` : ` · 兜底 ${j.every_n} 帧`);
-    }
-
     _drawCurve() {
-      // showCurve:false（VAS）时不创建曲线 DOM —— 这里及静态 draw() 的
-      // 调用点都可能是无条件的，统一在入口短路。
+      // 防御：曲线 DOM 尚未创建时直接返回（静态 draw() 的调用点可能无条件）。
       if (!this.curve || !this.curveCanvas || !this.curveCtx) return;
       const ctx = this.curveCtx;
       const cv = this.curveCanvas;
@@ -848,10 +785,8 @@
     },
     get(prefix) { return registry.get(prefix); },
     /**
-     * 当前控件上的判据配置。卡片把它拼进自己的启动请求体
-     * （VAS 的 /analyze 就是这么拿到 sample_mode / every_n /
-     * change_threshold 的）—— 组件自己已经在 POST 时落库，这里只是让
-     * 调用方不用再各自去读 DOM id。
+     * 当前控件上的判据配置。卡片把它拼进自己的启动请求体 ——
+     * 组件自己已经在 POST 时落库，这里只是让调用方不用再各自去读 DOM id。
      */
     config(prefix) {
       const inst = registry.get(prefix);

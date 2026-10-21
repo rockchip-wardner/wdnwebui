@@ -182,7 +182,7 @@
 }
 
 /* ---- 实时曲线（视频正下方，仅向导内可见）---- */
-/* 默认按 position:fixed 浮在画布下沿 —— VAS 这类单路老卡片还在用这条路径。
+/* 默认按 position:fixed 浮在画布下沿。
  * .wd-wizard-judge-fs 里的曲线会被 mountInWizard() 重置成 position:static
  * （直接由 JS 写 style 覆盖），靠 fieldset 容器的流式布局接管。
  */

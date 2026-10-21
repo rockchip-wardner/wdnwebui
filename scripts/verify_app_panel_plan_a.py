@@ -7,7 +7,7 @@ EXPECTED = {
     "video-target-detection":       "对实时视频流持续检测指定目标是否出现，命中时自动告警并描述。",
     "video-target-localization":    "输入任意文字描述，从图像中圈出对应目标所在区域。",
     "tts":                          "把中文文本转成自然语音。",
-    "video-analysis-search":        "上传视频做逐帧分析与摘要，并支持自然语言检索片段。",
+    "video-retrieval":              "上传视频建立检索索引，用自然语言反查命中片段。",
     "text-chat":                    "与通用大模型多轮对话，支持上下文连续追问。",
 }
 

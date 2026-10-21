@@ -975,7 +975,7 @@
   // video_detection / video_target_detection / video_target_localization
   // 的 ``session.state`` ∈ {opening, playing, paused, eof};
   // text_chat / tts 的 ``session.state`` ∈ {loading, running};
-  // video_analysis_search / audio_analysis / video_search
+  // video_retrieval / audio_analysis / video_search
   // 的 ``service.state`` / ``vcs.state`` 同样会在跑时落入这套值。
   // 加上 ``running`` / ``loading`` 兼容 video-detection 的 audio 子状态。
   const _ACTIVE_STATE_STRINGS = new Set([

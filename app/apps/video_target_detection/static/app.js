@@ -566,7 +566,7 @@ function initVideoTargetDetection() {
 
   loadInstancePickMulti(PICK_ID, "swcap_video_describe", "vtd.instances");
   // apiBase 指向本卡判据端点：/api/video/judge 操作的是单例 VideoSession
-  // （vd / vtl 共用），本页走 MultiChannelSession，同 VAS 挂自己的 judge_api。
+  // （vd / vtl 共用），本页走 MultiChannelSession，同 VR 挂自己的 judge_api。
   window.FrameJudge?.mount({ prefix: "vtd", canvasId: GRID_EL,
                              apiBase: API_PREFIX + "/video-target-detection/judge" });
 

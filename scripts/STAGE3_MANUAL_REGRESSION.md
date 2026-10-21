@@ -34,13 +34,12 @@ pkill -9 -f compute_worker            # 清掉打补丁前代码的孤儿 worker
 - [ ] 启用→禁用→再启用，反复 3 次，**无重复进程**（看系统信息页的进程数）
 - [ ] 已启用时禁用 `qwen3-vl-4b`（互斥替代品）→ 应报 403 并提示"到目标板子上禁用"
 
-## 3. 音视频描述 `video-analysis-search` / `#video-analysis-search`
+## 3. 监控反查 `video-retrieval` / `#video-retrieval`
 
 - [ ] 向导 → 选模型 → 启动
-- [ ] **流式逐字**渲染出 thinking / answer（不是一次性蹦出）
-- [ ] 事件文本是**通顺中文**，不是半截 JSON
-- [ ] 事件历史里**没有** `<|im_end|>` / `<｜im_end｜>` 等 ChatML 泄漏
-- [ ] 切帧 / 拖进度条后描述随之更新
+- [ ] **视频分段**提取检索索引
+- [ ] 提取成功后，提取结果会被存入缓存
+- [ ] 提取步骤结束，会开始根据提问进行反向检索
 - [ ] 切走页面时 DemoGuard 弹确认框；确认后后台确实停
 
 ## 4. 视频目标检测 `video-target-detection`

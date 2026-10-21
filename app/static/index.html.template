@@ -610,7 +610,7 @@
 
       {% card_slot "video-target-detection" %}
       {% card_slot "video-target-localization" %}
-      {% card_slot "video-analysis-search" %}
+      {% card_slot "video-retrieval" %}
       {% card_slot "tts" %}
       {% card_slot "text-chat" %}
       {% card_slot "usb-hid" %}

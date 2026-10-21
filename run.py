@@ -579,7 +579,7 @@ def main() -> None:
     # v0.6: no daemon bootstrap — ComputeRegistry's Hub uses FastDDS
     # SIMPLE discovery (multicast 239.255.0.1:7400).
 
-    # VAS_SEARCH extract over a long source runs 50-75s; uvicorn's default 20s WS
+    # VR extract over a long source runs 50-75s; uvicorn's default 20s WS
     # ping often times the connection out mid-extract so the progress bar
     # only resyncs on reconnect (visible as a single 0% → 100% jump).
     # **不要**加 ws_per_message_deflate=False。曾按「JPEG 本来就是 deflate

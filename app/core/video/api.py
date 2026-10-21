@@ -4,8 +4,7 @@
 任一张卡上改配置，三张卡同时生效（它们本来就在看同一个视频源）。挂一个
 core 级 router 比让每张卡各抄一份端点更不容易走样。
 
-VAS（``video-analysis-search``）**不在此列** —— 它自管理 ``VideoCapture``
-与 decode 循环，判据配置走自己的 ``/api/video-analysis-search/*``。
+``video-retrieval``（监控反查）**不在此列** —— 它只保留检索，没有判据。
 
 路由前缀由 :func:`register_judge_api` 决定（``app/main.py`` 调）。
 """
@@ -19,9 +18,9 @@ import logging
 from fastapi import APIRouter, FastAPI
 from pydantic import BaseModel, Field
 
-from app.core.video.change_detector import SAMPLE_MODE_AUTO
 from app.core.video.frame_judge import (
     DEFAULT_LONG_SIDE,
+    EXPOSED_METRICS,
     MODE_MANUAL,
     cost_ms,
     default_threshold,
@@ -72,14 +71,13 @@ def _normalize_alias(mode: str) -> str:
 
     不做这一步的话 ``POST /judge {"mode":"auto"}`` 会被当成未知模式静默回落
     manual —— 自动判帧"看起来关了"，而用户什么都没改。存量配置里的 ``z_mad``
-    同理（``normalize_mode`` 内部有迁移表）。VAS 那条链路在 api/service 两层都
-    做了同样的映射，这里保持一致。
+    同理（``normalize_mode`` 内部有迁移表）。
 
     **只用于校验** —— 真正传给 ``FrameJudge`` 的是原始字符串，见 :func:`set_judge`
     里那条"静默失效"的注释。
     """
     m = str(mode or "").strip().lower()
-    return normalize_mode(SAMPLE_MODE_AUTO if m == "auto" else m)
+    return normalize_mode(EXPOSED_METRICS[0] if m == "auto" else m)
 
 
 @router.get("/judge")
