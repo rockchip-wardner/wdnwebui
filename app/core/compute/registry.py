@@ -1754,13 +1754,26 @@ class ComputeRegistry:
             # 路由到本机,造成 NETWORK 卡 status 翻转。
             "--local-only",
         ]
-        if npu_index is not None and (npu_index if eager_load is None else eager_load):
+        if npu_index is not None and (True if eager_load is None
+                                      else bool(eager_load)):
             # autostart path: the card is known now, so hand it over and
             # let the worker's own eager-load thread build the model. The
             # replier is registered before that thread starts, so probe
             # and ``info`` keep answering while the weights load.
             # The compute page passes eager_load=False and loads over RPC
             # instead — see the method docstring.
+            #
+            # 判据是「npu_index 有没有给」，而不是「npu_index 是否非零」。
+            # 原来的写法是
+            #   if npu_index is not None and (npu_index if eager_load is None
+            #                                      else eager_load):
+            # 在 autostart 默认（eager_load=None）时右边取到 npu_index 本身，
+            # 而 **npu_index=0 是 falsy** —— 于是 0 号卡上的模型永远拿不到
+            # --npu，worker 进程起来了却不 eager load，状态永远卡在
+            # not_loaded。本方法 docstring 明写契约是
+            # "eager_load defaults to npu_index is not None"，代码没实现它。
+            # 实测：npu1 的 qwen2.5-omni-3b 能 running，npu0 的全部卡死，
+            # 差异就在这一处。
             cmd += ["--npu", str(int(npu_index))]
         try:
             # v0.8.6 改:worker stdout/stderr 写独立 log file,而不是 PIPE。
