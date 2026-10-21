@@ -125,7 +125,17 @@ HOST_SCREEN_H = 1080
 # 另外 `action` 用 ``Literal`` 而不是自由字符串：enum 会原样进 JSON
 # schema，4B 模型在 enum 上的服从率远高于"自己挑一个动词"。
 #
-# **动作集里刻意没有 `move`（只移动不点击）**：
+# **`not_found` 是必须的，不是可选的。** 实测踩过的坑：PC 上正跑着全屏
+# 游戏，用户却要求"打开记事本" —— 画面里根本没有桌面、没有任务栏、
+# 没有开始菜单。但 enum 只给了 click/type/key 这些动作，模型**被迫**挑
+# 一个，挑出来就是 `click` + 坐标 0,0（最保守的猜测），于是表现为
+# "点了左上角，什么也没发生"，而且步日志里 status=ok，完全看不出异常。
+#
+# 给了 `not_found` 之后，模型可以如实回答"画面里没有你要找的东西"，
+# 循环据此以明确原因收工。这是 agent 的基本设计：**动作集里必须有
+# "我做不到"这一项**，否则模型只会用错误的动作掩盖不确定。
+#
+# **`move`（只移动不点击）同样被刻意删掉**：
 # `DigitizerWriter.move(tip_down=False)` 的 docstring 写着 "Win PT drivers
 # silently discard this" —— 宿主根本不认悬停帧，唯一能观察到的后果是
 # 白烧一步推理、模型还以为鼠标动了。网页路径也不发悬停帧（没有按键时
@@ -136,7 +146,7 @@ HOST_SCREEN_H = 1080
 # LMOutput（规矩 1）。
 ActionName = Literal[
     "click", "double_click", "right_click", "drag",
-    "type", "key", "scroll", "wait", "done",
+    "type", "key", "scroll", "wait", "not_found", "done",
 ]
 
 
@@ -149,6 +159,7 @@ class AgentAction(BaseModel):
             "drag 从 (x,y) 拖到 (x2,y2) / "
             "type 输入一段文本到 text / key 按一个组合键到 text / "
             "scroll 滚动（x 为格数，负数向下）/ wait 等 x 秒 / "
+            "not_found **这张图里找不到完成这个任务需要的东西** / "
             "done 任务已完成。"
             "（没有\"只移动不点击\"的动作：触屏表达不了悬停。）"
         ),
@@ -206,13 +217,54 @@ _PROMPT_HEADER = """\
 规则：
 - 一次只输出一个动作，然后由系统执行、执行完给你一张新截图。
 - x 和 y 是**必填**的，任何动作都不能省略，也不要填 0 充数。
-- 只有当任务确实完成时才输出 done。看不到目标、界面没反应、或者需要用户
-  介入时，用 thought 说明卡在哪里，不要硬猜坐标。
+- **如果你在这张图里找不到完成这个任务需要的东西**（比如要求"打开记事本"
+  但图里是个全屏程序、没有桌面和任务栏），直接输出 not_found，并在 thought
+  里说明你看到了什么。**不要**因为找不到就随便挑一个坐标去点 —— 那只会
+  在屏幕上乱点，比不做更糟。
+- 只有当任务确实完成时才输出 done。界面没反应、或需要用户介入时，
+  同样用 not_found 或 thought 说明卡在哪里，不要硬猜坐标。
 - 不要重复执行已经成功执行过的同一个动作；画面变了就重新判断。
 """
 
 
-def _geometry_block(meta) -> str:
+def _active_area_1000(frame) -> Optional[tuple[int, int, int, int]]:
+    """Where is the real picture inside the frame, in 0-1000 coords?
+
+    实测踩到的坑：PC 上跑着 16:10 的程序，HDMI-IN 抓到的是 1920×1080，
+    而真实画面只有中间 1728×1080，**左右各 96px 黑边**。模型不知道这
+    件事，它按"整幅图"去理解，于是瞄准最左边那个按钮时会偏到黑边上 ——
+    肉眼看着"就差一点"，实际偏了 5% 屏宽。
+
+    判据用整行/整列均值 > 12 而不是 > 0：压缩噪点和暗色桌面边缘会有
+    几个接近 0 的像素，完全取非黑会把黑边算进内容区。
+    抽样 (::16) 后约 7k 列 × 68 行，单帧 ~0.3 ms。
+    """
+    import numpy as _np
+    try:
+        sub = frame[::16, ::16]
+        gray = sub.mean(axis=2)
+        col = gray.mean(axis=0)
+        row = gray.mean(axis=1)
+        c = _np.where(col > 12)[0]
+        r = _np.where(row > 12)[0]
+        if c.size == 0 or r.size == 0:
+            return None
+        h, w = frame.shape[:2]
+        sw, sh = max(1, sub.shape[1]), max(1, sub.shape[0])
+        x0 = int(c.min() * 16 / w * 1000)
+        x1 = int((c.max() + 1) * 16 / w * 1000)
+        y0 = int(r.min() * 16 / h * 1000)
+        y1 = int((r.max() + 1) * 16 / h * 1000)
+        # 真的存在黑边才报，否则纯噪声会让这段文字变成废话。
+        if x0 < 5 and x1 > 995 and y0 < 5 and y1 > 995:
+            return None
+        return (max(0, x0), max(0, y0), min(1000, x1), min(1000, y1))
+    except Exception as e:  # noqa: BLE001
+        LOG.debug("agent: active-area probe failed (%s)", e)
+        return None
+
+
+def _geometry_block(meta, frame=None) -> str:
     """Spell out where the desktop actually sits inside the square canvas.
 
     为什么必须写这段：RK3588 的 vision 变体是正方形（768×768），1920×1080
@@ -226,6 +278,11 @@ def _geometry_block(meta) -> str:
     顶部/底部因为后面会 clamp，看起来"还挺准"，把中部的错误完全盖住了，
     表现就是"有时候点得准有时候差很远"，极难归因。
 
+    另外 PC 上跑的程序**不一定**填满整幅。如果画面比 16:9 窄或高，
+    HDMI-IN 抓到的 1920×1080 里会有**黑边**；黑边上点什么都没用，但
+    模型不知道。`_active_area_1000` 给出真实内容区，写到这里让它
+    明白"目标要落在 x∈[50,950] 这条带里"。
+
     数字全部从当帧的 meta 现算，不是写死的 —— 换送检尺寸（384）后
     pad_top 会变，这里自动跟着变。
     """
@@ -234,6 +291,18 @@ def _geometry_block(meta) -> str:
     bottom = (meta.pad_top + meta.content_h) / size * 1000.0
     left = meta.pad_left / size * 1000.0
     right = ((meta.pad_left + meta.content_w) / size) * 1000.0
+    extra = ""
+    if frame is not None:
+        a = _active_area_1000(frame)
+        if a is not None:
+            ax0, ay0, ax1, ay1 = a
+            margin = int((ax1 - ax0) * 0.03)
+            extra = (
+                f"\n- 当前截图里**真实画面**在 x∈[{ax0},{ax1}]、"
+                f"y∈[{ay0},{ay1}] 这一块（其余都是黑色留边）。"
+                f"目标点最好离这块边界留 ≥{margin} 的余量"
+                f"（{margin}/1000 屏宽 ≈ {margin / 10:.1f}%）。"
+            )
     return (
         f"- 这是一张 {int(size)}×{int(size)} 的正方形图，但电脑桌面只有中间一条：\n"
         f"  x 从 {left:.0f} 到 {right:.0f}，y 从 **{top:.0f} 到 {bottom:.0f}**。\n"
@@ -243,6 +312,7 @@ def _geometry_block(meta) -> str:
         f"- 找目标时按**桌面自己的相对位置**估算：任务栏在最下面一行"
         f"（y≈{bottom - (bottom - top) * 0.03:.0f}），"
         f"桌面图标在左上，标题栏在最上面（y≈{top + (bottom - top) * 0.03:.0f}）。"
+        f"{extra}"
     )
 
 
@@ -461,6 +531,21 @@ class ComputerControlAgent:
                 self._append_step(step)
                 return self._finish("done", task_done=thought or None)
 
+            if name == "not_found":
+                # 模型如实说"画面里没有我要找的东西"。这不是错误，是
+                # 它终于有了"做不到"这个选项 —— 在这之前它只能挑个
+                # click + (0,0) 把"找不到"伪装成"点了但没反应"。
+                step = _new_step(i, {"action": "not_found", "thought": thought})
+                reason = (
+                    f"模型在这张截图里找不到完成「{self._task}」需要的东西。"
+                    + (f"它说：{thought}" if thought else "")
+                    + "（画面里可能不是桌面 —— 比如某个程序全屏了，"
+                      "没有任务栏和开始菜单。先切回桌面再试。）"
+                )
+                step.update(status="error", summary="", detail=reason)
+                self._append_step(step)
+                return self._fail(reason)
+
             step = _new_step(i, action)
             self._append_step(step)          # append now so the UI shows
                                             # the step while it executes
@@ -524,7 +609,7 @@ class ComputerControlAgent:
         prompt = _PROMPT_HEADER.format(
             task=self._task,
             history=_format_history(self._steps[:-1]),
-            geometry=_geometry_block(meta),
+            geometry=_geometry_block(meta, frame),
         )
         try:
             # ``image_size`` 必须和脚本侧 letterbox 的边长严格一致，
@@ -710,9 +795,11 @@ class ComputerControlAgent:
             hx, hy = self._point(action, "x", "y")
             if self._is_degenerate_origin(hx, hy):
                 raise ValueError(
-                    "模型给出的坐标落在屏幕左上角 (0,0) —— 那一块在 Windows "
-                    "桌面上点不到任何东西。多半是它没给坐标（被当成 0），或"
-                    "把灰色留边当成了屏幕顶部。已跳过这一步。")
+                    "坐标落在屏幕左上角 (0,0) —— 那一块在 Windows 桌面上"
+                    "点不到任何东西。两种可能：模型没给坐标（会被当成 0），"
+                    "或者**这张截图里根本没有你要找的东西**，模型只能瞎猜。"
+                    "（后者实测很常见：PC 上跑着全屏程序时要求它操作桌面，"
+                    "它就找不到。）已跳过这一步。")
             dig = get_digitizer()
             n = 2 if name == "double_click" else 1
             for _ in range(n):
@@ -1009,7 +1096,7 @@ def _normalize_action(obj: Any, why: Optional[list[str]] = None) -> Optional[dic
     action = str(body.get("action", "") or "").strip().lower()
     known = {
         "click", "double_click", "right_click", "drag",
-        "type", "key", "scroll", "wait", "done",
+        "type", "key", "scroll", "wait", "not_found", "done",
     }
     # Common synonyms the model reaches for despite the enum.
     action = {
@@ -1019,7 +1106,10 @@ def _normalize_action(obj: Any, why: Optional[list[str]] = None) -> Optional[dic
         "type_text": "type", "input": "type", "write": "type",
         "hotkey": "key", "press": "key", "keypress": "key",
         "wheel": "scroll", "scroll_down": "scroll", "scroll_up": "scroll",
-        "sleep": "wait", "finish": "done", "completed": "done",
+        "sleep": "wait", "notfound": "not_found", "not-found": "not_found",
+        "cannot_find": "not_found", "not_visible": "not_found",
+        "missing": "not_found", "unclear": "not_found", "give_up": "not_found",
+        "finish": "done", "completed": "done",
         "complete": "done", "stop": "done",
     }.get(action, action)
     if action not in known:
