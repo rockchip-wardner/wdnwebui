@@ -40,8 +40,13 @@ Endpoints
                                           并把承载它的 (model, npu_index)
                                           增量写进 ``compute.autostart``
                                           （下次 reboot 也会启）。
-* ``DELETE /api/compute/active-app``      清掉 ``compute.active_app`` 标记。
-                                          **不**动 autostart。
+* ``DELETE /api/compute/active-app``      清掉 ``compute.active_app``
+                                          **并把 ``compute.autostart``
+                                          置空**（退出应用 = "不想让这些
+                                          算力下次开机自己起来"）。配合上面
+                                          PUT 的"增量追加"，autostart 就是
+                                          本次会话用到的算力集合，进卡加、
+                                          退出清，不再只增不减。
 
 错误码：
 
@@ -634,9 +639,18 @@ async def clear_errors(payload: ClearErrorsRequest) -> dict:
 #                                         启的 worker 下次 reboot 也会起来。
 #                                         失败时 409 + 原因。
 #   DELETE /api/compute/active-app     —— 用户离开 / 切换 / 关闭 tab 时
-#                                         调用，**不**动 autostart（autostart
-#                                         仍负责"该启的算力"，由用户在算力页
-#                                         显式关闭）。
+#                                         调用，**同时把 compute.autostart
+#                                         置空**。旧行为是"不动 autostart"
+#                                         （理由：autostart 仍负责"该启的算
+#                                         力"，由用户在算力页显式关闭），但
+#                                         配上上面 PUT 的增量追加，autostart
+#                                         就只增不减：进过几张视频/音频卡之后
+#                                         config.jsonc 攒到 5 条、npu0 挤 3 个
+#                                         模型（估算 12500 MB），
+#                                         qwen3-vl-embedding-2b 直接 rc=-6
+#                                         起不来，而"去算力页手动关"没人记得
+#                                         做。现在退出即清空，autostart 回到
+#                                         "本次会话用到的算力"这个语义。
 
 def _resolve_card_manifest(app_id: str):
     """按 app_id 查 manifest。
@@ -719,9 +733,12 @@ async def put_active_app(payload: ActiveAppSet) -> dict:
 
 @router.delete("/compute/active-app")
 async def delete_active_app() -> dict:
-    """清掉 ``compute.active_app`` 标记。
+    """清掉 ``compute.active_app`` **并把 ``compute.autostart`` 置空**。
 
-    不动 autostart。响应永远是 ``{"ok": True, "active_app": null}``。
+    响应永远是 ``{"ok": True, "active_app": None}``。autostart 的清理由
+    :meth:`ComputeRegistry.clear_active_app` 一并落盘 —— 退出应用就是
+    "我不想让这些算力下次开机自己起来"，留着只会让 autostart 只增不减、
+    把 NPU 撑爆（见模块 docstring 里的实测数据）。
     """
     reg = get_registry()
     reg.clear_active_app()

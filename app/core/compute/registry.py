@@ -4204,11 +4204,27 @@ class ComputeRegistry:
         }
 
     def clear_active_app(self) -> None:
-        """清除 ``compute.active_app`` 标记。
+        """清除 ``compute.active_app`` **和** ``compute.autostart``。
 
-        不动 ``compute.autostart`` —— autostart 是"开机该启的算力"，可能
-        还有别处依赖它（手动配 / 其它 app 共用），由用户去算力页关掉。
-        只清 active_app = "我当前不在这个 app 的模式了"。
+        用户显式"退出应用"（back-home 按钮）时调用，语义是"我不在这张卡
+        的模式里了，也不想让这些算力下次开机自己起来"。
+
+        为什么要连 autostart 一起清
+        ----------------------------
+        旧行为只清 ``active_app``、**故意**留着 autostart，理由是
+        "autostart 负责该启的算力，由用户在算力页显式关闭"。但配合
+        :meth:`set_active_app` 的"进入卡片就增量追加 autostart"，结果是
+        autostart **只增不减**：每进一张卡就多一条，永远没人删。实测
+        跑过几张视频/音频卡之后 config.jsonc 里攒到 5 条、npu0 挤了 3 个
+        模型（估算 12500 MB），``qwen3-vl-embedding-2b`` 直接以 rc=-6
+        （NPU 分配失败）起不来，而"去算力页手动关"这一步没人会记得做。
+
+        现在退出即清空，autostart 回到"本次会话用到的算力"这个语义：
+        进卡 → 追加（中途重启能把本会话需要的模型拉回来）；
+        退出 → 全清（下次开机不自动起，用户要在算力页自己开）。
+
+        幂等：``active_app`` 和 ``autostart`` 都已经是干净的就直接返回，
+        省一次 fs write（back-home 可以被连点）。
         """
         try:
             section = get_config().get_section("compute", {}) or {}
@@ -4216,15 +4232,22 @@ class ComputeRegistry:
             return
         if not isinstance(section, dict):
             return
-        if "active_app" not in section:
+        had_app = "active_app" in section
+        prev_autostart = section.get("autostart")
+        # 只有"非空 list"才算需要清 —— 缺字段 / None / 已是 [] 都不动，
+        # 避免把 autostart 从"字段不存在"改成"显式空 list"这种无意义 diff。
+        had_autostart = isinstance(prev_autostart, list) and bool(prev_autostart)
+        if not had_app and not had_autostart:
             return  # 已经是干净的，省一次 fs write
         section.pop("active_app", None)
+        section["autostart"] = []
         try:
             get_config().set_section("compute", section)
         except Exception as e:  # noqa: BLE001
             LOG.warning("clear_active_app persist failed: %s", e)
             return
-        LOG.info("compute.active_app 已清空")
+        n = len(prev_autostart) if isinstance(prev_autostart, list) else 0
+        LOG.info("compute.active_app 已清空；compute.autostart 已清空（%d 条）", n)
 
 
 # --------------------------------------------------------------------------- #

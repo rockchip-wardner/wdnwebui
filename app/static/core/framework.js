@@ -138,13 +138,19 @@
   //       - 只有 back-home 按钮显式 _exit() 才清。
   //   * caps 全 local running 时额外 PUT /api/compute/active-app。后端
   //     把当前承载该 app 的 (model, npu_index) 增量写进 compute.autostart
-  //     —— 下次 reboot 时 worker 自动 spawn。caps 未 ready 时**不**PUT
-  //     (后端会 409),但 in-memory _current 仍设;轮询 1Hz 跟进 caps
-  //     状态,一旦 ready 立刻补 PUT。
+  //     —— 本次会话中途重启能把该卡需要的模型拉回来。caps 未 ready 时
+  //     **不**PUT(后端会 409),但 in-memory _current 仍设;轮询 1Hz 跟进
+  //     caps 状态,一旦 ready 立刻补 PUT。
+  //   * 显式 _exit() 时 DELETE /api/compute/active-app,后端会**连
+  //     compute.autostart 一起清空** —— 退出应用 = "不想让这些算力下次
+  //     开机自己起来"。之前是"只清 active_app、autostart 留着",配上
+  //     上面 PUT 的增量追加就成了只增不减:进过几张视频/音频卡之后
+  //     config.jsonc 攒到 5 条、npu0 挤 3 个模型(估算 12500 MB),
+  //     qwen3-vl-embedding-2b 直接 rc=-6(NPU 分配失败)起不来。
   //   * 后端 reboot 后的第一次 GET 看到 active_app 非空 → 前端
   //     拿到该值后直接跳到对应 #<id>,不再让用户重新点卡片。
-  //   * beforeunload 不再 DELETE —— 用户关 tab / 刷页是常见操作,不该
-  //     把 "我在这" 也一起擦掉;持久化跨 tab 保持,直到用户显式 _exit。
+  //   * beforeunload 不 DELETE —— 关 tab / 刷页是常见操作,不该把
+  //     "我在这" 和开机算力基线一起擦掉;只有显式 _exit() 才清。
   //
   // 与 DemoGuard 的边界:
   //   * DemoGuard 判定"页面在跑后台"(session.state in {playing,...}),
@@ -227,14 +233,15 @@
     },
 
     // 显式退出:用户在卡片页点 back-home / "退出应用" 时调用。
-    // 同步清掉 _current + 异步发 DELETE。下次 sidebar 应用面板 → apps
-    // 列表;reboot 后 bootRestore 也不再跳到这张卡。
+    // 同步清掉 _current + 异步发 DELETE(后端会连 autostart 一起清空)。
+    // 下次 sidebar 应用面板 → apps 列表;reboot 后 bootRestore 也不再跳到
+    // 这张卡;下次开机也不会自动拉起这张卡的算力。
     _exit() {
       this._current = null;
       try {
         // keepalive:back-home 紧跟着 location.hash="#/" 切页,普通 fetch
-        // 可能被中断;DELETE 是幂等的,即便本次没送达下次 _evaluate 也会
-        // 重新 PUT(那时 _current 已经 null,_evaluate 不会再写)。
+        // 可能被中断;DELETE 是幂等的,即便本次没送达也不会留下脏状态 ——
+        // autostart 被清空后前端不会再 PUT(_current 已 null)。
         fetch("/api/compute/active-app",
               { method: "DELETE", keepalive: true });
       } catch (_) { /* best-effort */ }
