@@ -164,20 +164,36 @@ class AgentAction(BaseModel):
             "（没有\"只移动不点击\"的动作：触屏表达不了悬停。）"
         ),
     )
-    # x/y 必填，且**不能给默认值**。
+    # x/y 缺省为 **None**，不是 0.0。
     #
-    # 这是踩过的坑：`required` 只有 `action`、x/y 带 `default=0.0` 时，
-    # 模型吐一个 `{"action":"click","thought":"点开始菜单"}` 完全合法，
-    # pydantic 静默补 0 → 动作落在 host (0,0)，也就是桌面左上角 ——
-    # 症状是"点了但没有任何反应"，而且步日志里看不出任何异常
-    # （click 的 status 是 ok，坐标 0,0 看上去也合法）。
-    # 改成必填后模型漏坐标就会校验失败 → respond 返回原始 str →
-    # 走 _parse_action_json 恢复 → 恢复路径同样不再补零（见 _normalize_action）。
-    x: float = Field(
-        description="目标点 x，0–1000 归一化，相对整张方形图（坐标空间见 prompt）。",
+    # 两个坑一起堵：
+    #
+    # 1) 曾经给过 default=0.0，模型吐 `{"action":"click","thought":"..."}`
+    #    完全合法，pydantic 静默补 0 → 点在桌面左上角，status 还是 ok，
+    #    症状是"点了但没有任何反应"且步日志看不出异常。
+    # 2) 但**改成必填也不行**：x/y 是 required 时，模型想回答
+    #    `not_found` / `done` / `wait` 也必须编两个坐标出来，而这三个
+    #    动作根本没有坐标可言 —— 它只能填 0,0。那等于把"我做不到"
+    #    又逼回成一个假坐标，于是同一批坐标再次撞上退化坐标闸。
+    #
+    # 所以：**坐标动作（click/double_click/right_click/drag）缺坐标就在
+    # _execute 里明确报错；非坐标动作随便省略。** 「没说」与「说了 0」
+    # 必须分得开，这就是 default=None 的全部意义。
+    x: Optional[float] = Field(
+        default=None,
+        description=(
+            "目标点 x，0–1000 归一化，相对整张方形图（坐标空间见 prompt）。"
+            "click/double_click/right_click/drag 必填；"
+            "not_found/done/wait 这类没有落点的动作可以省略。"
+        ),
     )
-    y: float = Field(
-        description="目标点 y，0–1000 归一化，相对整张方形图（坐标空间见 prompt）。",
+    y: Optional[float] = Field(
+        default=None,
+        description=(
+            "目标点 y，0–1000 归一化，相对整张方形图（坐标空间见 prompt）。"
+            "click/double_click/right_click/drag 必填；"
+            "not_found/done/wait 这类没有落点的动作可以省略。"
+        ),
     )
     x2: float = Field(
         default=0.0,
@@ -309,6 +325,10 @@ def _geometry_block(meta, frame=None) -> str:
         f"- 上下（y < {top:.0f} 或 y > {bottom:.0f}）是灰色留边，不是屏幕内容。\n"
         f"- 所以 y 必须落在 {top:.0f}~{bottom:.0f} 之间；y=0 或 y=1000 "
         f"点到的是屏幕外的灰边。\n"
+        f"- **刻度是 0 到 1000，不是 0 到 1。** 具体锚点：x=500 是画面正"
+        f"中间、x=1000 是最右边缘；y={top:.0f} 是画面最上沿、"
+        f"y={bottom:.0f} 是最下沿。（如果你算出 0.5 这种小数，它指的是 500，"
+        f"不是最左边 0.5%。）\n"
         f"- 找目标时按**桌面自己的相对位置**估算：任务栏在最下面一行"
         f"（y≈{bottom - (bottom - top) * 0.03:.0f}），"
         f"桌面图标在左上，标题栏在最上面（y≈{top + (bottom - top) * 0.03:.0f}）。"
@@ -321,14 +341,36 @@ def _format_history(steps: list[dict[str, Any]]) -> str:
 
     这一段是循环能收敛的关键：没有它，模型每轮都看到同一张"需要点击
     这里"的截图，就会无限重复同一个 click（实测的卡死形态）。
+
+    **失败步骤必须带上失败原因**，否则这个反馈通道等于没有：
+    成功步骤有 ``summary``（落点），失败步骤的 ``summary`` 是空的 ——
+    只写 ``✗ click`` 的话，模型下一轮拿到的信息和第一轮完全一样，
+    它没有理由改变主意，于是原样重复同一个动作，撞上重复检测收工。
+    实测就卡在这：模型连吐 4 次 ``click(0,0)``，每一步都被坐标闸拒掉，
+    但它每轮看到的反馈都是"我刚点了一下"，于是永远不知道自己错在哪。
     """
     if not steps:
         return ""
     lines = ["已经执行过的动作（按时间顺序，最新的在最后）："]
     for i, s in enumerate(steps, 1):
-        mark = "✓" if s.get("status") == "ok" else "✗"
-        target = s.get("summary") or ""
-        lines.append(f"{i}. [{mark}] {s.get('action', '')} {target}".rstrip())
+        ok = s.get("status") == "ok"
+        mark = "✓" if ok else "✗"
+        if ok:
+            tail = str(s.get("summary") or "")
+        else:
+            # ``detail`` 是 "ValueError: xxx" 的形式，那个前缀是给页面上
+            # 的人看的，喂给模型没有意义，剥掉只留原因本身。
+            tail = str(s.get("detail") or "").strip()
+            if ":" in tail:
+                tail = tail.split(":", 1)[1].strip()
+            tail = tail or "这一步没有生效（没有任何动作被下发到电脑）"
+        lines.append(f"{i}. [{mark}] {s.get('action', '')} {tail}".rstrip())
+    lines.append("")
+    lines.append(
+        "标 ✗ 的那些**完全没有生效**，屏幕没有变化。"
+        "不要原样重做：换一个真正不同的落点，或者用 not_found 说清"
+        "你在这张图里找不到目标。"
+    )
     return "\n".join(lines) + "\n\n"
 
 
@@ -336,12 +378,27 @@ def _format_history(steps: list[dict[str, Any]]) -> str:
 # Step bookkeeping
 # --------------------------------------------------------------------------- #
 def _new_step(idx: int, action: dict[str, Any]) -> dict[str, Any]:
+    # x/y/x2/y2 必须落进步日志。之前只记 action/thought/text，而 thought
+    # 经常是空的（模型吐最小对象 `{"action":"click","x":0,"y":0}`），
+    # 于是页面上只剩一句"坐标落在左上角"—— **看不到模型到底选了哪**，
+    # 无法区分"模型漏了坐标"、"模型以为那是屏幕角落"和"换算算错了"。
+    def _num(key):
+        v = action.get(key)
+        try:
+            return None if v is None else round(float(v), 1)
+        except (TypeError, ValueError):
+            return None
+
     return {
         "idx": idx,
         "ts": time.time(),
         "action": str(action.get("action", "")),
         "thought": str(action.get("thought", "") or ""),
         "text": str(action.get("text", "") or ""),
+        "x": _num("x"),
+        "y": _num("y"),
+        "x2": _num("x2"),
+        "y2": _num("y2"),
         "status": "pending",
         "summary": "",
         "detail": "",
@@ -666,6 +723,39 @@ class ComputerControlAgent:
             LOG.debug("agent: letterbox size lookup failed (%s) — 768", e)
             return 768
 
+    @staticmethod
+    def _scale_0_1(d: dict[str, Any]) -> dict[str, Any]:
+        """Rescale 0-1 coordinates to the 0-1000 space the prompt asks for.
+
+        这是本次「全部点在屏幕左上角」的真凶。
+
+        模型在这个 schema 上有相当高的概率把坐标给成 0-1（实测一整轮
+        任务连出 ``0.32/0.41``、``0.25/0.48``），而 schema 里 x/y 只是
+        ``float``，**校验完全通过** —— 于是 happy path 直接
+        ``model_dump()`` 走人，0-1 被当成 0-1000 用：0.41 在 0-1000
+        空间里就是屏幕最上面 0.4% 的位置，正好是灰边/左上角。
+
+        换算以前**只写在恢复路径**（``_normalize_action``，即模型 JSON
+        没通过校验、我们从原始文本里救回来的时候）。而这恰恰是最不
+        需要救的那条路径 —— 校验通过才走到 ``model_dump()``。等于
+        同一个已知坑在两条路径上只堵了一条：实测就是"坐标全都落在
+        左上角"，而步日志里显示 ``(0.25, 0.41)``，看着像个正常坐标。
+
+        所以换算必须放在**两条路径的汇合处**，而不是其中一条里。
+
+        取舍：0-1000 空间里 x<=1.0 的合法落点（屏宽最左边 0.1%）会
+        被误放大 1000 倍。这是有代价的，但比"每一次点击都落在屏幕
+        左上角"划算得多 —— 而且真要贴左边缘点的动作，模型给出来的
+        更可能是 0.0 而不是 0.0005。
+        """
+        for k in ("x", "y", "x2", "y2"):
+            v = d.get(k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if 0.0 <= float(v) <= 1.0:
+                d[k] = float(v) * 1000.0
+        return d
+
     def _coerce_action(self, result: Any, why: list[str]) -> Optional[dict[str, Any]]:
         """Normalise whatever ``respond`` returned into a plain dict.
 
@@ -682,7 +772,9 @@ class ComputerControlAgent:
         indistinguishable from the outside.
         """
         if isinstance(result, AgentAction):
-            return result.model_dump()
+            # 也要过 0-1 换算 —— 见 _scale_0_1 的说明：校验通过不代表
+            # 坐标就是 0-1000，而这条路径以前恰恰是漏掉换算的那条。
+            return self._scale_0_1(result.model_dump())
         if isinstance(result, str):
             if not result.strip():
                 why.append("模型返回了空内容")
@@ -794,12 +886,20 @@ class ComputerControlAgent:
         if name in ("click", "double_click", "right_click"):
             hx, hy = self._point(action, "x", "y")
             if self._is_degenerate_origin(hx, hy):
+                # 证据写进提示：模型给的原始 0-1000 坐标 + 它自己的
+                # thought。少了这两样，用户只会看到"点了左上角"而无法
+                # 判断是模型没看图、模型找不到目标、还是换算算错了。
+                thought = str(action.get("thought", "") or "").strip()
                 raise ValueError(
-                    "坐标落在屏幕左上角 (0,0) —— 那一块在 Windows 桌面上"
-                    "点不到任何东西。两种可能：模型没给坐标（会被当成 0），"
-                    "或者**这张截图里根本没有你要找的东西**，模型只能瞎猜。"
-                    "（后者实测很常见：PC 上跑着全屏程序时要求它操作桌面，"
-                    "它就找不到。）已跳过这一步。")
+                    f"模型给的落点是 ({action.get('x')}, {action.get('y')})"
+                    "（0-1000），换算到 PC 上正好是屏幕左上角 —— Windows "
+                    "桌面那一块什么都没有，点下去不会有任何反应。"
+                    + (f"它这一轮写的 thought 是：{thought}" if thought
+                       else "而且它**没有写 thought**（模型正常会说明"
+                            "自己看到了什么），说明这一轮它大概率根本没"
+                            "看图就吐了一个最小动作。")
+                    + "本步已跳过。下一步请给一个真正的落点；"
+                      "如果这张图里确实找不到要做的事，直接用 not_found。")
             dig = get_digitizer()
             n = 2 if name == "double_click" else 1
             for _ in range(n):
@@ -812,7 +912,9 @@ class ComputerControlAgent:
             hx, hy = self._point(action, "x", "y")
             hx2, hy2 = self._point(action, "x2", "y2")
             if self._is_degenerate_origin(hx, hy):
-                raise ValueError("拖拽起点落在屏幕左上角 (0,0)，已跳过。")
+                raise ValueError(
+                    f"拖拽起点落在屏幕左上角（模型给的是 "
+                    f"({action.get('x')}, {action.get('y')})，0-1000），已跳过。")
             if hx2 == hx and hy2 == hy:
                 raise ValueError(
                     f"拖拽起点和终点相同（({hx}, {hy})），无法拖动。")
@@ -880,9 +982,16 @@ class ComputerControlAgent:
         meta = self._meta
         if meta is None:
             raise RuntimeError("内部错误：坐标换算缺少 letterbox 元数据")
+        vx, vy = action.get(xk), action.get(yk)
+        # ``action.get(k, 0.0)`` 曾经把"模型没给坐标"悄悄变成 (0,0) ——
+        # 退化坐标闸就是为了接住这个才存在的。现在宁可在这里炸：
+        # 「没给」和「给了 0」是两种完全不同的模型输出，必须分开看。
+        if vx is None or vy is None:
+            raise ValueError(
+                f"{action.get('action', '?')} 动作缺少 {xk}/{yk}"
+                f"（xk={vx!r} yk={vy!r}）—— 没有坐标就没有落点，已跳过。")
         fw, fh = self._frame_size
-        return self._to_host((action.get(xk, 0.0), action.get(yk, 0.0)),
-                             meta, fw, fh)
+        return self._to_host((float(vx), float(vy)), meta, fw, fh)
 
     def _grab_screenshot(self):
         from app.core.hdmiin.capture import get_capture
@@ -1154,10 +1263,12 @@ def _normalize_action(obj: Any, why: Optional[list[str]] = None) -> Optional[dic
     }
     # 0-1 归一化兜底：小模型在这个 schema 上约 30% 概率给 0-1（与
     # detector_base 的 _normalize_bbox_to_0_1000 同一个坑）。
-    for k in ("x", "y", "x2", "y2"):
-        if 0.0 <= out[k] <= 1.0:
-            out[k] *= 1000.0
-    return out
+    #
+    # 和 happy path 共用 _scale_0_1：以前这段逻辑只长在恢复路径上，
+    # 而模型 JSON 一旦校验通过就走 AgentAction.model_dump()，换算被
+    # 绕过 —— 实测"每次点击都落在左上角"就是从这条缝里漏出去的。
+    # 两边必须同一份实现，否则改了一边忘了另一边就又复现。
+    return ComputerControlAgent._scale_0_1(out)
 
 
 # --------------------------------------------------------------------------- #
