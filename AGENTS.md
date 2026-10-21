@@ -1974,6 +1974,165 @@ npu2/npu3 只在 RGA / VPU 侧可见，对算力页来说它们是「枚举得�
 配合上一节的「一卡一模型」：要在本机额外起一个模型，只能先把目标卡上的实例
 停掉，再 `--npu 0` 或 `--npu 1` 指过去。**不存在「随便找个空卡跑」这种可能。**
 
+## 单计算卡降级策略（v0.24）
+
+**枚举到的卡 ≠ 能跑模型的卡。** `list_cards()` 返回的是
+`RKNN3Lite().get_devices_id()` 的下标序列，里面混着两类东西：
+
+| device_id 形态 | 是什么 | 能不能跑 rknn 模型 |
+|---|---|---|
+| `0003:31:00.0`（PCI BDF） | 真正的 RK1828 协卡 | ✅ |
+| `180B6D6C…`（USB 序列号） | 只在 RGA / VPU 侧可见的设备 | ❌ `vision init_runtime failed` |
+
+所以「**模型卡位**」= 探测到的 PCI 形态卡数 = 本机能同时跑几个模型的硬上限
+（每卡一个模型，见上文「一卡一模型」）。
+
+```
+registry.py::_PCI_BDF_RE          判定 PCI BDF 形态
+registry.py::ComputeRegistry.model_cards()   → [npu_index, ...] 模型卡位
+snapshot() 新增 model_cards / card_count 两个字段
+```
+
+**`compute.card_count`**（config.jsonc）是对探测结果的**上限**，不是强制值：
+
+| 配置 | 探测到 | 实际卡位数 | 效果 |
+|---|---|---|---|
+| 不配 | 2 | 2 | 双卡 |
+| `card_count = 1` | 2 | **1** | **双卡板模拟单卡板** |
+| 不配 | 1 | 1 | 单卡 |
+| `card_count = 2` | 1 | 1 | 仍是 1 —— 不能凭空变出卡 |
+
+> `ComputeConfigPayload` **必须**声明 `card_count`：`PUT /api/compute/config`
+> 是全量替换 `compute` section，未声明的字段会被 `extra="ignore"` 丢掉，
+> 运维手写的 `card_count` 会在任何一次保存后静默消失（与当年
+> `services` 那条静默数据丢失同类）。
+
+### 各应用的模型需求与单卡行为
+
+| 应用 | capability 数 | 单卡行为 |
+|---|---|---|
+| 文本对话 / 语音生成 / 视频目标检测 / 视频目标定位 | 1 | 模型落到唯一卡位，功能不变 |
+| 智能电脑控制 `usb_hid` | 0 | 纯硬件，不碰 NPU |
+| **音视频描述 `vd`** | **2** | **二选一**（视频描述 / 音频描述） |
+| **监控分析检索 `vas`** | **2** | **刚需两模型同时在位 → 单卡不可用** |
+
+### 实现手法：裁剪后的 effective cfg
+
+单卡策略**全收在向导层**（前端）；后端只加只读探测字段 + autostart 裁剪。
+
+`state.js::_planSingleCard(cfg, app, envCheck)` 在单卡时返回一份**裁剪过的
+`_active.cfg`**：`swcap_to_model` 只留本应用单卡下真正要用的那条，
+`npu_index` 指向实际卡位。下游三处消费点全部从 `_active.cfg` 取值，
+**一行都不用改**就自动按单卡语义工作：
+
+| 位置 | 用途 |
+|---|---|
+| `state.js:1359` `_finish` | 等待模型 running |
+| `state.js:1427` `_waitForModelsRunning` | 进度条 target 展开 |
+| `state.js:1767` `_wizardBringUpModels` | 一键开启（停非必需 + 启必需） |
+
+> 「停非必需」那一步在单卡下自动变成「先把旧模型停掉再加载新的」——
+> 这正是单卡要的语义，不需要额外代码。
+
+**双卡路径逐字不变**：`card_count !== 1` 时 `_planSingleCard` 返回 `null`，
+`single` 分支一条都不走。探测失败（`card_count` 缺失 = 0）也走原路径。
+
+### 二选一怎么声明
+
+应用在自己的 `wizard.json` 里声明单卡下能二选一的是哪两个，以及选了它
+之后**哪些步骤不再需要**（`skip_steps`）：
+
+```json
+"single_card_pick": [
+  { "cap": "swcap_video_describe",   "label": "视频描述功能",
+    "skip_steps": ["audio"] },
+  { "cap": "swcap_audio_understand", "label": "音频描述功能",
+    "skip_steps": ["detect"] }
+]
+```
+
+没声明 = 刚需多模型（vas）→ 单卡直接判定为不可用：环境检查页显示红色
+阻断提示、**不渲染**「一键开启」按钮、「下一步」禁用（但保留「跳过向导」，
+让用户能离开去看应用页的错误提示）。
+
+**`skip_steps` 为什么必要**：vd 的两个 capability 各自对应向导里的一步。
+选了「视频描述」却还要问用户「音频理解提示词」，用户填了 → 完成配置 →
+`applyWizardSnapshot` 里 `if (opts.audioPrompt)` 成立 → 去点「分析音频」→
+单卡上那个模型压根没加载 → 后端 502「功能未启用: swcap_audio_understand」
+→ 弹窗。
+
+裁剪落在**同一份 effective cfg** 里（`state.js::_stepsWithout`）：
+`swcap_to_model` 裁 capability，`steps` 裁步骤。下游全是现成逻辑：
+
+* 被裁步骤的字段不进 `_finish` 构造的 opts → `if (opts.audioPrompt)` /
+  `if (opts.prompt)` 自然不成立 → 那个功能**压根没被请求**
+  （不是把弹窗藏起来，是请求本身消失了）
+* 步骤指示器 / 完成摘要 / 「上一步」「下一步」全部按裁剪后的步骤表走
+
+> **步骤恢复必须存「步骤 id」而不是下标。** 裁剪会让下标整体错位：
+> 原来 index 3 = "audio"，裁掉 audio 后 index 3 = "finish" —— 按旧下标
+> 恢复会让用户一进来就落在「完成配置」上，前面的步骤直接被跳过。
+> `_lsSaveStep` 改存 step id，`_resolveStepIdx` 按 id 解析
+> （旧版本 localStorage 里的数字按下标兜底；存的步骤已被裁掉 → 回第 1 步
+> 重新确认环境与二选一）。
+
+`skip_steps` 只在单卡分支生效，双卡时 `cfg.steps` 一个都不动
+（`verify_wizard_single_card.mjs`【G】成对断言双卡 5 步 / 单卡 4 步）。
+
+**单 capability 的应用（其余 6 张卡）在单卡下不显示任何提示** —— 它们
+的行为与双卡完全一样（模型照常加载，只是落到唯一那张卡），没必要打扰
+用户。只有「完整功能需要 2 张卡」的应用才值得提示。
+
+### 已知竞态（既有缺陷，v0.24 未修）
+
+`mount()` 在 `await _probeEnv()` **之前**就把容器插进 DOM，而 `_active`
+要等 await **之后**才赋值。这个窗口期（约一次 `/api/compute` 往返）内：
+
+* `unmount()` 看到 `_active` 还是 null → 直接 return → **摘不掉上一个
+  容器**；
+* 于是交叠的两次挂载会留下**两个**向导容器，旧的那个还会把内容渲染到
+  新页面上。
+
+触发路径：框架的 home 页会**异步**跳到默认应用
+（`location.hash = "#" + appId`）并挂它的向导；用户在这段窗口里点了
+另一张卡，两次挂载就会交叠。
+
+**v0.24 试过在 `mount()` 里加挂载序号 + hash 校验来作废过期挂载，
+但两者会互相打架**（框架对同一页有**两个** tryMount 调用点
+`framework.js:426` 和 `framework.js:496`，`_wizardMounted` 要等
+tryMount 返回才标记 → 同一页可能并发挂两次 → 序号守卫会把**正确**
+的那次也作废掉，向导直接不出现）。已回退，**保持原行为**。
+
+要修的话需要重新设计：正确的方向是「**晚到的挂载不能顶掉已经就位的
+向导**」—— 挂载完成前不碰 `_active`、不卸载前一个，等自己被确认是当前
+页面的向导之后再顶替。**别用序号守卫硬做**，那会把「同一页并发两次
+挂载」误判成「有人比我新」。
+
+`_wizardBringUpModels` 另有一道显式护栏：被阻断的应用**一个模型都不启停**
+—— 既不加载，也不去停别人正在跑的模型（「停别人的模型」是破坏性的）。
+
+### 开机自启也要裁
+
+`boot_compute_services()` 按模型卡位裁 `compute.autostart`：
+
+* 指向「跑不了模型的卡」的条目 → 跳过（否则开机就是一屏 rc=-6 的 error）
+* **单卡专属**：同一张卡只保留第一条 —— 一张卡只能承载一个模型
+* 双卡时 `model_cards` 覆盖全部卡，**一条都不裁**
+
+### 回归
+
+| 脚本 | 覆盖 |
+|---|---|
+| `scripts/verify_wizard_single_card.mjs` | 单卡策略的纯逻辑（64/64）：双卡零变化、vd 二选一、**步骤裁剪**、finish 的 opts 契约、vas 阻断、探测失败不误判 |
+| `scripts/verify_single_card_ui.py` | 真实浏览器（36/36）：提示块、二选一 radio 切换、一键开启的 POST 落 NPU0、vas 下一步禁用、**vd 步骤裁剪 + 完成配置后不碰「分析音频」**、无 JS 报错 |
+| `scripts/verify_wizard_env_step.mjs` | 向导结构回归（59/59） |
+
+> `verify_wizard_env_step.mjs` 的私有函数注入锚点用
+> `window.WizardState = {` 的**开头**而不是整个导出语句 —— 导出对象的成员
+> 列表随功能增删变过好几轮，按整句匹配会在形状变化后**静默失配**，
+> 脚本报「Cannot read properties of undefined」看起来像被测代码坏了，
+> 其实是脚手架自己过期了。
+
 ## 多路 MPP 解码：单进程多线程，不要多进程（v0.20 实测）
 
 为 32 路 720P 监控做的 16 路解码压测（`.venv/src/wdnai/examples/

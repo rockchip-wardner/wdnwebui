@@ -39,6 +39,44 @@ def main():
         msgs = collect_console(page)
 
         # ============================================================ #
+        # 硬件环境 mock —— 固定成「双卡板」
+        #
+        # 本测试覆盖的是 vd 向导的**双卡**完整流程（env → source → detect
+        # → audio → finish，两个提示词都要进 opts）。
+        #
+        # 单卡板（v0.24 降级）会把「音频理解提示词」/「检测提示词+检测尺寸」
+        # 步骤裁掉，步骤数与 opts 都不一样 —— 那是 verify_single_card_ui.py
+        # 覆盖的另一条路径，不该由本测试兼。
+        #
+        # 所以这里把 /api/compute 固定成「2 张模型卡 + 两个模型都在跑」，
+        # 让本测试与真机是单卡还是双卡无关。
+        # ============================================================ #
+        page.add_init_script("""
+          (() => {
+            const origFetch = window.fetch.bind(window);
+            window.fetch = function(url, opts) {
+              const u = String(url);
+              if (u.endsWith('/api/compute') || u === '/api/compute') {
+                return Promise.resolve(new Response(JSON.stringify({
+                  card_count: 2,
+                  model_cards: [0, 1],
+                  instances: [
+                    // model_id 必须与 wizard.json 的 swcap_to_model 逐字一致：
+                    // _waitForModelsRunning 比的是 id 集合，写错不报错，只会
+                    // 一路等到 90s 兜底，让「wizard 回 source 步骤」永远红。
+                    { id: 'm0', model_id: 'qwen3-vl-4b', npu_index: 0,
+                      status: 'running', capability_types: ['swcap_video_describe'] },
+                    { id: 'm1', model_id: 'qwen2.5-omni-3b', npu_index: 1,
+                      status: 'running', capability_types: ['swcap_audio_understand'] },
+                  ],
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+              }
+              return origFetch(url, opts);
+            };
+          })();
+        """)
+
+        # ============================================================ #
         # T1: 首次打开 → 看到 wizard
         # ============================================================ #
         print("\n=== T1: 首次打开 ===")
@@ -139,17 +177,21 @@ def main():
         print("\n=== T10: 刷新后预填 ===")
         page.reload(wait_until="domcontentloaded")
         page.wait_for_selector(".wd-wizard-section", timeout=10000)
-        # 跳到 source 步骤(env_check 同样需要模拟通过)
-        page.evaluate("""
-          (() => {
-            document.querySelectorAll('.wd-wizard-env-row').forEach(r => {
-              r.classList.remove('wd-wizard-env-fail');
-              r.classList.add('wd-wizard-env-ok');
-            });
-            window.WizardState.stepForward();
-          })();
-        """)
-        page.wait_for_timeout(400)
+        # 向导会**恢复到上次停留的步骤**（T9 离开时停在「视频源」），
+        # 所以 source 输入框刷新后通常已经在页面上。
+        # 旧写法无条件 stepForward()，会把向导从 source 推到 detect ——
+        # 反而找不到 source 输入框（这一直是红的，不是本次改动引入）。
+        if page.locator("textarea[data-field-id='vd-sources']").count() == 0:
+            page.evaluate("""
+              (() => {
+                document.querySelectorAll('.wd-wizard-env-row').forEach(r => {
+                  r.classList.remove('wd-wizard-env-fail');
+                  r.classList.add('wd-wizard-env-ok');
+                });
+                window.WizardState.stepForward();
+              })();
+            """)
+            page.wait_for_timeout(400)
         # 此时 source 输入框应已预填
         source_val = page.input_value("textarea[data-field-id='vd-sources']")
         if source_val != "rtsp://test.local/stream":
@@ -228,30 +270,9 @@ def main():
                 fail(f"T5: state.values 缺少 {k}(填入后应累积)")
 
         # 不注入 spy;让真实 applyWizardSnapshot 跑 → vdOpen('/tmp/test.mp4') 抛错 → wizard 捕获
-        # mock /api/compute 让 wizard 的 _waitForModelsRunning 立即 return(模型"已 running")
-        # 这样不阻塞测试,直接走到 applyWizardSnapshot → vdOpen 抛错 → wizard 错误处理
-        page.evaluate("""
-          (() => {
-            const origFetch = window.fetch.bind(window);
-            window.fetch = function(url, opts) {
-              const u = String(url);
-              if (u.endsWith('/api/compute') || u === '/api/compute') {
-                return Promise.resolve(new Response(JSON.stringify({
-                  instances: [
-                    // model_id 必须与 wizard.json 的 swcap_to_model 逐字一致：
-                    // _waitForModelsRunning 比的是 id 集合，写错不报错，只会
-                    // 一路等到 90s 兜底，让「wizard 回 source 步骤」永远红。
-                    { id: 'm0', model_id: 'qwen3-vl-4b', npu_index: 0,
-                      status: 'running', capability_types: ['swcap_video_describe'] },
-                    { id: 'm1', model_id: 'qwen2.5-omni-3b', npu_index: 1,
-                      status: 'running', capability_types: ['swcap_audio_understand'] },
-                  ],
-                }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
-              }
-              return origFetch(url, opts);
-            };
-          })();
-        """)
+        # /api/compute 已被页首的 init script mock 成「双卡 + 两个模型 running」，
+        # _waitForModelsRunning 会立即 return → 直接走到 applyWizardSnapshot
+        # → vdOpen 失败 → wizard 错误处理
 
         finish_btn = page.locator("#wd-wizard-finish-btn")
         finish_btn.click()

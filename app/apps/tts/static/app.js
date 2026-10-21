@@ -784,7 +784,8 @@ const ComputeConfigPage = {
 
     const MAX_RK182X_CARDS = CC_MAX_RK182X_CARDS;
   // ...
-    let rk182xCards = this._sortNpuCards(cards).slice(0, MAX_RK182X_CARDS);
+    let rk182xCards = this._sortNpuCards(this._modelCards(cards))
+      .slice(0, MAX_RK182X_CARDS);
 
   // ...
     if (rk182xCards.length === 0 && devices.length > 0) {
@@ -1924,7 +1925,7 @@ const ComputeConfigPage = {
 
   // ...
     const MAX_RK182X_OPTIONS = CC_MAX_RK182X_CARDS;
-    const sorted = this._sortNpuCards(cards);
+    const sorted = this._sortNpuCards(this._modelCards(cards));
     const sortedIndices = sorted.map(c => c.npu_index);
 
   // ...
@@ -2005,9 +2006,19 @@ const ComputeConfigPage = {
     return fs;
   },
 
+  // 只保留「能跑 rknn 模型」的卡。``snapshot.cards`` 里混着 USB 序列号形态
+  // 的 RGA/VPU 设备（模型一上去就 vision init_runtime failed）。模型卡位由
+  // 后端 ``model_cards`` 给出；老后端没这字段时不过滤。
+  _modelCards(cards) {
+    const mc = this._snapshot && this._snapshot.model_cards;
+    if (!Array.isArray(mc)) return cards;
+    const keep = new Set(mc);
+    return (cards || []).filter((c) => keep.has(c.npu_index));
+  },
+
   _defaultTargetNpu(cards) {
     if (!cards || !cards.length) return 0;     // 兜底：选 enumerate #0
-    const sorted = this._sortNpuCards(cards);
+    const sorted = this._sortNpuCards(this._modelCards(cards));
     return sorted.length ? sorted[0].npu_index : 0;
   },
 

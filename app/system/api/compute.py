@@ -58,6 +58,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.compute.registry import (
     MODEL_PRESETS,
+    card_count_override,
     get_registry,
 )
 
@@ -221,6 +222,11 @@ class ComputeConfigPayload(BaseModel):
     model_config = {"extra": "ignore"}
 
     autostart: list[AutostartEntry] = Field(default_factory=list)
+    #: 模型卡位数上限（手工指定）。**必须在这里声明** —— 本端点是全量替换
+    #: ``compute`` section，未声明的字段会被 ``extra="ignore"`` 丢掉，运维
+    #: 手写的 ``card_count`` 会在任何一次保存后静默消失。
+    #: 语义是「对探测结果的上限」：双卡板写 1 → 模拟单卡板。
+    card_count: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="before")
     @classmethod
@@ -295,11 +301,13 @@ async def get_compute(response: Response) -> dict:
 
 @router.get("/compute/config")
 async def get_compute_config() -> dict:
-    """读 ``config.jsonc["compute"]["autostart"]``（不触发任何启动）。
+    """读 ``config.jsonc["compute"]``（不触发任何启动）。
 
     这个端点原本配套系统配置页的「算力实例列表」编辑表格；那张表已随
     ``compute.services`` 一起删除，这里保留为**只读**，方便脚本 / 运维
     确认当前开机自启配置。写入仍走 Pydantic 的 ``AutostartEntry`` 校验。
+
+    ``card_count`` 是模型卡位数上限（未配置 = 按探测结果）。
     """
     from app.core.config import get_config
     section = get_config().get_section("compute", {})
@@ -309,7 +317,9 @@ async def get_compute_config() -> dict:
         for entry in raw:
             if isinstance(entry, dict) and isinstance(entry.get("model"), str):
                 entries.append(entry)
-    return {"autostart": entries}
+    # 走 registry 的同一个函数取值 —— 非法值（0 / 非整数 / bool）在两处
+    # 必须判成同一个结果，不能这边回读出 0、那边当没配。
+    return {"autostart": entries, "card_count": card_count_override()}
 
 
 @router.put("/compute/config")

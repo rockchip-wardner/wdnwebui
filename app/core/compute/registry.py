@@ -37,6 +37,7 @@ import ctypes
 import ctypes.util
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -75,6 +76,38 @@ def _resolve_compute_mode() -> str:
     if env in ("subprocess", "inprocess"):
         return env
     return "subprocess"
+
+
+# --------------------------------------------------------------------------- #
+# 模型卡位（model slot）                                                        #
+# --------------------------------------------------------------------------- #
+# **枚举到的卡 ≠ 能跑模型的卡**。RKNN3 枚举（``get_devices_id()``）里混着
+# 两类东西：PCI BDF 形态（``0003:31:00.0``）是真正的 RK1828 协卡，能加载
+# rknn 模型；USB 序列号形态（``180B6D6C…``）只在 RGA / VPU 侧可见，在它
+# 上面加载 rknn 模型必然 ``vision init_runtime failed``（AGENTS.md v0.20
+# 实测：4 卡板子上 npu2 / npu3 就是这个形态）。
+#
+# 所以「模型卡位数」= 探测到的 PCI 形态卡数。**每张卡只能放一个模型**
+# （AGENTS.md v0.17 实测：同卡叠两个模型 rc=-6），这个数量就是本机
+# 能同时跑几个模型的硬上限。
+_PCI_BDF_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d+$")
+
+
+def card_count_override() -> Optional[int]:
+    """``config.jsonc["compute"]["card_count"]`` —— 手工指定模型卡位数。
+
+    语义是**对探测结果的上限**，不是强制值：双卡板写 1 → 模拟单卡板；
+    单卡板写 2 → 仍然是 1 张（不能凭空变出卡）。值非法（非整数 / < 1 /
+    bool）时忽略，按探测结果走 —— 配置写错不该让整机没有算力。
+    """
+    try:
+        section = get_config().get_section("compute", {})
+    except Exception:  # noqa: BLE001
+        return None
+    raw = section.get("card_count") if isinstance(section, dict) else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None
+    return raw
 
 
 # --------------------------------------------------------------------------- #
@@ -1211,6 +1244,22 @@ class ComputeRegistry:
         with self._lock:
             return self._cards_failed
 
+    def model_cards(self) -> List[int]:
+        """能承载 RKNN 模型的协卡索引（每张卡一个模型）。
+
+        权威来源 —— ``list_cards()`` 会把 USB 序列号形态的 RGA/VPU 设备
+        也算进去（见 :data:`_PCI_BDF_RE`）。受 ``compute.card_count``
+        上限约束（双卡板可用它模拟单卡板）。
+        """
+        detected = [
+            c["npu_index"] for c in self.list_cards()
+            if _PCI_BDF_RE.match(c.get("device_id") or "")
+        ]
+        cap = card_count_override()
+        if cap is not None:
+            detected = detected[:cap]
+        return detected
+
     def list_supported_models(self) -> list[dict]:
         base = get_config().get_section("base", {})
         # Priority: config → env var → on-disk model root chosen by
@@ -1336,9 +1385,15 @@ class ComputeRegistry:
             mid: preset.get("estimated_init_seconds", DEFAULT_ESTIMATED_INIT_SECONDS)
             for mid, preset in MODEL_PRESETS.items()
         }
+        model_cards = self.model_cards()
         return {
             "cards":             cards,
             "cards_failed":      self.cards_failed_reason(),
+            # 能跑 rknn 模型的卡。``cards`` 里还混着 USB 序列号形态的
+            # RGA/VPU 设备 —— 那些卡选不得（见 _PCI_BDF_RE）。
+            # ``card_count`` == 1 → 单卡板；== 2 → 双卡板。
+            "model_cards":       model_cards,
+            "card_count":        len(model_cards),
             "supported_models":  supported,
             "services":          services,
             "instances":         instances,
@@ -3127,6 +3182,28 @@ class ComputeRegistry:
         except ValueError as e:
             LOG.error("compute.autostart 配置非法，已跳过开机启动: %s", e)
             entries = []
+        # 单卡裁剪：autostart 里指向「跑不了模型的卡」的条目必须跳过；
+        # 单卡模式下每张卡只起第一条（一卡一模型，同卡叠模型 rc=-6，
+        # AGENTS.md v0.17 实测）。硬拉起来只会得到一堆 error 实例 ——
+        # 开机就报错，用户还以为板子坏了。
+        # 双卡时 model_cards 覆盖全部卡，一条都不裁，行为不变。
+        model_cards = self.model_cards()
+        if entries and model_cards:
+            single = len(model_cards) == 1
+            kept, seen = [], set()
+            for e in entries:
+                if e["npu_index"] not in model_cards:
+                    LOG.info("boot: autostart 跳过 %s @ npu%s —— 该卡不在"
+                             "模型卡位 %s 内（单卡模式）",
+                             e["model"], e["npu_index"], model_cards)
+                    continue
+                if single and e["npu_index"] in seen:
+                    LOG.info("boot: autostart 跳过 %s @ npu%s —— 单卡模式下"
+                             "一张卡只能承载一个模型", e["model"], e["npu_index"])
+                    continue
+                seen.add(e["npu_index"])
+                kept.append(e)
+            entries = kept
         # v0.4+: 顺便读一下 active_app 标记 —— boot 后日志会顺手打印
         # 一下当前记的"用户上次所在的卡片"。前端 bootRestore 会读
         # 这个值并跳过去，这里**不**做导航（主进程没有 webview），

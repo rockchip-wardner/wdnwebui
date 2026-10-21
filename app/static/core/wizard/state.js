@@ -57,16 +57,17 @@
     } catch (_) { /* ignore quota */ }
   }
 
-  // currentStep 持久化:用户填到第 3 步中途切走 / reboot / 重新打开
+  // currentStep 持久化:用户填到第 3 步中途切走 / reboot 后恢复
   // 软件,下次 mount 应该回到第 3 步,而不是第 1 步(把已填值都丢了的
-  // 既视感)。边界:超过 cfg.steps.length 视为 0(配置缩步骤时回退)。
+  // 既视感)。
+  //
+  // 存**步骤 id** 而不是下标(v0.24):单卡二选一会把不适用的步骤裁掉,
+  // 下标会整体错位 —— 原来 index 3 = "audio",裁掉后 index 3 = "finish",
+  // 按老下标恢复会让用户一进来就落在「完成配置」上。
   function _lsLoadStep(appId, cfg) {
     try {
-      const raw = localStorage.getItem(_lsKey(appId, cfg, "step"));
-      if (raw == null) return 0;
-      const n = parseInt(raw, 10);
-      return Number.isFinite(n) && n >= 0 ? n : 0;
-    } catch (_) { return 0; }
+      return localStorage.getItem(_lsKey(appId, cfg, "step"));
+    } catch (_) { return null; }
   }
   function _lsSaveStep(appId, cfg, step) {
     try {
@@ -76,6 +77,19 @@
   function _lsClearStep(appId, cfg) {
     try { localStorage.removeItem(_lsKey(appId, cfg, "step")); }
     catch (_) {}
+  }
+
+  // 把「上次停在哪个步骤」解析成当前步骤表里的下标。存的是步骤 id →
+  // 直接查表（裁剪后的表也能正确定位）；老版本存的是数字 → 按下标兜底；
+  // 存的步骤已被裁掉 → 回第 1 步,重新确认环境与二选一。
+  function _resolveStepIdx(steps, saved) {
+    if (!steps || !steps.length || saved == null) return 0;
+    const raw = String(saved);
+    const byId = steps.findIndex((s) => s.id === raw);
+    if (byId >= 0) return byId;
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n > 0 && n < steps.length) return n;
+    return 0;
   }
 
   // 完成标记:_finish() 里 applyWizardSnapshot 成功后置 1。
@@ -271,10 +285,34 @@
     return row;
   }
 
+  // 单卡提示块。kind: "warn"（可二选一）/ "block"（刚需多模型，单卡不可用）。
+  function _singleCardNotice(kind, title, lines) {
+    const box = _ce("div",
+      WIZARD_NS + "single-notice " + WIZARD_NS + "single-notice-" + kind);
+    box.appendChild(_ce("div", WIZARD_NS + "single-notice-title", title));
+    (lines || []).forEach((t) => {
+      box.appendChild(_ce("div", WIZARD_NS + "single-notice-line", t));
+    });
+    return box;
+  }
+
   function _renderEnvStep(body, foot, cfg, stepDef, state) {
     body.innerHTML = "";
     const hwOK = (state.envCheck.hwMissing || []).length === 0;
-    const swOK = (state.envCheck.swMissing || []).length === 0;
+    // 单卡策略：双卡（或探测失败）时 single 为 null,下面所有 single
+    // 分支都不走 —— 行为与之前逐字一致。
+    const single = state.single || null;
+    const singleOn = !!(single && single.active);
+    const blocked = !!(singleOn && single.blocked);
+    // 单卡下 capability 集合可能被裁剪：vd 二选一只留选中的那条；vas
+    // 不可用时两条都列出来,说明为什么不可用。
+    const swRequired = singleOn
+      ? (single.requiredCaps || [])
+      : (state.envCheck.swRequired || []);
+    const swMissing = singleOn
+      ? swRequired.filter((c) => (state.envCheck.swMissing || []).includes(c))
+      : (state.envCheck.swMissing || []);
+    const swOK = swMissing.length === 0;
 
     const card = _ce("div", WIZARD_NS + "env-card");
     card.appendChild(_ce("h3", null, "硬件能力"));
@@ -300,17 +338,82 @@
 
     const card2 = _ce("div", WIZARD_NS + "env-card");
     card2.appendChild(_ce("h3", null, "软件能力 / 模型"));
-    state.envCheck.swRequired.forEach((cap) => {
-      const ok = !state.envCheck.swMissing.includes(cap);
+
+    // --- 单卡提示块 ---------------------------------------------------- //
+    if (singleOn && blocked) {
+      // 刚需两个模型同时在位（监控分析检索）→ 单卡承载不了。
+      card2.appendChild(_singleCardNotice(
+        "block",
+        "⚠ 当前设备仅检测到 1 张计算卡，本应用无法使用",
+        [
+          `「${(state.app && state.app.title) || "本应用"}」需要同时启用 ` +
+            `${swRequired.length} 个模型（${swRequired.join("、")}），` +
+            "一张计算卡放不下两个模型（同卡叠模型会加载失败）。",
+          "请在「算力配置」页或硬件上增加计算卡后再使用本应用。",
+        ]));
+    } else if (singleOn && single.pickable) {
+      // 多 capability 但可二选一（音视频描述）→ 让用户选一边。
+      card2.appendChild(_singleCardNotice(
+        "warn",
+        "⚠ 当前设备仅检测到 1 张计算卡，本应用的完整功能需要 2 张计算卡",
+        ["单张计算卡无法同时承载两个模型，请在下面二选一："]));
+      const pickBox = _ce("div", WIZARD_NS + "single-pick");
+      // 模型名从**原始** cfg 取（``cfg`` 此时已经是裁剪过的 —— 只剩选中的
+      // 那条），否则未选中项会显示成「（加载 ?）」。
+      const pickSrc = (single.baseCfg && single.baseCfg.swcap_to_model)
+        || cfg.swcap_to_model || {};
+      single.pickable.forEach((p) => {
+        const m = pickSrc[p.cap] || {};
+        const label = _ce("label", WIZARD_NS + "single-pick-item");
+        const radio = _ce("input");
+        radio.type = "radio";
+        radio.name = WIZARD_NS + "single-pick";
+        radio.value = p.cap;
+        radio.checked = (p.cap === single.choice);
+        radio.addEventListener("change", () => {
+          if (!radio.checked) return;
+          _setSingleCardChoice(single, p.cap);
+          // 重渲染当前步骤：capability 列表的 ✓/✗ 和「一键开启」按钮
+          // 都要跟着这次选择变（换的是要加载的模型）。
+          _gotoStep(_active.currentStep);
+        });
+        label.appendChild(radio);
+        label.appendChild(_ce("span", WIZARD_NS + "single-pick-text",
+          p.label || p.cap));
+        label.appendChild(_ce("span", WIZARD_NS + "single-pick-model",
+          `（加载 ${m.model_id || "?"}）`));
+        pickBox.appendChild(label);
+      });
+      card2.appendChild(pickBox);
+    }
+    // 单 capability 的应用（多数应用）**不显示任何单卡提示** —— 它们在
+    // 单卡上的行为与双卡完全一样（模型照常加载，只是落到唯一那张卡），
+    // 没必要打扰用户。只有「完整功能需要 2 张卡」的应用才值得提示。
+    // ------------------------------------------------------------------ //
+
+    swRequired.forEach((cap) => {
+      // 被阻断时两条都显示为未满足（说明为什么不可用），而不是把已跑起
+      // 的那条显示成 ✓ —— 那会让人以为还差一点就能用。
+      const ok = blocked ? false : !swMissing.includes(cap);
       const row = _ce("div", WIZARD_NS + "env-row");
       row.classList.add(ok ? WIZARD_NS + "env-ok" : WIZARD_NS + "env-fail");
       row.textContent = (ok ? "✓ " : "✗ ") + cap;
       card2.appendChild(row);
     });
-    if (!state.envCheck.swRequired.length) {
+    // vd 二选一时把没选中的那条也列出来(中性样式)—— 用户得看到
+    // 「另一个功能在单卡下被关掉了」。
+    if (singleOn && single.pickable) {
+      single.pickable.forEach((p) => {
+        if (p.cap === single.choice) return;
+        const row = _ce("div", WIZARD_NS + "env-row " + WIZARD_NS + "env-off");
+        row.textContent = "— " + p.cap + "（单卡下未启用）";
+        card2.appendChild(row);
+      });
+    }
+    if (!swRequired.length) {
       card2.appendChild(_envNoReqRow("本应用不依赖模型 / 软件能力"));
     }
-    if (!swOK) {
+    if (!swOK && !blocked) {
       const bringBtn = _ce("button", WIZARD_NS + "primary-btn", "一键开启所需模型");
       bringBtn.id = WIZARD_NS + "env-bring-btn";
       const status = _ce("div", WIZARD_NS + "env-bring-status");
@@ -356,7 +459,9 @@
     body.appendChild(card2);
 
     // footer
-    _renderFootNext(foot, cfg, state, hwOK && swOK);
+    // blocked（单卡 + 刚需多模型）→ 「下一步」禁用，用户只能「跳过向导」
+    // 离开（后续版本该应用会改造成单 capability，届时阻断自然消失）。
+    _renderFootNext(foot, cfg, state, hwOK && swOK && !blocked);
   }
 
   async function _probeEnv(cfg, app) {
@@ -373,6 +478,8 @@
     // —— 后者正确防误关 peer 模型,前者却让 UI 显示误导。
     let swMissing = [];
     let runningCaps = new Set();
+    let cardCount = 0;
+    let modelCards = [];
     try {
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (r.ok) {
@@ -382,6 +489,10 @@
             for (const c of (inst.capability_types || [])) runningCaps.add(c);
           }
         }
+        // 模型卡位数（能跑 rknn 模型的卡）。1 → 单卡板，2 → 双卡板。
+        // 探测失败留 0 —— 0 不等于 1,单卡分支不会被误触发。
+        cardCount = (typeof data.card_count === "number") ? data.card_count : 0;
+        modelCards = Array.isArray(data.model_cards) ? data.model_cards : [];
       }
     } catch (_) { /* keep all missing */ }
     for (const cap of (app.software_capabilities || [])) {
@@ -392,7 +503,112 @@
       hwMissing: [], // 见上
       swRequired: app.software_capabilities || [],
       swMissing,
+      cardCount,
+      modelCards,
     };
+  }
+
+  // 裁掉与当前选择无关的步骤。声明在 wizard.json 的
+  // single_card_pick[].skip_steps 里（应用专属知识留在卡内，不进框架）：
+  // vd 选「视频描述」→ 裁 "audio" (音频理解提示词)；选「音频描述」→
+  // 裁 "detect" (检测提示词 + 检测尺寸)。
+  //
+  // 被裁步骤的字段不进 _finish 构造的 opts → vd 的 applyWizardSnapshot
+  // `if (opts.audioPrompt)` / `if (opts.prompt)` 自然不成立 → 那个功能
+  // 压根没被请求（不是把弹窗藏了）。
+  function _stepsWithout(cfg, pick) {
+    const skip = new Set(((pick && pick.skip_steps) || []));
+    const steps = cfg.steps || [];
+    if (!skip.size) return steps;
+    return steps.filter((s) => !skip.has(s.id));
+  }
+
+  // 裁剪后的 cfg:swcap_to_model 只留要用的那条,steps 裁掉无关步骤。
+  function _singleEffCfg(cfg, pick, npu) {
+    const cap = pick.cap;
+    return {
+      ...cfg,
+      swcap_to_model: {
+        [cap]: { ...cfg.swcap_to_model[cap], npu_index: npu },
+      },
+      steps: _stepsWithout(cfg, pick),
+    };
+  }
+
+  // ------------------------------------------------------------------ //
+  // 单卡策略（v0.24）                                                   //
+  // ------------------------------------------------------------------ //
+  // 一张 RK1828 协卡放不下两个模型（AGENTS.md v0.17 实测：同卡叠两个
+  // 模型 rc=-6）。双卡板上 vd / vas 各跑两个模型；单卡板上必须降级：
+  //
+  //   * 单 capability 的应用 —— 模型照常加载，只是落到唯一那张卡上。
+  //   * 多 capability 的应用 —— 要么让用户二选一（vd），要么直接不可用
+  //     （vas 刚需两个模型同时在位，单卡承载不了）。
+  //
+  // 实现手法：单卡时把 `_active.cfg` 换成一份**裁剪过的副本** ——
+  // `swcap_to_model` 只留本应用单卡下真正要用的那条，`npu_index` 指向
+  // 实际卡位，`steps` 裁掉与该选择无关的步骤。下游三处消费点（finish
+  // 等待 / 一键开启 / 进度条）全部从 `_active.cfg` 取值，于是**一行都
+  // 不用改**就自动按单卡语义工作。
+  //
+  // 返回 null = 双卡（或探测失败）→ 调用方保持原路径，行为逐字不变。
+  function _planSingleCard(cfg, app, envCheck) {
+    if (!envCheck || envCheck.cardCount !== 1) return null;
+    const declared = Object.keys(cfg.swcap_to_model || {});
+    // 实际卡位。正常就是 NPU0；万一枚举顺序变了（可跑模型的卡不是索引 0），
+    // 这里跟着走 —— 单卡板上也可能不是 0。
+    const npu = (envCheck.modelCards && envCheck.modelCards[0] != null)
+      ? envCheck.modelCards[0] : 0;
+
+    // 单 capability（多数应用）：原样保留，只换卡号。
+    if (declared.length <= 1) {
+      return {
+        active: true, blocked: false, baseCfg: cfg, npu,
+        requiredCaps: declared,
+        pickable: null, choice: null,
+        effCfg: declared.length
+          ? _singleEffCfg(cfg, { cap: declared[0] }, npu)
+          : { ...cfg, swcap_to_model: {} },
+      };
+    }
+
+    // 多 capability：应用自己声明「单卡下能二选一的是哪两个」（wizard.json
+    // 的 single_card_pick，可带 skip_steps）。声明了就让用户选；没声明
+    // = 刚需多模型（如 vas）→ 单卡不可用。
+    const pick = Array.isArray(cfg.single_card_pick) ? cfg.single_card_pick : [];
+    const usable = pick.filter(
+      (p) => p && p.cap && cfg.swcap_to_model && cfg.swcap_to_model[p.cap]);
+    if (usable.length >= 2) {
+      const def = usable[0].cap;          // 默认选第一个（vd = 视频描述）
+      const defPick = usable.find((p) => p.cap === def);
+      return {
+        active: true, blocked: false, baseCfg: cfg, npu,
+        requiredCaps: [def],
+        pickable: usable, choice: def,
+        effCfg: _singleEffCfg(cfg, defPick, npu),
+      };
+    }
+
+    return {
+      active: true, blocked: true, baseCfg: cfg, npu,
+      requiredCaps: declared,
+      pickable: null, choice: null,
+      effCfg: null,
+    };
+  }
+
+  // 切换二选一（vd）：重建裁剪后的 cfg 并重渲染当前步骤 ——
+  // capability 列表的 ✓/✗、「一键开启所需模型」按钮、以及**步骤表**都要
+  // 跟着变(选了音频描述 → 「检测提示词 + 检测尺寸」这一步整个消失)。
+  function _setSingleCardChoice(single, cap) {
+    if (!single || !single.pickable || !single.baseCfg) return;
+    const base = single.baseCfg;
+    const pick = single.pickable.find((p) => p.cap === cap);
+    if (!pick) return;
+    single.choice = cap;
+    single.requiredCaps = [cap];
+    single.effCfg = _singleEffCfg(base, pick, single.npu);
+    if (_active) _active.cfg = single.effCfg;
   }
 
   // 构造 toggle switch 元素(checkbox type)— 抽出来便于 source row 内复用
@@ -1081,13 +1297,14 @@
     const { cfg, container, app } = _active;
     if (idx < 0 || idx >= cfg.steps.length) return;
     _active.currentStep = idx;
-    // 落盘:用户切走 / reboot 后下次 mount 跳回这里。写盘失败不
-    // 影响本次 UI(只是个 best-effort 提示)。
-    _lsSaveStep(app.id, cfg, idx);
+    // 落盘:用户切走 / reboot 后下次 mount 跳回这里。存**步骤 id**而不是
+    // 下标 —— 单卡下步骤表会被裁剪,下标会错位(见 _lsLoadStep 注释)。
+    const stepDef = cfg.steps[idx];
+    _lsSaveStep(app.id, cfg, (stepDef && stepDef.id) || idx);
     _renderStepper(_q("#" + WIZARD_NS + "stepper", container), cfg, idx);
     const body = _q("#" + WIZARD_NS + "body", container);
     const foot = _q("#" + WIZARD_NS + "foot", container);
-    const def = cfg.steps[idx];
+    const def = stepDef;
     if (def.kind === "env_check") _renderEnvStep(body, foot, cfg, def, _active);
     else if (def.kind === "form") _renderFormStep(body, foot, cfg, def, _active);
     else if (def.kind === "finish") _renderFinishStep(body, foot, cfg, def, _active);
@@ -1378,20 +1595,26 @@
 
     const values = _lsLoad(app.id, cfg);
     const envCheck = await _probeEnv(cfg, app);
-    // 恢复上次停留的步骤:用户填到第 3 步中途切走 / reboot 后再回
-    // 同一张卡,wizard 应跳回第 3 步而不是强制第 1 步。超过当前 cfg
-    // .steps.length 视为配置变更(步骤被剪了)→ 回 0。
-    const stepCount = (cfg.steps || []).length;
+    // 单卡策略：双卡 / 探测失败 → single 为 null，后面保持原路径。
+    const single = _planSingleCard(cfg, app, envCheck);
+    // 恢复上次停留的步骤:用户填到第 3 步中途切走 / reboot 后再回同一张卡,
+    // 应跳回第 3 步而不是强制第 1 步。按**步骤 id**解析(见 _resolveStepIdx)。
     const restored = _lsLoadStep(app.id, cfg);
-    const startStep = (restored > 0 && restored < stepCount) ? restored : 0;
+    const effSteps = (single && single.effCfg && single.effCfg.steps)
+      || (cfg.steps || []);
+    const startStep = _resolveStepIdx(effSteps, restored);
 
     _active = {
       app, cfg, container,
       currentStep: startStep,
       values,
       envCheck,
+      single,
       intervals: [],
     };
+    // 单卡：cfg 换成裁剪后的副本（卡号指向唯一卡位 / 只留选中的
+    // capability）。localStorage_key 原样保留 → 步骤 / 完成标记的 key 不变。
+    if (single && single.effCfg) _active.cfg = single.effCfg;
     _renderShell(container, app, cfg);
     _gotoStep(startStep);
 
@@ -1526,6 +1749,14 @@
   // ------------------------------------------------------------------ #
   window._wizardBringUpModels = async function (cfg) {
     if (!cfg.swcap_to_model) return true;
+    // 单卡 + 刚需多模型（如监控分析检索）→ 本应用在当前设备上不可用。
+    // 明确**一个模型都不启停**：既不加载,也不去停别人正在跑的模型
+    // ——「停别人的模型」是破坏性的。
+    if (_active && _active.single && _active.single.blocked) {
+      console.warn("[wizard-state] 单卡模式：本应用被标记为不可用，"
+                   + "不启停任何模型");
+      return false;
+    }
     try {
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (!r.ok) return false;

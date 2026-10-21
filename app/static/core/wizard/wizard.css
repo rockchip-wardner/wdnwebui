@@ -149,6 +149,9 @@
 /* 空能力列表的占位说明（不依赖任何硬件 / 模型的应用，如阈值标定卡）。
    刻意比 env-ok 淡一档：它是「无需检查」，不是「检查通过」。 */
 .wd-wizard-env-row.wd-wizard-env-none { color: #64748b; font-style: italic; }
+/* 单卡下被关掉的 capability（vd 二选一时没选中的那条）—— 中性灰：
+   它既不是通过也不是失败，是「这次没开」。 */
+.wd-wizard-env-row.wd-wizard-env-off { color: #94a3b8; font-style: italic; }
 .wd-wizard-env-error {
   margin-top: 12px;
   padding: 8px 12px;
@@ -157,6 +160,59 @@
   color: #b91c1c;
   border-radius: 6px;
   font-size: 13px;
+}
+
+/* --- 单卡降级提示块（v0.24） ------------------------------------------ */
+/* 只有「完整功能需要 2 张计算卡」的应用才提示：warn（可二选一）/
+   block（刚需多模型，单卡不可用）。 */
+.wd-wizard-single-notice {
+  margin: 4px 0 14px 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.wd-wizard-single-notice-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.wd-wizard-single-notice-line { margin-top: 2px; }
+
+/* warn —— 可二选一 */
+.wd-wizard-single-notice-warn {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  color: #92400e;
+}
+/* block —— 刚需多模型，单卡不可用 */
+.wd-wizard-single-notice-block {
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  color: #991b1b;
+}
+
+.wd-wizard-single-pick { margin: 8px 0 4px 0; }
+.wd-wizard-single-pick-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  color: #374151;
+}
+.wd-wizard-single-pick-item:hover { border-color: #f59e0b; }
+.wd-wizard-single-pick-item input { margin: 0; }
+.wd-wizard-single-pick-text { font-weight: 600; }
+.wd-wizard-single-pick-model {
+  font-size: 12px;
+  color: #6b7280;
+  font-family: "SF Mono", Consolas, Monaco, monospace;
 }
 .wd-wizard-env-bring-status {
   margin-top: 12px;

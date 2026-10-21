@@ -1999,7 +1999,11 @@ const ComputeConfigPage = {
     const MAX_RK182X_CARDS = CC_MAX_RK182X_CARDS;
     // 按 npu_index 升序固定位置 —— 与 label "RK182x #N" 完全对齐，
     // 位置 1 ↔ #0、位置 2 ↔ #1，跨刷新稳定。详见 _sortNpuCards。
-    let rk182xCards = this._sortNpuCards(cards).slice(0, MAX_RK182X_CARDS);
+    //
+    // **只列模型卡位**（``_modelCards``）：多画一格跑不了模型的卡，会让
+    // 用户以为还有第二张卡可用（选它就会失败）。
+    let rk182xCards = this._sortNpuCards(this._modelCards(cards))
+      .slice(0, MAX_RK182X_CARDS);
 
     // wdnai 完全枚举不到 NPU 时，librknnsmi 兜底一次（host 没有 wdnai
     // / rknn3 的开发板情况），同样按 name 排序后再 cap。
@@ -3245,7 +3249,6 @@ const ComputeConfigPage = {
     return Array.from(suffixes).join(" + ");
   },
 
-  // v0.8 patch: 改回 radio + fieldset（v0.7 形态）。用户反馈
   _makeTargetFieldset(modelId, meta, inst, cards) {
     // v0.8 patch: 改回 radio + fieldset（v0.7 形态）。用户反馈
     // <select> 在 tick patch 路径下 dropdown 还是会被关闭（即使我们
@@ -3273,7 +3276,7 @@ const ComputeConfigPage = {
     // npu 枚举里）。enumerate index 就是真实的 NPU 编号，
     // "RK182x #N" 的 N 直接等于 enumerate index，不再 offset。
     const MAX_RK182X_OPTIONS = CC_MAX_RK182X_CARDS;
-    const sorted = this._sortNpuCards(cards);
+    const sorted = this._sortNpuCards(this._modelCards(cards));
     const sortedIndices = sorted.map(c => c.npu_index);
 
     // v0.8: 模型本身只支持某些 target（available_targets，如 ["182x"]）；
@@ -3366,8 +3369,18 @@ const ComputeConfigPage = {
 
   _defaultTargetNpu(cards) {
     if (!cards || !cards.length) return 0;     // 兜底：选 enumerate #0
-    const sorted = this._sortNpuCards(cards);
+    const sorted = this._sortNpuCards(this._modelCards(cards));
     return sorted.length ? sorted[0].npu_index : 0;
+  },
+
+  // 只保留「能跑 rknn 模型」的卡。``snapshot.cards`` 里混着 USB 序列号形态
+  // 的 RGA/VPU 设备（模型一上去就 vision init_runtime failed）。模型卡位由
+  // 后端 ``model_cards`` 给出；老后端没这字段时不过滤。
+  _modelCards(cards) {
+    const mc = this._snapshot && this._snapshot.model_cards;
+    if (!Array.isArray(mc)) return cards;
+    const keep = new Set(mc);
+    return (cards || []).filter((c) => keep.has(c.npu_index));
   },
 
   // NPU 卡片按 enumerate index (npu_index) 升序，与 label "RK182x #N"
