@@ -641,27 +641,165 @@ def _parse_autostart_config(raw) -> list[dict]:
     return out
 
 
-def _autostart_npu_index(model_id: str) -> int:
-    """``npu_index`` this model autostarts on, or ``-1`` when it doesn't.
+def _autostart_npu_map() -> dict[str, int]:
+    """config 的 autostart 列表 → ``{model_id: npu_index}``。
 
-    Tolerates a broken config: boot must not die because one entry is
-    malformed, and the model simply stays off until enabled by hand.
+    徽章 / 算力页 radio 默认卡位的**真源**；实例上缓存的同名字段只是 boot
+    快照，运行期改配置就过期。详见 AGENTS.md「开机自启徽章」。
     """
     try:
-        section = get_config().get_section("compute", {})
+        section = get_config().get_section("compute", {}) or {}
     except Exception:
-        return -1
+        return {}
     try:
         entries = _parse_autostart_config(
             section.get("autostart") if isinstance(section, dict) else None)
     except ValueError as e:
-        LOG.error("compute.autostart 配置非法（%s 默认卡信息按未配置处理）: %s",
-                  model_id, e)
-        return -1
-    for entry in entries:
-        if entry["model"] == model_id:
-            return entry["npu_index"]
-    return -1
+        LOG.error("compute.autostart 配置非法（默认卡信息按未配置处理）: %s", e)
+        return {}
+    return {e["model"]: e["npu_index"] for e in entries}
+
+
+def _with_autostart_markers(d: dict, autostart_npus: dict[str, int]) -> dict:
+    """把 config 派生的「开机自启」标记写进实例 dict。
+
+    覆盖实例上的 boot 快照。peer（adopted）卡不显示徽章 —— 开机自启是
+    **本板**的声明，对端板子的卡跟它无关。
+    """
+    cfg_npu = autostart_npus.get(d.get("model_id", ""), -1)
+    d["_default_npu_index"] = cfg_npu
+    d["_autostart"] = ("enabled" if cfg_npu >= 0 and
+                       d.get("_source") != "adopted" else "")
+    return d
+
+
+def _wants_eager_load(eager_load: bool | None) -> bool:
+    """要不要让 worker **自己在命令行上带** ``--npu`` 加载模型？
+
+    ``None`` = 默认要（autostart 路径），``False`` = 不要（算力页走 bind）。
+
+    **别拿卡号本身当布尔用** —— 卡号 0 是 falsy，早期就是这么写错的：
+    0 号卡的 autostart 条目静默变成「不带 --npu」，worker 起来了却永远
+    不加载模型。
+    """
+    return True if eager_load is None else bool(eager_load)
+
+
+def _worker_npu_arg(npu_index: int | None,
+                    eager_load: bool | None) -> list[str]:
+    """worker 命令行上的 ``--npu`` 参数；不该由 worker 自己加载时是空列表。"""
+    if npu_index is None or not _wants_eager_load(eager_load):
+        return []
+    return ["--npu", str(int(npu_index))]
+
+
+def _instance_reusable(inst_npu_index: int, inst_source: str,
+                       want_npu: int | None,
+                       eager_load: bool | None) -> bool:
+    """已有实例能不能被本次请求复用？
+
+    * 不指定卡 / 非本机来源（peer）→ 都能复用。
+    * 已绑在**同一张**卡 → 复用。
+    * 未绑卡（-1）→ 只有不要求 eager-load 时才复用（算力页 spawn→bind）。
+      autostart 要的是「worker 带着 --npu 自己加载」，复用空实例达不到，
+      且那条路径不再补 bind（补了就是两条 load 抢同一个 session slot）。
+    * 绑在**别的**卡 → 不复用（「同模型跑多张卡」要的正是这个）。
+    """
+    if want_npu is None:
+        return True
+    if inst_source not in ("spawned", "adopted_local"):
+        return True
+    if inst_npu_index == want_npu:
+        return True
+    if inst_npu_index == -1 and not _wants_eager_load(eager_load):
+        return True
+    return False
+
+
+def _crop_autostart_for_cards(entries: list[dict],
+                              model_cards: list[int]) -> tuple[list[dict], list[dict]]:
+    """按模型卡位裁剪 autostart：非模型卡丢弃，**每张卡只留第一条**。
+
+    返回 ``(保留的, 丢弃的)``，丢弃的由调用方记日志。保留哪条按 config
+    的先后顺序（第一条优先）—— 那是用户写入时的意图顺序。
+    """
+    if not model_cards:
+        return list(entries), []
+    keep_cards = set(model_cards)
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    seen_cards: set[int] = set()
+    for e in entries:
+        card = e.get("npu_index")
+        if card not in keep_cards or card in seen_cards:
+            dropped.append(e)
+            continue
+        seen_cards.add(card)
+        kept.append(e)
+    return kept, dropped
+
+
+def _merge_autostart_entry(prev: list[dict], model_id: str,
+                            npu_index: int) -> tuple[list[dict], bool, list[dict]]:
+    """把 ``(model_id, npu_index)`` 并入 autostart，保持「一卡一模型」。
+
+    返回 ``(新列表, 是否新增, 被替换掉的同卡旧条目)``。同卡已有**别的**
+    模型时那条旧记录必然陈旧（运行期同卡只可能有一个 running 实例），留着
+    boot 时同卡就起两个 worker（rc=-6）。替换**原地**进行，保持 config
+    的先后顺序。
+    """
+    def _is_stale(e: dict) -> bool:
+        return e.get("npu_index") == npu_index and e.get("model") != model_id
+
+    stale = [e for e in prev if _is_stale(e)]
+    has_self = any(e.get("model") == model_id
+                   and e.get("npu_index") == npu_index for e in prev)
+    out: list[dict] = []
+    placed = False
+    for e in prev:
+        if _is_stale(e):
+            # 陈旧条目：第一个位置给本条目（保持 config 的先后顺序），
+            # 其余直接丢弃 —— 同卡只留一条。
+            if not placed:
+                if not has_self:
+                    out.append({"model": model_id, "npu_index": npu_index})
+                placed = True
+            continue
+        out.append(dict(e))
+    if not has_self and not placed:
+        out.append({"model": model_id, "npu_index": npu_index})
+    return out, not has_self, stale
+
+
+def _autostart_plan(instances: list[ModelInstance], model_id: str,
+                    npu_index: int) -> str:
+    """boot autostart 的判定：**本板**这张卡上有没有在跑的 worker。
+
+    ``"skip"`` = 本板这张卡已在跑；``"spawn_local"`` = 本板负责起一个。
+
+    判据：本机实例（spawned / adopted_local）+ 状态 running / loading。
+    「进程在但 not_loaded」不算跑。**peer 不参与判定** —— autostart 声明的
+    是本板这张卡，借 peer 的算力会静默失效（对方一 unload 就没人跑）。
+    """
+    serving_here = [i for i in instances
+                    if i.model_id == model_id
+                    and i._source in ("spawned", "adopted_local")
+                    and i.npu_index == npu_index
+                    and i.status in ("running", "loading")]
+    return "skip" if serving_here else "spawn_local"
+
+
+def _autostart_needs_load(argv: list[str], worker_status: str | None) -> bool:
+    """复用的 worker 要不要补一次 ``load`` RPC？
+
+    带 ``--npu`` → 它自己加载，别插手（两条 load 抢同一个 session slot →
+    worker rc=-6）；已在 loading/running → 别插手；问不到状态 → 不发。
+    """
+    if "--npu" in argv:
+        return False
+    if worker_status in ("running", "loading"):
+        return False
+    return worker_status is not None
 
 
 def _sorted(it):
@@ -726,6 +864,9 @@ class ModelInstance:
     # boot-bind target (``--npu``). All three are empty/-1 when the model
     # isn't in compute.autostart (those presets fall through to legacy
     # behaviour: shown as unavailable, user enables manually).
+    #
+    # 这两个字段是 **boot 时的快照**；API 出参一律改用 config 现算的值
+    # （_with_autostart_markers）—— 运行期改配置后快照会过期。
     _config_label: str = ""
     _autostart: str = ""
     _default_npu_index: int = -1
@@ -1319,8 +1460,12 @@ class ComputeRegistry:
     # Snapshot                                                           #
     # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
+        autostart_npus = _autostart_npu_map()
         with self._lock:
-            instances = [inst.to_dict() for inst in self._instances.values()]
+            instances = [
+                _with_autostart_markers(inst.to_dict(), autostart_npus)
+                for inst in self._instances.values()
+            ]
 
         cards = [
             {"npu_index": c["npu_index"], "device_id": c["device_id"]}
@@ -1517,7 +1662,9 @@ class ComputeRegistry:
         """
         with self._lock:
             old_key = inst.key
-            inst.key = (-1, inst.model_id, "spawned")
+            # key 带上卡号（跟 spawn 时一致）：同模型两张卡都失败时不能撞同一个占位 key。
+            err_npu = inst.npu_index if isinstance(inst.npu_index, int) and inst.npu_index >= 0 else -1
+            inst.key = (err_npu, inst.model_id, "spawned")
             if old_key != inst.key:
                 self._instances.pop(old_key, None)
             self._instances[inst.key] = inst
@@ -1610,7 +1757,7 @@ class ComputeRegistry:
             LOG.info(
                 "spawn: %d existing %s worker(s) (pids=%s) are all ours "
                 "(already-tracked spawned) — proceeding to spawn a NEW "
-                "worker for the requested card", model_id, len(orphan_pids),
+                "worker for the requested card", len(orphan_pids), model_id,
                 orphan_pids)
         orphan_pids = reusable
         if allow_adopt and orphan_pids:
@@ -1705,15 +1852,23 @@ class ComputeRegistry:
                     continue
                 if not allow_adopt and inst._source == "adopted":
                     continue
-                if (npu_index is not None
-                        and inst._source in ("spawned", "adopted_local")
-                        and inst.npu_index not in (-1, npu_index)):
+                # Same card-aware rule as the outer ensure_worker_for_model
+                # (see _instance_reusable).
+                if not _instance_reusable(
+                        inst.npu_index, inst._source, npu_index, eager_load):
                     continue
                 return inst
         preset = MODEL_PRESETS[model_id]
+        # **卡号已知就把 key 定成带卡号的。** 两次 spawn 若都用占位 key，第二
+        # 次会把第一次的实例从 _instances 里挤掉（dict 覆盖）→ 那张卡的 worker
+        # 变孤儿 → 随后被 adopt 当「多余孤儿」杀掉。boot 路径不走
+        # bind_instance，光靠 bind 时改 key 救不了它。
+        spawn_npu = (npu_index
+                     if isinstance(npu_index, int) and npu_index >= 0
+                     else -1)
         inst = ModelInstance(
-            key=(-1, model_id, "spawned"),
-            npu_index=-1,
+            key=(spawn_npu, model_id, "spawned"),
+            npu_index=spawn_npu,
             model_id=model_id,
             capability_types=list(preset["capability_types"]),
             instance_name=preset["instance_name"],
@@ -1754,27 +1909,12 @@ class ComputeRegistry:
             # 路由到本机,造成 NETWORK 卡 status 翻转。
             "--local-only",
         ]
-        if npu_index is not None and (True if eager_load is None
-                                      else bool(eager_load)):
-            # autostart path: the card is known now, so hand it over and
-            # let the worker's own eager-load thread build the model. The
-            # replier is registered before that thread starts, so probe
-            # and ``info`` keep answering while the weights load.
-            # The compute page passes eager_load=False and loads over RPC
-            # instead — see the method docstring.
-            #
-            # 判据是「npu_index 有没有给」，而不是「npu_index 是否非零」。
-            # 原来的写法是
-            #   if npu_index is not None and (npu_index if eager_load is None
-            #                                      else eager_load):
-            # 在 autostart 默认（eager_load=None）时右边取到 npu_index 本身，
-            # 而 **npu_index=0 是 falsy** —— 于是 0 号卡上的模型永远拿不到
-            # --npu，worker 进程起来了却不 eager load，状态永远卡在
-            # not_loaded。本方法 docstring 明写契约是
-            # "eager_load defaults to npu_index is not None"，代码没实现它。
-            # 实测：npu1 的 qwen2.5-omni-3b 能 running，npu0 的全部卡死，
-            # 差异就在这一处。
-            cmd += ["--npu", str(int(npu_index))]
+        # autostart path: the card is known now, so hand it over and let
+        # the worker's own eager-load thread build the model. The replier
+        # is registered before that thread starts, so probe and ``info``
+        # keep answering while the weights load. The compute page passes
+        # eager_load=False and loads over RPC instead — see the docstring.
+        cmd += _worker_npu_arg(npu_index, eager_load)
         try:
             # v0.8.6 改:worker stdout/stderr 写独立 log file,而不是 PIPE。
             # 原因:PIPE 在 parent(uwsgi worker / uvicorn)死掉时 read 端
@@ -2117,8 +2257,22 @@ class ComputeRegistry:
             # 扫到我们的本地 worker,这时不能误杀)。这是修板B 在 04:43:35
             # boot probe 命中 board A pid=5509 后,cleanup 把本机 pid=4510
             # 当成 orphan SIGTERM 掉的 bug。
+            #
+            # registry 已经跟踪的本机 worker 不算孤儿 —— 同一个模型跑多张卡时
+            # 每张卡一个 worker，都是合法的。
+            with self._lock:
+                tracked_pids = set()
+                for i in self._instances.values():
+                    if i.model_id != model_id:
+                        continue
+                    if i.proc is not None and i.proc.pid:
+                        tracked_pids.add(i.proc.pid)
+                    peer_pid = getattr(i, "_peer_pid", None)
+                    if isinstance(peer_pid, int):
+                        tracked_pids.add(peer_pid)
             existing_pids = _find_workers_by_name(model_id)
-            extras = [p for p in existing_pids if p != worker_pid]
+            extras = [p for p in existing_pids
+                      if p != worker_pid and p not in tracked_pids]
             if extras:
                 LOG.warning(
                     "adopted %s from local pid=%d; cleaning %d extra orphan(s): %s",
@@ -2191,10 +2345,9 @@ class ComputeRegistry:
                 # Card-aware matching: without this, a model already on
                 # card 0 would be handed back for a request naming card 1
                 # and bind_instance would then ask one worker to load a
-                # second model onto a second card.
-                if (npu_index is not None
-                        and inst._source in ("spawned", "adopted_local")
-                        and inst.npu_index not in (-1, npu_index)):
+                # second model onto a second card. Rule: _instance_reusable.
+                if not _instance_reusable(
+                        inst.npu_index, inst._source, npu_index, eager_load):
                     continue
                 # spawned workers: 如果 subprocess 死了（probe 还没
                 # 来得及翻 error，或 probe 已 return），不要复用 stale
@@ -2305,13 +2458,19 @@ class ComputeRegistry:
             raise RuntimeError(f"npu_index 非法: {npu_index!r}")
 
         # 乐观更新：前端 1Hz tick 立即看到 status="loading" + npu_index。
-        # key 不变 —— 同一个 model 在加载期间应仍是 (-1, model_id)；
-        # 加载成功后异步改成 (npu_index, model_id)。
+        #
+        # key 也在**这里**换成带卡号的 —— 不能等异步 load 跑完（~35s），否则
+        # 同模型第二张卡的 spawn 会用同一个占位 key 把第一张卡挤掉（见 AGENTS.md）。
         with self._lock:
             inst.npu_index = npu_index
             inst.status = "loading"
             inst.started_at = time.time()
             inst.error = ""
+            new_key = (npu_index, inst.model_id, inst._source)
+            if inst.key != new_key:
+                self._instances.pop(inst.key, None)
+                inst.key = new_key
+                self._instances[new_key] = inst
         inst._bind_inflight = True
 
         def _run_load():
@@ -3067,6 +3226,9 @@ class ComputeRegistry:
         }
 
         out: list[dict] = []
+        # config 的 autostart 列表 —— 徽章 / 默认卡位的**真源**（见
+        # _autostart_npu_map）。跑一次，别每个实例读一遍 config。
+        autostart_npus = _autostart_npu_map()
         with self._lock:
             # v0.8.13:by_model 改成 list of insts per model_id,而不是只留
             # 最后一个。之前 dict comprehension inst.model_id -> inst 会让
@@ -3086,7 +3248,7 @@ class ComputeRegistry:
             # No label override anymore — the manifest owns it. The
             # autostart card is only a preselect for the radio; -1 means
             # "this model isn't autostarted, let the user pick".
-            cfg_default_npu = _autostart_npu_index(model_id)
+            cfg_default_npu = autostart_npus.get(model_id, -1)
             return {
                 "model_id":           model_id,
                 "label":              preset["label"],
@@ -3121,7 +3283,8 @@ class ComputeRegistry:
                 out.append(_unavailable_entry(model_id))
                 continue
             for inst in insts:
-                out.append(inst.to_dict())
+                out.append(_with_autostart_markers(inst.to_dict(),
+                                                    autostart_npus))
             # v0.8.7:只对 **远端 adopted** 补 unavailable 占位卡(让用户
             # 能用本机 NPU 覆盖)。adopted_local 已经是本机孤儿 worker 在跑,
             # 再补一条会让本地栏出现 2 个同名 model,用户困惑哪个是真的。
@@ -3151,13 +3314,15 @@ class ComputeRegistry:
         immediately (``not_loaded`` → ``loading`` → ``running`` as the
         build progresses).
 
-        A model already answered by a LAN peer is adopted rather than
-        spawned. That is a *different* situation from autostart: the peer
-        already loaded it on its own card, so there is nothing to bind
-        locally — sending a ``load`` to a peer's worker would try to grab
-        an NPU this board does not own. The requested ``npu_index`` is
-        recorded as the default for the compute page's radio, but the
-        worker is left alone.
+        A model already **running on this board's card** is not spawned
+        again. A LAN peer is deliberately **not** consulted here:
+        ``compute.autostart`` says "this board, this card" — borrowing a
+        peer's worker would leave the pinned card idle, and borrowed
+        compute disappears silently the moment the peer unloads it (its
+        side effect is the same symptom as "autostart never started").
+        Sharing compute across boards is a **runtime** feature
+        (:meth:`get_session` falls back to a peer only when this board
+        has no instance at all).
 
         Models *not* in ``autostart`` do not participate in boot at all:
         no spawn, no adopt, no NPU memory. The compute page still lists
@@ -3195,27 +3360,20 @@ class ComputeRegistry:
         except ValueError as e:
             LOG.error("compute.autostart 配置非法，已跳过开机启动: %s", e)
             entries = []
-        # 单卡裁剪：autostart 里指向「跑不了模型的卡」的条目必须跳过；
-        # 单卡模式下每张卡只起第一条（一卡一模型，同卡叠模型 rc=-6，
-        # AGENTS.md v0.17 实测）。硬拉起来只会得到一堆 error 实例 ——
-        # 开机就报错，用户还以为板子坏了。
-        # 双卡时 model_cards 覆盖全部卡，一条都不裁，行为不变。
+        # autostart 裁剪：非模型卡的条目丢弃 + 每张卡只留第一条
+        # （理由与规则见 _crop_autostart_for_cards）。
         model_cards = self.model_cards()
-        if entries and model_cards:
-            single = len(model_cards) == 1
-            kept, seen = [], set()
-            for e in entries:
+        if entries:
+            kept, dropped = _crop_autostart_for_cards(entries, model_cards)
+            for e in dropped:
                 if e["npu_index"] not in model_cards:
                     LOG.info("boot: autostart 跳过 %s @ npu%s —— 该卡不在"
-                             "模型卡位 %s 内（单卡模式）",
-                             e["model"], e["npu_index"], model_cards)
-                    continue
-                if single and e["npu_index"] in seen:
-                    LOG.info("boot: autostart 跳过 %s @ npu%s —— 单卡模式下"
-                             "一张卡只能承载一个模型", e["model"], e["npu_index"])
-                    continue
-                seen.add(e["npu_index"])
-                kept.append(e)
+                             "模型卡位 %s 内", e["model"], e["npu_index"],
+                             model_cards)
+                else:
+                    LOG.info("boot: autostart 跳过 %s @ npu%s —— 一张卡只能"
+                             "承载一个模型（同卡叠模型 rc=-6）",
+                             e["model"], e["npu_index"])
             entries = kept
         # v0.4+: 顺便读一下 active_app 标记 —— boot 后日志会顺手打印
         # 一下当前记的"用户上次所在的卡片"。前端 bootRestore 会读
@@ -3242,15 +3400,6 @@ class ComputeRegistry:
             with self._lock:
                 already = [i for i in self._instances.values()
                            if i.model_id == model_id]
-                # 本地在这张卡 = 已有，别重复启；本地在别的卡 = 并行推理的
-                # 第二份，照常再启一个（原来只看「该模型有没有实例」，配了
-                # 两张卡也只启一份，配了却不生效还不报错）。
-                local_here = [i for i in already
-                              if i.npu_index == npu_index
-                              and i._source in ("spawned", "adopted_local")]
-                local_elsewhere = [i for i in already
-                                   if i.npu_index != npu_index
-                                   and i._source in ("spawned", "adopted_local")]
             for inst in already:
                 # config no longer overrides labels (that lives in the
                 # manifest), but the autostart card is still the right
@@ -3259,32 +3408,18 @@ class ComputeRegistry:
                     inst._default_npu_index = npu_index
                 if not inst._autostart:
                     inst._autostart = "enabled"
-            if local_here or (already and not local_elsewhere):
-                LOG.info("boot: %s 已在 registry 的 npu=%d（%s），"
-                         "跳过 adopt/spawn",
-                         model_id, npu_index,
-                         (local_here or already)[0]._source)
+
+            # 判据：**本板**这张卡上有没有在跑的 worker。规则见
+            # _autostart_plan（纯函数，可单测）。
+            if _autostart_plan(list(self._instances.values()),
+                               model_id, npu_index) == "skip":
+                LOG.info("boot: %s 已在 npu=%d 跑着，跳过 adopt/spawn",
+                         model_id, npu_index)
                 continue
 
-            adopted = None
-            # adopt 只在本机一张都没跑时做：peer worker 与 entry 指定的卡号
-            # 无关，卡对不上不如自己 spawn 一个。
-            if not local_elsewhere:
-                try:
-                    adopted = self._adopt_existing_worker(model_id)
-                except Exception as e:  # noqa: BLE001
-                    LOG.warning("boot peer-adopt failed for %s: %s",
-                                model_id, e)
-            if adopted is not None:
-                adopted._default_npu_index = npu_index
-                adopted._autostart = "enabled"
-                LOG.info("boot: autostart %s → adopted %s (peer guid=%s "
-                         "status=%s); 不发 load —— 算力归对方，本板不动",
-                         model_id, adopted._source, adopted._peer_guid,
-                         adopted.status)
-                continue
-
-            # No worker anywhere → this board is responsible for it.
+            # 本板负责：起一个带 --npu N 的 worker。_boot_spawn_async 内部
+            # allow_adopt=False → 不去 adopt peer（否则会捡回那个空壳，
+            # 本板照样空转）。
             self._boot_spawn_async(model_id, npu_index)
 
         # NOTE: the orphan sweep already ran above the loop. Do not add a
@@ -3385,6 +3520,20 @@ class ComputeRegistry:
         threading.Thread(target=_runner, name=f"boot-bind-{inst.model_id}",
                          daemon=True).start()
 
+    def _worker_info(self, inst: ModelInstance) -> dict | None:
+        """问 worker 自己现在什么状态（``info`` RPC）；问不到返回 None。
+
+        主进程缓存的 ``inst.status`` 可能过期（``/proc`` 孤儿登记成
+        ``adopted_local`` 时状态是硬编码的 ``not_loaded``）。
+        """
+        if inst.rpc_client is None:
+            return None
+        try:
+            return inst.rpc_client.call(
+                {"action": "info", "op": "info"}, timeout_ms=5000)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _boot_spawn_async(self, model_id: str, npu_index: int) -> None:
         """Fire-and-forget spawn for one ``compute.autostart`` entry.
 
@@ -3404,19 +3553,36 @@ class ComputeRegistry:
         path: that path is shared with ``POST /compute/instances``, where
         the user picked the card by hand and nothing is autostarted. Doing
         it on the returned instance keeps the two callers honest.
+
+        ``allow_adopt`` 固定 False：autostart 声明的是「**本板**这张卡跑
+        这个模型」，捡回 peer 的实例（哪怕它正在跑）也会让本板这张卡空着
+        ——「借算力」是省卡优化，由 boot 循环单独判定，这里一律不 adopt。
         """
         def _runner():
             try:
                 inst = self.ensure_worker_for_model(
-                    model_id, allow_adopt=True, npu_index=npu_index)
+                    model_id, allow_adopt=False, npu_index=npu_index)
                 inst._autostart = "enabled"
                 inst._default_npu_index = npu_index
-                if inst._source == "adopted":
-                    LOG.info("boot autostart: %s came up as a peer instance; "
-                             "leaving its NPU alone", model_id)
-                    return
-                LOG.info("boot autostart: %s spawned with --npu=%d → %s",
-                         model_id, npu_index, inst.status)
+                # 报 worker 命令行里**实际**的 --npu 值：ensure_worker_for_model
+                # 也可能返回复用的实例，不能自称「spawned」。
+                argv = [str(a) for a in
+                        (getattr(getattr(inst, "proc", None), "args", None) or [])]
+                i = argv.index("--npu") if "--npu" in argv else -1
+                LOG.info("boot autostart: %s @ npu=%d → %s（worker %s）",
+                         model_id, npu_index, inst.status,
+                         "命令行带 --npu %s" % argv[i + 1]
+                         if 0 <= i < len(argv) - 1
+                         else "复用已绑定 npu=%s 的实例" % inst.npu_index)
+                # 兜底：复用到的 worker（/proc 孤儿 → adopted_local）没带 --npu，
+                # 不会自己加载 —— 补一次 load RPC。判据见 _autostart_needs_load。
+                if "--npu" not in argv and inst._source != "adopted":
+                    info = self._worker_info(inst)
+                    if _autostart_needs_load(argv, (info or {}).get("status")):
+                        LOG.info("boot autostart: %s 复用的 worker 没带 --npu"
+                                 "（%s），补发 load 让它加载到 npu=%d",
+                                 model_id, inst._source, npu_index)
+                        self.bind_instance(inst, npu_index)
             except Exception as e:  # noqa: BLE001
                 LOG.warning("boot autostart failed for %s @ npu=%d: %s",
                             model_id, npu_index, e)
@@ -4105,10 +4271,12 @@ class ComputeRegistry:
         -------
         dict
             ``{"ok": True, "active_app": app_id,
-                "autostart": [...], "autostart_extended": [...]}``
+                "autostart": [...], "autostart_extended": [...],
+                "autostart_replaced": [...]}``
             其中 ``autostart_extended`` 列出了本次新增的 (model,
             npu_index) —— 方便前端 / 运维看出"这次开启"实际多挂了几张
-            卡的 worker。
+            卡的 worker；``autostart_replaced`` 列出被替换掉的同卡旧条目
+            （维护「一卡一模型」不变量）。
         Raises
         ------
         ValueError
@@ -4152,14 +4320,12 @@ class ComputeRegistry:
             ]
 
         missing: list[str] = []
-        # 对每个 cap 找承载它的 local running 实例（不要求唯一）。
-        cap_to_local: dict[str, "ModelInstance"] = {}
+        # 对每个 cap 找承载它的 local running 实例（**可以不止一个** —— 同一个
+        # 模型跑两张卡时两张卡的实例都承载这个 capability）。
+        cap_to_local: dict[str, list["ModelInstance"]] = {}
         for cap in required_capabilities:
-            chosen = next(
-                (i for i in local_running if cap in i.capability_types),
-                None,
-            )
-            if chosen is None:
+            chosen = [i for i in local_running if cap in i.capability_types]
+            if not chosen:
                 missing.append(cap)
             else:
                 cap_to_local[cap] = chosen
@@ -4182,20 +4348,26 @@ class ComputeRegistry:
         prev_autostart = _parse_autostart_config(
             section.get("autostart") if isinstance(section, dict) else None
         )
-        # 索引：(model_id, npu_index) → True 方便 O(1) 去重
-        existing_keys: set[tuple[str, int]] = {
-            (e["model"], e["npu_index"]) for e in prev_autostart
-        }
         extended: list[dict] = []
-        new_autostart = list(prev_autostart)
-        for cap, inst in cap_to_local.items():
-            key = (inst.model_id, inst.npu_index)
-            if key in existing_keys:
-                continue
-            new_entry = {"model": inst.model_id, "npu_index": inst.npu_index}
-            new_autostart.append(new_entry)
-            existing_keys.add(key)
-            extended.append({"capability": cap, **new_entry})
+        replaced: list[dict] = []
+        new_autostart = prev_autostart
+        for cap, insts in cap_to_local.items():
+            # 同一个模型跑两张卡时两张卡都要记 —— 只记一张的话下次开机另一张卡空着。
+            for inst in insts:
+                # 维护「一卡一模型」不变量 —— 同卡的旧条目是陈旧的，替换掉
+                # （理由见 _merge_autostart_entry）。
+                new_autostart, added, stale = _merge_autostart_entry(
+                    new_autostart, inst.model_id, inst.npu_index)
+                replaced.extend(stale)
+                for e in stale:
+                    LOG.info("compute.active_app=%s: autostart 移除同卡旧条目 "
+                             "%s @ npu%s（该卡现在跑 %s）",
+                             app_id, e["model"], e["npu_index"], inst.model_id)
+                if not added:
+                    continue
+                extended.append({"capability": cap,
+                                 "model": inst.model_id,
+                                 "npu_index": inst.npu_index})
 
         section["autostart"] = new_autostart
         section["active_app"] = app_id
@@ -4214,6 +4386,8 @@ class ComputeRegistry:
             "active_app": app_id,
             "autostart": list(new_autostart),
             "autostart_extended": extended,
+            # 同卡旧条目被替换掉的那些（维护「一卡一模型」不变量）。
+            "autostart_replaced": replaced,
         }
 
     def clear_active_app(self) -> None:

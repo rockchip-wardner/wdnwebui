@@ -134,6 +134,32 @@ def main():
         page.goto(f"{BASE}/", wait_until="domcontentloaded")
         page.wait_for_timeout(1000)
 
+        # ---------- 0. 前置：把板子模拟成单卡 ----------
+        # 单卡策略只在 card_count==1 时生效。``compute.card_count``（对
+        # 探测结果的上限）能热生效、不用重启 —— 本脚本因此在任何硬件上
+        # 都能跑，不用把「本机恰好是单卡」当成前提。
+        print("\n【0】前置：compute.card_count=1（模拟单卡板）")
+        orig_cfg = page.evaluate(
+            """async () => {
+                const r = await fetch('/api/compute/config', {cache:'no-store'});
+                return await r.json();
+            }"""
+        )
+        page.evaluate(
+            """async (cfg) => {
+                await fetch('/api/compute/config', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        autostart: cfg.autostart || [],
+                        card_count: 1,
+                    }),
+                });
+            }""",
+            orig_cfg,
+        )
+        page.wait_for_timeout(800)
+
         # ---------- 1. 算力页报告单卡 ----------
         print("\n【1】/api/compute 报告单卡")
         snap = page.evaluate(
@@ -146,10 +172,13 @@ def main():
               str(snap.get("card_count")))
         check("model_cards == [0]", snap.get("model_cards") == [0],
               json.dumps(snap.get("model_cards")))
-        check("枚举到 2 张卡，但只有 1 张能跑模型",
-              len(snap.get("cards") or []) == 2
-              and len(snap.get("model_cards") or []) == 1,
-              f"cards={len(snap.get('cards') or [])}")
+        # 枚举到的设备数随硬件变（USB 形态的 RGA/VPU 也算进去），不能写死
+        # —— 只断言「能跑模型的卡比枚举到的少」这个不变量。
+        check("枚举到的设备多于能跑模型的卡（USB 形态的不算模型卡）",
+              len(snap.get("model_cards") or []) == 1
+              and len(snap.get("cards") or []) > 1,
+              f"cards={len(snap.get('cards') or [])} "
+              f"model_cards={snap.get('model_cards')}")
 
         # ---------- 2. 监控反查（vr）→ 单 capability，不提示不阻断 ----------
         print("\n【2】监控反查（vr）—— 单 capability 应用，单卡正常")
@@ -426,6 +455,34 @@ def main():
         # ---------- 7. 无 JS 报错 ----------
         print("\n【7】全程无 JS 报错")
         check("pageerror 数为 0", len(errors) == 0, " | ".join(errors[:3]))
+
+        # ---------- 8. 收尾：恢复板子原来的配置 ----------
+        # card_count=1 是临时设的，autostart 也可能被 set_active_app 追加过
+        # 条目 —— 不恢复就污染了真机。
+        print("\n【8】恢复真机配置")
+        page.evaluate(
+            """async (cfg) => {
+                await fetch('/api/compute/config', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        autostart: cfg.autostart || [],
+                        card_count: cfg.card_count,
+                    }),
+                });
+            }""",
+            orig_cfg,
+        )
+        page.wait_for_timeout(500)
+        restored = page.evaluate(
+            """async () => {
+                const r = await fetch('/api/compute/config', {cache:'no-store'});
+                return await r.json();
+            }"""
+        )
+        check("card_count 已恢复原值",
+              restored.get("card_count") == orig_cfg.get("card_count"),
+              f"{restored.get('card_count')} vs {orig_cfg.get('card_count')}")
 
         browser.close()
 

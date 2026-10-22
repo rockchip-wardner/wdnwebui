@@ -2175,6 +2175,13 @@ worker（pid 不同）双双 `running`。约束是「**一卡一模型**」，�
 （`wdndds/rpc/<id>/worker-<pid>`），两个实例不会撞。真正要改的是四处
 单例假设，见下。
 
+> ⚠️ 「数据层本来就支持」这句话曾经把人带沟里：key 的**形状**带卡号，
+> 但 `bind_instance` 直到异步 load 跑完（~35s）才把占位 key 换成带卡号的
+> 那个 —— 同一模型开第二张卡时，第二张卡的 spawn 就在这个窗口里用同一个
+> 占位 key 把第一张卡覆盖掉了。实测症状：第二张卡永远加载不上 + 算力页
+> 多出一张重复卡。详见
+> [同模型多卡启用：实例 key 必须当场带卡号](#同模型多卡启用实例-key-必须当场带卡号v027-修)。
+
 **`LLMRPCSession` 绑定 worker 身份，所以没有透明负载均衡**。
 `_setup_rpc_client` 按 pid 建 Service，session 对象本身带着「我是哪张卡的
 哪个 worker」这个身份。想打另一张卡就必须显式指名 —— 这也是
@@ -2193,6 +2200,95 @@ for h in handles:
 
 `include_remote` 默认 `False`（只返回本机）的原因见 `get_session` 的
 docstring：视频消费方走 `/dev/shm` path-list 传帧，跨机 worker 读不到。
+
+### 同模型多卡启用：实例 key 必须当场带卡号（v0.27 修）
+
+**症状**（真机，用户在「视频目标定位」向导点「一键开启所有模型」）：
+`LocateAnything-3b` 只加载到 NPU0，NPU1 一直不加载；算力配置页出现**两张**
+[GD] 卡片（同一个 pid）。
+
+**根因是一串三步**，`POST /api/compute/instances {npu_index:[0,1]}` 触发：
+
+1. **实例 key 撞车**。`_spawn_compute_worker` 给每次 spawn 都用占位 key
+   `(-1, model_id, "spawned")`，而 `bind_instance` 直到**异步** load 跑完
+   （实测 ~35s）才把 key 换成 `(npu, model_id, source)`。第二张卡的 spawn
+   在这 35s 窗口里用**同一个占位 key** 注册 → dict 覆盖 → 第一张卡的实例
+   被挤出 `_instances`。
+2. **adopt 找不到它 → 另建一张卡**。LAN peer 的 SPDP 事件触发
+   `_maybe_adopt_from_peer()` → `_adopt_existing_worker()` → probe 命中本机
+   worker。因为 1. 把它挤出了，`_find_inst_by_worker_pid()` 找不到 → 新建
+   一条 `adopted_local` → 算力页多出第二张 [GD] 卡。
+3. **adopt 把第二张卡的 worker 当孤儿杀掉**。「清理多余孤儿」把 `/proc` 里
+   所有**不是**被 adopt 的同 model worker SIGTERM 掉 → NPU1 的 worker 死了
+   → 那张卡永远加载不上。
+
+真机日志原文（修之前）：
+
+```
+spawned compute_worker for LocateAnything-3b (pid=12265)     # 卡 0
+spawned compute_worker for LocateAnything-3b (pid=12268)     # 卡 1
+adopted LocateAnything-3b from local pid=12265; cleaning 1 extra orphan(s): [12268]
+sent SIGTERM to orphan worker pid=12268
+bind LocateAnything-3b RPC fail: err='timeout' rc=0
+```
+
+**改法**（四处，全在 `registry.py`）：
+
+* **spawn 时就把卡号写进 key** —— `_spawn_compute_worker` 建实例时用
+  `(npu_index, model_id, "spawned")`（卡号未知才退回 `-1`）。**boot(autostart)
+  路径不走 `bind_instance`**，光靠 bind 时改 key 救不了它。
+* `bind_instance()` 的乐观更新里**当场**把 key 换成
+  `(npu_index, model_id, source)` —— 卡号在 bind 时已经确定，不该等 35s
+  后的异步 load。key 与 `npu_index` 从此同步。
+* `_adopt_existing_worker()` 的「清理多余孤儿」只杀**不在 `_instances` 里**
+  的同 model worker。registry 跟踪的那些（一个模型跑 N 张卡 → N 个本机
+  worker）全都是合法的。
+* 顺带修 `spawn: %d existing %s worker(s)` 的 log 参数错位（`%d` 收到
+  `model_id` 字符串 → logging 内部 TypeError，**整条消息连同 traceback
+  一起丢掉**）。
+
+**为什么 key 必须带卡号**：`_instances` 是 `dict[key → instance]`，key 撞车
+就是**静默覆盖** —— 后一次注册把前一个实例挤出去，那张卡的 worker 变成没人
+管的进程。没有「多了一张卡」的提示，只有一张卡莫名其妙加载不上。
+
+**autostart 要记两张卡**（`set_active_app`）：同一个模型跑两张卡时，
+承载该 capability 的 local running 实例**有两个**，两个都要写进
+`compute.autostart`。只记第一个的话，下次开机另一张卡空着，用户以为
+「两张卡都开着」其实只剩一张。
+
+**修之后**同一场景的日志 —— adopt 走 in-place 更新，既不新建卡也不杀 worker：
+
+```
+spawned compute_worker for LocateAnything-3b (pid=17783)   # 卡 0
+spawned compute_worker for LocateAnything-3b (pid=17786)   # 卡 1
+v0.8.28: in-place updated spawned for LocateAnything-3b (pid=0 npu=1 status=loading)
+```
+
+实测（真机 RK3588 + 2×RK1828）：
+
+* 向导路径：`POST /api/compute/instances {npu_index:[0,1]}` → 两个 worker
+  分别 `building LLMSession(model=LocateAnything-3b, npu=0/1)`，
+  `rknnsmi` 两张卡都是 `3203 / 5120 MB`，算力页 `[GD]` 卡片 **2 张、卡号
+  0 和 1**，没有重复卡。
+* boot 路径：`autostart = [{LA,0},{LA,1}]` → 两个 worker 命令行分别带
+  `--npu 0` / `--npu 1`，都 `running`，算力页同样 2 张卡。
+
+回归：`scripts/verify_multicard_enable.py`（29/29）。桩件里的 **load RPC 必须
+挂住**（`threading.Event`）—— 真机上模型加载要 35s，bug 就发生在这个窗口
+里；桩件秒回的话异步 key 迁移会在第二张卡 spawn 之前跑完，race 被抹掉，
+测试变成「永远绿」的假回归。反向验证：把修复回退，该脚本 8 项失败。
+
+**勿回退**：
+
+* **实例 key 必须带卡号** —— spawn 时带（boot 路径靠它），bind 时再确认一次
+  （算力页路径靠它）。挪回「统一用 `(-1, model_id, source)` 占位」就退回
+  「第二张卡的 spawn 覆盖第一张卡」。
+* **adopt 的孤儿清理不能杀 registry 已跟踪的 worker** —— 一个模型跑多张
+  卡时 N 个本机 worker 都合法。
+* **`_find_inst_by_worker_pid()` 的 in-place 更新是「不重复建卡」的保证**
+  —— adopt 命中本机 worker 时必须复用已有 entry，别新建 `adopted_local`。
+* **`set_active_app()` 要记承载该 capability 的全部 local 实例** —— 只记
+  第一个会让「两张卡」在下次开机退化成一张。
 
 ### 只有 npu0 / npu1 能跑模型（v0.20 实测）
 
@@ -2353,8 +2449,9 @@ tryMount 返回才标记 → 同一页可能并发挂两次 → 序号守卫会�
 `boot_compute_services()` 按模型卡位裁 `compute.autostart`：
 
 * 指向「跑不了模型的卡」的条目 → 跳过（否则开机就是一屏 rc=-6 的 error）
-* **单卡专属**：同一张卡只保留第一条 —— 一张卡只能承载一个模型
-* 双卡时 `model_cards` 覆盖全部卡，**一条都不裁**
+* **每张卡只保留第一条** —— 一卡一模型是硬约束（[见「一卡一模型」是不变量](#一卡一模型是不变量由三层共同保证v025-修)）。
+  这条**不限于单卡**：双卡板上同卡挂多条同样要裁（配置是
+  `set_active_app` 增量追加来的历史沉积）。
 
 ### 回归
 
@@ -3504,15 +3601,109 @@ replier 注册**先于** eager-load 线程启动，worker 一起来 `info` 就�
 "spawn 时一个 load + 主进程再 bind 一次 load" 两条路径在同一个 session
 slot 上打架。
 
-**autostart adopt 到远端 peer 时不发 load** —— 那是对面板子的卡，发过去
-等于抢本机不拥有的 NPU。只把 `npu_index` 记成算力页 checkbox 的默认值。
+**autostart 一律本板自己起，不借 peer 的算力** —— `npu_index` 是本板物理
+卡号，声明了就要在这张卡上跑。借 peer 是**运行期**的特性（`get_session`
+找不到本机实例时才用 peer 的 worker，见「多板 LAN 集群」），不是开机自启
+的语义。
 
 **每张卡一条 autostart**。同一个模型出现在两条里（不同 `npu_index`）是
 合法的，会生成两个 worker 各占一卡；同一个 `npu_index` 出现两次则被
 `compute.autostart 含重复 model` 校验拒掉（因为那才是真撞车）。
 
+### 「autostart 声明的是本板跑」—— peer 空壳不能截胡（v0.26 修）
+
+`compute.autostart` 声明的是「**这台板子**开机要跑哪几个 worker、各绑哪张
+卡」，`npu_index` 是**本板**物理卡号。boot 时只有一种情况可以不自己起：
+**本板这张卡上已经在跑**（running / loading）。
+
+判定收敛成一个纯函数 `_autostart_plan()`，返回 `skip` / `spawn_local`。
+判据：**本机实例**（spawned / adopted_local）+ 状态 running / loading。
+
 **踩过的坑（勿回退）**：
 
+* **「借 peer 的算力」在开机自启上是脆的** —— 旧逻辑在 peer 回应时就
+  判成「算力归对方，本板不动」。但借来的算力会**静默失效**：peer 那边
+  卸载了（退出卡片 / 重启）本板就没人跑，而本板声明的那张卡一直空着 ——
+  症状和「没自启」一模一样（真机实测：借了 .109 的 qwen3-vl-4b，几分钟后
+  对方卸了，模型谁都没跑）。autostart 要的是**确定**：本板自己起，一定
+  起来。借 peer 是运行期 `get_session` 的事。
+* **peer 的「空壳」不能算「算力归对方」** —— peer 那边**进程在、模型没
+  加载**（`not_loaded`）时，`_adopt_existing_worker()` 照样会把它 adopt
+  过来（它只在 `status == "error"` 时才拒绝）。旧代码因此判成「算力归
+  对方，本板不动」而**放弃本板启动** —— 真机症状：重启后两个 autostart
+  模型一个都没起来，日志是
+  `boot: autostart X → adopted adopted (peer ... status=not_loaded); 不发 load`。
+  多板还会互相 adopt 对方的空壳 → **谁都不加载的死锁**。
+  现在 autostart 路径**一律本板自己起**，peer 完全不参与判定。
+* **「peer 已经 loaded」是前提，不是结论** —— `boot_compute_services()`
+  的 docstring 写着「a model already **loaded** by a LAN peer is not
+  spawned again」，但代码从没检查过这个前提。docstring 写前提、代码不兑现，
+  是最难查的一类 bug；改判据时先确认 docstring 的前提真的被代码 enforce。
+  （v0.26 起这条前提本身也取消了：autostart 只管本板。）
+* **`info` 报 `npu_index` 只在 load 之后** —— worker 没加载时
+  `npu_index` 是 `None`（主进程侧记成 -1），cmdline 上的卡号在另一个字段
+  `npu_index_startup` 里。所以「按卡号找本机实例」时，没加载的 worker
+  一律落在 npu=-1 上，别把它当成「绑在别的卡」。
+* **boot 路径不许 adopt peer** —— `_boot_spawn_async()` 内部固定
+  `allow_adopt=False`：autostart 声明的是本板这张卡，捡回 peer 的实例
+  （哪怕它正在跑）也会让本板这张卡空着，而且借来的算力随时会消失。
+* **复用到的残留 worker 要补 load —— 但先问 worker** —— `/proc` 孤儿被
+  登记成 `adopted_local` 时状态是**硬编码**的 `not_loaded`（主进程不知道它
+  有没有 `--npu`），它不会自己加载 → 不补一次 load 的话，autostart 声明
+  的模型永远停在 `not_loaded`。但补之前**必须 `info` 问 worker**：已经在
+  loading/running 就别插手（两条 load 抢同一个 session slot → worker
+  rc=-6），问不到就别发。判定抽成 `_autostart_needs_load()`。
+* **徽章的真源是 config，不是实例上缓存的标志** —— 算力页的「开机自启」
+  徽章（连同算力页 radio 的默认卡位）一律从 `config.compute.autostart`
+  **现算**（`_autostart_npu_map()` + `_with_autostart_markers()`）。实例上
+  的 `_autostart` / `_default_npu_index` 只是 **boot 时的快照**：运行期进
+  卡片时 `set_active_app()` 把模型追加进 config，实例上的标志还是空的 →
+  页面不显示「开机自启」（真机症状：跑完音视频描述，config 里明明两条，
+  页面只有 [VLM] 视觉描述v3 有徽章，[Omni] 多感知描述v2.5 没有）。同一
+  模型的两张卡还会一个有徽章一个没有 —— 取决于 boot 循环有没有扫到它，
+  纯时序问题。
+  **peer（网络算力栏）的卡不显示徽章** —— 开机自启是**本板**的声明，跟
+  对端板子的卡无关。
+
+### 「一卡一模型」是不变量，由三层共同保证（v0.25 修）
+
+一张 RK1828 协卡装不下两个模型 —— 同卡叠第二个模型 `rc=-6`，stderr 为空
+（见 [单卡 NPU 容量约束](#单卡-npu-容量约束两张卡--一张卡装两个)）。
+**这是物理约束，不是配置偏好**，所以「每张卡最多一条 autostart」是硬
+不变量，三层各管一段：
+
+| 层 | 谁 | 做什么 |
+|---|---|---|
+| 配置生成 | `set_active_app()` | 追加 `(model, npu)` 时把**同卡的其它条目替换掉**（旧条目必然陈旧：运行期同卡只可能有一个 running 实例） |
+| 配置解析 | `_parse_autostart_config()` | 拒掉「同模型同卡」重复 |
+| boot | `boot_compute_services()` | `_crop_autostart_for_cards()`：非模型卡的条目丢弃 + **每卡只留第一条** |
+
+> boot 那层的裁剪**不是「猜测性预检」**：卡位唯一性是已实测确认的硬
+> 事实，不是按 `memory_estimate_mb` 猜显存还剩多少（后者会误杀合法
+> 配置，上文 v0.17 明确反对）。被裁掉的条目**只记日志不改 config** ——
+> config 是用户的意图，boot 无权替他改。
+
+**踩过的坑（勿回退）**：
+
+* **`--npu` 的卡号 0 是 falsy** —— 判定「要不要带 `--npu`」时**不能拿
+  `npu_index` 自己的值当布尔用**。写成
+  `(npu_index if eager_load is None else eager_load)` 时，卡号 0 的
+  autostart 条目会静默变成「不带 `--npu`」→ worker 起来了却**永远不
+  加载模型**（`npu_index: null` + `session not loaded`），而 boot 日志
+  照样打印 `spawned with --npu=0`。真机实测：npu1 的条目正常加载，
+  npu0 的条目全部 `not_loaded`。现在命令行的 `--npu` 参数一律由
+  `_worker_npu_arg(npu_index, eager_load)` 生成，「要不要 eager-load」
+  的判定集中在 `_wants_eager_load(eager_load)`。
+* **boot 日志不能说「spawned」除非真的是新建进程** —— `ensure_worker_for_model()`
+  可能返回一个**复用**的实例。原来那句硬编码的
+  `boot autostart: %s spawned with --npu=%d` 把复用说成新建，正好盖住了
+  上面那个 bug。现在直接读 worker 进程的真实 argv，报**实际**的
+  `--npu` 值（复用实例则报「复用已绑定 npu=N 的实例」）。
+* **adopted（LAN peer）实例会截胡「同模型跑两张卡」** —— peer 上有该
+  模型时，第二个卡位直接复用 peer 的实例（`pid=0`），本机**不会**为它
+  再起一个 worker。这不是 bug：peer 的算力是共享的（它不占本机的卡），
+  本机重复加载反而浪费一张卡。只有 **spawned / adopted_local** 实例才
+  参与卡位判定（`_instance_reusable()`）。
 * `_cleanup_unregistered_workers()` 必须排在 spawn 循环**之前**。排在
   后面会和 fire-and-forget 的 spawn 线程竞争 `tracked_pids`，把刚
   `Popen` 但还没登记进 `_instances` 的 worker 判成孤儿杀掉 —— 实测首个
@@ -3521,8 +3712,31 @@ slot 上打架。
   跟踪的 spawned pid。autostart 两条同模型不同卡时，第二条必然 `/proc`
   命中第一条刚起的 worker，不扣就会把它抢成 `adopted_local`。详见
   [同一个模型跑两张卡](#同一个模型跑两张卡v019算力页运行在多选) 的坑 1。
+* **未绑卡（`npu_index == -1`）的实例只能在「算力页 spawn→bind」路径上
+  复用**。autostart 路径要的是「worker 带着 `--npu N` 自己加载」，复用
+  一个没带 `--npu` 的 worker 达不到效果，而 autostart 路径**不会再补
+  一次 bind**（补了就是两次 load 抢同一个 session slot，worker rc=-6）。
+  漏了这条就是「同模型配两张卡，第二条卡位被静默吞掉」。
 * `hidden` 语义已从 `compute.services[].autostart == "hidden"` 迁到
   manifest 的 `hidden` 字段，这样配置写坏了也不会误隐藏模型。
+
+回归：`scripts/verify_autostart_card_uniqueness.py`（32/32）—— 覆盖
+`_wants_eager_load` / `_worker_npu_arg` / `_crop_autostart_for_cards` /
+`_merge_autostart_entry` / `_instance_reusable` 五个纯函数（含「0 号卡
+到底带不带 `--npu`」的命令行级断言），以及「任意追加序列后每卡仍只有
+一条」的不变量。
+
+`scripts/verify_autostart_boot_plan.py`（20/20）—— 覆盖
+`_autostart_plan()`：本板这张卡在跑 → skip；其余一律本板自己起。重点是
+「peer 不参与判定（不借 peer 的算力）」「peer 空壳（not_loaded）不能截胡
+本板启动」「本板已有 not_loaded 实例时本板自己起」，外加
+`_autostart_needs_load()` 的补 load 判据。
+
+`scripts/verify_autostart_badge.py`（13/13）—— 覆盖「开机自启」徽章按
+config 派生（实例上的快照会过期）、peer 卡不显示徽章、
+`_autostart_npu_map()` 对残缺/非法配置的容错。
+`scripts/verify_autostart_badge_ui.py`（7/7）—— 页面级：本机算力栏每张
+卡的徽章可见性必须与 `config.compute.autostart` 一致。
 
 ## `compute.active_app` —— 用户"所在卡片"自恢复（v0.4 起）
 

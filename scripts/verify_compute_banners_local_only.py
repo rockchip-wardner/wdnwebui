@@ -153,12 +153,17 @@ def assert_banners(name, expects, titles, ok_count, failed):
 def run_scenario(page, instances):
     """挂一次 scenario,等 banner 渲染稳定后返回 titles。
 
-    简单做法:wait_for_selector + 2s sleep。ComputeConfigPage 1Hz tick 会
-    调 load() + render(),banner 内容取决于 mock 数据,2s 内一定走完两
-    次 tick 且 mock 数据不变。比 stability loop 更稳定(后者在多场景连
-    跑时会被 1Hz tick 触发重新渲染判定而 fail)。"""
+    **必须整页重载**（``about:blank`` → 目标 hash）：hash-only 的 goto
+    不重载文档,场景之间只靠 ComputeConfigPage 的 1Hz tick 补渲染 ——
+    那一拍没赶上就断言到**上一个场景**的 banner,于是「期望有 banner」
+    的场景全红（实测偶发,真机上有实例在 loading 时更容易踩到）。
+    整页重载后首屏就是本场景的 mock 数据,没有时序窗口。
+    """
     body = json.dumps(mock_compute(instances))
+    # 旧 route 会累积，playwright 取最后一个生效 —— 清掉，只留本场景的。
+    page.unroute("**/api/compute")
     page.route("**/api/compute", make_route_handler(body))
+    page.goto("about:blank")
     page.goto(f"{BASE}/#compute-config",
               wait_until="domcontentloaded", timeout=15000)
     # state="attached" 而非默认 visible —— section 内父 element 带 .hidden
@@ -167,7 +172,7 @@ def run_scenario(page, instances):
                            state="attached", timeout=8000)
     page.wait_for_selector("#cc-banner-stack",
                            state="attached", timeout=5000)
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(1200)
     return read_banners(page)
 
 
