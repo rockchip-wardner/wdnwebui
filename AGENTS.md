@@ -2944,18 +2944,33 @@ rebuild from scratch. Opt-outs:
   `SKIP_WDNAV_VIDEO_BUILD=1` env var (CI pre-built images).
 
 The hard rule for users of these SDKs: **after `git pull` on
-`.venv/src/<sdk>`, run `./update_rkwhl.sh`.** It `git pull`s all three
-SDKs and forces `pip install -e --force-reinstall --no-deps` on each,
-which is what actually triggers the rebuild hooks. The previous
+`.venv/src/<sdk>`, run `./update_rkwhl.sh`.** It `git pull`s every
+editable package under `.venv/src/` and forces
+`pip install -e --no-deps` on each whose HEAD advanced, which is what
+actually triggers the rebuild hooks. The previous
 heuristic of "only reinstall when `pyproject.toml` changed" missed
 wrapper-only commits — root cause of the wdndds
 `undefined symbol: wdndds_topic_writer_create` incident after commit
 871d00f (`_cshim.py` gained new ctypes bindings, `pyproject.toml`
 untouched). `update_rkwhl.sh` now rebuilds unconditionally on any HEAD
 advance. For one-off sync of a single SDK, `pip install -e
---force-reinstall --no-deps .venv/src/<sdk>` is the minimum; on a
+--no-deps .venv/src/<sdk>` is the minimum; on a
 fresh host, `bootstrap_wdndds_native.sh` is still required for apt
 deps + native lib vendoring.
+
+`update_rkwhl.sh` 同样驱动两个**卡片插件包**（`wdnapps_video_analyzer` /
+`wdnapps_hdmi_processor`），但它们是 pure-Python、没有 `.so` 可断言，改由
+`verify_plugin_cards` → `scripts/check_plugin_entrypoints.py` 校验
+「entry point 能解析 → manifest `"id"` 与 entry point 名逐字相同 → 卡片
+目录有 `static/`」。这组断言挡的是另一个静默失败：entry point 名照着包目录
+写下划线、而卡 id 是连字符时，pip 全程报成功，宿主启动却把这几张卡 FATAL
+跳过。
+
+> 包名一律传**下划线**（`wdnapps_video_analyzer`）。pip 规范名是连字符的
+> `wdnapps-video-analyzer`，但 site-packages 上实际生成的是
+> `wdnapps_video_analyzer-0.1.0.dist-info` 和
+> `__editable__.wdnapps_video_analyzer-0.1.0.pth`——实测传连字符名时
+> `purge_install_traces` 的 glob **一个都命中不到**。
 
 ## Layout
 

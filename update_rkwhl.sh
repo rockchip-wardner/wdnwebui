@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 更新 .venv/src 下以 editable 模式安装的 wdnav / wdnai / wdndds / wdnhid
+# 以及两个应用插件包 wdnapps_video_analyzer / wdnapps_hdmi_processor
 # 用法：./update_rkwhl.sh
 #
 # 每个包的流程（v1.3 起）：
@@ -23,6 +24,10 @@
 #     requirement 报错。
 #   * 每次 install 后**断言 .so 落地**——setuptools ≥64 会静默吞掉
 #     build_py 钩子的 RuntimeError，pip 返回 0、日志全绿但产物没生成。
+#   * 插件包（wdnapps_*）没有 .so，改为断言 **entry point → manifest id →
+#     static/ 三段链路**。这组断言挡的是另一个静默失败：entry point 名写了
+#     下划线而 manifest "id" 是连字符时，pip 全程报成功，但宿主启动时把这
+#     几张卡 FATAL 跳过，页面上就是"卡片不见了"且日志里只有一行 ERROR。
 #   * 强制重建：`UPDATE_RKWHL_FORCE_REBUILD=1 ./update_rkwhl.sh`。
 
 set -euo pipefail
@@ -57,6 +62,58 @@ else
     echo "==> 未找到 requirements.txt，跳过 web 依赖同步"
 fi
 
+# ---------------------------------------------------------------------------
+# 插件包（wdnapps_*）的产物校验
+#
+# 这两个包是 pure-Python，没有 .so 可断言；但它们有一个更致命的失败模式：
+# **pip 装成功了，卡片却一个都不出现**，而且全程不报错。最常见的原因是
+# entry point 名与 manifest.json 的 "id" 不一致——包目录用下划线
+# (cards/video_detection/)，卡 id 一贯用连字符 ("video-detection")，照着
+# 模块名写就全错。宿主 discover() 判 FATAL 后**静默跳过**该卡，所以
+# "装上了" 与 "卡片能用" 是两件事，必须在这里断言。
+#
+# 用 importlib.util.find_spec 而不是 import_module：前者只 import 父包
+# (cards/__init__.py 是空的，正好)，**不执行叶子模块**；后者会顺着 api.py
+# 拉起整个 app.core.*（compute registry、解码器初始化），在更新脚本里既慢
+# 又带副作用。
+#
+# 输出约定：一行一卡，`OK <id> (<dir>)` 或 `BAD: <原因>`。判定逻辑在
+# scripts/check_plugin_entrypoints.py（也可独立跑），这里只负责调用 + 呈现。
+# 最初这段是 `$(python - <<'PYEOF' ... )` 的内联 heredoc，在本机 bash
+# 5.2 上**解析期**就报 `command substitution: syntax error near unexpected
+# token '||'`——最小用例能过、函数里不能过，不值得继续纠缠这种脆写法。
+# ---------------------------------------------------------------------------
+verify_plugin_cards() {
+    local pkg="$1"
+    local checker="$SCRIPT_DIR/scripts/check_plugin_entrypoints.py"
+    local out bad
+
+    if [ ! -f "$checker" ]; then
+        echo "FATAL: [$pkg] 找不到校验脚本 $checker" >&2
+        return 1
+    fi
+
+    # 判定交给 grep，不用 python 的退出码 —— python 侧恒定 exit 0，
+    # 输出里 `BAD:` 开头即为失败。`cd "$SCRIPT_DIR"` 是必须的：
+    # 卡片模块 import 的是宿主仓库根的 `app.core.*`。
+    out="$(cd "$SCRIPT_DIR" && python "$checker" "$pkg" 2>&1)" || true
+
+    if [ -z "$out" ]; then
+        echo "FATAL: [$pkg] 插件校验无输出（python 可能没跑起来）" >&2
+        return 1
+    fi
+
+    bad="$(printf '%s\n' "$out" | grep -c '^BAD' || true)"
+    printf '%s\n' "$out" | sed 's/^OK /    ✅ /'
+    if [ "$bad" != "0" ]; then
+        printf '%s\n' "$out" | grep '^BAD' | sed 's/^BAD: /    ❌ /' >&2
+        echo "FATAL: [$pkg] 插件卡片校验未通过（$bad 项）。宿主启动时会静默丢卡，" >&2
+        echo "       不是启动时报错，所以必须在这里拦住。" >&2
+        return 1
+    fi
+    return 0
+}
+
 # 校验某个 SDK 安装后必须落地的 .so 产物。pip install -e 在 setuptools ≥64
 # 上会**静默吞掉** ``build_py`` 钩子的 RuntimeError（参见 bootstrap_wdndds_native.sh
 # 注释 / AGENTS.md「SDK native-`.so` rebuild policy」段）——pip exit code 仍为 0，
@@ -90,6 +147,12 @@ verify_outputs() {
             # wdnhid 是 pure-Python（USB Gadget HID bindings），无 .so 产物。
             # wdnwebui 卡片侧 import wdnhid，必须保证本包可用即可。
             return 0
+            ;;
+        wdnapps_video_analyzer|wdnapps_hdmi_processor)
+            # 应用插件包也是 pure-Python，同样没有 .so；但要验的东西更重要
+            # ——卡片是不是真的注册上了（见 verify_plugin_cards 的说明）。
+            verify_plugin_cards "$pkg"
+            return $?
             ;;
     esac
 
@@ -294,8 +357,21 @@ run_pkg wdnai  "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
 run_pkg wdndds "git+ssh://git@10.10.10.10/wardner/wdndds.git#egg=wdndds"
 run_pkg wdnhid "git+ssh://git@10.10.10.10/wardner/wdnhid.git#egg=wdnhid"
 
+# 应用插件包（wdnwebui 的卡片）。放在 SDK 之后：wdnapps_hdmi_processor 的
+# usb_hid 卡 import wdnhid / wdnav，先有它们再装插件，日志里的报错才不会
+# 指向"还没装的 SDK"这种假线索。
+#
+# **包名必须用下划线**（= 目录名 = pip 落盘的 dist-info / .pth 名）。
+# pip 的规范名是连字符的 wdnapps-video-analyzer，但 site-packages 上实际
+# 生成的是 wdnapps_video_analyzer-0.1.0.dist-info 和
+# __editable__.wdnapps_video_analyzer-0.1.0.pth。purge_install_traces 全靠
+# $pkg 拼这些 glob —— 传连字符名会让清理静默落空，旧 .pth 越攒越多，
+# 而那正是文件头 v1.3 要根治的"实体目录遮挡 editable 安装"问题。
+run_pkg wdnapps_video_analyzer "git+ssh://git@10.10.10.10/wardner/wdnapps_video_analyzer.git#egg=wdnapps_video_analyzer"
+run_pkg wdnapps_hdmi_processor "git+ssh://git@10.10.10.10/wardner/wdnapps_hdmi_processor.git#egg=wdnapps_hdmi_processor"
+
 if [ ${#FAILED_PKGS[@]} -eq 0 ]; then
-    echo "更新完成（wdnav / wdnai / wdndds / wdnhid 全部成功）。"
+    echo "更新完成（wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor 全部成功）。"
     exit 0
 fi
 

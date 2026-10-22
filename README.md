@@ -90,11 +90,20 @@ After pulling upstream changes (or for routine sync), run:
 ./update_rkwhl.sh
 ```
 
-It `git pull`s all three SDKs (wdnav / wdnai / wdndds) and runs
-`pip install --no-deps -e` on each — that is what actually triggers
+It `git pull`s every editable package under `.venv/src/` — the four SDKs
+(wdnav / wdnai / wdndds / wdnhid) and the two card plugins
+(wdnapps_video_analyzer / wdnapps_hdmi_processor) — and runs
+`pip install --no-deps -e` on each. That is what actually triggers
 the `.so` rebuild hooks for wdndds and wdnav. HEAD advances → rebuild
-(~5–20s per SDK). For manual single-SDK sync,
-`pip install --no-deps -e .venv/src/<sdk>` is the minimum; on a fresh
+(~5–20s per SDK). Packages whose HEAD didn't move are left untouched.
+
+For the two plugin packages there are no `.so` to assert, so the script
+instead checks that every card is really registered: each
+`wdnwebui.cards` entry point must resolve to a card directory whose
+`manifest.json` `"id"` matches the entry-point name and whose `static/`
+exists. That catches the silent failure where pip succeeds but the host
+drops every card at boot. For manual single-package sync,
+`pip install --no-deps -e .venv/src/<pkg>` is the minimum; on a fresh
 host, `sudo ./bootstrap_wdndds_native.sh` is still required for apt
 deps + native lib vendoring.
 
