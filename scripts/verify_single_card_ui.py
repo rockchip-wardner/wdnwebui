@@ -142,21 +142,31 @@ def main():
         orig_cfg = page.evaluate(
             """async () => {
                 const r = await fetch('/api/compute/config', {cache:'no-store'});
+                if (!r.ok) return {__http_error: r.status};
                 return await r.json();
             }"""
         )
+        # **读不到就别写。** PUT /api/compute/config 是**全量替换** compute
+        # section —— 拿不到原值还往下写，autostart 会被整个写空，用户板子
+        # 上的「开机自启」配置就没了（这个坑真的踩过：某次 GET 拿到 {}，
+        # `cfg.autostart || []` 把它写成空数组）。
+        if not isinstance(orig_cfg, dict) or "autostart" not in orig_cfg:
+            raise SystemExit(
+                f"读不到 /api/compute/config（拿到 {orig_cfg!r}）—— "
+                "为免把真机配置写空，本次不跑。")
+        orig_autostart = orig_cfg.get("autostart") or []
         page.evaluate(
             """async (cfg) => {
                 await fetch('/api/compute/config', {
                     method: 'PUT',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
-                        autostart: cfg.autostart || [],
+                        autostart: cfg.autostart,
                         card_count: 1,
                     }),
                 });
             }""",
-            orig_cfg,
+            {"autostart": orig_autostart},
         )
         page.wait_for_timeout(800)
 
@@ -466,23 +476,30 @@ def main():
                     method: 'PUT',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
-                        autostart: cfg.autostart || [],
+                        autostart: cfg.autostart,
                         card_count: cfg.card_count,
                     }),
                 });
             }""",
-            orig_cfg,
+            {"autostart": orig_autostart,
+             "card_count": orig_cfg.get("card_count")},
         )
         page.wait_for_timeout(500)
         restored = page.evaluate(
             """async () => {
                 const r = await fetch('/api/compute/config', {cache:'no-store'});
+                if (!r.ok) return {__http_error: r.status};
                 return await r.json();
             }"""
         )
         check("card_count 已恢复原值",
               restored.get("card_count") == orig_cfg.get("card_count"),
               f"{restored.get('card_count')} vs {orig_cfg.get('card_count')}")
+        # autostart 也要断言 —— 它才是用户真正在意的「开机自启」配置，
+        # 之前只查 card_count，配置被写空了也照样报绿。
+        check("autostart 已恢复原值",
+              (restored.get("autostart") or []) == orig_autostart,
+              f"{restored.get('autostart')} vs {orig_autostart}")
 
         browser.close()
 
