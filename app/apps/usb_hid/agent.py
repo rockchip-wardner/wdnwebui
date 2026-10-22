@@ -232,6 +232,9 @@ _PROMPT_HEADER = """\
 {geometry}
 规则：
 - 一次只输出一个动作，然后由系统执行、执行完给你一张新截图。
+- **thought 必填**：每一步都要先用一句话写清楚"你现在在这张图里看到了什么、
+  为什么要点这个位置"。这不是可选的礼貌用语 —— 调试时它是唯一能核对
+  "你的意图"和"你的落点"是否一致的依据；空 thought 会让整轮排查失去方向。
 - x 和 y 是**必填**的，任何动作都不能省略，也不要填 0 充数。
 - **如果你在这张图里找不到完成这个任务需要的东西**（比如要求"打开记事本"
   但图里是个全屏程序、没有桌面和任务栏），直接输出 not_found，并在 thought
@@ -246,31 +249,93 @@ _PROMPT_HEADER = """\
 def _active_area_1000(frame) -> Optional[tuple[int, int, int, int]]:
     """Where is the real picture inside the frame, in 0-1000 coords?
 
-    实测踩到的坑：PC 上跑着 16:10 的程序，HDMI-IN 抓到的是 1920×1080，
-    而真实画面只有中间 1728×1080，**左右各 96px 黑边**。模型不知道这
-    件事，它按"整幅图"去理解，于是瞄准最左边那个按钮时会偏到黑边上 ——
-    肉眼看着"就差一点"，实际偏了 5% 屏宽。
+    PC 上跑的程序不一定填满整幅：16:10 的画面被 HDMI-IN 塞进 1920×1080
+    后左右各有留边。留边上点什么都没用，所以需要知道它有多宽。
 
-    判据用整行/整列均值 > 12 而不是 > 0：压缩噪点和暗色桌面边缘会有
-    几个接近 0 的像素，完全取非黑会把黑边算进内容区。
-    抽样 (::16) 后约 7k 列 × 68 行，单帧 ~0.3 ms。
+    长度不是写死的 —— 每一帧重算，采样步长 16px，分辨率 ±1% 屏宽。
+    问题出在**判据**上：原来写死 `mean > 12`，而实测黑边像素是字面上的
+    `[16, 16, 16]`（这条 HDMI 链路有黑电平抬升，不是 0），永远过不了
+    12 这道门 → `c.min()` 恒为 0 → 函数**一直返回 None**，等于这个函数
+    从上线起就没工作过。
+
+    判据改成**看平不平**，而不是看黑不黑。实测留边那几列纵向
+    std = **0.0**（逐像素完全恒定），而内容列 std 在 18~57 —— 任何
+    Windows 界面都不可能整列恒定。这比"够不够黑"可靠：深色壁纸亮度
+    接近留边时，亮度法会整片漏检（实测内容均值 35 时四种亮度判据全部
+    漏检，平度法照常检出）。
+
+    两级：平度为主，亮度为辅（平度在"整幅都很平"时无能为力，退回亮度
+    法）。两侧都有"别信"的保护 —— 平度段必须从画面边缘开始数且左右
+    两段不得重叠，亮度法要求检出区确实比整幅窄。
+
+    **结果只用于日志告警，不进 prompt。** 曾把它写成一句行动建议
+    （"真实画面在 x∈[50,950]，离边界留 ≥27 余量"）发给模型，结果模型
+    顺从地往里挪，把开始按钮（x=69.1，恰好不满足 ≥77 这条建议）推到了
+    下一个图标（资源管理器 x=95.3）上 —— 用户实测"点开始变点文件夹"。
+    **检测结果可以给人看，不能拿来指挥模型**；模型的坐标本来就包含
+    留边，它瞄不准是普通定位误差，不需要额外补偿。
+
+    抽样 (::16) 后约 7k 列 × 68 行，单帧 ~0.5 ms。
     """
     import numpy as _np
+
+    FLAT_EPS = 2.0     # 纵向 std 低于此值算"平"（实测留边是 0.0，内容 ≥3.8）
+    MIN_RUN = 2        # 至少连续 2 个采样列 = 32px 才算留边，滤掉单列噪声
+
+    def _flat_run(std_seq, eps, min_run):
+        """从序列开头数连续多少个元素"平"。返回 0 表示这一侧没有留边。"""
+        i = 0
+        n = std_seq.size
+        while i < n and std_seq[i] < eps:
+            i += 1
+        return i if i >= min_run else 0
+
     try:
         sub = frame[::16, ::16]
         gray = sub.mean(axis=2)
         col = gray.mean(axis=0)
         row = gray.mean(axis=1)
-        c = _np.where(col > 12)[0]
-        r = _np.where(row > 12)[0]
-        if c.size == 0 or r.size == 0:
-            return None
+        col_std = gray.std(axis=0)
+        row_std = gray.std(axis=1)
+        nc, nr = col.size, row.size
+
+        l_flat = _flat_run(col_std, FLAT_EPS, MIN_RUN)
+        r_flat = _flat_run(col_std[::-1], FLAT_EPS, MIN_RUN)
+        t_flat = _flat_run(row_std, FLAT_EPS, MIN_RUN)
+        b_flat = _flat_run(row_std[::-1], FLAT_EPS, MIN_RUN)
+        # 左右/上下两段撞在一起 = 整幅都平（无信号、纯色、纯色壁纸），
+        # 不是留边。这种情况必须返回 None 而不是给一个反过来的区间。
+        col_by_flat = (l_flat + r_flat) < nc and (l_flat or r_flat)
+        row_by_flat = (t_flat + b_flat) < nr and (t_flat or b_flat)
+
+        col_thr = max(8.0, float(_np.percentile(col, 95)) * 0.35)
+        row_thr = max(8.0, float(_np.percentile(row, 95)) * 0.35)
+        c = _np.where(col > col_thr)[0]
+        r = _np.where(row > row_thr)[0]
+        col_by_lum = c.size > 0
+        row_by_lum = r.size > 0
+
         h, w = frame.shape[:2]
-        sw, sh = max(1, sub.shape[1]), max(1, sub.shape[0])
-        x0 = int(c.min() * 16 / w * 1000)
-        x1 = int((c.max() + 1) * 16 / w * 1000)
-        y0 = int(r.min() * 16 / h * 1000)
-        y1 = int((r.max() + 1) * 16 / h * 1000)
+        if col_by_flat:
+            x0 = int(l_flat * 16 / w * 1000)
+            x1 = int((nc - r_flat) * 16 / w * 1000)
+        elif col_by_lum:
+            x0 = int(c.min() * 16 / w * 1000)
+            x1 = int((c.max() + 1) * 16 / w * 1000)
+        else:
+            return None
+        if row_by_flat:
+            y0 = int(t_flat * 16 / h * 1000)
+            y1 = int((nr - b_flat) * 16 / h * 1000)
+        elif row_by_lum:
+            y0 = int(r.min() * 16 / h * 1000)
+            y1 = int((r.max() + 1) * 16 / h * 1000)
+        else:
+            y0, y1 = 0, 1000
+
+        # 必须真的比整幅窄，否则"没检出"和"整幅都是内容"会变成同一件事。
+        if x0 >= x1 or y0 >= y1:
+            return None
         # 真的存在黑边才报，否则纯噪声会让这段文字变成废话。
         if x0 < 5 and x1 > 995 and y0 < 5 and y1 > 995:
             return None
@@ -294,31 +359,23 @@ def _geometry_block(meta, frame=None) -> str:
     顶部/底部因为后面会 clamp，看起来"还挺准"，把中部的错误完全盖住了，
     表现就是"有时候点得准有时候差很远"，极难归因。
 
-    另外 PC 上跑的程序**不一定**填满整幅。如果画面比 16:9 窄或高，
-    HDMI-IN 抓到的 1920×1080 里会有**黑边**；黑边上点什么都没用，但
-    模型不知道。`_active_area_1000` 给出真实内容区，写到这里让它
-    明白"目标要落在 x∈[50,950] 这条带里"。
-
     数字全部从当帧的 meta 现算，不是写死的 —— 换送检尺寸（384）后
     pad_top 会变，这里自动跟着变。
+
+    **不要在这里写左右黑边的信息**（曾写过"真实画面在 x∈[50,950]，
+    离边界留 ≥27 余量"，已删）：实测模型的坐标**本来就包含黑边**，
+    它瞄开始按钮给 x=50 而按钮在 x=69，那 19 个单位是普通定位误差，
+    不是"没扣黑边"。给它一条"要往里挪"的建议，它就真往里挪 ——
+    而开始菜单在 x=69 恰好**不满足**"≥77"这条建议，于是被推到了
+    下一个图标（资源管理器 x=95）上。用户实测：点开始按钮 → 点成了
+    右侧文件夹。**检测结果可以给日志看，不能当行动建议喂给模型。**
+    `_active_area_1000` 现在只用于 `_note_out_of_range` 的越界告警。
     """
     size = float(meta.size or 1)
     top = meta.pad_top / size * 1000.0
     bottom = (meta.pad_top + meta.content_h) / size * 1000.0
     left = meta.pad_left / size * 1000.0
     right = ((meta.pad_left + meta.content_w) / size) * 1000.0
-    extra = ""
-    if frame is not None:
-        a = _active_area_1000(frame)
-        if a is not None:
-            ax0, ay0, ax1, ay1 = a
-            margin = int((ax1 - ax0) * 0.03)
-            extra = (
-                f"\n- 当前截图里**真实画面**在 x∈[{ax0},{ax1}]、"
-                f"y∈[{ay0},{ay1}] 这一块（其余都是黑色留边）。"
-                f"目标点最好离这块边界留 ≥{margin} 的余量"
-                f"（{margin}/1000 屏宽 ≈ {margin / 10:.1f}%）。"
-            )
     return (
         f"- 这是一张 {int(size)}×{int(size)} 的正方形图，但电脑桌面只有中间一条：\n"
         f"  x 从 {left:.0f} 到 {right:.0f}，y 从 **{top:.0f} 到 {bottom:.0f}**。\n"
@@ -332,8 +389,30 @@ def _geometry_block(meta, frame=None) -> str:
         f"- 找目标时按**桌面自己的相对位置**估算：任务栏在最下面一行"
         f"（y≈{bottom - (bottom - top) * 0.03:.0f}），"
         f"桌面图标在左上，标题栏在最上面（y≈{top + (bottom - top) * 0.03:.0f}）。"
-        f"{extra}"
     )
+
+
+def _extract_thinking(raw: str, limit: int = 1200) -> str:
+    """Pull the model's ``<think>…</think>`` chain out of its raw output.
+
+    ``respond()`` 返回的是 ``_parse_output`` 之后的产物，think 块已经被
+    ``strip_thinking_blocks`` 摘干净，所以调试时想看"模型为什么这么选"
+    只能在原始文本里捞。开着 ``enable_thinking`` 后每个动作前面都会带
+    一段，正是"意图 vs 落点"对不上的地方。
+
+    截断到 ``limit``：推理链动辄几百上千字，全量塞进步日志会把页面
+    撑爆，而排障只需要开头那几句。
+    """
+    if not raw:
+        return ""
+    import re
+    m = re.search(r"<think>(.*?)(?:</think>|$)", raw, flags=re.DOTALL)
+    if not m:
+        return ""
+    text = " ".join(m.group(1).split())
+    if len(text) > limit:
+        text = text[:limit] + " …（已截断）"
+    return text
 
 
 def _format_history(steps: list[dict[str, Any]]) -> str:
@@ -377,7 +456,8 @@ def _format_history(steps: list[dict[str, Any]]) -> str:
 # --------------------------------------------------------------------------- #
 # Step bookkeeping
 # --------------------------------------------------------------------------- #
-def _new_step(idx: int, action: dict[str, Any]) -> dict[str, Any]:
+def _new_step(idx: int, action: dict[str, Any],
+              thinking: str = "") -> dict[str, Any]:
     # x/y/x2/y2 必须落进步日志。之前只记 action/thought/text，而 thought
     # 经常是空的（模型吐最小对象 `{"action":"click","x":0,"y":0}`），
     # 于是页面上只剩一句"坐标落在左上角"—— **看不到模型到底选了哪**，
@@ -394,6 +474,10 @@ def _new_step(idx: int, action: dict[str, Any]) -> dict[str, Any]:
         "ts": time.time(),
         "action": str(action.get("action", "")),
         "thought": str(action.get("thought", "") or ""),
+        # think 链:模型开启 enable_thinking 后吐的推理过程。仅调试用 ——
+        # 它解释"为什么选这个落点",而 thought 是模型自己写的结论。
+        # 两者一起才能回答"意图和点击是否匹配"。
+        "thinking": thinking or "",
         "text": str(action.get("text", "") or ""),
         "x": _num("x"),
         "y": _num("y"),
@@ -436,6 +520,10 @@ class ComputerControlAgent:
         # getting the pairing wrong silently shifts every click.
         self._meta: Any = None
         self._frame_size: tuple[int, int] = (HOST_SCREEN_W, HOST_SCREEN_H)
+        # 上一轮推理的原始文本 / think 链,由 _ask_model 写、_loop 读。
+        # 只用于调试展示,不参与任何决策。
+        self._last_raw: str = ""
+        self._last_thinking: str = ""
 
     # -- public API ---------------------------------------------------- #
     @property
@@ -580,10 +668,19 @@ class ComputerControlAgent:
 
             name = str(action.get("action", "") or "").strip()
             thought = str(action.get("thought", "") or "")
-            LOG.info("agent step %d: action=%s thought=%r", i, name, thought)
+            thinking = self._last_thinking
+            LOG.info("agent step %d: action=%s thought=%r thinking=%r",
+                     i, name, thought, thinking[:200])
+            # thought 空着不算错(模型有权只给动作),但**调试期**必须看得见:
+            # 上一轮 9 个成功步骤的 thought 全空,导致"意图和点击是否匹配"
+            # 这个问题根本无法回答 —— 看不到意图就只能猜。
+            if not thought and not thinking:
+                LOG.warning("agent step %d: 模型既没写 thought 也没吐 think 链,"
+                            "只给了一个动作", i)
 
             if name == "done":
-                step = _new_step(i, {"action": "done", "thought": thought})
+                step = _new_step(i, {"action": "done", "thought": thought},
+                                 thinking)
                 step.update(status="ok", summary="", detail="任务完成")
                 self._append_step(step)
                 return self._finish("done", task_done=thought or None)
@@ -592,7 +689,8 @@ class ComputerControlAgent:
                 # 模型如实说"画面里没有我要找的东西"。这不是错误，是
                 # 它终于有了"做不到"这个选项 —— 在这之前它只能挑个
                 # click + (0,0) 把"找不到"伪装成"点了但没反应"。
-                step = _new_step(i, {"action": "not_found", "thought": thought})
+                step = _new_step(i, {"action": "not_found", "thought": thought},
+                                 thinking)
                 reason = (
                     f"模型在这张截图里找不到完成「{self._task}」需要的东西。"
                     + (f"它说：{thought}" if thought else "")
@@ -603,7 +701,7 @@ class ComputerControlAgent:
                 self._append_step(step)
                 return self._fail(reason)
 
-            step = _new_step(i, action)
+            step = _new_step(i, action, thinking)
             self._append_step(step)          # append now so the UI shows
                                             # the step while it executes
             sig = self._action_signature(action)
@@ -672,16 +770,35 @@ class ComputerControlAgent:
             # ``image_size`` 必须和脚本侧 letterbox 的边长严格一致，
             # 否则 backend 会自作主张选另一个 vision 变体，0-1000 坐标
             # 空间就和 meta 对不上（见 detector_base 里的同一段注释）。
+            #
+            # ``enable_thinking=True`` 打开模型的推理模式：它会先吐一段
+            # ``<think>…</think>`` 再给 JSON。调试期间这是最有价值的一段
+            # 信息 —— 上一轮 9 个成功步骤的 ``thought`` **全是空的**，
+            # 动作序列又明显偏离任务（跳过了"开始菜单 → notepad → 回车"
+            # 整段），没有推理链就只能靠猜它在干什么。
+            #
+            # ``on_delta`` 用来把**原始文本**收回来：``respond`` 在
+            # ``_parse_output`` 里会把 think 块 strip 掉
+            # （``strip_thinking_blocks``），返回的 AgentAction 里
+            # 根本没有它。delta 累加后与最终文本一致（见 respond 的
+            # on_delta 契约第 2 条），所以这是唯一能在主进程侧拿到
+            # think 原文的办法。回调跑在 cshim 守护线程上，只做 list
+            # append，不阻塞。
+            stream: list[str] = []
             result = asyncio.run(session.respond(
                 prompt=prompt,
                 attachment=[Attachment(canvas)],
                 generating=AgentAction,
                 image_size=target,
+                enable_thinking=True,
+                on_delta=stream.append,
             ))
         except Exception as e:  # noqa: BLE001
             LOG.warning("agent step %d: respond failed: %s", step_idx, e)
             return None, f"第 {step_idx} 步模型推理失败：{e}"
 
+        self._last_raw = "".join(stream)
+        self._last_thinking = _extract_thinking(self._last_raw)
         raw = result if isinstance(result, str) else type(result).__name__
         payload = self._coerce_action(result, why)
         if payload is None:
@@ -798,6 +915,45 @@ class ComputerControlAgent:
 
     # -- coordinate mapping -------------------------------------------- #
     @staticmethod
+    def _note_out_of_range(action: dict[str, Any], step: dict[str, Any],
+                           meta: Any) -> None:
+        """Flag model coordinates that fall outside the desktop band.
+
+        灰色留边那一条(0-1000 里上下各占 22%)不是屏幕，点下去必然没
+        东西。实测模型给过 y=950 —— 换算后被 clamp 到屏幕最底边，看着
+        像"点了任务栏下方"，实际上它瞄的是画布底部、也就是灰边。
+        不记这一笔，"点不准"就永远归因不到"模型瞄错了区域"。
+        """
+        if meta is None:
+            return
+        try:
+            size = float(meta.size or 1)
+            top = meta.pad_top / size * 1000.0
+            bottom = (meta.pad_top + meta.content_h) / size * 1000.0
+            left = meta.pad_left / size * 1000.0
+            right = ((meta.pad_left + meta.content_w) / size) * 1000.0
+        except Exception:  # noqa: BLE001
+            return
+        def _num(v):
+            return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        x, y = _num(action.get("x")), _num(action.get("y"))
+        bad = []
+        if y is not None:
+            if y < top:
+                bad.append(f"y={y:.0f} 在灰色留边里（桌面从 {top:.0f} 开始）")
+            elif y > bottom:
+                bad.append(f"y={y:.0f} 在灰色留边里（桌面到 {bottom:.0f} 结束）")
+        if x is not None:
+            if x < left:
+                bad.append(f"x={x:.0f} 在左侧留边里（桌面从 {left:.0f} 开始）")
+            elif x > right:
+                bad.append(f"x={x:.0f} 在右侧留边里（桌面到 {right:.0f} 结束）")
+        if bad:
+            note = "⚠ 模型给的坐标越界：" + "；".join(bad) + "。已 clamp 到桌面内。"
+            step["warn"] = note
+            LOG.warning("agent: step %s %s", step.get("idx"), note)
+
+    @staticmethod
     def _tap(dig, hx: int, hy: int) -> None:
         """One tap, byte-identical to the hand-verified web path.
 
@@ -884,6 +1040,12 @@ class ComputerControlAgent:
         from app.apps.usb_hid.service import get_digitizer, get_keyboard
 
         if name in ("click", "double_click", "right_click"):
+            # 越界坐标**照样执行**(clamp 到桌面内),但先记账。静默 clamp
+            # 是"点不准"最难查的一种：模型给了 y=950,而桌面区只有
+            # 219~781，clamp 之后看起来仍是一个正常落点，日志里完全
+            # 看不出模型其实瞄到了灰边上。记下来才能把"模型给的"和
+            # "实际落的"对上。
+            self._note_out_of_range(action, step, self._meta)
             hx, hy = self._point(action, "x", "y")
             if self._is_degenerate_origin(hx, hy):
                 # 证据写进提示：模型给的原始 0-1000 坐标 + 它自己的

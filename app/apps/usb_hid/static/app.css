@@ -112,6 +112,46 @@
   overflow-wrap: anywhere;
 }
 
+/* 越界告警：模型把坐标给到了灰边/黑边上,clamp 之前的事实。 */
+.usb-hid-task-warn {
+  flex: 1 0 100%;
+  margin-top: 4px;
+  padding: 4px 8px;
+  border-left: 2px solid #f59e0b;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* think 链:整行折叠,默认收起。靠 summary 显示"有没有推理"，
+ * 想看才展开 —— 推理链动辄几百字，默认展开会把步日志撑成一堵墙。 */
+.usb-hid-task-thinking {
+  flex: 1 0 100%;
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid #e5e7eb;
+}
+.usb-hid-task-thinking > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #9ca3af;
+  list-style: revert;
+}
+.usb-hid-task-thinking > summary:hover {
+  color: var(--muted);
+}
+.usb-hid-task-thinking-body {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #6b7280;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Wizard source step — 固定源样式。wizard 框架把 input 渲染成可写
  * 文本框，但 hdmiin 是硬件固定源，不可改。app.js 在 source step
  * 渲染时给 input 加 .is-fixed-source + readonly=true，并隐藏浏览

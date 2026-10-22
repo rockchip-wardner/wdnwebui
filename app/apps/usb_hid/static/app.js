@@ -707,6 +707,32 @@
           ? (s.detail || "执行失败")
           : (s.thought || "");
         li.append(idx, act, target, thought);
+
+        // 越界告警(模型把坐标给到了灰边/黑边上)。单独一行加红边，
+        // 因为它是"点不准"最直接的线索，但不该挤占 thought 那行的位置。
+        if (s.warn) {
+          const warn = document.createElement("div");
+          warn.className = "usb-hid-task-warn";
+          warn.textContent = s.warn;
+          li.appendChild(warn);
+        }
+
+        // think 链(模型开 enable_thinking 后的推理过程)。默认折叠：
+        // 它是排障依据，但一屏塞满推理链会淹没真正要看的那一行动作。
+        // 折叠后标题行仍然显示"有推理"，一眼能看出哪几步模型犹豫过。
+        if (s.thinking) {
+          const det = document.createElement("details");
+          det.className = "usb-hid-task-thinking";
+          const sum = document.createElement("summary");
+          sum.textContent = "模型推理过程";
+          const body = document.createElement("span");
+          body.className = "usb-hid-task-thinking-body";
+          // 同样是 textContent：think 链也是模型生成的字符串。
+          body.textContent = s.thinking;
+          det.append(sum, body);
+          li.appendChild(det);
+        }
+
         frag.appendChild(li);
       }
       this.taskLog.replaceChildren(frag);
