@@ -8,7 +8,7 @@
 worker rc=-6）。
 
 根因：第 1 步「停非必需」按 **capability（模型级）** 判要不要停。
-qwen3-vl-4b 的 capability 是 swcap_video_describe，在 vd 卡的
+qwen3-vl-4b 的 capability 是 swcap_vision_chat，在 vd 卡的
 swcap_to_model 里 → 判成「需要」→ 两张卡上的都不停 → npu1 腾不出来。
 
 正确粒度是 **(模型, 卡位) 对**：vd 卡要的是
@@ -36,10 +36,10 @@ APP = "video-detection"
 # 两张卡都跑 qwen3-vl-4b —— 复现用户场景
 INSTANCES = [
     {"model_id": "qwen3-vl-4b", "npu_index": 0, "status": "running",
-     "_source": "spawned", "capability_types": ["swcap_video_describe"],
+     "_source": "spawned", "capability_types": ["swcap_vision_chat"],
      "transition": "", "pid": 111},
     {"model_id": "qwen3-vl-4b", "npu_index": 1, "status": "running",
-     "_source": "spawned", "capability_types": ["swcap_video_describe"],
+     "_source": "spawned", "capability_types": ["swcap_vision_chat"],
      "transition": "", "pid": 222},
 ]
 
@@ -90,7 +90,7 @@ def main() -> int:
         # **必须在 goto 之前装好 mock** —— 框架在页面加载时就会自动进入
         # 「上次打开的卡片」，向导 mount 里的 _probeEnv 会立刻拉
         # /api/compute。route 装晚了,那次请求就打到真后端了(板子上
-        # 真的在跑 omni → swcap_audio_understand ✓ → 「一键开启」按钮
+        # 真的在跑 omni → swcap_audio_chat ✓ → 「一键开启」按钮
         # 根本不渲染)。
         page.route("**/api/compute/instances", on_instances)
         page.route("**/api/compute", on_compute)

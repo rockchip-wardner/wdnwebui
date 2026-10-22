@@ -296,23 +296,94 @@
     return box;
   }
 
+  // ------------------------------------------------------------------ //
+  // 就绪判据：capability 级 + **(模型, 卡位) 对**级                          //
+  // ------------------------------------------------------------------ //
+  //
+  // 为什么必须到卡位级：同一个模型跑两张卡是**合法形态** —— vtd 卡要
+  // qwen3-vl-4b 同时占 npu0 和 npu1。只看「模型 running 没」会把「只起了
+  // npu0 那份」判成就绪 → env 步显示 ✓、无「一键开启」按钮 → 用户走到
+  // 完成配置页才死等第二张卡。卡位级口径与 finish 步的等待一致。
+  // 详见 AGENTS.md「env 步的「就绪」判据也必须是 (模型, 卡位) 对级」。
+  function _modelSlots(cfg, instances) {
+    // instances 必须是本机实例（_localInstances 过滤后）
+    const local = instances || [];
+    const slots = [];
+    for (const [cap, m] of Object.entries((cfg && cfg.swcap_to_model) || {})) {
+      if (!m || !m.model_id) continue;
+      const npus = (m.npu_index == null) ? null
+        : (Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index]);
+      if (!npus) {
+        const any = local.find((i) => i.model_id === m.model_id);
+        const ok = local.some((i) => i.model_id === m.model_id
+          && i.status === "running");
+        slots.push({
+          cap, model_id: m.model_id, npu_index: null, ok,
+          state: ok ? "running" : (any ? any.status : "missing"),
+        });
+        continue;
+      }
+      for (const n of npus) {
+        const inst = local.find((i) => i.model_id === m.model_id && i.npu_index === n);
+        const ok = !!(inst && inst.status === "running");
+        slots.push({
+          cap, model_id: m.model_id, npu_index: n, ok,
+          state: ok ? "running" : (inst ? inst.status : "missing"),
+        });
+      }
+    }
+    return slots;
+  }
+
+  // env 步的判定结果 —— 渲染与后台刷新共用同一份口径。
+  //
+  // `cfg` 是**裁剪后**的那份（单卡模式下 npu_index 已换成唯一卡号）：
+  // 按原始 cfg 算会算出单卡板上不存在的卡位。
+  function _envView(state, cfg) {
+    const single = state.single || null;
+    const singleOn = !!(single && single.active);
+    const env = state.envCheck || {};
+    const swRequired = singleOn
+      ? (single.requiredCaps || [])
+      : (env.swRequired || []);
+    const allMissing = env.swMissing || [];
+    const swMissing = singleOn
+      ? swRequired.filter((c) => allMissing.includes(c))
+      : allMissing;
+    const slots = _modelSlots(cfg || state.cfg, env.instances || []);
+    return {
+      swRequired,
+      swMissing,
+      slots,
+      // 就绪 = capability 齐 **且** 每个要求的卡位都跑上了。
+      swOK: swMissing.length === 0 && slots.every((s) => s.ok),
+      blocked: !!(singleOn && single.blocked),
+    };
+  }
+
+  // env 结论的指纹 —— 后台刷新只在结论**变了**时才重绘（否则会把
+  // 「一键开启」刚写的状态文案擦掉，用户看着像按钮没反应）。
+  function _envSig(view) {
+    return view.swMissing.join(",") + "|" + view.slots
+      .map((s) => `${s.model_id}@${s.npu_index}:${s.ok ? 1 : 0}`).join(",");
+  }
+
   function _renderEnvStep(body, foot, cfg, stepDef, state) {
     body.innerHTML = "";
     const hwOK = (state.envCheck.hwMissing || []).length === 0;
+    // 判定结果 —— 渲染与后台刷新共用 _envView 的同一份口径。
+    const view = _envView(state, cfg);
     // 单卡策略：双卡（或探测失败）时 single 为 null,下面所有 single
     // 分支都不走 —— 行为与之前逐字一致。
     const single = state.single || null;
     const singleOn = !!(single && single.active);
-    const blocked = !!(singleOn && single.blocked);
+    const blocked = view.blocked;
     // 单卡下 capability 集合可能被裁剪：vd 二选一只留选中的那条；多
     // capability 又没声明二选一时,两条都列出来,说明为什么不可用。
-    const swRequired = singleOn
-      ? (single.requiredCaps || [])
-      : (state.envCheck.swRequired || []);
-    const swMissing = singleOn
-      ? swRequired.filter((c) => (state.envCheck.swMissing || []).includes(c))
-      : (state.envCheck.swMissing || []);
-    const swOK = swMissing.length === 0;
+    const swRequired = view.swRequired;
+    const swMissing = view.swMissing;
+    const slots = view.slots;
+    const swOK = view.swOK;
 
     const card = _ce("div", WIZARD_NS + "env-card");
     card.appendChild(_ce("h3", null, "硬件能力"));
@@ -394,7 +465,10 @@
     swRequired.forEach((cap) => {
       // 被阻断时两条都显示为未满足（说明为什么不可用），而不是把已跑起
       // 的那条显示成 ✓ —— 那会让人以为还差一点就能用。
-      const ok = blocked ? false : !swMissing.includes(cap);
+      let ok = blocked ? false : !swMissing.includes(cap);
+      // 卡位没齐也算未满足：vtd 只起了 npu0 那份时 capability 仍是
+      // running（显示 ✓），但应用其实不能用 —— 光看 ✓ 会骗人。
+      if (ok && slots.some((s) => s.cap === cap && !s.ok)) ok = false;
       const row = _ce("div", WIZARD_NS + "env-row");
       row.classList.add(ok ? WIZARD_NS + "env-ok" : WIZARD_NS + "env-fail");
       row.textContent = (ok ? "✓ " : "✗ ") + cap;
@@ -410,6 +484,18 @@
         card2.appendChild(row);
       });
     }
+    // 卡位级明细：差哪张卡必须看得见。上面 capability 行只说「模型在不
+    // 在」，这里说「跑在要求的卡上没有」—— vtd 要 qwen3-vl-4b 同时占
+    // npu0/npu1，只起了 npu0 时这里会明确列出缺 npu#1。
+    slots.forEach((s) => {
+      const row = _ce("div", WIZARD_NS + "env-row");
+      row.classList.add(s.ok ? WIZARD_NS + "env-ok" : WIZARD_NS + "env-fail");
+      const where = (s.npu_index == null) ? "任意卡" : `RK182x #${s.npu_index}`;
+      const mark = s.ok ? "✓" : (s.state === "loading" ? "⏳" : "✗");
+      const tail = s.ok ? "" : (s.state === "loading" ? "（启动中）" : "（未运行）");
+      row.textContent = `${mark} ${s.model_id} @ ${where}${tail}`;
+      card2.appendChild(row);
+    });
     if (!swRequired.length) {
       card2.appendChild(_envNoReqRow("本应用不依赖模型 / 软件能力"));
     }
@@ -461,7 +547,79 @@
     // footer
     // blocked（单卡 + 刚需多模型）→ 「下一步」禁用，用户只能「跳过向导」
     // 离开（后续版本该应用会改造成单 capability，届时阻断自然消失）。
+    // swOK 是**卡位级**判据 —— 差一张卡就出不了「下一步」，用户只能先点
+    // 「一键开启所需模型」，不会一路走到完成配置页再死等第二张卡。
     _renderFootNext(foot, cfg, state, hwOK && swOK && !blocked);
+
+    // 后台刷新一次：快照是 mount 时拉的，用户可能在「算力配置」页手动把
+    // 缺的模型启上再回来 —— 旧快照会让「下一步」一直灰着，像向导卡死。
+    _refreshEnv(state, _envSig(view));
+  }
+
+  // env 步的后台刷新：重新拉一次 /api/compute，比对结论指纹。
+  // 结论变了 → 重绘当前步（按钮 / 明细行 / 「下一步」跟着变）；
+  // 结论没变 → 什么都不动（保住「一键开启」刚写的状态文案）。
+  async function _refreshEnv(state, sig) {
+    let instances, judged;
+    try {
+      const r = await fetch("/api/compute", { cache: "no-store" });
+      if (!r.ok) return;
+      const data = await r.json();
+      instances = _localInstances(data);
+      // 用**探针那份** cfg 复判(srcCfg),别用裁剪后的 —— 两处口径必须一致
+      judged = _capJudgement(state.app, state.envCheck.srcCfg || state.cfg, instances);
+    } catch (_) { return; }
+    // 已经离开 env 步 → 不用再刷（重绘会把用户填好的表单步骤冲掉）。
+    const stepDef = (state.cfg.steps || [])[state.currentStep];
+    if (!stepDef || stepDef.kind !== "env_check") return;
+    state.envCheck.instances = instances;
+    state.envCheck.swMissing = judged.swMissing;
+    state.envCheck.groupsUnsatisfied = judged.groupsUnsatisfied;
+    if (_envSig(_envView(state, state.cfg)) === sig) return;  // 结论没变
+    _gotoStep(state.currentStep);
+  }
+
+  // 本机实例（peer adopt 的不算本机算力 —— 远端卡本机无权启停，借来的
+  // 算力会静默失效）。与 finish 步的等待同口径。
+  function _localInstances(data) {
+    return ((data && data.instances) || []).filter((i) => i._source !== "adopted");
+  }
+
+  // capability 缺失判定（逐能力 + 组感知）。
+  //
+  // 组感知:同一条 swcap_to_model 上写了同一个 "group" 的能力,必须由
+  // **同一个**实例同时满足 —— usb_hid 的视觉 + 工具调用就是这个形状。
+  // env 步与后台刷新共用这一份,免得两处判出不同结论。
+  function _capJudgement(app, cfg, instances) {
+    const runningCaps = new Set();
+    // 本机 running 实例各自的 capability_types —— 组判定要「某个实例是否
+    // 同时具备组内全部能力」,光有一个扁平的能力集合不够。
+    const localCapSets = [];
+    for (const inst of (instances || [])) {
+      if (inst.status !== "running") continue;
+      const caps = inst.capability_types || [];
+      for (const c of caps) runningCaps.add(c);
+      localCapSets.push(caps);
+    }
+    const swMissing = [];
+    for (const cap of (app && app.software_capabilities) || []) {
+      if (!runningCaps.has(cap)) swMissing.push(cap);
+    }
+    // 组感知：存在 group 声明时，逐组再验一次「单个实例同时满足整组」。
+    // 逐能力全绿但分属两个实例的情况在这里被判缺 —— 否则 UI 显示就绪,
+    // 用户进卡才发现功能不可用(usb_hid 视觉+工具调用正是这个形状)。
+    const groups = Array.from(_capGroups(cfg).values()).filter((g) => g.length > 1);
+    const groupsUnsatisfied = [];
+    for (const g of groups) {
+      const covered = localCapSets.some(
+        (caps) => g.every((c) => caps.indexOf(c) !== -1));
+      if (!covered) groupsUnsatisfied.push(g.join(" + "));
+    }
+    // 组内每项都有实例、但不是同一个实例 → 逐能力检查看不到，得额外报
+    const splitGroups = groupsUnsatisfied.filter(
+      (label) => label.split(" + ").every((c) => runningCaps.has(c)));
+    if (splitGroups.length) swMissing = swMissing.concat(splitGroups);
+    return { swMissing, groupsUnsatisfied };
   }
 
   async function _probeEnv(cfg, app) {
@@ -476,59 +634,33 @@
     // NPU,本机未"开启";误把它算进 running 会让用户在未启本地算力
     // 时看到 ✓,与同文件 _wizardBringUpModels 跳过 adopted 的语义不对称
     // —— 后者正确防误关 peer 模型,前者却让 UI 显示误导。
-    let swMissing = [];
-    let runningCaps = new Set();
-    // 本机 running 实例各自的 capability_types 列表 —— 组感知判定要用
-    // 「同一个实例是否同时具备组内全部能力」，光有一个扁平的能力集合不够。
-    const localCapSets = [];
     let cardCount = 0;
     let modelCards = [];
+    // 本机实例全量 —— 卡位级判据要用（只留 capability 名会把「跑在第几张
+    // 卡」这个信息整个丢掉，vtd 就因此判错）。
+    let instances = [];
     try {
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (r.ok) {
         const data = await r.json();
-        for (const inst of (data.instances || [])) {
-          if (inst.status === "running" && inst._source !== "adopted") {
-            const caps = inst.capability_types || [];
-            for (const c of caps) runningCaps.add(c);
-            localCapSets.push(caps);
-          }
-        }
+        instances = _localInstances(data);
         // 模型卡位数（能跑 rknn 模型的卡）。1 → 单卡板，2 → 双卡板。
         // 探测失败留 0 —— 0 不等于 1,单卡分支不会被误触发。
         cardCount = (typeof data.card_count === "number") ? data.card_count : 0;
         modelCards = Array.isArray(data.model_cards) ? data.model_cards : [];
       }
     } catch (_) { /* keep all missing */ }
-
-    // 逐能力缺失（细粒度提示：告诉用户到底缺哪一项）
-    for (const cap of (app.software_capabilities || [])) {
-      if (!runningCaps.has(cap)) swMissing.push(cap);
-    }
-
-    // 组感知：存在 group 声明时，逐组再验一次「单个实例同时满足整组」。
-    // 逐能力全绿但分属两个实例的情况在这里被判缺 —— 否则 UI 显示就绪，
-    // 用户进卡才发现功能不可用（usb_hid 视觉+工具调用正是这个形状）。
-    const groups = Array.from(_capGroups(cfg).values()).filter((g) => g.length > 1);
-    const groupsUnsatisfied = [];
-    for (const g of groups) {
-      const covered = localCapSets.some(
-        (caps) => g.every((c) => caps.indexOf(c) !== -1));
-      if (!covered) groupsUnsatisfied.push(g.join(" + "));
-    }
-    // 组内每项都有实例、但不是同一个实例 → 逐能力检查看不到，得额外报
-    const splitGroups = groupsUnsatisfied.filter(
-      (label) => label.split(" + ").every((c) => runningCaps.has(c)));
-    if (splitGroups.length) {
-      swMissing = swMissing.concat(splitGroups);
-    }
-
+    // capability 缺失判定 —— env 步与后台刷新共用同一份口径。
+    const judged = _capJudgement(app, cfg, instances);
     return {
       hwRequired,
       hwMissing: [], // 见上
       swRequired: app.software_capabilities || [],
-      swMissing,
-      groupsUnsatisfied,
+      swMissing: judged.swMissing,
+      groupsUnsatisfied: judged.groupsUnsatisfied,
+      instances,
+      // 后台刷新要用**同一份** cfg 复判（单卡裁剪后的 cfg 组集合会变小）
+      srcCfg: cfg,
       cardCount,
       modelCards,
     };

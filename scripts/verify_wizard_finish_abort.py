@@ -122,12 +122,18 @@ def wipe_state(page):
 
 
 def step_index(page) -> int:
-    return page.evaluate("""() => {
-        const a = document.querySelectorAll('#wd-wizard-stepper .wd-wizard-step-dot');
+    # **必须限定在本卡的向导容器内** —— `#wd-wizard-stepper` 是全局 id,
+    # 页面里若同时存在两个向导容器(框架自动进的那张卡 + 本卡),用
+    # document 级选择器会读到**另一个**向导的 stepper,步骤号恒为 0
+    # (症状:「没走到第 2 步」偶发失败,重跑又过)。
+    return page.evaluate("""(id) => {
+        const root = document.getElementById('wd-wizard-root-' + id);
+        if (!root) return -1;
+        const a = root.querySelectorAll('.wd-wizard-step-dot');
         for (let i = 0; i < a.length; i++)
             if (a[i].classList.contains('wd-wizard-step-active')) return i;
         return -1;
-    }""")
+    }""", APP)
 
 
 def step_title(page) -> str:
@@ -307,10 +313,16 @@ def scen_e_navaway(page, ctl):
     enter_card(page)
     if step_index(page) != 0:
         raise AssertionError(f"首次进入应落在第 1 步，实际 {step_index(page)}")
-    click_next(page)                        # → 第 2 步
+    ok = click_next(page)                   # → 第 2 步
     page.wait_for_timeout(300)
     if step_index(page) != 1:
-        raise AssertionError(f"没走到第 2 步，实际 {step_index(page)}")
+        btns = page.eval_on_selector_all(
+            f"#wd-wizard-root-{APP} button",
+            "els => els.map(e => e.id + ':' + e.textContent.trim()"
+            " + (e.disabled ? '(disabled)' : ''))")
+        raise AssertionError(
+            f"没走到第 2 步，实际 {step_index(page)}"
+            f"（click_next={ok}）buttons={btns}")
     page.evaluate("() => { window.location.hash = '#compute-config'; }")
     page.wait_for_timeout(1200)
     page.evaluate("(id) => { window.location.hash = '#' + id; }", APP)
@@ -378,13 +390,17 @@ def main() -> int:
             page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
             ctl = Ctl()
             try:
+                # mock 必须在 goto **之前**装好 —— 框架在页面加载时就会
+                # 自动进入「上次打开的卡片」，向导 mount 里的 _probeEnv
+                # 会立刻拉 /api/compute。route 装晚了那次请求就打到真
+                # 后端了(板子上真在跑的模型会污染 swMissing / swOK)。
+                install_routes(page, ctl)
                 page.goto(BASE, wait_until="domcontentloaded", timeout=20000)
                 page.wait_for_function(
                     "() => window.__APP_MANIFESTS__ && window.ROUTER"
                     " && window.WizardRegistry && window.WizardState",
                     timeout=15000)
                 wipe_state(page)
-                install_routes(page, ctl)
                 msg = fn(page, ctl)
                 print(f"  ✅ {msg}")
                 ok += 1

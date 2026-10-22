@@ -1865,6 +1865,43 @@ swcap_audio_understand → qwen2.5-omni-3b   @ npu1
 回归:`scripts/verify_wizard_multicard_bringup.py`(5 断言,mock 驱动,
 断言「停的是多余那张卡、不是需要的那张、DELETE 带卡号」)。
 
+#### env 步的「就绪」判据也必须是 **(模型, 卡位) 对**级(v0.28 修)
+
+用户实测 BUG(视频目标监控 / vtd 卡):`qwen3-vl-4b` 跑在 RK182x#0、
+`qwen2.5-omni-3b` 跑在 RK182x#1,点「视频目标监控」进向导模式:
+
+* 第 1 步「运行环境检查」显示「✓ swcap_video_describe 已就绪」
+  → **不显示「一键开启所需模型」按钮**
+* 一路走到最后一步「完成配置」→ 点完成 → **永久等待**「[VLM]视觉描述v3
+  启动在 RK182x#1」(npu1 上跑的是 omni,不是它)
+
+根因:env 步只按 **capability(模型级)** 判就绪。vtd 的 `swcap_to_model` 是
+`{swcap_video_describe: {model_id: qwen3-vl-4b, npu_index: [0, 1]}}` ——
+同一个模型要**两张卡都跑**。qwen3-vl-4b 在 npu0 上 running → capability
+命中 → 判成就绪 → **卡位缺口被整个忽略**。
+
+> 与 finish 步的等待口径**必须一致**:`_waitForModelsRunning` 早就按
+> `(model_id, npu_index)` 对逐个等(否则用户要两张卡却只等到一张,推理
+> 退化成单卡还不报错)。env 步判「就绪」却按模型级 → 两处口径不一致 →
+> 用户被放行到 finish 步死等。
+
+**改法**(`app/static/core/wizard/state.js`):
+
+| 位置 | 作用 |
+|---|---|
+| `_modelSlots(cfg, instances)` | 纯函数:把 `swcap_to_model` 展开成 (模型, 卡位) 对,逐个标 `ok`(`npu_index` 为 null 的模型 → 任意卡即可,与 finish 步一致) |
+| `_envView(state, cfg)` | 判定结果:`swOK = capability 齐 **且** 每个卡位都就绪`;渲染与后台刷新共用同一份口径 |
+| `_localInstances` / `_missingCaps` | 本机实例过滤 + capability 缺失判定(peer adopt 不算本机算力,与 finish 步同口径) |
+| `_renderEnvStep` | 多渲染**卡位明细行**(`✓ qwen3-vl-4b @ RK182x #0` / `✗ … #1(未运行)`);capability 行在卡位没齐时也显示 ✗;`swOK` 假 → 出「一键开启所需模型」按钮 + 「下一步」禁用 |
+| `_refreshEnv` | env 步后台刷新一次:结论**变了**才重绘(否则会擦掉「一键开启」刚写的状态文案) |
+
+> **卡位级判据必须用「裁剪后」的 cfg** —— 单卡模式下 `_planSingleCard` 把
+> `npu_index` 换成唯一卡号;按原始 cfg 算会算出**不存在的卡位**。所以
+> slots 在**渲染时**算(`_envView` 收 `cfg` 参数),不在 `mount` 里算。
+
+回归:`scripts/verify_wizard_slot_readiness.py`(13 断言,mock 驱动,覆盖
+「半就绪 → 出按钮 + 缺卡明细 + 下一步禁用」「全就绪 → 无按钮」两态)。
+
 ### 向导 finish 步的等待必须遇终态立即中止（v0.28 修）
 
 用户实测死锁（视频目标定位 / vtl）：向导 env 步点「一键开启模型」→
@@ -2372,11 +2409,12 @@ cols==rows（1/4/9/16/25 路）才正好 16:9。6 路是 3×2，**必然有留�
 | 测试 | 文件 | 检查点 |
 |---|---|---|
 | Layer 1+2 | `scripts/verify_wizard_bringup_skip_adopted.py` | 2/2 |
-| Layer 1 UI | `scripts/verify_probe_env_local_only.py` | 5/5 |
+| Layer 1 UI | `scripts/verify_probe_env_local_only.py` | 6/6 |
 | Layer 3 | `scripts/verify_find_by_model_priority.py` | 10/10 |
 | 全量 wizard | `scripts/smoke_wizard_all.py` | 6/6 |
 | 启停过渡态 | `scripts/verify_compute_transition_guard.py` | 23/23 |
 | 一键开启腾卡 | `scripts/verify_wizard_multicard_bringup.py` | 5/5 |
+| env 就绪卡位级 | `scripts/verify_wizard_slot_readiness.py` | 13/13 |
 
 > **mock `/api/compute` 必须在 `page.goto()` 之前装好**。框架在页面加载
 > 时就会进卡片并 mount，向导的 `_probeEnv` 立刻拉 `/api/compute` —— route

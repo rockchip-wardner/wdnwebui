@@ -273,22 +273,63 @@ function makeContainer() {
 }
 
 /**
+ * 造「本机正在跑该卡所需模型」的实例列表。
+ *
+ * env 步的就绪判据是 **(模型, 卡位) 对**级（vtd 要 qwen3-vl-4b 同时占
+ * npu0 + npu1）—— 快照里没有对应实例时 env 步会正确地判成「未就绪」
+ * （下一步禁用 + 出现「一键开启所需模型」按钮）。所以「下一步不被
+ * 禁用」这条断言的前提是**模型确实在跑**。
+ */
+function runningInstancesFor(cfg) {
+  const out = [];
+  for (const [cap, m] of Object.entries(cfg.swcap_to_model || {})) {
+    if (!m || !m.model_id) continue;
+    const npus = (m.npu_index == null) ? []
+      : (Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index]);
+    for (const n of npus) {
+      if (n == null) continue;
+      out.push({
+        model_id: m.model_id, npu_index: n, status: "running",
+        _source: "spawned", capability_types: [cap], transition: "",
+      });
+    }
+  }
+  return out;
+}
+
+/**
  * 跑一遍「挂载 → 渲染环境检查页」。
  * @param appId  应用 id（读它的 wizard.json + manifest.json）
  * @param cardCount  后端报告的模型卡位数
  * @param modelCards 后端报告的模型卡位
  */
 async function mountEnv(appId, cardCount, modelCards) {
+  const cfg = loadWizard(appId);
+  const manifest = loadManifest(appId);
+  // app stub 要带 manifest 的能力声明 —— _probeEnv 的 capability 级判据
+  // 读的就是它。早年的 stub 没带，capability 判据在测试里是**空转**的，
+  // 掩盖了「模型没在本机跑 → env 步判未就绪」这条真实语义。
+  const app = {
+    id: appId, title: manifest.title || appId,
+    software_capabilities: manifest.software_capabilities || [],
+    hardware_capabilities: manifest.hardware_capabilities || [],
+  };
   computeFixture = {
     card_count: cardCount,
     model_cards: modelCards,
     instances: [],
   };
-  const cfg = loadWizard(appId);
-  const manifest = loadManifest(appId);
-  const app = { id: appId, title: manifest.title || appId };
-  const envCheck = await priv._probeEnv(cfg, app);
+  let envCheck = await priv._probeEnv(cfg, app);
   const single = priv._planSingleCard(cfg, app, envCheck);
+  // 实例按**裁剪后**的 cfg 造 —— 单卡下卡号已被换成唯一卡位，
+  // 按原始 cfg 造会落在一张不存在的卡上，卡位级判据会判成未就绪。
+  const effCfg = (single && single.effCfg) ? single.effCfg : cfg;
+  computeFixture = {
+    card_count: cardCount,
+    model_cards: modelCards,
+    instances: runningInstancesFor(effCfg),
+  };
+  envCheck = await priv._probeEnv(cfg, app);
   const { container, body, foot } = makeContainer();
   const state = {
     app, cfg: single && single.effCfg ? single.effCfg : cfg,

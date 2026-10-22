@@ -20,16 +20,22 @@ swcap_vision_grounding(LocateAnything-3b spawned not_loaded),但 LAN 上另一�
 测试策略
 ----
 对 video-target-localization(manifest.software_capabilities =
-["swcap_vision_grounding"],swcap_to_model 唯一条目)做 5 个场景,mock /api/compute
+["swcap_vision_grounding"],swcap_to_model 唯一条目)做 6 个场景,mock /api/compute
 返回不同组合,断言 env-row DOM 的 class 与 text。
+
+**就绪判据是 (模型, 卡位) 对级** —— vtl 的 swcap_to_model 声明
+``npu_index: [0, 1]``:同一个模型要**两张卡都跑**才算就绪。所以「本机
+启了」必须落在**要求的卡位**上,只起一张卡仍然是未就绪(用户实测 BUG:
+vtd 只起 npu0 那份 → env 步显示 ✓ → 一路走到完成配置页死等第二张卡)。
 
 | 场景 | 本机 spawned | peer adopted | 期望 |
 |---|---|---|---|
 | A  | not_loaded    | running      | ✗ swcap_vision_grounding (bug 场景) |
-| B  | running       | -            | ✓ swcap_vision_grounding |
+| B  | running@0,1   | -            | ✓ swcap_vision_grounding |
 | C  | not_loaded    | not_loaded   | ✗ swcap_vision_grounding |
-| D  | running       | running      | ✓ swcap_vision_grounding |
-| E  | running(多源) | -            | ✓ swcap_vision_grounding (smoke 主路径) |
+| D  | running@0,1   | running      | ✓ swcap_vision_grounding |
+| E  | running@0,1(多源) | -        | ✓ swcap_vision_grounding (smoke 主路径) |
+| F  | running@0 only | -           | ✗ swcap_vision_grounding (卡位缺一张) |
 """
 import json
 import sys
@@ -56,13 +62,14 @@ def make_route_handler(mock_body: str):
     return handler
 
 
-def instance(model_id, status, source, peer_name=""):
+def instance(model_id, status, source, peer_name="", npu_index=None):
     base = {
         "model_id": model_id,
         "status": status,
         "_source": source,
         "capability_types": [SWCAP],
-        "npu_index": 0 if status == "running" else -1,
+        "npu_index": (0 if status == "running" else -1) if npu_index is None
+        else npu_index,
     }
     if source == "adopted":
         base["_peer_name"] = peer_name
@@ -70,26 +77,35 @@ def instance(model_id, status, source, peer_name=""):
     return base
 
 
+def _both_cards(status, source, peer_name=""):
+    """vtl 要 LocateAnything-3b 同时占 npu0 和 npu1 —— 两张卡各一个实例。"""
+    return [instance("LocateAnything-3b", status, source, peer_name, npu_index=n)
+            for n in (0, 1)]
+
+
 SCENARIOS = [
     # (name, mock instances, expects 摸 ok-class present?)
     ("A. peer adopted running only (BUG 场景 — 本机未启)",
      [instance("LocateAnything-3b", "running", "adopted", peer_name="PeerX")],
      False),
-    ("B. local spawned running",
-     [instance("LocateAnything-3b", "running", "spawned")],
+    ("B. local spawned running (两张卡都在)",
+     _both_cards("running", "spawned"),
      True),
     ("C. both not_loaded",
      [instance("LocateAnything-3b", "not_loaded", "spawned"),
       instance("LocateAnything-3b", "not_loaded", "adopted", peer_name="PeerX")],
      False),
     ("D. local spawned running + peer adopted running (本机已启,peer 也在跑)",
-     [instance("LocateAnything-3b", "running", "spawned"),
-      instance("LocateAnything-3b", "running", "adopted", peer_name="PeerX")],
+     _both_cards("running", "spawned")
+     + [instance("LocateAnything-3b", "running", "adopted", peer_name="PeerX")],
      True),
     ("E. 多个 spawned 本机实例 running(已包含 swcap_vision_grounding)",
-     [instance("LocateAnything-3b", "running", "spawned"),
-      instance("OtherModel-7b", "running", "spawned")],
+     _both_cards("running", "spawned")
+     + [instance("OtherModel-7b", "running", "spawned", npu_index=0)],
      True),
+    ("F. 本机只起了 npu0 一张卡 (卡位级判据 — 仍算未就绪)",
+     [instance("LocateAnything-3b", "running", "spawned", npu_index=0)],
+     False),
 ]
 
 
