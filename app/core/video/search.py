@@ -608,7 +608,7 @@ class VideoSearchService:
             start = 0.0
             lock = get_session_call_lock()
         except Exception as e:  # pragma: no cover - defensive
-            LOG.exception("vcs extract worker error: %s", e)
+            LOG.exception("vr extract worker error: %s", e)
             self._set_state(_STATE_ERROR, str(e))
             return
 

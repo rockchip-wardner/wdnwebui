@@ -263,5 +263,5 @@
   // 全局暴露 —— 各卡片 IIFE 不挂 window,故 rename + 暴露两个常用名
   // 兼容旧 VdFsModal 引用。统一收口到 FSModal。
   window.FSModal = FSModal;
-  window.VdFsModal = FSModal;  // 兼容旧引用(vd / vcs / vfa app.js 里的 VdFsModal.open)
+  window.VdFsModal = FSModal;  // 兼容旧引用(vd / vr / vfa app.js 里的 VdFsModal.open)
 })();

@@ -48,7 +48,7 @@ def probe_video_meta(source: str) -> Optional[dict]:
 
             if (duration_s <= 0 or total_frames <= 0) and fps > 0:
                 LOG.info(
-                    "vcs: probe metadata 不全 (duration=%.1fs, frames=%d) — "
+                    "vr: probe metadata 不全 (duration=%.1fs, frames=%d) — "
                     "fall back to full decode for %s",
                     duration_s, total_frames, source,
                 )
@@ -126,7 +126,7 @@ def _read_chunk_frames(source: str, start_s: float, chunk_seconds: int,
     - 每帧缩放到 576×576（embedding 模型 vision 输入）。
     """
     import av
-    LOG.info("vcs: PyAV opening %s for chunk @%.2fs (chunk_seconds=%d)",
+    LOG.info("vr: PyAV opening %s for chunk @%.2fs (chunk_seconds=%d)",
              source, start_s, chunk_seconds)
     import time as _time
     t0 = _time.time()
@@ -180,7 +180,7 @@ def _read_chunk_frames(source: str, start_s: float, chunk_seconds: int,
                 bgr = cv2.resize(bgr, (_VISION_SIZE, _VISION_SIZE),
                                  interpolation=cv2.INTER_LINEAR)
             frames.append(bgr)
-        LOG.info("vcs: PyAV done in %.2fs — %d/%d frames decoded",
+        LOG.info("vr: PyAV done in %.2fs — %d/%d frames decoded",
                  _time.time() - t0, len(frames), len(frame_numbers))
         return frames
     finally:
