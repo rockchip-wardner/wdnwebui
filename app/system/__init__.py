@@ -21,6 +21,7 @@ def register_all(app: FastAPI) -> None:
     module exposes a ``router`` object that gets included here.
     """
     from app.system.api import (
+        apps,
         compute,
         config,
         coprocessor,
@@ -38,6 +39,9 @@ def register_all(app: FastAPI) -> None:
     app.include_router(power.router,          prefix="/api")
     app.include_router(coprocessor.router,    prefix="/api")
     app.include_router(versions.router,       prefix="/api")
+    # 应用包安装（首页应用网格末尾那个"添加应用"磁位拖 wheel 到这里）。
+    # ⚠️ 装包 = 在本机执行任意代码，本端点无鉴权、信任局域网。
+    app.include_router(apps.router,           prefix="/api")
     # 设备端文件浏览器(v0.4 后从 video_detection 抽出,所有需要"浏览设备文件"
     # 的卡片共用):前端走 /static/core/fs-modal.js 渲染模态 + /api/fs 取数据。
     app.include_router(fs_browser.router,     prefix="/api")

@@ -694,14 +694,187 @@
         ${desc}
       </a>`;
     }).join("");
-    grid.innerHTML = html;
-    grid.addEventListener("click", (ev) => {
-      const a = ev.target.closest(".app-card");
-      if (!a) return;
-      ev.preventDefault();
-      ROUTER.navigate(a.dataset.page);
-    });
+    grid.innerHTML = html + _addAppTileHtml();
+    // grid 自身的 click 委托**只绑一次**。原来这里是每次 render 都
+    // addEventListener，而 grid 元素跨重绘不变 —— 于是每重绘一次就多一个
+    // 监听器，点一次卡片触发 N 次 navigate。装完应用会重绘网格，把这个
+    // 累积速度直接翻倍，所以在这行之前必须先拆掉。
+    if (!_appsGridClickBound) {
+      _appsGridClickBound = true;
+      grid.addEventListener("click", (ev) => {
+        // 「添加应用」磁位不是导航项：它 class 是 .app-add-tile 不带
+        // .app-card，所以下面 closest(".app-card") 天然匹配不到。这里再显式
+        // 挡一道 —— 万一将来它被包进某个 .app-card 容器里，点了也不该跳路由。
+        if (ev.target.closest(".app-add-tile")) return;
+        const a = ev.target.closest(".app-card");
+        if (!a) return;
+        ev.preventDefault();
+        ROUTER.navigate(a.dataset.page);
+      });
+    }
+    // 磁位每次 innerHTML 都被重建，它的监听器必须跟着重绑（grid 委托绑一次
+    // 不会随 innerHTML 失效，那是 grid 上的监听；tile 上的是元素自身的）。
+    _bindAddAppTile(grid);
     _preloadCardScripts();
+  }
+
+  // grid 级 click 委托的"已绑定"标记（见 renderAppPanel 里的说明）。
+  let _appsGridClickBound = false;
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 「添加应用」磁位 —— 自己装新卡片
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // 网格末尾固定一个空位（不占路由、不进 sidebar、刷新后还在）。它只做一件
+  // 事：把 wdnapp 的 wheel 交给后端装。
+  //
+  // 为什么安装日志比成功提示更重要：后端在**装之前**就验过包里有没有
+  // `wdnwebui.cards` entry point 和 manifest.json，不是应用包会带着「缺什么」
+  // 回来。把原文显示出来，用户才能判断是自己的 pyproject 漏了声明，还是包
+  // 根本就是拖错了 —— 笼统一句"安装失败"谁也查不动。
+
+  const APP_INSTALL_URL = "/api/apps/install";
+
+  function _addAppTileHtml() {
+    return `
+      <div class="app-add-tile" role="button" tabindex="0"
+           aria-label="添加应用：拖入 wdnapp 包"
+           data-app-add-tile>
+        <div class="app-add-placeholder">
+          <svg class="app-add-icon" viewBox="0 0 24 24" aria-hidden="true"
+               fill="none" stroke="currentColor" stroke-width="1.5"
+               stroke-linecap="round">
+            <circle cx="12" cy="12" r="9"></circle>
+            <line x1="12" y1="8" x2="12" y2="16"></line>
+            <line x1="8" y1="12" x2="16" y2="12"></line>
+          </svg>
+          <p class="app-add-hint">拖动 wdnapp 包到此处安装</p>
+        </div>
+        <h2 class="app-card-title">添加应用</h2>
+        <p class="app-add-status" hidden></p>
+      </div>`;
+  }
+
+  function _setAddTileStatus(tile, text, kind) {
+    if (!tile) return;
+    const el = tile.querySelector(".app-add-status");
+    if (!el) return;
+    if (!text) { el.hidden = true; el.textContent = ""; el.className = "app-add-status"; return; }
+    el.hidden = false;
+    el.textContent = text;
+    el.className = "app-add-status" + (kind ? " is-" + kind : "");
+  }
+
+  function _uploadApp(whl) {
+    const grid = document.querySelector("#page-apps .apps-grid");
+    const tile = grid && grid.querySelector("[data-app-add-tile]");
+    if (!whl) return;
+    const name = whl.name || "";
+    if (!/\.whl$/i.test(name)) {
+      _setAddTileStatus(tile, "只接受 .whl 包，收到的是 " + name, "error");
+      return;
+    }
+    _setAddTileStatus(tile, "正在安装 " + name + " …", "busy");
+
+    const fd = new FormData();
+    fd.append("file", whl, name);
+    fetch(APP_INSTALL_URL, { method: "POST", body: fd })
+      .then(async (r) => {
+        const text = await r.text();
+        let data = null;
+        try { data = JSON.parse(text); } catch (_) { /* 非 JSON 回退到原文 */ }
+        if (!r.ok) {
+          const detail = (data && (data.detail || data.message))
+            || text || ("HTTP " + r.status);
+          _setAddTileStatus(tile, "安装失败：" + detail, "error");
+          return;
+        }
+        // 装上了但列表刷不出来时后端返 200 + ok:false（见 apps.py 的说明）。
+        // 只看 r.ok 会把它当成功，然后因为拿不到 cards 而静默不刷新 ——
+        // 用户看到的是"提示成功了，网格没变"，比报错更难查。
+        if (data && data.ok === false) {
+          _setAddTileStatus(tile, data.message || "安装后刷新应用列表失败", "error");
+          return;
+        }
+        // 装好了：先把清单换掉并重绘，**再**写状态。
+        //
+        // 顺序不能反 —— renderAppPanel() 是 grid.innerHTML = ...，会把磁位
+        // 连同 .app-add-status 整个重建。先写状态再重绘的话，那行提示会在
+        // 下一行代码里被自己的 innerHTML 抹掉：包确实装上了、卡片确实出现
+        // 了，但用户什么确认都看不到（实测踩过，等 .is-ok 永远等不到）。
+        const merged = (data && Array.isArray(data.cards)) ? data.cards : null;
+        if (merged) {
+          // 整份替换，不要只 push 新增项：装包可能同时修好别的卡片
+          // （manifest 改过了），只增量会让前后端卡片清单不一致，
+          // 留下一个谁也点不动的幽灵卡片。
+          window.__APP_MANIFESTS__ = Object.assign(
+            {}, window.__APP_MANIFESTS__ || {}, { cards: merged });
+        }
+        renderAppPanel();
+        const freshGrid = document.querySelector("#page-apps .apps-grid");
+        _setAddTileStatus(
+          freshGrid && freshGrid.querySelector("[data-app-add-tile]"),
+          "已安装 " + (data.package || name) + " " + (data.version || "")
+            + "：新增 " + ((data.new_cards || []).length) + " 个卡片",
+          "ok");
+      })
+      .catch((e) => {
+        _setAddTileStatus(tile, "安装请求失败：" + (e && e.message ? e.message : e), "error");
+      });
+  }
+
+  function _bindAddAppTile(grid) {
+    const tile = grid.querySelector("[data-app-add-tile]");
+    if (!tile) return;
+
+    // 点击 / 回车 → 文件选择器（拖不了包的场景，比如从别的机器推过来）
+    const picker = document.createElement("input");
+    picker.type = "file";
+    picker.accept = ".whl";
+    picker.style.display = "none";
+    picker.addEventListener("change", () => {
+      if (picker.files && picker.files[0]) _uploadApp(picker.files[0]);
+      picker.value = "";        // 允许连续拖同一个文件再触发一次
+    });
+    tile.addEventListener("click", () => picker.click());
+    tile.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        picker.click();
+      }
+    });
+
+    // 拖放 —— dragover 必须 preventDefault，否则 drop 根本不触发
+    tile.addEventListener("dragover", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      tile.classList.add("is-dropping");
+    });
+    tile.addEventListener("dragenter", (ev) => {
+      ev.preventDefault();
+      tile.classList.add("is-dropping");
+    });
+    tile.addEventListener("dragleave", (ev) => {
+      ev.stopPropagation();
+      // dragleave 会在子元素间移动时冒泡上来，不判断 relatedTarget 会闪
+      if (ev.relatedTarget && tile.contains(ev.relatedTarget)) return;
+      tile.classList.remove("is-dropping");
+    });
+    tile.addEventListener("drop", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      tile.classList.remove("is-dropping");
+      const dt = ev.dataTransfer;
+      if (!dt) return;
+      // 一次拖多个文件只取第一个 —— wheel 装一个就够，装第二个得等第一个
+      // 的结果出来（entry point 冲突时后者的行为不可预测）
+      const f = dt.files && dt.files[0];
+      if (!f) {
+        _setAddTileStatus(tile, "没看到文件，只接受拖 .whl 包", "error");
+        return;
+      }
+      _uploadApp(f);
+    });
   }
 
   // 预热所有卡片 JS,让首次点击直接命中 _loadedApps,避免 showPage 同步

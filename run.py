@@ -19,6 +19,11 @@ import uvicorn
 from app import __version__
 from app.core.config import get_config
 
+#: 仓库根目录。reload_dirs 要用它算绝对路径 —— 相对路径是相对 **CWD** 解析的，
+#: 而 run.py 可能从别处启动（``python /path/to/run.py``），那样 uvicorn 会去
+#: 监听一个不存在或不对的目录，reload 直接静默失效。
+_ROOT = Path(__file__).resolve().parent
+
 
 def _ensure_wdndds_native_path() -> None:
     """Prepend wdndds native lib dir to LD_LIBRARY_PATH。
@@ -592,6 +597,24 @@ def main() -> None:
         host="0.0.0.0",
         port=8000,
         reload=True,
+        # **只监听源码目录**，这是白名单而不是排除。
+        #
+        # 为什么不用 reload_excludes：uvicorn 把它交给 watchfiles 的
+        # DefaultFilter，而那个过滤器是 ``PurePath(path).match(pattern)``
+        # —— 从路径**尾部**匹配。``.venv/lib*`` 只有两段，被过滤的文件路径
+        # 尾部是 ``site-packages/<pkg>/xxx.py``，永远匹配不上，于是 pip 往
+        # site-packages 写文件照样触发 reload（实测踩过：装完应用卡在
+        # "Waiting for background tasks"，端口还占着但没人处理请求）。
+        #
+        # reload_dirs 是「看这些目录」，语义正好：源码就这几处。
+        #   app/       —— 本仓代码 + 静态资源
+        #   .venv/src/ —— editable 安装的 SDK 源码（wdnai/wdnav…），
+        #                  改它们仍然热重载；pip 装的 wheel 在
+        #                  site-packages，本来也不该被 watch（不是源码树）
+        #
+        # scripts/ 故意不看：改验证脚本不该重启 Web 服务（这个也踩过，
+        # 改一个 .py 就把在跑的服务搞停了）。
+        reload_dirs=[str(_ROOT / "app"), str(_ROOT / ".venv" / "src")],
         ws_ping_interval=5.0,
         ws_ping_timeout=60.0,
     )

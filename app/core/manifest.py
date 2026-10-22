@@ -317,11 +317,21 @@ def _validate(
     if any(e.startswith("FATAL") for e in errors):
         return None, errors
 
-    # Nested fields
-    backend = raw["backend"]
-    frontend = raw["frontend"]
-    demo_guard = raw["demo_guard"]
-    prompts = raw["prompts"]
+    # Nested fields.
+    #
+    # 用 .get() 而不是 raw[...] 是**故意的**：这里以前是四个直接下标，
+    # 任一字段缺失就抛 KeyError 冲出 _validate —— 而 discover() 是开机
+    # 必经之路，于是**一张卡的 manifest 写漏字段 = 整个 Web UI 起不来**，
+    # 报错还只是一句 KeyError，看不出是哪张卡的哪个字段。
+    #
+    # 卡片包可以被用户自己装进来（应用网格里拖 wheel），manifest 不再是
+    # 同一批人写的，漏字段是迟早的事。所以：backend / frontend 缺了就
+    # 记 FATAL（这张卡不能用），demo_guard / prompts 缺了就当空（可选项，
+    # 本来就允许不声明）。**任何一张坏卡都不许拖垮启动。**
+    backend = raw.get("backend") or {}
+    frontend = raw.get("frontend") or {}
+    demo_guard = raw.get("demo_guard") or {}
+    prompts = raw.get("prompts") or {}
     if "module" not in backend:
         errors.append("FATAL: backend.module missing")
     if "register_api" not in backend:

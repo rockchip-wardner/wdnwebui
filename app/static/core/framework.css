@@ -5453,6 +5453,128 @@ body.dg-modal-open .back-home-btn {
   color: #2563eb;
 }
 
+/* ── 「添加应用」磁位 ──────────────────────────────────────────────
+   网格末尾的空位：不是卡片（不跳路由），只负责接收拖进来的 wheel。
+   视觉上刻意与 .app-card 同一套语言（16:9 占位块 + 虚线边 + 同款标题），
+   这样它看起来是"网格的一部分"，而不是突然冒出来的系统控件。 */
+.app-add-tile {
+  display: block;
+  cursor: pointer;
+  border-radius: 12px;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  /* 拖放时要吃住事件，否则浏览器会直接导航到那个 .whl 文件，把当前页
+     换成一次下载 —— 这是 HTML5 drag & drop 最常见的坑 */
+  -webkit-user-drag: element;
+}
+
+.app-add-tile:hover {
+  transform: scale(1.03);
+}
+
+.app-add-placeholder {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: transparent;
+  /* 虚线边比普通卡片的稍深一档：这里的虚线是"这里可以放东西"的语义，
+     不是卡片占位图的装饰 */
+  border: 2px dashed #a8a8b4;
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  /* 图标 + 提示文字竖排居中。提示必须紧贴图标、落在同一个视觉焦点里 ——
+     放到占位块外面（紧跟标题）时它在网格里是个不起眼的小字，
+     「这里能拖包安装」这个信息基本没人会读。 */
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: #9ca3af;
+  transition: color 0.2s ease, border-color 0.2s ease,
+              background-color 0.2s ease;
+}
+
+.app-add-tile:hover .app-add-placeholder {
+  border-color: #2563eb;
+  color: #2563eb;
+}
+
+.app-add-icon {
+  /* 88px：占位块是 16:9 的宽幅，56px 在里面显得像"图标没加载出来"而不是
+     "这是这里的操作"。描边从 2 降到 1.5 是配套的 —— 24px 视口放大到 88px
+     是 3.7 倍，2px 会变成 7.4px 实际粗细，圆加粗得像个实心盘。 */
+  width: 88px;
+  height: 88px;
+  /* 这个磁位常驻在网格里、又不参与任何操作，图标抢眼会让人以为点它有
+     反应。压到 0.45：一眼能看见"这里有个加号"，但视觉重量明显低于
+     8 张真卡片。hover / 拖入时回到 1，说明它此刻是可交互的。 */
+  opacity: 0.45;
+  transition: opacity 0.2s ease, transform 0.15s ease;
+}
+
+.app-add-tile:hover .app-add-icon,
+.app-add-tile.is-dropping .app-add-icon {
+  opacity: 1;
+}
+
+.app-add-tile:hover .app-card-title {
+  color: #2563eb;
+}
+
+/* 提示文字：跟在图标下面、同样半透明，同样 hover 才变实 */
+.app-add-hint {
+  font-size: 15px;
+  margin: 0;
+  padding: 0 16px;
+  color: inherit;
+  opacity: 0.55;
+  text-align: center;
+  line-height: 1.4;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+  transition: opacity 0.2s ease;
+}
+
+.app-add-tile:hover .app-add-hint,
+.app-add-tile.is-dropping .app-add-hint {
+  opacity: 1;
+}
+
+/* 拖入悬停态：整块高亮，给出"松手就装"的即时反馈 */
+.app-add-tile.is-dropping .app-add-placeholder {
+  border-color: #2563eb;
+  border-style: solid;
+  background: rgba(37, 99, 235, 0.06);
+  color: #2563eb;
+}
+
+.app-add-tile.is-dropping .app-add-icon {
+  transform: scale(1.12);
+}
+
+/* 安装状态行。默认 hidden，JS 有内容时才显示 —— 不占位，避免空磁位显得
+   像加载失败（与 env_check 那张卡同样的考虑）。 */
+.app-add-status {
+  font-size: 14px;
+  margin: 6px 8px 0;
+  text-align: left;
+  line-height: 1.45;
+  /* pip 输出可能很长，别让它把网格撑变形 */
+  overflow-wrap: anywhere;
+}
+
+.app-add-status.is-busy {
+  color: #6b7280;
+}
+
+.app-add-status.is-ok {
+  color: #15803d;
+}
+
+.app-add-status.is-error {
+  color: #b91c1c;
+}
+
 /* 应用卡片副标题(一句话功能说明) — caption 样式,放在 <h2> 下方;
    hover 与标题同色变蓝,让整张卡片一起被点亮 */
 .app-card-desc {

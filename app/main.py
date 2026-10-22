@@ -199,7 +199,11 @@ def _manifest_to_dict(m: CardManifest) -> dict:
             "stop_endpoints": m.demo_guard_stop_endpoints,
             "stop_sync_endpoints": m.demo_guard_stop_sync_endpoints,
         },
-        "prompts": m.raw["prompts"],
+        # .get() 是故意的：卡片包可以被用户自己装进来，manifest 的
+        # prompts 段缺失是迟早的事。这里是首页渲染的必经路径，一个 KeyError
+        # 就是**整个首页 500** —— 而不是"这张卡的提示词用不上"。
+        # manifest._validate 已经把缺 prompts 当可选处理，这里保持一致。
+        "prompts": m.raw.get("prompts") or {},
         "status": m.status,
         "errors": m.errors,
         "hidden": m.hidden,
