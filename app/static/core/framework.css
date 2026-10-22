@@ -828,7 +828,8 @@ html, body {
   height: 100%;
   display: block;
 }
-#vcs-canvas {
+#vcs-canvas,
+#vr-canvas {
   width: 100%;
   height: 100%;
   display: block;
