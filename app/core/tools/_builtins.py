@@ -91,7 +91,7 @@ def _register_video_search(registry) -> None:
 
 
 def _register_tts_alert(registry) -> None:
-    """Lazy-import ``app.apps.video_detection.tts_alert.TtsAlert``
+    """Lazy-import ``app.core.tools.tts_alert.TtsAlert``
     and register it.
 
     Worker 进程 import 该模块只 import wdnai + 标准库 + 一段文本；
@@ -107,7 +107,7 @@ def _register_tts_alert(registry) -> None:
     ``resolve_available_tool_names``）。
     """
     try:
-        from app.apps.video_detection.tts_alert import TtsAlert
+        from app.core.tools.tts_alert import TtsAlert
     except Exception as e:  # noqa: BLE001
         _LOG.warning("builtins: failed to import TtsAlert: %s", e)
         return

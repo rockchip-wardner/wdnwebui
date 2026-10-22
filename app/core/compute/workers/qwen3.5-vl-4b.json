@@ -12,7 +12,7 @@
   "memory_estimate_mb": 3500,
   "estimated_init_seconds": 60,
   "description": "Qwen3.5-4B 多模态模型，支持图像描述、文本对话和电脑 GUI 操作规划",
-  "notes": "VLM-mode LLM（MRoPE 烙印），既能吃图像也能纯文本。spec.options 里的 presence_penalty=1.5 来自 examples/Qwen3_5_VL/cpp/main.cc 的默认值，用来压制长 multimodal 输出的复读。注：Qwen3.5-4B-llm.1828.rknn 同时支撑文本对话与视频描述两份能力，本机没有纯文本版 Qwen3.5-4B RKNN。swcap_computer_control 声明在本文件而不是新开一个 worker manifest：电脑控制要的也是「吃一张截图 + 输出文本」，与本模型的能力完全同构，action 的语义解析、坐标系换算、落到 HID 的副作用全部在主进程 app.apps.usb_hid.agent 里做（AGENTS.md 设计原则 6）。",
+  "notes": "VLM-mode LLM（MRoPE 烙印），既能吃图像也能纯文本。spec.options 里的 presence_penalty=1.5 来自 examples/Qwen3_5_VL/cpp/main.cc 的默认值，用来压制长 multimodal 输出的复读。注：Qwen3.5-4B-llm.1828.rknn 同时支撑文本对话与视频描述两份能力，本机没有纯文本版 Qwen3.5-4B RKNN。swcap_computer_control 声明在本文件而不是新开一个 worker manifest：电脑控制要的也是「吃一张截图 + 输出文本」，与本模型的能力完全同构，action 的语义解析、坐标系换算、落到 HID 的副作用全部在主进程 wdnapps_hdmi_processor.cards.usb_hid.agent 里做（AGENTS.md 设计原则 6）。",
   "available_targets": [
     "182x"
   ],

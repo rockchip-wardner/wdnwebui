@@ -1,7 +1,7 @@
 /* vtl-palette —— VTL/VTD 共享的目标框颜色调色板(20 色循环)。
  *
  * v0.4 之前 const 写在 VTD 的 app.js IIFE 里,同名的 VTL 在
- * ``app.apps.video_target_localization.app.js`` 引用 ``vtlPaletteRGB``,
+ * ``wdnapps_video_analyzer.cards.video_target_localization 的 app.js`` 引用 ``vtlPaletteRGB``,
  * 但因为 IIFE 作用域封闭,VTL 跑起来裸名 undefined → pageerror。
  *
  * 抽到 core 后两边都用 ``const vtlPaletteRGB = window.vtlPaletteRGB;

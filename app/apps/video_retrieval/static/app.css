@@ -1,9 +1,0 @@
-/* video-retrieval 卡片私有样式（卡片 static/app.css）。 */
-
-/* 历史记录子行控件对齐。 */
-.vr-cache-row > input[type="checkbox"] {
-  flex: none;
-  width: 14px;
-  height: 14px;
-  margin: 0;
-}

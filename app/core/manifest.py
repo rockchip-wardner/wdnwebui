@@ -1,11 +1,29 @@
 """Card manifest discovery + validation (v0.4 plugin refactor).
 
-A *card* is a self-contained application under ``app/apps/<card_id>/``
-with its own ``manifest.json`` describing its metadata (id, title, capabilities,
-backend entry points, frontend assets). The plugin loader scans
-``app/apps/*/manifest.json`` at boot and produces a list of validated
+A *card* is a self-contained application with its own ``manifest.json``
+describing its metadata (id, title, capabilities, backend entry points,
+frontend assets). The plugin loader produces a list of validated
 ``CardManifest`` objects that ``main.py`` then uses to wire up FastAPI
 routes + static mounts + frontend asset references.
+
+Two discovery channels feed the same validation pipeline:
+
+1. **Built-in** — ``app/apps/<card_id>/manifest.json`` scanned from disk.
+   After the v0.25 split this holds only ``text_chat`` + ``tts``.
+2. **Installed plugins** — any distribution advertising an entry point in
+   the ``wdnwebui.cards`` group. The entry point *name* is the card id and
+   its *value* is the importable card module; the card directory is that
+   module's parent directory. Because ``_validate()`` derives
+   ``static_dir = card_dir / "static"`` and ``main.py`` mounts
+   ``/static/apps/<id>`` → ``static_dir``, a plugin package needs no
+   special support at all: keep the very same on-disk layout
+   (``<pkg>/cards/<card_id>/{manifest.json, api.py, static/}``) inside
+   site-packages and every URL, route and validator keeps working.
+
+Both channels therefore share one contract — *a directory containing
+``manifest.json`` plus a ``static/`` subdir*, located wherever the package
+happens to live. Only ``backend.module`` in the JSON differs: it must name
+the plugin's own importable module rather than an ``app.apps.*`` path.
 
 Validation covers:
 
@@ -34,6 +52,10 @@ LOG = logging.getLogger("core.manifest")
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 _APPS_DIR = _APP_ROOT / "apps"
+
+# Entry-point group used by out-of-tree card distributions. Each point is
+# ``<card_id> = <importable card module>``; see module docstring.
+_ENTRY_POINT_GROUP = "wdnwebui.cards"
 
 
 @dataclass
@@ -138,6 +160,10 @@ def discover() -> list[CardManifest]:
             continue
         raw_manifests.append((card_dir, raw))
 
+    # Installed plugin cards (pip / pip -e installed distributions that
+    # advertise the ``wdnwebui.cards`` entry-point group).
+    raw_manifests.extend(_discover_from_entry_points())
+
     # First pass: validate + check id uniqueness.
     seen_ids: set[str] = set()
     validated: list[CardManifest] = []
@@ -181,6 +207,80 @@ def discover() -> list[CardManifest]:
             )
 
     return validated
+
+
+def _discover_from_entry_points() -> list[tuple[Path, dict[str, Any]]]:
+    """Collect ``(card_dir, manifest_dict)`` from installed plugin packages.
+
+    Each ``wdnwebui.cards`` entry point names a card module
+    (``video_detection = "wdnapps_video_analyzer.cards.video_detection"``).
+    We import that module purely to locate its package directory, then read
+    ``manifest.json`` from it — so the manifest stays a plain JSON file and
+    stays diff-reviewable exactly as it was when the card lived in-tree.
+
+    Failure policy: **never** propagate. A plugin whose optional dependency is
+    missing, or whose package is half-removed, must degrade to "card absent"
+    rather than take the whole web UI down at boot. Each failure is logged and
+    the remaining plugins still load.
+    """
+    try:
+        from importlib.metadata import entry_points
+    except Exception as e:  # noqa: BLE001  (py<3.10)
+        LOG.warning("entry_points unavailable, plugins not loaded: %s", e)
+        return []
+
+    try:
+        eps = list(entry_points(group=_ENTRY_POINT_GROUP))
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("could not enumerate %s entry points: %s",
+                    _ENTRY_POINT_GROUP, e)
+        return []
+
+    if not eps:
+        return []
+
+    out: list[tuple[Path, dict[str, Any]]] = []
+    for ep in eps:
+        try:
+            mod = importlib.import_module(ep.value)
+        except Exception as e:  # noqa: BLE001
+            LOG.error("[%s] plugin entry point %r not importable: %s",
+                      ep.name, ep.value, e)
+            continue
+
+        mod_file = getattr(mod, "__file__", None)
+        if not mod_file:
+            LOG.error("[%s] plugin module %r has no __file__ (namespace pkg?)",
+                      ep.name, ep.value)
+            continue
+        card_dir = Path(mod_file).resolve().parent
+        manifest_path = card_dir / "manifest.json"
+        if not manifest_path.is_file():
+            LOG.error("[%s] no manifest.json in %s", ep.name, card_dir)
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            LOG.error("[%s] manifest.json unreadable (%s): %s",
+                      ep.name, manifest_path, e)
+            continue
+
+        # The entry-point name is the card id; a mismatch means the plugin
+        # was renamed in pyproject.toml but not in manifest.json (or vice
+        # versa), which silently produces two cards or a phantom id.
+        declared = str(raw.get("id", "")).strip()
+        if declared != ep.name:
+            LOG.error("[%s] FATAL: manifest id %r != entry-point name %r",
+                      ep.name, declared, ep.name)
+            continue
+        out.append((card_dir, raw))
+
+    if out:
+        LOG.info("loaded %d plugin card(s) from %s: %s",
+                 len(out), _ENTRY_POINT_GROUP,
+                 ", ".join(str(raw["id"]) for _, raw in out))
+    return out
 
 
 def _validate(

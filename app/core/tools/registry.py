@@ -192,7 +192,7 @@ def get_tool_registry() -> ToolRegistry:
     Example (in a card's ``api.py`` or ``__init__.py``)::
 
         from app.core.tools.registry import get_tool_registry
-        from app.apps.video_detection.tts_alert import TtsAlert
+        from app.core.tools.tts_alert import TtsAlert
 
         get_tool_registry().register(
             key="tts_alert",

@@ -928,18 +928,36 @@ app/apps/<card_id>/
   `get_tool_registry().register(... VideoSearch ...)`,把微信视频检索
   工具装入全局注册中心 —— 这是允许的单向注入(im_bridge → core tools)。
 
-### 当前卡片清单(v0.4.0)
+### 当前卡片清单(v0.25 插件化)
 
-| `id` | capability | 后端入口 |
-|---|---|---|
-| `audio-analysis` | `swcap_audio_understand` | `app.apps.audio_analysis` |
-| `text-chat` | `swcap_text_chat` | `app.apps.text_chat` |
-| `tts` | `swcap_audio_tts` | `app.apps.tts` |
-| `video-retrieval` | `swcap_video_retrieval` | `app.apps.video_retrieval`（检索） |
-| `video-detection` | `swcap_video_describe` | `app.apps.video_detection` (+ `tts_alert` 工具) |
-| `video-target-detection` | `swcap_video_describe` | `app.apps.video_target_detection` (TargetDoc) |
-| `video-target-localization` | `swcap_grounding` | `app.apps.video_target_localization` (LocatorDoc) |
-| `usb-hid` | `swcap_computer_control` | `app.apps.usb_hid`（手动透传 + AI 任务循环 `agent.py`） |
+卡片分两个来源，宿主 `app/core/manifest.py::discover()` 两条通道并成同一
+条校验管线：
+
+1. **内置** —— 扫 `app/apps/*/manifest.json`（磁盘）
+2. **插件** —— 扫 `wdnwebui.cards` entry point 组（已安装的 wheel）。
+   entry point 名 = 卡 id（**连字符**，须与 manifest `"id"` 逐字相同），
+   值 = 可 import 的卡模块；宿主据此定位卡片目录（`模块目录/manifest.json`
+   + `模块目录/static/`）。因此插件包**不需要任何特殊支持**，保持与在树
+   时完全相同的目录结构即可，所有 URL / 路由 / wizard 字段 id 都不用改。
+
+依赖方向是单向的：插件 → `app.core.*`。core 不得依赖插件，否则插件没装
+时 core 会静默降级。
+
+| `id` | capability | 后端入口 | 来源 |
+|---|---|---|---|
+| `text-chat` | `swcap_text_chat` | `app.apps.text_chat` | 内置 |
+| `tts` | `swcap_audio_tts` | `app.apps.tts` | 内置 |
+| `audio-analysis` | `swcap_audio_understand` | `wdnapps_video_analyzer.cards.audio_analysis` | `wdnapps_video_analyzer` |
+| `video-retrieval` | `swcap_video_retrieval` | `wdnapps_video_analyzer.cards.video_retrieval`（检索） | `wdnapps_video_analyzer` |
+| `video-detection` | `swcap_video_describe` | `wdnapps_video_analyzer.cards.video_detection` | `wdnapps_video_analyzer` |
+| `video-target-detection` | `swcap_video_describe` | `wdnapps_video_analyzer.cards.video_target_detection` (TargetDoc) | `wdnapps_video_analyzer` |
+| `video-target-localization` | `swcap_grounding` | `wdnapps_video_analyzer.cards.video_target_localization` (LocatorDoc) | `wdnapps_video_analyzer` |
+| `usb-hid` | `swcap_computer_control` | `wdnapps_hdmi_processor.cards.usb_hid`（手动透传 + AI 任务循环 `agent.py`） | `wdnapps_hdmi_processor` |
+
+> `tts_alert` 工具住在 `app/core/tools/tts_alert.py` 而不是音视频描述卡里：
+> `core/tools/_builtins.py` 要 import 它，而 `_builtins` 同时被 detach 的
+> `compute_worker` 子进程 import —— 它一旦指向可选插件，插件没装时该工具
+> 会**静默消失**（那次 import 是故意软失败的，见 `_register_tts_alert`）。
 
 `scene-threshold-tuner`(曾用名「阈值标定」,显示名「视频画面变更阈值测试」)
 已在 v0.18 **整卡下线**:它的能力(帧间差异判定)不再需要单独一张卡 ——
@@ -948,7 +966,7 @@ app/apps/<card_id>/
 标定台只剩历史价值(它当初用来定下的默认值 6.0 / 长边 160 至今仍是
 `FrameJudge` 的默认),代码已删除。
 
-新增卡片示例(如加一个"图像 OCR"应用):只需 `mkdir app/apps/ocr && 写 manifest.json + api.py + service.py + __init__.py + static/`,`display_order` 自动出现在侧栏,**不动** `app/main.py` 或任何 core 模块。
+新增卡片示例(如加一个"图像 OCR"应用)有两条路：**内置卡** = `mkdir app/apps/ocr && 写 manifest.json + api.py + service.py + __init__.py + static/`；**插件卡** = 在某个插件包里加 `cards/ocr/`(同样一套文件)并在该包 `pyproject.toml` 的 `[project.entry-points."wdnwebui.cards"]` 注册 `"ocr" = "<包>.cards.ocr"` + `package-data`。两条路都**不动** `app/main.py` 或任何 core 模块。
 
 ## AI 电脑控制（usb-hid 的任务循环）
 
