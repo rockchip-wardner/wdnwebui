@@ -14,6 +14,18 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
 
 - **Web framework**: FastAPI + Uvicorn (`run.py` boots `app.main:app` on
   `0.0.0.0:8000` with `reload=True`).
+  - **必须用 `run.py` 起**（不能直接 `uvicorn app.main:app`）：`run.py` 的
+    `_ensure_wdndds_native_path()` 会把 wdndds 的原生库目录加进
+    `LD_LIBRARY_PATH`；缺了它，spawn 出去的 `compute_worker` 加载不了
+    cshim，会**秒退**（rc=0，表现为「功能未启用: swcap_vision_grounding」）。
+  - **别和 systemd 单元 `wdnwebui.service` 同时跑**：该单元
+    `Restart=on-failure` + `RestartSec=5`，抢不到 8000 端口就每 5 秒
+    重启一轮，而**每轮重启都会把 cgroup 里的 `compute_worker` 一起
+    SIGTERM 掉** —— 症状是「worker 加载完（~33s）后 ~9s 就死」，
+    很容易被误判成「NPU 加载有问题」。`strace -f -e trace=kill,tgkill`
+    能直接看到发送方（`si_pid` 指向 systemd，不是 registry）。
+    排查前先 `systemctl status wdnwebui.service`，冲突就
+    `systemctl stop wdnwebui`。
 - **Internal SDKs** (installed editable from private SSH git, **not** PyPI):
   - `wdnav` — Rockchip MPP / RGA2 / V4L2 video bindings.
     Native libs (`librockchip_mpp`, `librga`) must be installed on the host;
@@ -236,20 +248,100 @@ vd 除了 `image_size` / `model_id`，还有两处 vtd 没有的东西：
   高度，再用 `grid-auto-rows:1fr` 撑满行。提示层（`.vd-overlay`）要放在宫格
   **内部** —— absolute 不参与网格布局，`inset:0` 正好罩住画面。
 
-### vtl 的「命中定格」：就地快照，不等新图
+### vtl 的「命中定格」：定格**算框那一帧**，不是定格「事件到达时」的画布
 
-事件到达时把该路 tile canvas 的像素拷进离屏 canvas，定格 2s，期间的重绘就是
-**反复重贴这张快照 + 叠 bbox**（浏览器渲染管线会把长期不写入的 canvas 降级）。
+事件到达时把**该路 tile canvas** 换成「模型算框时看到的那一帧」，定格 2s，
+期间的重绘就是**反复重贴这张帧 + 叠 bbox**（浏览器渲染管线会把长期不写入的
+canvas 降级）。
 
-两个不能省的细节：
+> **踩过的坑：定格「事件到达时的画布」= 画框必然偏移**
+>
+> 框是在**送检帧**上算的，而事件要等模型推理完才到 —— 本机实测 grounding
+> 单次 **1.66s ≈ 41 帧 @25fps**。等事件到浏览器，实时流早就往前跑了 41 帧，
+> 目标（人）已经走开；把那一刻的画布定格，框就落在**别的时刻**的目标上。
+> 这就是「定位到目标后画框在实时画面里偏移」的全部原因。
+>
+> 实证（`scripts/verify_vtl_box_alignment.py`）：同一批框画在
+> 「送检帧」上像素级贴合；画在「事件到达时的画布」上整体错开一人身位。
+>
+> **修法**：后端把**算框用的那一帧**随事件一起下发（`frame_b64`），
+> 前端定格它。关键在于**零额外编码**：`read0_multi` 的 `outs[0]`（显示尺寸）
+> 与 `outs[1]`（送检尺寸）是**同一次解码**的两次 RGA，内容完全一致；解码
+> 线程本来就要把 `outs[0]` 编成 JPEG 推给 WS，多留一个引用即可。
+>
+> 三个不能省的细节：
+>
+> * **多路必须按路冻结**。用一份全局冻结态会把所有画面按在同一张旧帧上，看起来
+>   就是「整个画面卡住不动」。
+> * **整帧有内存账**。显示尺寸 JPEG 单条 ~130KB，事件历史 200 条就是 26MB。
+>   所以：事件只给最近 12 条留整帧（`_trim_event_frames`）；WS 建连时的
+>   `event_history` 包与 `/events` REST 都**去掉整帧**（`?frames=1` 可要回来）。
+>   实时事件（WS 的 `event`）必须带整帧 —— 前端定格靠的就是它。
+> * bbox 坐标在**送检帧**（448×252）空间，画布是**显示尺寸**（960 或 384 宽），
+>   必须按 `canvas 实测尺寸 / frame_w·frame_h` 换算，否则框会挤到左上角。
+>   整帧图与框空间不同尺寸时，历史缩略图那条路径也要按
+>   `图尺寸 / frame_w·frame_h` 换算（`vtlRenderHistoryItem`）。
 
-* **多路必须按路冻结**。用一份全局冻结态会把所有画面按在同一张旧帧上，看起来
-  就是「整个画面卡住不动」。
-* **不能等一张新图**。grounding 事件的 `frame_b64` 是**空的** ——
-  `_build_grounding_event` 明确去掉了整帧编码（worker_loop 里每事件多编一次要
-  30~100ms），只留 `crop_b64`。所以冻结源只能是画面本身。
-* bbox 坐标在**送检帧**（448×252）空间，画布是**显示尺寸**（960 或 384 宽），
-  必须按 `canvas 实测尺寸 / frame_w·frame_h` 换算，否则框会挤到左上角。
+### vtl 的 grounding prompt：**不能带 JSON Schema**
+
+vtl 走 `swcap_vision_grounding`（LocateAnything-3b，`kind="grounding"`）。detector
+照例 `sess.respond(prompt=..., generating=LocatorDoc, ...)`，而 `LocatorDoc`
+的 JSON Schema 有 2KB 多。
+
+> **踩过的坑：schema 进了 grounding 的 prompt → 「定位到 41 个目标」**
+>
+> 症状：事件里目标数暴涨（40~112 个），标签是
+> `description` / `ROI 左上角 x，0–1000 归一化。` / `ROI 右下角 y，0–1000 归一化。`
+> 之类 —— 看着像「模型输出质量波动」，其实**错误在输入侧拼接**。
+>
+> 那些字符串就是 `LocatorDoc` / `BoundingBox` 的 **JSON Schema 字段名和
+> Field description**（`wdnai/grounding.py` + `app/core/llm/detector_base.py`
+> 的 `_build_grounding_doc_class`）。LocateAnything 是 grounding 模型，
+> **把 prompt 里的每个名词短语都当成要定位的目标** → schema 的字段被逐个
+> ground 出来。
+>
+> 真机 A/B 实测（广州地铁人流素材 + 查询「穿黄色衣服的人」，6 帧）：
+>
+> | | 每帧目标数 | 最慢一帧 |
+> |---|---|---|
+> | schema 进 prompt（修复前） | `[1, 0, 144, 5, 2, 1]` | **13.7 s** |
+> | 干净 prompt（修复后） | `[1, 0, 1, 1, 1, 1]` | ~0.5 s |
+>
+> **「污染」是逐帧随机的** —— 某些帧看着正常、某些帧直接炸成上百个框。
+> 所以「12 条事件里 8 条干净」**不能**当成「8 条真的干净」；那 8 条只是
+> 这一帧模型没跑偏。
+>
+> **修法是两层，缺一不可**：
+>
+> 1. **wdnai**：`LLMSession._suppress_generating_in_prompt` 对
+>    `kind in ("tts", "grounding")` 返回 `True` —— grounding 的 prompt 里
+>    只有用户查询，`generating=` 仍然承载输出侧解析
+>    （`_parse_locate_output` 照旧从 raw text 抽 `<box>`）。
+>    符合「per-model 行为差异写进 wdnai」。
+> 2. **wdnwebui**：主进程给 `LLMRPCSession` 传**真正的 `ModelSpec`**
+>    （`app/core/compute/workers.build_model_spec(model_id)`），而不是
+>    worker manifest 的 preset dict。
+>
+> **第 2 层是被第 1 层的一个坑逼出来的**：SDK 判断模型族靠
+> `spec.kind`，而 manifest 的 preset dict **没有 `kind`** → 判定拿到
+> `None` → 抑制**静默失效** → schema 照旧进 prompt。
+> 只改 wdnai 而不改这里，真机跑起来**完全没效果**（`WDNAI_TRACE_PROMPT`
+> 打印的 `kind=None` 就是现场证据）。
+> 现在两边都堵上了：SDK 侧 `_model_kind()` 兼容 dict / ModelSpec 两种
+> 形状，**解析不到时打一条 warning**（不再静默）；webui 侧统一走
+> `build_model_spec()`，worker 和主进程用**同一份**解析逻辑。
+>
+> 回归防护：
+> * `python -m scripts.verify_grounding_prompt`（不占 NPU）断言
+>   grounding prompt 里没有 schema、且 vlm 的 schema hint 没被误伤；
+> * `python -m scripts.verify_grounding_live`（占 NPU）跑真实 vtl 卡片，
+>   断言**每帧目标数稳定** —— 只查标签会漏判：模型没跑偏的那些帧看起来
+>   是干净的（真机复现：12 条里 11 条是 1 个目标，第 11 条炸成 40 个假框
+>   + 1 个真框 = 用户报的「41 个目标」）。
+>
+> 排查同类问题先看**真正发出去的 prompt**：`WDNAI_TRACE_PROMPT=1` 会把每次
+> 推理实际发出的 prompt 打到 stderr（含 `kind=` 和长度）。
+
 
 ### 向导搬画面：容器 id 必须显式声明
 

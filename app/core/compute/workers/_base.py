@@ -334,21 +334,18 @@ def _build_session(model_id: str, npu_index: int):
     A missing or misspelled factory surfaces here as a clear
     ``RuntimeError`` (the instance flips to ``error`` with this text)
     rather than a bare ``AttributeError`` from deep inside a loader.
+
+    The ``manifest → ModelSpec`` resolution itself lives in
+    :func:`app.core.compute.workers.build_model_spec` so the **main
+    process** can resolve the very same spec when it builds its
+    ``LLMRPCSession`` — one resolver, one spec, both sides of the wire.
     """
-    manifest = load_manifest(model_id)
-    factory_name = (manifest.get("spec_factory") or "").strip()
-    if not factory_name:
-        raise RuntimeError(
-            f"worker {model_id!r}: manifest has no 'spec_factory' "
-            f"(expected a wdnai.SystemLanguageModel method name)")
     mod = _load_wdnai()
-    factory = getattr(mod["SystemLanguageModel"], factory_name, None)
-    if factory is None:
-        raise RuntimeError(
-            f"worker {model_id!r}: wdnai.SystemLanguageModel has no "
-            f"{factory_name!r} — check 'spec_factory' in "
-            f"workers/{model_id}.json against the installed wdnai")
-    spec = factory()
+    factory_name = (load_manifest(model_id).get("spec_factory") or "").strip()
+    # Lazy import: the package __init__ owns the manifest scanner, and
+    # importing it at module level would close a cycle.
+    from app.core.compute.workers import build_model_spec
+    spec = build_model_spec(model_id)
     LOG.info("building LLMLocalSession(model=%s, npu=%d) via %s) ...",
              model_id, npu_index, factory_name)
     t0 = time.time()

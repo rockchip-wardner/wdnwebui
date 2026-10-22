@@ -53,6 +53,7 @@ from wdnai import RetiredCapabilityError, migrate_legacy
 from app.core.config import default_models_root, get_config
 from app.core.compute.workers import (
     WorkerManifest,
+    build_model_spec,
     discover as discover_workers,
     load_one as load_worker_manifest,
     model_presets as _model_presets,
@@ -3051,9 +3052,16 @@ class ComputeRegistry:
         inst._svc = svc
         try:
             from app.core.compute.proxy import make_rpc_session
-            spec = MODEL_PRESETS.get(inst.model_id)
-            if spec is None:
-                raise RuntimeError(f"no ModelSpec for model {inst.model_id!r}")
+            # The **real** ``wdnai.ModelSpec`` — NOT the manifest preset
+            # dict.  The preset view carries UI metadata but no ``kind``,
+            # and ``kind`` is what the SDK uses to decide whether the
+            # JSON-schema hint may enter the prompt.  Passing the dict
+            # made ``spec.kind`` resolve to ``None``, the schema
+            # suppression silently switched itself off, and a 2 KB
+            # ``LocatorDoc`` JSON Schema rode along into every grounding
+            # prompt — the model then grounded the schema's own field
+            # names ("description", "ROI 左上角 x，0–1000 归一化。").
+            spec = build_model_spec(inst.model_id)
             inst.rpc_session_proxy = make_rpc_session(
                 model=spec,
                 model_id=inst.model_id,

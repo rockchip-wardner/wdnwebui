@@ -329,12 +329,26 @@ def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
         return spec.detector_getter().stop()
 
     @router.get("/events")
-    async def list_events() -> dict:
+    async def list_events(frames: bool = False) -> dict:
+        """事件列表。
+
+        默认**不带整帧**：定位事件的 ``frame_b64`` 是「算框用的那一帧」
+        （显示尺寸 JPEG，单条 ~130KB），200 条就是 26MB —— 页面初始化
+        会拉一次这个端点，扛不住。实时事件走 WS（那里带着整帧，前端定格
+        要用）。要拿整帧就加 ``?frames=1``。
+        """
         det = spec.detector_getter()
+        events = det.events()
+        latest = det.latest()
+        if not frames:
+            for ev in events:
+                ev.pop("frame_b64", None)
+            if latest:
+                latest.pop("frame_b64", None)
         return {
             "snapshot": det.snapshot(),
-            "events": det.events(),
-            "latest": det.latest(),
+            "events": events,
+            "latest": latest,
             "session": spec.session_getter().snapshot(),
         }
 
@@ -464,6 +478,13 @@ def build_multi_router(spec: MultiCardSpec, tag: str) -> APIRouter:
         history = detector.events_since(0)
         if history:
             last_event_id = history[-1]["id"]      # 已发过的后面不再单发
+            # 历史包里**去掉整帧**：定位事件带的 frame_b64 是「算框用的
+            # 那一帧」（显示尺寸 JPEG，单条 ~130KB），50 条就是 6.6MB ——
+            # 建连时一次性灌进浏览器会把渲染进程压死，而历史列表本来只
+            # 需要框和文字。实时事件（下面那条 send_json）仍带整帧 ——
+            # 前端定格靠的就是它。
+            for ev in history[-WS_EVENT_HISTORY_MAX:]:
+                ev.pop("frame_b64", None)
             await ws.send_json({"type": "event_history",
                                 "events": history[-WS_EVENT_HISTORY_MAX:]})
         try:

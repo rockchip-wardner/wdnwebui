@@ -56,6 +56,7 @@ DMA-BUF 上单独 RGA 到自己的尺寸。早前它们共用一张（``_out = m
 """
 from __future__ import annotations
 
+import base64
 import logging
 import queue
 import threading
@@ -239,7 +240,7 @@ class Channel:
         "started_at", "last_frame_ts", "_lock", "_latest_bgr",
         "_disp_w", "_disp_h", "_stop", "_play", "_live", "_publish",
         "judge", "_ana_w", "_ana_h", "_ana_due", "_ana_bgr",
-        "_ana_seq", "_ana_seen",
+        "_ana_jpg", "_ana_seq", "_ana_seen",
         # 解码→广播那一段的三个计数器（判「解码出来却没推出去」丢在哪）：
         # _disp_skip 显示节流没到点而故意不推 / _disp_err JPEG 编码失败 /
         # _pub_exc publish_frame 抛异常。decode_fps == display_fps 时都应是 0。
@@ -289,6 +290,19 @@ class Channel:
         # 送检尺寸的 BGR。序号判新旧，见 request_inference。
         self._ana_due = threading.Event()
         self._ana_bgr: Any = None
+        # **送检那一帧的显示尺寸 JPEG**（未 base64 的原始字节）。
+        #
+        # 为什么必须留：``read0_multi`` 出的 ``outs[0]``（显示尺寸）和
+        # ``outs[1]``（送检尺寸）是**同一次解码**的两次 RGA，内容完全
+        # 一样。模型在 ``outs[1]`` 上算框，而事件到达浏览器时实时流已经
+        # 往前跑了整整一个推理时延（本机实测 grounding 1.66s ≈ 41 帧）——
+        # 浏览器若定格「事件到达那一刻的画布」，框就落在**别的时刻**的
+        # 目标上（人已经走开了）。把这一帧的显示 JPEG 一起交给 detector，
+        # 事件里就带着**算框用的那张图**，前端定格它 → 框与目标严格对齐。
+        #
+        # 零额外开销：这张 JPEG 解码线程本来就要编（每帧都编给 WS 推流），
+        # 这里只是多留一个引用，不额外 imencode、不额外 RGA。
+        self._ana_jpg: bytes = b""
         self._ana_seq = 0        # 解码线程每产出一张送检图 +1
         self._ana_seen = 0       # 轮转线程已消费到的序号
         # 解码→广播的三个计数器，见 __slots__ 处的说明
@@ -323,6 +337,10 @@ class Channel:
     def take_inference(self, timeout: float = 1.0):
         """等解码线程交出送检图；没有就返回 None（让本轮跳过）。
 
+        返回 ``(送检 BGR, 该帧的显示尺寸 JPEG 字节)``。JPEG 与 BGR 出自
+        **同一次解码**（``read0_multi`` 的两个输出），所以它就是「模型算框
+        时看到的那一帧」的高清版本 —— 前端拿它定格，框才不会错位。
+
         ``timeout`` 要宽于一个解码帧周期（1000/display_fps），否则轮转会
         频繁空手而归 —— 那正是 ``RR_MIN_INFER_MS`` 要抓的「空转」。
         """
@@ -331,14 +349,16 @@ class Channel:
             with self._lock:
                 if self._ana_seq > self._ana_seen:
                     self._ana_seen = self._ana_seq
-                    return self._ana_bgr
+                    return self._ana_bgr, self._ana_jpg
             if self._stop.is_set() or time.monotonic() >= deadline:
-                return None
+                return None, b""
             time.sleep(0.005)
 
-    def _publish_inference(self, img) -> None:
+    def _publish_inference(self, img, jpg: bytes = b"") -> None:
+        """交出送检图 + 同一帧的显示 JPEG（两者必须同时可见，不能错配）。"""
         with self._lock:
             self._ana_bgr = img
+            self._ana_jpg = jpg or b""
             self._ana_seq += 1
 
     def snapshot_gray_for_judge(self, long_side: int):
@@ -491,8 +511,13 @@ class Channel:
                     # RGA 失败 —— 丢这一帧，不打断整路
                     continue
                 frame = outs[0]
+                # 送检图与显示图出自**同一次解码**（read0_multi 的两个输出），
+                # 内容一致、只有分辨率不同。这里先把送检图扣下来，**等下面把
+                # 这一帧的显示 JPEG 编好之后**再一起交出去 —— 两者必须成对，
+                # 否则事件里带的图和算框用的图就不是同一张。
+                ana_frame = None
                 if want_ana and len(outs) > 1:
-                    self._publish_inference(outs[1])
+                    ana_frame = outs[1]
                     self._ana_due.clear()
 
                 self.frames += 1
@@ -539,6 +564,7 @@ class Channel:
                 # 所以 disp_every 恒为 1，这个节流器实际从不丢帧。
                 now = time.monotonic()
                 jpg = None
+                pub_jpg = None
                 if disp_every <= 1 or self.frames % disp_every == 0:
                     try:
                         ok, buf = cv2.imencode(
@@ -548,6 +574,7 @@ class Channel:
                         jpg = bytes(buf) if ok else None
                         if not ok:
                             self._disp_err += 1
+                        pub_jpg = jpg
                     except Exception:  # noqa: BLE001
                         jpg = None
                         self._disp_err += 1
@@ -555,12 +582,29 @@ class Channel:
                     # 故意不推这一帧。与 imencode 失败分开计数：那个是错误，
                     # 这个是帧率整形；32 路下 decode_fps == display_fps 时不该发生。
                     self._disp_skip += 1
+                    if ana_frame is not None:
+                        # 但这一帧要送检 —— 事件里必须带上**算框用的那一帧**，
+                        # 否则前端只能定格「事件到达时」的画布，框会落在别的
+                        # 时刻的目标上。多编一份的代价是每推理 1 次（不是每帧）。
+                        try:
+                            ok, buf = cv2.imencode(
+                                ".jpg", frame,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
+                            )
+                            jpg = bytes(buf) if ok else None
+                        except Exception:  # noqa: BLE001
+                            jpg = None
                 self.set_frame(frame)
-                if jpg is not None and self._publish is not None:
+                if pub_jpg is not None and self._publish is not None:
                     try:
-                        self._publish(self.idx, jpg)
+                        self._publish(self.idx, pub_jpg)
                     except Exception:  # noqa: BLE001
                         self._pub_exc += 1
+
+                # 送检图 + 同一帧的显示 JPEG 一起交出去（必须成对，见上面
+                # ``ana_frame`` 处的注释）。JPEG 在上面刚编好，零额外编码。
+                if ana_frame is not None:
+                    self._publish_inference(ana_frame, jpg or b"")
 
                 if period:
                     target += 1
@@ -1102,15 +1146,33 @@ class MultiChannelSession:
             # 请求本路在**下一次解码**上多出一张送检尺寸的图（同一次
             # 解码的 DMA-BUF 多跑一次 RGA），然后等它交接。没有出帧就
             # 跳过本路。等待窗口要宽于一个解码帧周期。
+            #
+            # ``take_inference`` 同时交出**同一帧的显示尺寸 JPEG** —— 它
+            # 就是模型算框时看到的那张图（更高清）。交给 detector 后随
+            # 事件下发，前端据此定格，框才不会落在「事件到达那一刻」的
+            # 画面上（推理时延内目标早走了）。
             ch.request_inference()
-            frame = ch.take_inference(timeout=ANA_WAIT_TIMEOUT)
+            frame, ana_jpg = ch.take_inference(timeout=ANA_WAIT_TIMEOUT)
             if frame is None:
                 return False, 0
+
+            # base64 只在这里做一次（每路每次推理 1 次，不是每帧）。
+            # 空 JPEG（显示节流跳过 / 编码失败）就传空串，detector 侧
+            # 照旧把 frame_b64 留空，前端回退到旧的「就地快照」行为。
+            frame_b64 = ""
+            if ana_jpg:
+                try:
+                    frame_b64 = base64.b64encode(ana_jpg).decode("ascii")
+                except Exception as exc:  # noqa: BLE001
+                    LOG.debug("mc-vlm-rr ch%02d base64 失败: %s",
+                              ch.idx, exc)
+                    frame_b64 = ""
 
             t0 = time.perf_counter()
             try:
                 ok = detector.submit_frame_to(
                     slot_idx, frame, ch.frame_pos,
+                    frame_b64=frame_b64,
                     judge_score=judge_score, channel=ch.idx)
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("mc-vlm-rr ch%02d submit 失败: %s", ch.idx, exc)

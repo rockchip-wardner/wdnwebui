@@ -347,6 +347,59 @@ def model_presets() -> Dict[str, Dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# manifest → ModelSpec
+# --------------------------------------------------------------------------- #
+# The manifest's ``spec_factory`` names a method on ``wdnai.SystemLanguageModel``;
+# calling it yields the real ``ModelSpec``.  **One resolver, two callers**:
+# the worker builds its ``LLMLocalSession`` from it, and the main process
+# builds its ``LLMRPCSession`` from it.
+#
+# Why it must be the real ModelSpec and NOT the manifest preset dict:
+# the preset view carries UI metadata (label / capability_types / notes …)
+# but **no ``kind``** — and ``kind`` is what the SDK uses to decide whether
+# the JSON-schema hint may go into the prompt.  Handing the dict to
+# ``LLMRPCSession`` made ``spec.kind`` resolve to ``None``, the schema
+# suppression silently switched itself off, and a 2 KB ``LocatorDoc`` JSON
+# Schema rode along into every grounding prompt — the model then grounded
+# the schema's own field names ("description", "ROI 左上角 x，0–1000
+# 归一化。") instead of the user's target.
+#
+# Building the spec is cheap (dataclass + path resolution, no RKNN load);
+# the actual model load still happens in the worker.
+_SPEC_CACHE: Dict[str, Any] = {}
+
+
+def build_model_spec(model_id: str) -> Any:
+    """Return the ``wdnai.ModelSpec`` for ``model_id`` (cached).
+
+    Raises ``RuntimeError`` with an actionable message when the manifest
+    has no ``spec_factory`` or the installed wdnai does not expose it —
+    the same two failure modes the worker reports.
+    """
+    cached = _SPEC_CACHE.get(model_id)
+    if cached is not None:
+        return cached
+    manifest = load_one(model_id)
+    if manifest is None:
+        raise RuntimeError(f"worker {model_id!r}: manifest not found")
+    factory_name = (manifest.spec_factory or "").strip()
+    if not factory_name:
+        raise RuntimeError(
+            f"worker {model_id!r}: manifest has no 'spec_factory' "
+            f"(expected a wdnai.SystemLanguageModel method name)")
+    from wdnai import SystemLanguageModel
+    factory = getattr(SystemLanguageModel, factory_name, None)
+    if factory is None:
+        raise RuntimeError(
+            f"worker {model_id!r}: wdnai.SystemLanguageModel has no "
+            f"{factory_name!r} — check 'spec_factory' in "
+            f"workers/{model_id}.json against the installed wdnai")
+    spec = factory()
+    _SPEC_CACHE[model_id] = spec
+    return spec
+
+
 def known_capability_types() -> set:
     """Every legal ``swcap_*`` value.
 

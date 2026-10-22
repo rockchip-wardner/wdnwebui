@@ -1153,6 +1153,9 @@ class WdnaiDetector:
 
     HISTORY_MAX = 200
     ITEM_QUEUE_MAX = 1  # latest-only — older frames are dropped
+    # 事件里保留整帧的条数上限（内存账：整帧 ~130KB/条）。
+    # 整帧只有「WS 推送那一刻」有用，历史列表用不到 —— 见 _trim_event_frames。
+    _EVENT_FRAME_KEEP = 12
     # 工具调用循环的硬上限。即使 ``tool_call_max_iters=0``（无限）
     # 也会卡在这里 —— 兜底避免失控模型在同一帧里无限循环把 worker
     # 锁死。200 次 × 1s/inference ≈ 3 分钟单帧最坏延迟，足够 cover
@@ -1763,6 +1766,31 @@ judge_score: Optional[float] = None,
     def events(self) -> list:
         with self._events_lock:
             return [ev.to_dict() if hasattr(ev, "to_dict") else dict(ev) for ev in self._events]
+
+    def _trim_event_frames(self) -> None:
+        """整帧（``frame_b64``）只给最近 N 条事件留着。
+
+        ``frame_b64`` 是「算框用的那一帧」（显示尺寸 JPEG，~130KB/条）。
+        事件历史有 ``HISTORY_MAX``(200) 条，全留着就是 26MB 常驻内存 ——
+        而整帧的用途只有「WS 把这条事件推给浏览器」这一瞬间：浏览器拿它
+        定格画面，之后历史列表只用框和文字。
+
+        WS 轮询 ``events_since`` 的周期是几十毫秒，事件落地后很快就被取
+        走，所以留 12 条绰绰有余（12 × 1.66s ≈ 20s 的余量）。
+
+        **从新往旧数**：整帧是给「刚发生的那条事件」用的 —— 浏览器收到
+        它才能定格。反过来（从旧往新清）会把**最新**那条的整帧清掉，
+        表现为「事件到了但画面没定格 / 定格错位」。
+
+        调用方已持 ``_events_lock``。
+        """
+        kept = 0
+        for ev in reversed(self._events):
+            if not getattr(ev, "frame_b64", None):
+                continue
+            kept += 1
+            if kept > self._EVENT_FRAME_KEEP:
+                ev.frame_b64 = ""
 
     def latest(self) -> Optional[dict]:
         with self._events_lock:
@@ -3075,6 +3103,8 @@ judge_score: Optional[float] = None,
                     self._events.append(ev)
                     self._latest = ev.to_dict()
                     _last_seen_event_ts = time.monotonic()
+                # 整帧只给最近 N 条事件留着（内存账，见 _trim_event_frames）。
+                self._trim_event_frames()
                 # ``latest`` 在多 event 帧下指向最后一个；前端
                 # ``addVtdEvent`` 用 unshift() 重新排序，最终列表的
                 # 顺序仍是 frame_pos 内 id 倒序（最新在前）。
