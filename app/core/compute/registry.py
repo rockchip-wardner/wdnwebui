@@ -33,6 +33,7 @@ snapshot 字段：
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
 import logging
@@ -757,6 +758,25 @@ def _instance_reusable(inst_npu_index: int, inst_source: str,
     return False
 
 
+def transition_of(inst) -> str:
+    """这个实例处于哪个过渡态？``""`` | ``"loading"`` | ``"stopping"``。
+
+    纯函数(不碰 registry 的锁),便于单测。``stopping`` 取自
+    ``_stop_depth``;``loading`` 取自 status —— status 的值域里没有
+    「关闭中」,关闭过程中对外仍报 running/loading。
+
+    启停前先看它:过渡态里再 load 一次就是两个 init 线程抢同一份 NPU
+    内存(rc=-6)。详见 AGENTS.md「模型启停的过渡态」。
+    """
+    if inst is None:
+        return ""
+    if getattr(inst, "_stop_depth", 0) > 0:
+        return "stopping"
+    if getattr(inst, "status", "") == "loading":
+        return "loading"
+    return ""
+
+
 def _crop_autostart_for_cards(entries: list[dict],
                               model_cards: list[int]) -> tuple[list[dict], list[dict]]:
     """按模型卡位裁剪 autostart：非模型卡丢弃，**每张卡只留第一条**。
@@ -944,6 +964,15 @@ class ModelInstance:
     # 按钮 flicker（probe 陈旧 r 覆盖 unload 乐观写的 "not_loaded"）。
     _probe_gen: int = 0
     _logged_running: bool = False
+    # 「正在关闭中」计数(unload / stop 期间 > 0)—— status 里没有这个
+    # 状态,关闭中对外仍报 running/loading,并发请求会把正在卸载的实例
+    # 当成可复用的 → 再 load 一次 → rc=-6。判据见 transition_of()。
+    # 用**计数**不用 bool:_stop_inst 内部会调 unload_instance(嵌套),
+    # 内层 finally 减 1 不能把外层的「关闭中」提前清掉。
+    _stop_depth: int = 0
+    # 「正在关的是哪张卡」—— unload 的乐观写会把 npu_index 重置成 -1,
+    # 排队判断要按卡粒度,所以单独留一份。
+    _stop_npu: int = -1
     # Provenance / discovery
     _source: str = "spawned"                    # "spawned" | "adopted_local" | "adopted" | "unavailable"
     _peer_guid: str = ""                       # adopted: peer participant GUID
@@ -968,6 +997,8 @@ class ModelInstance:
             "label":              self.label,
             "instance_name":      self.instance_name,
             "status":             self.status,
+            # 过渡态另开字段,不改 status 的值域(status 的消费方太多)
+            "transition":         transition_of(self),
             "error":              self.error,
             "stderr_full":        self.stderr_full,
             "capability_types":   list(self.capability_types),
@@ -1072,6 +1103,13 @@ class ComputeRegistry:
         # 防 peer listener 重入 adopt:同 model_id SPDP lease 重发时,
         # 第一次触发 adopt 在跑 (16s probe 上限),后续事件直接跳过。
         self._adopt_inflight: set[str] = set()
+        # per-model 启停操作锁 —— 排队等待结束后可能有多个请求同时醒来,
+        # 一起对同一个实例 bind 就是又一轮「两个 init 线程抢 NPU 内存」。
+        self._model_locks: dict[str, threading.Lock] = {}
+        # 本机最近停掉过哪些 (model, npu) —— DELETE 的幂等凭据。
+        # 单进程 uvicorn 下并发 DELETE 只能在事件循环里排队,轮到第二个
+        # 时实例已不在(npu_index 也被乐观写重置成 -1) → 误报 404。
+        self._recently_stopped: dict[Tuple[str, int], float] = {}
         self._mode: str = _resolve_compute_mode()
         self._migrate_legacy_capability_types()
         self._migrate_legacy_preset_names()
@@ -2751,33 +2789,44 @@ class ComputeRegistry:
         """
         for inst in self._instances_of(model_id):
             inst._probe_gen += 1  # 失效 in-flight probe 的 r
-            if inst.rpc_client is not None:
-                try:
-                    # unload_handler 立即返回 {"status": "unloaded"}。5s 足够。
-                    with inst._probe_lock:
-                        if inst.rpc_client is None:
-                            continue
-                        inst.rpc_client.call(
-                            {"action": "unload", "op": "unload"},
-                            timeout_ms=5_000)
-                except Exception as e:  # noqa: BLE001
-                    LOG.warning("unload %s (npu=%s) RPC failed: %s",
-                                model_id, inst.npu_index, e)
-            with self._lock:
-                old_key = inst.key
-                inst.npu_index = -1
-                inst.key = (-1, model_id, inst._source)
-                inst.status = "not_loaded"
-                inst.load_time_sec = None
-                inst.loaded_at = None
-                self._instances.pop(old_key, None)
-                # Two instances unloading at once would both land on
-                # key (-1, model, source) and the second would overwrite
-                # the first, orphaning it. Keep them apart by suffixing.
-                if (-1, model_id, inst._source) in self._instances:
-                    inst.key = (-1 - len(self._instances), model_id,
-                                inst._source)
-                self._instances[inst.key] = inst
+            # 「关闭中」:置位期间并发启停请求会排队等它结束,而不是
+            # 把正在卸载的实例当成可复用的再 load 一次(rc=-6)。
+            inst._stop_depth += 1
+            try:
+                self._unload_one(inst, teardown)
+            finally:
+                inst._stop_depth -= 1
+
+    def _unload_one(self, inst: ModelInstance, teardown: bool) -> None:
+        """对单个实例跑 unload RPC + 状态回收(见 unload_instance)。"""
+        model_id = inst.model_id
+        if inst.rpc_client is not None:
+            try:
+                # unload_handler 立即返回 {"status": "unloaded"}。5s 足够。
+                with inst._probe_lock:
+                    if inst.rpc_client is None:
+                        return
+                    inst.rpc_client.call(
+                        {"action": "unload", "op": "unload"},
+                        timeout_ms=5_000)
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("unload %s (npu=%s) RPC failed: %s",
+                            model_id, inst.npu_index, e)
+        with self._lock:
+            old_key = inst.key
+            inst.npu_index = -1
+            inst.key = (-1, model_id, inst._source)
+            inst.status = "not_loaded"
+            inst.load_time_sec = None
+            inst.loaded_at = None
+            self._instances.pop(old_key, None)
+            # Two instances unloading at once would both land on
+            # key (-1, model, source) and the second would overwrite
+            # the first, orphaning it. Keep them apart by suffixing.
+            if (-1, model_id, inst._source) in self._instances:
+                inst.key = (-1 - len(self._instances), model_id,
+                            inst._source)
+            self._instances[inst.key] = inst
         # Tear down the local FastDDS endpoints so the cshim payload
         # pool doesn't pin in hub._services. The hub Service / Requester
         # is what AGENTS.md calls "每个 ~60 MB of RSS" per Service;
@@ -2787,12 +2836,12 @@ class ComputeRegistry:
         # Skipped when the caller defers it (see the ``teardown`` arg) —
         # ``stop_instance_local`` still needs this Requester to deliver
         # the shutdown RPC that follows.
-            if teardown:
-                self._teardown_rpc_client(inst)
-            else:
-                LOG.debug(
-                    "unload %s (npu=%s): rpc_client teardown deferred to caller",
-                    model_id, inst.npu_index)
+        if teardown:
+            self._teardown_rpc_client(inst)
+        else:
+            LOG.debug(
+                "unload %s (npu=%s): rpc_client teardown deferred to caller",
+                model_id, inst.npu_index)
 
     def stop_instance_local(self, model_id: str,
                             npu_index: Optional[int] = None) -> None:
@@ -2835,7 +2884,10 @@ class ComputeRegistry:
             raise RuntimeError(f"{model_id} 不在 registry")
         t0 = time.time()
         for inst in targets:
+            npu = inst.npu_index      # stop 会把它重置成 -1，先记卡号
             self._stop_inst(model_id, inst)
+            with self._lock:
+                self._recently_stopped[(model_id, npu)] = time.time()
         LOG.info(
             "compute_registry: stop_instance_local exit model=%s "
             "instances=%d elapsed=%.2fs thread=%s",
@@ -2848,13 +2900,29 @@ class ComputeRegistry:
             raise RuntimeError(
                 f"{model_id} 是远端 peer 提供的 service，本机无权停止")
         inst._probe_gen += 1  # 同 unload_instance 理由
+        # 「关闭中」覆盖**整个** 5 步拆除(含 3s SIGTERM 宽限),不只是
+        # unload RPC —— 那 3s 里实例仍报 running,是最容易被并发请求
+        # 当成可复用的窗口。
+        inst._stop_depth += 1
+        inst._stop_npu = inst.npu_index
+        try:
+            self._stop_inst_body(model_id, inst)
+        finally:
+            inst._stop_depth -= 1
+            inst._stop_npu = -1
+
+    def _stop_inst_body(self, model_id: str, inst: ModelInstance) -> None:
+        """_stop_inst 的主体(见 :meth:`_stop_inst`)。"""
         LOG.debug(
             "compute_registry: stop enter model=%s npu=%s source=%s thread=%s",
             model_id, inst.npu_index, inst._source, threading.get_ident())
         # (1) unload first — must not tear down the Requester, step 2
         # needs it. See the method docstring for why this order.
         try:
-            self.unload_instance(model_id, teardown=False)
+            # 只 unload **这一个**实例 —— unload_instance(model_id) 按模型
+            # 全量遍历,停一张卡会连带 unload 同一模型在别的卡上的实例
+            # (实测:停 npu0 的 qwen3-vl-4b,npu1 的那个也变 not_loaded)。
+            self._unload_one(inst, teardown=False)
         except Exception as e:  # noqa: BLE001
             LOG.warning("stop: unload %s raised: %s", model_id, e)
         # (2) graceful shutdown over the still-live Requester
@@ -3285,6 +3353,56 @@ class ComputeRegistry:
         found.sort(key=lambda i: (local_first.get(i._source, 9),
                                   i.npu_index))
         return found
+
+    def transition_cards(self, model_id: str) -> List[Tuple[int, str]]:
+        """这个模型处于过渡态的 ``(卡号, 过渡态)`` 列表(给 API 层排队用)。
+
+        ``stopping`` 的卡号取 ``_stop_npu`` —— unload 的乐观写会把
+        ``npu_index`` 重置成 -1。
+        """
+        out: List[Tuple[int, str]] = []
+        for inst in self._instances_of(model_id):
+            kind = transition_of(inst)
+            if not kind:
+                continue
+            npu = (inst._stop_npu if kind == "stopping" else inst.npu_index)
+            out.append((npu, kind))
+        return out
+
+    def was_recently_stopped(self, model_id: str,
+                              npu_index: Optional[int] = None,
+                              window_s: float = 10.0) -> bool:
+        """这个模型是不是刚被本机停掉过(``window_s`` 秒内)?
+
+        DELETE 是幂等语义:刚停过的再删一次应成功,而不是 404。
+        """
+        now = time.time()
+        with self._lock:
+            for (mid, npu), ts in list(self._recently_stopped.items()):
+                if now - ts > window_s:
+                    self._recently_stopped.pop((mid, npu), None)
+                    continue
+                if mid != model_id:
+                    continue
+                if npu_index is not None and npu != npu_index:
+                    continue
+                return True
+        return False
+
+    @contextlib.contextmanager
+    def model_op_lock(self, model_id: str):
+        """同模型的启停操作串行化。
+
+        排队后可能有多个请求同时醒来 —— 一起 bind 又是「两个 init 线程
+        抢同一份 NPU 内存」(rc=-6)。
+        """
+        with self._lock:
+            lock = self._model_locks.get(model_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._model_locks[model_id] = lock
+        with lock:
+            yield
 
     def list_with_source(self) -> list[dict]:
         """UI-friendly snapshot of every catalog model's current state.

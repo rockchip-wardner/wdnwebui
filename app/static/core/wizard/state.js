@@ -1932,8 +1932,24 @@
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (!r.ok) return false;
       const data = await r.json();
-      // 1. 停非必需(后端契约 DELETE + JSON {model};按 capability 是否被 swcap_to_model 命中判断)
-      for (const inst of (data.instances || [])) {
+      // 1. 停非必需(后端契约 DELETE + JSON {model, npu_index})
+      //
+      // 判据必须是 **(模型, 卡位) 对**,不是模型级。同一个模型跑两张卡
+      // 是合法形态(vtd: qwen3-vl-4b 同时占 npu0 和 npu1),但「需要的卡」
+      // 逐张不同:vd 卡要 (qwen3-vl-4b, npu0) + (qwen2.5-omni-3b, npu1)。
+      // 按 capability 判会以为 npu1 上那个 qwen3-vl-4b 也是需要的 →
+      // 不停 → npu1 显存被占(3500MB)→ omni 要 2500MB 装不下 →
+      // rc=-6 起不来(真机实测)。
+      const instances = data.instances || [];
+      // 没声明卡号的模型 → 任意卡都算需要;声明了 → 只有那几张卡算。
+      const wantedModels = new Set();
+      const wantedPairs = new Set();
+      for (const m of Object.values(cfg.swcap_to_model || {})) {
+        if (m.npu_index == null) { wantedModels.add(m.model_id); continue; }
+        const npus = Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index];
+        for (const n of npus) wantedPairs.add(m.model_id + "@" + n);
+      }
+      for (const inst of instances) {
         // 安全护栏:_source === "adopted" 是从远端 peer 通过 DDS adopt
         // 来的算力实例(其他板子 spawn 的 worker),本机无权限启停 —
         // 跳过整个循环,不动 DELETE 也不动任何字段。Peer 实例的 NPU
@@ -1941,20 +1957,37 @@
         // 错误(wizard 一键开启曾因缺失此护栏误关 peer 模型)。
         // spawned / adopted_local(本机)继续走原逻辑。
         if (inst._source === "adopted") continue;
-        const caps = inst.capability_types || [];
-        const isNeeded = caps.some((c) => cfg.swcap_to_model[c]);
+        const modelId = inst.model_id;
+        if (!modelId) continue;
+        // 卡号未知(npu_index 缺失 / -1)→ **无法**判断它是不是「要的那张
+        // 卡」→ 一律不动它。DELETE 不带卡号 = 停该模型**所有卡**,会连本
+        // 应用需要的那张一起停掉(真机 BUG 的同款后果,只是方向相反)。
+        const npuKnown = Number.isInteger(inst.npu_index) && inst.npu_index >= 0;
+        const isNeeded = !npuKnown
+          || wantedModels.has(modelId)
+          || wantedPairs.has(modelId + "@" + inst.npu_index);
         // running / loading 状态的实例才需要停(其他状态后端会拒)
         if (!isNeeded && (inst.status === "running" || inst.status === "loading")) {
-          const modelId = inst.model_id;
-          if (!modelId) continue;
+          // 还在启动中 → 跳过这一个(后端对「启动中禁用」是 409 拒绝,
+          // 硬发只会把整条链带失败)。同模型的**别的卡**照常处理 ——
+          // 带上 npu_index 后 DELETE 只影响这一张。
+          if (inst.status === "loading") continue;
+          // 正在关闭中 → 已经在关了,不用再发一次
+          if (inst.transition === "stopping") continue;
           const dr = await fetch("/api/compute/instances", {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ model: modelId }),
+            // 带 npu_index:只停这一张卡。不带的话后端会停该模型的
+            // 所有卡 —— 连本应用需要的那些卡一起停掉。
+            body: JSON.stringify({ model: modelId, npu_index: inst.npu_index }),
           });
           if (!dr.ok) {
-            console.warn("[wizard-state] stop", modelId, "→ HTTP", dr.status,
-                         await dr.text().catch(() => ""));
+            const detail = await dr.text().catch(() => "");
+            // 实例已经不在了(快照是 1s 前的,期间可能被别人停掉)→
+            // 达到目的,继续。后端对「不在 registry」返 400 不是 404。
+            if (dr.status === 404 || detail.includes("不在 registry")) continue;
+            console.warn("[wizard-state] stop", modelId, "@", inst.npu_index,
+                         "→ HTTP", dr.status, detail);
             return false;
           }
         }

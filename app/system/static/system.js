@@ -1847,6 +1847,7 @@ const ComputeConfigPage = {
   _system: null,        // /api/system-monitor 缓存
   _loading: false,
   _selectedTarget: {},  // {model_id: [npu_index, ...]} —— 用户勾选的卡（可多张）
+  _pendingModels: new Set(),  // 在飞的启停请求（model_id）—— 防连点
 
   init() {
     if (this.initialized) return;
@@ -2816,6 +2817,8 @@ const ComputeConfigPage = {
     // 远端 peer（其他板子的 worker）：本机无权启停，toggle 直接禁用，
     // 用户不必点得到、也不会再撞弹窗。
     const isPeer   = svc._source === "adopted";
+    // 后端过渡态:"" | "loading" | "stopping" —— 启停操作进行中。
+    const trans    = svc.transition || "";
 
     // ---- card 整体 class
     card.dataset.source = svc._source || "spawned";
@@ -2855,7 +2858,8 @@ const ComputeConfigPage = {
     // / unavailable 本就无 Popen 句柄，always 隐藏。
     const isOff = state === "not_loaded" || state === "missing_model_dir";
     h.restartBtn.style.display = (isOrphan || isUnavail || isOff) ? "none" : "";
-    h.restartBtn.disabled = isLoad;
+    // 关闭中也不能重启(restart = unload + spawn,必撞正在进行的关闭)
+    h.restartBtn.disabled = isLoad || trans === "stopping";
 
     // ---- toggle 状态
     h.toggle.classList.toggle("is-on", isOn);
@@ -2866,10 +2870,13 @@ const ComputeConfigPage = {
     const targetPicked = this._hasTargetPicked(card.dataset.model, svc);
     const needsTarget = !isOn && !isErr && !isMissingDir
                      && !isPeer && !isUnavail;
+    // 过渡态("loading"/"stopping")也锁住 toggle —— 后端会排队或 409,
+    // 前端先锁掉能少一轮无谓请求。
     const toggleBlocked = noCards
                        || isLoad
                        || isErr
                        || isPeer
+                       || !!trans
                        || (needsTarget && !targetPicked);
     h.toggleInput.checked = isOn;
     h.toggleInput.disabled = toggleBlocked;
@@ -2882,7 +2889,9 @@ const ComputeConfigPage = {
         `${meta.label}：${isOn ? "已启用" : "未启用"}，点击切换`);
     }
 
-    if (noCards) {
+    if (trans === "stopping") {
+      h.toggle.title = "正在关闭中，已锁定";
+    } else if (noCards) {
       h.toggle.title = "无可用 NPU 卡";
     } else if (isLoad) {
       h.toggle.title = "加载中，已锁定";
@@ -3074,6 +3083,11 @@ const ComputeConfigPage = {
   // 启用/禁用/重启三条路径的公共骨架：发请求 → 失败则按语义决定是否
   // 弹窗 → 刷新。抽出来是因为三者除 method/path/body/文案外完全同构。
   async _computeAction(path, method, body, actionLabel) {
+    // 同模型的启停请求在飞 → 忽略重复点击(后端会排队,但重复请求会让
+    // 用户多等一轮:启用 → 快照还没刷新的 1s 窗口内再点 → 变成"禁用")。
+    const key = (body && body.model) || "";
+    if (key && this._pendingModels.has(key)) return;
+    if (key) this._pendingModels.add(key);
     try {
       const r = await fetch(API_PREFIX + path, {
         method,
@@ -3087,6 +3101,8 @@ const ComputeConfigPage = {
       }
     } catch (e) {
       alert("请求失败: " + e.message);
+    } finally {
+      if (key) this._pendingModels.delete(key);
     }
     await this.load();
   },

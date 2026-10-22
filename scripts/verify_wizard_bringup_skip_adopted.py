@@ -21,33 +21,44 @@ def main():
 
         # Layer 1: 全 mock
         # GET /api/compute 返回混合实例
+        #
+        # **实例必须带 npu_index** —— 真机快照里一定有(registry 每次
+        # to_dict 都带)。判据是 (模型, 卡位) 对;卡号未知的实例一律不动
+        # (见 state.js 的 npuKnown 护栏),mock 缺字段就测不到「停多余
+        # 那张卡」这条主路径了。
         page.route("**/api/compute", lambda route: route.fulfill(
             status=200, content_type="application/json",
             body=json.dumps({
                 "instances": [
                     # 本机 spawned,running,swcap_vision_chat → 需要,不删
                     {"model_id": "qwen3.5-vl-4b", "status": "running",
-                     "_source": "spawned",
+                     "npu_index": 0, "_source": "spawned",
                      "capability_types": ["swcap_vision_chat", "swcap_text_chat"]},
                     # 本机 spawned,running,swcap_vision_embedding → 不需要,应删
                     {"model_id": "qwen3-vl-embedding-2b", "status": "running",
-                     "_source": "spawned",
+                     "npu_index": 0, "_source": "spawned",
                      "capability_types": ["swcap_vision_embedding"]},
                     # 远端 adopted,running,swcap_vision_embedding → 绝不应删
                     {"model_id": "qwen3-vl-embedding-2b", "status": "running",
-                     "_source": "adopted",
+                     "npu_index": 0, "_source": "adopted",
                      "_peer_name": "PeerBoard-X",
                      "_peer_ip": "192.168.1.100",
                      "capability_types": ["swcap_vision_embedding"]},
                     # 远端 adopted,running,swcap_text_chat → 绝不应删
                     {"model_id": "peer-text-llm", "status": "running",
-                     "_source": "adopted",
+                     "npu_index": 0, "_source": "adopted",
                      "_peer_name": "PeerBoard-Y",
                      "_peer_ip": "192.168.1.101",
                      "capability_types": ["swcap_text_chat"]},
                     # 本机 spawned,not_loaded → 状态过滤已跳过
-                    {"model_id": "qwen3-vl-4b", "status": "not_loaded",
-                     "_source": "spawned",
+                    {"model_id": "qwen3.5-vl-4b", "status": "not_loaded",
+                     "npu_index": 0, "_source": "spawned",
+                     "capability_types": ["swcap_vision_chat"]},
+                    # 本机 spawned,running 但**卡号未知**(npu_index=-1)
+                    # → 判不出是不是「要的那张卡」→ 一律不动(否则 DELETE
+                    #   不带卡号 = 停该模型所有卡,会误停需要的那张)
+                    {"model_id": "qwen3.5-vl-4b", "status": "running",
+                     "npu_index": -1, "_source": "spawned",
                      "capability_types": ["swcap_vision_chat"]},
                 ],
             }),
@@ -105,11 +116,29 @@ def main():
         browser.close()
 
         # Layer 2: 真实 server DELETE
+        #
+        # **不能写死模型名** —— peer 板子上跑什么模型会变(写死
+        # qwen3-vl-embedding-2b 的话,peer 不跑它时本机 registry 里根本没
+        # 这个实例 → 后端返 404「不在 registry」→ 测试红,但 server 的
+        # 403 护栏其实好好的)。改成从真实快照里挑一个 adopted 实例。
         print(f"\n=== Layer 2: 真实 server DELETE adopted ===")
+        snap = json.loads(urllib.request.urlopen(
+            "http://127.0.0.1:8000/api/compute", timeout=5).read())
+        adopted = [i for i in (snap.get("instances") or [])
+                   if i.get("_source") == "adopted"]
+        if not adopted:
+            print("  ⚠ 当前没有 peer adopt 实例 → 本层跳过(不是失败)")
+            print(f"\n=== 总结: {ok}/1 (Layer 2 跳过) ===")
+            print("✅ 全部通过")
+            return 0
+        target = adopted[0]
+        print(f"  目标: {target.get('model_id')} @ npu{target.get('npu_index')}"
+              f" (peer={target.get('_peer_name')})")
         req = urllib.request.Request(
             "http://127.0.0.1:8000/api/compute/instances",
             method="DELETE",
-            data=json.dumps({"model": "qwen3-vl-embedding-2b"}).encode(),
+            data=json.dumps({"model": target.get("model_id"),
+                             "npu_index": target.get("npu_index")}).encode(),
             headers={"Content-Type": "application/json"},
         )
         try:

@@ -56,6 +56,8 @@ Endpoints
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response
@@ -65,6 +67,7 @@ from app.core.compute.registry import (
     MODEL_PRESETS,
     card_count_override,
     get_registry,
+    transition_of,
 )
 
 
@@ -262,6 +265,55 @@ class ComputeConfigPayload(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# 过渡态排队
+#
+# 模型处在「启动中」(loading) 或「关闭中」(stopping) 时,新的启停请求
+# 不能直接执行 —— 都会 rc=-6:
+#
+#   * loading 中再 load  → worker 侧只在 running 时幂等 → 再起一个 init
+#     线程 → 两个 init 线程抢同一份 NPU 内存。
+#   * stopping 中再 load → session 正在被 close,新 session 又要占内存。
+#   * loading 中再 stop  → init 线程被 SIGKILL 砍掉,rknn3_destroy 没跑
+#     → NPU 显存不归还。
+#   * stopping 中再 stop → 实例已出 registry → 误报 404。
+#
+# 策略:启 → 排队等它结束;停 → loading 时拒绝(409),stopping 时排队。
+# 详见 AGENTS.md「模型启停的过渡态」。
+# --------------------------------------------------------------------------- #
+
+# loading 要等模型加载完:真机 30~90s(omni / LocateAnything 约 60s)。
+_QUEUE_WAIT_LOADING_S = 120.0
+# stopping 要等 5 步拆除(unload RPC + SIGTERM + 3s 宽限 + SIGKILL):~10s。
+_QUEUE_WAIT_STOPPING_S = 30.0
+
+
+async def _await_quiet(reg, model_id: str, npus: Optional[set],
+                       timeout_s: float) -> bool:
+    """等 ``model_id`` 在 ``npus``(None = 全部卡)上的过渡态结束。
+
+    True = 已静默可执行启停;False = 超时。
+
+    **必须 async 轮询**:单进程 uvicorn 只有一个事件循环,同步 sleep 会
+    把整个服务卡住(DELETE 本身就在同步阻塞事件循环)。
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        busy = [(n, k) for (n, k) in reg.transition_cards(model_id)
+                if npus is None or n in npus]
+        if not busy:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.25)
+
+
+def _transitions_of(reg, model_id: str, npu: Optional[int]) -> set:
+    """该模型在指定卡(不给 = 全部卡)上的过渡态种类集合。"""
+    return {k for (n, k) in reg.transition_cards(model_id)
+            if npu is None or n == npu}
+
+
+# --------------------------------------------------------------------------- #
 # 权限 / 状态工具
 # --------------------------------------------------------------------------- #
 def _require_owned(inst, action: str) -> None:
@@ -372,34 +424,52 @@ async def start_instance(req: InstanceRequest) -> dict:
     reg = get_registry()
     npu_indices = (req.npu_index if isinstance(req.npu_index, list)
                    else [req.npu_index])
+    # 过渡态前置判定：目标卡还在启动/关闭 → 排队等它结束，而不是直接
+    # 再 load 一次（见文件头的「过渡态排队」注释：那是 rc=-6 的来源）。
+    want = set(npu_indices)
+    if not await _await_quiet(reg, req.model, want, _QUEUE_WAIT_LOADING_S):
+        raise HTTPException(
+            status_code=409,
+            detail=(f"{req.model} 仍在启动/关闭中，请稍后重试"),
+        )
     created: list[dict] = []
     errors: list[dict] = []
     for n in npu_indices:
-        try:
-            # eager_load=False：算力页的卡是用户在 UI 上选的，走
-            # 「spawn（不带 --npu）→ RPC action=load」这条路。若同时传
-            # --npu 让 worker 自己 eager-load，两条 load 会争同一个
-            # session slot，worker 直接 rc=-6（真机实测）。
-            inst = reg.ensure_worker_for_model(req.model, allow_adopt=False,
-                                               npu_index=n, eager_load=False)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        if inst._source == "adopted":
-            peer_label = inst._peer_name or (inst._peer_guid or "")[:8] or "peer"
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"{req.model} 是远端 peer ({peer_label}) 提供的 service，"
-                    "本机无权 bind。请到对端机器上点启用，或先在本机启动"
-                    "一个新实例（unavailable → spawned）。"
-                ),
-            )
-        try:
-            inst = reg.bind_instance(inst, n)
-        except RuntimeError as e:
-            errors.append({"npu_index": n, "detail": str(e)})
-            continue
-        created.append(inst.to_dict())
+        # 同一模型的启停串行化 —— 排队的多个请求可能同时醒来。
+        with reg.model_op_lock(req.model):
+            try:
+                # eager_load=False：算力页的卡是用户在 UI 上选的，走
+                # 「spawn（不带 --npu）→ RPC action=load」。若同时传 --npu
+                # 让 worker 自己 eager-load，两条 load 会争同一个 session
+                # slot，worker 直接 rc=-6（真机实测）。
+                inst = reg.ensure_worker_for_model(
+                    req.model, allow_adopt=False,
+                    npu_index=n, eager_load=False)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            if inst._source == "adopted":
+                peer_label = (inst._peer_name
+                              or (inst._peer_guid or "")[:8] or "peer")
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"{req.model} 是远端 peer ({peer_label}) 提供的 "
+                        "service，本机无权 bind。请到对端机器上点启用，或先在"
+                        "本机启动一个新实例（unavailable → spawned）。"
+                    ),
+                )
+            # 幂等：已经在这张卡上 loading / running → 不用再 load。
+            # worker 侧只在 running 时幂等，loading 时会再起一个 init 线程
+            # 抢同一份 NPU 内存（rc=-6），所以这里必须挡住。
+            if inst.npu_index == n and inst.status in ("loading", "running"):
+                created.append(inst.to_dict())
+                continue
+            try:
+                inst = reg.bind_instance(inst, n)
+            except RuntimeError as e:
+                errors.append({"npu_index": n, "detail": str(e)})
+                continue
+            created.append(inst.to_dict())
     return {"ok": not errors, "instances": created,
             "errors": errors, "snapshot": reg.snapshot()}
 
@@ -439,8 +509,32 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
         400: registry 侧停止失败。
     """
     reg = get_registry()
-    inst = (reg._instances_of(req.model, req.npu_index) or [None])[0]
+    npu = req.npu_index
+    # 过渡态先判 —— 停止期间 unload 的乐观写会把 npu_index 重置成 -1，
+    # 按卡号查会「找不到」→ 误报 404（用户看到的「关闭一个正在关闭中
+    # 的模型」报错就是这么来的）。过渡态表用 _stop_npu 兜住卡号。
+    kinds = _transitions_of(reg, req.model, npu)
+    if "loading" in kinds:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"{req.model} 正在启动中，请等加载完成后再禁用"),
+        )
+    if "stopping" in kinds:
+        # 已经在关了 → 排队等它关完，返回幂等成功（不再发第二次 stop）。
+        want = {npu} if npu is not None else None
+        if not await _await_quiet(reg, req.model, want, _QUEUE_WAIT_STOPPING_S):
+            raise HTTPException(
+                status_code=409,
+                detail=(f"{req.model} 正在关闭中，请稍后重试"),
+            )
+        return {"ok": True, "snapshot": reg.snapshot()}
+    inst = (reg._instances_of(req.model, npu) or [None])[0]
     if inst is None:
+        # 刚被本机停过 → 幂等成功(DELETE 本来就是幂等语义)。单进程下
+        # 并发 DELETE 只能在事件循环里排队,轮到它时实例已不在(卡号也被
+        # 重置成 -1)→ 靠 registry._recently_stopped 兜住。
+        if reg.was_recently_stopped(req.model, npu):
+            return {"ok": True, "snapshot": reg.snapshot()}
         where = f" (npu_index={req.npu_index})" if req.npu_index is not None else ""
         raise HTTPException(
             status_code=404,
@@ -462,7 +556,11 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
             ),
         )
     try:
-        reg.stop_instance_local(req.model, req.npu_index)
+        with reg.model_op_lock(req.model):
+            # 锁内复查：等锁期间可能已经有人启/停过同一个模型。
+            if _transitions_of(reg, req.model, npu):
+                return {"ok": True, "snapshot": reg.snapshot()}
+            reg.stop_instance_local(req.model, npu)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "snapshot": reg.snapshot()}
@@ -481,13 +579,22 @@ async def restart_instance(req: RestartRequest) -> dict:
     仅 spawned 允许；adopted peer → 403。
     """
     reg = get_registry()
+    # restart = unload + spawn,过渡态中做必然撞车(rc=-6 / 显存不归还)。
+    kinds = _transitions_of(reg, req.model, None)
+    if kinds:
+        what = "启动中" if "loading" in kinds else "关闭中"
+        raise HTTPException(
+            status_code=409,
+            detail=f"{req.model} 正在{what}，请稍后重试",
+        )
     inst = reg._find_by_model(req.model)
     if inst is None:
         raise HTTPException(
             status_code=404, detail=f"{req.model} 不在 registry")
     _require_owned(inst, "重启")
     try:
-        reg.restart_instance_local(req.model)
+        with reg.model_op_lock(req.model):
+            reg.restart_instance_local(req.model)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "snapshot": reg.snapshot()}
@@ -618,7 +725,15 @@ async def stop_all_instances() -> dict:
     reg = get_registry()
     stopped: list[str] = []
     errors: list[str] = []
+    skipped: list[str] = []
     for inst in list(reg._instances.values()):
+        # 跳过过渡态：正在启动中的实例硬 unload 会让 worker 的 init
+        # 线程带不走 rknn3_destroy → NPU 显存不归还；正在关闭中的本来
+        # 就在关,重复 unload 没意义。
+        kind = transition_of(inst)
+        if kind:
+            skipped.append(f"{inst.model_id}:{kind}")
+            continue
         try:
             reg.unload_instance(inst.model_id)
             stopped.append(inst.model_id)
@@ -627,6 +742,7 @@ async def stop_all_instances() -> dict:
     return {
         "ok": not errors,
         "stopped": stopped,
+        "skipped": skipped,
         "errors": errors,
         "snapshot": reg.snapshot(),
     }

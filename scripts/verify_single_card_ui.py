@@ -252,6 +252,12 @@ def main():
         print("\n【4】切到「音频描述」→ 一键开启只加载 omni @ NPU0")
         # 先把 VLM 跑起来 —— 单卡下「换模型」的真实场景是：停掉旧的、
         # 加载新的。一键开启的第 1 步必须先停掉 VLM。
+        #
+        # **必须等到 running 再点一键开启**：模型加载要 ~50s，只等 3s 的话
+        # 实例还是 `loading` —— 一键开启对「启动中」的实例**故意不删**
+        # （后端对「启动中禁用」是 409 拒绝，硬发只会把整条链带失败，见
+        # AGENTS「模型启停的过渡态」）。那样「停掉旧模型」这一步根本不会
+        # 发生，断言看到的 DELETE 列表是空的 —— 那不是 bug，是没等到位。
         page.evaluate(
             """async () => {
                 await fetch('/api/compute/instances', {
@@ -261,7 +267,21 @@ def main():
                 });
             }"""
         )
-        page.wait_for_timeout(3000)
+        vlm_running = False
+        for _ in range(60):
+            page.wait_for_timeout(2000)
+            vlm_running = page.evaluate(
+                """async () => {
+                    const r = await fetch('/api/compute', {cache:'no-store'});
+                    const d = await r.json();
+                    return (d.instances || []).some(i =>
+                        i.model_id === 'qwen3-vl-4b' && i.status === 'running'
+                        && i._source !== 'adopted');
+                }"""
+            )
+            if vlm_running:
+                break
+        check("VLM 已 running（停旧模型的前提）", vlm_running)
         posts = []
         page.on("request", lambda r: posts.append(
             (r.method, r.post_data))

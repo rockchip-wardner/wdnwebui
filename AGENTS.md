@@ -1809,15 +1809,61 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
 ### `_wizardBringUpModels` 全局入口
 
 `app/static/core/wizard/state.js` 暴露 `window._wizardBringUpModels(cfg)`,
-供 env-check 步骤的"一键开启"按钮调用。三步流程:
+供 env-check 步骤的"一键开启"按钮调用。两步流程:
 
 1. **停非必需**(本机 spawned / adopted_local;**跳过 adopted 远端 peer**):
-   `instance._source !== "adopted"` 的 running / loading 实例,如果其
-   capability 不在 `cfg.swcap_to_model` 中 → DELETE `/api/compute/instances`。
+   `instance._source !== "adopted"` 的 running 实例,如果它**不在本应用
+   需要的 (模型, 卡位) 对集合里** → DELETE `/api/compute/instances
+   {model, npu_index}`(**必须带卡号**)。
 2. **启必需**:`swcap_to_model` 的每条 → POST `/api/compute/instances
    {model, npu_index}`(allow_adopt=False,peer adopted → server 403 兜底)。
 3. 返回 `true` 表示启动指令已发,后台加载中;false 表示失败(env_check 步骤
    会 retry 2 次 + confirm 兜底)。
+
+#### 「停非必需」的判据必须是 **(模型, 卡位) 对**,不是模型级（v0.28 修）
+
+用户实测 BUG(音视频描述 / vd 卡):两张 RK182X 都加载了 [VLM]视觉描述v3
+(`qwen3-vl-4b`) 时,点「一键开启所需模型」→ [Omni]多感知描述v2.5
+(`qwen2.5-omni-3b`)**起不来**。
+
+vd 卡的 `swcap_to_model` 要的是**两张不同的卡**:
+
+```
+swcap_video_describe  → qwen3-vl-4b        @ npu0
+swcap_audio_understand → qwen2.5-omni-3b   @ npu1
+```
+
+原判据按 **capability(模型级)** 算:`qwen3-vl-4b` 的 capability 是
+`swcap_video_describe`,在 `swcap_to_model` 里 → **两张卡上的都判成
+「需要」→ 都不停** → npu1 仍被 qwen3-vl-4b 占着(3500MB),omni 要
+2500MB,5120 装不下 → worker **rc=-6**。
+
+> 同模型跑两张卡是**合法形态**(vtd 卡就是 `qwen3-vl-4b @ npu[0,1]`),
+> 但「需要哪张卡」逐张不同。判据粒度错了就会腾不出卡。
+
+* **需要集合**:`swcap_to_model` 的每条按 `npu_index` 展开成
+  `(model_id, npu)` 对;`npu_index` 为 null 的卡 → 该模型**任意卡**都算需要。
+* **DELETE 必须带 `npu_index`** —— 不带就是「停该模型的所有卡」,会连本
+  应用需要的那张一起停掉。
+* **卡号未知(`npu_index` 缺失 / -1)的实例一律不动** —— 判不出它是不是
+  「要的那张卡」;而 DELETE 不带卡号 = 停该模型**所有卡**,等于把需要的
+  那张也停掉(同款事故的反方向)。真机快照里 `npu_index` 一定有值,这条
+  护栏是给「字段缺失 / 乐观写重置成 -1」的快照兜底。
+
+#### `stop_instance_local(npu_index=N)` 只停那一张,连带 unload 也一样（v0.28 修）
+
+`stop_instance_local` 的文档语义是「`npu_index` 缺省停该模型全部实例;
+给了卡号只停那一张」。但 `_stop_inst` 内部调的是
+`unload_instance(model_id, teardown=False)` —— 那是**按模型全量遍历**的,
+于是**停 npu0 的 qwen3-vl-4b 会把 npu1 上的同模型实例也 unload 掉**
+(真机实测:npu1 的那个跟着变 `not_loaded`),与文档语义相悖,也会把
+「腾出来的卡」重新弄脏。
+
+→ `_stop_inst` 改调 `_unload_one(inst, teardown=False)`(单实例版),
+只回收目标实例。
+
+回归:`scripts/verify_wizard_multicard_bringup.py`(5 断言,mock 驱动,
+断言「停的是多余那张卡、不是需要的那张、DELETE 带卡号」)。
 
 ### 向导 finish 步的等待必须遇终态立即中止（v0.28 修）
 
@@ -2167,6 +2213,35 @@ const r = await openVtdFromTextarea();   // 内部读文本框 → 按行拆 →
 > 同类信号：**症状只在"多值"时出现、单值正常**，几乎总是调用方把多值
 > 整块塞进了单值字段。
 
+### 踩过的坑：`#wd-wizard-stepper` 是**全局 id** → document 级选择器会读到另一个向导
+
+向导容器是 `#wd-wizard-root-<appId>`，但它内部的 stepper / body 用的是
+**不带 app id 的全局 id**（`#wd-wizard-stepper` / `#wd-wizard-body`）。
+
+框架内部没事 —— `state.js` 一律用 `container.querySelector("#wd-wizard-stepper")`
+**限定在本卡容器内**（`_gotoStep` / `_renderStepper` 都这么写）。
+
+**页面里可能同时存在两个向导容器**：框架在页面加载时会自动进入「上次
+打开的卡片」并 mount 它，你再切到另一张卡 → 两个容器短暂并存 →
+**同名 id 重复**。
+
+于是**外部**用 document 级选择器就会串台：
+
+```js
+// ❌ 读到的是另一个向导的 stepper —— 步骤号恒为 0
+document.querySelectorAll('#wd-wizard-stepper .wd-wizard-step-dot')
+// ✅ 限定在本卡容器内
+document.getElementById('wd-wizard-root-' + id)
+      .querySelectorAll('.wd-wizard-step-dot')
+```
+
+症状：**回归脚本偶发失败、重跑又过**（是否串台取决于框架自动进的是
+哪张卡）。`verify_wizard_finish_abort.py` 的 `step_index()` 就踩过这个。
+
+> 视觉上没有影响（另一个向导所在的 page section 是 hidden 的），改 id
+> 化会波及 `framework.js` 的 `showPage` 定位，**别动** —— 写选择器时
+> 限定容器就行。
+
 ### 踩过的坑：两个状态框画在同一个 CSS 属性上 → 静默互相覆盖
 
 **曾有过两个框**：**黄框 = 当前正在被 VLM 推理的那一路**
@@ -2300,6 +2375,14 @@ cols==rows（1/4/9/16/25 路）才正好 16:9。6 路是 3×2，**必然有留�
 | Layer 1 UI | `scripts/verify_probe_env_local_only.py` | 5/5 |
 | Layer 3 | `scripts/verify_find_by_model_priority.py` | 10/10 |
 | 全量 wizard | `scripts/smoke_wizard_all.py` | 6/6 |
+| 启停过渡态 | `scripts/verify_compute_transition_guard.py` | 23/23 |
+| 一键开启腾卡 | `scripts/verify_wizard_multicard_bringup.py` | 5/5 |
+
+> **mock `/api/compute` 必须在 `page.goto()` 之前装好**。框架在页面加载
+> 时就会进卡片并 mount，向导的 `_probeEnv` 立刻拉 `/api/compute` —— route
+> 装晚了那次请求就打到**真后端**，板子上真在跑的模型会污染 `swMissing` /
+> `swOK`（「一键开启所需模型」按钮干脆不渲染）。症状是「脚本偶发失败、
+> 重跑又过了」—— 板子状态一变就复现。
 
 如果将来 peer adopted 也算"已就绪"(如多板共享算力场景),三层都得
 放宽;别只改一处 —— 前端看到 ✓ 但 server 仍 403 会让用户迷惑。
@@ -2493,6 +2576,62 @@ v0.8.28: in-place updated spawned for LocateAnything-3b (pid=0 npu=1 status=load
   —— adopt 命中本机 worker 时必须复用已有 entry，别新建 `adopted_local`。
 * **`set_active_app()` 要记承载该 capability 的全部 local 实例** —— 只记
   第一个会让「两张卡」在下次开机退化成一张。
+
+### 模型启停的过渡态：启停前必须先判状态（v0.28 修）
+
+用户报的四类竞态 —— 「再次开启一个正在启动中的模型」「开启一个正在
+关闭中的模型」「关闭一个正在启动中的模型」「关闭一个正在关闭中的
+模型」。四个都是 `rc=-6`（SIGABRT）的来源。
+
+**根因不是「没加锁」，是状态机缺了「关闭中」这一态。**
+`status` 的值域只有 `not_loaded / loading / running / error`，
+**关闭过程中对外仍报 running/loading** —— 并发请求看不出「这个实例
+正在被拆」，于是当成可复用的再 load 一次。worker 侧 `load_handler`
+只在 **running** 时幂等；**loading 时不命中那个分支** → 会**再起一个
+init 线程** → 两个 init 线程同时申请同一份 NPU 内存 → rc=-6。
+
+**判据**（`registry.transition_of()`，纯函数，单测友好）：
+
+| 过渡态 | 判据 | 说明 |
+|---|---|---|
+| `stopping` | `inst._stop_depth > 0` | unload / stop 期间置位；用**计数**不用 bool —— `_stop_inst` 内部会调 `unload_instance`（嵌套），内层 finally 减 1 不能把外层的「关闭中」提前清掉 |
+| `loading` | `inst.status == "loading"` | 含 worker 内部 init 线程那段（那段里 `_bind_inflight` 已清零，只有 status 还留着 loading） |
+
+`transition` 作为**独立字段**进快照，**不改 `status` 的值域** ——
+status 的消费方太多（wizard 等待 / probe / 算力页 badge / `_probe_env`），
+塞进 `"stopping"` 会波及一大片。
+
+**语义**（`app/system/api/compute.py`）：
+
+| 目标状态 | 操作 | 行为 |
+|---|---|---|
+| loading | 启用 | **排队**等它加载完 → 重新求值再执行（worker 侧 running 幂等，安全） |
+| loading | 禁用 | **409 拒绝**「正在启动中，请等加载完成后再禁用」—— 硬 unload 会让 worker 的 init 线程带不走 `rknn3_destroy` → **NPU 显存不归还** |
+| stopping | 启用 | **排队**等它关完 → 重新求值再执行 |
+| stopping | 禁用 | **排队**等它关完 → 幂等 200 |
+
+**排队必须 async 轮询**：服务是**单进程** uvicorn（单事件循环），同步
+sleep 会把整个服务卡住 —— 而 DELETE 本身就在同步阻塞事件循环（unload
+RPC + SIGTERM + 3s 宽限 + SIGKILL ≈ 4–5s）。
+
+**排队醒了之后要持 per-model 锁 + 重新求值**：多个请求可能同时醒来，
+一起 bind 又变成「两个 init 线程抢 NPU 内存」。且**已经 running 的
+实例再「启用」必须幂等跳过**（不再 bind）—— worker 侧虽然 running
+时幂等，但多一次 RPC 没意义。
+
+**「刚停过」要记一笔（`_recently_stopped`）**：单进程下并发 DELETE
+只能在事件循环里排队，等它轮到时「关闭中」早已结束、实例的
+`npu_index` 也被乐观写重置成 -1 → 按卡号查不到 → **误报 404**。
+只有记住「刚停过」才能把它判成幂等成功。DELETE 本来就是幂等语义。
+
+**前端**（`system.js`）：`transition` 非空 → toggle / 重启按钮禁用 +
+提示「正在关闭中」；`_computeAction` 加 per-model pending 锁防连点。
+**向导**（`wizard/state.js`）：「一键开启」第 1 步**跳过**正在启动中的
+模型 —— DELETE 不带卡号会把该模型所有卡一起停，撞上 loading 那张就是
+409，硬发只会把整条链带失败。
+
+回归：`scripts/verify_compute_transition_guard.py`（23 断言，假 registry
+驱动 API handler，不起服务不占 NPU）；真机四场景见下节。
 
 ### 只有 npu0 / npu1 能跑模型（v0.20 实测）
 
