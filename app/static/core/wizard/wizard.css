@@ -689,6 +689,104 @@
   cursor: not-allowed;
 }
 
+/* ════════════════════════════════════════════════════════════════════ */
+/* prompt_rows 字段(定位提示词等):卡片条目 + focus-within 高亮      */
+/* ════════════════════════════════════════════════════════════════════ */
+/*
+ * 基础样式(.vtl-prompt-*)在 framework.css,应用页面(vtl 卡片自己的功能页)
+ * 用的是同一套类名 —— 这里**只在向导容器内覆写**,应用页面外观一行不变。
+ * 序号徽标 + 输入框 + 删除按钮收在一张卡里,聚焦时整卡高亮。
+ */
+.wd-wizard-container .vtl-prompt-rows-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wd-wizard-container .vtl-prompt-rows {
+  gap: 8px;
+  margin-bottom: 0;
+}
+/* 卡片本体 = .vtl-prompt-row-inner。基础样式里 .vtl-prompt-row 是折叠
+ * 动画容器(0fr→1fr),向导不折叠(行是直接 add/remove 的),摊平成 block。 */
+.wd-wizard-container .vtl-prompt-row {
+  display: block;
+}
+.wd-wizard-container .vtl-prompt-row-inner {
+  display: grid;
+  grid-template-columns: 22px 1fr 26px;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 8px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: visible;
+  transition: border-color 0.15s, box-shadow 0.15s, background-color 0.15s;
+}
+/* 聚焦时整卡高亮 —— 高亮由卡片承担,输入框自己不再画光环 */
+.wd-wizard-container .vtl-prompt-row-inner:focus-within {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  background: #fbfdff;
+}
+/* 序号徽标(圆形,聚焦时转蓝) */
+.wd-wizard-container .vtl-prompt-row-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0;
+}
+.wd-wizard-container .vtl-prompt-row-inner:focus-within .vtl-prompt-row-num {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+/* 输入框:融入卡片(无边框),边框由卡片统一给 */
+.wd-wizard-container .vtl-prompt-row-input {
+  height: 32px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+}
+.wd-wizard-container .vtl-prompt-row-input:focus {
+  outline: none;
+  box-shadow: none;
+}
+.wd-wizard-container .vtl-prompt-row-input::placeholder {
+  color: #9ca3af;
+}
+/* 删除按钮:平时中性幽灵态,hover 才转红 */
+.wd-wizard-container .vtl-prompt-row-remove {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+  color: #9ca3af;
+  background: transparent;
+  border-color: transparent;
+}
+.wd-wizard-container .vtl-prompt-row-remove:hover:not(:disabled) {
+  background: #fee2e2;
+  border-color: #fecaca;
+  color: #dc2626;
+}
+/* toolbar:加行按钮在左,计数在右 */
+.wd-wizard-container .vtl-prompt-toolbar {
+  justify-content: flex-start;
+}
+.wd-wizard-container .vtl-prompt-hint {
+  margin-left: auto;
+}
+
 /* 移动端响应式 */
 @media (max-width: 1023px) {
   .wd-wizard-section {

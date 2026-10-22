@@ -903,11 +903,15 @@
           // 多行 prompt 输入 UI(类似 vtl 的"定位提示词"):rows 每行一个
           // text input,初始 1 行,可点"+"加到 max_rows,点"−"删到
           // min_rows。值存为字符串数组,opts[ui_key] = [v1, v2, ...]。
-          // 复用 framework.css 已有的 .vtl-prompt-* 类(已在应用页面用),
-          // wizard 这边保持视觉一致。
-          el = _ce("div", "vtl-prompt-rows");
+          //
+          // el = 包装层(rows + toolbar):rows 单独装一层,加行才插在
+          // toolbar 上方 —— wrap.appendChild(el) 在 switch 之后,直接往
+          // wrap 挂 toolbar 会排到所有输入框**上面**。
+          el = _ce("div", "vtl-prompt-rows-wrap");
           el.dataset.fieldId = field.id;
           el.dataset.fieldType = "prompt_rows";
+          const rowsEl = _ce("div", "vtl-prompt-rows");
+          el.appendChild(rowsEl);
           const minRows = Number.isFinite(field.min_rows) ? field.min_rows : 1;
           const maxRows = Number.isFinite(field.max_rows) ? field.max_rows : 20;
           // 行容器(已有 prompt 数组 → 恢复;否则 1 行)
@@ -916,10 +920,12 @@
             : [""];
           const wizardAddPromptRow = (val) => {
             const row = _ce("div", "vtl-prompt-row is-open");
+            // 挂 wd-wizard-input:不挂就退回浏览器默认控件样式(2px 灰边 /
+            // 24px 高),和向导其它字段不像一家人
             row.innerHTML = `
               <div class="vtl-prompt-row-inner">
                 <span class="vtl-prompt-row-num"></span>
-                <input type="text" class="vtl-prompt-row-input"
+                <input type="text" class="vtl-prompt-row-input ${WIZARD_NS}input"
                        maxlength="200" spellcheck="false"
                        placeholder="${(field.placeholder || "").replace(/"/g, "&quot;")}" />
                 <button type="button" class="vtl-prompt-row-remove vd-btn vd-btn-mini"
@@ -927,57 +933,54 @@
               </div>`;
             const input = row.querySelector(".vtl-prompt-row-input");
             if (val) input.value = val;
-            el.appendChild(row);
+            // 点卡片空白处也聚焦(卡片本身就是一个字段)
+            row.querySelector(".vtl-prompt-row-inner").addEventListener("click", (ev) => {
+              if (ev.target.closest("button")) return;
+              input.focus();
+            });
+            rowsEl.appendChild(row);
           };
           initial.forEach(wizardAddPromptRow);
-          // toolbar: 添加按钮 + 计数
+          // toolbar: 添加按钮 + 计数(排在 rows 之后)
           const toolbar = _ce("div", "vtl-prompt-toolbar");
           const addBtn = _ce("button", "vd-btn vtl-prompt-add", "+ 添加输入框");
           addBtn.type = "button";
           const hintEl = _ce("span", "vtl-prompt-hint");
           toolbar.appendChild(addBtn);
           toolbar.appendChild(hintEl);
-          // 容器 wrap(挂载 el + toolbar)— wrap 是 _renderFormStep 后续的
-          // 统一容器,带 label;toolbar 紧跟 el。
-          wrap.appendChild(toolbar);
-          // 行内 helper:重排编号 + 更新 add 按钮 disabled + 更新 hint
-          const renumber = () => {
-            el.querySelectorAll(".vtl-prompt-row-num").forEach((n, i) => {
-              n.textContent = String(i + 1);
+          el.appendChild(toolbar);
+          // 行内 helper:编号 / 计数 / 按钮可用性一次同步
+          const syncRows = () => {
+            const rows = rowsEl.querySelectorAll(".vtl-prompt-row");
+            rows.forEach((r, i) => {
+              r.querySelector(".vtl-prompt-row-num").textContent = String(i + 1);
             });
-            const cnt = el.querySelectorAll(".vtl-prompt-row").length;
-            hintEl.textContent = `${cnt} / ${maxRows}`;
+            const cnt = rows.length;
+            // 「1 / 20」语义不明 → 补单位
+            hintEl.textContent = `${cnt} / ${maxRows} 条`;
+            hintEl.title = `已添加 ${cnt} 条,最多 ${maxRows} 条`;
             addBtn.disabled = cnt >= maxRows;
-          };
-          // 行内 helper:同步 remove 按钮 disabled(MIN_ROWS 时禁)
-          const syncRemoveBtns = () => {
-            const cnt = el.querySelectorAll(".vtl-prompt-row").length;
-            el.querySelectorAll(".vtl-prompt-row-remove").forEach((b) => {
+            rowsEl.querySelectorAll(".vtl-prompt-row-remove").forEach((b) => {
               b.disabled = cnt <= minRows;
             });
           };
           // 增行
           addBtn.addEventListener("click", () => {
-            const cnt = el.querySelectorAll(".vtl-prompt-row").length;
-            if (cnt >= maxRows) return;
+            if (rowsEl.querySelectorAll(".vtl-prompt-row").length >= maxRows) return;
             wizardAddPromptRow("");
-            renumber();
-            syncRemoveBtns();
+            syncRows();
           });
-          // 删行(直接 DOM remove — 跳过应用页 vtlPromptRemoveRow
+          // 删行(直接 DOM remove —— 跳过应用页 vtlPromptRemoveRow
           // 的折叠动画,wizard 卸载/下一步时 DOM 会整体被替换)
           el.addEventListener("click", (e) => {
             const btn = e.target.closest(".vtl-prompt-row-remove");
             if (!btn) return;
             const row = btn.closest(".vtl-prompt-row");
-            const cnt = el.querySelectorAll(".vtl-prompt-row").length;
-            if (!row || cnt <= minRows) return;
-            row.parentNode.removeChild(row);
-            renumber();
-            syncRemoveBtns();
+            if (!row || rowsEl.querySelectorAll(".vtl-prompt-row").length <= minRows) return;
+            row.remove();
+            syncRows();
           });
-          renumber();
-          syncRemoveBtns();
+          syncRows();
           break;
         default: // text
           el = _ce("input", WIZARD_NS + "input");
