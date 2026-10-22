@@ -81,4 +81,8 @@ def split_thinking(text: str) -> Tuple[str, str]:
         thinking = m.group(1).strip()
         answer = text[m.end():].strip()
         return thinking, answer
+    # Only an opening marker, never closed (non-thinking models still emit
+    # ``<think>`` sometimes): strip it so it cannot leak into the answer.
+    if "<think>" in text:
+        return "", text.replace("<think>", "", 1).strip()
     return "", text.strip()

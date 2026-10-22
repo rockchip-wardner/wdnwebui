@@ -316,6 +316,7 @@ def _run_turn(
     tool_names: List[str],
     context_limit: int,
     max_new_tokens: int,
+    enable_thinking: bool = False,
     on_delta: Optional[TypingCallable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """One generation turn: trim → infer → classify → split.
@@ -334,6 +335,7 @@ def _run_turn(
         tools=classes,
         on_delta=on_delta,
         max_new_tokens=max_new_tokens,
+        enable_thinking=enable_thinking,
     ))
 
     tool_call = ""
@@ -367,6 +369,7 @@ def run_chat_with_tools(
     *,
     context_limit: int,
     max_new_tokens: int = 2048,
+    enable_thinking: bool = False,
     tool_names: List[str],
     on_delta: Optional[TypingCallable[[str], None]] = None,
     stop_event=None,
@@ -423,6 +426,7 @@ def run_chat_with_tools(
                 tool_names=tool_names if i == 1 else [],
                 context_limit=context_limit,
                 max_new_tokens=max_new_tokens,
+                enable_thinking=enable_thinking,
                 on_delta=on_delta,
             )
         except Exception as exc:  # noqa: BLE001

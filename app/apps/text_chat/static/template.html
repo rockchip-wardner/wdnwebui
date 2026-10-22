@@ -17,8 +17,15 @@
 
         <div class="imb-card">
           <div class="imb-card-head">
-            <h3>对话</h3>
-            <span class="imb-status" id="text-chat-state-badge" data-state="idle">空闲</span>
+            <div class="imb-card-head-title">
+              <h3>对话</h3>
+              <span class="imb-status" id="text-chat-state-badge" data-state="idle">空闲</span>
+            </div>
+            <label class="text-chat-thinking-toggle"
+                   title="开启后模型先输出思考过程（更慢，消耗更多 token）">
+              <input type="checkbox" id="text-chat-thinking" />
+              <span>深度思考</span>
+            </label>
             <span class="vd-spacer"></span>
             <span class="imb-meta-inline" id="text-chat-tokens">0 / 16384 tokens</span>
             <button class="vd-btn vd-btn-mini" id="text-chat-reset-btn">清空对话</button>

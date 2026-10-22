@@ -35,6 +35,7 @@ cannot answer a question we need.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, List, Optional
 
 from wdndds import LLMRPCSession
@@ -51,6 +52,72 @@ _INFER_TIMEOUT_MS = 120_000
 # answer in milliseconds and must not inherit the inference budget, or a
 # wedged inference would make the UI's poll loop look broken too.
 _CONTROL_TIMEOUT_MS = 15_000
+
+
+# --------------------------------------------------------------------------- #
+# Thinking-mode arbitration (shared worker, per-call toggle)
+# --------------------------------------------------------------------------- #
+# ``enable_thinking`` is a per-call field on ``session_run``, but the RKNN
+# session latches thinking **on** once it has been enabled: a later
+# ``enable_thinking=False`` is ignored until the KV cache is cleared *and*
+# the chat template is re-applied (measured on Qwen3.5-4B; ``reset()``
+# alone is a no-op). The worker's ``set_thinking_mode`` op owns that state
+# so every caller — text chat, video description, USB-HID agent, WeChat —
+# runs in the mode it asked for, even though they share one session.
+#
+# The lock is per worker, not global: different models are independent and
+# must not serialise against each other. It surrounds both the mode switch
+# and the ``respond`` call, so within this process no other caller can flip
+# the mode in between. (A LAN peer adopting the same worker is outside this
+# lock; see AGENTS.md — single-board deployments are unaffected.)
+_THINKING_LOCKS: dict[str, threading.RLock] = {}
+_THINKING_LOCKS_GUARD = threading.Lock()
+_THINKING_SUPPORTED: dict[str, bool] = {}
+
+
+def _thinking_lock(service_name: str) -> threading.RLock:
+    with _THINKING_LOCKS_GUARD:
+        lock = _THINKING_LOCKS.get(service_name)
+        if lock is None:
+            lock = threading.RLock()
+            _THINKING_LOCKS[service_name] = lock
+        return lock
+
+
+def _wrap_thinking_mode(sess: Any, service_name: str) -> None:
+    """Tell the worker the mode the current caller expects before ``respond``.
+
+    ``set_thinking_mode`` is idempotent: worker-side state is the single
+    source of truth, and it only does the reset + template reapply when the
+    requested mode actually differs. That is what makes the toggle "only
+    acts on change" while still being correct if another board flipped the
+    session in the meantime.
+    """
+    orig_respond = sess.respond
+    lock = _thinking_lock(service_name)
+
+    async def respond(prompt: Any = None, *args: Any, **kwargs: Any) -> Any:
+        desired = bool(kwargs.get("enable_thinking", False))
+        with lock:
+            # A worker that predates the op answers "unknown op". Remember
+            # that (unless the caller needs ON, where a retry may succeed
+            # after an upgrade) so non-thinking models pay at most one
+            # failed control call per process.
+            if _THINKING_SUPPORTED.get(service_name) is not False or desired:
+                try:
+                    sess.call_op(
+                        "set_thinking_mode",
+                        {"enable_thinking": desired},
+                        timeout_ms=_CONTROL_TIMEOUT_MS,
+                    )
+                    _THINKING_SUPPORTED[service_name] = True
+                except Exception as e:  # noqa: BLE001
+                    if "unknown op" in str(e).lower():
+                        _THINKING_SUPPORTED[service_name] = False
+                    LOG.debug("set_thinking_mode failed (%s) — continuing", e)
+            return await orig_respond(prompt, *args, **kwargs)
+
+    sess.respond = respond
 
 
 def make_rpc_session(
@@ -93,6 +160,9 @@ def make_rpc_session(
     # its spec. Attach it so diagnostics and logs can name the model
     # without threading the id through every call site.
     sess.model_id = model_id
+    # Make ``enable_thinking`` behave as a per-call toggle even though the C
+    # session latches it on. See the block above.
+    _wrap_thinking_mode(sess, service_name)
     return sess
 
 

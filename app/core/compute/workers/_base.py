@@ -814,6 +814,46 @@ def reset_handler(state: dict) -> dict:
         return {"status": "error", "error": f"reset failed: {e}"}
 
 
+def set_thinking_mode_handler(state: dict, payload: dict) -> dict:
+    """Idempotently switch the C-side thinking mode for the shared session.
+
+    The RKNN session keeps thinking enabled across calls even when a later
+    ``respond(enable_thinking=False)`` asks to turn it off; only resetting
+    the KV cache **and re-applying the chat template** restores
+    non-thinking mode (measured on Qwen3.5-4B: ``clear_kvcache`` alone is
+    a no-op, re-setting the template is what actually flips it back).
+
+    The state lives **here**, in the worker, because the C session is the
+    single source of truth: several main processes (this board plus a LAN
+    peer that adopted this worker) route requests to the same session, so
+    a caller-side cache would disagree after the other board flipped it.
+
+    ``changed=False`` for the common case (mode already matches), so the
+    caller pays one cheap control-plane round trip and no reset unless the
+    mode really changes.
+    """
+    desired = bool(payload.get("enable_thinking", False))
+    sess = state.get("session")
+    if sess is None:
+        return {"status": "noop (not loaded)", "changed": False}
+    current = bool(state.get("thinking_mode", False))
+    if current == desired:
+        return {"status": "ok", "changed": False}
+    try:
+        sess.reset()
+        backend = getattr(sess, "_backend", None)
+        rknn = getattr(backend, "rknn_llm", None) or getattr(backend, "rknn", None)
+        if rknn is None:
+            return {"status": "error", "error": "no rknn handle"}
+        from wdnai.backends._common import apply_chat_template
+        apply_chat_template(rknn)
+        state["thinking_mode"] = desired
+        LOG.info("thinking mode -> %s (reset + chat template reapplied)", desired)
+        return {"status": "ok", "changed": True}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": f"set_thinking_mode failed: {e}"}
+
+
 def _pcm_chunk_forwarder_factory(sock):
     """Build the SDK's ``on_audio_chunk`` for a Unix-domain PCM sink.
 
@@ -986,6 +1026,7 @@ def _build_extra_ops(state: dict, model_id: str,
         "unload": lambda p: unload_handler(state),
         "shutdown": _shutdown,
         "reset": lambda p: reset_handler(state),
+        "set_thinking_mode": lambda p: set_thinking_mode_handler(state, p),
         "count_tokens": lambda p: count_tokens_handler(state, p),
         # Off-pump-thread + timeout, per the note above.
         "embed_text": lambda p: embed_text_handler(state, p),

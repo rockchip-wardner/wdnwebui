@@ -4252,6 +4252,50 @@ body.dg-modal-open .back-home-btn {
   margin-top: 4px;
 }
 
+/* “深度思考”开关：页面级持久（localStorage），默认关闭 */
+.text-chat-thinking-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: #6b7280;
+  cursor: pointer;
+  user-select: none;
+}
+.text-chat-thinking-toggle input {
+  margin: 0;
+  cursor: pointer;
+}
+
+/* 标题栏里的“标题 + 开关”组合：作为单个 flex 子项，不打破
+ * .imb-card-head 的 space-between；gap 让开关与标题之间留出呼吸。 */
+.imb-card-head-title {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+/* 文本对话标题栏：开关与“空闲”角标之间留 16px，避免两个胶囊紧贴。
+ * 限定 #page-text-chat，不改变其它卡片的 .imb-card-head 布局。 */
+#page-text-chat .imb-card-head > .text-chat-thinking-toggle {
+  margin-left: 16px;
+}
+
+/* 标题栏位置更显眼：白色 pill + 边框，选中时变蓝 */
+.imb-card-head .text-chat-thinking-toggle {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: #374151;
+}
+.imb-card-head .text-chat-thinking-toggle:has(input:checked) {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  color: #1d4ed8;
+}
+
 /* 打字机光标：流式渲染时挂在最后一个气泡末尾 */
 .text-chat-cursor::after {
   content: "▍";

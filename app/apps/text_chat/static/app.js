@@ -31,6 +31,18 @@ const TextChat = {
     // 永远不出现 user / assistant 气泡(典型症状:"输入问题,点发送
     // 没有反应")。其他系统页 system.js 的 loader 会再调一次
     // ensureWs(),内部有 readyState 守卫,重复调用安全。
+    const thinkEl = $("text-chat-thinking");
+    if (thinkEl) {
+      try {
+        thinkEl.checked = localStorage.getItem("text_chat_thinking") === "1";
+      } catch (_) { /* private mode */ }
+      thinkEl.addEventListener("change", () => {
+        try {
+          localStorage.setItem("text_chat_thinking",
+                               thinkEl.checked ? "1" : "0");
+        } catch (_) { /* ignore */ }
+      });
+    }
     this.ensureWs();
   },
 
@@ -321,7 +333,7 @@ const TextChat = {
     // 用户点 summary 展开;流式累积也不再自动展开。
     li.innerHTML = `
       <span class="imb-msg-meta">模型 · ${ts}</span>
-      <details class="text-chat-thinking">
+      <details class="text-chat-thinking" hidden>
         <summary>思考过程（点击展开）</summary>
         <div class="text-chat-thinking-body" data-role="thinking-body"></div>
       </details>
@@ -347,6 +359,8 @@ const TextChat = {
     if (!p || !p.thinkingEl) return;
     p.thinkingBuf += delta;
     p.thinkingEl.textContent = p.thinkingBuf;
+    const details = p.assistantLi?.querySelector(".text-chat-thinking");
+    if (details && p.thinkingBuf.trim()) details.hidden = false;
     // thinking 默认折叠 — 流式累积不自动展开,避免抢戏;
     // 用户想看时点 summary 展开即可。
     this._scrollToBottom();
@@ -382,9 +396,8 @@ const TextChat = {
       if (p.thinkingEl) p.thinkingEl.textContent = info.thinking;
       const details = p.assistantLi.querySelector(".text-chat-thinking");
       if (details) {
-        // 默认折叠 — 即使 done frame 含 thinking 也不自动展开;
-        // 没 thinking 时整个 details 隐藏,折叠与否无关紧要。
-        if (!info.thinking) details.hidden = true;
+        // 默认折叠；没有思考内容时整块隐藏（空 <think></think> 不显示）。
+        details.hidden = !info.thinking.trim();
       }
     }
     if (typeof info.answer === "string") {
@@ -476,7 +489,10 @@ const TextChat = {
       const r = await fetch(API_PREFIX + "/text-chat/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({
+          text,
+          enable_thinking: !!document.getElementById("text-chat-thinking")?.checked,
+        }),
       });
       if (!r.ok) {
         let detail = "HTTP " + r.status;

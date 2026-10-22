@@ -87,6 +87,7 @@ class ChatRequest:
     id:        int   = 0
     text:      str   = ""
     ts:        float = 0.0
+    enable_thinking: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -196,7 +197,7 @@ class _TextChatManager:
             self._error = error
 
     # -------------------------------------------------------------- REST API
-    def send(self, text: str) -> int:
+    def send(self, text: str, *, enable_thinking: bool = False) -> int:
         """发起一轮推理；返回 request_id；上一轮还在跑抛 ValueError。"""
         text = (text or "").strip()
         if not text:
@@ -208,7 +209,8 @@ class _TextChatManager:
             self._current_request_id = rid
             self._last_started = time.time()
             self._set_state(self.STATE_LOADING)
-        req = ChatRequest(id=rid, text=text, ts=self._last_started)
+        req = ChatRequest(id=rid, text=text, ts=self._last_started,
+                          enable_thinking=bool(enable_thinking))
         # 立即 echo 给前端（不用等 worker 排到队首）
         self._broadcast({"type": "user_echo", "request_id": rid, "text": text})
         self._broadcast({"type": "state", "state": self.snapshot()})
@@ -328,6 +330,7 @@ class _TextChatManager:
                     req.text,
                     context_limit=context_limit,
                     max_new_tokens=self.MAX_NEW_TOKENS,
+                    enable_thinking=req.enable_thinking,
                     tool_names=self._resolve_tool_names(),
                     on_delta=lambda d: router.push(d),
                     stop_event=self._worker_stop_event,
@@ -344,6 +347,10 @@ class _TextChatManager:
             })
             self._broadcast({"type": "state", "state": self.snapshot()})
             return
+
+        # Flush whatever the router still holds (a short answer with no
+        # closing marker never crosses the tail buffer otherwise).
+        router.flush()
 
         # 7. 检查是否被 stop 中断 —— 丢弃本轮
         stopped = (
@@ -460,52 +467,108 @@ class _TextChatManager:
 # ThinkingRouter：observer 每次 delta 进来调用，按  thinking 边界切频道
 # --------------------------------------------------------------------------- #
 class _ThinkingRouter:
-    """增量状态机：维护一个游标决定下一段 delta 推 thinking 还是 answer。
+    """Split streamed deltas into the thinking / answer channels.
 
-    进入点固定假设模型先输出 thinking（用户已确认对话模型走 enable_thinking
-    必输出 ``<think>...</think>``）；首次见到 ``</think>`` 后切到 answer。
+    Two output shapes have to work, and both were measured on Qwen3.5-4B:
+
+    * thinking **on** — the C side injects ``<think>`` into the assistant
+      prefix, so the stream starts with the reasoning text and only the
+      closing ``</think>`` appears in the deltas;
+    * thinking **off** — the model emits an empty ``<think>\n\n</think>``
+      block, then the answer.
+
+    Deltas can split either tag across calls (``<th`` + ``ink>``), so the
+    router buffers instead of using ``str.find`` on a single delta. An
+    empty thinking segment is not emitted at all: the page hides the
+    thought block when there is nothing to show, and a transient empty
+    block is exactly the bug this replaces.
     """
+
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+    _PREFIX_LIMIT = 64          # give up tag detection on pathological whitespace
 
     def __init__(self, emit_fn: Callable[[dict], None], request_id: int) -> None:
         self._emit = emit_fn
         self._request_id = request_id
         self._mode = "thinking"          # thinking / answer
-        self._sent_start_marker = False
+        self._buf = ""
+        self._start_seen = False
+        self._saw_open = False
+        self._saw_close = False
+
+    def _emit_thinking(self, text: str) -> None:
+        if text and text.strip():
+            self._emit({
+                "type": "thinking",
+                "request_id": self._request_id,
+                "delta": text,
+            })
+
+    def _emit_answer(self, text: str) -> None:
+        if text:
+            self._emit({
+                "type": "answer",
+                "request_id": self._request_id,
+                "delta": text,
+            })
 
     def push(self, delta: str) -> None:
         if not delta:
             return
-        if self._mode == "thinking":
-            end_idx = delta.find("</think>")
-            if end_idx >= 0:
-                head = delta[:end_idx]
-                if head:
-                    self._emit({
-                        "type": "thinking",
-                        "request_id": self._request_id,
-                        "delta": head,
-                    })
-                self._mode = "answer"
-                rest = delta[end_idx + len("</think>"):]
-                if rest:
-                    self._emit({
-                        "type": "answer",
-                        "request_id": self._request_id,
-                        "delta": rest,
-                    })
+        self._buf += delta
+
+        if not self._start_seen:
+            stripped = self._buf.lstrip()
+            if len(stripped) < len(self._OPEN) and self._OPEN.startswith(stripped):
+                # Still a possible ``<think>`` prefix (or only whitespace).
+                if len(self._buf) <= self._PREFIX_LIMIT:
+                    return
+                self._start_seen = True           # pathological: give up
+            elif stripped.startswith(self._OPEN):
+                self._buf = stripped[len(self._OPEN):]
+                self._start_seen = True
+                self._saw_open = True
             else:
-                # 整个 delta 还在 thinking 段
-                self._emit({
-                    "type": "thinking",
-                    "request_id": self._request_id,
-                    "delta": delta,
-                })
+                self._start_seen = True
+
+        if self._mode == "thinking":
+            idx = self._buf.find(self._CLOSE)
+            if idx >= 0:
+                head = self._buf[:idx]
+                rest = self._buf[idx + len(self._CLOSE):]
+                self._saw_close = True
+                self._emit_thinking(head)
+                self._mode = "answer"
+                self._buf = ""
+                self._emit_answer(rest)
+                return
+            keep = len(self._CLOSE) - 1
+            if len(self._buf) > keep:
+                emit = self._buf[:-keep]
+                self._buf = self._buf[-keep:]
+                self._emit_thinking(emit)
         else:
-            self._emit({
-                "type": "answer",
-                "request_id": self._request_id,
-                "delta": delta,
-            })
+            emit = self._buf
+            self._buf = ""
+            self._emit_answer(emit)
+
+    def flush(self) -> None:
+        """Emit the tail buffer when the turn ends (called after the agent)."""
+        rest = self._buf
+        self._buf = ""
+        if not rest:
+            return
+        if self._mode == "thinking":
+            if not self._saw_open and not self._saw_close:
+                # Plain answer with no markers at all (model ignored the
+                # template): do not mislabel it as thinking.
+                self._emit_answer(rest)
+            else:
+                # An unterminated thought block is still thinking.
+                self._emit_thinking(rest)
+        else:
+            self._emit_answer(rest)
 
 
 # --------------------------------------------------------------------------- #

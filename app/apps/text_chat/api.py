@@ -54,6 +54,7 @@ router = APIRouter(tags=["text-chat"])
 class SendPayload(BaseModel):
     model_config = {"extra": "ignore"}
     text: str = Field(min_length=1, max_length=8192)
+    enable_thinking: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -70,7 +71,8 @@ async def post_text_chat_send(payload: SendPayload) -> dict:
     """发起一轮推理；返回 ``request_id`` + 当前 snapshot。"""
     svc = get_chat_service()
     try:
-        rid = svc.send(payload.text)
+        rid = svc.send(payload.text,
+                       enable_thinking=payload.enable_thinking)
     except ValueError as e:
         msg = str(e)
         if "上一条" in msg:

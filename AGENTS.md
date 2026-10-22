@@ -4966,7 +4966,9 @@ RIFF header by hand.
 
 `#page-text-chat` 暴露纯文本对话（`swcap_text_chat` capability，由
 qwen3.5-vl-4b 提供），
-流式逐字渲染 ` thinking... response` 与正式回答，单页实例串行推理，
+流式逐字渲染 ` thinking...</think>` 与正式回答（思考过程由页面「深度
+思考」开关控制，**默认关闭**；关闭时思考块整块隐藏，见下文「深度思考
+开关」），单页实例串行推理，
 多轮上下文由主进程裁剪、wdnai 拼 ChatML。
 
 **推理走 compute_worker 子进程（RPC）**。`get_session("swcap_text_chat")`
@@ -5033,7 +5035,9 @@ qwen3.5-vl-4b 提供），
   wdnwebui 自己的生命周期动词、跑主循环。**没有 `chat_run` /
   `chat_poll` / `chat_stop` / `infer_handler`**。
   - `extra_ops`（`_build_extra_ops`）分两类：
-    **新增** `load` / `unload` / `shutdown` / `count_tokens`；
+    **新增** `load` / `unload` / `shutdown` / `count_tokens` /
+    `set_thinking_mode`（后者是 thinking 开关的唯一真源，见下文「深度思考
+    开关」）；
     **覆盖**内置 `info`（要报 `not_loaded` / `missing_model_dir` /
     `error` 这套自己的状态机）与 `embed_text` / `embed_video`
     （必须离开 replier pump 线程 + 超时，否则 NPU 卡死会占住串行 pump
@@ -5062,6 +5066,51 @@ qwen3.5-vl-4b 提供），
     `make_result_callback` / `_make_sink_result_cb`**：wrapper 依赖 SDK
     私有符号，SDK 一重构就断（f61dddd 改名事故：算力配置页所有模型加载
     报 `AttributeError`，worker 静默退化成无流式）。
+
+* **深度思考开关（`enable_thinking`）—— 动态切换要「reset + 重设模板」，
+  状态必须放 worker 侧**：
+  - 页面级开关「深度思考」（默认关，`localStorage["text_chat_thinking"]`），
+    随 `POST /api/text-chat/send {enable_thinking}` 下发；
+    `ChatRequest` → `run_chat_with_tools(enable_thinking=…)` →
+    `respond(enable_thinking=…)`。**只有文本对话传 True**；微信桥接、
+    音视频描述、电脑控制都不传（默认 False）。
+  - **C 侧 thinking 是「开了就锁住」的**（真机 Qwen3.5-4B 实测）：一旦
+    `enable_thinking=True` 跑过一轮，之后所有 `enable_thinking=False` 都
+    被忽略 —— **`sess.reset()`（`clear_kvcache`）单独无效**，必须
+    `reset()` **再 `set_chat_template(CHATML_SYSTEM/USER/ASSISTANT)`**
+    才能切回非思考。实测同一 session：开启 2.2s / 输出完整思考；
+    关闭 0.39s / 输出空的 ` thinking\n\n` 块；只 reset 不重设模板 → 仍是
+    完整思考。重建 session 也能回到 OFF，但要 45s 模型加载，不可用。
+  - 因此 **worker 提供 `set_thinking_mode` extra op**
+    （`workers/_base.py`）：**幂等**（模式相同直接返回 `changed=False`），
+    只在变化时做 reset + 重设模板，状态存在 `state["thinking_mode"]`。
+    状态放 worker 而不是主进程，是因为 **C 会话才是唯一真源**：LAN peer
+    adopt 同一 worker 时，两个主进程各自缓存会不一致。
+  - **`proxy.make_rpc_session` 包装所有 session 的 `respond`**
+    （`_wrap_thinking_mode`）：每次请求前在 per-worker 锁内先调
+    `set_thinking_mode(desired)` 再推理。于是 **text_chat 的开关不会污染
+    同 worker 的其它应用**（vd / usb_hid / 微信请求前都会被自动切回 OFF），
+    而「真正 reset 只在模式改变时发生」由 worker 侧判断保证。锁按 worker
+    隔离（不同模型互不串行）；worker 端本就串行执行 RPC，加锁不增加延迟。
+  - **旧 worker 进程**（未重启、没有该 op）→ `call_op` 报 `unknown op`
+    → 包装层记下并降级继续，**不影响推理**；worker 重启后自动获得该 op。
+  - **已知边界（多板）**：LAN peer 借同一 worker 时，两边主进程在各自的
+    锁外 → `set_thinking_mode` 与 `respond` 之间有极小窗口（对端刚切走
+    模式）。**单板部署不受影响**；多板共用 worker 且同时混用
+    thinking / 非 thinking 才会遇到。
+  - **输出形态两种，`_ThinkingRouter` 必须都覆盖**（勿回退成
+    `delta.find("</think>")` 的单 delta 写法）：
+    * 开启：流里**没有** ` thinking` 开标签（C 侧把它注入 assistant
+      前缀了），只有思考内容 + `</think>`；
+    * 关闭：模型仍输出空的 ` thinking\n\n</think>` 块。
+    标签会被 token 流切开（`<th` + `ink>`），所以 router 是**缓冲式状态机**
+    （保留尾部 `len(tag)-1` 个字符），空思考段**不 emit**；结束时
+    `flush()` 兜住尾部（无任何标签的纯答案按 answer 处理）。
+    `runner.split_thinking` 另补一档：只有孤立 ` thinking` 开标签时从
+    answer 中剥掉。前端 `<details class="text-chat-thinking">` 初始
+    `hidden`，**只有非空 thinking 才显示**（关闭思考时整块消失，不再出现
+    用户看到的「只有一个 ` thinking`」）。
+  - 回归：`scripts/verify_thinking_router.py`（6 用例，纯逻辑，无需 NPU）。
 
 * **跨进程后立刻失效的东西 —— v0.16 实测踩过的坑，别再踩**：
   - **`sess._backend` 恒为 None**。会话在 worker 进程，任何
@@ -5105,12 +5154,17 @@ qwen3.5-vl-4b 提供），
     现在图像与 embed_video 帧统一走 `_bgr_to_path` / `decode_attachments`
     一套描述符，不再有第二套解码分支。
 
-* **Proxy**（`app/core/compute/proxy.py`，v0.16 起只剩装配 + 一条策略）：
+* **Proxy**（`app/core/compute/proxy.py`，v0.16 起只剩装配 + 两条策略）：
   - `make_rpc_session(...)` → 返回 `wdndds.LLMRPCSession`，复用 registry
     已有的 `Hub` / `Service` / `Requester`（不再自建 participant）。
     `_INFER_TIMEOUT_MS=120_000`（够 768px VLM 帧的 ~35s，又要能抓住真卡
     死）、`_CONTROL_TIMEOUT_MS=15_000`（控制面毫秒级，不该继承推理预算）。
   - `count_tokens(sess, texts)`：带降级，控制面失败不让整轮对话失败。
+  - `_wrap_thinking_mode(sess, service_name)`：包装 `respond`，在
+    per-worker 锁内先调 worker 的 `set_thinking_mode` 再推理 —— 让
+    `enable_thinking` 在「C 会话一旦开启就锁死」的前提下表现得像
+    per-call 开关，且同一 worker 的其它调用方（vd / usb_hid / 微信）
+    请求前会被自动切回它们期望的模式。详见「深度思考开关」小节。
   - **不再有** `_ProxyResult` / `_AttachmentProxy` / `_decode_reply_shm` /
     `_encode_attachments`：schema 在调用方解析，附件与长文本的
     `/dev/shm` 路由由 wdndds 两端统一负责。**没有 LAN peer 降级**了 ——
