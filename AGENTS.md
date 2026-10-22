@@ -1673,6 +1673,57 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
 3. 返回 `true` 表示启动指令已发,后台加载中;false 表示失败(env_check 步骤
    会 retry 2 次 + confirm 兜底)。
 
+### 向导 finish 步的等待必须遇终态立即中止（v0.28 修）
+
+用户实测死锁（视频目标定位 / vtl）：向导 env 步点「一键开启模型」→
+**另开一个页面**把模型全关 → 回到向导点「完成配置」→ 永远卡在
+「等待模型加载完毕」，回不到第 1 步、进不了应用页 —— 该应用彻底不可用。
+
+根因：`_waitForModelsRunning` 的收敛条件只有两个 ——「全部 running」或
+「90s 超时」。模型被关掉后实例要么从 registry 消失（**缺席**），要么
+status 变 `error`（**终态**），两种都让等待永远等下去；进度条还按旧
+`started_at` 从 24% 一路涨到 99% 封顶，**看上去像还在加载** —— 这正是
+「像死机」而不是「报错」的原因。
+
+> 用户给的方案是「改浏览器缓存策略：切走 / 跳过后再进来回到第 1 步」。
+> 方向合理，但**不是这个 bug 的成因**：finish 步刻意不落盘 `.step`
+> （`_gotoStep` 里 `kind === "finish"` → `_lsClearStep`），重新进入
+> **本来就**回到第 1 步（实测确认）。死锁发生在**同一次挂载内**的
+> finish 等待上，缓存救不了。缓存策略仍按用户要求改了（见下），但
+> 根因必须单独修 —— 别把「改了缓存」当成「修好了」。
+
+**三条不变量**（`state.js::_waitForModelsRunning`）：
+
+1. **终态立即中止**：`inst.status === "error"` → 立刻抛错，不等宽限期
+   （实测 62~78ms）。`abort` 必须在 `try/catch` **外面**抛 ——
+   `catch (_) { /* retry */ }` 会把中止吞掉。
+2. **缺席有宽限**：`MISSING_GRACE_MS = 15s`。POST 之后实例 ~1s 才注册，
+   15s 足够宽松；宽限只用来区分「刚 POST 还没注册」和「压根没跑」。
+   关键在**卡号匹配**：`unload_instance` 会把 `npu_index` 重置成 -1，
+   所以「被停掉的实例」对 `npu_index: 0` 的 target 就是**缺席**。
+   （现有 7 张卡的 `swcap_to_model` 全都声明了具体卡号，没有
+   `npu_index: null` 的卡 —— 那是唯一会漏判的形态。）
+3. **等待可被打断**：向导被卸载（点「上一步」/「跳过向导」/切页）时
+   `statusBox.isConnected` 为 false → **抛错**中止，不能 `return`。
+   静默 `return` 等于「等待成功」，`_finish` 会接着调
+   `applyWizardSnapshot` —— 模型没就绪就把应用拉起来（半个死锁）。
+
+**失败必须给出口**：finish 失败时渲染错误 + 「重新开启模型」按钮
+（`#wd-wizard-finish-retry-btn`，调 `window._wizardBringUpModels(cfg)`
+后重试 `_finish`）。没有它，用户唯一的出路是连点三次「上一步」回到
+env 步 —— 看上去就像「回不去」（用户实测）。
+
+**用户方案（已实现）**：`unmount(silent=true)`（= `onNavAway` 切页路径）
+与「跳过向导」都清掉 `.step`（**保留 `.values`**，回来仍预填）→ 再次
+进入该卡从第 1 步开始。**reload 不清**（reload 不走 `onNavAway`）——
+既有语义「刷新后回到上次停留的步骤」保持不变（`test_wizard_vd.py` T10
+依赖它）。
+
+回归：`scripts/verify_wizard_finish_abort.py`（7 场景，全 mock
+`/api/compute`，**不碰真机算力**）：缺席 15s 内中止 / error <0.5s 中止 /
+等待中离开不调 applyWizardSnapshot / 重试按钮可恢复 / 切走再进回第 1 步 /
+跳过再进回第 1 步 / reload 仍恢复步骤。
+
 ### `wizard:unmounted` 事件 + 重新挂载
 
 `state.js:unmount()` 末尾 dispatch `window` 上的 `wizard:unmounted` 事件

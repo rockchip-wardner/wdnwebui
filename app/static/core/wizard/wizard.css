@@ -524,6 +524,10 @@
 .wd-wizard-finish-error:empty {
   display: none;
 }
+/* finish 失败后的「重新开启模型」按钮与错误文字之间留白。 */
+.wd-wizard-finish-error .wd-wizard-primary-btn {
+  margin-top: 10px;
+}
 
 /* v0.16: finish 步骤等待模型启动由 "等待模型启动中..." 一行改为进度条
    + 百分比 + 剩余时间。errBox 同时承担"加载进度"(蓝)与"启动失败 /

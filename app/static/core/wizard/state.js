@@ -1194,16 +1194,46 @@
     _renderFootNext(foot, cfg, state, false);
     foot.appendChild(finishBtn);
 
-    finishBtn.addEventListener("click", async () => {
+    // 跑一次 finish：成功 → 向导关闭；失败 → 渲染错误 + 出口。
+    // 「完成配置」与「重新开启模型」两个按钮共用它。
+    const runFinish = async () => {
       finishBtn.disabled = true;
       errBox.textContent = "";
       try {
         await _finish(state);
       } catch (e) {
-        errBox.textContent = (e && (e.message || e)) || "完成失败";
+        _renderFinishError(errBox, e, cfg, runFinish);
         finishBtn.disabled = false;
       }
+    };
+    finishBtn.addEventListener("click", runFinish);
+  }
+
+  /**
+   * finish 失败后的出口：模型没起来时给「重新开启模型」按钮 —— 没有它，
+   * 用户唯一的出路是「上一步」连点三次回到 env 步，看上去就像「回不去」。
+   */
+  function _renderFinishError(errBox, e, cfg, runFinish) {
+    errBox.textContent = "";
+    const line = _ce("div", null,
+      (e && (e.message || e)) || "完成失败");
+    errBox.appendChild(line);
+    if (!e || !e.retryable) return;
+    if (typeof window._wizardBringUpModels !== "function") return;
+    const again = _ce("button", WIZARD_NS + "primary-btn", "重新开启模型");
+    again.id = WIZARD_NS + "finish-retry-btn";
+    again.addEventListener("click", async () => {
+      again.disabled = true;
+      line.textContent = "正在重新开启模型...";
+      const ok = await window._wizardBringUpModels(cfg);
+      if (!ok) {
+        line.textContent = "重新开启失败 —— 请到「算力配置」页手动开启后重试。";
+        again.disabled = false;
+        return;
+      }
+      await runFinish();
     });
+    errBox.appendChild(again);
   }
 
   function _renderFootNext(foot, cfg, state, canNext) {
@@ -1362,6 +1392,8 @@
   function skip() {
     if (!_active) return;
     _captureValues(_active.cfg, _active); // 保留已填
+    // 「跳过向导」= 明确不做了 → 步骤位置也别留着（下次进来从第 1 步）。
+    _lsClearStep(_active.app.id, _active.cfg);
     unmount();
   }
 
@@ -1436,6 +1468,13 @@
     return t.model_id + "@" + t.npu_index;
   }
 
+  /** 等待模型时的「可重试」错误 —— finish 步据此给「重新开启模型」按钮。 */
+  function _modelWaitError(msg) {
+    const e = new Error(msg);
+    e.retryable = true;
+    return e;
+  }
+
   async function _waitForModelsRunning(cfg) {
     // 展开成 (model_id, npu_index) 对：只按 model_id 判的话，多卡场景下
     // "任意一张卡起来了"就算齐，用户要两张卡却只等到一张，推理退化成单卡
@@ -1449,6 +1488,10 @@
     const statusBox = _q("#" + WIZARD_NS + "finish-error");
     if (!statusBox) return;
     const deadline = Date.now() + 90 * 1000; // 90s 兜底超时
+    // 缺席宽限：模型不在 registry 里持续这么久 → 判定为没启动。POST 后
+    // ~1s 实例才出现，15s 足够宽松。
+    const MISSING_GRACE_MS = 15 * 1000;
+    const missingSince = {};
     const PROG_CLS = WIZARD_NS + "finish-progress";
     const FAIL_CLS = WIZARD_NS + "finish-error-fail";
     const hasHeader = targets.length > 1;
@@ -1515,17 +1558,19 @@
       }
     };
 
-    const setError = (msg) => {
-      statusBox.classList.remove(PROG_CLS);
-      statusBox.classList.add(FAIL_CLS);
-      statusBox.textContent = msg;
-    };
     const clearBox = () => {
       statusBox.classList.remove(PROG_CLS, FAIL_CLS);
       statusBox.textContent = "";
     };
 
     while (Date.now() - deadline < 0) {
+      // 向导已被卸载（上一步 / 跳过向导 / 切页）→ 中止。注意是**抛错**
+      // 不是 return：静默 return 等于「等待成功」，_finish 会接着调
+      // applyWizardSnapshot，把没就绪的应用拉起来。
+      if (!statusBox.isConnected) {
+        throw new Error("向导已离开，等待中止。");
+      }
+      let abort = null;
       try {
         const r = await fetch("/api/compute", { cache: "no-store" });
         if (r.ok) {
@@ -1563,22 +1608,30 @@
             const inst = instances.find((i) => i.model_id === m.model_id
               && (m.npu_index == null || i.npu_index === m.npu_index));
             if (!inst) {
+              // 一直不出现 = 没启动（被关了 / 压根没开），不是「还在启动」。
+              // 超过宽限就中止 —— 盯一条不变的进度条等满 90s 比报错更像死机。
+              if (missingSince[key] == null) missingSince[key] = Date.now();
+              if (Date.now() - missingSince[key] > MISSING_GRACE_MS) {
+                abort = `本机未运行「${key}」—— 模型可能已被关闭或从未开启。`;
+                break;
+              }
               // POST 后 1s 内 worker 还没上报 status;显式 "等待启动…" 而
               // 非 0%,避免和真 0% 加载混淆
               statusMap[key] = { status: "wait", barPct: 0, label: "等待启动…" };
               continue;
             }
+            delete missingSince[key];
             if (inst.status === "running") {
               statusMap[key] = { status: "done", barPct: 100, label: "✓ 100%" };
               doneCount++;
               continue;
             }
             if (inst.status === "error") {
-              statusMap[key] = {
-                status: "error", barPct: 0,
-                label: `✗ ${inst.error || "未知错误"}`,
-              };
-              continue;
+              // **终态**：worker 挂了 / 被别处关掉了。立刻中止 —— 继续等满
+              // 90s 只会让用户盯一条不再变化的进度条（真机实测：另一个页面
+              // 「全部停止」后，这里卡满 90s 才报错）。
+              abort = `「${key}」启动失败：${inst.error || "未知错误"}`;
+              break;
             }
             const startTs = inst.started_at || now;
             const elapsed = Math.max(0, now - startTs);
@@ -1589,13 +1642,17 @@
               label: `${pct}% (~${remaining}s 剩余)`,
             };
           }
-          updateProgress(statusMap, doneCount);
+          if (!abort) updateProgress(statusMap, doneCount);
         }
       } catch (_) { /* retry */ }
+      if (abort) {
+        clearBox();
+        throw _modelWaitError(abort);
+      }
       await new Promise((r) => setTimeout(r, 1000));
     }
-    setError("模型启动超时,可继续等待或退出");
-    throw new Error("等待模型启动超时");
+    clearBox();
+    throw _modelWaitError("等待模型启动超时（90s）—— 模型可能已被关闭或加载失败。");
   }
 
   // ------------------------------------------------------------------ #
@@ -1699,7 +1756,11 @@
 
   function unmount(silent) {
     if (!_active) return;
-    const { app, container, intervals, _onNavAway, movedCanvas } = _active;
+    const { app, container, intervals, _onNavAway, movedCanvas, cfg } = _active;
+    // 切到别的页面（silent=true）→ 丢掉「上次停在哪一步」：半截的向导 +
+    // 外部算力变化（模型被别的页面关掉）会死锁。只清 step 不清 values，
+    // 已填的字段回来仍预填。
+    if (silent) _lsClearStep(app.id, cfg);
     intervals.forEach(clearInterval);
     if (_onNavAway) window.removeEventListener("hashchange", _onNavAway);
     // 还原被 move 进 canvas-wrap 的画面元素。不还原的话 wizard 容器销毁会
