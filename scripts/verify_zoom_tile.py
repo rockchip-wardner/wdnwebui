@@ -15,13 +15,19 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import sys
 import urllib.request
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 BASE = "http://localhost:8000"
-SRC = "/home/rockchip/work/wdnwebui/app/apps/video_target_localization/static/preview.mp4"
-SHOT_DIR = "/home/rockchip/work/wdnwebui"
+# 素材在**插件包里**（卡片已迁出仓库），路径问解析器，别硬编码。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from card_dirs import card_dir  # noqa: E402
+
+SRC = str(card_dir("video-target-localization") / "static" / "preview.mp4")
+SHOT_DIR = str(Path(__file__).resolve().parent.parent)
 
 CARDS = {
     "video-detection": ("vd-grid", "/api/video-detection", "vd"),

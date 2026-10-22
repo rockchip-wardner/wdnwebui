@@ -26,6 +26,43 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 APPS_DIR = REPO / "app" / "apps"
+
+
+def _cards() -> list[dict]:
+    """所有卡（内置 app/apps/ + 插件包）的解析结果。
+
+    6 张卡已迁到 wdnapps_* 插件包，只扫 app/apps/ 等于**几乎没扫** ——
+    跨卡 import 的检查会假绿。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from card_dirs import resolve_cards
+    return resolve_cards()
+
+
+def _card_dirs() -> list[Path]:
+    return [Path(c["dir"]) for c in _cards()]
+
+
+def _cross_card_predicate(self_mod: str):
+    """import 指向**别的**卡 → 违规。
+
+    卡的 import 命名空间有两个：内置卡 ``app.apps``，插件卡
+    ``<包>.cards``（跨卡引用形如 ``wdnapps_video_analyzer.cards.video_retrieval``）。
+    引用宿主框架 ``app.core.*`` 是合法的（插件就是靠它用 NPU / 解码器）。
+    """
+    ns_own = {}
+    for c in _cards():
+        ns_own.setdefault(c["ns"], set()).add(c["mod"])
+
+    def predicate(name: str) -> bool:
+        for ns, mods in ns_own.items():
+            if not name.startswith(ns + "."):
+                continue
+            tail = name[len(ns) + 1:].split(".")[0]
+            if tail and tail not in mods:
+                return True
+        return False
+    return predicate
 SYS_DIR = REPO / "app" / "system"
 TEST_PORT = 18080
 TEST_BASE = f"http://localhost:{TEST_PORT}"
@@ -72,24 +109,15 @@ def _all_py_under(root: Path):
 def scan_cross_app_imports():
     """A1: app/apps/<id>/*.py 不应跨 app import"""
     bad = []
-    for app_dir in sorted(APPS_DIR.iterdir()):
-        if not app_dir.is_dir() or app_dir.name.startswith(("_", ".")):
-            continue
+    for app_dir in _card_dirs():
         # 含连字符的目录名 (audio-analysis) 在 import 里是下划线
-        app_mod_id = app_dir.name.replace("-", "_")
         for py in _all_py_under(app_dir):
             try:
                 tree = ast.parse(py.read_text(encoding="utf-8"))
             except SyntaxError as e:
                 bad.append((py, "syntax-error", str(e)))
                 continue
-            def predicate(name):
-                if not name.startswith("app.apps."):
-                    return False
-                # 容许自己: app.apps.<self>
-                tail = name[len("app.apps."):]
-                own = tail.split(".")[0]
-                return own != app_mod_id
+            predicate = _cross_card_predicate(app_dir.name)
             hits = _scan_imports(tree, predicate)
             for kind, target, line in hits:
                 bad.append((py, f"cross-app-{kind}", f"{target} (line {line})"))
@@ -99,9 +127,7 @@ def scan_cross_app_imports():
 def scan_app_system_imports():
     """A2: app/apps/<id>/*.py 不应 import app.system.*"""
     bad = []
-    for app_dir in sorted(APPS_DIR.iterdir()):
-        if not app_dir.is_dir() or app_dir.name.startswith(("_", ".")):
-            continue
+    for app_dir in _card_dirs():
         for py in _all_py_under(app_dir):
             try:
                 tree = ast.parse(py.read_text(encoding="utf-8"))
@@ -312,7 +338,12 @@ def c_failure_injection(app_id, failure_kind):
     failure_kind ∈ {"bad_manifest", "missing_template", "syntax_appjs"}
     注入故障 → 触发 reload → 验证其他 app 仍 ok → 恢复
     """
-    app_dir = APPS_DIR / app_id.replace("-", "_")
+    # 卡片源码目录：内置卡在 app/apps/，插件卡在 .venv/src/ 的插件包里
+    # —— 不能一律拼 APPS_DIR（6 张卡已迁走）。
+    app_dir = next((Path(c["dir"]) for c in _cards()
+                    if c["id"] == app_id or c["name"] == app_id), None)
+    if app_dir is None:
+        return {"skipped": True, "reason": f"找不到卡片 {app_id}"}
     manifest = app_dir / "manifest.json"
     template = app_dir / "static" / "template.html"
     appjs = app_dir / "static" / "app.js"

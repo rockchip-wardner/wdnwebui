@@ -15,11 +15,25 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, "..");
 const STATE_JS = path.join(REPO, "app/static/core/wizard/state.js");
+
+// 卡片源码目录 —— 内置卡在 app/apps/，插件卡在 .venv/src/ 的插件包里，
+// 不能硬编码 app/apps/<id>/（6 张卡已迁走）。统一问 scripts/card_dirs.py。
+const PY = process.env.WDNWEBUI_PYTHON || path.join(REPO, ".venv/bin/python");
+const CARDS = JSON.parse(execFileSync(
+  PY, [path.join(REPO, "scripts/card_dirs.py")], { encoding: "utf8" }));
+const CARD_BY_NAME = new Map(CARDS.map((c) => [c.name, c]));
+const CARD_BY_ID = new Map(CARDS.map((c) => [c.id, c]));
+function cardDir(appId) {
+  const c = CARD_BY_NAME.get(appId) || CARD_BY_ID.get(appId);
+  if (!c) throw new Error(`找不到卡片 ${appId}（已发现：${CARDS.map((x) => x.id)}）`);
+  return c.dir;
+}
 
 // ---------------------------------------------------------------- //
 // 最小 DOM shim —— 只实现 state.js 实际用到的那几个方法
@@ -292,12 +306,12 @@ console.log("\n【C】_fieldKey：wizard.json 的 ui_key 优先");
     priv._fieldKey("text-chat", { id: "text-chat-prompt" }) === "prompt");
   // 全卡扫描：任何一张卡的 form 字段漏写 ui_key 都要被抓出来 —— opts key
   // 全靠它，漏一个就静默退化成 sttSource 这种带前缀的名字。
-  const appDirs = fs.readdirSync(path.join(REPO, "app/apps"))
-    .filter((d) => fs.existsSync(path.join(REPO, "app/apps", d, "static/wizard.json")));
   const bad = [];
-  for (const a of appDirs) {
+  for (const c of CARDS) {
+    if (!fs.existsSync(path.join(c.dir, "static/wizard.json"))) continue;
+    const a = c.name;
     const wz = JSON.parse(fs.readFileSync(
-      path.join(REPO, `app/apps/${a}/static/wizard.json`), "utf8"));
+      path.join(c.dir, "static/wizard.json"), "utf8"));
     for (const s of wz.steps.filter((x) => x.kind === "form")) {
       for (const f of s.fields || []) if (!f.ui_key) bad.push(`${a}/${f.id}`);
     }
@@ -310,9 +324,9 @@ console.log("\n【D】4 步向导卡的 wizard.json 与 manifest 自洽（以 vi
 {
   const APP = "video_target_localization";
   const mf = JSON.parse(fs.readFileSync(
-    path.join(REPO, `app/apps/${APP}/manifest.json`), "utf8"));
+    path.join(cardDir(APP), "manifest.json"), "utf8"));
   const wj = JSON.parse(fs.readFileSync(
-    path.join(REPO, `app/apps/${APP}/static/wizard.json`), "utf8"));
+    path.join(cardDir(APP), "static/wizard.json"), "utf8"));
   check("manifest 声明 wizard_config", mf.wizard_config === "wizard.json");
   check("wizard.enabled=true", wj.enabled === true);
   // 断言刻意写成"首步 env_check / 末步 finish"而不是"正好 4 步"—— 卡片
@@ -340,7 +354,7 @@ console.log("\n【D】4 步向导卡的 wizard.json 与 manifest 自洽（以 vi
   check("canvas id 已显式声明（多路卡不能靠推导）",
     wj.canvas_id === "vtl-grid", String(wj.canvas_id));
   const tpl = fs.readFileSync(
-    path.join(REPO, `app/apps/${APP}/static/template.html`), "utf8");
+    path.join(cardDir(APP), "static/template.html"), "utf8");
   check("模板里有 #vtl-open", tpl.includes('id="vtl-open"'));
   check("模板里有向导声明的 canvas 容器", tpl.includes(`id="${canvasId}"`), canvasId);
   // wizard 关闭按钮会按 .vd-stage/.vtd-stage/.vtl-stage 把 canvas 搬回页面
@@ -353,7 +367,7 @@ console.log("\n【D】4 步向导卡的 wizard.json 与 manifest 自洽（以 vi
   check("source 步骤含 -loop（inline 到 source 行）",
     wj.steps[1].fields.some((f) => /-loop$/.test(f.id)));
   const js = fs.readFileSync(
-    path.join(REPO, `app/apps/${APP}/static/app.js`), "utf8");
+    path.join(cardDir(APP), "static/app.js"), "utf8");
   check("app.js 导出到 WizardState 约定的全局名",
     new RegExp(`window\\.ImApp_${APP}\\s*=\\s*`).test(js), APP);
   // WizardState 按 "ImApp_" + id.replace(/-/g,"_") 查找并调用 applyWizardSnapshot
@@ -368,15 +382,16 @@ console.log("\n【D】4 步向导卡的 wizard.json 与 manifest 自洽（以 vi
 
 console.log("\n【E】全部带 wizard 的卡仍以 env_check 开头（env 步骤回归）");
 {
-  const apps = fs.readdirSync(path.join(REPO, "app/apps"))
-    .filter((d) => fs.existsSync(path.join(REPO, "app/apps", d, "manifest.json")));
+  // 遍历**所有**卡（内置 + 插件）—— 只扫 app/apps/ 会漏掉 5 张插件卡，
+  // 断言「共检查 N 张」就永远达不到。
   let n = 0;
-  for (const a of apps) {
-    const wp = path.join(REPO, "app/apps", a, "static/wizard.json");
+  for (const c of CARDS) {
+    const a = c.name;
+    const wp = path.join(c.dir, "static/wizard.json");
     if (!fs.existsSync(wp)) continue;
     const cfg = JSON.parse(fs.readFileSync(wp, "utf8"));
     const manifest = JSON.parse(fs.readFileSync(
-      path.join(REPO, "app/apps", a, "manifest.json"), "utf8"));
+      path.join(c.dir, "manifest.json"), "utf8"));
     if (manifest.wizard_config !== "wizard.json") {
       check(`${a}: manifest.wizard_config 与文件不符`, false, manifest.wizard_config);
       continue;

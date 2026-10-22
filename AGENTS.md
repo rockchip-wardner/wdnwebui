@@ -943,6 +943,13 @@ app/apps/<card_id>/
 依赖方向是单向的：插件 → `app.core.*`。core 不得依赖插件，否则插件没装
 时 core 会静默降级。
 
+> **脚本别再硬编码 `app/apps/<id>/`** —— 6 张卡的源码在插件包里，不在仓库
+> 里。verify 脚本要取卡片的 wizard.json / manifest.json / app.js，走
+> `scripts/card_dirs.py`（内置 + 插件双通道解析，返回 id / 目录名 / 路径 /
+> import 命名空间）。否则轻则 ENOENT 崩掉，重则**扫不到任何东西却照样报
+> 绿** —— `verify_apps_isolation` 的跨卡 import 检查只剩 2 张内置卡时就是
+> 这个下场。
+
 | `id` | capability | 后端入口 | 来源 |
 |---|---|---|---|
 | `text-chat` | `swcap_text_chat` | `app.apps.text_chat` | 内置 |

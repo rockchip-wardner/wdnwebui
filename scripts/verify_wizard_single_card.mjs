@@ -15,11 +15,25 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, "..");
 const STATE_JS = path.join(REPO, "app/static/core/wizard/state.js");
+
+// 卡片源码目录 —— 内置卡在 app/apps/，插件卡在 .venv/src/ 的插件包里，
+// 不能硬编码 app/apps/<id>/（6 张卡已迁走）。统一问 scripts/card_dirs.py。
+const PY = process.env.WDNWEBUI_PYTHON || path.join(REPO, ".venv/bin/python");
+const CARDS = JSON.parse(execFileSync(
+  PY, [path.join(REPO, "scripts/card_dirs.py")], { encoding: "utf8" }));
+const CARD_BY_NAME = new Map(CARDS.map((c) => [c.name, c]));
+const CARD_BY_ID = new Map(CARDS.map((c) => [c.id, c]));
+function cardDir(appId) {
+  const c = CARD_BY_NAME.get(appId) || CARD_BY_ID.get(appId);
+  if (!c) throw new Error(`找不到卡片 ${appId}（已发现：${CARDS.map((x) => x.id)}）`);
+  return c.dir;
+}
 
 // ---------------------------------------------------------------- //
 // 最小 DOM shim
@@ -237,11 +251,11 @@ const DEFAULT_STEPS = [{ id: "env", kind: "env_check" }, { id: "finish", kind: "
 
 // 真实应用的 wizard.json 声明（不 mock —— 声明本身就是要守的契约）
 function loadWizard(appId) {
-  const p = path.join(REPO, `app/apps/${appId}/static/wizard.json`);
+  const p = path.join(cardDir(appId), "static/wizard.json");
   return JSON.parse(fs.readFileSync(p, "utf8"));
 }
 function loadManifest(appId) {
-  const p = path.join(REPO, `app/apps/${appId}/manifest.json`);
+  const p = path.join(cardDir(appId), "manifest.json");
   return JSON.parse(fs.readFileSync(p, "utf8"));
 }
 
