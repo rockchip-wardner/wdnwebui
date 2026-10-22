@@ -359,7 +359,7 @@ console.log("\n【B】单卡 —— 一键开启的模型必须落到唯一卡�
 console.log("\n【C】单卡 —— vtd 原本声明 npu [0,1]，应收敛到单卡位");
 {
   const r = await mountEnv("video_target_detection", 1, [0]);
-  const m = r.state.cfg.swcap_to_model["swcap_video_describe"];
+  const m = r.state.cfg.swcap_to_model["swcap_vision_chat"];
   check("vtd: npu_index 从 [0,1] 收敛为 0", JSON.stringify(m.npu_index) === "0",
     JSON.stringify(m));
   check("vtd: 模型仍是 qwen3-vl-4b", m.model_id === "qwen3-vl-4b", m.model_id);
@@ -380,10 +380,10 @@ console.log("\n【D】单卡 —— vd 多 capability 二选一");
     `count=${radios(r.body).length}`);
   check("vd: 默认选中视频描述",
     radios(r.body)[0] && radios(r.body)[0].checked === true
-    && radios(r.body)[0].value === "swcap_video_describe",
+    && radios(r.body)[0].value === "swcap_vision_chat",
     JSON.stringify(radios(r.body).map((x) => [x.value, x.checked])));
   check("vd: 默认只加载视频描述对应的模型",
-    Object.keys(r.state.cfg.swcap_to_model).join() === "swcap_video_describe",
+    Object.keys(r.state.cfg.swcap_to_model).join() === "swcap_vision_chat",
     Object.keys(r.state.cfg.swcap_to_model).join());
   check("vd: 未选中的 capability 以中性行展示",
     r.body.text().includes("单卡下未启用"),
@@ -397,15 +397,15 @@ console.log("\n【D】单卡 —— vd 多 capability 二选一");
     && posts[0].npu_index === 0, JSON.stringify(posts));
 
   // 切到「音频描述」→ 只起 omni
-  const audioRadio = radios(r.body).find((x) => x.value === "swcap_audio_understand");
+  const audioRadio = radios(r.body).find((x) => x.value === "swcap_audio_chat");
   check("vd: 音频描述 radio 存在且未选中", !!audioRadio && audioRadio.checked === false);
   audioRadio.checked = true;
   for (const fn of (audioRadio.listeners.change || [])) fn();
   check("vd: 切换后 swcap_to_model 只剩音频描述",
-    Object.keys(r.state.cfg.swcap_to_model).join() === "swcap_audio_understand",
+    Object.keys(r.state.cfg.swcap_to_model).join() === "swcap_audio_chat",
     Object.keys(r.state.cfg.swcap_to_model).join());
   check("vd: 切换后卡号仍为 0",
-    r.state.cfg.swcap_to_model["swcap_audio_understand"].npu_index === 0);
+    r.state.cfg.swcap_to_model["swcap_audio_chat"].npu_index === 0);
   posts = [];
   await globalThis.window._wizardBringUpModels(r.state.cfg);
   check("vd: 切到音频后只 POST qwen2.5-omni-3b @ npu0",
@@ -415,7 +415,7 @@ console.log("\n【D】单卡 —— vd 多 capability 二选一");
 
 console.log("\n【E】单卡 —— 单 capability 的检索卡（监控反查）不提示、不阻断");
 {
-  // 监控反查（video_retrieval）只有 1 个 capability（swcap_video_retrieval）
+  // 监控反查（video_retrieval）只有 1 个 capability（swcap_vision_embedding）
   // —— 单卡下它跟普通单 capability 应用一样：模型落到唯一卡位，功能不变。
   // 早期版本的「监控分析检索」是刚需两个模型（分析+检索）才会被单卡阻断，
   // 卡片改名后那个前提已不存在。
@@ -427,7 +427,7 @@ console.log("\n【E】单卡 —— 单 capability 的检索卡（监控反查�
     r.single !== null && r.single.active === true
     && r.single.blocked === false);
   check("vr: swcap_to_model 被裁成单卡（卡号=0）",
-    r.state.cfg.swcap_to_model["swcap_video_retrieval"].npu_index === 0,
+    r.state.cfg.swcap_to_model["swcap_vision_embedding"].npu_index === 0,
     JSON.stringify(r.state.cfg.swcap_to_model));
   check("vr: 「下一步」不被禁用", nextBtnDisabled(r.foot) !== true,
     String(nextBtnDisabled(r.foot)));
@@ -469,7 +469,7 @@ console.log("\n【G】单卡二选一 —— 裁掉不适用的步骤");
     !stepIds(r.state.cfg).includes("audio"), stepIds(r.state.cfg).join());
 
   // G3 切到「音频描述」→ 没有「检测提示词 + 检测尺寸」步
-  const audioRadio = radios(r.body).find((x) => x.value === "swcap_audio_understand");
+  const audioRadio = radios(r.body).find((x) => x.value === "swcap_audio_chat");
   audioRadio.checked = true;
   for (const fn of (audioRadio.listeners.change || [])) fn();
   check("vd 单卡选音频描述: 步骤表 = env/source/audio/finish",
@@ -538,7 +538,7 @@ console.log("\n【H】finish 构造的 opts —— 被裁掉的字段不得出�
   check("单卡选视频描述: opts 不带 detectSize（随 detect 步一起裁掉）",
     videoOpts && videoOpts.detectSize === undefined, JSON.stringify(videoOpts));
 
-  const audioOpts = await runFinish(1, [0], "swcap_audio_understand");
+  const audioOpts = await runFinish(1, [0], "swcap_audio_chat");
   check("单卡选音频描述: opts 带 audioPrompt",
     audioOpts && audioOpts.audioPrompt === "转写音频", JSON.stringify(audioOpts));
   check("单卡选音频描述: opts **不带** prompt（不启动画面检测）",

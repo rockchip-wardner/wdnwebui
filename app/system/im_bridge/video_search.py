@@ -15,7 +15,7 @@
 
 真正的执行失败（embedding 会话缺失、检索异常）以抛错结束 —— 走
 chat-agent 的失败回喂路径。capability 门控
-（``requires_capability="swcap_video_retrieval"``）由注册表声明 +
+（``requires_capability="swcap_vision_embedding"``）由注册表声明 +
 chat_agent 前置校验双层保证。
 """
 from __future__ import annotations

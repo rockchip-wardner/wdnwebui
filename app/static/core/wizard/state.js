@@ -327,7 +327,7 @@
     // 会让上面这张卡渲染成一个光秃秃的标题，看着像加载失败。补一行说明，
     // 让「没有要求」读起来是「无需检查」而不是「检查没跑」。
     if (!state.envCheck.hwRequired.length) {
-      card.appendChild(_envNoReqRow("本应用不依赖特定硬件能力（纯 CPU 计算）"));
+      card.appendChild(_envNoReqRow("本应用不依赖特定硬件能力"));
     }
     if (!hwOK) {
       const err = _ce("div", WIZARD_NS + "env-error");
@@ -478,6 +478,9 @@
     // —— 后者正确防误关 peer 模型,前者却让 UI 显示误导。
     let swMissing = [];
     let runningCaps = new Set();
+    // 本机 running 实例各自的 capability_types 列表 —— 组感知判定要用
+    // 「同一个实例是否同时具备组内全部能力」，光有一个扁平的能力集合不够。
+    const localCapSets = [];
     let cardCount = 0;
     let modelCards = [];
     try {
@@ -486,7 +489,9 @@
         const data = await r.json();
         for (const inst of (data.instances || [])) {
           if (inst.status === "running" && inst._source !== "adopted") {
-            for (const c of (inst.capability_types || [])) runningCaps.add(c);
+            const caps = inst.capability_types || [];
+            for (const c of caps) runningCaps.add(c);
+            localCapSets.push(caps);
           }
         }
         // 模型卡位数（能跑 rknn 模型的卡）。1 → 单卡板，2 → 双卡板。
@@ -495,17 +500,69 @@
         modelCards = Array.isArray(data.model_cards) ? data.model_cards : [];
       }
     } catch (_) { /* keep all missing */ }
+
+    // 逐能力缺失（细粒度提示：告诉用户到底缺哪一项）
     for (const cap of (app.software_capabilities || [])) {
       if (!runningCaps.has(cap)) swMissing.push(cap);
     }
+
+    // 组感知：存在 group 声明时，逐组再验一次「单个实例同时满足整组」。
+    // 逐能力全绿但分属两个实例的情况在这里被判缺 —— 否则 UI 显示就绪，
+    // 用户进卡才发现功能不可用（usb_hid 视觉+工具调用正是这个形状）。
+    const groups = Array.from(_capGroups(cfg).values()).filter((g) => g.length > 1);
+    const groupsUnsatisfied = [];
+    for (const g of groups) {
+      const covered = localCapSets.some(
+        (caps) => g.every((c) => caps.indexOf(c) !== -1));
+      if (!covered) groupsUnsatisfied.push(g.join(" + "));
+    }
+    // 组内每项都有实例、但不是同一个实例 → 逐能力检查看不到，得额外报
+    const splitGroups = groupsUnsatisfied.filter(
+      (label) => label.split(" + ").every((c) => runningCaps.has(c)));
+    if (splitGroups.length) {
+      swMissing = swMissing.concat(splitGroups);
+    }
+
     return {
       hwRequired,
       hwMissing: [], // 见上
       swRequired: app.software_capabilities || [],
       swMissing,
+      groupsUnsatisfied,
       cardCount,
       modelCards,
     };
+  }
+
+  // ── 能力组（capability group）─────────────────────────────────────────
+  //
+  // `swcap_to_model` 的每个条目默认**各自成组**（一个能力一个模型，历史行为）。
+  // 条目上写了同一个 `"group"` 的必须由**同一个**模型同时满足 —— 这是
+  // usb_hid 的写法（它要视觉 + 工具调用，两个实例各满足一半等于没满足）。
+  //
+  // 为什么需要它：能力回答「模型能做什么」，绑定回答「哪个模型来做」。历史上
+  // 这两件事被混在一起，于是想锁定 provider 就只能另起一个业务能力名
+  // （swcap_tool_call 就是这么来的）。拆开之后，确定性回归绑定层。
+  //
+  // 返回 Map<groupKey, string[]>，key 只用于去重，不对外暴露。
+  function _capGroups(cfg) {
+    const map = (cfg && cfg.swcap_to_model) ? cfg.swcap_to_model : {};
+    const byGroup = new Map();
+    for (const [cap, m] of Object.entries(map)) {
+      const key = (m && m.group) ? "g:" + m.group : "c:" + cap;
+      if (!byGroup.has(key)) byGroup.set(key, []);
+      byGroup.get(key).push(cap);
+    }
+    return byGroup;
+  }
+
+  // 选中某个能力时，连带它所在整组一起保留 —— 选组不是选单个能力。
+  function _groupOf(cfg, cap) {
+    const byGroup = _capGroups(cfg);
+    for (const caps of byGroup.values()) {
+      if (caps.indexOf(cap) !== -1) return caps.slice();
+    }
+    return [cap];
   }
 
   // 裁掉与当前选择无关的步骤。声明在 wizard.json 的
@@ -523,14 +580,23 @@
     return steps.filter((s) => !skip.has(s.id));
   }
 
-  // 裁剪后的 cfg:swcap_to_model 只留要用的那条,steps 裁掉无关步骤。
+  // 裁剪后的 cfg:swcap_to_model 只留 keep 里的那些条目（整组，不拆散），
+  // npu_index 统一指向实际卡位，steps 裁掉无关步骤。
+  function _singleEffCfgFor(cfg, keep, npu) {
+    const src = cfg.swcap_to_model || {};
+    const out = {};
+    for (const cap of keep) {
+      if (src[cap]) out[cap] = { ...src[cap], npu_index: npu };
+    }
+    return { ...cfg, swcap_to_model: out };
+  }
+
+  // 裁剪后的 cfg:swcap_to_model 只留要用的那条（组感知的实现在
+  // _singleEffCfgFor），steps 裁掉无关步骤。
   function _singleEffCfg(cfg, pick, npu) {
-    const cap = pick.cap;
+    const keep = _groupOf(cfg, pick.cap);
     return {
-      ...cfg,
-      swcap_to_model: {
-        [cap]: { ...cfg.swcap_to_model[cap], npu_index: npu },
-      },
+      ..._singleEffCfgFor(cfg, keep, npu),
       steps: _stepsWithout(cfg, pick),
     };
   }
@@ -539,40 +605,47 @@
   // 单卡策略（v0.24）                                                   //
   // ------------------------------------------------------------------ //
   // 一张 RK1828 协卡放不下两个模型（AGENTS.md v0.17 实测：同卡叠两个
-  // 模型 rc=-6）。单卡板上必须降级：
+  // 模型 rc=-6）。单卡板上必须降级。**单位是「组」不是「能力」**：
   //
-  //   * 单 capability 的应用 —— 模型照常加载，只是落到唯一那张卡上。
-  //   * 多 capability 的应用 —— 要么让用户二选一（vd），要么直接不可用
-  //     （刚需两个模型同时在位，单卡承载不了）。
+  //   * 单组 —— 无论组里有几项能力，都只需要一个模型，照常加载，只是落到
+  //     唯一那张卡上（usb_hid 视觉 + 工具调用同组 = 单组）。
+  //   * 多组 —— 要么让用户二选一（vd），要么直接不可用（刚需两个模型
+  //     同时在位，单卡承载不了）。
   //
   // 实现手法：单卡时把 `_active.cfg` 换成一份**裁剪过的副本** ——
-  // `swcap_to_model` 只留本应用单卡下真正要用的那条，`npu_index` 指向
-  // 实际卡位，`steps` 裁掉与该选择无关的步骤。下游三处消费点（finish
-  // 等待 / 一键开启 / 进度条）全部从 `_active.cfg` 取值，于是**一行都
-  // 不用改**就自动按单卡语义工作。
+  // `swcap_to_model` 只留本应用单卡下真正要用的那一**组**（整组保留，
+  // 不拆散），`npu_index` 指向实际卡位，`steps` 裁掉与该选择无关的
+  // 步骤。下游三处消费点（finish 等待 / 一键开启 / 进度条）全部从
+  // `_active.cfg` 取值，于是**一行都不用改**就自动按单卡语义工作。
   //
   // 返回 null = 双卡（或探测失败）→ 调用方保持原路径，行为逐字不变。
   function _planSingleCard(cfg, app, envCheck) {
     if (!envCheck || envCheck.cardCount !== 1) return null;
     const declared = Object.keys(cfg.swcap_to_model || {});
+    // **按组计数，不是按能力计数。** 一个组 = 一个模型。usb_hid 声明两项
+    // 能力（视觉 + 工具调用）但它们同组，所以是**一个**模型需求 —— 若按
+    // declared.length 判定就会把它误判成「刚需多模型」→ 单卡板直接
+    // blocked，整张卡不可用，而它本来只需要一个模型。
+    const groups = Array.from(_capGroups(cfg).values());
     // 实际卡位。正常就是 NPU0；万一枚举顺序变了（可跑模型的卡不是索引 0），
     // 这里跟着走 —— 单卡板上也可能不是 0。
     const npu = (envCheck.modelCards && envCheck.modelCards[0] != null)
       ? envCheck.modelCards[0] : 0;
 
-    // 单 capability（多数应用）：原样保留，只换卡号。
-    if (declared.length <= 1) {
+    // 单组（多数应用）：原样保留，只换卡号 —— 整组都要保留，不能只留第一项。
+    if (groups.length <= 1) {
+      const keep = groups.length ? groups[0] : [];
       return {
         active: true, blocked: false, baseCfg: cfg, npu,
         requiredCaps: declared,
         pickable: null, choice: null,
         effCfg: declared.length
-          ? _singleEffCfg(cfg, { cap: declared[0] }, npu)
+          ? { ..._singleEffCfgFor(cfg, keep, npu), steps: _stepsWithout(cfg, null) }
           : { ...cfg, swcap_to_model: {} },
       };
     }
 
-    // 多 capability：应用自己声明「单卡下能二选一的是哪两个」（wizard.json
+    // 多组：应用自己声明「单卡下能二选一的是哪两个」（wizard.json
     // 的 single_card_pick，可带 skip_steps）。声明了就让用户选；没声明
     // = 刚需多模型 → 单卡不可用。
     const pick = Array.isArray(cfg.single_card_pick) ? cfg.single_card_pick : [];
@@ -583,7 +656,8 @@
       const defPick = usable.find((p) => p.cap === def);
       return {
         active: true, blocked: false, baseCfg: cfg, npu,
-        requiredCaps: [def],
+        // requiredCaps 是选中项**整组**的能力（选组不是选单个能力）
+        requiredCaps: _groupOf(cfg, def),
         pickable: usable, choice: def,
         effCfg: _singleEffCfg(cfg, defPick, npu),
       };
@@ -606,7 +680,8 @@
     const pick = single.pickable.find((p) => p.cap === cap);
     if (!pick) return;
     single.choice = cap;
-    single.requiredCaps = [cap];
+    // 整组，不是单个能力
+    single.requiredCaps = _groupOf(base, cap);
     single.effCfg = _singleEffCfg(base, pick, single.npu);
     if (_active) _active.cfg = single.effCfg;
   }
@@ -1480,9 +1555,17 @@
     // "任意一张卡起来了"就算齐，用户要两张卡却只等到一张，推理退化成单卡
     // 还不报错。
     const targets = [];
+    const seen = new Set();
     for (const [, m] of Object.entries(cfg.swcap_to_model || {})) {
       const cards = Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index];
-      for (const n of cards) targets.push({ model_id: m.model_id, npu_index: n });
+      for (const n of cards) {
+        // 同组能力指向同一个模型时会展开出重复对 —— 进度行会多出几行
+        // 一模一样的加载条，90s 超时也按重复条数算。
+        const key = m.model_id + "@" + n;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        targets.push({ model_id: m.model_id, npu_index: n });
+      }
     }
     if (targets.length === 0) return;
     const statusBox = _q("#" + WIZARD_NS + "finish-error");
@@ -1877,7 +1960,13 @@
         }
       }
       // 2. 启必需(后端契约 POST + JSON {model, npu_index})
-      for (const [cap, m] of Object.entries(cfg.swcap_to_model)) {
+      //    **按 (model_id, npu_index) 去重** —— 同组能力指向同一个模型时
+      //    （usb_hid 的视觉 + 工具调用）逐条目 POST 会把同一个模型启两次。
+      const started = new Set();
+      for (const m of Object.values(cfg.swcap_to_model)) {
+        const key = m.model_id + "@" + m.npu_index;
+        if (started.has(key)) continue;
+        started.add(key);
         const sr = await fetch("/api/compute/instances", {
           method: "POST",
           headers: { "Content-Type": "application/json" },

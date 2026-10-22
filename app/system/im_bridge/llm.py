@@ -29,6 +29,8 @@ import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional
 
+from wdnai import SoftwareCapability
+
 from app.core.tools.registry import resolve_available_tool_names
 
 _LOG = logging.getLogger("wechat_llm")
@@ -152,7 +154,7 @@ class _LlmBridge:
         其辞。"""
         try:
             from app.core.compute.registry import get_registry
-            get_registry().get_session("swcap_video_retrieval")
+            get_registry().get_session(SoftwareCapability.VISION_EMBEDDING)
         except Exception as exc:  # noqa: BLE001
             _LOG.info("wechat video skipped for %s (model disabled): %s",
                       user_id, exc)

@@ -2422,7 +2422,7 @@ body.dg-modal-open .back-home-btn {
   font-size: 12px;
   color: var(--text-2);
   font-family: var(--mono);
-  /* 长 capability_types（如 "swcap_audio_query · swcap_audio_analyse"）超过
+  /* 长 capability_types（如 "swcap_vision_chat · swcap_audio_chat"）超过
    * 1fr 宽度时强制换行，避免撑爆中间列、把状态列挤出卡片外。 */
   overflow-wrap: anywhere;
   word-break: break-all;

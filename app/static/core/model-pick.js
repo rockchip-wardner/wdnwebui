@@ -6,26 +6,41 @@
  *
  * 用法:
  *   <script src="/static/core/model-pick.js" defer></script>
- *   loadModelPick("vtd-model-pick", "swcap_video_describe", "vtd.model_id");
+ *   loadModelPick("vtd-model-pick", "swcap_vision_chat", "vtd.model_id");
+ *   loadModelPick("usb-model-pick", ["swcap_vision_chat","swcap_tool_call"],
+ *                 "usb.model_id");          // ← 组模式：AND 语义
  *
  *   行为:
  *   * 拉 /api/compute/instances-by-capability,渲染 dropdown options
  *   * placeholder "自动 (本机优先)" 永远可选
  *   * localStorage 缓存上次选择,模型停掉后回退到 "自动"
  *   * 没有可用实例时下拉被禁用
+ *
+ *   **capability 可以是字符串或字符串数组。** 数组 = 能力组：只列**同时**
+ *   具备全部能力的实例。前端自己按单个能力分别查再求交集做不到这一点 ——
+ *   「一个实例都满足」和「两个实例各满足一半」在前端看都是交集非空,
+ *   后者却会在推理时才炸。后端对重复的 capability= 参数按 AND 处理。
  */
 (function () {
   "use strict";
 
   const API_PREFIX = "/api";
 
+  function _capQuery(capability) {
+    const caps = Array.isArray(capability) ? capability : [capability];
+    return caps
+      .filter((c) => typeof c === "string" && c)
+      .map((c) => "capability=" + encodeURIComponent(c))
+      .join("&");
+  }
+
   async function loadModelPick(selId, capability, storageKey) {
     const sel = document.getElementById(selId);
     if (!sel) return;
     let data = { instances: [] };
     try {
-      const url = `${API_PREFIX}/compute/instances-by-capability`
-                + `?capability=${encodeURIComponent(capability)}`;
+      const url = `${API_PREFIX}/compute/instances-by-capability?`
+                + _capQuery(capability);
       const r = await fetch(url, { cache: "no-store" });
       if (r.ok) data = await r.json();
     } catch (_) { /* best-effort */ }
@@ -118,8 +133,8 @@
     if (!box) return [];
     let data = { instances: [] };
     try {
-      const url = `${API_PREFIX}/compute/instances-by-capability`
-                + `?capability=${encodeURIComponent(capability)}`;
+      const url = `${API_PREFIX}/compute/instances-by-capability?`
+                + _capQuery(capability);
       const r = await fetch(url, { cache: "no-store" });
       if (r.ok) data = await r.json();
     } catch (_) { /* best-effort */ }

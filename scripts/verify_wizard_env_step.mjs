@@ -167,10 +167,10 @@ const computeFixtures = {
   running: {
     instances: [
       { status: "running", _source: "spawned",
-        capability_types: ["swcap_video_describe", "swcap_video_retrieval"] },
+        capability_types: ["swcap_vision_chat", "swcap_vision_embedding"] },
       // peer adopted —— 按 _probeEnv 语义**不算**本机就绪
       { status: "running", _source: "adopted",
-        capability_types: ["swcap_audio_tts"] },
+        capability_types: ["swcap_text_to_speech"] },
     ],
   },
   empty: { instances: [] },
@@ -227,12 +227,12 @@ console.log("【A】老卡（能力列表非空）渲染不变 —— 不应出�
 {
   fetchMode = "running";
   const envCheck = await priv._probeEnv(
-    { swcap_to_model: { swcap_audio_understand: { model_id: "qwen2.5-omni-3b" } } },
-    { software_capabilities: ["swcap_audio_understand"],
+    { swcap_to_model: { swcap_audio_chat: { model_id: "qwen2.5-omni-3b" } } },
+    { software_capabilities: ["swcap_audio_chat"],
       hardware_capabilities: ["hwcap_venc"] },
   );
-  // swcap_audio_understand 只挂在 peer adopted 上 → 按语义算「本机未启」
-  check("peer adopted 不算本机就绪", JSON.stringify(envCheck.swMissing) === '["swcap_audio_understand"]',
+  // swcap_audio_chat 只挂在 peer adopted 上 → 按语义算「本机未启」
+  check("peer adopted 不算本机就绪", JSON.stringify(envCheck.swMissing) === '["swcap_audio_chat"]',
     JSON.stringify(envCheck.swMissing));
   check("hwRequired 原样透传", JSON.stringify(envCheck.hwRequired) === '["hwcap_venc"]');
 
@@ -257,7 +257,7 @@ console.log("\n【A2】老卡全部能力就绪 —— 渲染不变 + 下一步�
 {
   fetchMode = "running";
   const envCheck = await priv._probeEnv({},
-    { software_capabilities: ["swcap_video_describe"],
+    { software_capabilities: ["swcap_vision_chat"],
       hardware_capabilities: ["hwcap_venc"] });
   check("无缺失", envCheck.swMissing.length === 0);
   const { body, foot } = renderEnv({}, envCheck);

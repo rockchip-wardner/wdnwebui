@@ -204,7 +204,7 @@ def main():
               page.locator(f".{NS}single-notice").count() == 0,
               f"count={page.locator(f'.{NS}single-notice').count()}")
         check("只列自己的 capability",
-              any("swcap_video_retrieval" in r for r in rows(page)),
+              any("swcap_vision_embedding" in r for r in rows(page)),
               " | ".join(rows(page)))
         check("有「一键开启所需模型」按钮",
               page.locator(f"#{NS}env-bring-btn").count() == 1,
@@ -237,14 +237,14 @@ def main():
               f"count={radios.count()}")
         check("默认选中视频描述",
               radios.nth(0).is_checked()
-              and radios.nth(0).get_attribute("value") == "swcap_video_describe",
+              and radios.nth(0).get_attribute("value") == "swcap_vision_chat",
               str(radios.nth(0).get_attribute("value")))
         check("未选中的 capability 标为「单卡下未启用」",
               "单卡下未启用" in txt)
         check("只列出选中的那个 capability（+ 中性行）",
-              any("swcap_video_describe" in r and "未启用" not in r
+              any("swcap_vision_chat" in r and "未启用" not in r
                   for r in rows(page))
-              and not any("swcap_audio_understand" in r and "未启用" not in r
+              and not any("swcap_audio_chat" in r and "未启用" not in r
                           for r in rows(page)),
               " | ".join(rows(page)))
 
@@ -270,9 +270,9 @@ def main():
         page.wait_for_timeout(1200)
         txt2 = body_text(page)
         check("切换后 capability 列表只剩音频描述（视频描述降为中性行）",
-              any("swcap_audio_understand" in r and "未启用" not in r
+              any("swcap_audio_chat" in r and "未启用" not in r
                   for r in rows(page))
-              and any("swcap_video_describe" in r and "未启用" in r
+              and any("swcap_vision_chat" in r and "未启用" in r
                       for r in rows(page)),
               " | ".join(rows(page)))
         bring = page.locator(f"#{NS}env-bring-btn")
@@ -367,7 +367,7 @@ def main():
         # 往 localStorage 预埋一条「上一轮双卡时填过的音频理解提示词」——
         # 模拟用户切到单卡后 localStorage 里还留着旧值。
         #   旧行为:audio 步还在 → 旧值进 opts → applyWizardSnapshot 点
-        #           「分析音频」→ 后端 502「功能未启用: swcap_audio_understand」
+        #           「分析音频」→ 后端 502「功能未启用: swcap_audio_chat」
         #           → 弹「启动音频分析失败: 功能未启用: …」
         #   新行为:audio 步被裁掉 → opts 里没有 audioPrompt → 压根不点
         #
@@ -412,7 +412,7 @@ def main():
                     "instances": [{
                         "id": "m0", "model_id": "qwen3-vl-4b", "npu_index": 0,
                         "status": "running",
-                        "capability_types": ["swcap_video_describe"],
+                        "capability_types": ["swcap_vision_chat"],
                     }],
                 })),
         )

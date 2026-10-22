@@ -150,7 +150,7 @@ def main() -> int:
         """Build the check for one capability, then run it immediately."""
         label = f"[npu{npu}] {mid} {cap}"
 
-        if cap == "swcap_video_describe":
+        if cap == "swcap_vision_chat":
             @check(label)
             def _run():
                 from app.core.llm.detector_base import _get_vlm_doc_cls
@@ -165,7 +165,7 @@ def main() -> int:
                     raise RuntimeError(f"空描述，res 类型={type(res).__name__}")
                 return f"desc={text[:60]!r}"
 
-        elif cap == "swcap_audio_understand":
+        elif cap == "swcap_audio_chat":
             @check(label)
             def _run():
                 import numpy as np
@@ -200,7 +200,7 @@ def main() -> int:
                     raise RuntimeError(f"空回复，res 类型={type(res).__name__}")
                 return f"reply={text[:60]!r}"
 
-        elif cap == "swcap_grounding":
+        elif cap == "swcap_vision_grounding":
             @check(label)
             def _run():
                 from app.core.llm.detector_base import _get_grounding_doc_cls

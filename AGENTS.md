@@ -950,16 +950,55 @@ app/apps/<card_id>/
 > 绿** —— `verify_apps_isolation` 的跨卡 import 检查只剩 2 张内置卡时就是
 > 这个下场。
 
-| `id` | capability | 后端入口 | 来源 |
+| `id` | capability（能力组） | 后端入口 | 来源 |
 |---|---|---|---|
 | `text-chat` | `swcap_text_chat` | `app.apps.text_chat` | 内置 |
-| `tts` | `swcap_audio_tts` | `app.apps.tts` | 内置 |
-| `audio-analysis` | `swcap_audio_understand` | `wdnapps_video_analyzer.cards.audio_analysis` | `wdnapps_video_analyzer` |
-| `video-retrieval` | `swcap_video_retrieval` | `wdnapps_video_analyzer.cards.video_retrieval`（检索） | `wdnapps_video_analyzer` |
-| `video-detection` | `swcap_video_describe` | `wdnapps_video_analyzer.cards.video_detection` | `wdnapps_video_analyzer` |
-| `video-target-detection` | `swcap_video_describe` | `wdnapps_video_analyzer.cards.video_target_detection` (TargetDoc) | `wdnapps_video_analyzer` |
-| `video-target-localization` | `swcap_grounding` | `wdnapps_video_analyzer.cards.video_target_localization` (LocatorDoc) | `wdnapps_video_analyzer` |
-| `usb-hid` | `swcap_computer_control` | `wdnapps_hdmi_processor.cards.usb_hid`（手动透传 + AI 任务循环 `agent.py`） | `wdnapps_hdmi_processor` |
+| `tts` | `swcap_text_to_speech` | `app.apps.tts` | 内置 |
+| `audio-analysis` | `swcap_audio_chat` | `wdnapps_video_analyzer.cards.audio_analysis` | `wdnapps_video_analyzer` |
+| `video-retrieval` | `swcap_vision_embedding` | `wdnapps_video_analyzer.cards.video_retrieval`（检索） | `wdnapps_video_analyzer` |
+| `video-detection` | `swcap_vision_chat` + `swcap_audio_chat`（两个模型） | `wdnapps_video_analyzer.cards.video_detection` | `wdnapps_video_analyzer` |
+| `video-target-detection` | `swcap_vision_chat` | `wdnapps_video_analyzer.cards.video_target_detection` (TargetDoc) | `wdnapps_video_analyzer` |
+| `video-target-localization` | `swcap_vision_grounding` | `wdnapps_video_analyzer.cards.video_target_localization` (LocatorDoc) | `wdnapps_video_analyzer` |
+| `usb-hid` | `swcap_vision_chat` + `swcap_tool_call`（**同组 → 同一模型**） | `wdnapps_hdmi_processor.cards.usb_hid`（手动透传 + AI 任务循环 `agent.py`） | `wdnapps_hdmi_processor` |
+
+### 能力词表由 wdnai 定义，不许自造
+
+7 个 `swcap_*` 全部是 `wdnai.SoftwareCapability` 的成员（`wdnai/capability.py`），
+命名轴统一为 `<输入模态>_<输出形态或功能>`：
+
+| 成员 | 值 | 含义 | provider |
+|---|---|---|---|
+| `TEXT_CHAT` | `swcap_text_chat` | 文本→文本（多轮 / 流式） | qwen3.5-vl-4b |
+| `VISION_CHAT` | `swcap_vision_chat` | 图像→文本 | qwen3-vl-4b、qwen3.5-vl-4b |
+| `VISION_GROUNDING` | `swcap_vision_grounding` | 图像→0–1000 归一化 bbox | LocateAnything-3b |
+| `AUDIO_CHAT` | `swcap_audio_chat` | 音频→文本 | qwen2.5-omni-3b |
+| `VISION_EMBEDDING` | `swcap_vision_embedding` | 图像→向量 | qwen3-vl-embedding-2b |
+| `TEXT_TO_SPEECH` | `swcap_text_to_speech` | 文本→语音 | qwen3-tts |
+| `TOOL_CALL` | `swcap_tool_call` | →**可执行动作 / 工具调用** | qwen3.5-vl-4b |
+
+**能力描述的是模型能做什么，不是哪个业务用它。** 业务归属走绑定
+（`swcap_to_model`），两者混为一谈就会长出 `swcap_tool_call` 这种
+「绑定伪装成能力」的东西（见下节）。
+
+两个容易踩的判定：
+
+* **`TOOL_CALL` 按「输出可执行动作」判定，不是按「走没走 function call」**。
+  usb_hid 的 `AgentAction` 是 `@Generable` 结构化 schema（click/type/key/…），
+  而 `tts_alert` / `video_search` 是 `@Callable` 调度 —— 两者都算。
+  反过来，vtd 的 `TargetDoc` 虽然也是 `@Generable`，但产出的是**检测结果描述**
+  不是可执行动作，所以只挂 `VISION_CHAT`：schema 属调用方业务
+  （设计原则 6）。
+* **枚举描述本机 RKNN 端口真实现的通路，不是上游权重的理论能力**。上游
+  Qwen2.5-Omni 是全模态，但本机这份 RKNN 只导出了音频通路
+  （`wdnai/backends/omni.py` 首行自述 `wav-in, text-out`，`run_images()`
+  直接 `raise`），所以它只声明 `AUDIO_CHAT`。声明一个只有运行时才会炸的
+  能力，比不声明更糟。
+
+`wdnai` 侧还提供 `coerce()`（严格，只认当前名）、`migrate_legacy()`
+（读老配置，认历史别名）、`LEGACY_ALIASES` / `RETIRED_CAPABILITIES`。
+`RETIRED` 是**报错**而不是静默映射 —— 老迁移表里
+`video_query` / `video_analyse` 迁到两个从未上线的能力名，把老配置变成了
+永久的「功能未启用」且毫无线索，现在 boot 迁移会丢弃并告警。
 
 > `tts_alert` 工具住在 `app/core/tools/tts_alert.py` 而不是音视频描述卡里：
 > `core/tools/_builtins.py` 要 import 它，而 `_builtins` 同时被 detach 的
@@ -986,14 +1025,29 @@ app/apps/<card_id>/
               → 等 PC 反应(1.2s) → 下一轮，直到 done / 停止 / 步数上限
 ```
 
-### 为什么单独开一个 swcap
+### 为什么不单独开一个 swcap（历史包袱已拆除）
 
-`get_session(capability)` 命中多实例时按「本机优先 + 卡号升序」取第一个
-（`registry.py::get_session`）。`swcap_video_describe` 同时被 qwen3-vl-4b 和
-qwen3.5-vl-4b 声明 —— 电脑控制拿到哪个模型取决于卡号排列，用户不可控。
-`swcap_computer_control` **只**挂在 `workers/qwen3.5-vl-4b.json` 上，取到的
-永远是那一个。不新开 worker manifest：电脑控制要的也是「吃一张图 + 出文本」，
-与 qwen3.5-vl-4b 能力同构。
+原来这里有个 `swcap_computer_control`，理由写的是「`get_session` 命中多实例时按
+「本机优先 + 卡号升序」取第一个（`registry.py::get_session`），而
+`swcap_video_describe` 同时被 qwen3-vl-4b 和 qwen3.5-vl-4b 声明 —— 电脑控制
+拿到哪个模型取决于卡号排列，用户不可控」。
+
+看清楚就知道：**那是绑定问题，被伪装成了能力。** 能力回答「模型能做什么」，
+选哪个模型回答「绑定」；混在一起时，想锁 provider 就只能另起一个业务能力名，
+而那个名字立刻开始承担它不该承担的事（一个新业务想用同款能力就发现名字不对）。
+
+现在能力与绑定解耦：
+
+* 能力如实声明 —— usb_hid 需要 `swcap_vision_chat`（截图要视觉）+
+  `swcap_tool_call`（动作要可执行输出），两项都在 `wizard.json` 的
+  `swcap_to_model` 条目上带 `"group": "agent"`；
+* 「必须同一个模型」由**组绑定**保证 —— 组感知的三处判定
+  （`registry.set_active_app` 按组校验、`list_running_by_capabilities` 的 AND
+  查询、前端 `_planSingleCard` **按组数**而非能力数判单卡）都不再出现
+  「两个实例各满足一半」被算成就绪的情况。
+
+不新开 worker manifest：电脑控制要的也是「吃一张图 + 输出动作」，与
+qwen3.5-vl-4b 能力同构。
 
 > `config.jsonc` 已在 `compute.autostart` 里加上 `qwen3.5-vl-4b`（npu0），
 > 但该文件是 **.gitignore 的**（per-user 配置），换机器要手动加一行。
@@ -1004,7 +1058,7 @@ action 的 schema、0-1000→帧像素→PC 像素的两次换算、键名解析
 **全部在主进程**（设计原则 6）。除了「worker 是 detach 进程不能 reload」这个
 老理由，还因为同一份 RKNN 会挂多个 capability，action 语义必须跟着**调用方**
 走。相应地**不要调 `sess.reset()`**：qwen3.5-vl-4b 这个实例同时挂着
-`swcap_text_chat`（微信对话）和 `swcap_computer_control`，每轮 prompt 都是
+`swcap_text_chat`（微信对话）和 `swcap_tool_call`，每轮 prompt 都是
 自包含的不依赖 worker 侧会话历史，reset 只会把并发的微信对话历史一起清掉。
 
 ### `@Generable` schema 的两条老规矩（沿用 TargetDoc）
@@ -2247,8 +2301,8 @@ worker（pid 不同）双双 `running`。约束是「**一卡一模型**」，�
 
 ```python
 # 枚举所有能服务该 capability 的端点（含/不含远端由 include_remote 决定）
-handles = get_registry().list_sessions("swcap_video_describe", include_remote=False)
-handles = get_registry().list_sessions("swcap_video_describe",
+handles = get_registry().list_sessions("swcap_vision_chat", include_remote=False)
+handles = get_registry().list_sessions("swcap_vision_chat",
                                        include_remote=True,     # 也含 LAN peer
                                        model_id="qwen3-vl-4b")
 for h in handles:
@@ -2397,24 +2451,32 @@ snapshot() 新增 model_cards / card_count 两个字段
 
 ### 各应用的模型需求与单卡行为
 
-| 应用 | capability 数 | 单卡行为 |
+| 应用 | 能力组数 | 单卡行为 |
 |---|---|---|
 | 文本对话 / 语音生成 / 视频目标检测 / 视频目标定位 / 监控反查 `vr` | 1 | 模型落到唯一卡位，功能不变 |
 | 智能电脑控制 `usb_hid` | 0 | 纯硬件，不碰 NPU |
 | **音视频描述 `vd`** | **2** | **二选一**（视频描述 / 音频描述） |
 
+> 组数 ≠ 能力数：`usb_hid` 若启用 AI 任务循环需要两项能力，但它们同组，
+> 仍是**一个**模型需求。
 > 「监控分析检索」已改名为「监控反查 `vr`」并**删掉分析功能只保留检索**
-> （v0.25），capability 从 2 个降到 1 个 —— 它不再是「刚需两模型」的卡，
-> 单卡下与其它单 capability 应用一样。`vd` 是目前唯一需要二选一的卡。
+> （v0.25），组数从 2 降到 1 —— 它不再是「刚需两模型」的卡，
+> 单卡下与其它单组应用一样。`vd` 是目前唯一需要二选一的卡。
 
 ### 实现手法：裁剪后的 effective cfg
 
 单卡策略**全收在向导层**（前端）；后端只加只读探测字段 + autostart 裁剪。
 
 `state.js::_planSingleCard(cfg, app, envCheck)` 在单卡时返回一份**裁剪过的
-`_active.cfg`**：`swcap_to_model` 只留本应用单卡下真正要用的那条，
-`npu_index` 指向实际卡位。下游三处消费点全部从 `_active.cfg` 取值，
-**一行都不用改**就自动按单卡语义工作：
+`_active.cfg`**：`swcap_to_model` 只留本应用单卡下真正要用的那一**组**
+（整组保留，不拆散），`npu_index` 指向实际卡位。下游三处消费点全部从
+`_active.cfg` 取值，**一行都不用改**就自动按单卡语义工作：
+
+> **判定单位是「组」不是「能力」。** 一个组 = 一个模型。usb_hid 声明两项能力
+> 但同组，所以是**单组 = 单模型**需求。若按能力数（`declared.length <= 1`）
+> 判定，它会被误判成「刚需多模型」→ 单卡板上直接 blocked，整张卡不可用，
+> 而它本来只需要一个模型 —— 这是本次重构里最容易踩的一处。
+> `video-detection` 是两个独立组，所以仍然需要 `single_card_pick` 二选一。
 
 | 位置 | 用途 |
 |---|---|
@@ -2435,9 +2497,9 @@ snapshot() 新增 model_cards / card_count 两个字段
 
 ```json
 "single_card_pick": [
-  { "cap": "swcap_video_describe",   "label": "视频描述功能",
+  { "cap": "swcap_vision_chat",   "label": "视频描述功能",
     "skip_steps": ["audio"] },
-  { "cap": "swcap_audio_understand", "label": "音频描述功能",
+  { "cap": "swcap_audio_chat", "label": "音频描述功能",
     "skip_steps": ["detect"] }
 ]
 ```
@@ -2449,7 +2511,7 @@ snapshot() 新增 model_cards / card_count 两个字段
 **`skip_steps` 为什么必要**：vd 的两个 capability 各自对应向导里的一步。
 选了「视频描述」却还要问用户「音频理解提示词」，用户填了 → 完成配置 →
 `applyWizardSnapshot` 里 `if (opts.audioPrompt)` 成立 → 去点「分析音频」→
-单卡上那个模型压根没加载 → 后端 502「功能未启用: swcap_audio_understand」
+单卡上那个模型压根没加载 → 后端 502「功能未启用: swcap_audio_chat」
 → 弹窗。
 
 裁剪落在**同一份 effective cfg** 里（`state.js::_stepsWithout`）：
@@ -3162,8 +3224,8 @@ wdnwebui/
 │   ├── apps/                           # 8 个独立 app 卡片(v0.4 重构)
 │   │   ├── audio_analysis/             # 音频理解(嵌入音视频描述页)
 │   │   ├── text_chat/                  # 文本对话 (swcap_text_chat)
-│   │   ├── tts/                        # 语音生成 (swcap_audio_tts)
-│   │   ├── video_retrieval/            # 监控反查（只检索 swcap_video_retrieval）
+│   │   ├── tts/                        # 语音生成 (swcap_text_to_speech)
+│   │   ├── video_retrieval/            # 监控反查（只检索 swcap_vision_embedding）
 │   │   ├── video_detection/            # 音视频描述 (+ tts_alert 工具)
 │   │   ├── video_target_detection/     # 视频目标检测 (TargetDoc)
 │   │   └── video_target_localization/  # 视频目标定位 (LocatorDoc)
@@ -3383,13 +3445,13 @@ class AudioEvent:
 ### Capability 与 ComputeRegistry 集成
 
 * `MODEL_PRESETS["qwen2.5-omni-3b"]`：memory_estimate_mb=2500 /
-  estimated_init_seconds=50 / capability_types=["swcap_audio_understand"] /
+  estimated_init_seconds=50 / capability_types=["swcap_audio_chat"] /
   worker_name="audio-3b"（comm="worker:audio-3b", 13 字符）。
 * 该 manifest 的 `spec_factory="qwen_2_5_omni_3b"`，worker 侧据此调
   `SLM.qwen_2_5_omni_3b()`；`comm_name="audio-3b"` 来自同文件
   `workers/qwen2.5-omni-3b.json` 的 `worker_name`（`compute_worker_lazy.py`
   已删除）。
-* `_LEGACY_CAPABILITY_TYPE_RENAMES` 加 `"audio_understand" → "swcap_audio_understand"`，
+* `_LEGACY_CAPABILITY_TYPE_RENAMES` 加 `"audio_understand" → "swcap_audio_chat"`，
   兼容老 config.jsonc。
 
 ### API 端点（`app/apps/audio_analysis/api.py`）
@@ -3403,7 +3465,7 @@ class AudioEvent:
 | `POST` | `/api/audio-analysis/events/clear`  | 清空内存事件 |
 | `WS`   | `/api/audio-analysis/ws`            | server-push `{type:"hello"|"event"|"progress"|"state"}` |
 
-错误码与 detector / VR 对齐：502 + `RuntimeError("功能未启用: swcap_audio_understand")`。
+错误码与 detector / VR 对齐：502 + `RuntimeError("功能未启用: swcap_audio_chat")`。
 
 ### 前端模块（`app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)`）
 
@@ -4017,8 +4079,8 @@ holds it in memory. The file is seeded with a `base` section at
 
   UI 通过 `GET /api/compute` 每秒轮询状态，
   loading 实例显示预估倒计时（`ESTIMATED_INIT_SECONDS_PER_MODEL`）。
-  Capability 概念作为内部 key 使用（`get_session("swcap_video_describe")` /
-  `"swcap_audio_tts"`）；capability 路由仅走同进程 `ComputeRegistry`，
+  Capability 概念作为内部 key 使用（`get_session("swcap_vision_chat")` /
+  `"swcap_text_to_speech"`）；capability 路由仅走同进程 `ComputeRegistry`，
   跨机器发现走 FastDDS SIMPLE multicast（v0.6+），`ComputeRegistry`
   的 `Hub` 服务名 `wdndds/rpc/<model_id>` 自动暴露给 peer。
 
@@ -4724,7 +4786,7 @@ RIFF header by hand.
 
 * **Service** (`app/core/video/search.py`)：
   - `VideoSearchService` 单例（`get_service()`）。
-  - **LLMSession 必须从 ComputeRegistry 取** —— `get_session("swcap_video_retrieval")`，
+  - **LLMSession 必须从 ComputeRegistry 取** —— `get_session("swcap_vision_embedding")`，
     复用 `qwen3-vl-embedding-2b` 实例；找不到 capability 抛
     `RuntimeError("功能未启用: ...")`，HTTP 503 透传。`start_extract`
     加预检 `_ensure_session()`，不用等 worker 探测才报错。
@@ -4793,7 +4855,7 @@ RIFF header by hand.
     离开页面 confirm + 停提取 + `sendBeacon` 兜底。
 * **ComputeRegistry preset**（`app/core/compute/registry.py`）：
   - `MODEL_PRESETS["qwen3-vl-embedding-2b"]`：`capability_types=
-    ["swcap_video_retrieval"]`，`memory_estimate_mb=2000`，
+    ["swcap_vision_embedding"]`，`memory_estimate_mb=2000`，
     `estimated_init_seconds=30`。`kind="embedding"` 的 probe /
     `_init_session_subprocess` 分支按 vlm 文件布局校验（rknn_llm +
     rknn_vision + embed + tokenizer）。
@@ -4975,7 +5037,7 @@ qwen3.5-vl-4b 提供），
   `LocateAnything` backend（`wdnai.backends.locate_anything.LocateAnythingBackend`）。
   - `MODEL_PRESETS["locate-anything"]`：
     `kind="grounding"`（probe 按 vlm 文件布局校验），
-    `capability_types=["swcap_grounding"]`，
+    `capability_types=["swcap_vision_grounding"]`，
     `memory_estimate_mb=5500`，
     `estimated_init_seconds=60`，
     `worker_name="ground"`（comm = `worker:ground`，13 字符；alias 6 字符
@@ -5050,7 +5112,7 @@ qwen3.5-vl-4b 提供），
 * **唯一保留的内置工具** — ``tts_alert``：语音提醒，模型给出
   ``text`` / ``language`` / ``ref_speaker``，``TtsSession.start``
   触发本机播放。能力门控
-  ``requires_capability="swcap_audio_tts"``。
+  ``requires_capability="swcap_text_to_speech"``。
   工具注册中心 ``app/core/tools/registry.py`` 中
   ``get_tool_registry()`` 启动时只挂载 ``tts_alert`` 一条。
 
@@ -5291,7 +5353,7 @@ web 文本对话与微信桥接共用 ``run_chat_with_tools()`
         LocateAnything backend `wdnai.backends.locate_anything.LocateAnythingBackend`
         走 RKNN 视觉 encoder + RKNN LLM decoder；输出 0–1000 归一化 bbox + 文本）
         — `MODEL_PRESETS["locate-anything"]` memory_estimate_mb=5500、
-        capability_types=["swcap_grounding"]、`worker_name="ground"`（alias 6 字符，
+        capability_types=["swcap_vision_grounding"]、`worker_name="ground"`（alias 6 字符，
         在 TASK_COMM_LEN=16 的 8 字符硬限内）。
  - `kind="tts"`：`tts_model_dir` 目录存在即可；具体
         `.1828.rknn` / `.weight` / `.fp16.bin` 清单交给 backend 真实 init
@@ -5473,7 +5535,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
      上限）→ 落盘 `uploads/wechat_videos/<uid>/` → PyAV 探测 → 逐片
      **4s 片 / 1s 重叠** embedding（复用 VR 底层函数 `_probe_video_meta`
      / `_read_chunk_frames` / `_write_frames_to_shm` / `_cosine_similarity`
-     + `get_session("swcap_video_retrieval")`，SHM 帧传递 + timeout 重试
+     + `get_session("swcap_vision_embedding")`，SHM 帧传递 + timeout 重试
      与 UI 页同款）→ ready。
    - **md5 缓存命中短路**（下载落盘后、PyAV 探测前）：流式算本地
      md5 → `get_video_cache().lookup(md5, model_id)` 命中即把
@@ -5607,7 +5669,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     含微信条目，用户决策）不变 —— 跨入口命中复用保持（表共享、
     展示隔离）。同 md5 同参数两渠道互覆（save 幂等语义，检索等价）。
 * **VideoSearch 工具**（`app/core/tools/video_search.py`，
-  `requires_capability="swcap_video_retrieval"`）：**无调用时机限制**
+  `requires_capability="swcap_vision_embedding"`）：**无调用时机限制**
   的四态结果型返回 —— `ok`（命中片段）/ `extracting`（附实时进度）/
   `downloading` / `no_video`，状态即合法业务结果而非错误，模型自由
   组织回复。真正的执行失败（会话缺失等）抛错走失败回喂。
@@ -5626,7 +5688,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   复核；PyAV probe 后时长复核 —— 统一 raise → error 态 + ⚠️ 微信
   通知，超限文件不残留。
 * **capability 预检（未启用整体不可用）**：`handle_incoming` 分流时
-  先 `get_session("swcap_video_retrieval")` —— 未加载则**不入队**
+  先 `get_session("swcap_vision_embedding")` —— 未加载则**不入队**
   （加载后需重发视频），回固定文案「视频检索模型功能未被启用，需在
   算力配置页中加载启用后重新发送」，并向该用户 history 注入系统通知
   （此场景 VideoSearch 不在 schema 中，模型无工具可调，注入后才能
@@ -6434,7 +6496,7 @@ replier pump**。诊断时别被这批日志带偏 —— **先看有没有真�
 
 **实测**：杀掉 Omni worker 后，第 3 次连续失败时
 `state=error error='连续 3 段推理失败（Omni worker 可能已失联），会话已停止'`；
-第 3 次的原始错误正是「功能未启用: swcap_audio_understand」——registry
+第 3 次的原始错误正是「功能未启用: swcap_audio_chat」——registry
 这时才发现 worker 没了（晚了 3 次）。
 
 > **registry 层面的根治**（本地 worker 存活探测）**本期未做** —— 那是共享

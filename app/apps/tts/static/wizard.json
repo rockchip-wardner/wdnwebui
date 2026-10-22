@@ -2,7 +2,7 @@
   "enabled": true,
   "wizard_title": "语音生成快速配置",
   "swcap_to_model": {
-    "swcap_audio_tts": { "npu_index": 1, "model_id": "qwen3-tts" }
+    "swcap_text_to_speech": { "npu_index": 1, "model_id": "qwen3-tts" }
   },
   "open_source_button": "",
   "start_buttons": ["tts-start"],

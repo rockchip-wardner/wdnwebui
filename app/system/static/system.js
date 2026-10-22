@@ -2754,7 +2754,7 @@ const ComputeConfigPage = {
     body.className = "cc-service-body";
     card.appendChild(body);
 
-    // SW capability chips（swcap_video_describe / swcap_audio_tts / …）
+    // SW capability chips（swcap_vision_chat / swcap_text_to_speech / …）
     const capsEl = document.createElement("div");
     capsEl.className = "cc-service-caps";
     body.appendChild(capsEl);

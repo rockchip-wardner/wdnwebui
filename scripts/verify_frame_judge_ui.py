@@ -47,8 +47,8 @@ OPEN = "打开"
 # 只在**本测试页**里把 /api/compute 的能力清单桩成全绿。属于测试替身，
 # 不碰任何产品代码，也不代表真机算力状态。
 STUB_CAPS = [
-    "swcap_video_describe", "swcap_video_retrieval", "swcap_audio_understand",
-    "swcap_grounding", "swcap_text_chat", "swcap_audio_tts",
+    "swcap_vision_chat", "swcap_vision_embedding", "swcap_audio_chat",
+    "swcap_vision_grounding", "swcap_text_chat", "swcap_text_to_speech",
 ]
 STUB_COMPUTE = {
     "instances": [{"status": "running", "_source": "spawned",

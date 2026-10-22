@@ -78,6 +78,11 @@ class CardManifest:
     # ---- Capabilities ----
     software_capabilities: list[str]
     hardware_capabilities: list[str]
+    #: 能力组：每组内的能力必须由**同一个**模型同时满足。派生自卡片
+    #: ``static/wizard.json`` 的 ``swcap_to_model[].group``（见
+    #: :func:`_derive_capability_groups`）。只保留成员数 > 1 的组 ——
+    #: 单项组等价于「逐能力各找一个实例」，无需携带。
+    capability_groups: list[list[str]]
 
     # ---- Backend ----
     backend_module: str
@@ -345,6 +350,18 @@ def _validate(
         if cap not in known_hw_caps:
             errors.append(f"unknown hardware_capability {cap!r}")
 
+    # 能力组（派生，非声明字段）：组内能力必须已在 software_capabilities
+    # 里，否则就是组里写了个 manifest 没声明的能力 —— 逐能力就绪检查
+    # 根本不会去看它。
+    cap_groups = _derive_capability_groups(card_dir)
+    for grp in cap_groups:
+        for cap in grp:
+            if cap not in sw_caps:
+                errors.append(
+                    f"capability group references {cap!r} which is not in "
+                    f"software_capabilities (group {grp!r})"
+                )
+
     if any(e.startswith("FATAL") for e in errors):
         return None, errors
 
@@ -372,6 +389,7 @@ def _validate(
         preview_video=str(raw.get("preview_video", "")).strip(),
         software_capabilities=list(sw_caps),
         hardware_capabilities=list(hw_caps),
+        capability_groups=[list(g) for g in cap_groups],
         backend_module=str(backend["module"]).strip(),
         backend_register_api=str(backend["register_api"]).strip(),
         backend_register_shutdown=str(backend.get("register_shutdown", "")).strip(),
@@ -402,6 +420,51 @@ def _static_url_to_rel(url: str) -> Optional[str]:
             return rest.split("/", 1)[1]
         return rest
     return None
+
+
+def _derive_capability_groups(card_dir: Path) -> list[list[str]]:
+    """Read ``static/wizard.json`` and return the card's capability groups.
+
+    A *group* is a set of capabilities that one **single** model must provide
+    together. It is declared implicitly: entries of the wizard config's
+    ``swcap_to_model`` that carry the same ``"group"`` name form one group;
+    an entry without one forms its own singleton group. So the seven cards
+    that need one model each declare nothing at all — grouping is opt-in.
+
+    Only groups with more than one member are returned. A singleton group is
+    exactly the historical per-capability behaviour, and emitting it would
+    just make every card look like it had a group to satisfy.
+
+    Why this lives here rather than in the wizard frontend: the **backend**
+    needs it too. ``set_active_app`` decides whether a card is genuinely
+    ready, and checking each capability independently calls a card ready
+    when "capability A is on model X and capability B is on model Y" — two
+    half-satisfying instances that will fail at inference time. Deriving the
+    groups once, server-side, keeps the browser from being the only thing
+    that knows about them.
+    """
+    wizard = card_dir / "static" / "wizard.json"
+    if not wizard.is_file():
+        return []
+    try:
+        with open(wizard, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        LOG.warning("[%s] wizard.json unreadable, no capability groups: %s",
+                    card_dir.name, exc)
+        return []
+    entries = cfg.get("swcap_to_model")
+    if not isinstance(entries, dict):
+        return []
+    by_group: dict[str, list[str]] = {}
+    for cap, spec in entries.items():
+        if not isinstance(cap, str) or not isinstance(spec, dict):
+            continue
+        name = spec.get("group")
+        if not isinstance(name, str) or not name:
+            continue
+        by_group.setdefault(name, []).append(cap)
+    return [caps for caps in by_group.values() if len(caps) > 1]
 
 
 def _known_software_capabilities() -> set[str]:

@@ -198,12 +198,12 @@ def _check_set_active_app_integration():
             (-1, "LocateAnything-3b", "spawned"): reg_mod.ModelInstance(
                 key=(-1, "LocateAnything-3b", "spawned"),
                 npu_index=0, model_id="LocateAnything-3b",
-                capability_types=["swcap_grounding"],
+                capability_types=["swcap_vision_grounding"],
                 instance_name="LocateAnything-3b", label="LocateAnything-3b",
                 memory_estimate_mb=3000, status="running",
                 queued_at=0.0, started_at=0.0, _source="spawned"),
         }
-        out = reg.set_active_app("video-target-localization", ["swcap_grounding"])
+        out = reg.set_active_app("video-target-localization", ["swcap_vision_grounding"])
     finally:
         reg_mod.get_config = orig_get_config
 

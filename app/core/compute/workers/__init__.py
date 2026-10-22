@@ -54,6 +54,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from wdnai import SoftwareCapability
+
 LOG = logging.getLogger("compute.workers")
 
 WORKERS_DIR = Path(__file__).resolve().parent
@@ -204,14 +206,31 @@ def _validate(raw: Any, stem: str) -> tuple[Optional[WorkerManifest], List[str]]
     if not isinstance(factory, str) or not factory.strip():
         errors.append("'spec_factory' 缺失（wdnai.SystemLanguageModel 上的方法名）")
 
+    # Capability names are **not** free-form: the vocabulary is closed by
+    # ``wdnai.SoftwareCapability``. The old ``startswith("swcap_")`` check
+    # accepted any string with the right prefix, which is how ghost
+    # capabilities (``swcap_video_query`` / ``swcap_video_analyse`` — never
+    # declared by any worker, yet sitting in the legacy rename table) survived
+    # unnoticed: they looked valid and only failed much later as a permanent
+    # "功能未启用". Enum membership now catches a typo *and* a ghost at load
+    # time, on the file that introduced it.
     caps = raw.get("capability_types")
     if caps is None:
         errors.append("'capability_types' 缺失")
     elif not isinstance(caps, list) or not all(
-            isinstance(c, str) and c.startswith("swcap_") for c in caps):
-        errors.append("'capability_types' 必须是以 'swcap_' 开头的字符串列表")
+            isinstance(c, str) for c in caps):
+        errors.append("'capability_types' 必须是字符串列表")
     elif not caps:
         errors.append("'capability_types' 不能为空 —— worker 至少要提供一项能力")
+    else:
+        unknown = [c for c in caps if not SoftwareCapability.contains(c)]
+        if unknown:
+            errors.append(
+                "'capability_types' 含非法能力: {}（合法值为: {}）".format(
+                    ", ".join(unknown),
+                    ", ".join(SoftwareCapability.values()),
+                )
+            )
 
     if errors:
         return None, errors
@@ -329,16 +348,22 @@ def model_presets() -> Dict[str, Dict[str, Any]]:
 
 
 def known_capability_types() -> set:
-    """Every ``swcap_*`` any manifest declares.
+    """Every legal ``swcap_*`` value.
 
     Used by :func:`app.core.manifest._known_software_capabilities` to
-    validate card manifests — same contract it had when it read
-    ``MODEL_PRESETS`` directly.
+    validate card manifests. The set is now the **closed vocabulary** from
+    :class:`wdnai.SoftwareCapability` rather than the union of whatever the
+    worker manifests happen to declare.
+
+    Why that matters: a card declaring a capability that *no worker provides*
+    is a configuration error, but it is not a *vocabulary* error — and under
+    the old union-of-manifests contract it passed card validation silently,
+    only to fail much later as a permanent "功能未启用". With the vocabulary
+    closed in the SDK, the two concerns separate cleanly: this set answers
+    "is this a real capability name", the registry answers "is any model
+    currently running to provide it".
     """
-    caps: set = set()
-    for manifest in discover():
-        caps.update(manifest.capability_types)
-    return caps
+    return set(SoftwareCapability.values())
 
 
 __all__ = [

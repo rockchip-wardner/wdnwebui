@@ -7,7 +7,7 @@
   "preview_video": "/static/apps/tts/preview.mp4",
   "preview_image": "",
   "software_capabilities": [
-    "swcap_audio_tts"
+    "swcap_text_to_speech"
   ],
   "hardware_capabilities": [
     "hwcap_audio_output"

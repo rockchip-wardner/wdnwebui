@@ -369,7 +369,7 @@ try:
     R.get_config = lambda: fake_cfg
     try:
         res = h.reg.set_active_app("video-target-localization",
-                                   ["swcap_grounding"])
+                                   ["swcap_vision_grounding"])
     finally:
         R.get_config = orig_cfg
     autostart = res["autostart"]

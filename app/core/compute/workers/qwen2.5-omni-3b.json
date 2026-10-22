@@ -1,7 +1,7 @@
 {
   "label": "[Omni]多感知描述v2.5",
   "capability_types": [
-    "swcap_audio_understand"
+    "swcap_audio_chat"
   ],
   "spec_factory": "qwen_2_5_omni_3b",
   "worker_name": "audio-3b",
@@ -10,7 +10,7 @@
   "memory_estimate_mb": 2500,
   "estimated_init_seconds": 50,
   "description": "多感知描述模型（kind=omni，wav-in/text-out，单次推理上限 6s）",
-  "notes": "kind=\"omni\"，wav-in / text-out。单次 run_audio 硬上限 6 秒，切片由调用方负责（audio_analysis.CHUNK_SECONDS 保持 6s）。",
+  "notes": "kind=\"omni\"，wav-in / text-out。单次 run_audio 硬上限 6 秒，切片由调用方负责（audio_analysis.CHUNK_SECONDS 保持 6s）。⚠️ 上游 Qwen2.5-Omni 是端到端全模态（图像/视频/音频进、文本+语音出，Thinker-Talker 双分支），但**本机这份 RKNN 只导出了音频通路**：wdnai 的 omni backend 自述 wav-in/text-out，且 run_images() 直接 raise \"Omni backend does not support images.\"。所以本文件只声明 swcap_audio_chat。想给它加视觉/语音能力不是改 manifest 能解决的 —— 需要新的 RKNN 导出 + wdnai 侧实现对应的 run_*。",
   "available_targets": [
     "182x"
   ],

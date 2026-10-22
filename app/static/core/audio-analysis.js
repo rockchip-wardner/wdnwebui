@@ -23,7 +23,7 @@
     eventsCount: "vd-audio-events-count",
   };
 
-  const CAPABILITY = "swcap_audio_understand";
+  const CAPABILITY = "swcap_audio_chat";
 
   // 同一套 DOM id 只允许挂**一个**实例。重复挂载不是「多画一遍」，而是
   // **两套结果在同一个框里横跳**：每个实例各开一条 WebSocket、各自维护

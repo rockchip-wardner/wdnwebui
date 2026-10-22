@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from wdnai import SoftwareCapability
 
 from app.core.video.utils import (
     _read_chunk_frames,
@@ -170,7 +171,7 @@ class WechatVideoManager:
         from app.core.compute.registry import (
             get_registry, get_session_call_lock,
         )
-        session = get_registry().get_session("swcap_video_retrieval")
+        session = get_registry().get_session(SoftwareCapability.VISION_EMBEDDING)
         with get_session_call_lock():
             qvec = session.embed_text(text)
         qvec = np.asarray(qvec, dtype=np.float32)
@@ -373,7 +374,7 @@ class WechatVideoManager:
         from app.core.compute.registry import (
             get_registry, get_session_call_lock,
         )
-        session = get_registry().get_session("swcap_video_retrieval")
+        session = get_registry().get_session(SoftwareCapability.VISION_EMBEDDING)
         lock = get_session_call_lock()
 
         # ---- 1. 固定文案确认（A 组合播报节点）----

@@ -1,7 +1,7 @@
 {
   "label": "[TTS]文字转语音v3",
   "capability_types": [
-    "swcap_audio_tts"
+    "swcap_text_to_speech"
   ],
   "spec_factory": "qwen3_tts",
   "worker_name": "tts",

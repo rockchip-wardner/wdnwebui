@@ -42,6 +42,7 @@ from threading import RLock
 from typing import Callable, Dict, List, Optional, Tuple, Type
 
 from wdnai import Callable as WdnaiCallable
+from wdnai import SoftwareCapability
 
 
 @dataclass(frozen=True)
@@ -198,7 +199,7 @@ def get_tool_registry() -> ToolRegistry:
             key="tts_alert",
             name="语音提醒",
             description="...",
-            requires_capability="swcap_audio_tts",
+            requires_capability=SoftwareCapability.TEXT_TO_SPEECH,
             tool_class=TtsAlert,
             icon="🔊",
         )

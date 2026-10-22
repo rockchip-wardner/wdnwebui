@@ -56,9 +56,9 @@ Endpoints
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.core.compute.registry import (
@@ -509,7 +509,17 @@ async def get_capabilities() -> dict:
 
 
 @router.get("/compute/instances-by-capability")
-async def list_instances_by_capability(capability: str) -> dict:
+async def list_instances_by_capability(
+    capability: Optional[List[str]] = Query(
+        None,
+        description=(
+            "可重复：?capability=a&capability=b 表示 AND（同一实例须同时具备）"
+        ),
+    ),
+    capabilities: Optional[str] = Query(
+        None, description="逗号分隔的等价写法：?capabilities=a,b",
+    ),
+) -> dict:
     """返回当前 running 实例中能提供指定 capability 的清单。
 
     供音视频描述 / 视频目标检测 / 音频理解等消费者页面的"模型选择"
@@ -518,15 +528,38 @@ async def list_instances_by_capability(capability: str) -> dict:
     ``model_id`` 在 start 请求体里回传给后端。 本机实例排序在前,
     跟 ``get_session`` 自动选择语义一致,默认选项就是无下拉框时
     用户会拿到的那个。
+
+    **多个能力 = AND 语义**: ``?capability=a&capability=b``(重复参数)
+    或 ``?capabilities=a,b`` 返回**同时**具备两项能力的实例。这服务
+    卡片的能力组 —— 一张卡要求视觉 + 工具调用来自**同一个**模型时,
+    逐项分别查再在前端求交集分不清「一个实例都满足」和「两个实例各
+    满足一半」,后者会一路绿灯到推理时才炸。
+
+    只给一个(或零个)能力时行为与从前逐字节一致。
     """
-    if not capability or not isinstance(capability, str):
+    wanted: list[str] = []
+    for c in (capability or []):
+        if isinstance(c, str) and c.strip():
+            wanted.append(c.strip())
+    if isinstance(capabilities, str) and capabilities.strip():
+        wanted.extend(p.strip() for p in capabilities.split(",") if p.strip())
+    if not wanted:
         raise HTTPException(
             status_code=400,
-            detail="capability query 参数必填 (例如 swcap_video_describe)")
+            detail=(
+                "capability query 参数必填 "
+                "(例如 capability=swcap_vision_chat)"
+            )
+        )
     reg = get_registry()
+    if len(wanted) == 1:
+        instances = reg.list_running_by_capability(wanted[0])
+    else:
+        instances = reg.list_running_by_capabilities(wanted)
     return {
-        "capability":  capability,
-        "instances":   reg.list_running_by_capability(capability),
+        "capability":  wanted[0],
+        "capabilities": wanted,
+        "instances":   instances,
     }
 
 
@@ -689,6 +722,14 @@ class ActiveAppSet(BaseModel):
         min_length=1,
         description="目标卡片 id，对应 app/apps/<id>/manifest.json 的 id 字段。",
     )
+    capability_groups: Optional[List[List[str]]] = Field(
+        None,
+        description=(
+            "可选的能力组：每组必须由**同一个**本机实例同时满足。卡片要求"
+            "多个能力来自同一模型时必须传（如 usb_hid 需要视觉 + 工具调用）。"
+            "缺省 = 每个能力各自成组（历史行为）。"
+        ),
+    )
 
     @field_validator("app_id", mode="before")
     @classmethod
@@ -708,7 +749,9 @@ async def put_active_app(payload: ActiveAppSet) -> dict:
    找不到 → 409（前端不可能触发，是防御性的）。
     2. manifest 的 ``software_capabilities`` 必须全部有 **local** running
        实例承载（spawned ∪ adopted_local）。adopted peer 故意排除——
-       那台板子 reboot 之后 autostart 等于无效。
+       那台板子 reboot 之后 autostart 等于无效。传了
+       ``capability_groups`` 时按组校验：**单个**实例须同时满足组内全部
+       能力，否则「两个实例各满足一半」会被误判成就绪。
     3. 落盘 ``compute.active_app = app_id``，并把当前承载这些 caps
        的 (model, npu_index) 增量写进 ``compute.autostart``。已存在
        的项不重复加。
@@ -722,11 +765,16 @@ async def put_active_app(payload: ActiveAppSet) -> dict:
         )
 
     caps = list(getattr(manifest, "software_capabilities", []) or [])
+    # 组优先用调用方传来的，否则回落到 manifest 派生值 —— 后端才是权威，
+    # 浏览器漏传 / 传漏了也不至于把「两个实例各满足一半」判成就绪。
+    groups = payload.capability_groups
+    if groups is None:
+        groups = [list(g) for g in (getattr(manifest, "capability_groups", []) or [])]
     reg = get_registry()
     try:
-        result = reg.set_active_app(app_id, caps)
+        result = reg.set_active_app(app_id, caps, groups)
     except ValueError as e:
-        # 校验失败（缺 cap / 未知 cap）→ 409 让前端展示原因。
+        # 校验失败（缺 cap / 未知 cap / 组未被单个实例满足）→ 409 展示原因。
         raise HTTPException(status_code=409, detail=str(e)) from e
     return result
 

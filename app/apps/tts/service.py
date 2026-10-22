@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
+from wdnai import SoftwareCapability
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
@@ -353,8 +354,8 @@ class TtsSession:
         # Active SDK session is owned by ComputeRegistry (算力配置) — see
         # ``app/services/compute_registry.py``. TtsSession no longer
         # builds an LLMSession itself; ``_infer_one`` looks it up via
-        # ``get_registry().get_session("swcap_audio_tts")`` and surfaces
-        # "功能未启用: swcap_audio_tts" if no instance is running.
+        # ``get_registry().get_session("swcap_text_to_speech")`` and surfaces
+        # "功能未启用: swcap_text_to_speech" if no instance is running.
 
         # Latest snapshot data surfaced to the WS
         self._frames = 0
@@ -842,7 +843,7 @@ class TtsSession:
         # ComputeRegistry (算力配置), so we look it up by capability.
         try:
             from app.core.compute.registry import get_registry
-            sess = get_registry().get_session("swcap_audio_tts")
+            sess = get_registry().get_session(SoftwareCapability.TEXT_TO_SPEECH)
         except RuntimeError:
             sess = None
         if sess is not None:
@@ -883,11 +884,11 @@ class TtsSession:
         (``no_play=True``).
 
         LLMSession 由 ComputeRegistry 统一管理（"算力配置"页面启用）。
-        找不到 swcap_audio_tts capability → RuntimeError("功能未启用: swcap_audio_tts")。
+        找不到 swcap_text_to_speech capability → RuntimeError("功能未启用: swcap_text_to_speech")。
         """
         try:
             from app.core.compute.registry import get_registry
-            sess = get_registry().get_session("swcap_audio_tts")
+            sess = get_registry().get_session(SoftwareCapability.TEXT_TO_SPEECH)
         except RuntimeError as e:
             self._init_error = str(e)
             raise

@@ -1,7 +1,7 @@
 {
   "label": "[GD]视觉定位模型",
   "capability_types": [
-    "swcap_grounding"
+    "swcap_vision_grounding"
   ],
   "spec_factory": "locate_anything",
   "worker_name": "ground",

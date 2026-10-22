@@ -185,6 +185,10 @@ def _manifest_to_dict(m: CardManifest) -> dict:
         "preview_video": m.preview_video,
         "software_capabilities": m.software_capabilities,
         "hardware_capabilities": m.hardware_capabilities,
+        # 能力组：同一组内的能力必须由**同一个**模型同时满足（派生自
+        # 该卡的 wizard.json）。前端用它做「一个实例都满足」而不是
+        # 「两个实例各满足一半」的就绪判定。
+        "capability_groups": m.capability_groups,
         "frontend": {
             "template": m.raw["frontend"]["template"],
             "js": m.frontend_js,

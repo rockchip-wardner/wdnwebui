@@ -44,6 +44,8 @@ from __future__ import annotations
 import logging
 from typing import Callable, List, Tuple
 
+from wdnai import SoftwareCapability
+
 _LOG = logging.getLogger("app.core.tools.builtins")
 
 # 模块级幂等 flag —— 同一进程内多次调用 ``register_builtin_tools()``
@@ -82,7 +84,7 @@ def _register_video_search(registry) -> None:
             "返回命中时间段与相似度;依赖视频已完成后台分析"
             "(收到视频后自动进行)。"
         ),
-        requires_capability="swcap_video_retrieval",
+        requires_capability=SoftwareCapability.VISION_EMBEDDING,
         tool_class=VideoSearch,
         icon="🎬",
         channels=("chat_wechat",),
@@ -118,7 +120,7 @@ def _register_tts_alert(registry) -> None:
             "语音提醒工具：检测到需要立即提醒的场景时调用，"
             "传入提醒文本，将通过 Qwen3-TTS 在本机播放。"
         ),
-        requires_capability="swcap_audio_tts",
+        requires_capability=SoftwareCapability.TEXT_TO_SPEECH,
         tool_class=TtsAlert,
         icon="🔊",
         channels=("chat_web", "chat_wechat"),

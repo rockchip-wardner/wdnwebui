@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
+from wdnai import SoftwareCapability
 
 from app.core.config import get_config
 from app.core.video.session import get_session
@@ -1241,7 +1242,7 @@ class WdnaiDetector:
         self._diag_lock = threading.Lock()
         # watchdog: _worker_loop 上一次产出事件的时间戳。
         self._last_event_ts: float = 0.0
-        # 选中的 swcap_video_describe 实例 model_id。
+        # 选中的 swcap_vision_chat 实例 model_id。
         # ``""`` (空) = auto-pick (跟 ``get_session`` 一致的本机优先规则)。
         # ``start(model_id=...)`` 时填入；``_infer_sync`` 每次拿 session
         # 都按这个值走,允许用户在不重启 worker 的前提下切换底层实例
@@ -1274,28 +1275,31 @@ class WdnaiDetector:
         return ok
 
 # ------------------------------------------------------------------ #
-    def _required_capability(self) -> str:
+    def _required_capability(self) -> SoftwareCapability:
         """Return the ``ComputeRegistry`` capability this detector needs.
 
         Capability 分流规则(M4 起多 capability schema 共存):
 
-        * ``LocatorDoc`` —— 视频目标定位页 —— 走 ``swcap_grounding``
+        * ``LocatorDoc`` —— 视频目标定位页 —— 走 ``swcap_vision_grounding``
           (LocateAnything-3b 视觉定位模型)。判别靠 schema 类名,LocatorDoc
           在 ``_get_grounding_doc_cls`` 创建后 ``__name__`` 不变,稳定性靠
           schema-version 在 ``_SCHEMA_CACHE`` 强制 rebuild 兜底。
-        * 其它 (``VLMDoc`` / ``TargetDoc``) —— 走 ``swcap_video_describe``
+        * 其它 (``VLMDoc`` / ``TargetDoc``) —— 走 ``swcap_vision_chat``
           (qwen3-vl-4b / qwen3.5-vl-4b 通用 VLM),默认分支覆盖两个老
-          detector 单例。
+          detector 单例。``TargetDoc`` 虽然也用 ``@Generable`` 结构化输出,
+          但它产出的是**检测结果描述**而非可执行动作,所以模型侧只需要
+          「图像→文本」;动作/工具调用才对应 ``swcap_tool_call``。
 
         调用方:
           * ``snapshot()`` — 按本页 schema 决定查哪个 capability,避免
-            视频目标定位页在 user 已加载 ``swcap_grounding`` 但未加载
-            ``swcap_video_describe`` 时,被错误地标"功能未启用:
-            swcap_video_describe"。
+            视频目标定位页在 user 已加载 ``swcap_vision_grounding`` 但未加载
+            ``swcap_vision_chat`` 时,被错误地标"功能未启用:
+            swcap_vision_chat"。
           * ``start()`` — 同样的 capability 校验,503 透传。
 
-        返回常量字符串;**绝不**触网 / 触 NPU —— 纯 schema-class 查表,
-        调用安全 (snapshot 1Hz WS / 页面加载 / ``start()`` 三处共用)。
+        返回枚举成员(与裸字符串等价,``get_session`` 照常工作);**绝不**
+        触网 / 触 NPU —— 纯 schema-class 查表,调用安全
+        (snapshot 1Hz WS / 页面加载 / ``start()`` 三处共用)。
 
         **Factory 解析细节**:``__init__`` 把 ``generating_cls`` 原样存
         进 ``self._generating_cls``(``_get_target_doc_cls`` /
@@ -1305,7 +1309,7 @@ class WdnaiDetector:
         ``self._generating_cls.__name__`` 拿到 ``"_get_grounding_doc_cls"``
         而非 ``"LocatorDoc"``,命中不到目标分支,bug 依旧。这里在读
         ``__name__`` 前先调一次工厂拿到真类(失败兜底 ``None``,默认
-        走 swcap_video_describe)。
+        走 swcap_vision_chat)。
         """
         cls = self._generating_cls
         if callable(cls) and not isinstance(cls, type):
@@ -1314,8 +1318,8 @@ class WdnaiDetector:
             except Exception:  # noqa: BLE001
                 cls = None
         if getattr(cls, "__name__", "") == "LocatorDoc":
-            return "swcap_grounding"
-        return "swcap_video_describe"
+            return SoftwareCapability.VISION_GROUNDING
+        return SoftwareCapability.VISION_CHAT
 
     # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
@@ -1337,18 +1341,18 @@ class WdnaiDetector:
         # Empty list when the worker hasn't reported yet (model not
         # loaded, network probe failure, missing capability).
         #
-        # ``available_image_sizes`` 是 ``swcap_video_describe`` VLM 概
-        # 念(只有 VLM 实例会上报);视频目标定位页走 ``swcap_grounding``
+        # ``available_image_sizes`` 是 ``swcap_vision_chat`` VLM 概
+        # 念(只有 VLM 实例会上报);视频目标定位页走 ``swcap_vision_grounding``
         # —— 该 capability 实例不暴露 ``available_image_sizes`` 字段,
-        # 即使循环也会落空。直接按 capability != swcap_video_describe
+        # 即使循环也会落空。直接按 capability != swcap_vision_chat
         # 短路,``available_sizes`` 留空数组,前端下拉框按现有契约显示
         # 空状态。
         available_sizes: List[int] = []
-        if capability == "swcap_video_describe" and sess is not None:
+        if capability == SoftwareCapability.VISION_CHAT and sess is not None:
             try:
                 for inst in registry.list_with_source():
                     caps = inst.get("capability_types") or []
-                    if "swcap_video_describe" not in caps:
+                    if SoftwareCapability.VISION_CHAT not in caps:
                         continue
                     raw = inst.get("available_image_sizes") or []
                     if isinstance(raw, list):
@@ -1411,10 +1415,10 @@ class WdnaiDetector:
             raise RuntimeError("wdnai 不可用")
         if not (prompt or "").strip():
             raise ValueError("prompt 不能为空")
-        # model_id：用户从下拉框选的 swcap_video_describe 实例。
+        # model_id：用户从下拉框选的 swcap_vision_chat 实例。
         # ``None``（默认）→ 走 ``get_session`` 的本机优先 auto-pick，
         # 与旧行为一致。显式传入时校验该实例正在 running + 暴露
-        # ``swcap_video_describe`` + 给出对应的 RpcSessionProxy，失败
+        # ``swcap_vision_chat`` + 给出对应的 RpcSessionProxy，失败
         # 抛 RuntimeError 让 HTTP 层 503 透传。
         from app.core.compute.registry import get_registry
         registry = get_registry()
@@ -1422,7 +1426,7 @@ class WdnaiDetector:
             if not isinstance(model_id, str) or not model_id.strip():
                 raise ValueError(f"model_id 必须是字符串或 None: {model_id!r}")
             try:
-                registry.get_session_for_model("swcap_video_describe", model_id)
+                registry.get_session_for_model(SoftwareCapability.VISION_CHAT, model_id)
             except RuntimeError:
                 raise
             # 记录选中的 model_id，``_infer_sync`` 取 proxy 时再次校验
@@ -1450,10 +1454,10 @@ class WdnaiDetector:
             try:
                 for inst in registry.list_with_source():
                     caps = inst.get("capability_types") or []
-                    if "swcap_video_describe" not in caps:
+                    if SoftwareCapability.VISION_CHAT not in caps:
                         continue
                     # 用户选过 model_id 时,只对那个实例校验;
-                    # 否则取任意 swcap_video_describe running 实例
+                    # 否则取任意 swcap_vision_chat running 实例
                     # (auto-pick 与 get_session 一致)。
                     if (chosen_model_id
                             and inst.get("model_id") != chosen_model_id):
@@ -1493,7 +1497,7 @@ class WdnaiDetector:
         #
         # **注意**:schema 解析放在 capability 校验**之前** —— 不同
         # schema 对应不同 capability（``VLMDoc``/``TargetDoc`` 走
-        # ``swcap_video_describe``,``LocatorDoc`` 走 ``swcap_grounding``),
+        # ``swcap_vision_chat``,``LocatorDoc`` 走 ``swcap_vision_grounding``),
         # 必须先知道 schema class 才能选正确 capability。
         if self._generating_cls is None:
             self._generating_cls = _get_vlm_doc_cls()
@@ -1516,8 +1520,8 @@ class WdnaiDetector:
         # 前端能区分"功能未启用"和"运行时错误"。
         #
         # **多 capability schema 分流**(M4 引入):
-        # ``VLMDoc`` / ``TargetDoc`` 走 ``swcap_video_describe``,
-        # ``LocatorDoc`` 走 ``swcap_grounding`` (LocateAnything-3b
+        # ``VLMDoc`` / ``TargetDoc`` 走 ``swcap_vision_chat``,
+        # ``LocatorDoc`` 走 ``swcap_vision_grounding`` (LocateAnything-3b
         # 视觉定位模型)。通过 ``self._required_capability()`` 查表 ——
         # 与 ``snapshot()`` 同源,保证 1Hz WS 状态帧 + POST /prompt
         # 503 详情使用同一 capability 字符串,前端不会看到前后矛盾的
@@ -1865,8 +1869,8 @@ judge_score: Optional[float] = None,
         }
         _t0_infer = time.monotonic()
         # Per-frame capability must route through _required_capability() —
-        # hardcoding "swcap_video_describe" leaks that string into LocatorDoc
-        # disabled-events (text="(功能未启用: swcap_video_describe)") which the
+        # hardcoding "swcap_vision_chat" leaks that string into LocatorDoc
+        # disabled-events (text="(功能未启用: swcap_vision_chat)") which the
         # user sees in the VTL events history.
         _required_cap = self._required_capability()
         try:
@@ -1974,7 +1978,8 @@ judge_score: Optional[float] = None,
                 from app.core.compute.registry import get_registry
                 available_sizes: List[int] = []
                 for inst in get_registry().list_with_source():
-                    if "swcap_video_describe" not in (inst.get("capability_types") or []):
+                    if (SoftwareCapability.VISION_CHAT
+                            not in (inst.get("capability_types") or [])):
                         continue
                     for s in (inst.get("available_image_sizes") or []):
                         if isinstance(s, bool):

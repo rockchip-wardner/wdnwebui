@@ -152,7 +152,7 @@ def check_video_describe(res: Results, reg) -> None:
     from wdnai import ImageAttachment
 
     VLMDoc = _get_vlm_doc_cls()
-    sess = reg.get_session("swcap_video_describe")
+    sess = reg.get_session("swcap_vision_chat")
     out = sync(sess.respond(
         prompt="用中文一句话描述画面内容。",
         attachment=[ImageAttachment(frame())],
@@ -191,7 +191,7 @@ def check_target_detection(res: Results, reg) -> None:
     from wdnai import ImageAttachment
 
     TargetDoc = _get_target_doc_cls()
-    sess = reg.get_session("swcap_video_describe")
+    sess = reg.get_session("swcap_vision_chat")
     out = sync(sess.respond(
         prompt="定位画面中央的红色正方形，输出它的裁剪区域和对区域的描述。",
         attachment=[ImageAttachment(frame())],
@@ -262,7 +262,7 @@ def check_localization(res: Results, reg) -> None:
     from wdnai import ImageAttachment
 
     LocatorDoc = _get_grounding_doc_cls()
-    sess = reg.get_session("swcap_grounding")
+    sess = reg.get_session("swcap_vision_grounding")
     out = sync(sess.respond(
         prompt="找出画面中的红色正方形，并描述它的位置。",
         attachment=[ImageAttachment(frame())],
@@ -283,7 +283,7 @@ def check_streaming_deltas(res: Results, reg) -> None:
     """Deltas must arrive out-of-band and concatenate to the reply."""
     from wdnai import ImageAttachment
 
-    sess = reg.get_session("swcap_video_describe")
+    sess = reg.get_session("swcap_vision_chat")
     chunks: List[str] = []
     out = sync(sess.respond(
         prompt="用中文简短描述画面内容，不超过三十字。",
@@ -300,7 +300,7 @@ def check_streaming_deltas(res: Results, reg) -> None:
 
 def check_stop_is_soft(res: Results, reg) -> None:
     """``stop()`` must not raise on the client and must not wedge anything."""
-    sess = reg.get_session("swcap_video_describe")
+    sess = reg.get_session("swcap_vision_chat")
     try:
         sess.stop()
         res.record("session.stop() 可用", True, "published cancel, returned")
@@ -313,7 +313,7 @@ def check_count_tokens(res: Results, reg) -> None:
     """Chat history trimming depends on this; it must count, not guess."""
     from app.core.compute.proxy import count_tokens
 
-    sess = reg.get_session("swcap_video_describe")
+    sess = reg.get_session("swcap_vision_chat")
     texts = ["hello world", "中文测试句子，用来验证分词计数。"]
     counts = count_tokens(sess, texts)
     # The character/2 fallback would give ~5 and ~13. A real Qwen
@@ -404,7 +404,7 @@ def check_audio_analysis(res: Results, reg) -> None:
     """音视频描述's audio half: an AudioAttachment in, plain text out."""
     from wdnai import AudioAttachment
 
-    sess = reg.get_session("swcap_audio_understand")
+    sess = reg.get_session("swcap_audio_chat")
     out = sync(sess.respond(
         prompt="用中文简短描述这段音频的内容。",
         attachment=[AudioAttachment(_pcm_tone())],
@@ -422,7 +422,7 @@ def check_audio_routing(res: Results, reg) -> None:
     RPC timeout: everything inside ``serve_local_session`` raises into a
     reply, and this asserts the message survives that trip.
     """
-    sess = reg.get_session("swcap_audio_understand")
+    sess = reg.get_session("swcap_audio_chat")
     try:
         sync(sess.respond(prompt="没有音频附件。", max_new_tokens=32))
         res.record("音频缺附件报错清晰", False, "expected an error")
@@ -443,7 +443,7 @@ def check_tts(res: Results, reg) -> None:
     from wdnai import Attachment
 
     TTSResult = _get_tts_result_cls()
-    sess = reg.get_session("swcap_audio_tts")
+    sess = reg.get_session("swcap_text_to_speech")
     # Same shape the TTS page uses: the text to speak is a text
     # *attachment*; ``prompt=`` stays a plain string (the SDK calls
     # ``.rstrip()`` on it).
@@ -467,7 +467,7 @@ def check_tts(res: Results, reg) -> None:
 # --------------------------------------------------------------------------- #
 def check_embedding(res: Results, reg) -> None:
     """视频内容检索: embed ops are overridden to run off the pump thread."""
-    sess = reg.get_session("swcap_video_retrieval")
+    sess = reg.get_session("swcap_vision_embedding")
     vec = sess.embed_text("一只红色的正方形")
     arr = np.asarray(vec).reshape(-1)
     ok = arr.size > 0 and np.isfinite(arr).all() and float(np.linalg.norm(arr)) > 0

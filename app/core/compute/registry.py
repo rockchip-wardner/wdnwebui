@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+from wdnai import RetiredCapabilityError, migrate_legacy
+
 from app.core.config import default_models_root, get_config
 from app.core.compute.workers import (
     WorkerManifest,
@@ -133,7 +135,7 @@ HARDWARE_CAPABILITIES: list[dict] = [
         "class_name":      "HWAudioOutput",
         "category":        "audio",
         "label":           "音频输出（扬声器）",
-        "description":     "对外播放音频，配合 swcap_audio_tts 一起使用。",
+        "description":     "对外播放音频，配合 swcap_text_to_speech 一起使用。",
     },
     {
         "capability_type": "hwcap_hdmi_display",
@@ -528,18 +530,56 @@ MODEL_PRESETS: dict[str, dict] = _model_presets()
 # --------------------------------------------------------------------------- #
 # Legacy capability_type migration (kept for backward compat with old configs) #
 # --------------------------------------------------------------------------- #
+# Software capabilities are **not** listed here any more: their whole rename
+# table lives in ``wdnai.LEGACY_ALIASES`` / ``wdnai.RETIRED_CAPABILITIES``,
+# next to the enum that closes the vocabulary. What stays below are the
+# *hardware* names, which have no SDK-side vocabulary to live in.
+#
+# The old table also carried two software entries that were dead on arrival —
+# ``video_query`` → ``swcap_video_query`` and ``video_analyse`` →
+# ``swcap_video_analyse`` — for capabilities **no worker ever declared**. They
+# migrated silently into a string that could never resolve, so an old config
+# became a permanent "功能未启用" with no trace of where it came from. Those
+# now raise :class:`wdnai.RetiredCapabilityError` instead.
 _LEGACY_CAPABILITY_TYPE_RENAMES: dict[str, str] = {
     "video_input":     "hwcap_video_input",
-    "video_query":     "swcap_video_query",
-    "video_describe":  "swcap_video_describe",
     "audio_input":     "hwcap_audio_input",
     "audio_output":    "hwcap_audio_output",
     "hdmi_display":    "hwcap_hdmi_display",
-    "audio_tts":       "swcap_audio_tts",
-    "audio_understand":"swcap_audio_understand",
-    "video_analyse":   "swcap_video_analyse",
-    "text_chat":       "swcap_text_chat",
 }
+
+
+def _normalize_capability_groups(
+    required_capabilities: list[str],
+    required_groups: Optional[List[List[str]]] = None,
+) -> list[list[str]]:
+    """Normalise a card's capability requirements into groups.
+
+    A **group** is a set of capabilities that one *single* model must provide
+    together. Entries in ``swcap_to_model`` sharing a ``group`` name form one;
+    an entry without one forms its own singleton group. That makes the common
+    case ("one capability, one model") need no declaration at all.
+
+    ``required_groups`` is accepted as explicit lists of capabilities — the
+    shape the browser sends, derived from the wizard config it already fetched.
+    Capabilities present in ``required_capabilities`` but absent from every
+    group are appended as singletons, so a partial (or absent) group list
+    degrades to the old per-capability behaviour instead of silently dropping
+    a requirement.
+    """
+    caps = [c for c in (required_capabilities or []) if isinstance(c, str)]
+    grouped: set[str] = set()
+    out: list[list[str]] = []
+    for group in (required_groups or []):
+        if not isinstance(group, (list, tuple)):
+            continue
+        members = [c for c in group if isinstance(c, str)]
+        if not members:
+            continue
+        out.append(members)
+        grouped.update(members)
+    out.extend([[c] for c in caps if c not in grouped])
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1251,6 +1291,21 @@ class ComputeRegistry:
     # Legacy migration                                                  #
     # ------------------------------------------------------------------ #
     def _migrate_legacy_capability_types(self) -> None:
+        """Rewrite historical capability names stored in ``compute.instances``.
+
+        Two vocabularies live side by side here. Hardware names go through
+        :data:`_LEGACY_CAPABILITY_TYPE_RENAMES`; software names go through
+        ``wdnai.migrate_legacy``, which knows both the bare legacy names
+        (``video_describe``) and the previous ``swcap_*`` spelling
+        (``swcap_vision_chat``).
+
+        **This runs at boot, so it never raises.** A config naming a retired
+        software capability (``video_query`` / ``video_analyse``) used to be
+        migrated into a string no worker declares, leaving a permanent
+        "功能未启用" with no way to trace it. Now the entry is dropped with a
+        loud warning instead — the instance still starts, the stale claim does
+        not survive, and the log says exactly which entry went away.
+        """
         cfg = get_config().get_section("compute", {})
         instances = cfg.get("instances") if isinstance(cfg, dict) else None
         if not isinstance(instances, list):
@@ -1262,13 +1317,38 @@ class ComputeRegistry:
             caps = inst.get("capability_types")
             if not isinstance(caps, list):
                 continue
-            new_caps = [_LEGACY_CAPABILITY_TYPE_RENAMES.get(c, c) for c in caps]
+            new_caps: list[str] = []
+            for cap in caps:
+                if not isinstance(cap, str):
+                    continue
+                # Hardware first: only the HW rename table knows these.
+                hw = _LEGACY_CAPABILITY_TYPE_RENAMES.get(cap)
+                if hw is not None:
+                    new_caps.append(hw)
+                    renamed_total += 1
+                    continue
+                try:
+                    migrated, renamed = migrate_legacy(cap)
+                except RetiredCapabilityError as exc:
+                    LOG.warning(
+                        "实例 %s 声明的能力已下线，本次丢弃该能力声明: %s",
+                        inst.get("model") or inst.get("name") or "?",
+                        exc,
+                    )
+                    continue
+                except ValueError:
+                    # Unknown string (hand-edited config). Keep it verbatim:
+                    # dropping it would silently change what the user asked
+                    # for, and the registry validates on use anyway.
+                    new_caps.append(cap)
+                    continue
+                new_caps.append(migrated.value)
+                if renamed:
+                    renamed_total += 1
             if new_caps != caps:
                 inst["capability_types"] = new_caps
-                renamed_total += sum(
-                    1 for old, new in zip(caps, new_caps) if old != new
-                )
         if renamed_total:
+            LOG.info("已迁移 %d 处历史软件能力名", renamed_total)
             cfg["instances"] = instances
             try:
                 get_config().set_section("compute", cfg)
@@ -4168,19 +4248,21 @@ class ComputeRegistry:
             chosen.source, chosen.pid)
         return chosen.session
 
-    def list_running_by_capability(self, capability_type: str) -> list[dict]:
-        """Return one entry per running instance exposing ``capability_type``.
+    def _list_running_covering(self, wanted: set[str]) -> list[dict]:
+        """Running instances whose ``capability_types`` contain **all** of ``wanted``.
 
-        Powers the consumer-page "model dropdown": each entry carries the
-        minimum fields the UI needs to render an option + submit a
-        choice back.  Local-first ordering (spawned + adopted_local
-        before adopted) matches ``get_session`` semantics so the
-        dropdown default matches the auto-pick the user would have got
-        had they not asked for a choice.
-
-        Hidden-by-config entries are filtered out so the dropdown never
-        surfaces something the boot path won't actually start.
+        One pass, one body — ``list_running_by_capability`` and
+        ``list_running_by_capabilities`` are the same query with one or many
+        requirements. Local-first ordering (spawned + adopted_local before
+        adopted) matches ``get_session`` semantics so a dropdown's default is
+        the instance the user would have got without asking. Hidden-by-config
+        entries are filtered out so the dropdown never surfaces something the
+        boot path won't start.
         """
+        if not wanted:
+            # "No requirements" is not "any instance qualifies". Returning
+            # everything here would make a misconfigured group look ready.
+            return []
         hidden_set: set[str] = set()
         try:
             stored = get_config().get_section("compute", {})
@@ -4202,8 +4284,9 @@ class ComputeRegistry:
         with self._lock:
             for inst in self._instances.values():
                 if (inst.status != "running"
-                        or capability_type not in inst.capability_types
                         or inst.model_id in hidden_set):
+                    continue
+                if not wanted.issubset(set(inst.capability_types)):
                     continue
                 pid_val = (inst._peer_pid if isinstance(inst._peer_pid, int)
                            else getattr(inst.proc, "pid", None))
@@ -4214,12 +4297,38 @@ class ComputeRegistry:
                     "npu_index":       inst.npu_index,
                     "pid":             pid_val or 0,
                     "memory_estimate_mb": inst.memory_estimate_mb,
+                    "capability_types": list(inst.capability_types),
                     "_rank":           _source_rank(inst._source or ""),
                 })
         out.sort(key=lambda x: (x["_rank"], x["model_id"]))
         for e in out:
             e.pop("_rank", None)
         return out
+
+    def list_running_by_capability(self, capability_type: str) -> list[dict]:
+        """Return one entry per running instance exposing ``capability_type``.
+
+        Powers the consumer-page "model dropdown": each entry carries the
+        minimum fields the UI needs to render an option + submit a choice
+        back.  See :meth:`_list_running_covering` for ordering and the
+        hidden-set rule.
+        """
+        return self._list_running_covering({capability_type})
+
+    def list_running_by_capabilities(self, capabilities: List[str]) -> list[dict]:
+        """Running instances exposing **all** of ``capabilities`` (AND).
+
+        This is the query behind a card's *requirement group*, and the reason
+        :meth:`list_running_by_capability` alone was not enough. When a card
+        needs several capabilities from **one** model (usb_hid needs both
+        vision and tool calling), asking per-capability and intersecting
+        client-side cannot tell "one instance covers both" from "two instances
+        each cover half" — the second case passes a naive per-capability check
+        and then fails at inference time.
+
+        Order and duplicates in ``capabilities`` are irrelevant.
+        """
+        return self._list_running_covering(set(capabilities))
 
     # ------------------------------------------------------------------ #
     # active_app：用户当前所在的"卡片模式"                              #
@@ -4254,6 +4363,7 @@ class ComputeRegistry:
         self,
         app_id: str,
         required_capabilities: list[str],
+        required_groups: Optional[List[List[str]]] = None,
     ) -> dict:
         """记录 ``compute.active_app = app_id``，并按需扩展 autostart。
 
@@ -4267,6 +4377,12 @@ class ComputeRegistry:
             至少有一个 **local**（spawned ∪ adopted_local）running 实例
             提供该能力 —— 不接受远端 adopted（peer 那台板子 reboot
             后就没了，留 autostart 等于留个空头）。
+        required_groups:
+            可选的**能力组**：每个组必须由**单个** local running 实例
+            同时满足（见 :func:`_normalize_capability_groups`）。缺省时
+            每个能力各自成组，即历史上「逐能力各找一个实例」的语义 ——
+            那正是同组能力分散在两个模型时会误判就绪的原因，所以卡片
+            声明了 ``group`` 的场合必须传进来。
         Returns
         -------
         dict
@@ -4283,7 +4399,7 @@ class ComputeRegistry:
             * ``app_id`` 不是非空字符串
             * ``required_capabilities`` 里有不在 ``MODEL_PRESETS`` 注册
               表中的 capability（用户拼错 / 老 manifest 残留字段）
-            * 任一 required_capability 当前**没有** local running 实例
+            * 任一能力组当前**没有单个** local running 实例同时满足
               （意味着 wizard 还没跑完 / 模型还没加载，贸然记下"active"
               等于自我欺骗）。
         """
@@ -4308,10 +4424,22 @@ class ComputeRegistry:
                 + "（请检查 manifest 的 software_capabilities 字段）"
             )
 
-        # 2. 检查每个 req 是否有 local running 实例承载。local =
-        #    spawned ∪ adopted_local —— adopted (LAN peer) 故意排除：
-        #    那台板子随时可能掉电，留个 autostart 进去下次启动等于啥
-        #    也没起来。
+        # 2. 每个**组**必须由 local running 实例满足，且组内全部能力
+        #    由**同一个**实例承载。local = spawned ∪ adopted_local ——
+        #    adopted (LAN peer) 故意排除：那台板子随时可能掉电，留个
+        #    autostart 进去下次启动等于啥也没起来。
+        #
+        #    两个维度都要，缺一不可：
+        #
+        #    (a) 按组而非逐能力。逐能力找会让 cap A 落在模型 X、
+        #        cap B 落在模型 Y 时**误判就绪**——两个实例各满足
+        #        一半，逐项检查全绿，但那台卡真正需要的是「同一个模型
+        #        同时具备 A 和 B」。这种假就绪写进 active_app 后，
+        #        用户进卡才发现功能不能用。
+        #    (b) 一个 cap 可以对应**多个**实例。同一个模型跑两张卡时，
+        #        两张卡的实例都承载这些 capability，两张都要记进
+        #        autostart —— 只记一张的话下次开机另一张卡空着
+        #        （这是 d144747 修的，不能在这次合并里丢掉）。
         with self._lock:
             local_running = [
                 inst for inst in self._instances.values()
@@ -4319,21 +4447,31 @@ class ComputeRegistry:
                 and inst._source in ("spawned", "adopted_local")
             ]
 
-        missing: list[str] = []
-        # 对每个 cap 找承载它的 local running 实例（**可以不止一个** —— 同一个
-        # 模型跑两张卡时两张卡的实例都承载这个 capability）。
+        groups = _normalize_capability_groups(required_capabilities, required_groups)
         cap_to_local: dict[str, list["ModelInstance"]] = {}
-        for cap in required_capabilities:
-            chosen = [i for i in local_running if cap in i.capability_types]
+        unsatisfied: list[str] = []
+        for group in groups:
+            chosen = [i for i in local_running
+                      if set(group).issubset(set(i.capability_types))]
             if not chosen:
-                missing.append(cap)
-            else:
-                cap_to_local[cap] = chosen
-        if missing:
+                unsatisfied.append(" + ".join(group))
+                continue
+            for cap in group:
+                bucket = cap_to_local.setdefault(cap, [])
+                seen = {i.key for i in bucket}
+                for inst in chosen:
+                    # 按实例 key 去重：两个组含同一 cap 时不能把同一个
+                    # 实例记两次，否则 autostart 里出现重复条目
+                    if inst.key not in seen:
+                        bucket.append(inst)
+                        seen.add(inst.key)
+        if unsatisfied:
             raise ValueError(
-                "以下 required_capability 当前无 local running 实例: "
-                + ", ".join(missing)
+                "以下能力组当前没有单个 local running 实例同时满足: "
+                + ", ".join(unsatisfied)
                 + " —— 等模型加载完再进入此 app，或先在算力页启用对应模型"
+                + ("（同组能力必须由同一个模型提供）" if any(
+                    len(g) > 1 for g in groups) else "")
             )
 
         # 3. 落盘：active_app + 增量扩展 autostart。任一失败抛 OSError

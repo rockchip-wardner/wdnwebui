@@ -33,6 +33,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
+from wdnai import SoftwareCapability
+
 from app.core.audio.source import (
     DEFAULT_WINDOW_S,
     AudioChunk,
@@ -324,9 +326,9 @@ class MultiAudioSession:
         reg = get_registry()
         if self._model_id:
             self._session = reg.get_session_for_model(
-                "swcap_audio_understand", self._model_id)
+                SoftwareCapability.AUDIO_CHAT, self._model_id)
         else:
-            self._session = reg.get_session("swcap_audio_understand")
+            self._session = reg.get_session(SoftwareCapability.AUDIO_CHAT)
         return self._session
 
     def _infer(self, ch: _Channel, chunk: AudioChunk, gen: int) -> None:

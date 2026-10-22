@@ -25,20 +25,20 @@ def main():
             status=200, content_type="application/json",
             body=json.dumps({
                 "instances": [
-                    # 本机 spawned,running,swcap_video_describe → 需要,不删
+                    # 本机 spawned,running,swcap_vision_chat → 需要,不删
                     {"model_id": "qwen3.5-vl-4b", "status": "running",
                      "_source": "spawned",
-                     "capability_types": ["swcap_video_describe", "swcap_text_chat"]},
-                    # 本机 spawned,running,swcap_video_retrieval → 不需要,应删
+                     "capability_types": ["swcap_vision_chat", "swcap_text_chat"]},
+                    # 本机 spawned,running,swcap_vision_embedding → 不需要,应删
                     {"model_id": "qwen3-vl-embedding-2b", "status": "running",
                      "_source": "spawned",
-                     "capability_types": ["swcap_video_retrieval"]},
-                    # 远端 adopted,running,swcap_video_retrieval → 绝不应删
+                     "capability_types": ["swcap_vision_embedding"]},
+                    # 远端 adopted,running,swcap_vision_embedding → 绝不应删
                     {"model_id": "qwen3-vl-embedding-2b", "status": "running",
                      "_source": "adopted",
                      "_peer_name": "PeerBoard-X",
                      "_peer_ip": "192.168.1.100",
-                     "capability_types": ["swcap_video_retrieval"]},
+                     "capability_types": ["swcap_vision_embedding"]},
                     # 远端 adopted,running,swcap_text_chat → 绝不应删
                     {"model_id": "peer-text-llm", "status": "running",
                      "_source": "adopted",
@@ -48,7 +48,7 @@ def main():
                     # 本机 spawned,not_loaded → 状态过滤已跳过
                     {"model_id": "qwen3-vl-4b", "status": "not_loaded",
                      "_source": "spawned",
-                     "capability_types": ["swcap_video_describe"]},
+                     "capability_types": ["swcap_vision_chat"]},
                 ],
             }),
         ))
@@ -80,7 +80,7 @@ def main():
                 if (!window._wizardBringUpModels) return {ok: false, reason: 'no global'};
                 return await window._wizardBringUpModels({
                     swcap_to_model: {
-                        swcap_video_describe: { npu_index: 0, model_id: 'qwen3.5-vl-4b' },
+                        swcap_vision_chat: { npu_index: 0, model_id: 'qwen3.5-vl-4b' },
                     },
                 });
             })()

@@ -183,19 +183,43 @@
       return Array.isArray(caps) ? caps.slice() : [];
     },
 
+    // 卡片的能力组（同一组必须由同一个模型同时满足）。由服务端从该卡的
+    // wizard.json 派生后随 manifest 下发 —— 浏览器不必再 fetch 一次
+    // wizard 配置就知道「这几个能力得同一个模型来」。
+    _capGroups(m) {
+      if (!m) return [];
+      const groups = m.capability_groups;
+      return Array.isArray(groups)
+        ? groups.filter((g) => Array.isArray(g) && g.length > 1)
+        : [];
+    },
+
     // 从 /api/compute snapshot 判断"该 app 所需 cap 是否全部有 local
     // running 实例"。adopted (LAN peer) 故意排除：peer reboot 后这
     // 个 autostart 等于没意义,用户得手动在本机重启用对应模型。
-    _capsAllLocalRunning(caps, snapshot) {
+    //
+    // **组感知**：传入 groups（每组 = 一个模型须同时满足的能力集）时，
+    // 逐组再验一次「同一个实例同时具备整组」。只做逐能力检查的话，
+    // 「cap A 在模型 X / cap B 在模型 Y」会全绿通过，两个实例各满足
+    // 一半 —— active_app 落盘成功，用户进卡才发现功能不能用。
+    _capsAllLocalRunning(caps, snapshot, groups) {
       if (!caps || caps.length === 0) return false;  // 无 cap 的不进入 active_app
       if (!snapshot || !Array.isArray(snapshot.instances)) return false;
       const localRunning = snapshot.instances.filter(
         (i) => i && i.status === "running" && i.source !== "adopted"
       );
-      return caps.every((cap) =>
-        localRunning.some((i) => Array.isArray(i.capability_types)
-                              && i.capability_types.indexOf(cap) !== -1)
-      );
+      const capSets = localRunning.map(
+        (i) => (Array.isArray(i.capability_types) ? i.capability_types : []));
+      const everyCapOk = caps.every((cap) =>
+        capSets.some((s) => s.indexOf(cap) !== -1));
+      if (!everyCapOk) return false;
+      for (const g of (groups || [])) {
+        if (!Array.isArray(g) || g.length <= 1) continue;
+        if (!capSets.some((s) => g.every((c) => s.indexOf(c) !== -1))) {
+          return false;
+        }
+      }
+      return true;
     },
 
     async _fetchSnapshot() {
@@ -206,17 +230,24 @@
       } catch (_) { return null; }
     },
 
-    async _set(appId) {
+    async _set(appId, groups) {
       // 把 app_id PUT 到后端(后端在 caps 全 local running 时落盘
       // active_app + 增量写 autostart)。失败时不动 _current —— _current
       // 是用户视角的 last entered card,PUT 失败(409 caps 未 ready)不
       // 影响 sidebar / reboot 恢复的语义,等下次 _evaluate caps ready
       // 再补 PUT。
+      //
+      // capability_groups 一并带上(后端在缺失时会回落到 manifest 派生值,
+      // 两边一致):让"同组必须同一个模型"这条约束显式出现在请求里。
+      const body = { app_id: appId };
+      if (Array.isArray(groups) && groups.length) {
+        body.capability_groups = groups;
+      }
       try {
         const r = await fetch("/api/compute/active-app", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ app_id: appId }),
+          body: JSON.stringify(body),
         });
         if (!r.ok) {
           let detail = "";
@@ -294,9 +325,9 @@
         }
         const snap = await this._fetchSnapshot();
         if (!snap) return;  // 网络挂了,下个 tick 再来
-        if (this._capsAllLocalRunning(caps, snap)) {
+        if (this._capsAllLocalRunning(caps, snap, this._capGroups(m))) {
           // caps 已 ready → 落盘 active_app + 增量写 autostart(幂等)。
-          await this._set(m.id);
+          await this._set(m.id, this._capGroups(m));
         }
         // cap 未全 running(wizard 中、模型 loading、用户刚停掉):不 PUT
         // 后端会 409,但**不**清 _current。等下个 tick 1s 后再判定,

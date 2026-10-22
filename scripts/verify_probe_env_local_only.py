@@ -6,8 +6,8 @@
 ----
 app/static/core/wizard/state.js 的 _probeEnv 拉 /api/compute 后只过滤
 status === "running",没过滤 _source === "adopted"。结果:本机没启
-swcap_grounding(LocateAnything-3b spawned not_loaded),但 LAN 上另一台
-板子的同名模型 running 给 DG peer adopted → wizard UI 显示 ✓ swcap_grounding
+swcap_vision_grounding(LocateAnything-3b spawned not_loaded),但 LAN 上另一台
+板子的同名模型 running 给 DG peer adopted → wizard UI 显示 ✓ swcap_vision_grounding
 并允许跳过"一键开启"步骤,误导用户以为"已就绪"。
 
 对照参考: 同文件 _wizardBringUpModels 已正确跳过 adopted(注释明确说
@@ -20,16 +20,16 @@ swcap_grounding(LocateAnything-3b spawned not_loaded),但 LAN 上另一台
 测试策略
 ----
 对 video-target-localization(manifest.software_capabilities =
-["swcap_grounding"],swcap_to_model 唯一条目)做 5 个场景,mock /api/compute
+["swcap_vision_grounding"],swcap_to_model 唯一条目)做 5 个场景,mock /api/compute
 返回不同组合,断言 env-row DOM 的 class 与 text。
 
 | 场景 | 本机 spawned | peer adopted | 期望 |
 |---|---|---|---|
-| A  | not_loaded    | running      | ✗ swcap_grounding (bug 场景) |
-| B  | running       | -            | ✓ swcap_grounding |
-| C  | not_loaded    | not_loaded   | ✗ swcap_grounding |
-| D  | running       | running      | ✓ swcap_grounding |
-| E  | running(多源) | -            | ✓ swcap_grounding (smoke 主路径) |
+| A  | not_loaded    | running      | ✗ swcap_vision_grounding (bug 场景) |
+| B  | running       | -            | ✓ swcap_vision_grounding |
+| C  | not_loaded    | not_loaded   | ✗ swcap_vision_grounding |
+| D  | running       | running      | ✓ swcap_vision_grounding |
+| E  | running(多源) | -            | ✓ swcap_vision_grounding (smoke 主路径) |
 """
 import json
 import sys
@@ -37,7 +37,7 @@ from playwright.sync_api import sync_playwright
 
 BASE = "http://127.0.0.1:8000"
 APP_ID = "video-target-localization"
-SWCAP = "swcap_grounding"
+SWCAP = "swcap_vision_grounding"
 
 
 def mock_payload(scenario_name: str, instances: list) -> dict:
@@ -86,7 +86,7 @@ SCENARIOS = [
      [instance("LocateAnything-3b", "running", "spawned"),
       instance("LocateAnything-3b", "running", "adopted", peer_name="PeerX")],
      True),
-    ("E. 多个 spawned 本机实例 running(已包含 swcap_grounding)",
+    ("E. 多个 spawned 本机实例 running(已包含 swcap_vision_grounding)",
      [instance("LocateAnything-3b", "running", "spawned"),
       instance("OtherModel-7b", "running", "spawned")],
      True),
@@ -122,7 +122,7 @@ def main() -> int:
                 ctx.close()
                 continue
 
-            # 抓所有 env-row,过滤含 swcap_grounding 的那行
+            # 抓所有 env-row,过滤含 swcap_vision_grounding 的那行
             rows = page.evaluate("""() => {
                 return Array.from(document.querySelectorAll('.wd-wizard-env-row')).map(r => ({
                     cls: r.className,
@@ -137,7 +137,7 @@ def main() -> int:
                     break
 
             if not sw_row:
-                print(f"  ❌ 没找到 swcap_grounding 的 env-row")
+                print(f"  ❌ 没找到 swcap_vision_grounding 的 env-row")
                 failed.append(name)
             else:
                 is_ok = "wd-wizard-env-ok" in sw_row["cls"]

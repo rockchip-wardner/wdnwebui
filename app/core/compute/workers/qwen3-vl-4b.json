@@ -1,7 +1,7 @@
 {
   "label": "[VLM]视觉描述v3",
   "capability_types": [
-    "swcap_video_describe"
+    "swcap_vision_chat"
   ],
   "spec_factory": "qwen3_vl_4b",
   "worker_name": "vlm-4b",

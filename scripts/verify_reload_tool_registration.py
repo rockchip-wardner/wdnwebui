@@ -156,7 +156,7 @@ def test_post_reload_chat_agent_can_lookup_video_search_class():
             found = spec
             break
     assert found is not None
-    assert found.requires_capability == "swcap_video_retrieval"
+    assert found.requires_capability == "swcap_vision_embedding"
 
 
 def test_reload_does_not_double_register():

@@ -12,7 +12,7 @@
    ``LLMSession.embed_text`` 编码查询向量，遍历内存索引算余弦相似度，
    阈值过滤 + top_k 截断。
 
-LLMSession 从 ComputeRegistry 取（``swcap_video_retrieval`` capability），
+LLMSession 从 ComputeRegistry 取（``swcap_vision_embedding`` capability），
 与 detector 共用进程级 ``get_session_call_lock`` 串行化。
 
 命中项字段（对齐 demo 语义，前端契约不变）：
@@ -35,6 +35,7 @@ import time
 from typing import Callable, Iterator, List, Optional
 
 import numpy as np
+from wdnai import SoftwareCapability
 
 from app.core.compute.registry import (
     get_registry,
@@ -490,7 +491,7 @@ class VideoSearchService:
 
     def _ensure_session(self):
         """从 ComputeRegistry 拿 embedding session。未启用抛 RuntimeError。"""
-        return get_registry().get_session("swcap_video_retrieval")
+        return get_registry().get_session(SoftwareCapability.VISION_EMBEDDING)
 
     def clear_query(self) -> dict:
         """清空最近一次检索结果（query / hits），前端"清空"按钮调用。

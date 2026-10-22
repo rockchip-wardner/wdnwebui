@@ -122,8 +122,8 @@ rm -rf app/apps/<app>/  # 删前先备份
   "wizard_title": "音视频描述快速配置",          // 可选,默认 = manifest.title
   "localStorage_key": "wdnwebui.wizard.video-detection.values",  // 可选,默认按此规则生成
   "swcap_to_model": {                            // 应用层声明:一键开启所需模型映射
-    "swcap_video_describe":   { "npu_index": 0, "model_id": "vllm-q35-4b" },
-    "swcap_audio_understand": { "npu_index": 1, "model_id": "omni-q25-3b" }
+    "swcap_vision_chat":   { "npu_index": 0, "model_id": "vllm-q35-4b" },
+    "swcap_audio_chat": { "npu_index": 1, "model_id": "omni-q25-3b" }
   },
   "open_source_button": "vd-open",               // 完成配置时 applyWizardSnapshot 内部用于打开视频源的按钮 ID
   "start_buttons": [                             // 完成配置时按顺序模拟启动的按钮 ID 列表

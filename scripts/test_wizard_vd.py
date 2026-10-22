@@ -65,9 +65,9 @@ def main():
                     // _waitForModelsRunning 比的是 id 集合，写错不报错，只会
                     // 一路等到 90s 兜底，让「wizard 回 source 步骤」永远红。
                     { id: 'm0', model_id: 'qwen3-vl-4b', npu_index: 0,
-                      status: 'running', capability_types: ['swcap_video_describe'] },
+                      status: 'running', capability_types: ['swcap_vision_chat'] },
                     { id: 'm1', model_id: 'qwen2.5-omni-3b', npu_index: 1,
-                      status: 'running', capability_types: ['swcap_audio_understand'] },
+                      status: 'running', capability_types: ['swcap_audio_chat'] },
                   ],
                 }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
               }

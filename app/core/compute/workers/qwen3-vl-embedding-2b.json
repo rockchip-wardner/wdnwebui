@@ -1,7 +1,7 @@
 {
   "label": "[VLEmb]视觉信息编码v3",
   "capability_types": [
-    "swcap_video_retrieval"
+    "swcap_vision_embedding"
   ],
   "spec_factory": "qwen3_vl_embedding",
   "worker_name": "emb-2b",

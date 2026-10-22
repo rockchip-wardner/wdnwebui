@@ -7,10 +7,10 @@
 能力门控：
 
 * ``WdnaiDetector._infer_sync`` 已经在 worker 内先做了一次
-  ``get_registry().get_session("swcap_video_describe")`` 校验；
+  ``get_registry().get_session("swcap_vision_chat")`` 校验；
 * TTS 工具启用时，本 ``__call__`` 仍会再做一次 capability
-  检查（``get_session("swcap_audio_tts")``），未启用则直接抛
-  ``RuntimeError("功能未启用: swcap_audio_tts")``，由 detector
+  检查（``get_session("swcap_text_to_speech")``），未启用则直接抛
+  ``RuntimeError("功能未启用: swcap_text_to_speech")``，由 detector
   写入 ``DetectorEvent(level="error")``。
 
 并发：
@@ -29,6 +29,7 @@ from typing import Annotated
 
 from wdnai import Callable as WdnaiCallable
 from wdnai import Field as WdnaiField
+from wdnai import SoftwareCapability
 
 
 # tts_alert 默认音量。AGENTS.md 早期约定 standalone TTS page 默认
@@ -61,10 +62,10 @@ class TtsAlert:
         if not text:
             return {"text": "", "played": False, "error": "text 为空"}
 
-        # 能力门控：未启用 swcap_audio_tts → 抛错，由 detector 写入错误事件。
+        # 能力门控：未启用 swcap_text_to_speech → 抛错，由 detector 写入错误事件。
         from app.core.compute.registry import get_registry
         try:
-            get_registry().get_session("swcap_audio_tts")
+            get_registry().get_session(SoftwareCapability.TEXT_TO_SPEECH)
         except RuntimeError as e:
             raise RuntimeError(str(e)) from e
 
