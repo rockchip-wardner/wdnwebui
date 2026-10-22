@@ -1829,12 +1829,12 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
 vd 卡的 `swcap_to_model` 要的是**两张不同的卡**:
 
 ```
-swcap_video_describe  → qwen3-vl-4b        @ npu0
-swcap_audio_understand → qwen2.5-omni-3b   @ npu1
+swcap_vision_chat  → qwen3-vl-4b        @ npu0
+swcap_audio_chat → qwen2.5-omni-3b   @ npu1
 ```
 
 原判据按 **capability(模型级)** 算:`qwen3-vl-4b` 的 capability 是
-`swcap_video_describe`,在 `swcap_to_model` 里 → **两张卡上的都判成
+`swcap_vision_chat`,在 `swcap_to_model` 里 → **两张卡上的都判成
 「需要」→ 都不停** → npu1 仍被 qwen3-vl-4b 占着(3500MB),omni 要
 2500MB,5120 装不下 → worker **rc=-6**。
 
@@ -1870,13 +1870,13 @@ swcap_audio_understand → qwen2.5-omni-3b   @ npu1
 用户实测 BUG(视频目标监控 / vtd 卡):`qwen3-vl-4b` 跑在 RK182x#0、
 `qwen2.5-omni-3b` 跑在 RK182x#1,点「视频目标监控」进向导模式:
 
-* 第 1 步「运行环境检查」显示「✓ swcap_video_describe 已就绪」
+* 第 1 步「运行环境检查」显示「✓ swcap_vision_chat 已就绪」
   → **不显示「一键开启所需模型」按钮**
 * 一路走到最后一步「完成配置」→ 点完成 → **永久等待**「[VLM]视觉描述v3
   启动在 RK182x#1」(npu1 上跑的是 omni,不是它)
 
 根因:env 步只按 **capability(模型级)** 判就绪。vtd 的 `swcap_to_model` 是
-`{swcap_video_describe: {model_id: qwen3-vl-4b, npu_index: [0, 1]}}` ——
+`{swcap_vision_chat: {model_id: qwen3-vl-4b, npu_index: [0, 1]}}` ——
 同一个模型要**两张卡都跑**。qwen3-vl-4b 在 npu0 上 running → capability
 命中 → 判成就绪 → **卡位缺口被整个忽略**。
 
