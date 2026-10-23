@@ -91,6 +91,7 @@ const TextChat = {
       clearInterval(this._capPollTimer);
       this._capPollTimer = null;
     }
+    this._activeThinking = undefined;
   },
 
   _openWs() {
@@ -341,7 +342,19 @@ const TextChat = {
     return p;
   },
 
+  _thinkingHidden() {
+    if (this._activeThinking !== undefined) {
+      return this._activeThinking === false;
+    }
+    try { return localStorage.getItem("text_chat_thinking") !== "1"; }
+    catch (_) { return false; }
+  },
+
   _appendThinkingDelta(reqId, delta) {
+    // 关闭思考时后端仍可能返回模型自发的 <think> 内容（Qwen3.5 在
+    // enable_thinking=False 下对开放式输入会写英文 Thinking Process）——
+    // 前端兜底：OFF 时直接丢弃，不创建/不更新思考块。
+    if (this._thinkingHidden()) return;
     const p = this._ensureAssistantBubble(reqId);
     if (!p || !p.thinkingEl) return;
     p.thinkingBuf += delta;
@@ -378,6 +391,10 @@ const TextChat = {
     p.answerEl?.classList.remove("text-chat-cursor");
 
     // prefer the cleaner text from done frame (regex split) over the streamed buffer
+    // 关闭思考时后端仍可能带回模型自发的思考段 —— 兜底置空，details 随之隐藏。
+    if (this._thinkingHidden() && typeof info.thinking === "string") {
+      info.thinking = "";
+    }
     if (typeof info.thinking === "string") {
       p.thinkingBuf = info.thinking;
       if (p.thinkingEl) p.thinkingEl.textContent = info.thinking;
@@ -427,6 +444,7 @@ const TextChat = {
       }
     }
 
+    this._activeThinking = undefined;
     this._scrollToBottom();
   },
 
@@ -471,15 +489,14 @@ const TextChat = {
       this._setHint("上一条还在生成中…", true);
       return;
     }
+    const enabled = !!document.getElementById("text-chat-thinking")?.checked;
+    this._activeThinking = enabled;   // 本轮（含工具轮）按发送时的开关决定是否展示思考
     this._sending = true;
     try {
       const r = await fetch(API_PREFIX + "/text-chat/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          enable_thinking: !!document.getElementById("text-chat-thinking")?.checked,
-        }),
+        body: JSON.stringify({ text, enable_thinking: enabled }),
       });
       if (!r.ok) {
         let detail = "HTTP " + r.status;
@@ -529,6 +546,7 @@ const TextChat = {
       const empty = document.getElementById("text-chat-empty");
       if (empty) empty.style.display = "";
       this.pending.clear();
+      this._activeThinking = undefined;
       this.messages = [];
       this._setHint("已清空", false);
     } catch (err) {
@@ -566,13 +584,13 @@ TextChat.init();
 // 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
 //   tc-prompt  → opts.prompt
 // 空字段不触发对应动作(wizard 框架已校验);prompt 非空时把内容
-// 写回 #text-chat-input,**不**自动 send——text_chat 是用户主动发
-// 消息型应用,wizard 只负责"配置预填"。
+// 写回 #text-chat-input 并**自动发送**——向导完成 = 用户已经明确要开始
+// 对话（首次提问就是向导里填的）。原实现只预填、不发送，用户实测要求改。
 // 全局名约定 ImApp_<app.id 去掉 hyphen>—— wizard 按此查找。
 // ------------------------------------------------------------------ *
 window.ImApp_text_chat = window.ImApp_text_chat || {};
 window.ImApp_text_chat.applyWizardSnapshot = async function (opts) {
-  const result = { prompt_filled: false };
+  const result = { prompt_filled: false, sent: false };
   if (opts.prompt) {
     const input = document.getElementById("text-chat-input");
     if (input) {
@@ -580,6 +598,12 @@ window.ImApp_text_chat.applyWizardSnapshot = async function (opts) {
       input.dispatchEvent(new Event("input", { bubbles: true }));
       result.prompt_filled = true;
     }
+    // 与「发送」按钮同一条路径；send() 内部已处理空文本 / busy / 网络错误，
+    // 不会把异常抛回向导（避免 finish 被回退到上一步）。
+    try {
+      await TextChat.send();
+      result.sent = true;
+    } catch (_) { /* send() 已给出页面提示 */ }
   }
   return result;
 };
