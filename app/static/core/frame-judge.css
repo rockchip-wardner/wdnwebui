@@ -64,7 +64,11 @@
   background: #f8fafc;
 }
 .vj-config.vj-inline > .vj-row {
-  flex: 0 0 auto;
+  /* 允许收缩到容器宽度：侧栏只有 ~261px 可用，`flex: 0 0 auto`
+     会按 max-content 撑破配置区边框（vtl / vtd 实测）。 */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
   gap: 14px;
 }
 .vj-config.vj-inline > .vj-row > .vj-label {
@@ -75,20 +79,53 @@
   gap: 6px;
   white-space: nowrap;
 }
+.vj-config.vj-inline > .vj-row:first-child {
+  /* 与第二行（阈值 + 帧间隔）同宽，右端才能对齐：
+     26 + 6 + 80 + 14 + 39 + 6 + 80 = 251px。 */
+  flex: 0 0 251px;
+  width: 251px;
+  max-width: 100%;
+}
 /* 横向时给「判帧算法」下拉留足宽度：它的 option 带实测耗时标注，
-   在窄列里会被截成 "conc（约 2…"。 */
+   在窄列里会被截成 "conc（约 2…"。但 220px 硬下限会在 340px 侧栏里
+   溢出，所以下限交给容器，下拉自己伸缩。 */
 .vj-config.vj-inline > .vj-row:first-child > .vj-label {
-  flex: 1 1 300px;
+  flex: 1 1 180px;
+  min-width: 0;
   max-width: 380px;
 }
+.vj-config.vj-inline > .vj-row:first-child > .vj-label > span {
+  flex: 0 0 auto;          /* 标签文字不参与压缩 */
+}
 .vj-config.vj-inline > .vj-row:first-child .vj-select {
-  min-width: 220px;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+}
+.vj-config.vj-inline > .vj-row:nth-child(2) {
+  /* 与第一行（判帧算法）同宽 251px，并用 space-between 把「帧间隔」
+     推到这个宽度的右端。只让行盒子等宽还不够：label 是 flex: 0 1 auto，
+     内容不足 251 时盒子右端对齐、输入框右端却停在左侧，视觉上仍是
+     「第二行短一截」（实测 1302/1302 只是盒子右端）。 */
+  flex: 0 0 251px;
+  width: 251px;
+  max-width: 100%;
+  min-width: 0;
+  /* 阈值 + 帧间隔必须同一行：wrap 会先换行而不是压缩。 */
+  flex-wrap: nowrap;
+  justify-content: space-between;
 }
 .vj-config.vj-inline > .vj-row:nth-child(2) > .vj-label {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 .vj-config.vj-inline > .vj-row:nth-child(2) .vj-input {
-  width: 92px;
+  /* 两个数字框**等宽**（同 basis / 同 min，收缩比例一致）。可收缩是为了
+     字体比估算更宽时仍能塞进 251px，而不是溢出。 */
+  flex: 0 1 80px;
+  width: 80px;
+  min-width: 56px;
+  max-width: 100%;
 }
 .vj-config.vj-inline > .vj-hint {
   /* 说明文字单独占满下一行，别挤在控件后面把整行撑得歪歪扭扭。 */
