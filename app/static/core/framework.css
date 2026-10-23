@@ -171,7 +171,7 @@ html, body {
 }
 .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
 
-/* "向导模式"按钮(应用页 page-header 内,刷新按钮左侧)— 蓝色边框视觉区分 */
+/* "向导模式"按钮(应用页 page-header 内)—— 蓝色边框视觉区分 */
 .wizard-mode-btn {
   padding: 0.35rem 0.85rem;
   border: 1px solid #93c5fd;

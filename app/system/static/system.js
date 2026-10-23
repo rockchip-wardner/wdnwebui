@@ -728,20 +728,11 @@ function initLogs() {
   if (window.__logsInit) return;
   window.__logsInit = true;
 
-  const refreshBtn = document.getElementById("system-logs-refresh");
   const followEl   = document.getElementById("logs-follow");
   const clearBtn   = document.getElementById("logs-clear");
   const unitEl     = document.getElementById("logs-unit");
   const prioEl     = document.getElementById("logs-priority");
 
-  if (refreshBtn) refreshBtn.addEventListener("click", () => {
-    Logs.refresh().then(() => {
-      if (followEl && followEl.checked) {
-        stopLogsFollow();
-        startLogsFollow();
-      }
-    });
-  });
   if (followEl) followEl.addEventListener("change", () => {
     if (followEl.checked) {
       Logs.refresh().then(startLogsFollow);
@@ -790,10 +781,8 @@ const Base = {
     this.initialized = true;
 
     const form = document.getElementById("base-config-form");
-    const refreshBtn = document.getElementById("base-config-refresh");
     const reloadBtn = document.getElementById("bc-reload");
 
-    if (refreshBtn) refreshBtn.addEventListener("click", () => this.load());
     if (reloadBtn) reloadBtn.addEventListener("click", () => this.load());
 
     // Track edits so "放弃修改" actually drops them.
@@ -1852,7 +1841,6 @@ const ComputeConfigPage = {
   init() {
     if (this.initialized) return;
     this.initialized = true;
-    document.getElementById("cc-refresh")?.addEventListener("click", () => this.load());
     document.getElementById("cc-stop-all")?.addEventListener("click", () => this.stopAll());
   },
 
@@ -3507,12 +3495,10 @@ const Discovery = {
     const enableAll  = document.getElementById("discovery-hw-enable-all");
     const disableAll = document.getElementById("discovery-hw-disable-all");
     const saveBtn    = document.getElementById("discovery-hw-save");
-    const refreshBtn = document.getElementById("discovery-refresh");
 
     if (enableAll)  enableAll .addEventListener("click", () => this.setAllHw(true));
     if (disableAll) disableAll.addEventListener("click", () => this.setAllHw(false));
     if (saveBtn)    saveBtn   .addEventListener("click", () => this.saveHw());
-    if (refreshBtn) refreshBtn.addEventListener("click", () => this.load());
   },
 
   async load() {
@@ -3716,7 +3702,7 @@ function currentPage() {
 }
 
 /* Per-page loaders. Each entry is invoked on first navigation to the page
- * (and on every [data-refresh] click). Each function is idempotent — modules
+ * (and on every navigation to the page). Each function is idempotent — modules
  * guard with `initialized` flags so repeat calls are cheap.
  */
 const SYSTEM_PAGE_LOADERS = {
@@ -3803,10 +3789,6 @@ async function loadSystemPageData(name) {
     console.error("[system.js]", name, "load failed:", err);
   }
 }
-
-document.querySelectorAll("[data-refresh]").forEach((btn) => {
-  btn.addEventListener("click", () => loadSystemPageData(currentPage()));
-});
 
 window.addEventListener("hashchange", () => {
   const name = currentPage();

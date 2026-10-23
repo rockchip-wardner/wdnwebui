@@ -174,7 +174,6 @@
           <h2>系统信息</h2>
           <div class="header-meta">
             <span class="collected-at" id="system-monitor-time"></span>
-            <button class="refresh-btn" data-refresh>刷新</button>
           </div>
         </header>
 
@@ -325,7 +324,6 @@
           <h2>系统配置</h2>
           <div class="header-meta">
             <span class="collected-at" id="base-config-path">--</span>
-            <button class="refresh-btn" id="base-config-refresh">刷新</button>
           </div>
         </header>
 
@@ -434,7 +432,6 @@
           <h2>算力配置</h2>
           <div class="header-meta">
             <span class="collected-at" id="cc-collected-at">--</span>
-            <button class="refresh-btn" id="cc-refresh">刷新</button>
             <button class="vd-btn" id="cc-stop-all">全部停止</button>
           </div>
         </header>
@@ -477,7 +474,6 @@
           <h2>注册发现</h2>
           <div class="header-meta">
             <span class="collected-at" id="discovery-collected-at">--</span>
-            <button class="refresh-btn" id="discovery-refresh">刷新</button>
           </div>
         </header>
 
@@ -620,7 +616,6 @@
           <h2>系统日志</h2>
           <div class="header-meta">
             <span class="collected-at" id="system-logs-status">--</span>
-            <button class="refresh-btn" id="system-logs-refresh">刷新</button>
           </div>
         </header>
 

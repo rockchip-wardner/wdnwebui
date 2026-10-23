@@ -676,7 +676,6 @@ const ComputeConfigPage = {
   init() {
     if (this.initialized) return;
     this.initialized = true;
-    document.getElementById("cc-refresh")?.addEventListener("click", () => this.load());
     document.getElementById("cc-stop-all")?.addEventListener("click", () => this.stopAll());
   },
 
@@ -2122,12 +2121,10 @@ const Discovery = {
     const enableAll  = document.getElementById("discovery-hw-enable-all");
     const disableAll = document.getElementById("discovery-hw-disable-all");
     const saveBtn    = document.getElementById("discovery-hw-save");
-    const refreshBtn = document.getElementById("discovery-refresh");
 
     if (enableAll)  enableAll .addEventListener("click", () => this.setAllHw(true));
     if (disableAll) disableAll.addEventListener("click", () => this.setAllHw(false));
     if (saveBtn)    saveBtn   .addEventListener("click", () => this.saveHw());
-    if (refreshBtn) refreshBtn.addEventListener("click", () => this.load());
   },
 
   async load() {
