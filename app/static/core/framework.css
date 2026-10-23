@@ -5455,8 +5455,10 @@ body.dg-modal-open .back-home-btn {
 
 /* ── 「添加应用」磁位 ──────────────────────────────────────────────
    网格末尾的空位：不是卡片（不跳路由），只负责接收拖进来的 wheel。
-   视觉上刻意与 .app-card 同一套语言（16:9 占位块 + 虚线边 + 同款标题），
-   这样它看起来是"网格的一部分"，而不是突然冒出来的系统控件。 */
+   视觉上刻意与 .app-card 同一套语言（16:9 占位块 + 虚线边），这样它看起来
+   是"网格的一部分"，而不是突然冒出来的系统控件。
+   磁位不配 .app-card-title：提示语已经写在占位块里（加号下方），再挂一行
+   标题就成了"占位块说一遍、块外又说一遍"，而且两种字号打架。 */
 .app-add-tile {
   display: block;
   cursor: pointer;
@@ -5515,10 +5517,6 @@ body.dg-modal-open .back-home-btn {
 .app-add-tile:hover .app-add-icon,
 .app-add-tile.is-dropping .app-add-icon {
   opacity: 1;
-}
-
-.app-add-tile:hover .app-card-title {
-  color: #2563eb;
 }
 
 /* 提示文字：跟在图标下面、同样半透明，同样 hover 才变实 */

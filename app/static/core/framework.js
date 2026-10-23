@@ -750,7 +750,6 @@
           </svg>
           <p class="app-add-hint">拖动 wdnapp 包到此处安装</p>
         </div>
-        <h2 class="app-card-title">添加应用</h2>
         <p class="app-add-status" hidden></p>
       </div>`;
   }
