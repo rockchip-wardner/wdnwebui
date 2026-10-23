@@ -1921,18 +1921,18 @@ swcap_audio_chat → qwen2.5-omni-3b   @ npu1
 
 | 位置 | 作用 |
 |---|---|
-| `_modelSlots(cfg, instances)` | 纯函数:把 `swcap_to_model` 展开成 (模型, 卡位) 对,逐个标 `ok`(`npu_index` 为 null 的模型 → 任意卡即可,与 finish 步一致) |
-| `_envView(state, cfg)` | 判定结果:`swOK = capability 齐 **且** 每个卡位都就绪`;渲染与后台刷新共用同一份口径 |
-| `_localInstances` / `_missingCaps` | 本机实例过滤 + capability 缺失判定(peer adopt 不算本机算力,与 finish 步同口径) |
-| `_renderEnvStep` | 多渲染**卡位明细行**(`✓ qwen3-vl-4b @ RK182x #0` / `✗ … #1(未运行)`);capability 行在卡位没齐时也显示 ✗;`swOK` 假 → 出「一键开启所需模型」按钮 + 「下一步」禁用 |
+| `_modelSlots(cfg, instances)` | 纯函数:把 `swcap_to_model` 展开成 (模型, 卡位) 对,逐个标 `up`(running **或** loading —— 启动中算就绪在途;`npu_index` 为 null 的模型 → 任意卡即可,与 finish 步一致) |
+| `_envView(state, cfg)` | 判定结果:每条能力一个三态 `capStates`(ok / warn / fail),`swOK = 全部 ok`;渲染与后台刷新共用同一份口径 |
+| `_localInstances` / `_capJudgement` | 本机实例过滤 + capability 缺失判定(peer adopt 不算本机算力,与 finish 步同口径) |
+| `_renderEnvStep` | 能力行**三态**(✓ 全开或都在启动中 / ⚠ 半就绪 / ✗ 没开);**不外露模型名与卡号**;`swOK` 假 → 出「一键开启所需模型」按钮 + 「下一步」禁用 |
 | `_refreshEnv` | env 步后台刷新一次:结论**变了**才重绘(否则会擦掉「一键开启」刚写的状态文案) |
 
 > **卡位级判据必须用「裁剪后」的 cfg** —— 单卡模式下 `_planSingleCard` 把
 > `npu_index` 换成唯一卡号;按原始 cfg 算会算出**不存在的卡位**。所以
 > slots 在**渲染时**算(`_envView` 收 `cfg` 参数),不在 `mount` 里算。
 
-回归:`scripts/verify_wizard_slot_readiness.py`(13 断言,mock 驱动,覆盖
-「半就绪 → 出按钮 + 缺卡明细 + 下一步禁用」「全就绪 → 无按钮」两态)。
+回归:`scripts/verify_wizard_slot_readiness.py`(20 断言,mock 驱动,覆盖三态
++「半就绪 → 出按钮 + 下一步禁用」「全就绪 → 无按钮」)。
 
 ### 向导 finish 步的等待必须遇终态立即中止（v0.28 修）
 

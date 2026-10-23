@@ -148,6 +148,8 @@
   font-family: "SF Mono", Consolas, Monaco, monospace;
 }
 .wd-wizard-env-row.wd-wizard-env-fail { color: #b91c1c; }
+/* 半就绪（要的卡位只起了一部分）—— 黄：还没坏，但也不是全好。 */
+.wd-wizard-env-row.wd-wizard-env-warn { color: #b45309; }
 /* 空能力列表的占位说明（不依赖任何硬件 / 模型的应用，如阈值标定卡）。
    刻意比 env-ok 淡一档：它是「无需检查」，不是「检查通过」。 */
 .wd-wizard-env-row.wd-wizard-env-none { color: #64748b; font-style: italic; }

@@ -314,25 +314,40 @@
       const npus = (m.npu_index == null) ? null
         : (Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index]);
       if (!npus) {
-        const any = local.find((i) => i.model_id === m.model_id);
-        const ok = local.some((i) => i.model_id === m.model_id
-          && i.status === "running");
-        slots.push({
-          cap, model_id: m.model_id, npu_index: null, ok,
-          state: ok ? "running" : (any ? any.status : "missing"),
-        });
+        // npu_index 为 null → 任意卡即可（与 finish 步一致）。
+        // up = 已开启**或**正在启动中（启动中算「就绪在途」）。
+        const up = local.some((i) => i.model_id === m.model_id
+          && (i.status === "running" || i.status === "loading"));
+        slots.push({ cap, model_id: m.model_id, npu_index: null, up });
         continue;
       }
       for (const n of npus) {
         const inst = local.find((i) => i.model_id === m.model_id && i.npu_index === n);
-        const ok = !!(inst && inst.status === "running");
-        slots.push({
-          cap, model_id: m.model_id, npu_index: n, ok,
-          state: ok ? "running" : (inst ? inst.status : "missing"),
-        });
+        const up = !!(inst && (inst.status === "running" || inst.status === "loading"));
+        slots.push({ cap, model_id: m.model_id, npu_index: n, up });
       }
     }
     return slots;
+  }
+
+  // 每个 capability 的就绪态（渲染只出 swcap_*，模型名/卡号不外露）：
+  //   ok   = 所需模型全开或都在启动中 → ✓ 绿
+  //   warn = 半就绪（要的卡位只起了一部分）→ ⚠ 黄
+  //   fail = 没起 → ✗ 红
+  function _capStates(swRequired, swMissing, slots, groupFail) {
+    const out = {};
+    for (const cap of swRequired) {
+      // 能力组没被同一个实例满足 → 组内每项都判缺（逐项看都 ✓ 的话用户
+      // 以为能用，进卡才发现不行）。
+      if (groupFail.has(cap)) { out[cap] = "fail"; continue; }
+      // 没有任何运行中/启动中的实例提供这个能力 → 没就绪
+      if (swMissing.includes(cap)) { out[cap] = "fail"; continue; }
+      const mine = slots.filter((s) => s.cap === cap);
+      if (!mine.length) { out[cap] = "ok"; continue; }
+      const up = mine.filter((s) => s.up).length;
+      out[cap] = up === mine.length ? "ok" : (up > 0 ? "warn" : "fail");
+    }
+    return out;
   }
 
   // env 步的判定结果 —— 渲染与后台刷新共用同一份口径。
@@ -351,21 +366,28 @@
       ? swRequired.filter((c) => allMissing.includes(c))
       : allMissing;
     const slots = _modelSlots(cfg || state.cfg, env.instances || []);
+    // 组没被同一个实例满足 → 组内每项都判缺。groupsUnsatisfied 的元素
+    // 是 "a + b"（拼给人看的），拆回能力名。
+    const groupFail = new Set();
+    (env.groupsUnsatisfied || []).forEach((label) => {
+      String(label).split(" + ").forEach((c) => groupFail.add(c.trim()));
+    });
+    const capStates = _capStates(swRequired, swMissing, slots, groupFail);
     return {
       swRequired,
-      swMissing,
-      slots,
-      // 就绪 = capability 齐 **且** 每个要求的卡位都跑上了。
-      swOK: swMissing.length === 0 && slots.every((s) => s.ok),
+      capStates,
+      // 就绪 = 每条要求的能力都是 ok；warn/fail 都算没齐 → 出「一键开启」
+      // 按钮 + 禁用「下一步」。空 swRequired（不依赖模型）→ 可继续。
+      swOK: swRequired.every((c) => capStates[c] === "ok"),
       blocked: !!(singleOn && single.blocked),
     };
   }
 
-  // env 结论的指纹 —— 后台刷新只在结论**变了**时才重绘（否则会把
-  // 「一键开启」刚写的状态文案擦掉，用户看着像按钮没反应）。
+  // env 结论的指纹（每条要求的能力的最终态）—— 后台刷新只在结论**变了**
+  // 时才重绘，否则会擦掉「一键开启」刚写的状态文案。
   function _envSig(view) {
-    return view.swMissing.join(",") + "|" + view.slots
-      .map((s) => `${s.model_id}@${s.npu_index}:${s.ok ? 1 : 0}`).join(",");
+    return view.swRequired
+      .map((c) => c + ":" + (view.capStates[c] || "-")).join(",");
   }
 
   function _renderEnvStep(body, foot, cfg, stepDef, state) {
@@ -381,8 +403,6 @@
     // 单卡下 capability 集合可能被裁剪：vd 二选一只留选中的那条；多
     // capability 又没声明二选一时,两条都列出来,说明为什么不可用。
     const swRequired = view.swRequired;
-    const swMissing = view.swMissing;
-    const slots = view.slots;
     const swOK = view.swOK;
 
     const card = _ce("div", WIZARD_NS + "env-card");
@@ -408,7 +428,7 @@
     body.appendChild(card);
 
     const card2 = _ce("div", WIZARD_NS + "env-card");
-    card2.appendChild(_ce("h3", null, "软件能力 / 模型"));
+    card2.appendChild(_ce("h3", null, "软件能力"));
 
     // --- 单卡提示块 ---------------------------------------------------- //
     if (singleOn && blocked) {
@@ -463,15 +483,14 @@
     // ------------------------------------------------------------------ //
 
     swRequired.forEach((cap) => {
-      // 被阻断时两条都显示为未满足（说明为什么不可用），而不是把已跑起
-      // 的那条显示成 ✓ —— 那会让人以为还差一点就能用。
-      let ok = blocked ? false : !swMissing.includes(cap);
-      // 卡位没齐也算未满足：vtd 只起了 npu0 那份时 capability 仍是
-      // running（显示 ✓），但应用其实不能用 —— 光看 ✓ 会骗人。
-      if (ok && slots.some((s) => s.cap === cap && !s.ok)) ok = false;
+      // 三态：✓ 绿（全开或在启动中）/ ⚠ 黄（半就绪）/ ✗ 红（没开）。
+      // 被阻断时一律 fail —— 把已跑起的显示成 ✓ 会让人以为差一点就能用。
+      // 不列模型名 / 卡号：用户不需要知道模型跑在哪张卡上。
+      const st = blocked ? "fail" : (view.capStates[cap] || "fail");
       const row = _ce("div", WIZARD_NS + "env-row");
-      row.classList.add(ok ? WIZARD_NS + "env-ok" : WIZARD_NS + "env-fail");
-      row.textContent = (ok ? "✓ " : "✗ ") + cap;
+      row.classList.add(st === "ok" ? WIZARD_NS + "env-ok"
+        : (st === "warn" ? WIZARD_NS + "env-warn" : WIZARD_NS + "env-fail"));
+      row.textContent = (st === "ok" ? "✓ " : (st === "warn" ? "⚠ " : "✗ ")) + cap;
       card2.appendChild(row);
     });
     // vd 二选一时把没选中的那条也列出来(中性样式)—— 用户得看到
@@ -484,18 +503,6 @@
         card2.appendChild(row);
       });
     }
-    // 卡位级明细：差哪张卡必须看得见。上面 capability 行只说「模型在不
-    // 在」，这里说「跑在要求的卡上没有」—— vtd 要 qwen3-vl-4b 同时占
-    // npu0/npu1，只起了 npu0 时这里会明确列出缺 npu#1。
-    slots.forEach((s) => {
-      const row = _ce("div", WIZARD_NS + "env-row");
-      row.classList.add(s.ok ? WIZARD_NS + "env-ok" : WIZARD_NS + "env-fail");
-      const where = (s.npu_index == null) ? "任意卡" : `RK182x #${s.npu_index}`;
-      const mark = s.ok ? "✓" : (s.state === "loading" ? "⏳" : "✗");
-      const tail = s.ok ? "" : (s.state === "loading" ? "（启动中）" : "（未运行）");
-      row.textContent = `${mark} ${s.model_id} @ ${where}${tail}`;
-      card2.appendChild(row);
-    });
     if (!swRequired.length) {
       card2.appendChild(_envNoReqRow("本应用不依赖模型 / 软件能力"));
     }
@@ -591,23 +598,25 @@
   // **同一个**实例同时满足 —— usb_hid 的视觉 + 工具调用就是这个形状。
   // env 步与后台刷新共用这一份,免得两处判出不同结论。
   function _capJudgement(app, cfg, instances) {
-    const runningCaps = new Set();
-    // 本机 running 实例各自的 capability_types —— 组判定要「某个实例是否
+    const providedCaps = new Set();
+    // 本机实例各自的 capability_types —— 组判定要「某个实例是否
     // 同时具备组内全部能力」,光有一个扁平的能力集合不够。
     const localCapSets = [];
     for (const inst of (instances || [])) {
-      if (inst.status !== "running") continue;
+      // loading 也算「正在提供这个能力」—— 启动中显示 ✓，不用再点一次开启。
+      if (inst.status !== "running" && inst.status !== "loading") continue;
       const caps = inst.capability_types || [];
-      for (const c of caps) runningCaps.add(c);
+      for (const c of caps) providedCaps.add(c);
       localCapSets.push(caps);
     }
     const swMissing = [];
     for (const cap of (app && app.software_capabilities) || []) {
-      if (!runningCaps.has(cap)) swMissing.push(cap);
+      if (!providedCaps.has(cap)) swMissing.push(cap);
     }
     // 组感知：存在 group 声明时，逐组再验一次「单个实例同时满足整组」。
     // 逐能力全绿但分属两个实例的情况在这里被判缺 —— 否则 UI 显示就绪,
     // 用户进卡才发现功能不可用(usb_hid 视觉+工具调用正是这个形状)。
+    // 组内每项都判缺由渲染侧按 groupsUnsatisfied 统一处理。
     const groups = Array.from(_capGroups(cfg).values()).filter((g) => g.length > 1);
     const groupsUnsatisfied = [];
     for (const g of groups) {
@@ -615,10 +624,6 @@
         (caps) => g.every((c) => caps.indexOf(c) !== -1));
       if (!covered) groupsUnsatisfied.push(g.join(" + "));
     }
-    // 组内每项都有实例、但不是同一个实例 → 逐能力检查看不到，得额外报
-    const splitGroups = groupsUnsatisfied.filter(
-      (label) => label.split(" + ").every((c) => runningCaps.has(c)));
-    if (splitGroups.length) swMissing = swMissing.concat(splitGroups);
     return { swMissing, groupsUnsatisfied };
   }
 

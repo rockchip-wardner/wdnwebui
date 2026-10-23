@@ -198,7 +198,7 @@ def main():
               wizard_container_count(page) == 1,
               str(wizard_container_count(page)))
         txt = body_text(page)
-        check("停在第 1 步（env_check）", "软件能力 / 模型" in txt,
+        check("停在第 1 步（env_check）", "软件能力" in txt,
               " / ".join(txt.split("\n")[:3]))
         check("没有单卡提示块（单 capability 应用不打扰用户）",
               page.locator(f".{NS}single-notice").count() == 0,

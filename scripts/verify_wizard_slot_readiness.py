@@ -15,13 +15,14 @@ qwen2.5-omni-3b 跑在 RK182x#1，点「视频目标监控」进向导模式：
 命中 → 判成就绪 → 卡位缺口被完全忽略。正确粒度是 (模型, 卡位) 对，与
 finish 步的等待（_waitForModelsRunning）同口径。
 
-本脚本守住六条：
-  B1 半就绪（只起 npu0）→ 出现「一键开启所需模型」按钮
-  B2 半就绪 → 明细行明确指出缺 RK182x #1（且 capability 行不再显示 ✓）
+本脚本守住七条：
+  B1 半就绪（只起 npu0）→ ⚠ 黄 + 出现「一键开启所需模型」按钮
+  B2 半就绪 → **不再**暴露模型名 / 卡号明细行（用户不需要知道这么具体）
   B3 半就绪 → 「下一步」禁用（走不到完成配置页死等）
-  B4 全就绪（两张卡都有）→ **不**出现按钮，「下一步」可用
+  B4 全就绪（两张卡都有）→ ✓ 绿、**不**出现按钮，「下一步」可用
   B5 peer adopt 的实例不算本机就绪（远端算力本机无权用）
   B6 点按钮 → DELETE 带 npu_index 腾掉 omni@#1，POST 带 npu_index=[0,1]
+  B7 三态齐全：完全没开 → ✗ 红；正在启动中 → ✓ 绿（就绪在途）
 
 全 mock，不占 NPU、不碰真机。
 
@@ -60,6 +61,13 @@ ALL_READY = [
 PEER_ONLY = [
     _inst("qwen3-vl-4b", 0, ["swcap_vision_chat"]),
     _inst("qwen3-vl-4b", 1, ["swcap_vision_chat"], source="adopted"),
+]
+# 完全没开：本机一个实例都没有
+NONE_UP: list = []
+# 正在启动中：两个卡位都在 loading —— 也算「就绪在途」
+LOADING = [
+    _inst("qwen3-vl-4b", 0, ["swcap_vision_chat"], status="loading"),
+    _inst("qwen3-vl-4b", 1, ["swcap_vision_chat"], status="loading"),
 ]
 
 FAILED: list[str] = []
@@ -135,6 +143,33 @@ def env_rows(page) -> list[str]:
         "els => els.map(e => e.textContent.trim())")
 
 
+def cap_state(page, cap: str) -> str:
+    """软件能力行的三态：ok / warn / fail（认不出来返回 "?"）。
+
+    env 步有两张卡（硬件能力 / 软件能力），硬件行不含 swcap_ 前缀，
+    按能力名精确挑出软件能力行。
+    """
+    cls = page.eval_on_selector_all(
+        f"#{NS}root-{APP} .{NS}env-row",
+        """(els, cap) => {
+            const e = els.find(x => x.textContent.includes(cap));
+            return e ? e.className : null;
+        }""",
+        cap)
+    if not cls:
+        return "?"
+    for st in ("ok", "warn", "fail"):
+        if f"env-{st}" in cls:
+            return st
+    return "?"
+
+
+def no_model_detail_rows(rows: list[str]) -> bool:
+    """软件能力区不再出现模型名 / 卡号明细行。"""
+    return not any("qwen3-vl-4b" in r or "qwen2.5-omni-3b" in r
+                   or "RK182x #" in r for r in rows)
+
+
 def bring_btn_count(page) -> int:
     return page.locator(f"#{NS}root-{APP} #{NS}env-bring-btn").count()
 
@@ -154,17 +189,13 @@ def main() -> int:
         page, ctx, calls = open_wizard(browser, USER_SCENE)
         rows = env_rows(page)
         print("  env 行: " + " | ".join(rows))
+        check("B1 半就绪 → 能力行显示 ⚠（黄色告警）",
+              cap_state(page, "swcap_vision_chat") == "warn",
+              f"state={cap_state(page, 'swcap_vision_chat')}")
         check("B1 出现「一键开启所需模型」按钮",
               bring_btn_count(page) == 1, f"count={bring_btn_count(page)}")
-        check("B2 明细行指出缺 RK182x #1",
-              any("qwen3-vl-4b" in r and "#1" in r and r.startswith("✗")
-                  for r in rows), f"rows={rows}")
-        check("B2 明细行标出 #0 已就绪",
-              any("qwen3-vl-4b" in r and "#0" in r and r.startswith("✓")
-                  for r in rows), f"rows={rows}")
-        check("B2 capability 行不再显示 ✓（卡位没齐就不算就绪）",
-              any(r.startswith("✗") and "swcap_vision_chat" in r
-                  for r in rows), f"rows={rows}")
+        check("B2 不再显示模型名 / 卡号明细行",
+              no_model_detail_rows(rows), f"rows={rows}")
         check("B3 「下一步」禁用（走不到完成配置页死等）",
               next_disabled(page) is True, f"disabled={next_disabled(page)}")
 
@@ -196,13 +227,15 @@ def main() -> int:
         page, ctx, _ = open_wizard(browser, ALL_READY)
         rows = env_rows(page)
         print("  env 行: " + " | ".join(rows))
+        check("B4 能力行显示 ✓（绿色）",
+              cap_state(page, "swcap_vision_chat") == "ok",
+              f"state={cap_state(page, 'swcap_vision_chat')}")
         check("B4 不出现「一键开启所需模型」按钮",
               bring_btn_count(page) == 0, f"count={bring_btn_count(page)}")
         check("B4 「下一步」可用",
               next_disabled(page) is False, f"disabled={next_disabled(page)}")
-        check("B4 两张卡都标 ✓",
-              all(any("qwen3-vl-4b" in r and f"#{n}" in r and r.startswith("✓")
-                      for r in rows) for n in (0, 1)), f"rows={rows}")
+        check("B4 不再显示模型名 / 卡号明细行",
+              no_model_detail_rows(rows), f"rows={rows}")
         ctx.close()
 
         # ---- 场景 D：peer adopt 的实例不算本机就绪 --------------------------
@@ -210,11 +243,41 @@ def main() -> int:
         page, ctx, _ = open_wizard(browser, PEER_ONLY)
         rows = env_rows(page)
         print("  env 行: " + " | ".join(rows))
+        check("B5 peer adopt 不算就绪 → 半就绪 ⚠",
+              cap_state(page, "swcap_vision_chat") == "warn",
+              f"state={cap_state(page, 'swcap_vision_chat')}")
         check("B5 peer adopt 不算就绪 → 仍出现「一键开启」按钮",
               bring_btn_count(page) == 1, f"count={bring_btn_count(page)}")
-        check("B5 peer adopt 的 #1 仍标为缺",
-              any("qwen3-vl-4b" in r and "#1" in r and r.startswith("✗")
-                  for r in rows), f"rows={rows}")
+        check("B5 「下一步」禁用",
+              next_disabled(page) is True, f"disabled={next_disabled(page)}")
+        ctx.close()
+
+        # ---- 场景 E：完全没开启 ------------------------------------------
+        print("\n=== E: 完全没开启（本机一个实例都没有） ===")
+        page, ctx, _ = open_wizard(browser, NONE_UP)
+        rows = env_rows(page)
+        print("  env 行: " + " | ".join(rows))
+        check("B7 没开启 → 能力行显示 ✗（红色）",
+              cap_state(page, "swcap_vision_chat") == "fail",
+              f"state={cap_state(page, 'swcap_vision_chat')}")
+        check("B7 没开启 → 出现「一键开启」按钮",
+              bring_btn_count(page) == 1, f"count={bring_btn_count(page)}")
+        check("B7 没开启 → 「下一步」禁用",
+              next_disabled(page) is True, f"disabled={next_disabled(page)}")
+        ctx.close()
+
+        # ---- 场景 F：正在启动中 -------------------------------------------
+        print("\n=== F: 两个卡位都在启动中（loading） ===")
+        page, ctx, _ = open_wizard(browser, LOADING)
+        rows = env_rows(page)
+        print("  env 行: " + " | ".join(rows))
+        check("B7 启动中 → 能力行显示 ✓（就绪在途）",
+              cap_state(page, "swcap_vision_chat") == "ok",
+              f"state={cap_state(page, 'swcap_vision_chat')}")
+        check("B7 启动中 → 不出现「一键开启」按钮",
+              bring_btn_count(page) == 0, f"count={bring_btn_count(page)}")
+        check("B7 启动中 → 「下一步」可用（finish 步会等 running）",
+              next_disabled(page) is False, f"disabled={next_disabled(page)}")
         ctx.close()
 
         browser.close()

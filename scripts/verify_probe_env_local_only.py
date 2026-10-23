@@ -35,7 +35,11 @@ vtd 只起 npu0 那份 → env 步显示 ✓ → 一路走到完成配置页死�
 | C  | not_loaded    | not_loaded   | ✗ swcap_vision_grounding |
 | D  | running@0,1   | running      | ✓ swcap_vision_grounding |
 | E  | running@0,1(多源) | -        | ✓ swcap_vision_grounding (smoke 主路径) |
-| F  | running@0 only | -           | ✗ swcap_vision_grounding (卡位缺一张) |
+| F  | running@0 only | -           | ⚠ swcap_vision_grounding (卡位缺一张 → 半就绪) |
+
+env 步的能力行是**三态**：✓ 全开 / ⚠ 半就绪（要的卡位只起了一部分）/ ✗ 没开。
+F 以前判 ✗，现在按「半就绪」判 ⚠ —— 区别只是提示的强弱，"没齐 → 不能下一步"
+这条不变。
 """
 import json
 import sys
@@ -84,28 +88,28 @@ def _both_cards(status, source, peer_name=""):
 
 
 SCENARIOS = [
-    # (name, mock instances, expects 摸 ok-class present?)
+    # (name, mock instances, 期望的能力行三态 "ok" / "warn" / "fail")
     ("A. peer adopted running only (BUG 场景 — 本机未启)",
      [instance("LocateAnything-3b", "running", "adopted", peer_name="PeerX")],
-     False),
+     "fail"),
     ("B. local spawned running (两张卡都在)",
      _both_cards("running", "spawned"),
-     True),
+     "ok"),
     ("C. both not_loaded",
      [instance("LocateAnything-3b", "not_loaded", "spawned"),
       instance("LocateAnything-3b", "not_loaded", "adopted", peer_name="PeerX")],
-     False),
+     "fail"),
     ("D. local spawned running + peer adopted running (本机已启,peer 也在跑)",
      _both_cards("running", "spawned")
      + [instance("LocateAnything-3b", "running", "adopted", peer_name="PeerX")],
-     True),
+     "ok"),
     ("E. 多个 spawned 本机实例 running(已包含 swcap_vision_grounding)",
      _both_cards("running", "spawned")
      + [instance("OtherModel-7b", "running", "spawned", npu_index=0)],
-     True),
-    ("F. 本机只起了 npu0 一张卡 (卡位级判据 — 仍算未就绪)",
+     "ok"),
+    ("F. 本机只起了 npu0 一张卡 (卡位级判据 — 半就绪 ⚠)",
      [instance("LocateAnything-3b", "running", "spawned", npu_index=0)],
-     False),
+     "warn"),
 ]
 
 
@@ -116,7 +120,7 @@ def main() -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
 
-        for name, insts, expects_env_ok in SCENARIOS:
+        for name, insts, expects_state in SCENARIOS:
             print(f"\n=== {name} ===")
             ctx = browser.new_context()
             page = ctx.new_page()
@@ -156,15 +160,16 @@ def main() -> int:
                 print(f"  ❌ 没找到 swcap_vision_grounding 的 env-row")
                 failed.append(name)
             else:
-                is_ok = "wd-wizard-env-ok" in sw_row["cls"]
-                is_fail = "wd-wizard-env-fail" in sw_row["cls"]
-                actual = "✓" if is_ok else ("✗" if is_fail else "?")
-                print(f"  env-row: cls={sw_row['cls']!r}  text={sw_row['text']!r}")
-                if is_ok == expects_env_ok and (is_ok or is_fail):
-                    print(f"  ✅ {actual} 符合期望(env_ok={expects_env_ok})")
+                cls = sw_row["cls"]
+                actual = ("ok" if "wd-wizard-env-ok" in cls else
+                          "warn" if "wd-wizard-env-warn" in cls else
+                          "fail" if "wd-wizard-env-fail" in cls else "?")
+                print(f"  env-row: cls={cls!r}  text={sw_row['text']!r}")
+                if actual == expects_state:
+                    print(f"  ✅ {actual} 符合期望")
                     ok_count += 1
                 else:
-                    print(f"  ❌ 实际 {actual},期望 env_ok={expects_env_ok}")
+                    print(f"  ❌ 实际 {actual},期望 {expects_state}")
                     failed.append(name)
 
             ctx.close()
