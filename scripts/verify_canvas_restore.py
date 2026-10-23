@@ -95,7 +95,7 @@ def run(page, app_id, cid, src_id, errs):
     page.wait_for_timeout(200)
     page.evaluate("""() => {
         const b = [...document.querySelectorAll('.wd-wizard-source-action-btn')]
-            .find(x => x.textContent.trim() === '打开');
+            .find(x => x.textContent.trim() === '播放视频');
         if (b) b.click();
     }""")
     page.wait_for_timeout(2500)
@@ -104,7 +104,7 @@ def run(page, app_id, cid, src_id, errs):
     if not in_wiz.get("inWizard"):
         print(f"  ❌ 画面没搬进 wizard，后面的断言无意义: {in_wiz}")
         return 1
-    print("  点「打开」后: 画面在 wizard canvas-wrap 内 ✅")
+    print("  点「播放视频」后: 画面在 wizard canvas-wrap 内 ✅")
 
     page.evaluate("try { window.WizardState.unmount(); } catch(_) {}")
     page.wait_for_timeout(600)

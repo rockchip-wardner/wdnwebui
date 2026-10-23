@@ -5329,9 +5329,11 @@ body.dg-modal-open .back-home-btn {
   margin-left: 12px;
   border-radius: 4px;
   text-decoration: none;
-  color: inherit;
-  border: 1px solid #d0d0d8;
-  background: transparent;
+  /* 蓝底白字主操作色 —— 与向导 head「返回」/ footer「下一步」同一套色板,
+   * 每个能力卡右上角的这个按钮都长一个样。 */
+  color: #ffffff;
+  border: 1px solid #2563eb;
+  background: #2563eb;
   cursor: pointer;
   font-size: 14px;
   font-family: inherit;
@@ -5341,9 +5343,9 @@ body.dg-modal-open .back-home-btn {
 }
 
 .back-home-btn:hover {
-  background: #f0f0f5;
-  border-color: #2563eb;
-  color: #2563eb;
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+  color: #ffffff;
 }
 
 .back-home-btn:focus-visible {
@@ -5351,8 +5353,12 @@ body.dg-modal-open .back-home-btn {
   outline-offset: 2px;
 }
 
-/* "退出应用" 红框变体 —— 当前页活跃时由 base.js 切换 data-mode */
+/* "退出应用" 红框变体 —— 当前页活跃时由 base.js 切换 data-mode
+ * 底色要**显式写回 transparent**:base 已是蓝底实心,不重置就会变成
+ * 「蓝底红字」这种混色。红框（描边）变体保留与「返回首页」的视觉区分
+ * —— 退出是「会停掉后台应用」的动作,红色继续承担这个警示语义。 */
 .back-home-btn[data-mode="exit"] {
+  background: transparent;
   border-color: #ef4444;
   color: #b91c1c;
 }

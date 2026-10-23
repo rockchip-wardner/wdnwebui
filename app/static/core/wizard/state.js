@@ -21,7 +21,7 @@
     return el;
   }
 
-  /** 字段 id 是否是「视频源」——决定是否自动加浏览/打开/关闭按钮。
+  /** 字段 id 是否是「视频源」——决定是否自动加浏览/播放视频/关闭按钮。
    *
    *  **必须同时接受 `-source` 与 `-sources`**：多路卡字段是复数。这个判定
    *  在 `_renderFormStep` 出现两次（inline 循环开关 / 加浏览按钮），各写一份
@@ -164,7 +164,7 @@
     _applyNavLock(state);
   }
 
-  // 把上传锁同步到「下一步」/「打开」按钮。footer 重建后需重新调用
+  // 把上传锁同步到「下一步」/「播放视频」按钮。footer 重建后需重新调用
   // (此时按钮是新节点,disabled 不会继承)。
   function _applyNavLock(state) {
     const ids = [WIZARD_NS + "next-btn"];
@@ -1045,7 +1045,7 @@
         });
         row.appendChild(browseBtn);
         wrap.appendChild(row);
-        // 视频源下方追加"打开 / 关闭"按钮(wizard.json 的 open_source_button
+        // 视频源下方追加"播放视频 / 关闭"按钮(wizard.json 的 open_source_button
         // 字段声明应用页面对应的按钮 id;close 按钮 id 按 "*-open → *-close"
         // 约定推断,避免每个 wizard.json 多写一份)。按钮 click 走应用页面
         // 原生按钮(应用页面打开按钮已经把 wizard 的 source/loop 写回 +
@@ -1059,7 +1059,13 @@
             return !!(tCb && tCb.checked);
           };
           const actions = _ce("div", WIZARD_NS + "source-actions");
-          const openBtn = _ce("button", WIZARD_NS + "source-action-btn", "打开");
+          // 「播放视频」额外挂 source-open-btn：它与应用页面里那个**同名按钮**
+          // 必须同色（蓝底白字），否则同一个「播放视频」在应用页是蓝的、在
+          // 向导里是白底 —— 同名不同色 = 视觉语言自相矛盾。关闭按钮仍走
+          // source-action-btn 的白底次要样式。
+          const openBtn = _ce("button",
+            WIZARD_NS + "source-action-btn " + WIZARD_NS + "source-open-btn",
+            "播放视频");
           openBtn.type = "button";
           openBtn.id = WIZARD_NS + "source-open-" + field.id;
           // 点击"打开"后,wizard 容器内需要展示视频。应用页面的 canvas 元素
@@ -1074,7 +1080,7 @@
           // 声明，推导只作为单路老卡片的兜底。
           const canvasId = cfg.canvas_id
             || cfg.open_source_button.replace(/-open$/, "-canvas");
-          // 「浏览 / 打开 / 关闭」合并进同一个 row —— 与应用页面的按钮行同款。
+          // 「浏览 / 播放视频 / 关闭」合并进同一个 row —— 与应用页面的按钮行同款。
           // 原先浏览一行、打开/关闭另一行，中间还留上下边距，读起来像两组
           // 不相干的控件。canvas-wrap 仍挂在 wrap 上，排在按钮行下方。
           row.appendChild(actions);
@@ -1102,7 +1108,7 @@
             const handleUpload = async (file) => {
               dropStatus.textContent = `正在上传 ${file.name}...`;
               dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-busy";
-              // 上传在途:锁住「下一步」/「打开」(见文件头守卫注释)
+              // 上传在途:锁住「下一步」/「播放视频」(见文件头守卫注释)
               _setUploadBusy(state, true, field.id);
               try {
                 const fd = new FormData();
@@ -1179,7 +1185,7 @@
             });
           } else {
             // 没声明 upload_endpoint,给一个静态 placeholder
-            noUp = _ce("div", WIZARD_NS + "drop-text", "点击「打开」开始播放");
+            noUp = _ce("div", WIZARD_NS + "drop-text", "点击「播放视频」开始");
             canvasWrap.appendChild(noUp);
           }
 
@@ -1212,7 +1218,7 @@
             }
           };
           openBtn.addEventListener("click", () => {
-            // 上传在途时点「打开」会放旧源,同「下一步」一并锁住
+            // 上传在途时点「播放视频」会放旧源,同「下一步」一并锁住
             if (_active && _active.uploadBusy) { _flashUploadHint(); return; }
             try {
               const srcEl = document.getElementById(field.id);
@@ -1236,7 +1242,7 @@
               // 与 unmount 共用 _restoreCanvas。原先这里另写了一套（现查
               // .vd-stage 再插到最前），对多路卡是错的：画面已搬进向导、
               // 根本不在 pageSection 里，querySelector 落空后退化成把画面
-              // 塞成 page 的第一个子元素；没点过「打开」时更是无条件把它从
+              // 塞成 page 的第一个子元素；没点过「播放视频」时更是无条件把它从
               // .vd-stage-col 拽走。
               // 另：本函数签名是 (body, foot, cfg, stepDef, state)，闭包里
               // 没有 app —— 此前写裸 `app.id` 一进 handler 就 ReferenceError，
@@ -1249,7 +1255,7 @@
           actions.appendChild(openBtn);
           actions.appendChild(closeBtn);
         }
-        // 循环播放开关**追加在按钮行末尾**（浏览 / 打开 / 关闭 之后），与
+        // 循环播放开关**追加在按钮行末尾**（浏览 / 播放视频 / 关闭 之后），与
         // 应用页面同款顺序。放在 B 之外、B 之后：既要排在 actions 后面，
         // 又要在没有 open_source_button 的卡上照样出现。
         if (inlineLoopFieldId) {

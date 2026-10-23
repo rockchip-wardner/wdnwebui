@@ -31,30 +31,32 @@
   flex: 1;          /* 占满中间，撑开布局 */
   min-width: 0;     /* 允许文字过长被截断 */
 }
-/* head 右上角「返回」按钮：弱化视觉（白底灰边 + 灰字 + 小尺寸），
- * 不抢 h2 标题的注意力。 */
+/* ── 主操作按钮（蓝底白字）─────────────────────────────────────────────
+ * head 右上角「返回」与 footer「下一步 / 完成配置」共用这一组声明 ——
+ * 「返回」原先是白底灰边 + 灰字的小号弱化样式，放在 head 右上角很容易被
+ * 当成装饰而没人点；改成与「下一步」一样的蓝色高亮后，两个主动作视觉
+ * 同权、用户一眼就知道它是能点的。
+ * 共用一组声明而不是各写一份：色板/尺寸只改这一处，两个按钮永远同款。
+ */
+.wd-wizard-head-back-btn,
+.wd-wizard-primary-btn {
+  background: #2563eb;
+  border: 1px solid #2563eb;
+  color: #ffffff;
+  padding: 8px 22px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+/* 「返回」在 head 里，额外要不被标题挤扁 + 与标题留出间距 */
 .wd-wizard-head-back-btn {
   flex: 0 0 auto;
-  background: transparent;
-  border: 1px solid #d1d5db;
-  color: #6b7280;
-  padding: 5px 12px;
-  border-radius: 6px;
-  font-size: 13px;
-  cursor: pointer;
   margin-left: 12px;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 .wd-wizard-head-back-btn:hover {
-  background: #f3f4f6;
-  color: #374151;
-  border-color: #9ca3af;
-}  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 32px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid #e5e7eb;
+  background: #1d4ed8;
 }
 .wd-wizard-title {
   font-size: 24px;
@@ -355,20 +357,29 @@
   flex: 1;
   min-width: 0;
 }
+/* 「浏览…」按钮 —— 视频源字段的主动作（选本地文件/目录），与向导 head
+ * 「返回」/ footer「下一步」用同一套蓝底白字主色，不再是白底灰边的次要
+ * 控件。同一行的「打开 / 关闭」保持白底（.wd-wizard-source-action-btn），
+ * 蓝白分明，主动作只有浏览一个。 */
 .wd-wizard-browse-btn {
   flex-shrink: 0;
-  background: #ffffff;
-  border: 1px solid #d1d5db;
-  color: #374151;
+  background: #2563eb;
+  border: 1px solid #2563eb;
+  color: #ffffff;
   padding: 8px 14px;
   border-radius: 6px;
   font-size: 14px;
+  font-weight: 500;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
 }
 .wd-wizard-browse-btn:hover {
-  background: #f3f4f6;
-  border-color: #9ca3af;
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+}
+.wd-wizard-browse-btn:active {
+  background: #1e40af;
+  border-color: #1e40af;
 }
 
 /* 视频源按钮组（打开 / 关闭）。行内 gap 与对齐由 .wd-wizard-input-row 给，
@@ -400,6 +411,22 @@
 }
 .wd-wizard-source-action-btn:active {
   background: #e5e7eb;
+}
+/* 向导里的「播放视频」与应用页面里那个同名按钮同款（蓝底白字）——
+ * 同名按钮在两个视图里必须同色，否则「播放视频」一会儿蓝一会儿白。
+ * 「关闭」仍是白底次要样式（.wd-wizard-source-action-btn）。 */
+.wd-wizard-source-open-btn {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #ffffff;
+}
+.wd-wizard-source-open-btn:hover {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+}
+.wd-wizard-source-open-btn:active {
+  background: #1e40af;
+  border-color: #1e40af;
 }
 
 /* 多路视频卡 source step 末尾的"当前在编辑"提示：点 tile 时即时刷新。
@@ -696,17 +723,8 @@
   background: #f3f4f6;
   color: #374151;
 }
-.wd-wizard-primary-btn {
-  background: #2563eb;
-  border: 1px solid #2563eb;
-  color: #ffffff;
-  padding: 8px 22px;
-  border-radius: 6px;
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s;
-}
+/* 外观见文件头部的「主操作按钮」分组（与 head「返回」共用同一组声明），
+ * 这里只补 primary 独有的交互态：hover / disabled。 */
 .wd-wizard-primary-btn:hover:not(:disabled) {
   background: #1d4ed8;
 }
