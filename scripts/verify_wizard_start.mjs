@@ -151,7 +151,8 @@ const stripComments = (s) => s
   .replace(/(^|[^:])\/\/.*$/gm, "$1");
 
 for (const appId of ["video-detection", "video-target-detection",
-                     "video-target-localization", "video-retrieval"]) {
+                     "video-target-localization", "video-retrieval",
+                     "tts"]) {
   const js = fs.readFileSync(path.join(cardDir(appId), "static/app.js"), "utf8");
   const fn = js.match(/applyWizardSnapshot\s*=\s*async function[\s\S]*?\n};/);
   ok(!!fn, `${appId}: 找到 applyWizardSnapshot`);
@@ -160,6 +161,118 @@ for (const appId of ["video-detection", "video-target-detection",
     `${appId}: 向导启动路径里没有 btn.click()（disabled 按钮的 click 会被静默丢弃）`);
   ok(/_wizardStart\(/.test(body),
     `${appId}: 走宿主共享启动器 window.WizardStart.run()`);
+}
+
+// ---------------------------------------------------------------- //
+// (d) 语音生成卡片（tts）—— 2026-10-23 实测到的同类回归
+// ---------------------------------------------------------------- //
+// 症状：第一次跑完「语音生成快速配置」向导，**没有出声**；等模型加载完
+// 再跑一遍向导就能合成。原因和视频卡一模一样：tts 卡片用
+// `btn.click()` 启动，而启动按钮的 `disabled` 由**卡片快照**的
+// `capability_ready` 决定 —— 模型刚就绪时卡片还拿着旧快照（最多滞后
+// 一次 5s 轮询），按钮是灰的，**disabled 按钮的 click() 被浏览器静默
+// 丢弃** → 向导显示「完成配置」、合成根本没发生。
+//
+// 这里跑一遍真实代码路径（把卡片里的三个函数抠出来在沙箱里跑），
+// 断言：等就绪 → 才启动；不点按钮；不就绪 → 抛错且**不**启动；
+// 启动失败 → 抛错（向导不能显示「完成」）。
+console.log("[d] 语音生成卡片（tts）的向导启动路径");
+{
+  const js = fs.readFileSync(path.join(cardDir("tts"), "static/app.js"), "utf8");
+  const grab = (re, what) => {
+    const m = js.match(re);
+    ok(!!m, `tts: 找到 ${what}`);
+    return m ? m[0] : "";
+  };
+  const probeSrc = grab(
+    /async function ttsCapabilitySnapshot\(\) \{[\s\S]*?\n\}/, "ttsCapabilitySnapshot");
+  const helperSrc = grab(
+    /function _wizardStart\(opts\) \{[\s\S]*?\n\}/, "_wizardStart");
+  const applySrc = grab(
+    /window\.ImApp_tts\.applyWizardSnapshot = async function \(opts\) \{[\s\S]*?\n\};/,
+    "applyWizardSnapshot");
+
+  // 沙箱：真实宿主启动器 + 卡片真函数，DOM/fetch/TTS 全是桩。
+  const hostWin = {};
+  new Function("window", fs.readFileSync(HELPER, "utf8"))(hostWin);
+
+  const runTtsWizard = async ({ readyAfter = 0, startThrows = null } = {}) => {
+    let probes = 0;
+    const calls = { start: 0, click: 0 };
+    let readySeenAt = -1;
+    // 模拟后端：合成一旦启动，服务状态从 idle → loading/running。
+    // （真实 POST /api/tts/start 返回的快照就是 state="loading"）
+    let svcState = "idle";
+    const btnStub = { click: () => { calls.click++; } };
+    const documentStub = {
+      getElementById: (id) => (id === "tts-start" ? btnStub : { value: "" }),
+      querySelectorAll: () => [],
+    };
+    const fetchStub = async () => {
+      probes++;
+      const ready = probes > readyAfter;
+      if (ready && readySeenAt < 0) readySeenAt = probes;
+      return {
+        ok: true,
+        json: async () => ({
+          available: true,
+          capability_ready: ready,
+          capability_loading: ready ? [] : ["qwen3-tts"],
+          state: svcState,
+          busy: svcState === "loading" || svcState === "running",
+        }),
+      };
+    };
+    const ttsStub = {
+      start: async () => {
+        calls.start++;
+        svcState = "running";
+        if (startThrows) throw startThrows;
+      },
+    };
+    const win = { WizardStart: hostWin.WizardStart, ImApp_tts: {} };
+    const factory = new Function(
+      "window", "document", "fetch", "TTS", "API_PREFIX",
+      probeSrc + "\n" + helperSrc + "\n" + applySrc);
+    factory(win, documentStub, fetchStub, ttsStub, "/api");
+    let err = null;
+    let res = null;
+    try {
+      res = await win.ImApp_tts.applyWizardSnapshot({ text: "你好" });
+    } catch (e) { err = e; }
+    return { calls, err, res, probes, readySeenAt };
+  };
+
+  // 1) 能力就绪前**不启动**，就绪后才启动；全程不点按钮
+  {
+    const r = await runTtsWizard({ readyAfter: 2 });
+    ok(!r.err, "tts: 就绪后向导正常完成");
+    ok(r.calls.start === 1, "tts: 能力就绪后启动了合成（且只启动一次）");
+    ok(r.calls.click === 0,
+      "tts: 全程没有 btn.click()（disabled 按钮的 click 会被静默丢弃）");
+    ok(r.readySeenAt > 0 && r.probes > 1,
+      "tts: 不就绪时先轮询等待，而不是立刻开跑");
+    ok(r.res && r.res.started === true, "tts: 返回 started=true");
+  }
+
+  // 2) 一直不就绪 → 抛 capability_not_ready，且**绝不**启动
+  {
+    const r = await runTtsWizard({ readyAfter: Number.MAX_SAFE_INTEGER });
+    ok(!!r.err && /capability_not_ready/.test(r.err.message || ""),
+      "tts: 能力不就绪时抛 capability_not_ready（向导给「重新开启模型」）");
+    ok(r.calls.start === 0, "tts: 不就绪时**没有**启动合成");
+    ok(r.calls.click === 0, "tts: 不就绪时也没有点按钮");
+  }
+
+  // 3) 启动本身失败 → 错误要冒到向导（不能静默显示「完成配置」）
+  {
+    const r = await runTtsWizard({
+      readyAfter: 0,
+      startThrows: new Error("WizardSnapshotError:start_failed:提交失败: 功能未启用"),
+    });
+    ok(!!r.err && /start_failed/.test(r.err.message || ""),
+      "tts: 启动失败时错误冒给向导（不再「静默成功」）");
+  }
 }
 
 // ---------------------------------------------------------------- //

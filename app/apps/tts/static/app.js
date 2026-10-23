@@ -39,13 +39,15 @@ const TTS = {
       el.addEventListener("change", () => this._showAudioRowIfNeeded());
     });
 
-    if (startBtn)   startBtn.addEventListener("click", () => this.start());
+    // start() 失败会抛错（向导要看见），但按钮这条路只需要状态行 ——
+    // 起一个空的 catch，别在控制台刷 unhandled rejection。
+    if (startBtn)   startBtn.addEventListener("click", () => { this.start().catch(() => {}); });
     if (stopBtn)    stopBtn.addEventListener("click", () => this.stop());
     if (textEl) {
       textEl.addEventListener("keydown", (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
           e.preventDefault();
-          this.start();
+          this.start().catch(() => {});
         }
       });
     }
@@ -102,6 +104,10 @@ const TTS = {
     const isBusy = snap.busy === true || snap.running === true || snap.state === "loading" || snap.state === "running";
     const isRunning = snap.running === true;
     const capReady = snap.capability_ready !== false;
+    // 「本机有这个能力的实例但还在加载」—— 与「压根没启用」是两回事，
+    // 混成一句话会让用户以为自己没开模型，其实模型正在起来。
+    const capLoading = Array.isArray(snap.capability_loading)
+      && snap.capability_loading.length > 0;
 
     if (banner && reasonEl) {
       if (snap.available === false) {
@@ -109,8 +115,9 @@ const TTS = {
         reasonEl.textContent = snap.init_error || "upstream 模块缺失";
       } else if (!capReady) {
         banner.classList.remove("hidden");
-        reasonEl.textContent =
-          "模型未启用：请到「算力配置」页启用 [TTS] 文字转语音模型";
+        reasonEl.textContent = capLoading
+          ? "模型正在加载中，请稍候（加载完成后即可开始生成）"
+          : "模型未启用：请到「算力配置」页启用 [TTS] 文字转语音模型";
       } else {
         banner.classList.add("hidden");
       }
@@ -120,7 +127,9 @@ const TTS = {
       startBtn.disabled = isBusy || snap.available === false || !capReady;
       startBtn.title = capReady
         ? ""
-        : "功能未启用：请先在算力配置启用 [TTS] 文字转语音模型";
+        : (capLoading
+            ? "模型正在加载中，请稍候"
+            : "功能未启用：请先在算力配置启用 [TTS] 文字转语音模型");
     }
     if (stopBtn) {
       stopBtn.disabled = !isBusy;
@@ -137,7 +146,13 @@ const TTS = {
 
   formatMeta(snap) {
     if (!snap.available) return "语音生成不可用，请检查上游 Qwen3-TTS 模型路径 / rknn3 驱动";
-    if (snap.capability_ready === false) return "模型未启用：请先在算力配置启用 [TTS] 模型";
+    if (snap.capability_ready === false) {
+      const loading = Array.isArray(snap.capability_loading)
+        && snap.capability_loading.length > 0;
+      return loading
+        ? "模型正在加载中，请稍候…"
+        : "模型未启用：请先在算力配置启用 [TTS] 模型";
+    }
     if (snap.state === "idle")  return `模型: ${snap.model_dir}`;
     if (snap.state === "loading") return "正在加载模型…";
     if (snap.state === "running") {
@@ -156,6 +171,21 @@ const TTS = {
     return `状态: ${snap.state}`;
   },
 
+  /**
+   * 启动失败 → 写状态行 **并抛错**。
+   *
+   * 为什么必须抛：向导的 finish 步靠捕获异常来显示「完成配置失败」，
+   * 只写状态行的话向导会照样显示 ✓ —— 用户看到「配置完成」但什么都没
+   * 发生（这正是 2026-10-23 实测到的回归：向导跑完没合成）。
+   * 错误码用宿主向导认识的 `start_failed`（见 core/wizard/state.js）。
+   */
+  _startError(detail) {
+    this.setStatus(detail, true);
+    const e = new Error("WizardSnapshotError:start_failed:" + detail);
+    e.retryable = false;
+    return e;
+  },
+
   async start() {
     const textEl = document.getElementById("tts-text");
     const refEl = document.getElementById("tts-ref-speaker");
@@ -165,8 +195,7 @@ const TTS = {
 
     const text = (textEl ? textEl.value : "").trim();
     if (!text) {
-      this.setStatus("请输入要合成的文本", true);
-      return;
+      throw this._startError("请输入要合成的文本");
     }
     const playTo = this._selectedPlayTo();
 
@@ -206,26 +235,28 @@ const TTS = {
       volume: volEl ? Number(volEl.value) / 100 : 0.1,
       play_to: playTo,
     };
+    // 网络异常单独 catch —— 卡片自己的错误（_startError）不能再被包一层，
+    // 否则状态行里会出现 "提交失败: WizardSnapshotError:start_failed:…"。
+    let r, body;
     try {
-      const r = await fetch(API_PREFIX + "/tts/start", {
+      r = await fetch(API_PREFIX + "/tts/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        this.setStatus("提交失败: " + (body.detail || r.statusText), true);
-        return;
-      }
-      this.lastSnap = body;
-      this.render(body);
-      this.ensureWs();
-  // ...
-      if (this._wantsBrowser()) {
-        this._subscribeAudio();
-      }
+      body = await r.json().catch(() => ({}));
     } catch (err) {
-      this.setStatus("提交失败: " + err.message, true);
+      throw this._startError("提交失败: " + err.message);
+    }
+    if (!r.ok) {
+      throw this._startError("提交失败: " + (body.detail || r.statusText));
+    }
+    this.lastSnap = body;
+    this.render(body);
+    this.ensureWs();
+    // ...
+    if (this._wantsBrowser()) {
+      this._subscribeAudio();
     }
   },
 
@@ -2336,13 +2367,39 @@ TTS.init();
 // 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
 //   tts-text     → opts.text
 //   tts-play-to  → opts.playTo("browser" | "device" | "both")
-// 文本非空 → 写回 #tts-text 并模拟点 #tts-start(同应用页面原有的
-// "开始生成"按钮 — 复用其内部对 /api/tts/start 的调用 + play_to
-// 合成完成后自动试听逻辑,避免本文件重写 payload 装配)。
+// 文本非空 → 写回 #tts-text,然后**启动合成**(复用本文件 TTS.start()
+// 的 payload 装配 + play_to 逻辑,不重写一遍)。
+// (不再模拟点按钮 —— 理由见下面 WizardStart 那段注释)
+// 合成完成后自动试听逻辑同样复用,不重写 payload 装配。
 // 播放目标变更 → 同步勾选对应 radio(应用页面 onStart 内部读
 // `input[name=tts-play-to]:checked`)。
 // 全局名约定 ImApp_<app.id 去掉 hyphen>。
 // ------------------------------------------------------------------ *
+
+// 向导启动前的「能力就绪」探测 —— **直接问后端快照**,不等卡片自己的
+// 5s 轮询那一拍。为什么不能靠卡片快照:快照里的 capability_ready 是
+// 「registry 里有没有 running 的 TTS 实例」,模型刚就绪的那 1~5s 里
+// 卡片还拿着旧快照 → capability_ready=false → 启动按钮是 disabled。
+// 而 **disabled 按钮的 click() 被浏览器静默丢弃**(不报错、不打日志、
+// 不触发 handler)—— 向导显示「完成配置」、语音却根本没生成
+// (2026-10-23 实测:第一次跑完向导没出声,模型加载完再跑一遍就好了)。
+// 详见宿主 core/wizard-start.js 的文件头。
+async function ttsCapabilitySnapshot() {
+  const r = await fetch(API_PREFIX + "/tts", { cache: "no-store" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return await r.json();
+}
+
+// 调宿主共享的启动器(core/wizard-start.js)。宿主版本太老、没有这个
+// 模块时给一句人话错误,而不是 "Cannot read properties of undefined"。
+function _wizardStart(opts) {
+  const ws = window.WizardStart;
+  if (!ws || typeof ws.run !== "function") {
+    throw new Error("WizardSnapshotError:helper_missing:宿主缺少 /static/core/wizard-start.js,请更新 wdnwebui 后重试");
+  }
+  return ws.run(opts);
+}
+
 window.ImApp_tts = window.ImApp_tts || {};
 window.ImApp_tts.applyWizardSnapshot = async function (opts) {
   const result = { text_filled: false, started: false };
@@ -2356,13 +2413,28 @@ window.ImApp_tts.applyWizardSnapshot = async function (opts) {
       r.checked = (r.value === opts.playTo);
     });
   }
-  // 文本非空 → 模拟点"开始生成"(启动合成 + 试听)
+  // 文本非空 → 启动合成。**不能 btn.click()**:启动按钮的 disabled 由
+  // 卡片快照的 capability_ready 决定,模型刚就绪时按钮还是灰的,而
+  // disabled 按钮的 click() 会被浏览器**静默丢弃** → 向导显示「完成
+  // 配置」、语音却没生成(2026-10-23 实测)。改成宿主共享的 WizardStart:
+  // 先等能力真就绪(直接问后端),再直接调 TTS.start();等不到就抛错让
+  // 向导显示「重新开启模型」。
   if (opts.text) {
-    const btn = document.getElementById("tts-start");
-    if (btn) {
-      try { btn.click(); result.started = true; }
-      catch (e) { throw new Error("WizardSnapshotError:tts_start_failed:" + (e?.message || e)); }
-    }
+    await _wizardStart({
+      label: "语音合成",
+      probe: ttsCapabilitySnapshot,
+      // 就绪判据:后端说这个能力有 running 的实例(和 get_session 同口径)
+      isReady: (s) => !!(s && s.available !== false && s.capability_ready === true),
+      // 启动判据:服务已进入 loading/running(= 合成真的开跑了)
+      isStarted: (s) => !!(s && (s.busy === true
+        || s.state === "loading" || s.state === "running")),
+      start: async () => {
+        await TTS.start();
+      },
+      // 模型刚起来时 registry 可能还在收敛,给足等待再判定失败
+      timeoutMs: 30000,
+    });
+    result.started = true;
   }
   return result;
 };

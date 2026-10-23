@@ -1944,6 +1944,63 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
 验共享启动器的三种行为(不就绪不启动 / 等到就绪才启动 / 启动没成功要报错)
 + 四张卡的 hook 里不再有 `btn.click()` + 框架认识新错误码。
 
+#### 同一个坑的第 5 张卡:语音生成(tts)—— v0.30 修
+
+**症状**:第一次跑完「语音生成快速配置」向导,**没有出声**;等模型加载完再
+重复一遍向导,就能正常合成。
+
+**根因(2026-10-23 真机 journal 坐实,单机板)**:
+
+* `92dd883` 把宿主共享启动器 `core/wizard-start.js` 落地时,只改了**插件包里
+  的四张视频卡**(vd / vtd / vtl / vr)。**仓库内的 tts 卡漏改**,`applyWizardSnapshot`
+  还在用 `btn.click()`(见 `app/apps/tts/static/app.js`)。
+* tts 的启动按钮 `disabled` 判据是 `!capReady`,而 `capReady` 来自
+  **卡片自己的快照** `snapshot.capability_ready`(后端 = registry 里有没有
+  running 的 TTS 实例)。卡片快照的刷新周期是 **5s**,而向导的
+  `_waitForModelsRunning` 轮询 `/api/compute` 是 **1s** —— **快照比 registry
+  慢的不是一拍,是整整一个轮询周期**。
+* 于是:registry 在 `13:04:27` 把实例翻成 `running` → 向导 `13:04:28` 的
+  `/api/compute` 轮询看到 running → 立刻 `applyWizardSnapshot` → `btn.click()`
+  → 但卡片手里最新的快照是 `13:04:24` 的(`capability_ready=false`,按钮还是
+  灰的)→ **disabled 按钮的 click 被静默丢弃** → `POST /api/tts/start`
+  **从未发生**(journal 里 12:56~13:06 有 8 次向导的
+  `POST /api/compute/instances`,`POST /api/tts/start` 只有模型加载完之后的
+  2 次)。向导照样显示「完成配置」✓。
+* tts 的快照还有第二层放大:WS 的变化判据只看 `state / frames / error`,
+  **不含 `capability_ready`** → 模型被启用/停用时**会话状态不变**(还是
+  `idle`)→ WS **不推** → 卡片只能等下一次 5s 轮询。视频卡的 `session_ready`
+  同理,但它们的轮询是 1Hz,所以只差一拍。
+
+**修法**:
+
+* tts 的 `applyWizardSnapshot` 改用 `window.WizardStart.run()`:
+  `probe` = `GET /api/tts`(直接问后端,不等卡片那一拍),
+  `isReady` = `capability_ready === true`,
+  `isStarted` = `busy || state ∈ {loading, running}`。
+* `TTS.start()` 失败**要抛错**(`WizardSnapshotError:start_failed:…`),
+  不能再只往状态行写一句话 —— 只写状态行的话向导照样显示「完成配置」。
+* 后端 `/api/tts/ws` 的变化判据加上 `capability_ready`:模型启停时
+  **立刻**推一帧,按钮 200ms 内解禁,不必等 5s 轮询。
+* 后端快照补 `capability_loading`(本机有该能力但**还在加载**的 model id,
+  口径 = `registry.pending_models_for_capability`)。有了它,前端才能把
+  「模型正在加载中」和「压根没启用」分开说 —— 混成一句「模型未启用」会让
+  用户以为是自己没开模型。`get_session` 失败时同理:在加载就说「正在加载中」,
+  否则说「功能未启用」。
+
+**新增规矩**:
+
+* **任何卡片的向导启动路径都不许出现 `btn.click()`** —— 一律走
+  `window.WizardStart.run()`。新增卡片时照抄 vtd 的 hook 形状。
+* 卡片的启动函数**失败必须抛错**(带 `start_failed` / `capability_not_ready`
+  错误码),不能只写横幅 —— 否则向导永远显示「完成配置」。
+* 「就绪判据」必须**直接问后端**,不能用卡片自己的快照;卡片快照的刷新周期
+  (tts 5s / 视频卡 1s)就是「那一拍」的长度。
+
+**回归**:`scripts/verify_wizard_start.mjs` 的 (d) 段 —— 把 tts 卡里的
+`ttsCapabilitySnapshot` / `_wizardStart` / `applyWizardSnapshot` 抠出来在
+Node 沙箱里跑真代码,断言:不就绪不启动、就绪后才启动、**全程不点按钮**、
+不就绪抛 `capability_not_ready`、启动失败抛 `start_failed`。
+
 ### `_wizardBringUpModels` 全局入口
 
 `app/static/core/wizard/state.js` 暴露 `window._wizardBringUpModels(cfg)`,

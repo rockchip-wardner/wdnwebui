@@ -160,6 +160,11 @@ async def tts_ws(ws: WebSocket) -> None:
     last_state: Optional[str] = None
     last_frames = -1
     last_msg: Optional[str] = None
+    # capability_ready 单独记一份:模型被启用/停用时**会话状态不变**
+    # (state 仍是 idle),原来的变化判据看不到 → 前端拿不到新快照 →
+    # 启动按钮一直是 disabled,直到下一次 5s 轮询才恢复。
+    # 把「能力就绪」也纳入推送判据,这一拍延迟就没了。
+    last_cap: Optional[bool] = None
 
     sub_id: Optional[str] = None
     audio_q: Optional[asyncio.Queue] = None
@@ -240,9 +245,11 @@ async def tts_ws(ws: WebSocket) -> None:
 
     try:
         await ws.send_json(_push_snap())
-        last_state = sess.snapshot()["state"]
-        last_frames = sess.snapshot()["frames"]
-        last_msg = sess.snapshot()["error"]
+        snap0 = sess.snapshot()
+        last_state = snap0["state"]
+        last_frames = snap0["frames"]
+        last_msg = snap0["error"]
+        last_cap = snap0.get("capability_ready")
 
         while True:
             snap = sess.snapshot()
@@ -250,12 +257,14 @@ async def tts_ws(ws: WebSocket) -> None:
                 snap["state"] != last_state
                 or snap["frames"] != last_frames
                 or (snap["error"] or "") != (last_msg or "")
+                or snap.get("capability_ready") != last_cap
             )
             if changed:
                 await ws.send_json(_push_snap())
                 last_state = snap["state"]
                 last_frames = snap["frames"]
                 last_msg = snap["error"]
+                last_cap = snap.get("capability_ready")
             await asyncio.sleep(0.2)
     except WebSocketDisconnect:
         return

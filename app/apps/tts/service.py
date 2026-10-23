@@ -526,6 +526,26 @@ class TtsSession:
         except Exception:  # noqa: BLE001
             return False
 
+    @staticmethod
+    def _probe_capability_loading() -> List[str]:
+        """本机持有 TTS 能力但**还在加载**的 model id 列表。
+
+        与 ``_probe_capability_ready`` 是同一件事的两面：ready=False 时，
+        只有这里非空才能区分「模型正在加载」和「压根没启用」—— 前者等
+        一等就好，后者要去算力配置页开。前端 banner / 按钮 title 靠它
+        给准确文案（不然加载中也会显示「模型未启用」，误导用户）。
+
+        只看本机（peer 上的加载进度本机看不到，报「加载中」会让用户
+        对着一个永远不会就绪的进度条干等）—— 口径同 registry 的
+        ``pending_models_for_capability``。
+        """
+        try:
+            from app.core.compute.registry import get_registry
+            return list(get_registry().pending_models_for_capability(
+                "swcap_text_to_speech"))
+        except Exception:  # noqa: BLE001
+            return []
+
     def snapshot(self) -> dict:
         capability_ready = self._probe_capability_ready()
         with self._lock:
@@ -533,6 +553,8 @@ class TtsSession:
                 "state":          self._state,
                 "available":      self.available,
                 "capability_ready": capability_ready,
+                # 本机有该能力但还在加载的模型（空 = 真的没启用）
+                "capability_loading": self._probe_capability_loading(),
                 "init_error":     self._init_error,
                 "model_dir":      str(self._model_dir),
                 "model_dir_exists": self._model_dir.is_dir(),
@@ -906,8 +928,21 @@ class TtsSession:
             from app.core.compute.registry import get_registry
             sess = get_registry().get_session(SoftwareCapability.TEXT_TO_SPEECH)
         except RuntimeError as e:
-            self._init_error = str(e)
-            raise
+            # 「功能未启用」有两种完全不同的成因，用户看到的文案必须区分：
+            #   a) 本机有该能力的实例但**还在加载** → 等一等就好；
+            #   b) 压根没有该能力的实例 → 要去算力配置页启用。
+            # 混成一句话，用户会以为是自己没开模型，其实模型正在起来 ——
+            # 向导跑完「没出声」的那次就是这么误判的。
+            pending = self._probe_capability_loading()
+            if pending:
+                msg = (f"TTS 模型正在加载中({pending[0]}),"
+                       "请等模型就绪后重试")
+                # 「加载中」不是 init_error —— 别把这条留在快照里,
+                # 它只在 available=false 时才会显示,留着会误导。
+            else:
+                msg = str(e)
+                self._init_error = msg
+            raise RuntimeError(msg) from e
         try:
             ok, Attachment, *_ = _load_wdnai()
             TTSResult = _get_tts_result_cls()
