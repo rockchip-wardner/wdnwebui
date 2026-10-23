@@ -665,6 +665,20 @@ for (const a of _menus) {
   // ...
 const CC_MAX_RK182X_CARDS = 2;
 
+// 从错误响应里取出**人话**原因。FastAPI 的 HTTPException body 是
+// {"detail": "..."} —— 直接摆 raw body 会让用户看到带引号的 JSON 串
+// （例：{"detail":"npu_index=1 越界：…"}）。不是 JSON 的 body 原文就是原因。
+function computeErrorDetail(status, raw) {
+  const text = String(raw || "");
+  if (!text) return "HTTP " + status;
+  try {
+    const j = JSON.parse(text);
+    if (j && typeof j.detail === "string") return j.detail;
+    if (j && typeof j.message === "string") return j.message;
+  } catch (_) { /* 不是 JSON —— 原文就是原因 */ }
+  return text;
+}
+
 const ComputeConfigPage = {
   initialized: false,
   _tickHandle: null,
@@ -1744,7 +1758,8 @@ const ComputeConfigPage = {
       });
       if (!r.ok) {
         const text = await r.text();
-        alert(`启用失败 (HTTP ${r.status}): ${text}`);
+        alert(`启用失败 (HTTP ${r.status}): ` +
+              computeErrorDetail(r.status, text));
       }
     } catch (e) {
       alert("请求失败: " + e.message);
@@ -1761,7 +1776,8 @@ const ComputeConfigPage = {
       });
       if (!r.ok) {
         const text = await r.text();
-        alert(`卸载失败 (HTTP ${r.status}): ${text}`);
+        alert(`卸载失败 (HTTP ${r.status}): ` +
+              computeErrorDetail(r.status, text));
       }
     } catch (e) {
       alert("请求失败: " + e.message);
@@ -1778,7 +1794,8 @@ const ComputeConfigPage = {
       });
       if (!r.ok) {
         const text = await r.text();
-        alert(`重启失败 (HTTP ${r.status}): ${text}`);
+        alert(`重启失败 (HTTP ${r.status}): ` +
+              computeErrorDetail(r.status, text));
       }
     } catch (e) {
       alert("请求失败: " + e.message);

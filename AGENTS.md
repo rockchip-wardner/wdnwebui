@@ -2814,9 +2814,140 @@ RPC + SIGTERM + 3s 宽限 + SIGKILL ≈ 4–5s）。
 ——只看 HTTP 状态码会把「某张卡没起来」当成成功，用户一路走到完成配置
 页才炸。
 
+#### 过渡态守卫**只看本机实例** —— peer 的状态不该挡住本机启停（v0.29 修）
+
+**症状**：单板机（1 张 RK1828 协卡）上，向导「一键开启所需模型」一直卡在
+**「正在启动模型」**，音视频描述（视频描述功能）、视频目标检测（两者都要
+`qwen3-vl-4b`）都复现。看起来像模型永远起不来。
+
+**根因（不是 `05b53de` 引入的 —— 那个提交只是把 UI 的进度文案从
+「正在开启模型…」细分成「正在释放计算卡 #N…」/「正在启动模型…」，
+把真正卡住的那一步**显示出来**了；卡住本身更早就有）**：
+
+`POST /compute/instances` 排队等过渡态时，问的是
+`registry.transition_cards(model_id)` —— 它把**远端 peer（`_source ==
+"adopted"`）的实例**也算进去。而 peer 实例的 `npu_index` 是**对端板子
+的卡号**，和本机卡号数字相同纯属巧合。于是：
+
+- 本机要启 `qwen3-vl-4b@card0`，peer（172.16.9.109）的 qwen3-vl-4b 恰好
+  卡在 `loading` → 本机被挡住 → 排队满 `_QUEUE_WAIT_LOADING_S`(120s) →
+  **409「仍在启动/关闭中，请稍后重试」** → 向导重试 → 再烧 120s →
+  **看起来永远卡住**。
+- 本机卡上其实**什么都没占**（peer 的显存在对端板上）—— 白白卡死。
+- DELETE（腾卡）路径同样中招：`_transitions_of()` 也含 peer → 本机停
+  同名模型时先等 peer 的 loading 结束 → 永远等不到 → 409 → 腾卡失败。
+
+**修法**：`transition_cards(model_id, local_only=True)` 只看本机实例
+（`spawned` / `adopted_local`），API 层的 `_await_quiet()` /
+`_transitions_of()` 一律用 `local_only=True`。本机自己的过渡态**仍然要
+挡**（那才是 rc=-6 的来源，别把守卫整个关掉）。
+
+> **前端早就 peer-aware，后端不是**：`wizard/state.js` 的腾卡循环有
+> `if (inst._source === "adopted") continue;`（peer 的算力本机无权启停），
+> 后端的过渡态守卫却没做同样的区分 —— 这次修的就是这个不对称。
+
+**顺带把失败原因摆到 UI 上**：后端的 409 文案（「仍在启动/关闭中…」）和
+腾卡/启动失败的 detail 以前只进 `console.warn`，UI 上只剩「正在开启
+模型…」/「开启失败,正在重试」——用户看到的是"卡住"而不是"为什么"。现在
+`say()` 会把原因递到状态行，重试时也保留上一次的原因。
+
+**回归**：`scripts/verify_compute_transition_guard.py` 的 **S6**（6 条断言：
+peer 的过渡态不进本机视图 / API 层确实按 `local_only` 问 / 本机自己的
+loading 仍然排队等）。
+
+#### bind 之后必须重新拉起 probe —— 否则实例永久卡在 `loading`（v0.29 修）
+
+**症状**：同一条「一键开启所需模型」卡在「正在启动模型」的**第二条路径**
+（与上面 peer 那条无关，纯本机、自伤）。
+
+**根因**：`_probe_instance` 在**终态**（worker 报 error / worker 进程退出）
+会 `return` —— 它是"一次性"的。而 `bind_instance` 把 status 乐观写成
+`loading` 之后是**靠 probe 接管**的（worker 的 init 跑在它自己的线程里，
+load RPC 立即返 loading，状态全靠 probe 翻 running/error）。
+
+于是：模型加载失败过一次（显存不足 rc=-6 / 卡号越界 / 模型目录缺失）→
+probe 退出 → 用户再点「启用」（或向导「一键开启」重试）→ bind 又把 status
+写成 loading → **probe 已经死了，没人再探** → **实例永久卡在 loading**。
+
+后果和 peer 那条一样致命：启/停它的请求被过渡态守卫挡住（排队 120s →
+409「仍在启动/关闭中」）→ 向导「一键开启」永远卡在"正在启动模型"。
+
+**修法**：`registry._ensure_probe_thread(inst)` —— bind 之后保证有一个
+**活着的** probe（已活着就不重复起）。实测（2026-10-23）：
+第 1 次启 npu=1 → 加载失败 → `error`（probe 退出）；第 2 次启 → probe 被
+重新拉起 → 状态正确落到 `error`（修复前永久 `loading`，DELETE 连试 6 次
+全是 409，最后只能 kill 进程才收掉）。
+
+**回归**：同一个脚本的 **S7**（6 条断言：无 probe 时新起 / 还活着时不重复
+起 / 已死时换新的 / bind 后 status=loading 且有活 probe 接管 / load RPC
+已发出）。
+
 回归：`scripts/verify_compute_transition_guard.py`（25 断言，假 registry
 驱动 API handler，不起服务不占 NPU）；`scripts/verify_wizard_bringup_loading_card.py`
 （7 断言，mock 后端扫前端一键开启的 DELETE/POST 序列）；真机四场景见下节。
+
+#### 启模型前必须校验卡位 —— 越界的 npu 会造出「僵尸实例」（v0.29 修）
+
+**症状**：`POST /api/compute/instances` 传一个**本机没有的卡号**（单卡板传
+`npu_index=1`）→ 200 → 实例起来却是 `error`（worker 侧
+`IndexError: npu=1 out of range`）→ 而且这个实例**删不掉**（DELETE 连试
+6 次全 409），后续所有启停都被它堵在 120s 排队上。
+
+**根因**：`InstanceRequest._npu_list` 只校验 `>= 0`，**卡号是否真的存在**
+从没查过 —— docstring 早就承诺「npu_index 越界 → 400」，代码没兑现。请求
+一路走到 worker → `LLMSession(model, npu=1)` 抛 IndexError → 进程秒退 →
+registry 里留下一个 `status=error` 却**占着卡位**的实例（过渡态守卫把它
+当成「占着」→ 启停排队 120s → 409）。
+
+**修法**：`registry.npu_card_error(npu_index)` —— 在**过渡态排队之前**
+校验（排队要白等 120s，越界的卡号等再久也起不来）：
+
+| 情况 | 判定 | 提示 |
+|---|---|---|
+| 卡号在 `model_cards` 里 | 通过 | — |
+| 卡号超出探测到的卡数 | 400 越界 | 「本机只有 N 张卡（可用卡号 0~N-1）」 |
+| 卡在，但不是 PCI 形态 | 400 非模型卡位 | 「能承载 RKNN 模型的卡号是 [...]」 |
+| 被 `compute.card_count` 限掉 | 400 | 「card_count=1 只允许使用卡号 [...]」 |
+| **卡位探测失败**（`/dev/rknn3` 被 worker 占着） | **放行** | 未知 ≠ 越界 |
+
+**探测失败时放行**是刻意的：`list_cards()` 的探测有 5s 超时，而 worker 占着
+`/dev/rknn3` 是常态 —— 那时卡位是**未知**的，当成「越界」会把正常的启用
+请求全拒掉（整机都启不了模型）。
+
+实测（2026-10-23，单卡板）：同一个 `{"model":"qwen3-vl-4b","npu_index":1}`
+—— 修复前排队 120s 后 409；修复后 **7ms 返回 400**，detail =
+「npu_index=1 越界：本机只有 1 张卡（可用卡号 0~0），模型卡位 [0]」，
+registry 里**没有**留下任何实例。合法卡号（npu0）照常 200 → 42s → running。
+
+> 400 的 detail 会摆到 UI 上（向导的「启动失败: …」/ 算力页的 alert）。
+> FastAPI 的 body 是 `{"detail": "..."}` —— 前端要取 `.detail` 再显示，
+> 直接摆 raw body 会让用户看到带引号的 JSON 串。
+
+**回归**：`scripts/verify_npu_card_guard.py`（24 断言：U1 registry 判定的 6
+种卡位布局 + U2 API 层「越界立刻 400，且不排队 / 不 spawn / 不 bind」）。
+
+> **假 registry 的脚本要一并 fake 卡位**：`scripts/verify_multicard_enable.py`
+> 的 harness 用的是**真的** `ComputeRegistry` 类（只 fake 了 Popen / probe /
+> rpc / `/proc` 扫描）→ 新校验会真去探硬件 → 单卡板上 npu=1 被判越界 →
+> 用例直接崩。已在那里的 `_install()` 里补上 `reg._cards`（两张 PCI 形态的
+> 假卡）。凡是**用真 registry 类**做假硬件的脚本，都要记得这一点。
+
+#### 真机验证脚本必须按**实际卡位**选卡（v0.29 修）
+
+`scripts/verify_compute_transition_real.py` 以前默认 `--npu 1` —— 那是
+**双卡板**的默认值。在**单卡板**上 npu1 根本不存在，而脚本照跑：POST
+`{"npu_index": 1}` → 造出上面那个僵尸实例 → 脚本后面的断言全在测一个
+**永远起不来的实例**（「等它加载完」必然超时）。
+
+**修法**：
+
+* 默认**自动挑卡** —— 读 `/api/compute` 的 `model_cards`，优先挑一张
+  **没有别的模型占着**的卡位（一卡一模型，同卡叠模型 rc=-6）；
+* 显式 `--npu N` 而 N 不在 `model_cards` → **直接退出**（退出码 1），并
+  打印本机可用卡位。宁可不跑，也不要造僵尸。
+
+> 写这类「会真启停模型」的脚本时，默认值必须**按实际硬件推导**，不能写死
+> 某一块板子的布局 —— 脚本换块板子跑时，写死的卡号就是「不存在的卡」。
 
 ### 只有 npu0 / npu1 能跑模型（v0.20 实测）
 

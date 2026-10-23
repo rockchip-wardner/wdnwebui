@@ -156,6 +156,15 @@ class Harness:
         reg._setup_rpc_client = lambda inst: setattr(
             inst, "rpc_client", FakeRpc(gate))
         reg._probe_instance = lambda inst, *a, **kw: None
+        # **卡位也要 fake**：本脚本测的是「一个模型同时跑两张卡」的语义，
+        # 与真机有几张卡无关。不 fake 的话，v0.29 新增的卡位校验
+        # （registry.npu_card_error）会真去探硬件 —— 单卡板上 npu=1 被判
+        # 越界 → HTTP 400 →【7】直接崩。PCI BDF 形态 = 能跑 rknn 的卡。
+        reg._cards = [
+            {"npu_index": 0, "device_id": "0000:01:00.0"},
+            {"npu_index": 1, "device_id": "0000:02:00.0"},
+        ]
+        reg._cards_failed = ""
 
     _proc_pids = []
 

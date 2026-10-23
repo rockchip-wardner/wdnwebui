@@ -1504,21 +1504,78 @@ class ComputeRegistry:
         with self._lock:
             return self._cards_failed
 
-    def model_cards(self) -> List[int]:
+    def model_cards(self, cards: Optional[list[dict]] = None) -> List[int]:
         """能承载 RKNN 模型的协卡索引（每张卡一个模型）。
 
         权威来源 —— ``list_cards()`` 会把 USB 序列号形态的 RGA/VPU 设备
         也算进去（见 :data:`_PCI_BDF_RE`）。受 ``compute.card_count``
         上限约束（双卡板可用它模拟单卡板）。
+
+        ``cards`` 可传入**已经取好的**卡片列表 —— 避免调用方为了同一份
+        数据再探一次卡（探测可能要等 ``_RKNN_PROBE_TIMEOUT``）。
         """
         detected = [
-            c["npu_index"] for c in self.list_cards()
+            c["npu_index"] for c in (cards if cards is not None
+                                      else self.list_cards())
             if _PCI_BDF_RE.match(c.get("device_id") or "")
         ]
         cap = card_count_override()
         if cap is not None:
             detected = detected[:cap]
         return detected
+
+    def npu_card_error(self, npu_index: int) -> str | None:
+        """``npu_index`` 是否落在本机「能承载 RKNN 模型的卡位」内。
+
+        返回**中文错误原因**（可直接展示给用户），``None`` = 通过。
+
+        为什么要有（v0.29 补）：``POST /api/compute/instances`` 以前只校验
+        ``npu_index >= 0``，**越界的卡号照样往下走** —— 单卡板上传
+        ``npu_index=1``，worker 侧 ``LLMSession(model, npu=1)`` 抛
+        ``IndexError: npu=1 out of range``，进程秒退，registry 里留下一个
+        **起不来也删不掉**的僵尸实例（status=error 却占着卡位）。真机实测
+        这个僵尸实例会把后续所有启停都堵在「过渡态排队」上（120s → 409）。
+
+        三种拒绝理由要分开说，用户才知道该怎么改：
+
+        * **越界** —— 本机根本没有这张卡（卡号是 0 起连续编号的）；
+        * **不是模型卡位** —— 卡在，但它是 RGA/VPU 设备（USB 序列号形态），
+          跑不了 rknn 模型；
+        * **被 card_count 限掉** —— ``compute.card_count`` 把可用卡位裁短了
+          （双卡板写 1 = 模拟单卡板）。
+
+        **探测失败时不拦截**：``/dev/rknn3`` 被 worker 占着是常态（见
+        :meth:`list_cards` 的注释），这时候卡位是**未知**的，拦下来会让
+        整机都启不了模型 —— 宁可直接让 worker 去报错。
+        """
+        if not isinstance(npu_index, int) or isinstance(npu_index, bool):
+            return f"npu_index 必须是整数，got {npu_index!r}"
+        # 上次探测失败 → 卡位是未知的 → 不拦（也别再探一次）
+        if self.cards_failed_reason():
+            LOG.warning("npu_card_error: 卡位探测失败（%s），跳过越界校验",
+                        self.cards_failed_reason())
+            return None
+        cards = self.list_cards()          # 一次探测，下面都复用这份
+        if self.cards_failed_reason():     # 刚才这次探测失败了
+            LOG.warning("npu_card_error: 卡位探测失败，跳过越界校验")
+            return None
+        model_cards = self.model_cards(cards)
+        if npu_index in model_cards:
+            return None
+        detected = [c["npu_index"] for c in cards]
+        if not detected:
+            return (f"npu_index={npu_index} 越界：本机没有探测到任何 NPU 卡"
+                    f"（模型卡位 {model_cards}）")
+        if npu_index not in detected:
+            return (f"npu_index={npu_index} 越界：本机只有 {len(detected)} 张卡"
+                    f"（可用卡号 {min(detected)}~{max(detected)}），"
+                    f"模型卡位 {model_cards}")
+        cap = card_count_override()
+        if cap is not None and npu_index >= cap:
+            return (f"npu_index={npu_index} 不可用：compute.card_count={cap} "
+                    f"只允许使用卡号 {model_cards}")
+        return (f"npu_index={npu_index} 不是模型卡位：能承载 RKNN 模型的卡号"
+                f"是 {model_cards}（其余卡是 RGA/VPU 设备，跑不了 rknn 模型）")
 
     def list_supported_models(self) -> list[dict]:
         base = get_config().get_section("base", {})
@@ -2566,6 +2623,39 @@ class ComputeRegistry:
                 getattr(inst.proc, "pid", None))
         return r or {}
 
+    def _ensure_probe_thread(self, inst: ModelInstance) -> None:
+        """保证 ``inst`` 有**一个活着的** probe 线程。
+
+        为什么需要（2026-10-23 实测）：``_probe_instance`` 在**终态**
+        （worker 报 error / worker 进程退出）会 ``return`` —— 它是
+        "一次性"的，不再探了。而 :meth:`bind_instance` 把 status 乐观写成
+        ``loading`` 之后是**靠 probe 接管**的（worker 的 init 跑在它自己的
+        线程里，load RPC 立即返 loading）。
+
+        于是有一条**自伤**的路径：模型加载失败过一次（显存不足 rc=-6 /
+        卡号越界 / 模型目录缺失）→ probe 退出 → 用户再点「启用」（或向导
+        「一键开启」重试）→ bind 把 status 又写成 loading → **但 probe 已经
+        死了，没人再探** → 实例**永久卡在 loading**。
+
+        后果不只是页面上的状态不对：启/停它的请求会被过渡态守卫挡住
+        （排队满 120s → 409「仍在启动/关闭中」），**向导「一键开启所需模型」
+        就永远卡在"正在启动模型"**（真机实测：一条 npu=1 的僵尸实例让
+        DELETE 连试 6 次全是 409，最后只能 kill 进程才收掉）。
+
+        所以：**每次 bind 都要保证 probe 在跑**（已经活着就不重复起）。
+        """
+        t = getattr(inst, "_probe_thread", None)
+        if t is not None and t.is_alive():
+            return
+        probe = threading.Thread(
+            target=self._probe_instance,
+            args=(inst,),
+            name=f"compute-probe-{inst.model_id}",
+            daemon=True,
+        )
+        inst._probe_thread = probe
+        probe.start()
+
     def bind_instance(self, inst: ModelInstance, npu_index: int) -> ModelInstance:
         """v0.8 fire-and-forget：立即把 ``inst.status="loading"`` 返回，
         让前端 1Hz tick 看到 loading 状态 + 倒计时；后台线程跑 RPC
@@ -2621,6 +2711,13 @@ class ComputeRegistry:
                 self._instances.pop(inst.key, None)
                 inst.key = new_key
                 self._instances[new_key] = inst
+        # **必须有活着的 probe 接管** —— 下面 _run_load 的 "loading" 分支
+        # 是 fire-and-forget（worker 的 init 跑在它自己的线程里），状态
+        # 全靠 probe 翻 running/error。若 probe 早已在终态 return 了
+        # （上一次加载失败），这里再乐观写 loading 就没人探 → 实例永久卡在
+        # loading → 启/停它排队 120s → 409 → 向导「一键开启」永远转圈。
+        # 见 _ensure_probe_thread 的注释。
+        self._ensure_probe_thread(inst)
         inst._bind_inflight = True
 
         def _run_load():
@@ -3385,14 +3482,29 @@ class ComputeRegistry:
                                   i.npu_index))
         return found
 
-    def transition_cards(self, model_id: str) -> List[Tuple[int, str]]:
+    def transition_cards(self, model_id: str, *,
+                         local_only: bool = False) -> List[Tuple[int, str]]:
         """这个模型处于过渡态的 ``(卡号, 过渡态)`` 列表(给 API 层排队用)。
 
         ``stopping`` 的卡号取 ``_stop_npu`` —— unload 的乐观写会把
         ``npu_index`` 重置成 -1。
+
+        ``local_only=True`` 只看**本机**实例(spawned / adopted_local)。
+
+        **为什么必须有这个开关**:远端 peer(adopted)的过渡态说的是**对端
+        板子**的事 —— 它的 ``npu_index`` 是**对端的卡号**,和本机的卡号
+        数字相同纯属巧合。把它算进本机的排队判据,本机启同名模型就会被
+        对端的状态挡住。真机实测(2026-10-23 单板机):peer
+        (172.16.9.109) 的 qwen3-vl-4b 卡在 loading → 本机
+        ``POST /api/compute/instances {model: qwen3-vl-4b, npu_index: 0}``
+        排队 120s → 409「仍在启动/关闭中」→ 向导「一键开启所需模型」一直
+        卡在"正在启动模型"(每次重试再烧 120s)。两台板子各卡各的,谁也
+        启不了 —— 而且本机卡上根本没东西,显存是空的。
         """
         out: List[Tuple[int, str]] = []
         for inst in self._instances_of(model_id):
+            if local_only and inst._source == "adopted":
+                continue
             kind = transition_of(inst)
             if not kind:
                 continue

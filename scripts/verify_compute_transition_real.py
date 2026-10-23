@@ -11,11 +11,20 @@
 
 S3 会等模型加载完（真机 30~90s）才停 —— 这一段本来就慢，别当成卡死。
 
-⚠️ 会真的启停模型，占一张 NPU 卡（默认 qwen3-vl-4b @ npu1，约 3.5GB）。
-   板子上还有别人在用的时候挑一张空卡（--npu 参数）。
+⚠️ 会真的启停模型，占一张 NPU 卡（默认 qwen3-vl-4b，约 3.5GB），**脚本
+   结尾会把目标模型停掉**。板子上还有别人在用的时候挑一张空卡。
+
+**卡号怎么选（v0.29 改）**：
+
+  * 默认**自动挑** —— 读 ``/api/compute`` 的 ``model_cards``（能跑 rknn
+    模型的卡位），优先挑一张**没有别的模型**占着的卡。
+  * 旧版默认 ``--npu 1``，在**单卡板**上就是 npu1 —— 那张卡根本不存在，
+    worker 侧 ``LLMSession(model, npu=1)`` 抛 IndexError 秒退，留下一个
+    **起不来也删不掉**的僵尸实例，还把后续所有启停都堵在 120s 排队上。
+    现在显式指定的卡号**不在本机卡位内就直接退出**，不再造僵尸。
 
 用法：
-    .venv/bin/python scripts/verify_compute_transition_real.py [--npu 1] [--model qwen3-vl-4b]
+    .venv/bin/python scripts/verify_compute_transition_real.py [--npu N] [--model qwen3-vl-4b]
 """
 from __future__ import annotations
 
@@ -66,6 +75,60 @@ def local_inst(model: str, npu: int):
     return None
 
 
+def snapshot() -> dict:
+    st, d = call("GET", "/compute")
+    if st != 200:
+        raise SystemExit(f"读 /api/compute 失败: HTTP {st} {d}")
+    return d
+
+
+def pick_npu(model: str, requested: int | None) -> int:
+    """决定这次跑在哪个卡上。卡号不在本机卡位内 → **直接退出**。
+
+    旧版默认 ``--npu 1``：在单卡板上那是一张**不存在的卡** —— worker
+    侧 ``LLMSession(model, npu=1)`` 抛 IndexError 秒退，registry 里留下
+    一个起不来也删不掉的僵尸实例，还把后续所有启停都堵在 120s 排队上
+    （真机踩过）。现在默认自动挑卡，显式指定越界卡号则拒绝开跑。
+
+    自动挑的规则：优先挑**没有别的模型占着**的卡位（一张卡只能放一个
+    模型，同卡叠模型 rc=-6）。
+    """
+    snap = snapshot()
+    model_cards = snap.get("model_cards") or []
+    if not model_cards:
+        failed = snap.get("cards_failed") or ""
+        raise SystemExit(
+            "本机没有可用模型卡位（model_cards=[]）"
+            + (f"；探测失败原因：{failed}" if failed else "")
+            + " —— 跑不了这个验证（先看 /api/compute 的 cards_failed）")
+    if requested is not None:
+        if requested not in model_cards:
+            avail = "/".join(str(c) for c in model_cards)
+            raise SystemExit(
+                f"npu{requested} 不在本机模型卡位 {model_cards} 内 —— "
+                f"别在单卡板上指定不存在的卡（会造出永远起不来的僵尸实例）。"
+                f"可用卡位：--npu {avail}")
+        return requested
+    # 谁占着哪张卡（只看本机实例；peer 的算力不是本机的卡）
+    busy: dict[int, list[str]] = {}
+    for inst in snap.get("instances", []):
+        if inst.get("_source") == "adopted":
+            continue
+        if inst.get("status") not in ("running", "loading"):
+            continue
+        n = inst.get("npu_index")
+        if isinstance(n, int) and n >= 0:
+            busy.setdefault(n, []).append(inst.get("model_id") or "?")
+    for n in model_cards:
+        if not [m for m in busy.get(n, []) if m != model]:
+            return n
+    n = model_cards[0]
+    print(f"⚠️ 所有模型卡位都被别的模型占着（{busy}），只能试 npu{n} —— "
+          f"若该卡上有别的模型，本脚本会因显存不足失败（rc=-6）。",
+          flush=True)
+    return n
+
+
 def wait_for(model: str, npu: int, pred, timeout: float, label: str):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -78,15 +141,19 @@ def wait_for(model: str, npu: int, pred, timeout: float, label: str):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--npu", type=int, default=1)
+    ap.add_argument("--npu", type=int, default=None,
+                    help="跑在哪个卡（默认自动挑一张没被别的模型占着的卡位）")
     ap.add_argument("--model", default="qwen3-vl-4b")
     args = ap.parse_args()
-    model, npu = args.model, args.npu
+    model = args.model
+    npu = pick_npu(model, args.npu)
 
     print(f"=== 目标: {model} @ npu{npu} ===", flush=True)
 
     # 清理：这张卡上不要有残留
     if local_inst(model, npu):
+        print(f"⚠️ {model} 已经跑在 npu{npu} 上 —— 本脚本会把它停掉重起，"
+              f"结尾还会停掉它。", flush=True)
         call("DELETE", "/compute/instances", {"model": model, "npu_index": npu})
 
     # ---------------------------------------------------------------- #

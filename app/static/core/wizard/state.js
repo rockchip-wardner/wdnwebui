@@ -519,9 +519,14 @@
       const MAX_RETRY = 2;
       bringBtn.addEventListener("click", async () => {
         bringBtn.disabled = true;
+        // 记下后端给的最后一条消息:失败时它就是**原因**。后端可能排队
+        // 等了很久才失败(过渡态 409),只显示"正在开启模型..."/重试文案,
+        // 用户看到的是"卡住"而不是"为什么"。
+        let lastMsg = "";
         const doBringUp = async () => {
           status.textContent = "正在开启模型...";
           const ok = await window._wizardBringUpModels(cfg, (msg) => {
+            lastMsg = msg;
             status.textContent = msg;
           });
           return ok;
@@ -536,7 +541,9 @@
             return;
           }
           retryCount++;
-          status.textContent = `开启失败,正在重试 (${retryCount}/${MAX_RETRY})...`;
+          status.textContent = lastMsg
+            ? `${lastMsg} —— 重试 (${retryCount}/${MAX_RETRY})...`
+            : `开启失败,正在重试 (${retryCount}/${MAX_RETRY})...`;
         }
         // 2 次都失败
         const cont = window.confirm(
@@ -1482,11 +1489,17 @@
     again.addEventListener("click", async () => {
       again.disabled = true;
       line.textContent = "正在重新开启模型...";
+      let lastMsg = "";
       const ok = await window._wizardBringUpModels(cfg, (msg) => {
+        lastMsg = msg;
         line.textContent = msg;
       });
       if (!ok) {
-        line.textContent = "重新开启失败 —— 请到「算力配置」页手动开启后重试。";
+        // 保留后端给的原因(过渡态 409 / 显存不足 …),别一律换成一句
+        // "重新开启失败" —— 用户要靠这个去「算力配置」页对症处理。
+        line.textContent = lastMsg
+          ? `${lastMsg} —— 重新开启失败,请到「算力配置」页手动开启后重试。`
+          : "重新开启失败 —— 请到「算力配置」页手动开启后重试。";
         again.disabled = false;
         return;
       }
@@ -2115,6 +2128,20 @@
   // _wizardBringUpModels — 闭包 helper,供 env_check.js / registry.js 引用
   // 真正启停实现放 env_check.js (避免在 state.js 里堆 fetch 业务代码)
   // ------------------------------------------------------------------ #
+  // 从错误响应里取出**人话**原因。FastAPI 的 HTTPException body 是
+  // {"detail": "..."} —— 直接摆 raw body 会让用户看到带引号的 JSON 串
+  // （例：{"detail":"npu_index=1 越界：…"}）。不是 JSON 的 body 原文就是原因。
+  const _errDetail = async (res) => {
+    const raw = await res.text().catch(() => "");
+    if (!raw) return "HTTP " + res.status;
+    try {
+      const j = JSON.parse(raw);
+      if (j && typeof j.detail === "string") return j.detail;
+      if (j && typeof j.message === "string") return j.message;
+    } catch (_) { /* 不是 JSON —— 原文就是原因 */ }
+    return raw;
+  };
+
   window._wizardBringUpModels = async function (cfg, onProgress) {
     if (!cfg.swcap_to_model) return true;
     const say = (msg) => { if (typeof onProgress === "function") onProgress(msg); };
@@ -2182,12 +2209,15 @@
           body: JSON.stringify({ model: modelId, npu_index: inst.npu_index }),
         });
         if (!dr.ok) {
-          const detail = await dr.text().catch(() => "");
+          const detail = await _errDetail(dr);
           // 实例已经不在了(快照是 1s 前的,期间可能被别人停掉)→
           // 达到目的,继续。后端对「不在 registry」返 400 不是 404。
           if (dr.status === 404 || detail.includes("不在 registry")) continue;
           console.warn("[wizard-state] stop", modelId, "@", inst.npu_index,
                        "→ HTTP", dr.status, detail);
+          // 失败原因要说出来 —— 之前这里只 console.warn,UI 上只留下一句
+          // "正在开启模型...",用户看到的是"卡住"而不是"为什么"。
+          say(`释放计算卡 #${inst.npu_index} 失败: ${detail || ("HTTP " + dr.status)}`);
           return false;
         }
       }
@@ -2206,8 +2236,12 @@
           body: JSON.stringify({ model: m.model_id, npu_index: m.npu_index }),
         });
         if (!sr.ok) {
+          const detail = await _errDetail(sr);
           console.warn("[wizard-state] start", m.model_id, "→ HTTP", sr.status,
-                       await sr.text().catch(() => ""));
+                       detail);
+          // 400/409 的文案是后端给的直接原因(例:「npu_index=1 越界…」
+          // 「仍在启动/关闭中,请稍后重试」)—— 摆到 UI 上,别只留在 console 里。
+          say(`启动失败: ${detail || ("HTTP " + sr.status)}`);
           return false;
         }
         // 后端「部分失败也返 200」(ok: not errors) —— 必须看 body.ok,
@@ -2216,6 +2250,8 @@
         if (sj && sj.ok === false) {
           console.warn("[wizard-state] start", m.model_id, "→ 部分失败",
                        JSON.stringify(sj.errors || []));
+          const why = (sj.errors || []).map((e) => e.detail || e).join("; ");
+          say(`启动失败: ${why || "部分卡位启动失败"}`);
           return false;
         }
       }

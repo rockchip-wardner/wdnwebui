@@ -1828,6 +1828,20 @@ function isRemotePeerRejection(status, text) {
   return PEER_REJECT_HINT.test(String(text || ""));
 }
 
+// 从错误响应里取出**人话**原因。FastAPI 的 HTTPException body 是
+// {"detail": "..."} —— 直接把 raw body 弹给用户会看到带引号的 JSON 串
+// （{"detail":"npu_index=1 越界：…"}）。不是 JSON 的 body 原文就是原因。
+function computeErrorDetail(status, raw) {
+  const text = String(raw || "");
+  if (!text) return "HTTP " + status;
+  try {
+    const j = JSON.parse(text);
+    if (j && typeof j.detail === "string") return j.detail;
+    if (j && typeof j.message === "string") return j.message;
+  } catch (_) { /* 不是 JSON —— 原文就是原因 */ }
+  return text;
+}
+
 
 const ComputeConfigPage = {
   initialized: false,
@@ -3085,7 +3099,8 @@ const ComputeConfigPage = {
       if (!r.ok) {
         const text = await r.text();
         if (isRemotePeerRejection(r.status, text)) return;
-        alert(`${actionLabel}失败 (HTTP ${r.status}): ${text}`);
+        alert(`${actionLabel}失败 (HTTP ${r.status}): ` +
+              computeErrorDetail(r.status, text));
       }
     } catch (e) {
       alert("请求失败: " + e.message);

@@ -50,9 +50,12 @@ Endpoints
 
 错误码：
 
-* 400 —— pydantic 校验失败（缺字段、model 未知、npu_index 越界）。
+* 400 —— 业务校验失败（**npu_index 越界 / 不是模型卡位**）。
 * 403 —— 操作的是 adopted / unavailable service（本机无权启停）。
 * 404 —— list_cards 返回空（未检测到 NPU）或 stop 时实例不存在。
+* 409 —— 该模型在这张卡上还处于过渡态（loading / stopping），排队等完
+         仍没结束。
+* 422 —— pydantic 校验失败（缺字段、model 未知、npu_index 不是整数）。
 """
 from __future__ import annotations
 
@@ -89,6 +92,10 @@ class InstanceRequest(BaseModel):
     """
     #: Range checked in ``_npu_list`` instead of via ``Field(ge=..., le=...)``:
     #: those constraints do not survive the ``int | list[int]`` union.
+    #:
+    #: 这里只校验**形状**（整数 / 非负 / 去重）。「卡号是否真的存在」是
+    #: **运行时状态**（本机探测到几张卡、哪几张能跑 rknn 模型），只能在
+    #: handler 里查 —— 见 ``start_instance`` 里的 ``reg.npu_card_error()``。
     npu_index: int | list[int]
     model: str
 
@@ -295,12 +302,17 @@ async def _await_quiet(reg, model_id: str, npus: Optional[set],
 
     True = 已静默可执行启停;False = 超时。
 
+    **只看本机实例**(``transition_cards(..., local_only=True)``):远端
+    peer 的过渡态是对端板子的事,它的卡号不是本机的卡号 —— 把它算进来
+    会让本机启同名模型被对端的状态挡住(真机实测:peer 的 qwen3-vl-4b 卡
+    在 loading → 本机排队 120s → 409 → 向导「一键开启」一直转圈)。
+
     **必须 async 轮询**:单进程 uvicorn 只有一个事件循环,同步 sleep 会
     把整个服务卡住(DELETE 本身就在同步阻塞事件循环)。
     """
     deadline = time.monotonic() + timeout_s
     while True:
-        busy = [(n, k) for (n, k) in reg.transition_cards(model_id)
+        busy = [(n, k) for (n, k) in reg.transition_cards(model_id, local_only=True)
                 if npus is None or n in npus]
         if not busy:
             return True
@@ -310,8 +322,8 @@ async def _await_quiet(reg, model_id: str, npus: Optional[set],
 
 
 def _transitions_of(reg, model_id: str, npu: Optional[int]) -> set:
-    """该模型在指定卡(不给 = 全部卡)上的过渡态种类集合。"""
-    return {k for (n, k) in reg.transition_cards(model_id)
+    """该模型在指定卡(不给 = 全部卡)上的过渡态种类集合(只算本机实例)。"""
+    return {k for (n, k) in reg.transition_cards(model_id, local_only=True)
             if npu is None or n == npu}
 
 
@@ -420,12 +432,21 @@ async def start_instance(req: InstanceRequest) -> dict:
     渲染部分成功的状态。
 
     Raises:
-        400: npu_index 越界 / 未知 model。
+        400: npu_index 越界 / 不是模型卡位。
         403: model 是 adopted from peer，本机无权 bind。
+        422: pydantic 校验失败（缺字段 / model 未知 / npu_index 不是整数）。
     """
     reg = get_registry()
     npu_indices = (req.npu_index if isinstance(req.npu_index, list)
                    else [req.npu_index])
+    # 卡位校验**必须在过渡态排队之前**（v0.29 补）：越界的卡号等再久也
+    # 起不来（worker 会 IndexError 秒退），先排队只会让用户白等 120s
+    # 再收到一个语焉不详的 409。docstring 早就承诺了「npu_index 越界 → 400」，
+    # 以前只有 `>= 0` 的校验，单卡板上传 npu=1 会造出僵尸实例。
+    for n in npu_indices:
+        bad = reg.npu_card_error(n)
+        if bad:
+            raise HTTPException(status_code=400, detail=bad)
     # 过渡态前置判定：目标卡还在启动/关闭 → 排队等它结束，而不是直接
     # 再 load 一次（见文件头的「过渡态排队」注释：那是 rc=-6 的来源）。
     want = set(npu_indices)

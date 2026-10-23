@@ -34,7 +34,7 @@ sys.path.insert(0, ".")
 from fastapi import HTTPException  # noqa: E402
 
 import app.system.api.compute as capi  # noqa: E402
-from app.core.compute.registry import transition_of  # noqa: E402
+from app.core.compute.registry import ComputeRegistry, transition_of  # noqa: E402
 
 FAILED: list[str] = []
 PASSED = 0
@@ -60,6 +60,19 @@ class FakeInst:
         self.capability_types = list(caps)
         self._stop_depth = 0
         self._stop_npu = -1
+        # bind_instance / _probe_instance 用到
+        self._probe_lock = threading.Lock()
+        self._probe_thread = None
+        self._probe_gen = 0
+        self._bind_inflight = False
+        self.error = ""
+        self.started_at = 0.0
+        self.key = (npu_index, model_id, source)
+        self.proc = None
+        self.rpc_client = None
+        self.load_time_sec = None
+        self.loaded_at = None
+        self.finished_at = None
 
     def to_dict(self):
         return {"model_id": self.model_id, "npu_index": self.npu_index,
@@ -73,6 +86,9 @@ class FakeReg:
         self.inst = inst
         # transitions: [(npu, kind)] —— transition_cards() 的返回
         self.transitions = list(transitions)
+        # 每次 transition_cards() 收到的 local_only 参数（API 层必须传
+        # True —— 过渡态守卫只看本机实例，见 S6）
+        self.local_only_flags: list[bool] = []
         # 等待多少次之后过渡态消失（模拟「排队等到它结束」）
         self.clear_after = 0
         # 过渡态结束时回调 —— 模拟真实世界里的状态变化
@@ -85,13 +101,21 @@ class FakeReg:
         self.lock = threading.Lock()
 
     # ---- registry 接口
-    def transition_cards(self, model_id):
+    def transition_cards(self, model_id, local_only=False):
         self._polls += 1
+        self.local_only_flags.append(bool(local_only))
         if self.clear_after and self._polls > self.clear_after:
             if self.on_clear:
                 self.on_clear(self)
             return []
         return list(self.transitions)
+
+    def npu_card_error(self, npu_index):
+        """卡位校验（v0.29）—— 本脚本只关心过渡态，假 registry 一律放行。
+
+        越界卡号的真实行为另见 scripts/verify_npu_card_guard.py。
+        """
+        return None
 
     def _instances_of(self, model_id, npu_index=None):
         if self.inst is None:
@@ -294,12 +318,111 @@ def scen_timeout():
         capi._QUEUE_WAIT_LOADING_S = orig
 
 
+# --------------------------------------------------------------------------- #
+# S6 远端 peer(adopted)的过渡态**不能**挡住本机的启停
+# --------------------------------------------------------------------------- #
+def scen_s6():
+    print("\n=== S6 peer 的 loading 不挡本机启停（单板机 + peer 卡住） ===")
+    # (a) 真实 registry 的过滤：peer 的过渡态不进本机视图
+    real_reg = ComputeRegistry.__new__(ComputeRegistry)   # 不跑 __init__
+    peer = FakeInst(status="loading", npu_index=0, source="adopted")
+    local = FakeInst(status="running", npu_index=0, source="spawned")
+    real_reg._instances_of = lambda mid, npu_index=None: [peer, local]
+    all_cards = real_reg.transition_cards("qwen3-vl-4b")
+    local_cards = real_reg.transition_cards("qwen3-vl-4b", local_only=True)
+    check("S6 全量视图看得到 peer 的过渡态", (0, "loading") in all_cards,
+          str(all_cards))
+    check("S6 本机视图不含 peer 的过渡态", local_cards == [], str(local_cards))
+
+    # (b) API 层必须按 local_only=True 问 —— 否则上面的过滤用不上
+    inst = FakeInst(status="running", npu_index=0)
+    reg = FakeReg(inst=inst, transitions=[])      # 本机没有过渡态
+    patch(reg)
+    req = capi.InstanceRequest(model="qwen3-vl-4b", npu_index=[0])
+    r = run(capi.start_instance(req))
+    check("S6 启模型成功", r["ok"] is True)
+    check("S6 API 层按 local_only 问过渡态",
+          bool(reg.local_only_flags) and all(reg.local_only_flags),
+          str(reg.local_only_flags))
+
+    # (c) 本机自己的 loading 仍然要挡住（别把守卫整个关掉）
+    inst2 = FakeInst(status="loading", npu_index=0)
+    reg2 = FakeReg(inst=inst2, transitions=[(0, "loading")])
+    reg2.clear_after = 1
+    reg2.on_clear = lambda rr: setattr(rr.inst, "status", "running")
+    patch(reg2)
+    r2 = run(capi.start_instance(capi.InstanceRequest(model="qwen3-vl-4b",
+                                                      npu_index=[0])))
+    check("S6 本机的 loading 仍然排队等（没被误放行）", reg2._polls > 1,
+          f"polls={reg2._polls}")
+    check("S6 本机 loading 排完照常启", r2["ok"] is True)
+
+
+class FakeRpc:
+    """假 RPC client —— load 立即回 loading（worker 的 init 在它自己线程里跑）。"""
+
+    def __init__(self, reply=None):
+        self.reply = reply or {"ok": True, "data": {"status": "loading"}}
+        self.calls = 0
+
+    def call(self, payload, timeout_ms=None):
+        self.calls += 1
+        return dict(self.reply)
+
+
+# --------------------------------------------------------------------------- #
+# S7 bind 之后必须有**活着的** probe —— 否则实例永久卡在 loading
+# --------------------------------------------------------------------------- #
+def scen_s7():
+    print("\n=== S7 bind 后 probe 必须活着（否则永久 loading → 启停 409） ===")
+    reg = ComputeRegistry.__new__(ComputeRegistry)
+    reg._lock = threading.Lock()
+    reg._instances = {}
+    reg._probe_instance = lambda inst: time.sleep(2.0)   # 假 probe：睡一会儿
+
+    inst = FakeInst(model_id="qwen3-vl-4b", npu_index=-1, status="error")
+
+    # (a) 没有 probe → 必须起一个
+    reg._ensure_probe_thread(inst)
+    check("S7 无 probe 时起了新的", inst._probe_thread is not None
+          and inst._probe_thread.is_alive())
+    first = inst._probe_thread
+    reg._ensure_probe_thread(inst)
+    check("S7 probe 还活着时不重复起", inst._probe_thread is first)
+
+    # (b) probe 已死 → 必须换一个（这正是「加载失败过一次后再点启用」的路径）
+    first.join()
+    reg._ensure_probe_thread(inst)
+    check("S7 probe 已死时换新的", inst._probe_thread is not first
+          and inst._probe_thread.is_alive())
+
+    # (c) 端到端：bind 一个「加载失败过(error)」的实例 → 必须有活 probe 接管
+    reg2 = ComputeRegistry.__new__(ComputeRegistry)
+    reg2._lock = threading.Lock()
+    reg2._instances = {}
+    reg2._probe_instance = lambda i: time.sleep(3.0)
+    inst2 = FakeInst(model_id="qwen3-vl-4b", npu_index=-1, status="error")
+    inst2.rpc_client = FakeRpc()
+    dead = threading.Thread(target=lambda: None)
+    dead.start(); dead.join()                 # 一个已结束的线程
+    inst2._probe_thread = dead
+    reg2._instances[inst2.key] = inst2
+    out = reg2.bind_instance(inst2, 0)
+    check("S7 bind 后 status=loading", out.status == "loading", out.status)
+    check("S7 bind 后有活着的 probe 接管",
+          out._probe_thread is not None and out._probe_thread.is_alive())
+    check("S7 load RPC 已发出（走 loading 分支）",
+          inst2.rpc_client.calls >= 1, f"calls={inst2.rpc_client.calls}")
+
+
 def main() -> int:
     scen_s1()
     scen_s2()
     scen_s3()
     scen_s4()
     scen_s5()
+    scen_s6()
+    scen_s7()
     scen_i1()
     scen_i2()
     scen_timeout()
