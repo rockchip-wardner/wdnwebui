@@ -5,8 +5,11 @@
 
   S1 开启一个**正在启动中**的模型 → 排队等它加载完 → 200 + 最终 running
   S2 开启一个**正在关闭中**的模型 → 排队等它关完 → 200 + 重新拉起
-  S3 关闭一个**正在启动中**的模型 → 409「正在启动中，请等加载完成后再禁用」
+  S3 关闭一个**正在启动中**的模型 → 排队等它加载完 → 200 + 真的停掉
+     （腾卡必需：拒绝的话卡上那份继续占显存 → 新模型 rc=-6 起不来）
   S4 关闭一个**正在关闭中**的模型 → 幂等 200（不是 404）
+
+S3 会等模型加载完（真机 30~90s）才停 —— 这一段本来就慢，别当成卡死。
 
 ⚠️ 会真的启停模型，占一张 NPU 卡（默认 qwen3-vl-4b @ npu1，约 3.5GB）。
    板子上还有别人在用的时候挑一张空卡（--npu 参数）。
@@ -87,7 +90,7 @@ def main() -> int:
         call("DELETE", "/compute/instances", {"model": model, "npu_index": npu})
 
     # ---------------------------------------------------------------- #
-    print("\n=== S1/S3：模型正在启动中 ===", flush=True)
+    print("\n=== S1：模型正在启动中，再启用一次 ===", flush=True)
     st, d = call("POST", "/compute/instances", {"model": model, "npu_index": [npu]})
     check("S1 启动请求受理", st == 200, f"http={st}")
     # 等它进入 loading（worker 已 spawn、正在加载）
@@ -96,13 +99,6 @@ def main() -> int:
                        30, "进入 loading")
     check("S1 抓到 loading 窗口", True,
           f"transition={inst.get('transition')}")
-
-    # S3：loading 中禁用 → 409
-    st, d = call("DELETE", "/compute/instances",
-                 {"model": model, "npu_index": npu})
-    check("S3 loading 中禁用 → 409", st == 409, f"http={st} {d.get('detail')}")
-    check("S3 文案提到启动中", "启动中" in str(d.get("detail")),
-          str(d.get("detail")))
 
     # S1：loading 中再启用 → 排队等它加载完，不重复 bind、不 rc=-6
     t0 = time.time()
@@ -141,6 +137,25 @@ def main() -> int:
     wait_for(model, npu,
              lambda i: i is None or i.get("status") != "running",
              60, "等它彻底停下")
+
+    # ---------------------------------------------------------------- #
+    print("\n=== S3：模型正在启动中，禁用 → 排队等它加载完 → 停掉 ===", flush=True)
+    st, d = call("POST", "/compute/instances", {"model": model, "npu_index": [npu]})
+    check("S3 启动请求受理", st == 200, f"http={st}")
+    inst, _ = wait_for(model, npu,
+                       lambda i: i and i.get("status") == "loading",
+                       30, "进入 loading")
+    check("S3 抓到 loading 窗口", True,
+          f"transition={inst.get('transition')}")
+    t0 = time.time()
+    st, d = call("DELETE", "/compute/instances",
+                 {"model": model, "npu_index": npu})
+    dt = time.time() - t0
+    check("S3 loading 中禁用 → 200（排队后停掉）", st == 200,
+          f"http={st} {d.get('detail')}")
+    check("S3 有排队（不是立刻返回）", dt > 0.5, f"{dt:.1f}s")
+    inst, _ = wait_for(model, npu, lambda i: i is None, 60, "等它彻底停下")
+    check("S3 实例已从 registry 移除（卡腾空了）", inst is None, str(inst))
 
     # ---------------------------------------------------------------- #
     print("\n=== S2：模型正在关闭中，同时启用 ===", flush=True)

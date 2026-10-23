@@ -2724,7 +2724,7 @@ status 的消费方太多（wizard 等待 / probe / 算力页 badge / `_probe_en
 | 目标状态 | 操作 | 行为 |
 |---|---|---|
 | loading | 启用 | **排队**等它加载完 → 重新求值再执行（worker 侧 running 幂等，安全） |
-| loading | 禁用 | **409 拒绝**「正在启动中，请等加载完成后再禁用」—— 硬 unload 会让 worker 的 init 线程带不走 `rknn3_destroy` → **NPU 显存不归还** |
+| loading | 禁用 | **排队**等它加载完 → 再停。等它**加载完**是安全的：init 线程正常跑完、显存已归还；不安全的反而是**硬** unload（init 线程带不走 `rknn3_destroy` → 显存不归还）。**不能拒绝** —— 见下方「向导」段 |
 | stopping | 启用 | **排队**等它关完 → 重新求值再执行 |
 | stopping | 禁用 | **排队**等它关完 → 幂等 200 |
 
@@ -2744,12 +2744,21 @@ RPC + SIGTERM + 3s 宽限 + SIGKILL ≈ 4–5s）。
 
 **前端**（`system.js`）：`transition` 非空 → toggle / 重启按钮禁用 +
 提示「正在关闭中」；`_computeAction` 加 per-model pending 锁防连点。
-**向导**（`wizard/state.js`）：「一键开启」第 1 步**跳过**正在启动中的
-模型 —— DELETE 不带卡号会把该模型所有卡一起停，撞上 loading 那张就是
-409，硬发只会把整条链带失败。
+**向导**（`wizard/state.js`）：「一键开启」第 1 步**停非必需**时，
+**正在启动中的实例也要停**（DELETE 带 `npu_index`，后端排队等它加载完
+再停，返回时卡已腾空）。不能跳过 —— 跳过的话那份继续占显存 → 新模型
+加载时显存不足 → worker rc=-6 起不来（真机实测：vd 的 omni 正在 npu1
+启动，vtd 要把 qwen3-vl-4b 启到 npu1 → 起不来，最后一步报失败）。
+**「下一步」之前的腾卡顺序也是保证**：DELETE 全部返回后才 POST 启新模型。
 
-回归：`scripts/verify_compute_transition_guard.py`（23 断言，假 registry
-驱动 API handler，不起服务不占 NPU）；真机四场景见下节。
+**POST 返回 200 ≠ 成功**：后端 `POST /compute/instances` 单张失败不影响
+其余卡，仍返 200 + `{ok: false, errors: [...]}`。调用方**必须看 body.ok**
+——只看 HTTP 状态码会把「某张卡没起来」当成成功，用户一路走到完成配置
+页才炸。
+
+回归：`scripts/verify_compute_transition_guard.py`（25 断言，假 registry
+驱动 API handler，不起服务不占 NPU）；`scripts/verify_wizard_bringup_loading_card.py`
+（7 断言，mock 后端扫前端一键开启的 DELETE/POST 序列）；真机四场景见下节。
 
 ### 只有 npu0 / npu1 能跑模型（v0.20 实测）
 

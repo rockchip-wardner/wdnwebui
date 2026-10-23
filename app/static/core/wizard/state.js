@@ -521,7 +521,9 @@
         bringBtn.disabled = true;
         const doBringUp = async () => {
           status.textContent = "正在开启模型...";
-          const ok = await window._wizardBringUpModels(cfg);
+          const ok = await window._wizardBringUpModels(cfg, (msg) => {
+            status.textContent = msg;
+          });
           return ok;
         };
         for (let i = 0; i < MAX_RETRY; i++) {
@@ -1480,7 +1482,9 @@
     again.addEventListener("click", async () => {
       again.disabled = true;
       line.textContent = "正在重新开启模型...";
-      const ok = await window._wizardBringUpModels(cfg);
+      const ok = await window._wizardBringUpModels(cfg, (msg) => {
+        line.textContent = msg;
+      });
       if (!ok) {
         line.textContent = "重新开启失败 —— 请到「算力配置」页手动开启后重试。";
         again.disabled = false;
@@ -2098,8 +2102,9 @@
   // _wizardBringUpModels — 闭包 helper,供 env_check.js / registry.js 引用
   // 真正启停实现放 env_check.js (避免在 state.js 里堆 fetch 业务代码)
   // ------------------------------------------------------------------ #
-  window._wizardBringUpModels = async function (cfg) {
+  window._wizardBringUpModels = async function (cfg, onProgress) {
     if (!cfg.swcap_to_model) return true;
+    const say = (msg) => { if (typeof onProgress === "function") onProgress(msg); };
     // 单卡 + 刚需多模型（如监控分析检索）→ 本应用在当前设备上不可用。
     // 明确**一个模型都不启停**：既不加载,也不去停别人正在跑的模型
     // ——「停别人的模型」是破坏性的。
@@ -2146,30 +2151,31 @@
         const isNeeded = !npuKnown
           || wantedModels.has(modelId)
           || wantedPairs.has(modelId + "@" + inst.npu_index);
+        if (isNeeded) continue;
         // running / loading 状态的实例才需要停(其他状态后端会拒)
-        if (!isNeeded && (inst.status === "running" || inst.status === "loading")) {
-          // 还在启动中 → 跳过这一个(后端对「启动中禁用」是 409 拒绝,
-          // 硬发只会把整条链带失败)。同模型的**别的卡**照常处理 ——
-          // 带上 npu_index 后 DELETE 只影响这一张。
-          if (inst.status === "loading") continue;
-          // 正在关闭中 → 已经在关了,不用再发一次
-          if (inst.transition === "stopping") continue;
-          const dr = await fetch("/api/compute/instances", {
-            method: "DELETE",
-            headers: { "Content-Type": "application/json" },
-            // 带 npu_index:只停这一张卡。不带的话后端会停该模型的
-            // 所有卡 —— 连本应用需要的那些卡一起停掉。
-            body: JSON.stringify({ model: modelId, npu_index: inst.npu_index }),
-          });
-          if (!dr.ok) {
-            const detail = await dr.text().catch(() => "");
-            // 实例已经不在了(快照是 1s 前的,期间可能被别人停掉)→
-            // 达到目的,继续。后端对「不在 registry」返 400 不是 404。
-            if (dr.status === 404 || detail.includes("不在 registry")) continue;
-            console.warn("[wizard-state] stop", modelId, "@", inst.npu_index,
-                         "→ HTTP", dr.status, detail);
-            return false;
-          }
+        if (inst.status !== "running" && inst.status !== "loading") continue;
+        // 正在关闭中 → 已经在关了,不用再发一次
+        if (inst.transition === "stopping") continue;
+        // 正在启动中的**也要停** —— 后端会排队等它加载完再停,DELETE 返回
+        // 时卡已经腾空。跳过它 → 卡上那份继续占显存 → 新模型加载时显存
+        // 不足 → worker rc=-6 起不来(真机实测:vd 的 omni 正在 npu1 启动,
+        // vtd 要把 qwen3-vl-4b 启到 npu1 → 起不来,最后一步报失败)。
+        say(`正在释放计算卡 #${inst.npu_index}...`);
+        const dr = await fetch("/api/compute/instances", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          // 带 npu_index:只停这一张卡。不带的话后端会停该模型的
+          // 所有卡 —— 连本应用需要的那些卡一起停掉。
+          body: JSON.stringify({ model: modelId, npu_index: inst.npu_index }),
+        });
+        if (!dr.ok) {
+          const detail = await dr.text().catch(() => "");
+          // 实例已经不在了(快照是 1s 前的,期间可能被别人停掉)→
+          // 达到目的,继续。后端对「不在 registry」返 400 不是 404。
+          if (dr.status === 404 || detail.includes("不在 registry")) continue;
+          console.warn("[wizard-state] stop", modelId, "@", inst.npu_index,
+                       "→ HTTP", dr.status, detail);
+          return false;
         }
       }
       // 2. 启必需(后端契约 POST + JSON {model, npu_index})
@@ -2180,6 +2186,7 @@
         const key = m.model_id + "@" + m.npu_index;
         if (started.has(key)) continue;
         started.add(key);
+        say("正在启动模型...");
         const sr = await fetch("/api/compute/instances", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2188,6 +2195,14 @@
         if (!sr.ok) {
           console.warn("[wizard-state] start", m.model_id, "→ HTTP", sr.status,
                        await sr.text().catch(() => ""));
+          return false;
+        }
+        // 后端「部分失败也返 200」(ok: not errors) —— 必须看 body.ok,
+        // 否则某张卡没起来会被当成成功,用户走到完成配置页才炸。
+        const sj = await sr.json().catch(() => null);
+        if (sj && sj.ok === false) {
+          console.warn("[wizard-state] start", m.model_id, "→ 部分失败",
+                       JSON.stringify(sj.errors || []));
           return false;
         }
       }

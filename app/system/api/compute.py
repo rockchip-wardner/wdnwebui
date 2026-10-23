@@ -274,10 +274,12 @@ class ComputeConfigPayload(BaseModel):
 #     线程 → 两个 init 线程抢同一份 NPU 内存。
 #   * stopping 中再 load → session 正在被 close,新 session 又要占内存。
 #   * loading 中再 stop  → init 线程被 SIGKILL 砍掉,rknn3_destroy 没跑
-#     → NPU 显存不归还。
+#     → NPU 显存不归还。**硬**停才有这个风险;等它加载完再停是安全的。
 #   * stopping 中再 stop → 实例已出 registry → 误报 404。
 #
-# 策略:启 → 排队等它结束;停 → loading 时拒绝(409),stopping 时排队。
+# 策略:启 → 排队等它结束;停 → 也排队(loading 等它加载完,stopping 等它
+# 关完)。停之所以不能拒绝:调用方要先腾出目标卡再启新模型,拒绝的话卡上
+# 那份继续占显存 → 新模型显存不足 → worker rc=-6 起不来。
 # 详见 AGENTS.md「模型启停的过渡态」。
 # --------------------------------------------------------------------------- #
 
@@ -507,21 +509,36 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
         404: model（+ npu_index）不在 registry。
         403: 实例来自远端 peer。
         400: registry 侧停止失败。
+        409: 排队等过渡态结束超时（模型还在启动/关闭中）。
     """
     reg = get_registry()
     npu = req.npu_index
+    want = {npu} if npu is not None else None
     # 过渡态先判 —— 停止期间 unload 的乐观写会把 npu_index 重置成 -1，
     # 按卡号查会「找不到」→ 误报 404（用户看到的「关闭一个正在关闭中
     # 的模型」报错就是这么来的）。过渡态表用 _stop_npu 兜住卡号。
     kinds = _transitions_of(reg, req.model, npu)
+    waited_loading = False
     if "loading" in kinds:
-        raise HTTPException(
-            status_code=409,
-            detail=(f"{req.model} 正在启动中，请等加载完成后再禁用"),
-        )
+        # **排队等它加载完 → 再停**,不是拒绝。
+        #
+        # 为什么不能拒绝:调用方「一键开启所需模型」要先腾出目标卡再启新
+        # 模型。拒绝的话那份还在占显存 → 新模型加载时显存不足 → worker
+        # rc=-6 起不来(真机实测:vd 的 omni 正在 npu1 启动,vtd 要把
+        # qwen3-vl-4b 启到 npu1 → 起不来)。
+        #
+        # 为什么等它**加载完**是安全的:init 线程正常跑完、显存已归还,
+        # 随后的 unload 走正常路径。不安全的反而是**硬** unload —— 那才会
+        # 让 init 线程带不走 rknn3_destroy。
+        if not await _await_quiet(reg, req.model, want, _QUEUE_WAIT_LOADING_S):
+            raise HTTPException(
+                status_code=409,
+                detail=(f"{req.model} 仍在启动中，请稍后重试"),
+            )
+        waited_loading = True
+        kinds = _transitions_of(reg, req.model, npu)
     if "stopping" in kinds:
         # 已经在关了 → 排队等它关完，返回幂等成功（不再发第二次 stop）。
-        want = {npu} if npu is not None else None
         if not await _await_quiet(reg, req.model, want, _QUEUE_WAIT_STOPPING_S):
             raise HTTPException(
                 status_code=409,
@@ -534,6 +551,10 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
         # 并发 DELETE 只能在事件循环里排队,轮到它时实例已不在(卡号也被
         # 重置成 -1)→ 靠 registry._recently_stopped 兜住。
         if reg.was_recently_stopped(req.model, npu):
+            return {"ok": True, "snapshot": reg.snapshot()}
+        # 等的那次启动**失败**了 → 实例已移出 registry，卡本来就是空的
+        # → 幂等成功（别报 404：卡确实腾空了，调用方的目的已达成）。
+        if waited_loading:
             return {"ok": True, "snapshot": reg.snapshot()}
         where = f" (npu_index={req.npu_index})" if req.npu_index is not None else ""
         raise HTTPException(
@@ -558,8 +579,17 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
     try:
         with reg.model_op_lock(req.model):
             # 锁内复查：等锁期间可能已经有人启/停过同一个模型。
-            if _transitions_of(reg, req.model, npu):
+            kinds2 = _transitions_of(reg, req.model, npu)
+            if "stopping" in kinds2:
+                # 已经在关了 → 幂等成功。
                 return {"ok": True, "snapshot": reg.snapshot()}
+            if "loading" in kinds2:
+                # 又被启成 loading 了 → 本次**没停掉** → 别返回 ok 假装
+                # 成功：调用方会以为卡腾空了就去启新模型 → 显存不够起不来。
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"{req.model} 正在启动中，请稍后重试"),
+                )
             reg.stop_instance_local(req.model, npu)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

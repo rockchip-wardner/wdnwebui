@@ -5,8 +5,10 @@
 
   S1 开启一个**正在启动中**的模型 → 排队等它加载完 → 再执行
   S2 开启一个**正在关闭中**的模型 → 排队等它关完 → 再执行
-  S3 关闭一个**正在启动中**的模型 → 409 拒绝（不等、不硬杀）
+  S3 关闭一个**正在启动中**的模型 → 排队等它加载完 → 再停（腾卡必需：
+     拒绝的话卡上那份继续占显存 → 新模型 rc=-6 起不来）
   S4 关闭一个**正在关闭中**的模型 → 排队等它关完 → 幂等 200
+  S5 等的那次启动**失败**了 → 幂等 200（卡本来就是空的，不是 404）
 
 外加两条不变量：
 
@@ -116,6 +118,9 @@ class FakeReg:
     def stop_instance_local(self, model_id, npu_index=None):
         self.stop_calls += 1
 
+    def was_recently_stopped(self, model_id, npu_index=None, window_s=10.0):
+        return False
+
     def restart_instance_local(self, model_id):
         self.stop_calls += 1
 
@@ -181,21 +186,39 @@ def scen_s2():
 
 
 # --------------------------------------------------------------------------- #
-# S3 关闭一个正在启动中的模型 → 409 拒绝
+# S3 关闭一个正在启动中的模型 → 排队等它加载完 → 再停
 # --------------------------------------------------------------------------- #
 def scen_s3():
-    print("\n=== S3 关闭「正在启动中」的模型 → 409 拒绝 ===")
+    print("\n=== S3 关闭「正在启动中」的模型 → 排队等它加载完 → 再停 ===")
     inst = FakeInst(status="loading")
     reg = FakeReg(inst=inst, transitions=[(0, "loading")])
+    reg.clear_after = 2          # 轮询 2 次后过渡态消失
+    # 排队期间模型加载完成 → running（显存已归还，随后的 unload 正常）
+    reg.on_clear = lambda r: setattr(r.inst, "status", "running")
     patch(reg)
     req = capi.StopInstanceRequest(model="qwen3-vl-4b", npu_index=0)
-    try:
-        run(capi.stop_instance(req))
-        check("S3 抛 409", False, "没抛异常")
-    except HTTPException as e:
-        check("S3 是 409", e.status_code == 409, f"status={e.status_code}")
-        check("S3 文案提到启动中", "启动中" in str(e.detail), str(e.detail))
-    check("S3 没真去停", reg.stop_calls == 0, f"stop={reg.stop_calls}")
+    r = run(capi.stop_instance(req))
+    check("S3 返回 ok", r.get("ok") is True, str(r)[:80])
+    check("S3 等过了过渡态", reg._polls > 1, f"polls={reg._polls}")
+    check("S3 等完真的停了", reg.stop_calls == 1, f"stop={reg.stop_calls}")
+
+
+# --------------------------------------------------------------------------- #
+# S5 等的那次启动失败了 → 幂等 200（卡本来就是空的，不是 404）
+# --------------------------------------------------------------------------- #
+def scen_s5():
+    print("\n=== S5 等的那次启动失败 → 幂等 200（不是 404）===")
+    inst = FakeInst(status="loading")
+    reg = FakeReg(inst=inst, transitions=[(0, "loading")])
+    reg.clear_after = 2
+    # 加载失败 → 实例被移出 registry（卡本来就是空的）
+    reg.on_clear = lambda r: setattr(r, "inst", None)
+    patch(reg)
+    req = capi.StopInstanceRequest(model="qwen3-vl-4b", npu_index=0)
+    r = run(capi.stop_instance(req))
+    check("S5 返回 ok（不是 404）", r.get("ok") is True, str(r)[:80])
+    check("S5 没去停（实例已经没了）", reg.stop_calls == 0,
+          f"stop={reg.stop_calls}")
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +299,7 @@ def main() -> int:
     scen_s2()
     scen_s3()
     scen_s4()
+    scen_s5()
     scen_i1()
     scen_i2()
     scen_timeout()
