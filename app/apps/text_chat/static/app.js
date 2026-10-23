@@ -18,7 +18,6 @@ const TextChat = {
     $("text-chat-send-btn")?.addEventListener("click", () => this.send());
     $("text-chat-stop-btn")?.addEventListener("click", () => this.stop());
     $("text-chat-reset-btn")?.addEventListener("click", () => this.reset());
-    $("text-chat-refresh")?.addEventListener("click", () => this.refresh());
     $("text-chat-input")?.addEventListener("keydown", (e) => {
       // Cmd/Ctrl + Enter sends; plain Enter inserts a newline.
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {

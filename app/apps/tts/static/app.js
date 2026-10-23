@@ -22,7 +22,6 @@ const TTS = {
     const volValEl = document.getElementById("tts-volume-value");
     const startBtn = document.getElementById("tts-start");
     const stopBtn = document.getElementById("tts-stop");
-    const refreshBtn = document.getElementById("tts-refresh");
     const audioEl = document.getElementById("tts-audio");
 
     if (volEl && volValEl) {
@@ -40,7 +39,6 @@ const TTS = {
       el.addEventListener("change", () => this._showAudioRowIfNeeded());
     });
 
-    if (refreshBtn) refreshBtn.addEventListener("click", () => this.refresh());
     if (startBtn)   startBtn.addEventListener("click", () => this.start());
     if (stopBtn)    stopBtn.addEventListener("click", () => this.stop());
     if (textEl) {
