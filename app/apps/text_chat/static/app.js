@@ -43,6 +43,15 @@ const TextChat = {
         } catch (_) { /* ignore */ }
       });
     }
+    // 能力探测：用户去算力页启用模型后回来要自动恢复，不能等发一条
+    // 失败的消息才轮询。页面可见时每 5s 复查一次。
+    this._probeCap().catch(() => {});
+    if (!this._capTimer) {
+      this._capTimer = setInterval(() => {
+        if (document.visibilityState !== "visible") return;
+        this._probeCap().catch(() => {});
+      }, 5000);
+    }
     this.ensureWs();
   },
 
@@ -174,32 +183,7 @@ const TextChat = {
       DemoGuard.report("text-chat", { session: this.snapshot });
     }
     this._renderState();
-    // v0.4 修复：text-chat 在 capability 缺失时不广播给前端 WS,导致
-    // 用户在「算力配置」页启用对话模型后回到 text-chat,sticky 的
-    // snapshot.error = "功能未启用: swcap_text_chat" 还在 hint 上显示
-    // —— 必须用户主动点"刷新"或发条消息才会纠正。装一个 poll,只
-    // 在 error 匹配 "功能未启用" 时启动,snapshot 转好自动停。
-    this._maybeStartCapPoll();
-  },
-
-  _maybeStartCapPoll() {
-    const err = (this.snapshot && this.snapshot.error) || "";
-    const needPoll = /功能未启用/.test(err);
-    if (needPoll && !this._capPollTimer) {
-      this._capPollTimer = setInterval(() => {
-        // 只调 _probeCap —— 不调 refresh()。原因:
-        // text-chat service 内部的 snapshot.error 是上次 _run_one 失败
-        // 留下的"旧账",只有下一次成功 _run_one 才会清。refresh() 拉
-        // 回来的快照 Object.assign 到 this.snapshot 后,error 又被写
-        // 回前端 —— 会和 _probeCap 清掉的动作来回反复。绕过 refresh()
-        // 直接走 capabilities 这个"独立信源",确认 ComputeRegistry 已
-        // 暴露 swcap_text_chat 后本地清掉 sticky error。
-        this._probeCap().catch(() => {});
-      }, 3000);
-    } else if (!needPoll && this._capPollTimer) {
-      clearInterval(this._capPollTimer);
-      this._capPollTimer = null;
-    }
+    // 能力探测由 init() 的常驻轮询负责（页面可见时每 5s），见 _probeCap。
   },
 
   async _probeCap() {
@@ -219,13 +203,15 @@ const TextChat = {
     const hasTextChat = caps.some(
       (c) => c && c.type === "swcap_text_chat" && Number(c.npu_index) >= 0
     );
+    const changed = this._capReady !== hasTextChat;
+    this._capReady = hasTextChat;
     if (hasTextChat && this.snapshot && /功能未启用/.test(this.snapshot.error || "")) {
       // ComputeRegistry 已确认 swcap_text_chat 可用,但 text-chat
       // service 内部的 snapshot.error 是上次失败留下的"旧账"。本地
       // 清掉,banner 与 hint 立即恢复"就绪"态,用户无需手动刷页。
       this.snapshot.error = "";
-      this._renderState();
     }
+    if (changed) this._renderState();
   },
 
   _renderState() {
@@ -271,14 +257,16 @@ const TextChat = {
     const sendBtn = document.getElementById("text-chat-send-btn");
     const stopBtn = document.getElementById("text-chat-stop-btn");
     const input   = document.getElementById("text-chat-input");
-    if (sendBtn) sendBtn.disabled = busy;
+    const capReady = this._capReady;          // undefined = 首次探测未回
+    if (sendBtn) sendBtn.disabled = busy || capReady === false;
     if (input)   input.disabled = busy;
     if (stopBtn) stopBtn.disabled = !(state === "running" || state === "loading");
 
     const banner = document.getElementById("text-chat-unavailable");
     if (banner) {
       const isCapErr = state === "error" && s.error && /功能未启用/.test(s.error);
-      banner.classList.toggle("hidden", !isCapErr);
+      // 能力缺失不再等用户点一次失败：探测一回来就显示 banner + 禁发送。
+      banner.classList.toggle("hidden", !(isCapErr || capReady === false));
     }
 
     const hint = document.getElementById("text-chat-hint");

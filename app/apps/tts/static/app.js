@@ -51,6 +51,15 @@ const TTS = {
         }
       });
     }
+    // 能力变化（去算力页启用/停用模型）→ 页面可见时每 5s 复查；
+    // 生成中不打扰。
+    if (!this._capTimer) {
+      this._capTimer = setInterval(() => {
+        if (document.visibilityState !== "visible") return;
+        if (this.lastSnap && this.lastSnap.busy) return;
+        this.refresh().catch(() => {});
+      }, 5000);
+    }
   },
 
   async refresh() {
@@ -94,18 +103,26 @@ const TTS = {
 
     const isBusy = snap.busy === true || snap.running === true || snap.state === "loading" || snap.state === "running";
     const isRunning = snap.running === true;
+    const capReady = snap.capability_ready !== false;
 
     if (banner && reasonEl) {
       if (snap.available === false) {
         banner.classList.remove("hidden");
         reasonEl.textContent = snap.init_error || "upstream 模块缺失";
+      } else if (!capReady) {
+        banner.classList.remove("hidden");
+        reasonEl.textContent =
+          "模型未启用：请到「算力配置」页启用 [TTS] 文字转语音模型";
       } else {
         banner.classList.add("hidden");
       }
     }
 
     if (startBtn) {
-      startBtn.disabled = isBusy || snap.available === false;
+      startBtn.disabled = isBusy || snap.available === false || !capReady;
+      startBtn.title = capReady
+        ? ""
+        : "功能未启用：请先在算力配置启用 [TTS] 文字转语音模型";
     }
     if (stopBtn) {
       stopBtn.disabled = !isBusy;
@@ -122,6 +139,7 @@ const TTS = {
 
   formatMeta(snap) {
     if (!snap.available) return "语音生成不可用，请检查上游 Qwen3-TTS 模型路径 / rknn3 驱动";
+    if (snap.capability_ready === false) return "模型未启用：请先在算力配置启用 [TTS] 模型";
     if (snap.state === "idle")  return `模型: ${snap.model_dir}`;
     if (snap.state === "loading") return "正在加载模型…";
     if (snap.state === "running") {

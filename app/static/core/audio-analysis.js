@@ -106,13 +106,20 @@
           statusEl.textContent = "错误: " + (snap.error || "");
         } else {
           statusEl.textContent = (snap && snap.available === false)
-            ? "功能未启用"
+            ? "功能未启用：请先在算力配置启用 [Omni] 多感知描述模型"
             : "未启动";
         }
       }
       const startBtn = el("start");
       const stopBtn = el("stop");
-      if (startBtn) startBtn.disabled = !!(snap && snap.state === "extracting");
+      // 能力未启用（omni 没加载）时置灰：否则用户点了只会拿到 502。
+      const avail = !snap || snap.available !== false;
+      if (startBtn) {
+        startBtn.disabled = !avail || !!(snap && snap.state === "extracting");
+        startBtn.title = avail
+          ? ""
+          : "功能未启用：请先在算力配置启用 [Omni] 多感知描述模型";
+      }
       if (stopBtn) stopBtn.disabled = !(snap && snap.state === "extracting");
       const progEl = el("progress");
       if (progEl) {
@@ -296,6 +303,13 @@
     if (clearBtn) clearBtn.onclick = () => onClear();
     ensureWs();
     refresh();
+    // 用户可能切到算力配置启用模型再回来：定期刷新能力状态。
+    // 分析中不打扰；页面不可见时不发请求。
+    ctl.capTimer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      if (ctl.snap && ctl.snap.state === "extracting") return;
+      refresh();
+    }, 5000);
 
     ctl.refresh = refresh;
     ctl.stop = onStop;

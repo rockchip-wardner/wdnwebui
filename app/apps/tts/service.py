@@ -512,11 +512,27 @@ class TtsSession:
     def model_dir(self) -> Path:
         return self._model_dir
 
+    @staticmethod
+    def _probe_capability_ready() -> bool:
+        """能力是否可用（含 LAN peer，与 ``start()`` 的 ``get_session`` 同口径）。
+
+        ``list_sessions`` 是纯查询；``get_session`` 每次会打一条 INFO，
+        而 snapshot 由前端 5s 轮询 / WS 推进调用，不能污染日志。
+        """
+        try:
+            from app.core.compute.registry import get_registry
+            return bool(get_registry().list_sessions(
+                "swcap_text_to_speech", include_remote=True))
+        except Exception:  # noqa: BLE001
+            return False
+
     def snapshot(self) -> dict:
+        capability_ready = self._probe_capability_ready()
         with self._lock:
             return {
                 "state":          self._state,
                 "available":      self.available,
+                "capability_ready": capability_ready,
                 "init_error":     self._init_error,
                 "model_dir":      str(self._model_dir),
                 "model_dir_exists": self._model_dir.is_dir(),
