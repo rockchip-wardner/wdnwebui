@@ -3490,6 +3490,62 @@ deps + native lib vendoring.
 > `__editable__.wdnapps_video_analyzer-0.1.0.pth`——实测传连字符名时
 > `purge_install_traces` 的 glob **一个都命中不到**。
 
+## `vrepo` —— 工作区多仓库统筹（对标 Android `repo`）
+
+工作区里其实有 **7 个独立 git 仓库**（不是一个 submodule 树）：
+
+| 仓库 | 路径 | 远端 | 说明 |
+|---|---|---|---|
+| wdnwebui | `.` | `origin` | 本仓（.venv/ 已被 .gitignore 排除） |
+| wdnai | `.venv/src/wdnai` | `origin` | editable 安装，VLM/LLM SDK |
+| wdnapps_hdmi_processor | `.venv/src/wdnapps_hdmi_processor` | `origin` | editable 安装，HDMI 卡片插件 |
+| wdnapps_video_analyzer | `.venv/src/wdnapps_video_analyzer` | `origin` | editable 安装，视频卡片插件 |
+| wdnav | `.venv/src/wdnav` | `origin` | editable 安装，MPP/RGA/V4L2 |
+| wdndds | `.venv/src/wdndds` | `origin` | editable 安装，DDS/RPC |
+| wdnhid | `.venv/src/wdnhid` | **`rk`** | editable 安装，USB Gadget HID |
+
+根目录的 `vrepo`（纯标准库、单文件、可执行）把这 7 个仓当**一个 manifest**
+统筹，避免「逐个 cd 进去手工来一遍」：
+
+```bash
+./vrepo status            # 一屏看清 7 个仓的状态（最常用）
+./vrepo status --fetch    # 先刷新远端跟踪引用再看
+./vrepo sync -j 4         # 并行 fetch + ff-only 前进
+./vrepo sync --reinstall  # 顺带重装 HEAD 变动 / 版本漂移的 editable 包
+./vrepo doctor            # 一致性体检
+./vrepo forall -c 'git log -1 --oneline'
+./vrepo log -n 30         # 跨仓库合并的提交流
+./vrepo grep 'LLMSession' -i
+```
+
+零配置：没有 manifest 时自动扫描 `.` + `.venv/src/*`；`./vrepo init` 才落盘
+`.vrepo/manifest.json`（该目录已 gitignore —— 里面记的是各机器的本地路径）。
+
+**四个必须知道的坑**（都在代码里处理了，但改脚本时别改回去）：
+
+1. **远端名不一定是 `origin`** —— wdnhid 用的是 `rk`。工具从 upstream
+   反推远端名，取不到再回落到第一个已配置远端。写死 `origin` 会让 wdnhid
+   的 fetch/push 直接失败。
+2. **ahead/behind 可能是旧账** —— 它们来自**本地**远端跟踪引用。`fetch`
+   之后才准；`status` 默认不联网（快），要准就加 `--fetch`。
+3. **本地有提交时 push 会被拒** —— 非快进失败时工具提示
+   `vrepo sync --rebase`（把本地提交 rebase 到远端之上），而不是干巴巴报错。
+   `sync` 默认 `merge --ff-only`，**绝不**自动产生 merge commit。
+4. **editable 安装会漂移** —— 源码 `pyproject.toml` 的版本和 site-packages
+   里装的可能对不上（本仓 wdnai 就出现过装 0.6.0 / 源码 0.7.0）。
+   `doctor` 点名，`sync --reinstall` 重装。
+
+**与 `update_rkwhl.sh` 的分工**：`vrepo sync --reinstall` 覆盖的是
+「拉最新 + `pip install -e --no-deps`」这一步，且**跨全部 7 个仓**
+（含本仓与两个卡片插件包）。但 `update_rkwhl.sh` 仍独占三件事 vrepo 不做：
+`verify_outputs`（装完校验 `.so` 真的在位）、`purge_install_traces`
+（清旧 `.pth` 痕迹）、目录缺失时从 SSH URL 装。**新机器**仍必须先跑
+`bootstrap_wdndds_native.sh`（apt 依赖 + native lib 铺开）——
+`vrepo` 不碰这些。
+
+`doctor` 另外会查：`index.lock` 残留（上次 git 操作崩过）、没有 upstream
+的仓（`sync`/`push` 会静默跳过它）、`.venv/bin/python` 是否存在。
+
 ## Layout
 
 ```

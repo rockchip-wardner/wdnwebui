@@ -37,3 +37,7 @@ package-lock.json
 
 # JSONC 配置文件（设备级，应该各机器独立维护）
 config.jsonc
+
+# vrepo（多仓库统筹工具）的本地状态目录
+# manifest 记录的是各机器的本地路径 / 远端名，不入仓
+.vrepo/

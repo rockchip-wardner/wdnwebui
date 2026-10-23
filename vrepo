@@ -1,0 +1,1690 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""vrepo —— wdnwebui 工作区多仓库统筹工具（对标 Android 的 `repo`）。
+
+把「本仓 + .venv/src/ 下的各个 SDK」当成**一个 manifest** 来管，对所有
+git 仓库做统一的 status / sync / push / log / diff / grep / branch /
+forall 等操作，而不是逐个 cd 进去手工来一遍。
+
+    vrepo list                  # 列出所有被管理的仓库
+    vrepo status                # 一屏看清 7 个仓库的状态（最常用）
+    vrepo status --fetch        # 先刷新远端跟踪引用再看（否则 ahead/behind 是旧账）
+    vrepo sync -j 4             # 并行 fetch + ff-only 前进
+    vrepo sync --reinstall      # 顺带把 HEAD 变动 / 版本漂移的包重装 editable
+    vrepo doctor                # 一致性体检（editable 漂移 / 无 upstream / 脏树）
+    vrepo forall -c 'git log -1 --oneline'   # 在每个仓库里跑一条命令
+    vrepo log -n 20             # 跨仓库合并的提交流（按时间倒序）
+    vrepo manifest -r -w        # 记录当前各仓库 HEAD（可复现快照）
+
+设计约束
+--------
+* **零配置**：没有 manifest 时自动扫描 `.` + `.venv/src/*`，凡是独立 git
+  仓库就算一个 project；`vrepo init` 才会落盘 `.vrepo/manifest.json`。
+* **只用标准库**：不依赖 venv 里的任何东西（`pip` 只在 `--reinstall` 时才调）。
+* **危险操作需要显式授权**：`clean` 默认只预览，真删必须 `--force`；其余
+  写操作都支持 `--dry-run`。
+* **sync 绝不自动产生 merge commit**：默认 `merge --ff-only`；要把本地
+  提交 rebase 到远端之上，显式 `--rebase`。
+* **不越权**：任何命令都不会自动 `commit` / `reset --hard` / `push --force`。
+
+几个容易踩的点（都已在代码里处理）
+----------------------------------
+* **远端名不一定是 `origin`**：wdnhid 用的是 `rk`。本工具一律从 upstream
+  反推远端名，取不到再回落到第一个已配置远端。
+* **ahead/behind 可能是旧账**：它们来自本地远端跟踪引用，`fetch` 之后才
+  准。`status --fetch` 会先刷新；`sync` 内部本来就先 fetch。
+* **本地有提交时 push 会被拒**：非快进失败时本工具会提示
+  `vrepo sync --rebase`（把本地提交挪到远端之上）而不是干巴巴报错。
+* **editable 安装会漂移**：源码里 `pyproject.toml` 的版本和 site-packages
+  里装的可能不是一回事（本仓 wdnai 就出现过 0.6.0 / 0.7.0 不一致）。
+  `doctor` 会点名，`sync --reinstall` 会重装。
+* **pinned 快照恢复用完整 sha**：manifest 里记的是完整 sha，`sync -c` 会把
+  仓库 detach 到那个提交上（可复现，不是"分支名"）。
+
+forall 的变量替换
+-----------------
+    %p  仓库绝对路径      %r  仓库名        %b  当前分支
+    %n  仓库名            %h  当前 HEAD 短 sha
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# 常量
+# --------------------------------------------------------------------------
+
+MANIFEST_DIR = ".vrepo"
+MANIFEST_FILE = "manifest.json"
+MANIFEST_VERSION = 1
+
+#: 自动扫描的目录（相对工作区根）。每个子目录若自身是独立 git 仓库即入册。
+SCAN_DIRS = (".venv/src",)
+
+#: git 子进程默认超时（秒）。网络远端 fetch 可能很慢，给足。
+GIT_TIMEOUT = 900
+
+#: 输出上限，避免 grep 刷屏。
+MAX_OUTPUT_LINES = 300
+
+EXIT_OK = 0
+EXIT_PROBLEM = 1
+EXIT_USAGE = 2
+
+
+# --------------------------------------------------------------------------
+# 终端输出小工具
+# --------------------------------------------------------------------------
+
+
+class Color:
+    """ANSI 着色。NO_COLOR / 非 tty 时全部退化成空串。"""
+
+    def __init__(self, enabled: bool | None = None) -> None:
+        if enabled is None:
+            enabled = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        self.enabled = bool(enabled)
+        self.reset = "\033[0m" if self.enabled else ""
+        self.bold = "\033[1m" if self.enabled else ""
+        self.dim = "\033[2m" if self.enabled else ""
+        self.red = "\033[31m" if self.enabled else ""
+        self.green = "\033[32m" if self.enabled else ""
+        self.yellow = "\033[33m" if self.enabled else ""
+        self.blue = "\033[34m" if self.enabled else ""
+        self.cyan = "\033[36m" if self.enabled else ""
+
+    def paint(self, text: str, color: str) -> str:
+        if not self.enabled or not color:
+            return text
+        return f"{color}{text}{self.reset}"
+
+
+C = Color()
+_print_lock = threading.Lock()
+
+
+def dwidth(text: str) -> int:
+    """显示宽度（中文/全角算 2 列）。表格对齐必须用这个，不能用 len()。"""
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def pad(text: str, width: int, align: str = "left") -> str:
+    """按显示宽度补齐（超长则截断加省略号）。"""
+    cur = dwidth(text)
+    if cur > width:
+        out_text = ""
+        for ch in text:
+            if dwidth(out_text + ch) > max(0, width - 1):
+                break
+            out_text += ch
+        return out_text + "…" + " " * max(0, width - dwidth(out_text) - 1)
+    gap = max(0, width - cur)
+    if align == "right":
+        return " " * gap + text
+    if align == "center":
+        left = gap // 2
+        return " " * left + text + " " * (gap - left)
+    return text + " " * gap
+
+
+class Table:
+    """极简表格：按显示宽度对齐，支持每格单独着色。"""
+
+    def __init__(self, headers: list[str], aligns: list[str] | None = None) -> None:
+        self.headers = headers
+        self.aligns = aligns or ["left"] * len(headers)
+        self.rows: list[list[tuple[str, str]]] = []  # [(text, color)]
+
+    def add(self, cells) -> None:
+        row: list[tuple[str, str]] = []
+        for cell in cells:
+            row.append((cell, "") if isinstance(cell, str) else cell)
+        self.rows.append(row)
+
+    def render(self) -> str:
+        n = len(self.headers)
+        widths = [dwidth(h) for h in self.headers]
+        for row in self.rows:
+            for i in range(min(n, len(row))):
+                widths[i] = max(widths[i], dwidth(row[i][0]))
+        lines = []
+        head = "  ".join(pad(self.headers[i], widths[i], self.aligns[i]) for i in range(n))
+        lines.append(C.paint(head, C.bold))
+        for row in self.rows:
+            cells = []
+            for i in range(n):
+                text, color = row[i] if i < len(row) else ("", "")
+                cells.append(C.paint(pad(text, widths[i], self.aligns[i]), color))
+            lines.append("  ".join(cells).rstrip())
+        return "\n".join(lines)
+
+
+def out(msg: str = "") -> None:
+    with _print_lock:
+        print(msg, flush=True)
+
+
+def out_block(title: str, lines: list[str], color: str = "") -> None:
+    """串行整块打印，避免多线程输出互相穿插。"""
+    with _print_lock:
+        print(C.paint(title, color or C.bold), flush=True)
+        for line in lines or []:
+            for sub in (line or "").splitlines() or [""]:
+                print("    " + sub, flush=True)
+
+
+def die(msg: str, code: int = EXIT_USAGE) -> None:
+    print(C.paint(f"vrepo: {msg}", C.red), file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def tail_lines(text: str, n: int = 3) -> list[str]:
+    lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
+    return lines[-n:] if lines else []
+
+
+# --------------------------------------------------------------------------
+# git 封装
+# --------------------------------------------------------------------------
+
+
+class GitError(RuntimeError):
+    pass
+
+
+def git(path: Path, *args: str, timeout: int = GIT_TIMEOUT, check: bool = False):
+    """跑一条 git 命令。返回 CompletedProcess（text 模式）。"""
+    cmd = ["git", "-C", str(path), *args]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, errors="replace"
+        )
+    except subprocess.TimeoutExpired:
+        raise GitError(f"git 命令超时（{timeout}s）: git {' '.join(args)}")
+    except FileNotFoundError:
+        raise GitError("找不到 git 可执行文件")
+    if check and proc.returncode != 0:
+        raise GitError(
+            f"git {' '.join(args)} 失败（rc={proc.returncode}）: "
+            f"{(proc.stderr or proc.stdout or '').strip()}"
+        )
+    return proc
+
+
+def git_out(path: Path, *args: str, default: str = "") -> str:
+    proc = git(path, *args)
+    if proc.returncode != 0:
+        return default
+    return proc.stdout.strip()
+
+
+# --------------------------------------------------------------------------
+# 数据模型
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Project:
+    """一个被管理的仓库。"""
+
+    name: str
+    path: Path  # 绝对路径
+    rel: str  # 相对工作区根
+    revision: str = "master"  # 期望分支
+    remote: str = ""  # manifest 记录的远端名（空 → 运行时探测）
+    editable: bool = False  # 是否 pip editable 安装（需要 --reinstall）
+    pinned: str = ""  # manifest -r 记录的 HEAD（可复现快照）
+
+    @property
+    def short_rel(self) -> str:
+        return self.rel if self.rel else "."
+
+
+@dataclass
+class State:
+    """某个仓库的实时状态。"""
+
+    ok: bool = True
+    branch: str = "-"
+    sha: str = ""
+    subject: str = ""
+    date: str = ""
+    upstream: str = ""
+    remote: str = ""
+    remote_url: str = ""
+    ahead: int | None = None
+    behind: int | None = None
+    dirty: int = 0  # 已跟踪文件的改动数（staged + unstaged）
+    untracked: int = 0
+    staged: int = 0
+    detached: bool = False
+    error: str = ""
+
+    @property
+    def clean(self) -> bool:
+        return self.dirty == 0 and self.untracked == 0
+
+    @property
+    def sync_indicator(self) -> str:
+        if self.ahead is None or self.behind is None:
+            return "?"
+        if self.ahead and self.behind:
+            return f"↑{self.ahead}↓{self.behind}"
+        if self.ahead:
+            return f"↑{self.ahead}"
+        if self.behind:
+            return f"↓{self.behind}"
+        return "="
+
+
+def collect_state(proj: Project) -> State:
+    """一次性把一个仓库的状态查清楚。几个小 git 调用，7 个仓库也就几十毫秒。"""
+    st = State()
+    if not (proj.path / ".git").exists():
+        # 可能是 worktree / 裸库式布局，用 rev-parse 兜底判断
+        if git(proj.path, "rev-parse", "--git-dir").returncode != 0:
+            st.ok = False
+            st.error = "不是 git 仓库"
+            return st
+
+    st.branch = git_out(proj.path, "rev-parse", "--abbrev-ref", "HEAD") or "-"
+    st.detached = st.branch == "HEAD"
+
+    head = git_out(
+        proj.path, "log", "-1", "--pretty=format:%h%x1f%ad%x1f%s", "--date=short"
+    )
+    if head:
+        parts = head.split("\x1f")
+        st.sha = parts[0] if parts else ""
+        st.date = parts[1] if len(parts) > 1 else ""
+        st.subject = parts[2] if len(parts) > 2 else ""
+
+    st.upstream = git_out(
+        proj.path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
+    )
+
+    # 远端名：优先用 upstream 的前缀，其次 manifest 记录，再次 origin，
+    # 最后第一个已配置远端（wdnhid 的远端就叫 `rk`，不能假定是 origin）。
+    remote = st.upstream.split("/")[0] if st.upstream else ""
+    if not remote and proj.remote:
+        remote = proj.remote
+    if not remote:
+        remotes = git_out(proj.path, "remote")
+        remote = remotes.splitlines()[0].strip() if remotes else ""
+    st.remote = remote
+    if remote:
+        st.remote_url = git_out(proj.path, "remote", "get-url", remote)
+
+    # ahead / behind（一次调用拿到两个数）
+    if st.upstream:
+        proc = git(
+            proj.path, "rev-list", "--left-right", "--count", f"{st.upstream}...HEAD"
+        )
+        if proc.returncode == 0:
+            nums = proc.stdout.split()
+            if len(nums) == 2:
+                st.behind = int(nums[0])  # left = 仅 upstream 有的 = 落后
+                st.ahead = int(nums[1])  # right = 仅 HEAD 有的 = 领先
+
+    # 工作区
+    status = git_out(proj.path, "status", "--porcelain")
+    if status:
+        for line in status.splitlines():
+            if not line:
+                continue
+            xy = line[:2]
+            if xy == "??":
+                st.untracked += 1
+            else:
+                st.dirty += 1
+                if xy[0] not in (" ", "?"):
+                    st.staged += 1
+    return st
+
+
+# --------------------------------------------------------------------------
+# manifest / 发现
+# --------------------------------------------------------------------------
+
+
+def find_workspace_root() -> Path:
+    """定位工作区根。
+
+    优先级：$VREPO_ROOT → 脚本所在目录（脚本就住在工作区根）→ 含 manifest
+    的祖先 → 含 .venv/src 的祖先 → 当前目录。
+    """
+    env_root = os.environ.get("VREPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+
+    script_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd().resolve()
+    candidates: list[Path] = []
+    for base in (script_dir, cwd):
+        for parent in [base, *base.parents]:
+            candidates.append(parent)
+
+    for c in candidates:
+        if (c / MANIFEST_DIR / MANIFEST_FILE).exists():
+            return c
+    for c in candidates:
+        if any((c / d).is_dir() for d in SCAN_DIRS):
+            return c
+    return script_dir
+
+
+def is_git_repo(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if (path / ".git").exists():
+        return True
+    return git(path, "rev-parse", "--git-dir").returncode == 0
+
+
+def discover_projects(root: Path) -> list[Project]:
+    """零配置发现：工作区根 + SCAN_DIRS 下的一层子目录。"""
+    found: list[Project] = []
+    if is_git_repo(root):
+        found.append(Project(name=root.name, path=root, rel="."))
+    for d in SCAN_DIRS:
+        base = root / d
+        if not base.is_dir():
+            continue
+        for child in sorted(base.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            if is_git_repo(child):
+                found.append(
+                    Project(
+                        name=child.name,
+                        path=child,
+                        rel=str(child.relative_to(root)),
+                        editable=True,
+                    )
+                )
+    return found
+
+
+def manifest_path(root: Path) -> Path:
+    return root / MANIFEST_DIR / MANIFEST_FILE
+
+
+def load_manifest(root: Path) -> tuple[list[Project], bool]:
+    """返回 (projects, 是否来自已存在的 manifest 文件)。"""
+    path = manifest_path(root)
+    if not path.exists():
+        return discover_projects(root), False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"manifest 解析失败 ({path}): {exc}")
+    projects: list[Project] = []
+    for item in data.get("projects", []):
+        p = Path(item.get("path", "."))
+        abs_path = (root / p).resolve()
+        projects.append(
+            Project(
+                name=item.get("name") or abs_path.name,
+                path=abs_path,
+                rel=str(p),
+                revision=item.get("revision", "master"),
+                remote=item.get("remote", ""),
+                editable=bool(item.get("editable", False)),
+                pinned=item.get("pinned", ""),
+            )
+        )
+    if not projects:
+        return discover_projects(root), False
+    return projects, True
+
+
+def project_payload(proj: Project) -> dict:
+    data = {
+        "name": proj.name,
+        "path": proj.rel,
+        "revision": proj.revision,
+        "remote": proj.remote,
+        "editable": proj.editable,
+    }
+    if proj.pinned:
+        data["pinned"] = proj.pinned
+    return data
+
+
+def save_manifest(root: Path, projects: list[Project], path: Path | None = None) -> Path:
+    path = path or manifest_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": MANIFEST_VERSION, "projects": [project_payload(p) for p in projects]}
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return path
+
+
+# --------------------------------------------------------------------------
+# 上下文 & 并发
+# --------------------------------------------------------------------------
+
+
+class Context:
+    def __init__(self, args) -> None:
+        self.root = find_workspace_root()
+        self.args = args
+        self.projects, self.from_manifest = load_manifest(self.root)
+        self._states: dict[str, State] = {}
+        self._lock = threading.Lock()
+
+    # -- 选择子集 ---------------------------------------------------------
+    def selected(self) -> list[Project]:
+        projs = list(self.projects)
+
+        only: list[str] = []
+        for attr in ("only", "projects"):
+            val = getattr(self.args, attr, None) or []
+            if isinstance(val, str):
+                val = [val]
+            only.extend(val)
+        if only:
+            wanted = set(only)
+            known = {p.name for p in projs}
+            unknown = wanted - known
+            if unknown:
+                die(f"未知仓库: {', '.join(sorted(unknown))}（已知: {', '.join(sorted(known))}）")
+            projs = [p for p in projs if p.name in wanted]
+
+        skip = set(getattr(self.args, "skip", None) or [])
+        if skip:
+            projs = [p for p in projs if p.name not in skip]
+        return projs
+
+    # -- 状态缓存 ---------------------------------------------------------
+    def state(self, proj: Project) -> State:
+        with self._lock:
+            if proj.name not in self._states:
+                self._states[proj.name] = collect_state(proj)
+            return self._states[proj.name]
+
+    def jobs(self) -> int:
+        explicit = getattr(self.args, "jobs", None)
+        if explicit:
+            return max(1, explicit)
+        return max(1, min(8, len(self.projects)))
+
+
+def run_parallel(items, func, jobs: int, fail_fast: bool = False):
+    """并发跑 func(item)。
+
+    返回 [(item, result, exc)]，按输入顺序排列。func 抛异常时 result=None。
+    """
+    results: list[tuple] = []
+    if not items:
+        return results
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        futures = {pool.submit(func, item): item for item in items}
+        for fut in concurrent.futures.as_completed(futures):
+            item = futures[fut]
+            try:
+                results.append((item, fut.result(), None))
+            except Exception as exc:  # noqa: BLE001
+                results.append((item, None, exc))
+                if fail_fast:
+                    for other in futures:
+                        other.cancel()
+                    break
+    order = {id(i): n for n, i in enumerate(items)}
+    results.sort(key=lambda r: order.get(id(r[0]), 0))
+    return results
+
+
+# --------------------------------------------------------------------------
+# editable 安装状态（doctor / sync --reinstall 复用）
+# --------------------------------------------------------------------------
+
+
+def normalize_pkg(name: str) -> str:
+    return re.sub(r"[-_.]+", "_", name.strip().lower())
+
+
+def venv_python(root: Path) -> Path | None:
+    for rel in (".venv/bin/python", "venv/bin/python"):
+        p = root / rel
+        if p.exists():
+            return p
+    return None
+
+
+def site_packages_dirs(root: Path) -> list[Path]:
+    base = root / ".venv" / "lib"
+    if not base.is_dir():
+        return []
+    return [p / "site-packages" for p in sorted(base.iterdir()) if p.is_dir()]
+
+
+def declared_version(proj: Project) -> tuple[str, str]:
+    """返回 (包名, pyproject 里声明的版本)；读不到返回 ("", "")。"""
+    pyproject = proj.path / "pyproject.toml"
+    if not pyproject.exists():
+        return ("", "")
+    name = version = ""
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return ("", "")
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if not name and s.startswith("name") and "=" in s:
+            name = s.split("=", 1)[1].strip().strip('"').strip("'")
+        elif not version and s.startswith("version") and "=" in s:
+            version = s.split("=", 1)[1].strip().strip('"').strip("'")
+    return (name, version)
+
+
+def installed_version(root: Path, pkg_name: str) -> tuple[str, str]:
+    """返回 (已安装版本, dist-info 路径)；没装返回 ("", "")。"""
+    if not pkg_name:
+        return ("", "")
+    target = normalize_pkg(pkg_name)
+    for sp in site_packages_dirs(root):
+        if not sp.is_dir():
+            continue
+        for entry in sorted(sp.glob("*.dist-info")):
+            stem = entry.name[: -len(".dist-info")]
+            if normalize_pkg(stem.rsplit("-", 1)[0]) != target:
+                continue
+            ver = stem.rsplit("-", 1)[1] if "-" in stem else ""
+            return (ver, str(entry))
+    return ("", "")
+
+
+def editable_state(root: Path, proj: Project) -> dict:
+    """判断某仓库的 editable 安装是否「新鲜」。"""
+    pkg, want = declared_version(proj)
+    if not pkg:
+        return {"applicable": False, "reason": "没有 pyproject.toml"}
+    got, _dist_info = installed_version(root, pkg)
+    if not got:
+        return {
+            "applicable": True,
+            "pkg": pkg,
+            "declared": want,
+            "installed": "",
+            "stale": True,
+            "reason": "未安装（editable）",
+        }
+    stale = bool(want) and want != got
+    return {
+        "applicable": True,
+        "pkg": pkg,
+        "declared": want,
+        "installed": got,
+        "stale": stale,
+        "reason": "版本漂移" if stale else "一致",
+    }
+
+
+# --------------------------------------------------------------------------
+# 命令实现
+# --------------------------------------------------------------------------
+
+
+def cmd_list(ctx: Context) -> int:
+    projects = ctx.selected()
+    if not projects:
+        out("没有找到任何仓库。")
+        return EXIT_PROBLEM
+    table = Table(
+        ["名称", "路径", "分支", "HEAD", "远端", "说明"], ["left"] * 6
+    )
+    for proj in projects:
+        st = ctx.state(proj)
+        note = []
+        if not st.clean:
+            note.append(work_cell_text(st))
+        if st.ahead:
+            note.append(f"↑{st.ahead}")
+        if st.behind:
+            note.append(f"↓{st.behind}")
+        table.add(
+            [
+                proj.name,
+                proj.short_rel,
+                st.branch,
+                st.sha or "-",
+                st.remote or "-",
+                " ".join(note) if note else "clean",
+            ]
+        )
+    out(table.render())
+    out("")
+    out(
+        f"共 {len(projects)} 个仓库（工作区根 {ctx.root}）"
+        + ("" if ctx.from_manifest else "｜manifest 未落盘，`vrepo init` 可固化")
+    )
+    return EXIT_OK
+
+
+def cmd_info(ctx: Context) -> int:
+    for proj in ctx.selected():
+        st = ctx.state(proj)
+        out(C.paint(f"=== {proj.name} ===", C.bold))
+        out(f"  路径      : {proj.path}")
+        out(f"  相对路径  : {proj.short_rel}")
+        out(f"  分支      : {st.branch}{' (detached)' if st.detached else ''}")
+        out(f"  HEAD      : {st.sha}  {st.date}  {st.subject}")
+        out(f"  远端      : {st.remote or '(无)'}  {st.remote_url}")
+        out(f"  upstream  : {st.upstream or '(无)'}")
+        out(
+            "  领先/落后 : "
+            + (f"{st.ahead} / {st.behind}" if st.ahead is not None else "(无 upstream)")
+        )
+        out(
+            "  工作区    : "
+            + (
+                "clean"
+                if st.clean
+                else f"{st.dirty} 处改动（staged {st.staged}）+ {st.untracked} 个未跟踪"
+            )
+        )
+        if proj.editable:
+            es = editable_state(ctx.root, proj)
+            if es.get("applicable"):
+                mark = C.paint("漂移", C.yellow) if es.get("stale") else "一致"
+                out(
+                    f"  editable  : {es['pkg']} 装的是 {es.get('installed') or '-'}，"
+                    f"源码声明 {es.get('declared') or '-'} → {mark}"
+                )
+        out("")
+    return EXIT_OK
+
+
+def work_cell_text(st: State) -> str:
+    """工作区摘要文案。"""
+    if st.clean:
+        return "clean"
+    bits = []
+    if st.dirty:
+        bits.append(f"{st.dirty}处改动")
+    if st.untracked:
+        bits.append(f"{st.untracked}个未跟踪")
+    return "/".join(bits)
+
+
+def cmd_status(ctx: Context) -> int:
+    projects = ctx.selected()
+    if not projects:
+        out("没有找到任何仓库。")
+        return EXIT_PROBLEM
+
+    # --fetch：先刷新远端跟踪引用，否则 ahead/behind 是「上次 fetch 时的旧账」
+    if getattr(ctx.args, "fetch", False):
+        def do_fetch(proj: Project):
+            st = ctx.state(proj)
+            if not st.remote:
+                return None
+            return git(proj.path, "fetch", st.remote, "--prune").returncode
+
+        run_parallel(projects, do_fetch, ctx.jobs())
+        ctx._states.clear()  # 状态缓存作废，重新采一遍
+
+    results = run_parallel(projects, lambda p: ctx.state(p), ctx.jobs())
+    table = Table(
+        ["名称", "分支", "HEAD", "同步", "工作区", "最近提交"], ["left"] * 6
+    )
+    n_dirty = n_behind = n_ahead = n_err = 0
+    for proj, st, exc in results:
+        if exc is not None or st is None or not st.ok:
+            n_err += 1
+            msg = str(exc) if exc else (st.error if st else "未知错误")
+            table.add([proj.name, "-", "-", "?", (msg or "错误", C.red), ""])
+            continue
+        if st.behind:
+            n_behind += 1
+        if st.ahead:
+            n_ahead += 1
+        if not st.clean:
+            n_dirty += 1
+        sync_color = C.yellow if st.behind else (C.cyan if st.ahead else C.green)
+        table.add(
+            [
+                proj.name,
+                st.branch,
+                st.sha,
+                (st.sync_indicator, sync_color),
+                (work_cell_text(st), "" if st.clean else C.yellow),
+                st.subject,
+            ]
+        )
+    out(table.render())
+    out("")
+    parts = [f"{len(projects)} 个仓库"]
+    if n_dirty:
+        parts.append(f"{n_dirty} 个工作区有改动")
+    if n_ahead:
+        parts.append(f"{n_ahead} 个有未推送提交")
+    if n_behind:
+        parts.append(f"{n_behind} 个落后远端")
+    if n_err:
+        parts.append(f"{n_err} 个出错")
+    if len(parts) == 1:
+        parts.append("全部干净且与远端同步")
+    out("｜".join(parts))
+    if getattr(ctx.args, "exit_zero", False):
+        return EXIT_OK
+    return EXIT_PROBLEM if (n_dirty or n_behind or n_err) else EXIT_OK
+
+
+def cmd_sync(ctx: Context) -> int:
+    projects = ctx.selected()
+    dry = getattr(ctx.args, "dry_run", False)
+    rebase = getattr(ctx.args, "rebase", False)
+    checkout = getattr(ctx.args, "checkout", False)
+    fetch_only = getattr(ctx.args, "fetch_only", False)
+    reinstall = getattr(ctx.args, "reinstall", False)
+    failures = 0
+    moved: list[Project] = []
+
+    def work(proj: Project):
+        st = ctx.state(proj)
+        lines: list[str] = []
+        if not st.ok:
+            raise GitError(st.error or "状态读取失败")
+        if not st.remote:
+            return {"lines": [C.paint("没有配置远端，跳过", C.yellow)], "moved": False}
+        if dry:
+            lines.append(f"[dry-run] git fetch {st.remote} --prune")
+            if st.behind:
+                lines.append(f"[dry-run] git merge --ff-only {st.upstream}")
+            return {"lines": lines, "moved": False}
+
+        proc = git(proj.path, "fetch", st.remote, "--prune")
+        if proc.returncode != 0:
+            raise GitError("fetch 失败: " + " | ".join(tail_lines(proc.stderr or proc.stdout, 1)))
+        lines.append(f"fetch {st.remote} --prune  ok")
+
+        # pinned 快照恢复：先落到 manifest 记的那个提交上，再谈合并
+        if checkout and proj.pinned:
+            # manifest 里可能是短 sha，统一解析成完整 sha 再比
+            pinned_full = git_out(proj.path, "rev-parse", f"{proj.pinned}^{{commit}}")
+            if not pinned_full:
+                raise GitError(f"manifest 里的 pinned 提交不存在: {proj.pinned}")
+            head_now = git_out(proj.path, "rev-parse", "HEAD")
+            detached_at_pinned = (
+                head_now == pinned_full
+                and git_out(proj.path, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+            )
+            if not detached_at_pinned:
+                # 只比对 sha 不够——同一个 sha 上还挂着别的分支，
+                # 快照恢复要求的是「落在这个提交上且 detached」
+                proc = git(proj.path, "checkout", "--detach", pinned_full)
+                if proc.returncode != 0:
+                    raise GitError(
+                        "checkout pinned 失败: " + " | ".join(tail_lines(proc.stderr, 1))
+                    )
+                lines.append(f"checkout {pinned_full[:8]} (pinned, detached)")
+
+        if fetch_only:
+            return {"lines": lines, "moved": False}
+
+        # fetch 之后重新算 ahead/behind
+        behind = ahead = 0
+        if st.upstream:
+            proc = git(proj.path, "rev-list", "--left-right", "--count", "@{u}...HEAD")
+            if proc.returncode == 0 and len(proc.stdout.split()) == 2:
+                behind, ahead = (int(x) for x in proc.stdout.split())
+        else:
+            lines.append(C.paint("没有 upstream，无法快进", C.yellow))
+            return {"lines": lines, "moved": False}
+
+        if behind:
+            if rebase:
+                proc = git(proj.path, "pull", "--rebase")
+                action = "pull --rebase"
+            else:
+                proc = git(proj.path, "merge", "--ff-only", "@{u}")
+                action = "merge --ff-only"
+            if proc.returncode != 0:
+                err = " | ".join(tail_lines(proc.stderr or proc.stdout, 2))
+                hint = "（本地有分叉提交？试试 --rebase）" if ahead else ""
+                raise GitError(f"{action} 失败: {err}{hint}")
+            lines.append(f"{action}  前进 {behind} 个提交")
+            return {"lines": lines, "moved": True}
+        if ahead:
+            lines.append(f"已是最新（本地领先 {ahead} 个提交，未推送）")
+        else:
+            lines.append("已是最新")
+        return {"lines": lines, "moved": False}
+
+    results = run_parallel(
+        projects, work, ctx.jobs(), getattr(ctx.args, "fail_fast", False)
+    )
+    for proj, res, exc in results:
+        if exc is not None:
+            failures += 1
+            out_block(f"==> {proj.name}  ✗", [str(exc)], C.red)
+            continue
+        if res.get("moved"):
+            moved.append(proj)
+        out_block(f"==> {proj.name}  ✓", res["lines"], C.green)
+
+    if reinstall and not dry:
+        failures += reinstall_editable(ctx, moved)
+    elif reinstall and dry:
+        out("")
+        out("[dry-run] 将按 HEAD 变动 / 版本漂移重装 editable 包")
+
+    out("")
+    if failures:
+        out(C.paint(f"同步结束：{failures} 个仓库失败", C.red))
+        return EXIT_PROBLEM
+    out(C.paint("同步结束：全部成功", C.green))
+    return EXIT_OK
+
+
+def reinstall_editable(ctx: Context, moved: list[Project]) -> int:
+    """把「HEAD 动过」或「editable 版本漂移」的包重装一遍。"""
+    root = ctx.root
+    py = venv_python(root)
+    if not py:
+        out(C.paint("找不到 .venv/bin/python，跳过 editable 重装", C.yellow))
+        return 0
+    failures = 0
+    targets: list[tuple[Project, str]] = []
+    for proj in ctx.selected():
+        if not proj.editable:
+            continue
+        es = editable_state(root, proj)
+        if not es.get("applicable"):
+            continue
+        if proj in moved:
+            targets.append((proj, "HEAD 变动"))
+        elif es.get("stale"):
+            targets.append(
+                (proj, f"版本漂移 {es.get('installed') or '未装'}→{es.get('declared') or '?'}")
+            )
+    if not targets:
+        out("editable 安装全部新鲜，无需重装。")
+        return 0
+    with_deps = getattr(ctx.args, "with_deps", False)
+    for proj, reason in targets:
+        cmd = [str(py), "-m", "pip", "install", "-e", str(proj.path)]
+        if not with_deps:
+            cmd.append("--no-deps")
+        out_block(f"==> reinstall {proj.name} ({reason})", [" ".join(cmd)], C.cyan)
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        if proc.returncode != 0:
+            failures += 1
+            out_block("    ✗ 失败", tail_lines(proc.stderr or proc.stdout, 3), C.red)
+        else:
+            ok = [
+                ln
+                for ln in (proc.stdout or "").splitlines()
+                if "Successfully" in ln or "ERROR" in ln
+            ]
+            out_block("    ✓ 完成", ok[-2:] or ["(ok)"], C.green)
+    return failures
+
+
+def cmd_fetch(ctx: Context) -> int:
+    ctx.args.rebase = False
+    ctx.args.checkout = False
+    ctx.args.fetch_only = True
+    ctx.args.reinstall = False
+    return cmd_sync(ctx)
+
+
+def cmd_push(ctx: Context) -> int:
+    projects = ctx.selected()
+    dry = getattr(ctx.args, "dry_run", False)
+    failures = 0
+
+    def work(proj: Project):
+        st = ctx.state(proj)
+        if not st.ok:
+            raise GitError(st.error or "状态读取失败")
+        if not st.upstream:
+            return {"lines": [C.paint("没有 upstream，跳过", C.yellow)], "status": "skip"}
+        if not st.ahead:
+            return {"lines": [C.paint("没有待推送的提交", C.dim)], "status": "skip"}
+        cmd = ["git", "push"] + (["--dry-run"] if dry else [])
+        proc = subprocess.run(
+            cmd, cwd=str(proj.path), capture_output=True, text=True, errors="replace"
+        )
+        if proc.returncode != 0:
+            err = proc.stderr or proc.stdout or ""
+            hint = ""
+            if any(
+                k in err
+                for k in ("non-fast-forward", "fast-forwards", "fetch first", "rejected")
+            ):
+                hint = "｜远端有新提交：先 `vrepo sync --rebase` 把本地提交挪到远端之上"
+            raise GitError(
+                "push 失败: " + " | ".join(tail_lines(err, 1)) + hint
+            )
+        prefix = "[dry-run] " if dry else ""
+        lines = [prefix + ln for ln in tail_lines(proc.stdout, 4)]
+        return {"lines": lines, "status": "ok"}
+
+    results = run_parallel(
+        projects, work, ctx.jobs(), getattr(ctx.args, "fail_fast", False)
+    )
+    for proj, res, exc in results:
+        if exc is not None:
+            failures += 1
+            out_block(f"==> {proj.name}  ✗", [str(exc)], C.red)
+            continue
+        if res["status"] == "skip":
+            out_block(f"==> {proj.name}  –", res["lines"], C.dim)
+        else:
+            out_block(f"==> {proj.name}  ✓", res["lines"] or ["(无输出)"], C.green)
+    out("")
+    if failures:
+        out(C.paint(f"推送结束：{failures} 个仓库失败", C.red))
+        return EXIT_PROBLEM
+    out(C.paint("推送结束：全部成功", C.green))
+    return EXIT_OK
+
+
+def cmd_forall(ctx: Context) -> int:
+    projects = ctx.selected()
+    args = ctx.args
+    # `-c/--command`（repo 兼容）与末尾位置参数二选一
+    command = (args.command or "").strip() or " ".join(args.cmd or [])
+    if not command.strip():
+        die("forall 需要一条命令，例如：vrepo forall -c 'git log -1 --oneline'")
+    quiet = getattr(args, "quiet", False)
+    prefix = getattr(args, "prefix", True)
+    failures = 0
+
+    def expand(proj: Project) -> str:
+        st = ctx.state(proj)
+        return (
+            command.replace("%p", str(proj.path))
+            .replace("%n", proj.name)
+            .replace("%r", proj.name)
+            .replace("%b", st.branch or "")
+            .replace("%h", st.sha or "")
+        )
+
+    def work(proj: Project):
+        proc = subprocess.run(
+            expand(proj),
+            cwd=str(proj.path),
+            shell=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        return proc
+
+    results = run_parallel(projects, work, ctx.jobs(), getattr(args, "fail_fast", False))
+    for proj, proc, exc in results:
+        if exc is not None:
+            failures += 1
+            out_block(f"==> {proj.name}  ✗", [str(exc)], C.red)
+            continue
+        if proc.returncode != 0:
+            failures += 1
+        if quiet:
+            if proc.returncode != 0:
+                out_block(f"==> {proj.name}  ✗ rc={proc.returncode}", [], C.red)
+            continue
+        body = (proc.stdout or "") + (proc.stderr or "")
+        for ln in body.splitlines():
+            if not ln.strip():
+                continue
+            out(f"[{proj.name}] {ln}" if prefix else ln)
+        if proc.returncode != 0:
+            out_block(f"==> {proj.name}  ✗ rc={proc.returncode}", [], C.red)
+    out("")
+    out(f"forall 结束：{len(projects)} 个仓库，{failures} 个失败")
+    return EXIT_PROBLEM if failures else EXIT_OK
+
+
+def cmd_log(ctx: Context) -> int:
+    projects = ctx.selected()
+    args = ctx.args
+    limit = args.max_count or 20
+    extra: list[str] = []
+    if args.since:
+        extra += ["--since", args.since]
+    if args.author:
+        extra += ["--author", args.author]
+    if args.grep:
+        extra += ["--grep", args.grep]
+
+    def work(proj: Project):
+        proc = git(
+            proj.path,
+            "log",
+            f"-n{limit * 3}",
+            "--pretty=format:%h%x1f%ad%x1f%s",
+            "--date=short",
+            *extra,
+        )
+        if proc.returncode != 0:
+            raise GitError((proc.stderr or "").strip() or "git log 失败")
+        return proc.stdout
+
+    results = run_parallel(projects, work, ctx.jobs())
+    entries = []
+    for proj, stdout, exc in results:
+        if exc or not stdout:
+            continue
+        for line in stdout.strip().splitlines():
+            parts = line.split("\x1f")
+            if len(parts) == 3:
+                entries.append((parts[1], proj.name, parts[0], parts[2]))
+    entries.sort(reverse=True)
+    table = Table(["日期", "仓库", "提交", "说明"], ["left"] * 4)
+    for date, name, sha, subject in entries[:limit]:
+        table.add([date, name, sha, subject])
+    out(table.render())
+    out("")
+    out(f"共 {len(entries)} 条提交（显示前 {min(limit, len(entries))} 条，按日期倒序）")
+    return EXIT_OK
+
+
+def cmd_diff(ctx: Context) -> int:
+    projects = ctx.selected()
+    extra = list(ctx.args.git_args or [])
+    found = False
+    for proj in projects:
+        st = ctx.state(proj)
+        if st.clean:
+            continue
+        found = True
+        out_block(f"==> {proj.name}", [], C.bold)
+        body: list[str] = []
+        proc = git(proj.path, "diff", "--stat", *extra)
+        body += (proc.stdout or "").strip().splitlines()
+        proc = git(proj.path, "diff", "--cached", "--stat", *extra)
+        cached = (proc.stdout or "").strip().splitlines()
+        if cached:
+            body.append("(staged)")
+            body += cached
+        if st.untracked:
+            body.append(f"(未跟踪 {st.untracked} 个)")
+            status = git_out(proj.path, "status", "--porcelain")
+            for line in status.splitlines():
+                if line.startswith("?? "):
+                    body.append("  " + line[3:])
+        for ln in body:
+            out("    " + ln)
+        out("")
+    if not found:
+        out("所有仓库的工作区都是干净的。")
+    return EXIT_OK
+
+
+def cmd_grep(ctx: Context) -> int:
+    projects = ctx.selected()
+    args = ctx.args
+    extra = list(args.git_args or [])
+    if args.ignore_case:
+        extra.append("-i")
+    if args.files_with_matches:
+        extra.append("-l")
+    if args.max_count:
+        extra += ["-m", str(args.max_count)]
+    hits = 0
+    shown = 0
+    for proj in projects:
+        proc = git(
+            proj.path,
+            "grep",
+            "--line-number",
+            "--color=never",
+            "-I",
+            "-e",
+            args.pattern,
+            *extra,
+        )
+        if proc.returncode not in (0, 1):
+            continue
+        for line in (proc.stdout or "").splitlines():
+            if not line:
+                continue
+            hits += 1
+            if shown < MAX_OUTPUT_LINES:
+                shown += 1
+                out(f"[{proj.name}] {line}")
+    out("")
+    if hits > MAX_OUTPUT_LINES:
+        out(f"共 {hits} 处命中（只显示前 {MAX_OUTPUT_LINES} 处）")
+    else:
+        out(f"共 {hits} 处命中")
+    return EXIT_OK if hits else EXIT_PROBLEM
+
+
+def cmd_branch(ctx: Context) -> int:
+    for proj in ctx.selected():
+        proc = git(proj.path, "branch", "-a", "--no-color", *(ctx.args.git_args or []))
+        out_block(f"==> {proj.name}", (proc.stdout or "").strip().splitlines(), C.bold)
+    return EXIT_OK
+
+
+def cmd_start(ctx: Context) -> int:
+    projects = ctx.selected()
+    branch = ctx.args.branch
+    base = ctx.args.base
+    failures = 0
+    for proj in projects:
+        st = ctx.state(proj)
+        if st.branch == branch:
+            out_block(f"==> {proj.name}  –", [f"已在 {branch}"], C.dim)
+            continue
+        exists = git(proj.path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        if exists.returncode == 0:
+            out_block(f"==> {proj.name}  –", [f"分支 {branch} 已存在，未切换"], C.yellow)
+            continue
+        cmd = ["git", "checkout", "-b", branch] + ([base] if base else [])
+        proc = subprocess.run(cmd, cwd=str(proj.path), capture_output=True, text=True)
+        if proc.returncode != 0:
+            failures += 1
+            out_block(
+                f"==> {proj.name}  ✗", tail_lines(proc.stderr or proc.stdout, 2), C.red
+            )
+        else:
+            out_block(f"==> {proj.name}  ✓", [f"创建并切到 {branch}"], C.green)
+    out("")
+    return EXIT_PROBLEM if failures else EXIT_OK
+
+
+def cmd_checkout(ctx: Context) -> int:
+    projects = ctx.selected()
+    target = ctx.args.branch
+    failures = 0
+    for proj in projects:
+        st = ctx.state(proj)
+        if st.branch == target:
+            out_block(f"==> {proj.name}  –", [f"已在 {target}"], C.dim)
+            continue
+        proc = subprocess.run(
+            ["git", "checkout", target],
+            cwd=str(proj.path),
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            failures += 1
+            out_block(
+                f"==> {proj.name}  ✗", tail_lines(proc.stderr or proc.stdout, 2), C.red
+            )
+        else:
+            out_block(f"==> {proj.name}  ✓", [f"切到 {target}"], C.green)
+    out("")
+    return EXIT_PROBLEM if failures else EXIT_OK
+
+
+def cmd_manifest(ctx: Context) -> int:
+    projects = ctx.selected()
+    if ctx.args.record:
+        for proj in projects:
+            # 记完整 sha：快照要能精确复现，短 sha 有歧义
+            proj.pinned = git_out(proj.path, "rev-parse", "HEAD")
+    if ctx.args.refresh:
+        discovered = {p.rel: p for p in discover_projects(ctx.root)}
+        for proj in projects:
+            if proj.rel in discovered:
+                proj.remote = discovered[proj.rel].remote
+                proj.editable = discovered[proj.rel].editable
+    elif not ctx.from_manifest:
+        # manifest 还没落盘：把运行时探测到的远端/分支补上，
+        # 免得打印出来的 manifest 一片空白
+        for proj in projects:
+            st = ctx.state(proj)
+            if not proj.remote:
+                proj.remote = st.remote
+            if st.branch and st.branch != "HEAD":
+                proj.revision = st.branch
+    payload = {
+        "version": MANIFEST_VERSION,
+        "projects": [project_payload(p) for p in projects],
+    }
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    if ctx.args.output:
+        path = Path(ctx.args.output)
+        if not path.is_absolute():
+            path = ctx.root / path
+        save_manifest(ctx.root, projects, path)
+        out(f"已写入 {path}")
+    elif ctx.args.write:
+        path = save_manifest(ctx.root, projects)
+        out(f"已写入 {path}")
+    else:
+        out(text.rstrip())
+    return EXIT_OK
+
+
+def cmd_init(ctx: Context) -> int:
+    projects = discover_projects(ctx.root)
+    if not projects:
+        die("没有发现任何 git 仓库")
+    for proj in projects:
+        st = ctx.state(proj)
+        proj.remote = st.remote
+        if st.branch and st.branch != "HEAD":
+            proj.revision = st.branch
+        proj.editable = proj.rel != "."
+    path = save_manifest(ctx.root, projects)
+    out(f"已写入 manifest: {path}")
+    out("")
+    table = Table(["名称", "路径", "分支", "远端", "editable"], ["left"] * 5)
+    for proj in projects:
+        table.add(
+            [
+                proj.name,
+                proj.short_rel,
+                proj.revision,
+                proj.remote or "-",
+                "是" if proj.editable else "否",
+            ]
+        )
+    out(table.render())
+    return EXIT_OK
+
+
+def cmd_doctor(ctx: Context) -> int:
+    projects = ctx.selected()
+    problems = 0
+    out(C.paint("vrepo doctor —— 工作区一致性体检", C.bold))
+    out("")
+    out(f"  工作区根  : {ctx.root}")
+    out(f"  git       : {git_out(ctx.root, '--version') or '(未知)'}")
+
+    py = venv_python(ctx.root)
+    out(f"  venv      : {py if py else C.paint('缺失（.venv/bin/python 不存在）', C.red)}")
+    if not py:
+        problems += 1
+
+    out("")
+    table = Table(["仓库", "检查项", "结果"], ["left"] * 3)
+    for proj in projects:
+        st = ctx.state(proj)
+        if not st.ok:
+            table.add([proj.name, "git 仓库", (st.error or "异常", C.red)])
+            problems += 1
+            continue
+        if not st.remote:
+            table.add([proj.name, "远端", ("未配置", C.red)])
+            problems += 1
+        else:
+            table.add([proj.name, "远端", (f"{st.remote}  {st.remote_url}", "")])
+        if not st.upstream:
+            table.add([proj.name, "upstream", ("未设置（sync/push 会跳过）", C.yellow)])
+            problems += 1
+        if st.clean:
+            table.add([proj.name, "工作区", ("clean", C.green)])
+        else:
+            table.add(
+                [
+                    proj.name,
+                    "工作区",
+                    (f"{st.dirty} 处改动 + {st.untracked} 个未跟踪", C.yellow),
+                ]
+            )
+            problems += 1
+        if st.ahead:
+            table.add([proj.name, "未推送", (f"领先远端 {st.ahead} 个提交", C.yellow)])
+            problems += 1
+        if st.behind:
+            table.add([proj.name, "落后远端", (f"落后 {st.behind} 个提交", C.yellow)])
+            problems += 1
+        gitdir = git_out(proj.path, "rev-parse", "--git-dir")
+        if gitdir:
+            lock = Path(gitdir)
+            if not lock.is_absolute():
+                lock = proj.path / lock
+            if (lock / "index.lock").exists():
+                table.add(
+                    [proj.name, "index.lock", ("残留锁文件，之前的 git 操作可能已崩溃", C.red)]
+                )
+                problems += 1
+        if proj.editable:
+            es = editable_state(ctx.root, proj)
+            if es.get("applicable"):
+                if es.get("stale"):
+                    table.add(
+                        [
+                            proj.name,
+                            "editable",
+                            (
+                                f"版本漂移：装的是 {es['installed'] or '未装'}，源码是 "
+                                f"{es['declared'] or '?'} → vrepo sync --reinstall",
+                                C.yellow,
+                            ),
+                        ]
+                    )
+                    problems += 1
+                else:
+                    table.add(
+                        [
+                            proj.name,
+                            "editable",
+                            (f"{es['pkg']} {es['installed']}（一致）", C.green),
+                        ]
+                    )
+    out(table.render())
+
+    if getattr(ctx.args, "net", False):
+        out("")
+        net_table = Table(["仓库", "远端可达性"], ["left"] * 2)
+        for proj in projects:
+            st = ctx.state(proj)
+            if not st.remote:
+                continue
+            proc = git(proj.path, "ls-remote", "--exit-code", st.remote, "HEAD", timeout=60)
+            if proc.returncode == 0:
+                net_table.add([proj.name, (f"可达 {st.remote}", C.green)])
+            else:
+                net_table.add([proj.name, (f"不可达 {st.remote}", C.red)])
+                problems += 1
+        out(net_table.render())
+
+    out("")
+    if problems:
+        out(C.paint(f"体检结束：{problems} 项需要注意", C.yellow))
+        return EXIT_PROBLEM
+    out(C.paint("体检结束：一切正常", C.green))
+    return EXIT_OK
+
+
+def cmd_clean(ctx: Context) -> int:
+    projects = ctx.selected()
+    force = getattr(ctx.args, "force", False)
+    extra = ["-x"] if getattr(ctx.args, "ignored", False) else []
+    total = 0
+    for proj in projects:
+        cmd = ["git", "clean", "-fd" if force else "-nd"] + extra
+        proc = subprocess.run(cmd, cwd=str(proj.path), capture_output=True, text=True)
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            continue
+        total += len(lines)
+        head = f"==> {proj.name}（将删除）" if force else f"==> {proj.name}（预览）"
+        out_block(
+            head,
+            lines[:40] + (["…"] if len(lines) > 40 else []),
+            C.yellow if force else C.dim,
+        )
+    out("")
+    if force:
+        out(f"共清理 {total} 项。")
+    else:
+        out(f"共 {total} 项可清理（预览模式）。加 --force 才会真正删除。")
+    return EXIT_OK
+
+
+def cmd_which(ctx: Context) -> int:
+    for proj in ctx.selected():
+        out(proj.path)
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+EPILOG = """\
+命令一览：
+  list      列出所有被管理的仓库
+  info      逐仓库详细信息（远端 / upstream / 领先落后 / editable 版本）
+  status    状态总览（--fetch 先刷新远端跟踪引用）
+  sync      并行 fetch + 快进（--rebase / --reinstall / --dry-run）
+  fetch     只并行 fetch
+  push      并行推送本地提交（--dry-run 预演）
+  forall    在每个仓库里跑一条命令（-c 与 repo 同义：命令）
+  log       跨仓库合并的提交列表（--since / --author / --grep）
+  diff      各仓库工作区差异统计
+  grep      跨仓库代码搜索（-i / -l / -m）
+  branch    列出各仓库分支
+  start     在所有仓库创建并切到同名分支
+  checkout  在所有仓库切换分支
+  manifest  查看/落盘 manifest（-r 记录 HEAD 快照，-w 写文件）
+  init      扫描并生成 .vrepo/manifest.json
+  doctor    一致性体检（--net 额外查远端可达性）
+  clean     清理未跟踪文件（默认只预览，--force 才真删）
+  which     打印仓库绝对路径
+
+示例：
+  vrepo status --fetch                 刷新后一屏看清所有仓库
+  vrepo sync -j 4 --reinstall          并行同步，必要时重装 editable 包
+  vrepo doctor                         体检：版本漂移 / 无 upstream / 脏树
+  vrepo forall -c 'git log -1 --oneline'
+  vrepo log -n 30 --since '2 weeks ago'
+  vrepo grep 'LLMSession' -i
+  vrepo manifest -r -w                 记录当前 HEAD 快照到 .vrepo/manifest.json
+  vrepo sync -c                        恢复到 manifest 记录的快照
+  vrepo start feature/foo --only wdnai
+
+筛选仓库：--only <名称>（可重复） / --skip <名称>（可重复）
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="vrepo",
+        description="wdnwebui 工作区多仓库统筹工具（对标 Android repo）",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-C", "--chdir", help="切换到指定工作区根目录")
+    # dest 用 subcommand，避免和 forall 的 --command（dest="command"）撞名
+    sub = p.add_subparsers(dest="subcommand", metavar="<command>")
+
+    def add_jobs(sp) -> None:
+        sp.add_argument("-j", "--jobs", type=int, help="并发度（默认 min(8, 仓库数)）")
+
+    def add_filters(sp, with_positional: bool = True) -> None:
+        sp.add_argument("--only", action="append", help="只对这些仓库操作（可重复）")
+        sp.add_argument("--skip", action="append", help="跳过这些仓库（可重复）")
+        if with_positional:
+            sp.add_argument("projects", nargs="*", help="只对这些仓库操作（仓库名）")
+
+    # ---- list / info / status ------------------------------------------
+    sp = sub.add_parser("list", help="列出所有被管理的仓库")
+    add_jobs(sp)
+    add_filters(sp)
+
+    sp = sub.add_parser("info", help="逐仓库的详细信息")
+    add_jobs(sp)
+    add_filters(sp)
+
+    sp = sub.add_parser("status", help="所有仓库的状态总览")
+    add_jobs(sp)
+    add_filters(sp)
+    sp.add_argument("--exit-zero", action="store_true", help="总是以 0 退出")
+    sp.add_argument(
+        "--fetch", action="store_true", help="先刷新远端跟踪引用（否则 ahead/behind 是旧账）"
+    )
+
+    # ---- sync / fetch / push -------------------------------------------
+    sp = sub.add_parser("sync", help="并行 fetch + 快进到远端最新")
+    add_jobs(sp)
+    add_filters(sp)
+    sp.add_argument("-n", "--dry-run", action="store_true", help="只打印将要执行的命令")
+    sp.add_argument("--rebase", action="store_true", help="用 pull --rebase 代替 ff-only 合并")
+    sp.add_argument("-c", "--checkout", action="store_true", help="先切到 manifest 里 pinned 的 HEAD")
+    sp.add_argument("--fetch-only", action="store_true", help="只 fetch，不合并")
+    sp.add_argument("--reinstall", action="store_true", help="同步后重装 editable 包")
+    sp.add_argument("--with-deps", action="store_true", help="重装时解析依赖（默认 --no-deps）")
+    sp.add_argument("--fail-fast", action="store_true", help="一个失败就整体中止")
+
+    sp = sub.add_parser("fetch", help="只并行 fetch，不合并")
+    add_jobs(sp)
+    add_filters(sp)
+    sp.add_argument("-n", "--dry-run", action="store_true")
+    sp.add_argument("--fail-fast", action="store_true")
+
+    sp = sub.add_parser("push", help="并行推送各仓库的本地提交")
+    add_jobs(sp)
+    add_filters(sp)
+    sp.add_argument("-n", "--dry-run", action="store_true")
+    sp.add_argument("--fail-fast", action="store_true")
+
+    # ---- forall ---------------------------------------------------------
+    sp = sub.add_parser("forall", aliases=["foreach"], help="在每个仓库里跑一条命令")
+    add_jobs(sp)
+    add_filters(sp, with_positional=False)
+    sp.add_argument(
+        "-c",
+        "--command",
+        dest="command",
+        help="要执行的命令（repo 兼容写法，等价于直接写在末尾）",
+    )
+    sp.add_argument("cmd", nargs=argparse.REMAINDER, help="要执行的命令")
+    sp.add_argument("--quiet", action="store_true", help="不打印正常输出")
+    sp.add_argument(
+        "--no-prefix", dest="prefix", action="store_false", help="输出不加 [仓库名] 前缀"
+    )
+    sp.add_argument("--fail-fast", action="store_true")
+
+    # ---- log / diff / grep / branch ------------------------------------
+    sp = sub.add_parser("log", help="跨仓库合并的提交列表")
+    add_jobs(sp)
+    add_filters(sp)
+    sp.add_argument("-n", "--max-count", type=int, default=20, help="显示条数")
+    sp.add_argument("--since", help="例如 '2 weeks ago'")
+    sp.add_argument("--author", help="作者过滤")
+    sp.add_argument("--grep", help="提交信息过滤")
+
+    sp = sub.add_parser("diff", help="各仓库工作区差异统计")
+    add_jobs(sp)
+    add_filters(sp, with_positional=False)
+    sp.add_argument("git_args", nargs=argparse.REMAINDER, help="透传给 git diff 的参数")
+
+    sp = sub.add_parser("grep", help="跨仓库代码搜索")
+    add_jobs(sp)
+    add_filters(sp, with_positional=False)
+    sp.add_argument("pattern", help="搜索的模式")
+    sp.add_argument("-i", "--ignore-case", action="store_true")
+    sp.add_argument("-l", "--files-with-matches", action="store_true")
+    sp.add_argument("-m", "--max-count", type=int, help="每个文件的命中上限")
+    sp.add_argument("git_args", nargs=argparse.REMAINDER, help="透传给 git grep 的参数")
+
+    sp = sub.add_parser("branch", help="列出各仓库的分支")
+    add_jobs(sp)
+    add_filters(sp, with_positional=False)
+    sp.add_argument("git_args", nargs=argparse.REMAINDER)
+
+    # ---- start / checkout ----------------------------------------------
+    sp = sub.add_parser("start", help="在所有仓库创建并切到同名分支")
+    add_jobs(sp)
+    add_filters(sp, with_positional=False)
+    sp.add_argument("branch", help="分支名")
+    sp.add_argument("-b", "--base", help="起点（默认当前 HEAD）")
+
+    sp = sub.add_parser("checkout", help="在所有仓库切换分支")
+    add_jobs(sp)
+    add_filters(sp, with_positional=False)
+    sp.add_argument("branch")
+
+    # ---- manifest / init ------------------------------------------------
+    sp = sub.add_parser("manifest", help="查看/落盘 manifest")
+    add_jobs(sp)
+    add_filters(sp)
+    sp.add_argument("-r", "--record", action="store_true", help="把当前 HEAD 记为 pinned")
+    sp.add_argument("--refresh", action="store_true", help="重新扫描路径与远端")
+    sp.add_argument("-w", "--write", action="store_true", help="写入 .vrepo/manifest.json")
+    sp.add_argument("-o", "--output", help="写到指定文件")
+
+    sp = sub.add_parser("init", help="扫描并生成 .vrepo/manifest.json")
+    add_jobs(sp)
+
+    # ---- doctor / clean / which ----------------------------------------
+    sp = sub.add_parser("doctor", help="工作区一致性体检")
+    add_jobs(sp)
+    add_filters(sp)
+    sp.add_argument("--net", action="store_true", help="额外检查远端可达性（要联网）")
+
+    sp = sub.add_parser("clean", help="清理各仓库的未跟踪文件（默认只预览）")
+    add_jobs(sp)
+    add_filters(sp)
+    sp.add_argument("-f", "--force", action="store_true", help="真正删除（危险）")
+    sp.add_argument("-x", "--ignored", action="store_true", help="连被忽略的文件一起")
+
+    sp = sub.add_parser("which", help="打印指定仓库的绝对路径")
+    add_jobs(sp)
+    add_filters(sp)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.subcommand:
+        parser.print_help()
+        return EXIT_OK
+
+    if getattr(args, "chdir", None):
+        target = Path(args.chdir).resolve()
+        if not target.is_dir():
+            die(f"目录不存在: {target}")
+        os.chdir(target)
+        os.environ["VREPO_ROOT"] = str(target)
+
+    # REMAINDER 里可能带着前导 "--"，去掉
+    for attr in ("cmd", "git_args"):
+        val = getattr(args, attr, None)
+        if val and val[0] == "--":
+            setattr(args, attr, val[1:])
+
+    ctx = Context(args)
+
+    dispatch = {
+        "list": cmd_list,
+        "info": cmd_info,
+        "status": cmd_status,
+        "sync": cmd_sync,
+        "fetch": cmd_fetch,
+        "push": cmd_push,
+        "forall": cmd_forall,
+        "foreach": cmd_forall,
+        "log": cmd_log,
+        "diff": cmd_diff,
+        "grep": cmd_grep,
+        "branch": cmd_branch,
+        "start": cmd_start,
+        "checkout": cmd_checkout,
+        "manifest": cmd_manifest,
+        "init": cmd_init,
+        "doctor": cmd_doctor,
+        "clean": cmd_clean,
+        "which": cmd_which,
+    }
+    handler = dispatch.get(args.subcommand)
+    if handler is None:
+        die(f"未知命令: {args.subcommand}")
+    try:
+        return handler(ctx)
+    except GitError as exc:
+        print(C.paint(f"vrepo: {exc}", C.red), file=sys.stderr, flush=True)
+        return EXIT_PROBLEM
+    except KeyboardInterrupt:
+        print(C.paint("\nvrepo: 已中断", C.yellow), file=sys.stderr, flush=True)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
