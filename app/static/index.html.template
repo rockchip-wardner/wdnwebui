@@ -707,5 +707,9 @@
        MultiGrid.onZoom 挂回调。纯逻辑，无对应 css。 -->
   <script src="/static/core/zoom-frame.js" defer></script>
   <script src="/static/core/audio-analysis.js" defer></script>
+  <!-- 向导「完成配置」后的通用启动器（等能力就绪 → 直接启动 → 失败可见）。
+       必须早于各卡片的 app.js 被执行：卡片的 applyWizardSnapshot 会用它，
+       而不是 btn.click()（disabled 按钮的 click 会被浏览器静默丢弃）。 -->
+  <script src="/static/core/wizard-start.js" defer></script>
 </body>
 </html>

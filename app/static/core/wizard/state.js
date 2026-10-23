@@ -1709,6 +1709,19 @@
         if (srcIdx >= 0) _gotoStep(srcIdx);
         throw new Error("播放视频失败,请回到向导修改视频源");
       }
+      // 「模型还没就绪」—— 卡片等不到能力就绪就抛这个（core/wizard-start.js）。
+      // 之前这类失败是**静默**的：向导显示完成、页面上什么都没跑，用户只能
+      // 猜。现在显式报错 + 可重试（finish 错误框会给「重新开启模型」）。
+      if (msg.indexOf("capability_not_ready") >= 0) {
+        const detail = msg.split("capability_not_ready:")[1]
+          || "模型还没就绪(或已被关闭),请开启模型后重试。";
+        throw _modelWaitError(detail);
+      }
+      // 「启动没成功」—— 卡片自己的启动函数失败(提示词为空 / 没勾模型实例 …)。
+      if (msg.indexOf("start_failed") >= 0) {
+        const detail = msg.split("start_failed:")[1] || "启动失败,请到功能页看提示。";
+        throw new Error(detail);
+      }
       throw e;
     }
     // applyWizardSnapshot 成功落到了下游 → 此向导视为"已完成"。

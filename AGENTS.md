@@ -1877,7 +1877,9 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
   //
   // 通常做:
   //   1) 把 opts 字段填到 DOM input / 调用现有 setter
-  //   2) 触发 start_buttons[0] 自动 click
+  //   2) **用宿主共享启动器 window.WizardStart.run() 启动**(等能力就绪 →
+  //      直接调启动函数 → 确认真的在跑);**不要 btn.click()** ——
+  //      disabled 按钮的 click 会被浏览器静默丢弃,详见下一节
   //   3) 返回 Promise(throw → wizard 回退到 source 步骤)
 };
 ```
@@ -1885,6 +1887,62 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
 未实现 `applyWizardSnapshot` 的 app:wizard 完成时只是 unmount,应用页
 不会跑出 demo 页(`console.warn`)。这是 wizard 设计上的"安全降级" —— 让
 应用层**可选**地接入自动启动,但不强制。
+
+### 踩过的坑:启动按钮的 `disabled` 会把 `btn.click()` **静默吞掉**(v0.29 修)
+
+**症状**:向导配完点「完成配置」,向导显示"配置完成"、功能页上却**什么都没
+跑** —— 音视频描述(vd)的视频描述没启动、视频任意目标定位(vtl)没定位。
+「视频目标检测」(vtd)有时能跑 —— **纯看运气**。
+
+**根因(2026-10-23 真机 journal 证据链)**:
+
+1. `6ea16e9 feat(cards): 模型能力未启用时置灰「启动检测」` 给启动按钮加了
+   `disabled` 判据:`startBtn.disabled = !snap.available || !snap.session_ready
+   || snap.model_loading || snap.enabled || booting`。`session_ready` 来自**卡片
+   自己的 1Hz WS 快照**,而 registry 那边模型可能**刚刚**才变成 running ——
+   **快照比 registry 慢一拍(≤1s)**。
+2. 卡片原本的向导启动方式是 `btn.click()`(模拟用户点「启动检测」)。
+   **disabled 按钮的 `click()` 被浏览器静默丢弃**:不报错、不打日志、不触发
+   handler。于是向导的 `applyWizardSnapshot` "成功"返回 → 向导 unmount →
+   功能页上什么都没跑。
+3. 真机日志坐实(单机板,`/api/compute` 轮询 + WS 快照两条线):
+   - vtl:`08:19:35 instance LocateAnything-3b → running` 与
+     `08:19:35 POST /api/video-target-localization/open` **同一秒**,
+     而卡片的 WS 快照 `08:19:36` 才送来 `session_ready=true` → 点击被吞,
+     **`POST .../prompt` 从未发生**。
+   - vd:`08:24:34 qwen3-vl-4b → running` / `08:24:35 open` / **无
+     `POST .../prompt`** —— 同一个坑。
+   - vtd:`08:14:34 → running`、点击发生在 `08:14:35`(模型提前 ≥1s 就绪)
+     → 侥幸赢下这一拍 → 看得出"能不能跑"取决于模型就绪与点击的相对时序。
+
+**修法(宿主 `app/static/core/wizard-start.js` + 四张卡的 hook)**:
+
+* 新增共享启动器 `window.WizardStart.run({label, probe, start, isReady,
+  isStarted})`:**等能力真就绪 → 直接调卡片自己的启动函数 → 再问一次后端
+  确认"真的在跑"**。三步缺一不可:
+  - *等就绪*:`probe` **直接问后端快照**(卡片自己的 `refresh*Detector()`),
+    不等 WS 那一拍;等不到(20s)→ 抛 `capability_not_ready`(retryable),
+    向导显示错误 + 「重新开启模型」。
+  - *直接启动*:绕开按钮的 `disabled` —— 不能再用 `btn.click()`。
+  - *确认*:卡片的启动函数失败时只往 overlay 写一句话、不抛异常;不确认
+    就会把"没启动"又变成"静默成功"。没跑起来 → 抛 `start_failed`。
+* 四张卡(vd / vtd / vtl / **vr**)的 `applyWizardSnapshot` 都改用它;
+  vtl / vtd 的 `loadInstancePickMulti` 要挪到**就绪之后**(等就绪前模型还没
+  起,实例列表是空的 → "一个都没勾"静默中止)。
+* vd 的**音轨分析**同坑(「分析音频」按钮的 `disabled` 来自音轨面板快照的
+  `available`;Omni 刚就绪时按钮还是灰的 → click 被吞 → 音轨没跑起来),
+  一并改用 `isReady: available !== false` / `isStarted: state === "extracting"`。
+* vr(视频内容检索)的就绪口径与三张视频卡不同 —— 它的按钮 `disabled` 判据是
+  `modeAvail.search`(检索模型有没有实例)+ **检索问题非空**;它靠点击前那次
+  `vrRefreshModeAvail()`(查活的实例表)兜住了前者,但**问题空着时按钮必灰**
+  → click 被吞 → 静默不启动。改用同一启动器,但判据换成卡片自己的通道:
+  `isReady: available !== false` / `isStarted: 错误横幅为空`
+  (`vrStart()` 的每个"没开始"分支都写横幅,成功开跑时清空 —— 比看 state 稳,
+  state 可能是上一轮的)。
+
+**回归**:`node scripts/verify_wizard_start.mjs`(纯 Node,不占 NPU)——
+验共享启动器的三种行为(不就绪不启动 / 等到就绪才启动 / 启动没成功要报错)
++ 四张卡的 hook 里不再有 `btn.click()` + 框架认识新错误码。
 
 ### `_wizardBringUpModels` 全局入口
 
