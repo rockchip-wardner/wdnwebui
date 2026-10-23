@@ -381,14 +381,38 @@
           catch (_) { /* ignore */ }
           return;
         }
-        // 用户大概率还没动 hash,直接跳过去;但若用户已主动离开
-        // 过一次默认页(罕见),尊重现状不抢。
-        if (ROUTER.currentPage() === "apps") {
+        // 置一次性许可标记。**必须在卡片 IIFE 跑起来之前调用** —— 改 hash 会同步
+        // 触发 hashchange → showPage → _loadCardJS → 卡片 IIFE,卡片就在这几行
+        // 之后立刻读这个标记。反过来写(先改 hash 后 arm)会因为卡片 IIFE 抢先
+        // 执行而读不到,表现为"偶尔不自动恢复"。
+        //
+        // 标记本身只是一次性许可:core/boot-restore.js 的 claim() 取走即失效,
+        // 所以用户事后手动进同一张卡不会被误当成开机恢复(那会把上次的源
+        // 重新打开一遍)。
+        const arm = () => {
+          window.__WDN_BOOT_RESTORE__ = { app_id: appId, at: Date.now() };
+          try {
+            window.dispatchEvent(new CustomEvent("compute:boot-restore",
+                                                 { detail: { app_id: appId } }));
+          } catch (_) { /* old browser */ }
+        };
+
+        const page = ROUTER.currentPage();
+        if (page === "apps") {
+          arm();
           // 用 location.hash 而不是 ROUTER.navigate:boot 期还没
           // 注册 _keptPages / DemoGuard,走 navigate 会触发一些
           // 还没初始化的回调。直接改 hash 让 hashchange listener
           // 接管(那个 listener 此时已经绑好了)。
           location.hash = "#" + appId;
+        } else if (page === appId) {
+          // **刷新时 URL 已经带着 #<app_id>** —— 不需要跳,但**照样要 arm**。
+          //
+          // 真机踩过的坑(v0.27):早期只在上面那个 `page === "apps"` 分支里
+          // arm,于是"用户在卡片页按 F5"这条最常见的路径完全不触发恢复 ——
+          // 而它恰恰是"重启服务后回来看一眼"的自然动作。表现是裸 URL 打开
+          // 能自动恢复、带 hash 刷新不能,极易误判成"恢复功能是坏的"。
+          arm();
         }
       } catch (_) { /* boot failure, ignore */ }
     },

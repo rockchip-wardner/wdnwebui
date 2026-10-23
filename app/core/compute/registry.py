@@ -1719,6 +1719,37 @@ class ComputeRegistry:
                     })
         return out
 
+    def pending_models_for_capability(self, capability_type: str) -> list[str]:
+        """本机持有 ``capability_type`` 但还没到 ``running`` 的模型 id 列表。
+
+        为什么需要这个：``get_session(capability)`` 只认 ``status == "running"``
+        （见 :meth:`list_sessions`），所以开机 autostart 把 worker 拉起来、
+        模型还在加载的那几十秒里，它一律抛 ``RuntimeError("功能未启用")``。
+        调用方（detector ``snapshot()``）把它 catch 成 ``init_error``，
+        前端于是显示「**模型加载失败**: 功能未启用: swcap_vision_chat」——
+        把「正在加载」误报成了「加载失败」，按钮还保持可点，一点就 502。
+
+        本方法给出第三种状态所需的判据：**这台机器上有这个能力的实例，
+        只是还没就绪**。非空即代表「等一等就好」，空才真的是能力缺失。
+        空列表**不代表**没有该能力（可能是 peer 持有、或压根没配 autostart），
+        所以调用方只把它用作「不是错误」的提示，不用来断言能力存在。
+
+        只看本机（spawned / adopted_local）：peer 上的模型本机等不到它的加载
+        进度，报「正在加载」会让用户对着一个永远不会就绪的进度条干等。
+        """
+        out: list[str] = []
+        with self._lock:
+            for inst in self._instances.values():
+                if capability_type not in (inst.capability_types or []):
+                    continue
+                if inst._source not in ("spawned", "adopted_local"):
+                    continue
+                # not_loaded = worker 进程已起但模型还没开始/没加载完（本板
+                # 带 --npu 启动时短暂停在这个状态，见 boot autostart 日志）。
+                if inst.status in ("loading", "not_loaded"):
+                    out.append(inst.model_id)
+        return out
+
     def list_hardware_capabilities(self) -> list[dict]:
         state = _load_hardware_capability_state()
         out = []

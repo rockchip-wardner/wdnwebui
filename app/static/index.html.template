@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/static/core/frame-judge.css" />
   <link rel="stylesheet" href="/static/core/multi-grid.css" />
   <link rel="stylesheet" href="/static/core/model-pick.css" />
+  <link rel="stylesheet" href="/static/core/boot-restore.css" />
   
   
   
@@ -702,6 +703,7 @@
   <script src="/static/core/wizard/state.js" defer></script>
   <script src="/static/core/fs-modal.js" defer></script>
   <script src="/static/core/model-pick.js" defer></script>
+  <script src="/static/core/boot-restore.js" defer></script>
   <script src="/static/core/format-utils.js" defer></script>
   <script src="/static/core/vtl-palette.js" defer></script>
   <script src="/static/core/frame-judge.js" defer></script>

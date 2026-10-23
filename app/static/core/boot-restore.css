@@ -1,0 +1,58 @@
+/* ==========================================================================
+   开机自启恢复的按钮反馈（音视频描述 / 视频目标检测 / 视频目标定位 共用）
+   —— 配 app/static/core/boot-restore.js
+   ==========================================================================
+   场景：开机 autostart 把 worker 拉起来后，模型还要加载 ~35~40s。这段时间里
+   「启动检测」既不该可点（点了必 502「功能未启用」），也不该是死的 —— 用户
+   需要看见"系统正在准备，完成后会自动开始"。所以这里给它一个转圈圈。
+
+   为什么单独一个文件而不是塞进 framework.css：三张卡分属不同插件包
+   （wdnapps_video_analyzer），它们的私有 CSS 都在各自的 cards/<id>/static/；
+   唯独这条规则是三张卡**共用**且与卡片无关的，和 multi-grid.css / frame-judge.css
+   是同一类东西 —— 放 core，卡片只管加 class。
+
+   注意 .vd-btn 是普通 button（inline-block），要靠这里改成 inline-flex 才能把
+   圈和文字排成一行；不这么写圈会另起一行，按钮高度被撑开。 */
+
+.vd-btn.is-boot-wait,
+button.is-boot-wait {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  cursor: progress;
+}
+
+/* 圈本身。尺寸按按钮的 0.85rem 字号配（13.6px 字 → 12px 圈），
+   再用 currentColor 描边：.vd-btn-primary 是白字白底反转，
+   用 currentColor 就不用为 primary / 普通两种按钮各写一套。 */
+.vd-btn.is-boot-wait::before,
+button.is-boot-wait::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  opacity: 0.85;
+  /* 复用 framework.css 里已有的 @keyframes（wd-loading-spin），
+     不重复定义一个只差名字的旋转动画。 */
+  animation: wd-loading-spin 0.8s linear infinite;
+}
+
+/* 转圈时按钮整体降一档亮度但**不**走 :disabled 的 opacity —— 后者会让
+   文案一起变淡，读起来像"坏了"而不是"在忙"。 */
+.vd-btn.is-boot-wait {
+  opacity: 0.85;
+}
+
+/* 尊重系统的"减少动态效果"设置：转圈改成静态实心环，
+   文案「正在等待模型加载…」本身已经说明了状态，不依赖动画。 */
+@media (prefers-reduced-motion: reduce) {
+  .vd-btn.is-boot-wait::before,
+  button.is-boot-wait::before {
+    animation: none;
+    border-top-color: currentColor;
+    opacity: 0.5;
+  }
+}

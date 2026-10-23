@@ -1337,6 +1337,22 @@ class WdnaiDetector:
             sess = None
             session_ready = False
             session_error = str(e)
+        # "还没 running" 有两种完全不同的含义，必须分开：
+        #   * 本机有实例、正在加载（autostart 刚把 worker 拉起来那几十秒）
+        #     → 等待即可，前端该转圈而不是报错；
+        #   * 本机确实没有能提供该能力的实例（没配 autostart / 模型卸载了）
+        #     → 真的错误，init_error 才是对的。
+        # get_session() 两者都抛同样的 RuntimeError，所以只能另问 registry。
+        # 见 registry.pending_models_for_capability 的 docstring。
+        model_loading = False
+        loading_models: List[str] = []
+        if not session_ready:
+            try:
+                loading_models = list(
+                    registry.pending_models_for_capability(capability))
+            except Exception:  # noqa: BLE001
+                loading_models = []
+            model_loading = bool(loading_models)
         # Query the running VLM instance for its loaded vision-model
         # native sizes — never hardcode [384, 768] on the client.
         # Filter by capability instead of model_id so any future VLM
@@ -1381,6 +1397,11 @@ class WdnaiDetector:
                 "model":                  "",  # UI 不再展示模型名，仅作
                                                 # snapshot shape 兼容位
                 "session_ready":          session_ready,
+                # 本机实例正在加载（autostart 开机自启路径）。前端据此把
+                # 「模型加载失败」改写成「正在等待模型加载」并让启动按钮
+                # 转圈，而不是让用户对着一个可点但必 502 的按钮。
+                "model_loading":          model_loading,
+                "loading_models":         loading_models,
                 # K>1 时 worker_alive / queue_size 只代表 slot 0，真实并发度看
                 # slot_count / slots。
                 "worker_alive":           self._worker is not None and self._worker.is_alive(),
