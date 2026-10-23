@@ -318,6 +318,8 @@ def _run_turn(
     max_new_tokens: int,
     enable_thinking: bool = False,
     on_delta: Optional[TypingCallable[[str], None]] = None,
+    retry_empty_answer: bool = False,
+    on_retry: Optional[TypingCallable[[], None]] = None,
 ) -> Dict[str, Any]:
     """One generation turn: trim → infer → classify → split.
 
@@ -352,6 +354,35 @@ def _run_turn(
     else:
         thinking, answer = split_thinking(
             result if isinstance(result, str) else str(result or ""))
+        if retry_empty_answer and not answer.strip() and thinking.strip():
+            # Qwen3.5 在多轮 history 下偶发：把完整答案写进 thinking，
+            # 生成 </think> 后直接 EOS，answer 为空。用**保留 history** 的
+            # 同一问题 + 强指令重试一次；重试的思考由 router.begin_retry()
+            # 丢弃，只把答案继续流式推给前端，第一次的 thinking 保留。
+            if on_retry is not None:
+                try:
+                    on_retry()
+                except Exception:  # noqa: BLE001
+                    pass
+            retry_prompt = f"{text}\n\n请务必在思考后给出最终回答。"
+            try:
+                retry = _run_coro(session.respond(
+                    prompt=retry_prompt,
+                    history=trimmed,
+                    tools=classes,
+                    on_delta=on_delta,
+                    max_new_tokens=max_new_tokens,
+                    enable_thinking=enable_thinking,
+                ))
+                retry_text = retry if isinstance(retry, str) else str(retry or "")
+                _, retry_answer = split_thinking(retry_text)
+                if retry_answer.strip():
+                    answer = retry_answer
+            except Exception:  # noqa: BLE001
+                pass
+
+    if retry_empty_answer and not answer.strip():
+        answer = "模型未生成最终回答，请重试"
 
     return {
         "answer": sanitize_chat_output(answer),
@@ -372,6 +403,8 @@ def run_chat_with_tools(
     enable_thinking: bool = False,
     tool_names: List[str],
     on_delta: Optional[TypingCallable[[str], None]] = None,
+    retry_empty_answer: bool = False,
+    on_retry: Optional[TypingCallable[[], None]] = None,
     stop_event=None,
     max_iters: Optional[int] = None,
     user_id: str = "",
@@ -428,6 +461,8 @@ def run_chat_with_tools(
                 max_new_tokens=max_new_tokens,
                 enable_thinking=enable_thinking,
                 on_delta=on_delta,
+                retry_empty_answer=retry_empty_answer,
+                on_retry=on_retry,
             )
         except Exception as exc:  # noqa: BLE001
             if stop_event is not None and stop_event.is_set():

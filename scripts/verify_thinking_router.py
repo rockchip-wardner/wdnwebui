@@ -71,6 +71,19 @@ case("off: 只有空标签对",
      ["<think>", "</think>"],
      thinking="", answer_contains="", no_thinking_event=True)
 
+# 重试时模型偶发模仿 <answer> 标签 —— 流式必须剥掉
+case("answer 标签（单 delta）",
+     ["<think>思考</think><answer>答案</answer>"],
+     thinking="思考", answer_contains="答案")
+
+case("answer 标签（跨 delta）",
+     ["<think>思考</think><ans", "wer>答案</ans", "wer>"],
+     thinking="思考", answer_contains="答案")
+
+case("answer 标签跨缓冲边界",
+     ["<think>思</think>", "<answ", "er>答", "案</answer>"],
+     thinking="思", answer_contains="答案")
+
 
 def main() -> int:
     failed = 0
@@ -84,7 +97,8 @@ def main() -> int:
         if want_answer and want_answer not in answer:
             ok = False
             reasons.append(f"answer={answer!r} missing={want_answer!r}")
-        if "<think>" in answer or "</think>" in answer:
+        if any(tag in answer for tag in
+               ("<think>", "</think>", "<answer>", "</answer>")):
             ok = False
             reasons.append(f"answer still contains tag: {answer!r}")
         if no_thinking_event and any(e["type"] == "thinking" for e in events):

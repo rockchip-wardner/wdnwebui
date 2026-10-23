@@ -23,6 +23,9 @@ _THINK_TAIL_RE = re.compile(r"^(.*?)</think>", re.DOTALL)
 
 
 _CHATML_STRAY_RE = re.compile(r"<\|im_end\|>")
+# 重试「只有思考、没有答案」时模型偶尔会模仿 <answer> 标签；它不是协议
+# 的一部分，直接剥离，避免漏进气泡正文。
+_ANSWER_TAG_RE = re.compile(r"</?answer>", re.IGNORECASE)
 
 
 def sanitize_chat_output(text: str) -> str:
@@ -47,6 +50,7 @@ def sanitize_chat_output(text: str) -> str:
     if idx >= 0:
         text = text[:idx]
     text = _CHATML_STRAY_RE.sub("", text)
+    text = _ANSWER_TAG_RE.sub("", text)
     return text.strip()
 
 

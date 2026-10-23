@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue as _queue
+import re
 import threading
 import time
 from collections import deque
@@ -333,6 +334,8 @@ class _TextChatManager:
                     enable_thinking=req.enable_thinking,
                     tool_names=self._resolve_tool_names(),
                     on_delta=lambda d: router.push(d),
+                    retry_empty_answer=True,
+                    on_retry=router.begin_retry,
                     stop_event=self._worker_stop_event,
                     channel="web",
                 )
@@ -487,6 +490,13 @@ class _ThinkingRouter:
     _OPEN = "<think>"
     _CLOSE = "</think>"
     _PREFIX_LIMIT = 64          # give up tag detection on pathological whitespace
+    # 模型偶发模仿 <answer> / </answer>（重试时尤其常见）。done 帧由
+    # sanitize_chat_output 清理；流式这里也过滤，并保留尾部 8 字符，
+    # 避免标签被 delta 切开时漏半截。
+    _ANSWER_TAG_RE = re.compile(r"</?answer>", re.IGNORECASE)
+    # 保留**完整标签长度**（9），而不是 len-1：标签可能整段落在
+    # 下一段 delta 的开头，只留 8 个字符会缺首字符而识别不出来。
+    _ANSWER_KEEP = max(len("<answer>"), len("</answer>"))
 
     def __init__(self, emit_fn: Callable[[dict], None], request_id: int) -> None:
         self._emit = emit_fn
@@ -496,8 +506,25 @@ class _ThinkingRouter:
         self._start_seen = False
         self._saw_open = False
         self._saw_close = False
+        self._suppress_thinking = False
+        self._answer_buf = ""
+
+    def begin_retry(self) -> None:
+        """切换为「只流式答案」：重试的思考丢弃，第一次的思考已展示过。"""
+        # 先把第一次残留的尾部（不足一个 </think> 长度的缓冲）补发，
+        # 否则 done 帧的 thinking 会比流式拼出来的多几个字符。
+        self.flush()
+        self._mode = "thinking"
+        self._buf = ""
+        self._start_seen = False
+        self._saw_open = False
+        self._saw_close = False
+        self._suppress_thinking = True
+        self._answer_buf = ""
 
     def _emit_thinking(self, text: str) -> None:
+        if self._suppress_thinking:
+            return
         if text and text.strip():
             self._emit({
                 "type": "thinking",
@@ -506,11 +533,21 @@ class _ThinkingRouter:
             })
 
     def _emit_answer(self, text: str) -> None:
-        if text:
+        if not text:
+            return
+        # 先拼接、再对整段过滤：标签可能被 delta 切成 <ans + wer>，
+        # 单段过滤会漏掉（Real bug 实测：跨 delta 时 <answer> 漏进答案）。
+        # 尾部保留完整标签长度，保证任何未完成的标签都还在缓冲里。
+        self._answer_buf += text
+        self._answer_buf = self._ANSWER_TAG_RE.sub("", self._answer_buf)
+        keep = self._ANSWER_KEEP
+        if len(self._answer_buf) > keep:
+            out = self._answer_buf[:-keep]
+            self._answer_buf = self._answer_buf[-keep:]
             self._emit({
                 "type": "answer",
                 "request_id": self._request_id,
-                "delta": text,
+                "delta": out,
             })
 
     def push(self, delta: str) -> None:
@@ -557,18 +594,25 @@ class _ThinkingRouter:
         """Emit the tail buffer when the turn ends (called after the agent)."""
         rest = self._buf
         self._buf = ""
-        if not rest:
-            return
-        if self._mode == "thinking":
-            if not self._saw_open and not self._saw_close:
-                # Plain answer with no markers at all (model ignored the
-                # template): do not mislabel it as thinking.
-                self._emit_answer(rest)
+        if rest:
+            if self._mode == "thinking":
+                if not self._saw_open and not self._saw_close:
+                    # Plain answer with no markers at all (model ignored the
+                    # template): do not mislabel it as thinking.
+                    self._emit_answer(rest)
+                else:
+                    # An unterminated thought block is still thinking.
+                    self._emit_thinking(rest)
             else:
-                # An unterminated thought block is still thinking.
-                self._emit_thinking(rest)
-        else:
-            self._emit_answer(rest)
+                self._emit_answer(rest)
+        if self._answer_buf:
+            out = self._answer_buf
+            self._answer_buf = ""
+            self._emit({
+                "type": "answer",
+                "request_id": self._request_id,
+                "delta": out,
+            })
 
 
 # --------------------------------------------------------------------------- #
