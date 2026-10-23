@@ -1,11 +1,8 @@
 """FastAPI application factory — plugin-driven (v0.4)."""
 from __future__ import annotations
 
-import html
-import json
 import logging
 import os
-import re
 import subprocess
 import threading
 from pathlib import Path
@@ -26,16 +23,13 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.core.config import get_config
-from app.core.manifest import (
-    CardManifest,
-    discover as discover_cards,
-)
+from app.core.html_assembly import assemble_index_html
+from app.core.manifest import discover as discover_cards
 from app.core.compute.registry import get_registry
 
 LOG = logging.getLogger("app.main")
 
 STATIC_DIR = Path(__file__).parent / "static"
-INDEX_TEMPLATE_PATH = STATIC_DIR / "index.html.template"
 
 
 def _raise_nofile_limit() -> None:
@@ -69,99 +63,6 @@ def _raise_nofile_limit() -> None:
 _raise_nofile_limit()
 
 
-# --------------------------------------------------------------------------- #
-# HTML assembly                                                               #
-# --------------------------------------------------------------------------- #
-def _assemble_index_html(manifests: list[CardManifest]) -> str:
-    """Build the index.html response by injecting card sections + manifests.
-
-    The template has two types of placeholders:
-      - ``{% card_slot "<page_id>" %}`` — replaced with that card's
-        ``static/template.html`` content.
-      - ``{{ card_css_links }}`` — replaced with one ``<link>`` per
-        card's CSS file.
-      - ``{{ app_manifests }}`` — replaced with the JSON dump of
-        ``window.__APP_MANIFESTS__`` (card metadata for the front-end).
-
-    Cards in ``status != "ok"`` are still rendered (their page
-    exists) but flagged in ``__APP_MANIFESTS__`` so the UI can show
-    a placeholder for the broken bits.
-    """
-    template = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8")
-
-    # 1. card_slot injection
-    for m in manifests:
-        token = '{% card_slot "' + m.id + '" %}'
-        if token not in template:
-            LOG.warning("[%s] no {{card_slot}} placeholder in index.html.template", m.id)
-            continue
-        template_path = m.static_dir / "template.html" if m.static_dir else None
-        if template_path and template_path.is_file():
-            content = template_path.read_text(encoding="utf-8")
-            # Strip any leading whitespace so the section is at the right indent
-            content = content.lstrip()
-            template = template.replace(token, content, 1)
-        else:
-            # Empty section placeholder if template.html missing
-            placeholder = (
-                f'<section id="page-{m.id}" class="page hidden" data-page="{m.id}">'
-                f'<header class="page-header"><h2>{html.escape(m.title)}</h2></header>'
-                f'<div class="placeholder-card"><p>本应用的页面模板未提供。</p></div>'
-                f'</section>'
-            )
-            template = template.replace(token, placeholder, 1)
-            LOG.warning("[%s] template.html missing — injected empty placeholder", m.id)
-
-    # 2. CSS link tags (8-A: all card CSS loaded eagerly at boot)
-    css_links: list[str] = []
-    for m in manifests:
-        for url in m.frontend_css:
-            css_links.append(
-                f'  <link rel="stylesheet" href="{html.escape(url)}" />'
-            )
-    template = template.replace(
-        "{{ card_css_links }}",
-        "\n".join(css_links) if css_links else "  <!-- no card CSS -->",
-    )
-
-    # 3. Manifests JSON for window.__APP_MANIFESTS__
-    manifests_data = {
-        "cards": [_manifest_to_dict(m) for m in manifests],
-    }
-    manifests_json = json.dumps(manifests_data, ensure_ascii=False)
-    template = template.replace("{{ app_manifests }}", manifests_json)
-
-    # 4. Cache-bust static assets (?v=<mtime>) — StaticFiles 默认不发
-    # Cache-Control, 浏览器会按 Last-Modified 启发式缓存; 用文件 mtime 作
-    # 版本串使 URL 随改动变化, 避免改前端后需手动硬刷新。覆盖 core/ 与
-    # system/（算力配置页的 system.js 在后者，早先漏掉它会让改完算力页
-    # 前端后浏览器仍跑旧副本，表现为"修复没生效"）。
-    for prefix, root in _STAMP_DIRS.items():
-        template = _ASSET_RE.sub(_make_stamp(root, prefix), template)
-
-    return template
-
-
-def _make_stamp(root: Path, prefix: str):
-    def stamp(match: re.Match) -> str:
-        attr, rel = match.group("attr"), match.group("rel")
-        try:
-            ver = int((root / rel).stat().st_mtime)
-        except OSError:
-            return match.group(0)
-        return f'{attr}="/static/{prefix}/{rel}?v={ver}"'
-    return stamp
-
-
-# 匹配 template 里对 /static/{core,system}/** 的 href/src（尚未带 ?v= 的）。
-_ASSET_RE = re.compile(
-    r'(?P<attr>href|src)="/static/(?:core|system)/(?P<rel>[^"?]+)"')
-_STAMP_DIRS = {
-    "core": Path(__file__).resolve().parent / "static" / "core",
-    "system": Path(__file__).resolve().parent / "system" / "static",
-}
-
-
 class _NoCacheStaticFiles(StaticFiles):
     """StaticFiles that forces ``Cache-Control: no-cache`` on every response.
 
@@ -175,45 +76,6 @@ class _NoCacheStaticFiles(StaticFiles):
         resp = super().file_response(*args, **kwargs)
         resp.headers["Cache-Control"] = "no-cache"
         return resp
-
-
-def _manifest_to_dict(m: CardManifest) -> dict:
-    """Build the per-card dict that gets serialized to the front-end."""
-    return {
-        "id": m.id,
-        "title": m.title,
-        "preview_video": m.preview_video,
-        "software_capabilities": m.software_capabilities,
-        "hardware_capabilities": m.hardware_capabilities,
-        # 能力组：同一组内的能力必须由**同一个**模型同时满足（派生自
-        # 该卡的 wizard.json）。前端用它做「一个实例都满足」而不是
-        # 「两个实例各满足一半」的就绪判定。
-        "capability_groups": m.capability_groups,
-        "frontend": {
-            "template": m.raw["frontend"]["template"],
-            "js": m.frontend_js,
-            "css": m.frontend_css,
-        },
-        "demo_guard": {
-            "active_state_keys": m.demo_guard_active_state_keys,
-            "stop_endpoints": m.demo_guard_stop_endpoints,
-            "stop_sync_endpoints": m.demo_guard_stop_sync_endpoints,
-        },
-        # .get() 是故意的：卡片包可以被用户自己装进来，manifest 的
-        # prompts 段缺失是迟早的事。这里是首页渲染的必经路径，一个 KeyError
-        # 就是**整个首页 500** —— 而不是"这张卡的提示词用不上"。
-        # manifest._validate 已经把缺 prompts 当可选处理，这里保持一致。
-        "prompts": m.raw.get("prompts") or {},
-        "status": m.status,
-        "errors": m.errors,
-        "hidden": m.hidden,
-        "display_order": m.display_order,
-        # 应用一句话功能简介,缺失则 framework 不渲染 .app-card-desc 标签
-        "description": m.raw.get("description", ""),
-        # 应用层声明的向导配置文件路径(通常是 "wizard.json",
-        # 与 manifest.json 同目录);缺失 → framework tryMount 零开销跳过。
-        "wizard_config": str(m.raw.get("wizard_config", "")).strip(),
-    }
 
 
 # --------------------------------------------------------------------------- #
@@ -342,7 +204,7 @@ def create_app() -> FastAPI:
         # Re-assemble on every request to pick up manifest changes during
         # hot-reload. Cheap enough for the ~30 cards case.
         return Response(
-            content=_assemble_index_html(discover_cards()),
+            content=assemble_index_html(discover_cards()),
             media_type="text/html; charset=utf-8",
             headers={"Cache-Control": "no-store, must-revalidate"},
         )

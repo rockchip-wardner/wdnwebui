@@ -928,11 +928,41 @@ v0.4 启动后默认进入**应用面板**(`#apps`),而非之前的某个具体�
   都仍可用,用于"先下线 / 等版本升级"的过渡期 —— 比 `remove_card.py`
   安全,反序列化时想恢复只需把 `hidden` 置 `false`。
 - 7 张卡片都从同一份 `__APP_MANIFESTS__` JSON 渲染,该 JSON 由后端
-  `_assemble_index_html()` 在每次 `/` 请求时动态拼装 ——
-  `/static/index.html.template` 里 3 个占位符:`{% card_slot "<id>" %}`
+  `assemble_index_html()`(`app/core/html_assembly.py`)在每次 `/` 请求时动态
+  拼装 —— `/static/index.html.template` 里 3 个占位符:`{% card_slot "<id>" %}`
   (替换为各 app 的 `static/template.html` 片段)、`{{ card_css_links }}`
   (拼装各 app 的 `<link rel="stylesheet">`)、`{{ app_manifests }}`
   (替换为 JSON dump)。
+
+### 卡位占位符:卡片缺席时必须**摘掉**(模板标记不许漏给用户)
+
+`{% card_slot "<id>" %}` 只对**已发现**的卡生效。插件包被卸载、源码被删、
+manifest 校验不过(插件 import 失败)时,模板里那一行占位符**没人替换** ——
+而 `{% ... %}` 在 HTML 里**没有任何特殊含义**,浏览器会把它当**普通文本**
+原样显示在页面上。
+
+> **真机复现**:删掉 `wdnapps_hdmi_processor` / `wdnhid` 两个仓库源码后,
+> 首页上凭空多出一行 `{% card_slot "usb-hid" %}`。插件包没了 → `usb-hid`
+> 卡不在 `discover()` 结果里 → 占位符没人替换 → 模板语法泄漏到 UI。
+
+所以 `assemble_index_html()` 在注入完已发现卡的片段之后,**必须**再跑一遍
+`_drop_unmatched_card_slots()` 把剩下的占位符摘掉:
+
+- 替换成 HTML 注释 `<!-- card_slot "<id>": card not installed -->` ——
+  浏览器不可见(问题消失),源码里留一行线索(将来把插件装回来知道往哪儿放);
+  删行则连线索都不剩。
+- 同时 `LOG.warning` 打出来,便于发现"卡片没装上"。
+
+**别只删模板里那行占位符了事** —— 插件装回来时那张卡要能自动回来。
+模板里保留占位符 + 拼装时摘掉没匹配上的,是唯一同时满足两者的做法。
+
+回归防护:`python -m scripts.verify_card_slot_missing`(离线,不占 NPU)
+断言拼装结果里没有任何残留的 `{% card_slot ... %}`。
+
+> **顺带**:插件包被删后,venv 里常留下**孤儿 editable 元数据**
+> (`__editable__.<pkg>.pth` + `<pkg>-<ver>.dist-info/`,entry point 仍登记着
+> 那个卡)。后果是 `discover()` 每次请求都 import 一次不存在的模块并
+> `LOG.error`。**连元数据一起清掉**:`pip uninstall -y <pkg>`。
 
 ### 侧栏 7 项(左 nav)
 
@@ -1003,9 +1033,11 @@ app/apps/<card_id>/
    `app.include_router(router, prefix="/api/<id>")`。
 3. 调 `register_shutdown()` 注册 app 关闭时的清理 hook。
 4. `app.mount("/static/apps/<id>", StaticFiles(...))` 装载每张卡的静态资源。
-5. `_assemble_index_html(discover_cards())` 读 `app/static/index.html.template`,
+5. `assemble_index_html(discover_cards())`(`app/core/html_assembly.py`)读
+   `app/static/index.html.template`,
    按 `display_order` 拼装每张卡的 `<template>` 片段、`app.js` `<script>`、
    `app.css` `<link>`,输出最终 `index.html`(动态路径,运行内存)。
+   缺席卡的 `{% card_slot %}` 占位符在这一步被摘掉(见「卡位占位符」章节)。
 6. 调 `system_register_all(app)` 装载系统级 API(算力配置、配置、监控、
    im_bridge、power、coprocessor、versions、fs_browser、system_logs)。
 7. **不**直接注册 surveillance(已下线,见 im_bridge 章节)。
@@ -3470,6 +3502,7 @@ wdnwebui/
 │   │
 │   ├── core/                           # 共享内核(原 app/services/*)
 │   │   ├── manifest.py                 # 插件清单加载 + 校验 (v0.4 重构)
+│   │   ├── html_assembly.py            # 首页 index.html 拼装(纯函数,缺卡位自动摘除)
 │   │   ├── config.py                   # ConfigStore (config.jsonc 原子读写)
 │   │   ├── uploads.py                  # 公共 uploads 路径管理
 │   │   ├── compute/
@@ -3533,7 +3566,7 @@ wdnwebui/
 │   │       └── system.js               # 系统页通用前端
 │   │
 │   └── static/
-│       ├── index.html.template         # 构建模板 — 见 core/manifest.py:_assemble_index_html
+│       ├── index.html.template         # 构建模板 — 见 core/html_assembly.py:assemble_index_html
 │       ├── core/                       # 框架核心 JS / CSS
 │       │   ├── framework.{js,css}      # 路由 + DemoGuard + 各 ImApp_<id> 装配
 │       │   ├── fs-modal.js             # 服务端文件浏览器模态
