@@ -147,9 +147,9 @@ class VideoSession:
         # frame sink"，并把逐帧分数留给 UI 画曲线 / 浮框。
         #
         # **判据是唯一的节流旋钮** —— 下游 detector 一律收到 every_n=1，
-        # 否则两级节流相乘（间隔 30 撞上 30 = 900 帧才送一帧），卡片上
-        # 写的"间隔 N 帧"就成了假话。默认值 30 与三张卡历史上 detector 的
-        # every_n 默认值一致，所以接入判据**不改变**开箱行为。
+        # 否则两级节流相乘（间隔 N 撞上 N = N² 帧才送一帧），卡片上
+        # 写的"间隔 N 帧"就成了假话。默认值取 `DEFAULT_EVERY_N`（600，
+        # 用户拍板的兜底间隔），与共享前端组件和三张卡的 wizard.json 一致。
         self._judge = FrameJudge(mode=EXPOSED_METRICS[0], every_n=DEFAULT_EVERY_N)
         self._judge_lock = threading.Lock()
 

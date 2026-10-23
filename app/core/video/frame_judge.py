@@ -59,9 +59,28 @@ MODE_MANUAL = "manual"
 # 否则这里调出来的阈值搬过去就是失效的。
 DEFAULT_LONG_SIDE = 160
 
-# 默认帧间隔。与三张视频卡历史上 detector 的 every_n 默认值一致，所以把
-# 节流从 detector 移到判据器**不改变**开箱行为（同样每 30 帧送一次）。
-DEFAULT_EVERY_N = 30
+# 默认帧间隔（兜底间隔，25fps 源下 ≈ 24s）。**用户拍板的值**（AGENTS.md
+# 「默认 every_n = 600」），也是共享前端组件 `frame-judge.js` 里
+# `_fallbackCfg()` / `inpEvery.value` 的默认值 —— 三处必须一致。
+#
+# 这里的 every_n 语义**随模式而变**，别拿 detector 时代的老直觉套：
+#
+# * 自动模式（gscore）：every_n 是**兜底间隔** —— 判据每评估一帧 gap 就涨
+#   一截（单路每 ``DEFAULT_SAMPLE_EVERY``=25 帧评估一次，多路每轮转一次
+#   评估一次，gap 一次就涨 25~50+ 帧），兜底条件是
+#   ``gap >= every_n and score >= threshold*0.5``。**every_n=30 时这个条件
+#   恒成立**（gap 一次就超过 30）→ 兜底每轮都触发 → gscore 门形同虚设，
+#   画面没变也照送 NPU。600 才是"双保险"该有的量级。
+# * 手动模式（manual）：every_n 是**固定跳帧间隔**（``pos % every_n == 0``）。
+#   多路页的 detector 侧 every_n 已锁死为 1（节流归轮转调度器），所以
+#   这一档就是唯一节流。
+#
+# 历史包袱：这里曾是 30，来自 detector 时代"每 30 帧送一次"的固定跳帧，
+# 注释写的是"与三张卡历史上 detector 的 every_n 默认值一致"。那个 detector
+# 节流**已经不存在了**（多路卡把 detector every_n 锁死为 1），而判据
+# 换到 gscore 之后 every_n 的语义变成了"兜底间隔"，30 就不再是等价替换 ——
+# 它把判据门整个废掉了。现统一回 600。
+DEFAULT_EVERY_N = 600
 
 # 解码线程**多久算一次分**（帧）。不是送检节流 —— 那是 every_n 的事。
 # 必须有间隔：算分前要先 RGA 缩一张 long_side 缩略图，而 RGA 是全机共享的

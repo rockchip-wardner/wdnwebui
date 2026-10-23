@@ -223,7 +223,7 @@
       // 没有配置控件时不要 POST（防御：控件尚未构建）。
       if (!this.selMode) return;
       const mode = this.selMode?.value || "manual";
-      const every = Math.max(1, parseInt(this.inpEvery?.value || "30", 10) || 30);
+      const every = Math.max(1, parseInt(this.inpEvery?.value || "600", 10) || 600);
       const dflt = this._defaultThreshold(mode);
       const thr = Math.max(0.1, parseFloat(this.inpThr?.value) || dflt);
       if (this.inpEvery) {
@@ -296,7 +296,7 @@
       let txt = mode === "manual"
         ? "手动跳帧：固定间隔送检，不做画面比对。"
         : `按「${mode}」比对画面，超过阈值立刻送检；变化达到阈值一半时，`
-          + `最长 ${this._everyN || 30} 帧兜底送一次，画面完全没变就一直不送。`;
+          + `最长 ${this._everyN || 600} 帧兜底送一次，画面完全没变就一直不送。`;
       if (!this.applied) txt += "（本轮分析进行中，本次修改从下次开始生效）";
       this.hint.textContent = txt;
     }
@@ -792,7 +792,7 @@
       const inst = registry.get(prefix);
       if (!inst) return null;
       const mode = inst.selMode?.value || "manual";
-      const every = Math.max(1, parseInt(inst.inpEvery?.value || "30", 10) || 30);
+      const every = Math.max(1, parseInt(inst.inpEvery?.value || "600", 10) || 600);
       const thr = Math.max(0.1, parseFloat(inst.inpThr?.value)
         || (registry.get(prefix)?._defaultThreshold(mode) ?? 15));
       return { mode, every_n: every, threshold: thr };

@@ -1744,8 +1744,56 @@ mode**;而跨卡共用的配置(判据只有一份,三张卡共用 `VideoSession
 `/judge/metrics` 端点都返回 `cost_ms` 字典。`wizard.json` 是静态配置,里面的
 「约 2 ms/帧」只是同一测量的取整近似,权威数字看功能页下拉。
 
-默认模式是 `manual` —— 三张卡历史上默认每 30 帧送一次,`DEFAULT_EVERY_N = 30`
-就是为了保持这个开箱行为不变。
+默认模式是 `gscore`(v0.22 起,`EXPOSED_METRICS[0]`),默认帧间隔
+`DEFAULT_EVERY_N = 600`(25fps 下 ≈ 24s 兜底间隔)。**这两个默认值三处必须
+一致**:后端常量 `frame_judge.DEFAULT_EVERY_N`、共享前端组件
+`frame-judge.js` 的 `_fallbackCfg()` / `inpEvery.value`、以及三张卡的
+`wizard.json` 里 `<prefix>-judge-every-n` 的 `default`。任一处漂移都会出现
+「向导显示 A、功能页显示 B、浮框 every_n_eff 口径又对不上 B」的三方打架。
+
+> **别再用 detector 时代的老直觉解释 30**:那个 30 是"每 30 帧送一次"的
+> **固定跳帧节流**,而多路卡的 detector every_n 早已锁死为 1(节流归轮转
+> 调度器),那个节流**不存在了**。判据换到 gscore 之后 every_n 的语义变成
+> **兜底间隔**,而兜底条件是 `gap >= every_n and score >= threshold*0.5`:
+> 单路每 25 帧评估一次、多路每轮转评估一次,gap 一次就涨 25~50+ 帧 ——
+> **every_n=30 时兜底条件恒成立**,gscore 门形同虚设,画面没变也照送 NPU。
+> 600 才是"双保险"该有的量级(见 §默认 every_n = 600)。
+
+### 踩过的坑:vtd 向导的帧间隔默认 30(其它卡 600)
+
+**症状**:「视频目标监控」快速配置里帧间隔默认 **30**,而音视频描述 /
+视频目标定位都是 **600**。
+
+**根因**:`a0a98cb`(vtd 多路页接通帧判据)把 vtd 的 `wizard.json` 从
+`default: 600` 改成了 `30`,**只动了 vtd 一张卡**。那个 30 不是设计决定,
+是抄了后端当时的 `DEFAULT_EVERY_N = 30`(=detector 时代"每 30 帧送一次"的
+固定节流)。同一批 commit 里 vtl / vd 的 600 没动,于是差异一直留着;v0.25
+把视频卡拆成插件包时又被原样冻结进 `wdnapps_video_analyzer`。
+
+**危害不只是"数字不一样"**:多路页的判据是**每轮转评估一次**
+(`multi_session._run_one_channel` → `judge.observe(thumb, ch.frames)`),
+两次评估之间该路已经解了 25~50+ 帧,`gap` 一次就涨过 30 → 兜底条件
+`gap >= every_n` 恒成立 → **gscore 门被架空**,画面没变也照送 NPU。600 才
+是"兜底间隔"该有的量级(≈24s)。
+
+**修法**:vtd `wizard.json` 的 `default` 回到 600,并把后端
+`DEFAULT_EVERY_N` 一起从 30 改成 600 —— 后端常量是**初始态**,不改它的话
+「直接进功能页(不过向导)」的用户看到的仍是 30,和向导里的 600 打架。
+共享前端组件 `frame-judge.js` 里残留的 `|| "30"` 兜底(输入框空时的
+fallback)一并改成 600。
+
+> **三处默认值必须一致**:后端 `frame_judge.DEFAULT_EVERY_N`、共享组件
+> `frame-judge.js`(`_fallbackCfg()` / `inpEvery.value` / `config()` 里的
+> fallback)、各卡 `wizard.json` 的 `<prefix>-judge-every-n.default`。
+> 改任何一处,grep 一遍另外两处。
+>
+> 回归防护:`python -m scripts.verify_judge_every_n_defaults`(不占 NPU)——
+> 断言三处默认值都等于 600 **且** 钉住行为:用真实 `FrameJudge` 跑一轮
+> 「多路轮转」模拟(每轮之间解 47 帧),every_n=30 时兜底恒成立(20/20 轮
+> 全放行 = gscore 门被架空),every_n=600 时门只放行 2/20 轮。
+>
+> 卡片源码现在在插件包里(`.venv/src/wdnapps-video-analyzer/`),**改卡片的
+> `wizard.json` 不在本仓库** —— 用 `scripts/card_dirs.py` 查源目录。
 
 三条**实测踩出来的**规矩，改这块时务必先读:
 

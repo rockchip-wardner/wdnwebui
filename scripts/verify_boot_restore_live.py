@@ -193,7 +193,7 @@ def main() -> int:
                     break
                 time.sleep(1.5)
 
-        # 事件要等判据攒够帧（gscore 默认 every_n=30），不是立刻就有 ——
+        # 事件要等判据攒够帧（gscore 默认 every_n=600 兜底间隔），不是立刻就有 ——
         # 这里给一段等待，否则会在"刚启动、还没出事件"的瞬间断言，白红。
         evs = []
         for _ in range(40):
