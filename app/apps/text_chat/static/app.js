@@ -591,6 +591,15 @@ TextChat.init();
 window.ImApp_text_chat = window.ImApp_text_chat || {};
 window.ImApp_text_chat.applyWizardSnapshot = async function (opts) {
   const result = { prompt_filled: false, sent: false };
+  // 向导的「深度思考」选择 → 同步页面开关 + localStorage（页面级持久），
+  // 让随后的 send() 按它决定 enable_thinking。向导默认关；未传也显式置关，
+  // 避免主界面上次开启的残留影响向导结果。
+  const wantThinking = opts.enableThinking === true;
+  const thinkingCb = document.getElementById("text-chat-thinking");
+  if (thinkingCb) thinkingCb.checked = wantThinking;
+  try {
+    localStorage.setItem("text_chat_thinking", wantThinking ? "1" : "0");
+  } catch (_) { /* private mode */ }
   if (opts.prompt) {
     const input = document.getElementById("text-chat-input");
     if (input) {

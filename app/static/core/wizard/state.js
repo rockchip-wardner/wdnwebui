@@ -877,7 +877,10 @@
         head.appendChild(lbl);
         head.appendChild(fillBtn);
         wrap.appendChild(head);
-      } else {
+      } else if (field.type !== "checkbox") {
+        // checkbox 的文字由 _buildToggle 自带的 toggle-text 渲染；这里再
+        // 加一次 field-label 会让同一句话出现两遍。inline 进 source 行的
+        // -loop 字段不会走到这里，不受影响。
         wrap.appendChild(lbl);
       }
       let el;
@@ -1402,13 +1405,18 @@
       if (s.kind !== "form") return;
       (s.fields || []).forEach((f) => {
         const v = state.values[f.id];
-        if (v == null || v === "" || v === false) return;
+        const isCheckbox = f.type === "checkbox";
+        // checkbox 的 false 默认不显示（多数开关「关」是常态）；显式声明
+        // summary_show_false 的字段例外 —— 例如「深度思考」需要明确写出
+        // 「否」，让用户在完成页确认自己的选择。
+        const showFalse = isCheckbox && f.summary_show_false === true;
+        if (v == null || v === "" || (v === false && !showFalse)) return;
         hasAny = true;
         const row = _ce("div", WIZARD_NS + "summary-row");
         // 完成配置摘要优先用 summary_label(短标题),否则用 label/form id
         const summaryLabel = f.summary_label || f.label || f.id;
         row.appendChild(_ce("span", null, summaryLabel + ":"));
-        const val = (f.type === "checkbox") ? "是" : String(v);
+        const val = isCheckbox ? (v ? "是" : "否") : String(v);
         row.appendChild(_ce("span", WIZARD_NS + "summary-val", val));
         summary.appendChild(row);
       });
