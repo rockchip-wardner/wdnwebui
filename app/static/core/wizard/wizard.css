@@ -237,6 +237,33 @@
   font-weight: 500;
   color: #374151;
 }
+/* 「例:…」标签行 + 「一键填入」按钮 */
+.wd-wizard-field-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.wd-wizard-field-head > .wd-wizard-field-label {
+  /* 不占满整行 —— 按钮要**紧跟**在例子文字后面,不是甩到行尾 */
+  flex: 0 1 auto;
+}
+.wd-wizard-fill-example {
+  flex: 0 0 auto;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 2px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #2563eb;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s;
+}
+.wd-wizard-fill-example:hover {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
 .wd-wizard-input,
 .wd-wizard-form textarea {
   width: 100%;

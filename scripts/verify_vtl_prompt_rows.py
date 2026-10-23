@@ -30,18 +30,29 @@ def main():
         # 测试 1:ground 步骤渲染了 prompt-rows UI(不是 textarea)
         t1 = page.evaluate("""() => {
             const wizardBody = document.querySelector('.wd-wizard-section .wd-wizard-body');
+            const inputs = [...wizardBody.querySelectorAll('.vtl-prompt-row-input')];
             return {
                 hasTextarea: !!wizardBody.querySelector('textarea'),
                 hasPromptRows: !!wizardBody.querySelector('.vtl-prompt-rows'),
                 hasAddBtn: !!wizardBody.querySelector('.vtl-prompt-add'),
                 initialRowCount: wizardBody.querySelectorAll('.vtl-prompt-row').length,
                 stepTitle: wizardBody.querySelector('.wd-wizard-step-title')?.textContent,
+                values: inputs.map(i => i.value),
+                placeholders: inputs.map(i => i.placeholder),
             };
         }""")
         print(f"=== 1) ground 步骤 ===")
         print(f"  {t1}")
-        if not t1['hasTextarea'] and t1['hasPromptRows'] and t1['hasAddBtn'] and t1['initialRowCount'] == 1:
+        if not t1['hasTextarea'] and t1['hasPromptRows'] and t1['hasAddBtn'] and t1['initialRowCount'] == 2:
             print(f"  ✅ 渲染多行 UI,无单 textarea")
+            ok += 1
+        else:
+            print(f"  ❌ FAIL")
+
+        # 测试 1b:默认两行 —— 第一行预填「穿着红衬衫的人」,第二行空着带浅色占位
+        if (t1['values'] == ['穿着红衬衫的人', '']
+                and t1['placeholders'] == ['例：穿着红衬衫的人'] * 2):
+            print(f"  ✅ 默认两行:第一行预填,第二行空且带占位")
             ok += 1
         else:
             print(f"  ❌ FAIL")
@@ -58,7 +69,7 @@ def main():
         }""")
         print(f"\n=== 2) 加 2 次后 ===")
         print(f"  {t2}")
-        if t2['rowCount'] == 3 and t2['inputCount'] == 3:
+        if t2['rowCount'] == 4 and t2['inputCount'] == 4:
             print(f"  ✅ 添加成功")
             ok += 1
         else:
@@ -128,8 +139,8 @@ def main():
             print(f"  ❌ FAIL")
 
         browser.close()
-        print(f"\n=== 总结: {ok}/4 ===")
-        if ok == 4:
+        print(f"\n=== 总结: {ok}/5 ===")
+        if ok == 5:
             print("✅ 全部通过")
             return 0
         return 1

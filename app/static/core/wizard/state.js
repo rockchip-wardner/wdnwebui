@@ -861,7 +861,20 @@
 
       const wrap = _ce("div", WIZARD_NS + "field");
       const lbl = _ce("label", WIZARD_NS + "field-label", field.label || field.id);
-      wrap.appendChild(lbl);
+      // 「label 即示例」约定:提示词类字段的 label 以「例」开头,例子后面跟
+      // 一个「一键填入」按钮。
+      let fillBtn = null;
+      if (field.type === "textarea" && /^例[:：]/.test(field.label || "")) {
+        const head = _ce("div", WIZARD_NS + "field-head");
+        fillBtn = _ce("button", WIZARD_NS + "fill-example", "一键填入");
+        fillBtn.type = "button";
+        fillBtn.title = "把上面的例子填进输入框";
+        head.appendChild(lbl);
+        head.appendChild(fillBtn);
+        wrap.appendChild(head);
+      } else {
+        wrap.appendChild(lbl);
+      }
       let el;
       const cur = state.values[field.id];
       switch (field.type) {
@@ -914,10 +927,14 @@
           el.appendChild(rowsEl);
           const minRows = Number.isFinite(field.min_rows) ? field.min_rows : 1;
           const maxRows = Number.isFinite(field.max_rows) ? field.max_rows : 20;
-          // 行容器(已有 prompt 数组 → 恢复;否则 1 行)
+          // 初始行:已存过 prompt 数组 → 恢复;否则用字段声明的 default_rows
+          // (["穿着红衬衫的人", ""] = 两行、第一行预填、第二行空着显示
+          // placeholder);再兜底 1 个空行。
+          const defaults = Array.isArray(field.default_rows)
+            ? field.default_rows.slice(0, maxRows) : [];
           const initial = Array.isArray(cur) && cur.length >= minRows
             ? cur.slice(0, maxRows)
-            : [""];
+            : (defaults.length ? defaults : [""]);
           const wizardAddPromptRow = (val) => {
             const row = _ce("div", "vtl-prompt-row is-open");
             // 挂 wd-wizard-input:不挂就退回浏览器默认控件样式(2px 灰边 /
@@ -991,6 +1008,15 @@
       // toggle / 复合容器(已经设了 data-field-id)无需再设
       if (!el.dataset.fieldId) el.dataset.fieldId = field.id;
       _bindFieldLive(cfg, state, field, el);
+      // 「一键填入」:把 label 里的例子(去掉「例:」前缀)写进输入框。派发
+      // change → _bindFieldLive → _captureValues,值立刻落进 state.values。
+      if (fillBtn) {
+        fillBtn.addEventListener("click", () => {
+          el.value = (lbl.textContent || "").replace(/^例[:：]\s*/, "");
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.focus();
+        });
+      }
       // 视频源字段自动追加"浏览…"按钮 + 同 stepDef 内 -loop toggle。
       //
       // 两个约束缺一不可：
