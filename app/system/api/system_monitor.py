@@ -52,6 +52,93 @@ _THERMAL_NAME_OVERRIDES = {
 }
 _SKIP_THERMAL_TYPES = {"acpitz", "acpi"}
 
+# ---------------------------------------------------------------------------
+# NPU 温度 / 功耗读取
+#
+# RK1828（RK3588 + PCIe AI 协处理器板）上，**设备级** SMI 命令要过 PCIe
+# 通道问 EP 固件要遥测，而这块固件**不应答** —— rknn-smi 先打
+#   [ERROR] [nsmi_pcie.c:651] Receive error, command: 12   （温度）
+#   [ERROR] [nsmi_pcie.c:651] Receive error, command: 7    （功耗）
+# 然后 rknnsmi_get_device_temperature() 直接返回 -1（GENERIC）。
+# 前端于是永远拿不到 NPU 温度（卡片上温度恒为空），journal 里每 3 秒
+# 刷一屏 ERROR。
+#
+# 实测（2026-10-24，本机双 RK1828 板）：
+#   rknnsmi_get_device_temperature(0) → 必失败（RknnSmiCallError GENERIC）
+#   rknnsmi_get_chip_temperature(0,0)  → 成功，raw = 43 / 45
+#   rknn-smi info CLI                   → Temp(C) 40 / 42（CLI 走的就是 chip 级）
+#   rknnsmi_get_device_power(0)        → PCIe 失败，但**库内部**回退到板级
+#                                        INA226（hwmon）→ 仍返回 ~5300 mW
+#
+# **设备级→chip 级的回退已经由 wdnai 承担**（RknnSmi.get_device_temperature
+# 失败时自动回退，并记住该卡设备级不通 → 后续不再触发注定失败的 PCIe
+# 命令）。所以本仓这里就是一次普通调用，不需要自己猜单位、不需要自己
+# 实现「设备级 / chip 级」这层平台语义。
+#
+# 功耗那边 wdnai 没法兜：设备级功耗命令（cmd 7）同样过不去 PCIe，库内部
+# 回退到板级 INA226（hwmon）——**值是对的**（两张卡读到的是同一路板级
+# 传感器，本来就不是逐卡功率），但每次调用都会先打一行 C 层的
+# "Receive error, command: 7"。功耗是慢变量，缓存几个轮询周期即可。
+# ---------------------------------------------------------------------------
+_POWER_CACHE: dict[int, tuple[float, float]] = {}   # index → (mW, 取值时刻)
+_POWER_TTL_S = 30.0                           # 慢变量；tooltip 显示，30s 足够新鲜
+
+
+def _read_power_mw(smi, idx: int) -> Optional[float]:
+    """读 NPU 功耗（mW），带短 TTL 缓存。
+
+    设备级功耗命令（cmd 7）在这块固件上同样过不去 PCIe，rknn-smi 库内部
+    会回退到板级 INA226（hwmon）——**值是对的**（注意两张卡读到的是同一路
+    板级传感器，本来就不是逐卡功率），但每次调用都会先打一行 C 层的
+    "Receive error, command: 7"。功耗是慢变量，缓存几个轮询周期即可。
+    """
+    import logging
+
+    now = time.time()
+    hit = _POWER_CACHE.get(idx)
+    if hit is not None and now - hit[1] < _POWER_TTL_S:
+        return hit[0]
+    try:
+        val = smi.get_device_power(idx)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).debug(
+            "rknnsmi get_device_power(%d) failed: %s: %s",
+            idx, type(e).__name__, e)
+        return None
+    if val is None:
+        return None
+    val = float(val)
+    _POWER_CACHE[idx] = (val, now)
+    return val
+
+
+# ---------------------------------------------------------------------------
+# 失败日志限流
+#
+# PCIe 链路偶尔会进入一段坏状态（典型触发：NPU 被 SIGTERM 打断、卡复位），
+# 此时一整轮 SMI 查询会集体失败（get_memory_info / get_chip_health /
+# get_chip_list …，ret=-1 / -8）。这类失败**自己会恢复**，但前端每 3 秒
+# 轮询一次，逐次记 WARNING 就是刷屏。
+#
+# 所以同一个 (操作, 设备) 的失败最多每 _SMI_WARN_TTL_S 记一条 WARNING，
+# 其余降到 DEBUG —— 真要追时看 DEBUG 就够。
+# ---------------------------------------------------------------------------
+_SMI_WARN_AT: dict[str, float] = {}
+_SMI_WARN_TTL_S = 60.0
+
+
+def _smi_warn_once(key: str, msg: str, *args) -> None:
+    """同一个 key 的失败最多每 60s 记一条 WARNING，其余记 DEBUG。"""
+    import logging
+
+    lg = logging.getLogger(__name__)
+    now = time.time()
+    if now - _SMI_WARN_AT.get(key, 0.0) >= _SMI_WARN_TTL_S:
+        _SMI_WARN_AT[key] = now
+        lg.warning(msg, *args)
+    else:
+        lg.debug(msg, *args)
+
 
 async def _run_rknn_smi_info() -> tuple[str, str, int]:
     """Run ``rknn-smi info``; return (stdout, stderr, returncode)."""
@@ -326,8 +413,8 @@ async def _collect_npu_via_smi() -> list[dict]:
                 if info.get("product_name"):
                     row["id"] = info["product_name"]
             except Exception as e:  # noqa: BLE001
-                import logging
-                logging.getLogger(__name__).warning(
+                _smi_warn_once(
+                    f"device_info:{idx}",
                     "rknnsmi get_device_info(%d) failed: %s: %s",
                     idx, type(e).__name__, e,
                 )
@@ -335,8 +422,8 @@ async def _collect_npu_via_smi() -> list[dict]:
                 chips = smi.get_chip_list(idx)
                 chip_id = chips[0] if chips else 0
             except Exception as e:  # noqa: BLE001
-                import logging
-                logging.getLogger(__name__).warning(
+                _smi_warn_once(
+                    f"chip_list:{idx}",
                     "rknnsmi get_chip_list(%d) failed: %s: %s",
                     idx, type(e).__name__, e,
                 )
@@ -348,28 +435,24 @@ async def _collect_npu_via_smi() -> list[dict]:
             except Exception:
                 # USB / ETH devices don't expose PCIe BDF; leave None.
                 pass
+            # 温度：wdnai 已内建「设备级失败 → 回退 chip 级」并记住该卡
+            # 设备级不通（见文件头的说明），这里就是一次普通调用。
             try:
                 row["temp_c"] = smi.get_device_temperature(idx)
             except Exception as e:  # noqa: BLE001
-                import logging
-                logging.getLogger(__name__).warning(
+                _smi_warn_once(
+                    f"device_temp:{idx}",
                     "rknnsmi get_device_temperature(%d) failed: %s: %s",
                     idx, type(e).__name__, e,
                 )
-            try:
-                row["power_mw"] = smi.get_device_power(idx)
-            except Exception as e:  # noqa: BLE001
-                import logging
-                logging.getLogger(__name__).warning(
-                    "rknnsmi get_device_power(%d) failed: %s: %s",
-                    idx, type(e).__name__, e,
-                )
+            # 功耗：值来自库内部的 hwmon 回退（PCIe 路径坏），带 TTL 缓存。
+            row["power_mw"] = _read_power_mw(smi, idx)
             try:
                 npu = smi.get_npu_info(idx, chip_id)
                 row["npu_percent"] = float(npu.get("util_rate_pct", 0) or 0)
             except Exception as e:  # noqa: BLE001
-                import logging
-                logging.getLogger(__name__).warning(
+                _smi_warn_once(
+                    f"npu_info:{idx}:{chip_id}",
                     "rknnsmi get_npu_info(%d, %d) failed: %s: %s",
                     idx, chip_id, type(e).__name__, e,
                 )
@@ -386,8 +469,8 @@ async def _collect_npu_via_smi() -> list[dict]:
                         f"{int(total / (1024 * 1024))}"
                     )
             except Exception as e:  # noqa: BLE001
-                import logging
-                logging.getLogger(__name__).warning(
+                _smi_warn_once(
+                    f"memory_info:{idx}:{chip_id}",
                     "rknnsmi get_memory_info(%d, %d) failed: %s: %s",
                     idx, chip_id, type(e).__name__, e,
                 )
@@ -395,8 +478,8 @@ async def _collect_npu_via_smi() -> list[dict]:
                 health = smi.get_chip_health(idx, chip_id)
                 row["health"] = health.name
             except Exception as e:  # noqa: BLE001
-                import logging
-                logging.getLogger(__name__).warning(
+                _smi_warn_once(
+                    f"chip_health:{idx}:{chip_id}",
                     "rknnsmi get_chip_health(%d, %d) failed: %s: %s",
                     idx, chip_id, type(e).__name__, e,
                 )
