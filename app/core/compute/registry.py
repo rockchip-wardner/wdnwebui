@@ -964,6 +964,24 @@ class ModelInstance:
     # 按钮 flicker（probe 陈旧 r 覆盖 unload 乐观写的 "not_loaded"）。
     _probe_gen: int = 0
     _logged_running: bool = False
+    # 「本次 load 已发起、但**还没被 worker 确认**」的标志。
+    #
+    # worker 的 load_handler 是**同步**把 state["status"]="loading" 写好
+    # 才回 load 的 RPC（app/core/compute/workers/_base.py:494 → :562），
+    # 所以「load 被确认」≡「worker 侧状态已经是本轮的」。在确认之前，
+    # worker 报上来的 error 只可能是**上一轮**的残留。
+    #
+    # 为什么需要它：probe 是「一次性」线程（终态就 return），而 bind
+    # 乐观写 loading 之后全靠 probe 翻 running/error。上一轮加载失败
+    # （worker 进程还活着，state 停在 ("error", 旧错误)）后重试时，
+    # 新起的 probe 抢在 load RPC 之前读到那个**旧** error —— 若把它
+    # 当成本次终态，probe 写完 error 就自杀退出 → 没人再探 → 实例
+    # 永远停在「启动失败」，哪怕 worker 其实已经加载成功（真机实测：
+    # retry 后 worker 34.5s 就绪，主进程仍报上一轮的旧错误）。
+    #
+    # 生命周期：bind_instance 置 True → _run_load 收到 worker 的 ack
+    # （或失败）后置 False。
+    _load_pending: bool = False
     # 「正在关闭中」计数(unload / stop 期间 > 0)—— status 里没有这个
     # 状态,关闭中对外仍报 running/loading,并发请求会把正在卸载的实例
     # 当成可复用的 → 再 load 一次 → rc=-6。判据见 transition_of()。
@@ -2706,6 +2724,10 @@ class ComputeRegistry:
             inst.status = "loading"
             inst.started_at = time.time()
             inst.error = ""
+            # 「本次 load 还没被 worker 确认」—— **必须在下面起 probe 之前**
+            # 置位，否则新 probe 的第一次 info 读会把它当成本次的终态。
+            # probe 拿它判「worker 报上来的 error 是上一轮的残留」。
+            inst._load_pending = True
             new_key = (npu_index, inst.model_id, inst._source)
             if inst.key != new_key:
                 self._instances.pop(inst.key, None)
@@ -2730,6 +2752,10 @@ class ComputeRegistry:
             # status with ``error``. Bail early instead.
             rpc_client = inst.rpc_client
             if rpc_client is None:
+                # 没有 RPC client 可用 → 这次 load 永远不会发生，标志要清，
+                # 否则 probe 会一直把 worker 报的 error 当成陈旧残留忽略。
+                with self._lock:
+                    inst._load_pending = False
                 return
             try:
                 # load_handler 立即返回 {"status": "loading"} + npu_index
@@ -2858,6 +2884,10 @@ class ComputeRegistry:
                               f" (rc={rc})" if rc is not None else "")
             finally:
                 inst._bind_inflight = False
+                # load 已经有结果了（ack / 失败 / 异常）—— worker 侧的状态
+                # 从此刻起是**本轮**的，probe 不再需要把它的 error 当残留。
+                with self._lock:
+                    inst._load_pending = False
                 LOG.debug(
                     "compute_registry: _run_load done model=%s npu=%d "
                     "final_status=%s thread=%s",
@@ -4336,14 +4366,35 @@ class ComputeRegistry:
                         # 不 return — 继续 poll + drain stderr，保留对 running
                         # worker 的可见性（embed_video 错误/NPU 卡死不会显示）
                     if worker_status == "error":
+                        # **本次 load 还没被 worker 确认**时，worker 报上来的
+                        # error 是**上一轮**的残留 —— worker 要等自己把
+                        # state["status"] 翻成 "loading" 才回 load 的 RPC，
+                        # 所以在 ack 之前它报的还是上一轮那个 error。
+                        #
+                        # 以前这里无条件写 error 并 return（probe 是「一次性」
+                        # 的，终态就退出）→ 探针一死就没人再探 → 实例永远
+                        # 停在「启动失败」，哪怕 worker 其实已经加载成功
+                        # （真机实测：retry 后 worker 34.5s 就绪，主进程仍报
+                        # 上一轮的旧错误文案）。
+                        #
+                        # 正确做法：**忽略**这次陈旧 error，继续探 —— 下一次
+                        # 读到的就是本轮的真实状态（loading / running / error）。
                         with self._lock:
-                            inst.status = "error"
-                            inst.error = data.get("init_error", "")
-                            inst.finished_at = time.time()
-                        LOG.warning(
-                            "instance %s @ npu=%d → error: %s",
-                            inst.model_id, inst.npu_index, inst.error)
-                        return
+                            stale = inst._load_pending
+                            if not stale:
+                                inst.status = "error"
+                                inst.error = data.get("init_error", "")
+                                inst.finished_at = time.time()
+                        if stale:
+                            LOG.debug(
+                                "compute_registry: _probe_instance %s 忽略 load "
+                                "确认前的陈旧 error（worker 仍在用上一轮的"
+                                "状态）", inst.model_id)
+                        else:
+                            LOG.warning(
+                                "instance %s @ npu=%d → error: %s",
+                                inst.model_id, inst.npu_index, inst.error)
+                            return
                     if worker_status == "loading":
                         with self._lock:
                             if inst.status != "loading":
