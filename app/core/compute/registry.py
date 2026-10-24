@@ -1399,6 +1399,23 @@ class ComputeRegistry:
                     # for, and the registry validates on use anyway.
                     new_caps.append(cap)
                     continue
+                except Exception as exc:  # noqa: BLE001
+                    # **本段在启动路径上跑** —— 任何漏网的异常都会让
+                    # ComputeRegistry.__init__ 抛出去 → 整个服务起不来。
+                    # 真实踩过的坑：wdnai.migrate_legacy 曾用
+                    # `value in SoftwareCapability`，而 Enum.__contains__
+                    # 在 Python 3.11 对非枚举成员抛 TypeError（3.12 才按值
+                    # 返回 True/False）→ 合法能力串也炸 → TypeError 逃出
+                    # 本函数 → 服务启动失败。
+                    # 所以这里兜住**所有**异常：能力名原样保留（后续用到时
+                    # 校验会给出准确报错），只记一条日志，不拦停启动。
+                    LOG.warning(
+                        "实例 %s 的能力 %r 迁移时异常（已原样保留）: %s: %s",
+                        inst.get("model") or inst.get("name") or "?",
+                        cap, type(exc).__name__, exc,
+                    )
+                    new_caps.append(cap)
+                    continue
                 new_caps.append(migrated.value)
                 if renamed:
                     renamed_total += 1
