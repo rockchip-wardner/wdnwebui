@@ -2943,6 +2943,67 @@ probe 退出 → 用户再点「启用」（或向导「一键开启」重试）
 驱动 API handler，不起服务不占 NPU）；`scripts/verify_wizard_bringup_loading_card.py`
 （7 断言，mock 后端扫前端一键开启的 DELETE/POST 序列）；真机四场景见下节。
 
+#### 探针把「上一轮残留的 error」当成本次终态 —— 重试后永远停在「启动失败」（v0.30 修）
+
+**症状**：worker 侧某次加载失败（缺包 / rknn init 错 / 模型文件缺失）→
+用户把原因修掉后**重试** → worker 其实加载成功了（真机实测 34.2s 就绪），
+但算力页一直显示「启动失败」，错误文案还是**上一轮**的那句；能力也取不到
+（`功能未启用: swcap_vision_chat`）。更糟的是 NPU 内存被白占着。
+
+> 这是上面 `_ensure_probe_thread` 那次修的**同一个坑的另一半**：上次修的是
+> 「probe 早已退出 → bind 后没人探 → 永久卡 loading」；这次是「重新起的
+> probe 抢在 load RPC 前面读到旧 error → 写完 error 就自杀 → 永久卡 error」。
+> 两个症状同源：probe 是**一次性**线程，终态就 `return`。
+
+**根因**：三个动作凑在一起 ——
+
+1. worker 侧 load 失败但**进程还活着** → state 停在
+   `("error", 旧错误)`（`workers/_base.py:555-556`）；
+2. 重试复用同一个 worker → `bind_instance` 乐观写 `status="loading"`，
+   然后**先**起 probe（`registry.py:2742`）、**后**发 load RPC
+   （`registry.py:2893`）。probe 的 info 调用持着 `inst._probe_lock`，
+   load RPC 也要抢这把锁 → **probe 那条 info 先到 worker**，worker 回的是
+   上一轮的 error；
+3. probe 把它当成本次终态 → 写 `status="error"` 并 `return` → 没人再探。
+
+修复前的 journal（同一秒内两条，顺序就是证据）：
+
+```
+[WARNING] instance qwen3-vl-4b @ npu=0 → error: ModuleNotFoundError: No module named 'tokenizers'
+[INFO]    bind qwen3-vl-4b @ npu=0: async load started, deferring to probe
+```
+
+**修法**：`registry.ModelInstance._load_pending` —— 「本次 load 已发起、但
+**还没被 worker 确认**」的标志。worker 的 `load_handler` 是**同步**把
+`state["status"]="loading"` 写好才回 load 的 RPC
+（`workers/_base.py:494` → `:562`），所以「load 被确认」≡「worker 侧状态
+已经是本轮的」→ **ack 之前 worker 报上来的 error 必然属于上一轮**。
+
+- `bind_instance` 乐观写时置 `True`（**必须在起 probe 之前**，否则新 probe
+  的第一次 info 读就看不到）；
+- `_run_load` 的 `finally` 里清 `False`（ack / 失败 / 异常都覆盖）；
+- probe 收到 `error` 时：`_load_pending` 为 True → **忽略**这次陈旧 error
+  并继续探；为 False → 照旧当终态（写 error + 退出探针）。
+
+**别把 `_probe_gen` 当成解法**：load 路径没有 bump 它，且 probe 的 gen 快照
+取在发调用**之前**（`registry.py:4213`）—— bump 早于快照就完全无效，
+还是竞态。
+
+修复后同一场景的 journal（重试后**没有** "→ error" 那一行）：
+
+```
+08:06:39  bind qwen3-vl-4b @ npu=0: async load started, deferring to probe
+08:06:40  instance qwen3-vl-4b @ npu=0 → error: FileNotFoundError: ...   ← 真错误，终态
+08:06:42  bind qwen3-vl-4b @ npu=0: async load started, deferring to probe ← 重试
+08:07:16  instance qwen3-vl-4b @ npu=0 → running (load=34.2s)             ← 收敛
+```
+
+回归：`scripts/verify_probe_stale_error.py`（14 断言，不占 NPU）—— T1 探针
+忽略陈旧 error 且能收敛到 running / T2 真 error 仍是终态（防修过头）/
+T3 标志生命周期（ack 前 True、ack 后归零、起探针前已置位）/ T4 走真
+`bind_instance` 的端到端。**该脚本在修复前是 4 通过 10 失败**（T1、T4 全红，
+症状与真机一致）。
+
 #### 启模型前必须校验卡位 —— 越界的 npu 会造出「僵尸实例」（v0.29 修）
 
 **症状**：`POST /api/compute/instances` 传一个**本机没有的卡号**（单卡板传
@@ -6510,6 +6571,61 @@ XML profile 路径：`$XDG_RUNTIME_DIR/wdndds_default_profile.xml`
   1=peer OK 但 RPC 失败, 2=无 peer, 3=cshim 不可用）。
 * **无 daemon HTTP API**：v0.5 时代 daemon 的 `/status` / `/peers`
   /start /stop 端点全部下线。
+
+### NPU 温度读不到 / C 层 ERROR 刷屏（v0.30 修）
+
+**症状**：`journalctl -u wdnwebui` 里每 3 秒一屏 ——
+
+```
+[ERROR] [nsmi_pcie.c:651] Receive error, command: 12     ← 设备级温度
+[ERROR] [rk_nsmi.c:1143] rknnsmi receive failed, ret=-1
+[WARNING] system_monitor: rknnsmi get_device_temperature(0) failed: ...
+[ERROR] [nsmi_pcie.c:651] Receive error, command: 7      ← 设备级功耗
+[WARN]  [rk_nsmi.c:906] rknnsmi receive failed, ret=-1
+[INFO]  [rk_nsmi.c:923] Device[0] get device power from hwmon node, power: 5143 mW
+```
+
+而且**卡片上温度恒为空**（前端 `temp_c` 一直是 null → 不渲染 °C）。
+
+**根因**：RK1828（RK3588 + PCIe AI 协处理器板）的 **设备级** SMI 命令要过
+PCIe 通道问 EP 固件要遥测，这块固件**不应答** —— rknn-smi 先打
+"Receive error, command: N"，`rknnsmi_get_device_temperature()` 于是返回
+-1（GENERIC）。实测（2026-10-24，本机双 RK1828，pcie-rkep 3.3.1）：
+
+| 调用 | 结果 |
+|---|---|
+| `rknnsmi_get_device_temperature(0)` | **必失败**（GENERIC -1） |
+| `rknnsmi_get_chip_temperature(0,0)` | **成功**，raw = 43 / 45 |
+| `rknn-smi info` CLI | 正常，Temp(C) 40 / 42（CLI 走的就是 chip 级） |
+| `rknnsmi_get_device_power(0)` | PCIe 失败，但**库内部**回退到板级 INA226（hwmon）→ 仍返回 ~5300 mW |
+
+**两级温度单位不一样**：设备级是毫度（×1000），chip 级是**整度**。
+wdnai 两级都按毫度 ÷1000 → chip 级的 43°C 会被算成 **0.043**。
+（wdnai 那边这个换算是 bug，属 SDK 仓库；本仓只能自己兜。）
+
+**修法**（`app/system/api/system_monitor.py`）：
+
+* `_read_temp_c()`：**先试 chip 级**（RK1828 上唯一可用的路），失败再试
+  设备级；用 `_TEMP_SOURCE_CACHE` 记住每张卡哪一级能用 —— 于是 **cmd 12
+  根本不会被发起**，C 层那行 "Receive error, command: 12" 消失。
+* `_normalize_temp_c()`：把 `0 < v < 1` 判成「被误除了 1000 的毫度」并乘回
+  1000。两种单位约定都能出正确值，将来 wdnai 修好换算也不会被反着乘。
+* `_read_power_mw()`：功耗照旧调（值是对的，来自库内部的 hwmon 回退），
+  但加 30s TTL 缓存 —— 功耗是慢变量，压掉 cmd 7 的噪音。
+* `_smi_warn_once()`：同一个 (操作, 设备) 的失败最多每 60s 记一条 WARNING，
+  其余降 DEBUG。PCIe 链路瞬态坏掉时（NPU 被 SIGTERM 打断、卡复位）会集体
+  失败一轮，逐次记 WARNING 就是刷屏。
+
+回归：`scripts/verify_npu_temperature_fallback.py`（15 断言，不占 NPU）——
+chip 级归一 / 设备级命令**一次不被调用** / 两级都失败不抛 / 设备级可用时
+也能出温度 / 功耗 TTL / WARNING 限流。**修复前是 5 通过 8 失败**。
+
+> **旁证（排查 SMI 的坑）**：`/tmp/rknnsmi.lock` 被 webui 进程持有 → 同一
+> 时刻另起 `rknn-smi info` CLI 会直接 `Failed to initialize rknnsmi`；
+> 非 root 进程还会因为锁文件属主不对而 `errno 13`（cannot open lock file）。
+> 所以**排查 SMI 要么停服务，要么用私有 /tmp**：
+> `sudo unshare -m bash -c 'mount -t tmpfs tmpfs /tmp && ...'`
+> （mount namespace 里 /tmp 是新的 → flock 落在另一个 inode → 不冲突）。
 
 ### 已知限制
 
