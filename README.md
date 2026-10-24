@@ -43,12 +43,20 @@ pip install -r requirements.txt
 ```
 
 That pulls FastAPI, Uvicorn, Pydantic, psutil, opencv-python-headless,
-python-multipart, and **`gguf`**.
+python-multipart, **`gguf`**, **`transformers`** and **`tokenizers`**.
 
 - `gguf` — used by `wdnai.gguf_tokenizer` to parse the
   `*.tokenizer.gguf` files that ship with each RKNN model. The
   `wdnai` SDK imports it but doesn't declare it as a dependency, so
   we pin it here.
+- `transformers` / `tokenizers` — `wdnai.gguf_tokenizer` loads every
+  RKNN model's `*.tokenizer.gguf` through them, so a model can't even
+  *start* without them (`ModuleNotFoundError: No module named
+  'tokenizers'` → 「启动失败」 on the compute page). The `wdnai` SDK
+  declares both in its `pyproject.toml`, but it is installed with
+  `pip install --no-deps -e` (§4b), which skips dependency resolution
+  entirely — so they have to be listed here. No PyTorch needed: only
+  the tokenizer half of `transformers` is used.
 - `wechatbot-sdk` — async client for the 微信 iLink bot; the synchronous
   wrapper that drives the im-bridge page lives in
   `app/services/wechat_bot.py` (inlined from `wdndds.Wechat` in 0.5+).

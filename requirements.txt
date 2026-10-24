@@ -7,6 +7,27 @@ opencv-python-headless>=4.8.0
 python-multipart>=0.0.9
 av>=11.0.0
 gguf>=0.10.0
+# transformers / tokenizers —— wdnai 加载 RKNN 模型 tokenizer 的硬依赖，
+# 和上面的 gguf 同属「wdnai 没兜住、由 wdnwebui 兜」的一类。
+#
+# 故障链：RKNN 模型目录自带 *.tokenizer.gguf（如
+# /userdata/models/Qwen3-VL-4B/Qwen3-VL-4B.tokenizer.gguf），
+# wdnai.backends._common.load_tokenizer() 对 .gguf 走
+# wdnai.gguf_tokenizer.load_tokenizer_from_gguf()，那里 **先**
+# `from tokenizers import Tokenizer`、**再** `from transformers import
+# PreTrainedTokenizerFast`。缺任一个，worker 侧 LLMSession 初始化即炸：
+#   ModuleNotFoundError: No module named 'tokenizers'
+# 算力页表现为「qwen3-vl-4b@0 启动失败」。
+#
+# 为什么必须显式声明：wdnai 的 pyproject 里写了 transformers>=4.40 /
+# tokenizers>=0.15，但 update_rkwhl.sh 和 README §4 都是
+# `pip install --no-deps -e` 装 SDK —— --no-deps 直接跳过依赖安装，
+# 这两个包**永远**不会自己进 venv。靠 transformers 的传递依赖满足也是
+# 侥幸（换个 transformers 版本改了它的 tokenizers 上界就再炸）。
+# 上界卡 <5 / <1：transformers 5.x、tokenizers 1.x 的 API 变动未验证，
+# wdnai 目前只在 tokenizer 这条窄路径上用到它们。
+transformers>=4.40,<5
+tokenizers>=0.15,<1
 wechatbot-sdk>=0.3.0,<1.0
 lancedb==0.34.0
 pyarrow==25.0.1

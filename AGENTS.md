@@ -3642,6 +3642,27 @@ If `git clone` fails, the host either lacks SSH access to `10.10.10.10` or
 the deploy key isn't loaded. Do **not** fall back to a public mirror — these
 SDKs aren't published.
 
+**wdnai 的依赖不会自己进 venv —— `transformers` / `tokenizers` 必须由
+wdnwebui 的 `requirements.txt` 提供。** `update_rkwhl.sh`（以及上面那条
+手工安装）用的是 `pip install --no-deps -e`，`--no-deps` 直接跳过依赖安装，
+所以 wdnai 的 pyproject 里声明的 `transformers>=4.40` / `tokenizers>=0.15`
+**永远**不会自己被装进 venv。缺任一个的典型症状：
+
+* 算力页报「`「qwen3-vl-4b@0」启动失败：ModuleNotFoundError: No module
+  named 'tokenizers'`」；
+* worker 日志（`/tmp/wdnwebui-worker/<model>.log`）里是
+  `LLMSession init failed for qwen3-vl-4b @ npu=0: ModuleNotFoundError: ...`。
+
+故障链：每个 RKNN 模型目录都自带 `*.tokenizer.gguf` →
+`wdnai.backends._common.load_tokenizer()` 对 `.gguf` 走
+`wdnai.gguf_tokenizer.load_tokenizer_from_gguf()`，那里**先**
+`from tokenizers import Tokenizer`、**再**
+`from transformers import PreTrainedTokenizerFast` —— 所以先炸的永远是
+`tokenizers`，`transformers` 只是紧随其后（两个都缺，但报错只暴露第一个）。
+`gguf` 是同一类问题（已声明在 `requirements.txt`）。
+修法：`.venv/bin/pip install -r requirements.txt`（装的是 transformers +
+tokenizers + 它们的传递依赖，**不需要** torch）。
+
 **wdndds also needs native libs built before `run.py` will boot.** Unlike
 wdnav/wdnai, `pip install wdndds` does not ship pre-built `.so` files —
 the `wdndds/_build.py` `build_py` hook is supposed to compile
