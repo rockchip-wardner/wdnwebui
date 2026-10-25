@@ -5596,6 +5596,27 @@ RIFF header by hand.
     按行删除 / 清空缓存 / 清空检索结果。
   - `DemoGuard` 注册 `video-retrieval`（`active_state_keys: ["search.state","busy"]`），
     离开页面 confirm + 停提取 + `sendBeacon` 兜底。
+  - **向导跑完自动播放视频**（`ImApp_video_retrieval.applyWizardSnapshot`）：
+    与 vtd / vtl / vd 同口径 —— 向导「完成配置」后画面就在播。四张视频卡里
+    原本**只有 vr 跑完是黑屏**（其余三张都是 open + 启动功能）。
+    * **两条通路彼此独立**，别当一回事：预览 = 共享 `VideoSession`
+      （MPP/RGA 解码，`/source/open` + `/source/ws`）；检索 =
+      `VideoSearchService`（PyAV 切片 + NPU embedding，`/open` + `/extract`）。
+      所以**预览打不开不阻断检索**（共享 session 正被别的卡占着、或某容器
+      MPP 解不了而 PyAV 能切，检索照样能做）—— 只 warn，真问题（源不存在
+      之类）由检索自己的错误横幅报。
+    * 顺序：**先开画面再启动检索** —— 等能力就绪最多 20s
+      （`WizardStart` 轮询上限），这期间画面已经在播，用户不用盯黑屏。
+    * **预览在跑 = 后台在跑**：`vrReport()` 的 `busy` 必须含
+      `previewPlaying`，否则离开页面不拦、停下也不走 stop_endpoints
+      → 共享解码线程一直解下去（与 vtd / vtl / vd 的
+      `session.state=playing` 同口径）。
+    * **点命中片段时要把后端解码也停掉**：`vrClosePreviewWs()` 只关 WS，
+      共享 `VideoSession` 的解码线程会继续解 + 继续编 JPEG（没有订阅者
+      也照编，broadcast 只是遍历空列表）—— `vrPlaySegment` 额外 POST
+      `/source/close`（只关预览那路，不碰检索侧）。
+    * 向导挂载期间 page section 是 hidden 的 → canvas 被压成 2×2；向导
+      卸载后 `vrDrawJpeg` 的尺寸漂移检测会自动把它同步回真实尺寸。
 * **ComputeRegistry preset**（`app/core/compute/registry.py`）：
   - `MODEL_PRESETS["qwen3-vl-embedding-2b"]`：`capability_types=
     ["swcap_vision_embedding"]`，`memory_estimate_mb=2000`，
