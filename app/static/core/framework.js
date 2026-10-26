@@ -205,8 +205,9 @@
     _capsAllLocalRunning(caps, snapshot, groups) {
       if (!caps || caps.length === 0) return false;  // 无 cap 的不进入 active_app
       if (!snapshot || !Array.isArray(snapshot.instances)) return false;
+      // 字段名是 _source(to_dict 里没有 source —— 那是 SessionHandle 的)
       const localRunning = snapshot.instances.filter(
-        (i) => i && i.status === "running" && i.source !== "adopted"
+        (i) => i && i.status === "running" && i._source !== "adopted"
       );
       const capSets = localRunning.map(
         (i) => (Array.isArray(i.capability_types) ? i.capability_types : []));
