@@ -2023,6 +2023,12 @@ body.dg-modal-open .back-home-btn {
   font-family: inherit;
   font-size: 0.88rem;
 }
+.tts-hint {
+  font-size: 0.76rem;
+  color: var(--muted);
+  font-family: var(--mono);
+  min-height: 1.1em;
+}
 .tts-volume {
   min-width: 11rem;
   flex: 0 0 auto;

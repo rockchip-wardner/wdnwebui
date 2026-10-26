@@ -24,6 +24,7 @@ from app.apps.tts.service import (
     PLAY_TARGETS,
     TTSRequest,
     get_session,
+    voice_catalog,
 )
 
 
@@ -41,13 +42,30 @@ async def get_tts() -> dict:
     return get_session().snapshot()
 
 
+def _voice_catalog() -> dict:
+    """音色 + 语种清单(取自 SDK 的表,不在前端硬编码)。"""
+    try:
+        return voice_catalog(get_session().model_dir)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"音色清单不可用: {e}")
+
+
+@router.get("/voices")
+async def tts_voices() -> dict:
+    """可用音色 + 语种清单。前端下拉按这个渲染,不在页面里硬编码。"""
+    return _voice_catalog()
+
+
 @router.post("/start")
 async def tts_start(payload: Optional[dict] = None) -> dict:
     """Body fields match ``TTSRequest``: ``text`` (required), ``language``,
-    ``speaker``, ``ref_speaker`` (default ``"girl_base"``), ``instruct``,
+    ``speaker``, ``ref_speaker`` (default ``"girl_base"``),
     ``volume`` (0.0–1.0, default 0.1), ``play_to`` (``"device"`` /
     ``"browser"`` / ``"both"``, default ``"device"``), ``no_play``,
     ``non_streaming_mode``, ``output`` (auto-filled when empty).
+
+    ``instruct`` (风格提示) 只作 SDK 透传,**页面不暴露**: 官方能力表里
+    Base 权重没有 instruction control,填了不改变语气。
 
     When ``play_to`` contains ``"browser"`` the WAV written to ``output``
     is served back via ``GET /api/tts/output?path=...`` so the page can
@@ -70,11 +88,29 @@ async def tts_start(payload: Optional[dict] = None) -> dict:
             detail=f"play_to 必须是 {', '.join(PLAY_TARGETS)} 之一",
         )
 
+    speaker = str(payload.get("speaker", "") or "").strip()
+    ref_speaker = str(payload.get("ref_speaker", "") or "").strip()
+    # 两个都不给才回落 girl_base —— 无条件补会把 speaker 的路堵死
+    # (SDK 里 ref_speaker 优先级高于 speaker)。
+    if not speaker and not ref_speaker:
+        ref_speaker = "girl_base"
+
+    # 音色必须是本模型真有的:Base 权重里内置音色那几行是未训练的噪声,
+    # 塞给 talker 等于没给音色条件 → 每次生成自由发挥。按清单拒掉。
+    avail = {v["id"] for v in _voice_catalog().get("voices", [])}
+    for name, kind in ((speaker, "内置音色"), (ref_speaker, "参考音色")):
+        if name and name not in avail:
+            raise HTTPException(
+                status_code=400,
+                detail=f"本模型没有{kind} {name!r};"
+                       f"当前可用: {', '.join(sorted(avail)) or '无'}",
+            )
+
     req = TTSRequest(
         text=text,
         language=str(payload.get("language", "auto") or "auto"),
-        speaker=str(payload.get("speaker", "") or ""),
-        ref_speaker=str(payload.get("ref_speaker", "girl_base") or "girl_base"),
+        speaker=speaker,
+        ref_speaker=ref_speaker,
         instruct=str(payload.get("instruct", "") or ""),
         volume=volume,
         no_play=bool(payload.get("no_play", False)),

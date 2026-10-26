@@ -1202,6 +1202,47 @@ class TtsSession:
 
 
 # --------------------------------------------------------------------------- #
+# Voice / language catalog
+# --------------------------------------------------------------------------- #
+def voice_catalog(model_dir=None) -> dict:
+    """可用音色 + 语种清单(前端下拉的数据源)。
+
+    全部取自 SDK 的表,不硬编码:参考音色 = 内嵌的 voice-clone 向量;
+    内置音色 = ``available_config_speakers()`` 实测该模型真带的。
+    ``dialect`` 非空表示该音色自带方言(SDK 会把语种锁成它)。
+    """
+    from wdnai.backends.tts import (
+        CODEC_LANGUAGE_ID,
+        SPK_IS_DIALECT,
+        _get_bundled_speaker_embeddings,
+        available_config_speakers,
+    )
+
+    # 「false」是 SDK 的哨兵值。方言不是独立语种 —— 它由对应音色携带,
+    # 不单独列进语种下拉。
+    dialects = {v for v in SPK_IS_DIALECT.values() if v and v != "false"}
+
+    def _dialect_of(name: str) -> str:
+        d = SPK_IS_DIALECT.get(name, "")
+        return d if d in dialects else ""
+
+    # 顺序跟着 SDK 走:内嵌字典天然顺序是 girl_base / ahu(girl_base 在前,
+    # 前端下拉默认选中它 = 历史默认行为)。
+    voices = [
+        {"id": name, "kind": "ref", "dialect": ""}
+        for name in _get_bundled_speaker_embeddings()
+    ]
+    voices += [
+        {"id": name, "kind": "builtin", "dialect": _dialect_of(name)}
+        for name in available_config_speakers(model_dir)
+    ]
+    languages = [{"id": "auto"}] + [
+        {"id": k} for k in CODEC_LANGUAGE_ID if k not in dialects
+    ]
+    return {"voices": voices, "languages": languages}
+
+
+# --------------------------------------------------------------------------- #
 # Singleton accessor
 # --------------------------------------------------------------------------- #
 _session: Optional[TtsSession] = None

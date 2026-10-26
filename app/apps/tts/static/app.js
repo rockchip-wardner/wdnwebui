@@ -5,24 +5,62 @@
   const fmtNum = window.fmtNum;
   const fmtEventTime = window.fmtEventTime;
 
+// 显示用标签。音色的**有效性**由后端 /api/tts/voices 给,这里只管
+// 怎么写给人看 —— 没有标签就退回显示原始 id。
+const VOICE_LABELS = {
+  girl_base: "girl_base（参考音色）",
+  ahu: "ahu（参考音色）",
+  vivian: "Vivian · 中文女声",
+  serena: "Serena · 中文女声",
+  uncle_fu: "Uncle Fu · 中文男声",
+  dylan: "Dylan · 北京话男声",
+  eric: "Eric · 四川话男声",
+  ryan: "Ryan · 英文男声",
+  aiden: "Aiden · 英文男声",
+  ono_anna: "Ono Anna · 日文女声",
+  sohee: "Sohee · 韩文女声",
+};
+const LANGUAGE_LABELS = {
+  auto: "auto（模型自动判断）",
+  chinese: "中文",
+  english: "英文",
+  japanese: "日文",
+  korean: "韩文",
+  german: "德文",
+  french: "法文",
+  russian: "俄文",
+  portuguese: "葡萄牙文",
+  spanish: "西班牙文",
+  italian: "意大利文",
+};
+const DIALECT_LABELS = {
+  sichuan_dialect: "四川话",
+  beijing_dialect: "北京话",
+};
+
 const TTS = {
   initialized: false,
   ws: null,
   backoff: 1.0,
   lastSnap: null,
+  _hasBuiltin: null,   // 清单里有没有内置音色(null = 还没拉清单)
 
   init() {
     if (this.initialized) return;
     this.initialized = true;
 
     const textEl = document.getElementById("tts-text");
-    const refEl = document.getElementById("tts-ref-speaker");
+    const voiceEl = document.getElementById("tts-voice");
     const langEl = document.getElementById("tts-language");
     const volEl = document.getElementById("tts-volume");
     const volValEl = document.getElementById("tts-volume-value");
     const startBtn = document.getElementById("tts-start");
     const stopBtn = document.getElementById("tts-stop");
     const audioEl = document.getElementById("tts-audio");
+
+    if (voiceEl) voiceEl.addEventListener("change", () => this._updateVoiceHint());
+    if (langEl) langEl.addEventListener("change", () => this._updateVoiceHint());
+    this.loadCatalog();
 
     if (volEl && volValEl) {
       volEl.addEventListener("input", () => {
@@ -59,6 +97,97 @@ const TTS = {
         if (this.lastSnap && this.lastSnap.busy) return;
         this.refresh().catch(() => {});
       }, 5000);
+    }
+  },
+
+  // ------------------------------------------------------------------ //
+  // 音色 / 语种清单
+  // ------------------------------------------------------------------ //
+  async loadCatalog() {
+    try {
+      const r = await fetch(API_PREFIX + "/tts/voices");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json() || {};
+      const voices = data.voices || [];
+      this._hasBuiltin = voices.some((v) => v.kind === "builtin");
+      this._fillVoices(voices);
+      this._fillLanguages(data.languages || []);
+      this._updateVoiceHint();
+    } catch (err) {
+      // 清单拿不到 → 下拉留空,后端回落到默认参考音色,功能不瘫。
+      const hintEl = document.getElementById("tts-voice-hint");
+      if (hintEl) hintEl.textContent = "音色清单加载失败: " + err.message;
+    }
+  },
+
+  _fillVoices(voices) {
+    const el = document.getElementById("tts-voice");
+    if (!el) return;
+    el.innerHTML = "";
+    const ref = [], builtin = [];
+    voices.forEach((v) => (v.kind === "ref" ? ref : builtin).push(v));
+    const addGroup = (list, label) => {
+      if (!list.length) return;
+      const g = document.createElement("optgroup");
+      g.label = label;
+      list.forEach((v) => {
+        const o = document.createElement("option");
+        o.value = v.id;
+        o.textContent = VOICE_LABELS[v.id] || v.id;
+        o.dataset.kind = v.kind || "";
+        o.dataset.dialect = v.dialect || "";
+        g.appendChild(o);
+      });
+      el.appendChild(g);
+    };
+    addGroup(ref, "参考音色（声音克隆）");
+    addGroup(builtin, "内置音色（模型自带）");
+  },
+
+  _fillLanguages(languages) {
+    const el = document.getElementById("tts-language");
+    if (!el) return;
+    el.innerHTML = "";
+    languages.forEach((l) => {
+      const o = document.createElement("option");
+      o.value = l.id;
+      o.textContent = LANGUAGE_LABELS[l.id] || l.id;
+      el.appendChild(o);
+    });
+  },
+
+  _selectedVoice() {
+    const el = document.getElementById("tts-voice");
+    const opt = el && el.selectedOptions ? el.selectedOptions[0] : null;
+    if (!opt || !opt.value) return { id: "", kind: "", dialect: "", label: "" };
+    return {
+      id: opt.value,
+      kind: opt.dataset.kind || "",
+      dialect: opt.dataset.dialect || "",
+      label: opt.textContent || opt.value,
+    };
+  },
+
+  // SDK 里「方言音色 + 语种 auto/chinese」会把语言 id 锁成该方言 ——
+  // 不说清楚,用户选了 auto 却听到四川话,看着像 bug。
+  _updateVoiceHint() {
+    const hintEl = document.getElementById("tts-voice-hint");
+    if (!hintEl) return;
+    // 本模型没有内置音色 → 说清楚原因,免得用户以为那一组是加载失败。
+    if (this._hasBuiltin === false) {
+      hintEl.textContent = "当前模型不含内置音色（部署的是声音克隆版权重），只有参考音色可选。";
+      return;
+    }
+    const voice = this._selectedVoice();
+    const langEl = document.getElementById("tts-language");
+    const lang = langEl ? langEl.value : "auto";
+    if (voice.dialect && (lang === "auto" || lang === "chinese")) {
+      const d = DIALECT_LABELS[voice.dialect] || voice.dialect;
+      hintEl.textContent = `「${voice.label}」自带${d}：语种 ${lang} 会锁定为${d}，改选其它语种可解除。`;
+    } else if (lang === "auto") {
+      hintEl.textContent = "语种 auto = 由模型自动判断文本语种。";
+    } else {
+      hintEl.textContent = "";
     }
   },
 
@@ -188,7 +317,6 @@ const TTS = {
 
   async start() {
     const textEl = document.getElementById("tts-text");
-    const refEl = document.getElementById("tts-ref-speaker");
     const langEl = document.getElementById("tts-language");
     const volEl = document.getElementById("tts-volume");
     const audioEl = this._audioEl();
@@ -230,11 +358,15 @@ const TTS = {
 
     const payload = {
       text,
-      ref_speaker: refEl ? refEl.value : "girl_base",
       language: langEl ? langEl.value : "auto",
       volume: volEl ? Number(volEl.value) / 100 : 0.1,
       play_to: playTo,
     };
+    // 音色二选一:参考音色走 ref_speaker,内置音色走 speaker。两个都发
+    // 会被 SDK 的 ref_speaker 优先级吃掉 —— 选了内置音色也是默认音色。
+    const voice = this._selectedVoice();
+    if (voice.kind === "ref") payload.ref_speaker = voice.id;
+    else if (voice.kind === "builtin") payload.speaker = voice.id;
     // 网络异常单独 catch —— 卡片自己的错误（_startError）不能再被包一层，
     // 否则状态行里会出现 "提交失败: WizardSnapshotError:start_failed:…"。
     let r, body;

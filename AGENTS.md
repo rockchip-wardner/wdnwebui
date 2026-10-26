@@ -5554,6 +5554,7 @@ are all documented in
   - ``GET  /api/tts`` — current snapshot (state / available / frames
     / audio_sec / elapsed / output / error / request / history_count).
   - ``GET  /api/tts/history`` — list of recent output WAVs.
+  - ``GET  /api/tts/voices`` — 可用音色 + 语种清单(前端下拉的数据源)。
   - ``WS   /api/tts/ws`` — pushes the snapshot on every state /
     frames / error change. Auto-reconnect with exponential backoff
     is handled on the client side (``app/static/core/framework.js (前端核心) + app/static/apps/<id>/app.js (各 app)``
@@ -5562,9 +5563,10 @@ are all documented in
   - Sidebar entry ``语音生成`` sits between ``视频检测`` and
     ``系统日志`` (mutually exclusive with other pages — the sidebar
     just toggles the ``.hidden`` class on each ``.page``).
-  - Textarea + speaker/language selectors + volume slider (default
-    30%, range 0–100, step 5; the label mirrors the slider value
-    live via the ``input`` event).
+  - Textarea + voice / language selectors (both rendered from
+    ``GET /api/tts/voices``) + volume slider (default 10%, range
+    0–100, step 5; the label mirrors the slider value live via the
+    ``input`` event).
   - Start / Stop buttons, status line, history list below. Cmd/Ctrl
     + Enter inside the textarea fires 开始生成.
 
@@ -5581,6 +5583,28 @@ are all documented in
   bundled dict directly — there is no runtime walk-up filesystem
   search anymore, so ``ref_speaker="girl_base"`` / ``"ahu"`` always
   resolves correctly regardless of the host's rknn3 layout.
+
+* **两条发声路径,别混。** ``ref_speaker`` = SDK 内嵌的参考音色
+  (``girl_base`` / ``ahu``,voice-clone x_vector,与权重无关);
+  ``speaker`` = 模型自带的内置音色(``SPK_ID`` 的 9 行)。**两者都发
+  等于只发 ``ref_speaker``** → ``POST /api/tts/start`` 只在**两个都
+  不给**时回落 ``girl_base``。
+* **本板部署的是 Base 权重,内置音色那 9 行是未训练的噪声** ——
+  塞进 talker 等于没给音色条件,每次生成自由发挥(2026-10-26 实测:
+  同一 Serena 时而男声时而女声)。清单只列 SDK
+  ``available_config_speakers()`` **实测可用**的音色(判据与实测
+  数字见该函数 docstring),API 也按清单**拒掉**不可用音色
+  (HTTP 400);换 CustomVoice 权重后自动放出,不改代码。
+* **音色/语种清单不许在前端硬编码** —— 取自 SDK 的表;10 个语种的
+  embedding 行在 Base 权重里都训练过,语种下拉扩到 10 个是真功能。
+* **instruct 页面不暴露** —— 官方能力表里 Base 的 "Instruction
+  Control" 列为空(只有 CustomVoice / VoiceDesign 有),填了不改变语气。
+* **方言音色会锁语种** —— ``eric`` / ``dylan`` 配 ``auto`` /
+  ``chinese`` 时 SDK 锁死语言 id,前端 ``#tts-voice-hint`` 明示。
+* **回归**:``scripts/verify_tts_voice_catalog.py``(不占 NPU)、
+  ``scripts/verify_tts_voices_real.py``(占 NPU:同一音色连生成 6 次,
+  **基频极差 < 8 半音** —— 音色条件失效时基频在男女声间乱跳、极差
+  翻倍;有效 2.8~5.7、失效 9.6~12.4)。
 
 **Volume semantics** — the slider value is passed straight through to
 the SDK as the linear amplitude scale (``chunk *= volume`` on the

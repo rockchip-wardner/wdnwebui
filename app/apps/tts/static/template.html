@@ -21,20 +21,11 @@
           <div class="tts-controls">
             <label class="tts-field">
               <span class="tts-label">声音</span>
-              <select id="tts-ref-speaker" class="tts-select">
-                <option value="girl_base">girl_base（默认）</option>
-                <option value="ahu">ahu</option>
-              </select>
+              <select id="tts-voice" class="tts-select"></select>
             </label>
             <label class="tts-field">
               <span class="tts-label">语种</span>
-              <select id="tts-language" class="tts-select">
-                <option value="auto">auto</option>
-                <option value="chinese">chinese</option>
-                <option value="english">english</option>
-                <option value="japanese">japanese</option>
-                <option value="korean">korean</option>
-              </select>
+              <select id="tts-language" class="tts-select"></select>
             </label>
             <label class="tts-field tts-volume">
               <span class="tts-label">音量 <span id="tts-volume-value">10%</span></span>
@@ -62,6 +53,7 @@
             <button id="tts-stop"  class="vd-btn" disabled>停止</button>
           </div>
 
+          <div class="tts-hint" id="tts-voice-hint"></div>
           <div class="tts-meta" id="tts-meta">未开始</div>
           <div class="tts-audio-row hidden" id="tts-audio-row">
             <span class="tts-audio-chip" id="tts-audio-chip">浏览器音频待启动</span>
