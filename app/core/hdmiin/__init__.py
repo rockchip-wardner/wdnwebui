@@ -19,7 +19,9 @@ Design notes:
   再读回它协商到的格式 —— 那是 ``cap.pixel_format``（**协商结果**，不是
   我们请求的值）。
 * 驱动报的四cc**可能是撒谎的**：rk_hdmirx 报 'NV24'（V4L2 规范里是 12bit
-  YUV420SP），实际写的是 8bit **YUV422SP**。缓冲区怎么解读一律问
+  YUV420SP），但**实测缓冲区里是 8bit YUV444**（Y 平面 W*H 字节 + 全宽
+  交错 CbCr 平面 2*W*H 字节，合计 = sizeimage 3*W*H）。照 fourcc 猜会把
+  色度读错，整幅画面偏色。缓冲区怎么解读一律问
   :func:`wdnav.v4l2.frame_layout`，别按 fourcc 猜。
 * All sysfs reads are best-effort; on a board without HDMI-RX
   hardware the probe degrades to ``ok=False`` with a reason, never

@@ -20,12 +20,14 @@ Why **MPP hardware** MJPEG (not PyAV mjpeg) and not BGR8:
   all four A76 cores free for the rest of the pipeline. AGENTS.md
   "设计原则 2" makes this mandatory: ``mpp`` is the only blessed
   route for JPEG I/O.
-* V4L2 negotiates ``NV12`` (YUV420SP) on this kernel/driver stack —
-  feeding that directly to ``MppEncoder(input_format=NV12)``
-  means MPP encodes from YUV; PyAV would have to do its own
-  BGR→NV12 step in libyuv (soft, ~10 ms per 1920×1080) before
-  the encode even starts. Skip that step entirely.
-* Throughput ceiling observed empirically (720p, q=80, **worst-case
+* V4L2 hands us a **YUV** frame (rk_hdmirx reports ``NV24``, which on
+  this driver is 8-bit **4:4:4** — see :meth:`HdmiInCapture._frame_bgr`).
+  That gets turned into BGR888 by the RGA, and the RGA then converts it
+  straight to an ``NV12`` plane which is fed to
+  ``MppEncoder(input_format=NV12)`` — so MPP encodes from YUV and PyAV
+  never has to do its own BGR→NV12 step in libyuv (soft, ~10 ms per
+  1920×1080) before the encode even starts.
+* Throughput ceiling observed empirically (1080p, q=80, **worst-case
   synthetic noise**): ~12 ms/frame ≈ 80 fps on a single encoder
   instance. A live desktop is far cheaper (~3 ms) because it is
   dominated by flat UI regions. 30 fps sustained leaves ample slack
@@ -43,20 +45,41 @@ the capture (not recreated every N frames):
   drains the output-task slot symmetrically to :func:`encode_h264`),
   so a single encoder instance can now run indefinitely.
 
-Why output is **1280×720, q=80**:
-* Bandwidth, not pixels, is the binding constraint. Frame size scales
-  with *screen content*, and a real desktop (text, photos, icons) at
-  720p q80 measures **~270 KB/frame** — ~8 MB/s at 30 fps. Do not
-  trust the much smaller number you get from an idle / black HDMI
-  source (that measures ~15 KB, because a black frame compresses to
-  almost nothing); sizing the transport off a black source
-  underestimates by ~18x.
-* Browser decode budget on RK3588 is ~200 MPix/s of software
-  libjpeg-turbo — 30 fps × 720p is 27.6 MPix/s (well under it),
-  30 fps × 1080p would be 62 MPix/s (right at saturation; the
-  page turns into a slideshow again). A user-visible diff at 30 fps
-  between 720p and 1080p is negligible because they only need to
-  spot-click PC UI controls.
+Why output is at the **native** resolution, q=80:
+* The preview used to be hardcoded to 1280×720 and that is what made
+  the operator's view look *blurry*. The page renders the frame into a
+  tile **wider than 1280** (``object-fit: contain`` over a full-width
+  stage), so the browser had to *upscale* the 720p JPEG by 1.4~1.5×.
+  Measured against an X-screenshot ground truth, the perceived
+  sharpness of the 720p preview is 82.6% / 77.4% / 74.4% / 56.7% at a
+  display width of 1400 / 1600 / 1800 / 1920 px — the wider the
+  window, the blurrier it looks. The very same frame at native 1080p
+  holds 108.8% / 104.5% / 103.3% / 101.6%.
+* Native is *not* the expensive option. The 1080p path replaces RGA's
+  scale+convert with a plain colour convert (3.96 ms) and the MPP
+  encode measured **5.7 ms** at 1080p vs **7.3 ms** at 720p — 11.5 ms
+  vs 12.4 ms per frame end to end (medians over 30 frames). So the
+  preview got sharper *and* slightly cheaper.
+* Bytes: frame size scales with *screen content*. A flat desktop
+  measures 41 KB/frame at 720p q80 and 80 KB at 1080p q80 (1.2 → 2.4
+  MB/s at 30 fps). Do not trust the much smaller number you get from
+  an idle / black HDMI source (~15 KB, because a black frame
+  compresses to almost nothing); sizing the transport off a black
+  source underestimates by ~18x. A photo-rich desktop measured
+  ~270 KB/frame at 720p q80 — that case goes to ~600 KB at 1080p,
+  i.e. ~18 MB/s at 30 fps, which is still fine on a LAN but is the
+  number to watch if the preview is ever tunnelled.
+* The *browser's* decode budget is the one number that used to argue
+  for 720p (30 fps × 720p = 27.6 MPix/s of libjpeg vs 62 MPix/s at
+  1080p, against a ~200 MPix/s single-core ceiling). In this
+  deployment the viewer is a **separate host** (board 172.16.9.82,
+  viewer 172.16.9.18), so that cost is not paid by this board at
+  all. If you *do* run the browser on the board itself, drop
+  ``target_fps`` to ~15 to keep the decode near the old 720p@30
+  budget — the preview then still carries full 1080p detail.
+* JPEG quality is *not* where the softness came from: on the same
+  frame q=80 → 94.9% and q=95 → 95.0% of the reference sharpness.
+  Buying quality there is close to a no-op; buying resolution is not.
 
 Two encoder-side bugs were found while chasing a "grey bar along the
 bottom of the preview" report. Both produced JPEGs with **no trailing
@@ -75,13 +98,16 @@ bottom MCU rows. Both are fixed in the cshim (see
    (1080 = 67.5×16). Strides are now MCU-aligned, with the caller's
    tightly-packed buffer copied row-wise into the padded destination.
 
-Neither change alters the bytes produced at 1280×720 (verified: md5 of
-a gradient frame is unchanged), since 720 is already 16-aligned.
+Neither change alters the bytes produced at a 16-aligned height (verified:
+md5 of a gradient frame is unchanged), since 720 is already 16-aligned —
+and the preview now runs at 1080, where the MCU alignment *does* apply
+(1080 → ver_stride 1088, handled by the cshim's padded copy).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -105,6 +131,14 @@ _STARVE_WINDOW_S = 8.0
 # source doesn't cause us to thrash open/close every few seconds.
 _REOPEN_COOLDOWN_S = 10.0
 
+#: HDMI 链路送来的 YUV 用的色彩空间：**BT.709 限幅**。
+#:
+#: 依据：rk_hdmirx 的 ``VIDIOC_G_FMT`` 报 "YCbCr/HSV Encoding: xvYCC
+#: 709" + "Quantization: Limited Range"；实测同一帧（HDMI-RX 回环本板
+#: HDMI-OUT，X 抓屏当地面真相）用 BT.601 解与真相差 MAE 4.16，用
+#: BT.709 差 2.39。RGA 默认按 BT.601 解，不声明就会整体偏色。
+_SRC_COLOR_SPACE_MODE = "IM_YUV_BT709_LIMIT_RANGE"
+
 
 class HdmiInCapture:
     """Owns the V4L2 device, the dequeue thread, and the latest frame.
@@ -115,31 +149,53 @@ class HdmiInCapture:
     """
 
     def __init__(self, device: str = "", target_fps: float = 30.0,
-                 out_w: int = 1280, out_h: int = 720, q_factor: int = 80):
+                 out_w: int = 0, out_h: int = 0, q_factor: int = 80):
         """
         :param target_fps: how many JPEG frames to produce per second.
             The encode loop enforces this *rate* on top of the
             device's natural rate, so a 60 fps source still
             only burns the CPU for the target_fps we ship to the
             browser.
-        :param out_w/out_h: JPEG output size. Defaults to 1280×720
-            because the human watching the live preview gets a
-            faithful image, and the browser-side JPEG decode load
-            stays at ~28 MPix/s — well under the ~200 MPix/s a
-            single RK3588 big-core can sustain. The grid → host
-            digitizer mapping doesn't care about this size (the
-            frontend still maps its 1920×1080 grid onto the
-            rendered image independently), so changing this is a
-            pure bandwidth / CPU trade.
+        :param out_w/out_h: JPEG output size. **0 (the default) means
+            "native"** — the preview is encoded at exactly the size
+            the driver negotiated (1920×1080 on this board), with no
+            downscale at all.
+
+            The preview used to be hardcoded to 1280×720, and that
+            was the reason the operator's view looked *blurry*:
+            the page renders the image into a tile wider than 1280
+            (``object-fit: contain`` over a full-width stage), so the
+            browser had to **upscale** the 720p JPEG by 1.4~1.5×.
+            Measured against an X-screenshot ground truth, the
+            perceived sharpness of the 720p preview collapses to
+            82.6% / 77.4% / 74.4% / 56.7% at a display width of
+            1400 / 1600 / 1800 / 1920 px — the wider the window, the
+            blurrier it looks. The same frame at native 1080p holds
+            108.8% / 104.5% / 103.3% / 101.6% at the same widths.
+
+            Native is also *cheaper* than it looks: the 1080p path
+            replaces RGA's scale+convert with a plain colour convert
+            (3.96 ms) and the MPP encode measured **5.7 ms** at
+            1080p vs **7.3 ms** at 720p, i.e. 11.5 ms vs 12.4 ms per
+            frame end to end. Bytes go 41 KB → 80 KB per frame; at
+            30 fps that is 1.2 MB/s → 2.4 MB/s, which is nothing on
+            the LAN (the viewer is a separate host, so the browser's
+            JPEG decode does not cost this board anything).
+
+            Pass explicit values to force a smaller preview.
         :param q_factor: MPP MJPEG quality factor (1..99). 80 is
             "visually-lossless on a live preview" — about 270 KB per
             1280×720 frame of real desktop content (a *black* frame
             measures only ~15 KB, which badly understates it). Lower
             q_factor → smaller bytes, more visible blocking; higher →
-            bigger bytes, sharper.
+            bigger bytes, sharper. Note this is *not* where the
+            preview's softness came from: measured on the same
+            frame, q=80 → 94.9% and q=95 → 95.0% of the reference
+            sharpness, so buying quality here is close to a no-op.
         """
         self._device = device or (discover_device() or "/dev/video0")
         self._target_fps = target_fps
+        # 0 = 跟随驱动协商出的原生分辨率（start() 里解析）。
         self._out_w = int(out_w)
         self._out_h = int(out_h)
         self._q_factor = int(q_factor)
@@ -154,7 +210,7 @@ class HdmiInCapture:
         self._layout = None
         # YUV 源用的复用缓冲（避免每帧分配 6MB）。
         self._bgr_scratch: Optional[np.ndarray] = None
-        self._nv12_scratch: Optional[np.ndarray] = None
+        self._yuv422_scratch: Optional[np.ndarray] = None
         # ---- AI-control side channel ---------------------------------- #
         # ``latest_jpeg`` is all the browser preview needs, but the
         # 智能电脑控制 agent has to hand a *pixel* frame to the VLM and
@@ -212,7 +268,7 @@ class HdmiInCapture:
         resolution (1920×1080 on this board), or ``None`` when the
         capture isn't running / nothing arrives within ``timeout``.
 
-        Why native resolution and not the 1280×720 preview JPEG:
+        Why native resolution and not the preview JPEG:
 
         * No JPEG decode, no second downscale — the agent hands the
           array straight to ``wdnai.utils.letterbox_resize_with_meta``,
@@ -342,13 +398,22 @@ class HdmiInCapture:
             _LOG.warning("v4l2 open %s failed: %s", self._device, e)
             return False
         cap.start()
-        # 驱动报的四cc可能"撒谎"（rk_hdmirx 报 NV24，实际写的是 8bit
-        # YUV422SP）—— 缓冲区怎么解读以 wdnav 的 frame_layout 为准。
+        # 驱动报的四cc可能"撒谎"（rk_hdmirx 报 NV24，按 V4L2 规范是 12bit
+        # YUV420SP，实际写的是 8bit **YUV444**）—— 缓冲区怎么解读以
+        # wdnav 的 frame_layout 为准，别按 fourcc 猜。
         self._layout = cap.frame_layout
         info = {"driver": cap.driver, "card": cap.card,
                 "capabilities": getattr(cap, "_caps", 0),
                 "width": cap.width, "height": cap.height,
                 "pixfmt": cap.pixel_format}
+        # out_w/out_h == 0 → 预览用**原生分辨率**（不降采样）。
+        # 必须在建 MPP 编码器之前定下来 —— 编码器的宽高在
+        # _ensure_encoder() 里锁定。
+        if self._out_w <= 0 or self._out_h <= 0:
+            self._out_w = int(cap.width)
+            self._out_h = int(cap.height)
+            _LOG.info("hdmiin preview at native resolution %dx%d",
+                      self._out_w, self._out_h)
         self._cap = cap
         self._info = info
         self._stop.clear()
@@ -413,8 +478,9 @@ class HdmiInCapture:
                 # mmap'd buffer (synthetic numpy frames don't trip
                 # it); routing through RGA→NV12 sidesteps that while
                 # still leaving the JPEG encoding itself on the
-                # dedicated EPU — RGA resize+colorconvert is ~2 ms
-                # at 1280×720, MPP encode is ~3 ms.
+                # dedicated EPU — the RGA colour convert is ~4 ms and
+                # the MPP encode ~5 ms at the native 1080p preview
+                # size (measured medians over 30 frames).
                 input_format=MppFrameFormat.YUV420SP,
                 q_factor=self._q_factor,
             )
@@ -476,7 +542,7 @@ class HdmiInCapture:
             empty_count = 0
             starved_since = None
             # 源格式可能是 BGR24，也可能是 YUV（rk_hdmirx 报 NV24、实际是
-            # 8bit YUV422SP）—— 统一在 _frame_bgr 里归一化成全分辨率
+            # 8bit YUV444）—— 统一在 _frame_bgr 里归一化成全分辨率
             # BGR888，预览和 VLM 截图**共用同一份**，别每帧转两遍。
             try:
                 bgr = self._frame_bgr(buf.plane_arrays[0])
@@ -575,24 +641,25 @@ class HdmiInCapture:
         """把一帧 V4L2 平面转成**全分辨率** BGR888。
 
         * ``bgr24`` 源：零拷贝视图（reshape），调用方要长期持有必须 copy。
-        * YUV 源：两次 RGA ``cvtcolor``（源格式 → NV12 → BGR），结果写进
-          复用的 ``self._bgr_scratch``。
+        * ``yuv444sp`` 源（本机 rk_hdmirx 报的 NV24 就是它）：色度按 2:1
+          抽成 4:2:2 半平面后，RGA 一次转成 BGR888。
+        * ``yuv422sp`` / ``yuv420sp`` 源：直接 RGA 转 BGR888。
 
-        为什么 YUV 源要绕这一圈：
+        为什么要按 payload 分支，而不是"默认按 BGR 读"：
 
-        1. 驱动报的 fourcc 未必是真布局。rk_hdmirx 报 'NV24'（V4L2 规范里
-           是 12bit YUV420SP），实际写的是 **8bit YUV422SP**（Y 平面 W*H +
-           交错 UV 平面 W*H）。按 fourcc 猜会读成满屏竖条纹 —— 布局要看
-           ``wdnav.v4l2.frame_layout``（它认这个驱动的 quirk）。
-        2. 本机 librga 1.10.5 的 **YUV 缩放是坏的**：亮度缩放正确
-           （合成图 MAD 0.07），色度完全错位（MAD 57）。BGR 源的缩放
-           反而是对的（合成图 MAD 1.7）。所以 YUV 源统一先转成 BGR，再走
-           BGR 那条（已验证的）缩放路径。
-        3. 中间必须过一道 NV12：RGA 的 422SP→BGR **不解交织**色度
-           （直接转出来的画面偏色），而 422SP→NV12 是像素级正确的
-           （与 numpy 参考逐像素一致，MAD 0.0）。
+        1. 驱动报的 fourcc 未必是真布局。rk_hdmirx 报 'NV24'，但按 V4L2
+           规范那是 12bit YUV420SP；**实测缓冲区里躺的是 8bit YUV444**
+           （Y 平面 W*H 字节 + 全宽交错 CbCr 平面 2*W*H 字节，合计正好
+           sizeimage = 3*W*H）。按 fourcc 猜会把色度读错 → 整幅画面偏色。
+           布局一律问 :func:`wdnav.v4l2.frame_layout`。
+        2. 色彩空间要显式声明。HDMI 链路（TX 端 RGB→YUV）用的是
+           **BT.709 限幅**（驱动的 G_FMT 也报 "YCbCr/HSV Encoding:
+           xvYCC 709" / "Quantization: Limited Range"），而 RGA 默认按
+           BT.601 解 —— 不声明就会整体偏色。实测同一帧：默认 BT.601 与
+           地面真相差 MAE 4.16，声明 BT.709 后 2.39。
 
-        三段全在 RGA 硬件里跑，CPU 只碰 numpy 的指针。
+        三段转换全在 RGA 硬件里跑，CPU 只碰 numpy 的指针（外加 4:4:4
+        → 4:2:2 的纯字节搬运，见 :meth:`_pack_yuv422`）。
         """
         h, w = self._cap.height, self._cap.width
         layout = self._layout
@@ -603,7 +670,7 @@ class HdmiInCapture:
                 return plane.reshape(h, w, 3)
             return plane
 
-        if payload not in ("yuv422sp", "yuv420sp"):
+        if payload not in ("yuv444sp", "yuv422sp", "yuv420sp"):
             raise RuntimeError(
                 f"unsupported capture payload {payload!r} "
                 f"(fourcc={getattr(layout, 'fourcc', '?')})"
@@ -613,27 +680,26 @@ class HdmiInCapture:
 
         if self._bgr_scratch is None or self._bgr_scratch.shape != (h, w, 3):
             self._bgr_scratch = np.empty((h, w, 3), dtype=np.uint8)
-            self._nv12_scratch = np.empty((h * w * 3) // 2, dtype=np.uint8)
-        src_fmt = getattr(
-            wdnav.rga.RgaFormat,
-            "YCbCr_422_SP" if payload == "yuv422sp" else "YCbCr_420_SP",
-        )
+            self._yuv422_scratch = np.empty(h * w * 2, dtype=np.uint8)
 
-        # 1) 源格式 → NV12（YUV420SP，同尺寸）
+        if payload == "yuv444sp":
+            src = self._pack_yuv422(plane, h, w)
+            src_fmt = wdnav.rga.RgaFormat.YCbCr_422_SP
+        else:
+            src = plane
+            src_fmt = getattr(
+                wdnav.rga.RgaFormat,
+                "YCbCr_422_SP" if payload == "yuv422sp" else "YCbCr_420_SP",
+            )
+
+        # YUV → BGR888：一次 RGA 转换。
+        # （本机实测：422SP→BGR 直转与 numpy 参考差 MAE 0.07；
+        #   420SP→BGR 直转 0.55。没必要再绕 NV12 中转。）
         wdnav.rga.cvtcolor(
             wdnav.rga.wrap_virtual(
-                plane.ctypes.data, w, h, src_fmt,
-            ),
-            wdnav.rga.wrap_virtual(
-                self._nv12_scratch.ctypes.data, w, h,
-                wdnav.rga.RgaFormat.YCbCr_420_SP,
-            ),
-        )
-        # 2) NV12 → BGR888（同尺寸）
-        wdnav.rga.cvtcolor(
-            wdnav.rga.wrap_virtual(
-                self._nv12_scratch.ctypes.data, w, h,
-                wdnav.rga.RgaFormat.YCbCr_420_SP,
+                src.ctypes.data, w, h, src_fmt,
+                color_space_mode=getattr(
+                    wdnav.rga, _SRC_COLOR_SPACE_MODE),
             ),
             wdnav.rga.wrap_virtual(
                 self._bgr_scratch.ctypes.data, w, h,
@@ -641,6 +707,37 @@ class HdmiInCapture:
             ),
         )
         return self._bgr_scratch
+
+    def _pack_yuv422(self, plane: np.ndarray, h: int, w: int) -> np.ndarray:
+        """把 8bit **4:4:4** 缓冲打包成 4:2:2 半平面（Y + 交错 CbCr）。
+
+        为什么需要这一步：RGA（librga 1.10.5）**没有 4:4:4 输入路径**
+        —— ``imcvtcolor`` / ``imresize`` 的源格式只支持
+        420/422/YUYV/400，实测传 ``YCbCr_444_SP`` 会报
+        ``src unsupported YUV444 semi-planner 8bit format``。而
+        rk_hdmirx 只肯给 NV24（=4:4:4），别的 fourcc 一律 EINVAL，
+        所以 4:4:4 → 4:2:2 这一步只能在这里做。
+
+        这一步是**纯字节搬运**：Y 平面原样搬过去，色度平面横向按 2:1
+        抽点（等价于标准 4:2:2 抽点），**不做任何颜色计算、不做缩放**。
+        真正的 YUV→RGB 转换和最终降采样仍然全部在 RGA 硬件里完成。
+
+        写法上有个大坑：别用 ``out.reshape(h, w//2, 2)[:] =
+        src.reshape(h, w, 2)[:, ::2, :]`` 这种三维花式赋值 —— numpy
+        对它是逐元素的 gather，本机实测 **9.97 ms/帧**（30 fps 就是
+        30% 单核）。把色度看成 **uint16**（一个 CbCr 像素正好 2 字节）
+        再取步长 2，numpy 走的是按行 memcpy，实测 **0.57 ms/帧**，
+        快 17 倍，字节完全一致。
+        """
+        flat = plane.reshape(-1)
+        out = self._yuv422_scratch
+        out[: h * w] = flat[: h * w]
+        # 色度：全宽交错 CbCr (h, w) 个 uint16 像素 → 半宽 (h, w//2)。
+        # h*w 必为偶数（4:4:4 的 CbCr 是 2 字节/像素），所以 uint16
+        # 视图的字节偏移是对齐的。
+        src_u16 = flat[h * w:].view(np.uint16).reshape(h, w)
+        out[h * w:].view(np.uint16).reshape(h, w // 2)[:] = src_u16[:, 0::2]
+        return out
 
     def _encode_jpeg(self, bgr: np.ndarray) -> bytes:
         """Full-resolution BGR888 frame → JPEG bytes via :class:`wdnav.mpp.MppEncoder`.
@@ -650,9 +747,10 @@ class HdmiInCapture:
         buffer (YUV source). We:
         2. Allocate an NV12 destination buffer
            ``(self._out_h * 3 // 2, self._out_w)``;
-        3. Run :func:`wdnav.rga.resize` from BGR-888 → YCbCr-420-SP at
-           the new size — a single RGA pass that both color-converts
-           and downscales (1920×1080 → 1280×720);
+        3. Run one RGA pass from BGR-888 → YCbCr-420-SP: a plain colour
+           conversion when the preview size equals the source size (the
+           default, native 1920×1080), or a scale+convert when the
+           caller asked for a smaller preview;
         4. Hand the resulting ``(out_h * 3 // 2, out_w)`` NV12 plane to
            MPP for JPEG encode on the encoder EPU.
 
@@ -660,9 +758,9 @@ class HdmiInCapture:
         the BGR888-input path hangs on the first ``encode_put_frame``
         when the input plane comes from a live V4L2 mmap'd buffer
         (synthetic numpy inputs work fine — verified at 320+ fps in
-        isolation). The RGA path is ~2 ms per 720p frame; the MPP
-        encode itself stays on the dedicated EPU at ~3 ms/frame, so
-        30 fps (one encode per 33 ms) leaves ~10× margin.
+        isolation). The RGA pass is ~4 ms per frame and the MPP
+        encode itself stays on the dedicated EPU at ~5 ms/frame, so
+        30 fps (one encode per 33 ms) leaves ~2.5× margin.
 
         The encoder instance is created once in :meth:`_ensure_encoder`
         and reused for the rest of the capture — the cshim
@@ -678,7 +776,28 @@ class HdmiInCapture:
 
         h, w = self._cap.height, self._cap.width
 
-        # RGA resize+colorconvert: 1920x1080 BGR_888 → 1280x720 NV12.
+        # RGA: BGR_888 → NV12 (色彩转换；同尺寸时不再重采样）。
+        #
+        # The destination is declared **BT.601 full range** on purpose.
+        # JPEG has no range signalling that browsers honour — every
+        # decoder (libjpeg included) reconstructs RGB from the stored
+        # YCbCr with the *full-range* BT.601 matrix, i.e.
+        #     R = Y + 1.402*(Cr-128)
+        # RGA's default is BT.601 **limited** range (Y ∈ [16,235]), so
+        # feeding that to the encoder makes the browser stretch the
+        # luma by 255/219 and the chroma by 255/224 → the picture comes
+        # out brighter and over-saturated (measured on this board:
+        # R +11.4 / G +4.5 / B +2.0 against an X-screenshot ground
+        # truth, exactly the 1.164/1.596/2.072 mismatch).
+        #
+        # Declaring the destination as BT.601 full range makes RGA emit
+        # Y ∈ [0,255] with the *same* matrix the browser will use, so
+        # the round trip is exact: the same frame measures MAE 8.215
+        # with the default and **1.174** with the explicit mode.
+        #
+        # BT.709 would be wrong here even though the HDMI link itself
+        # is 709: the browser only ever applies 601 to a JPEG, so
+        # converting RGB → 709 YCbCr would introduce a hue shift.
         nv12 = np.zeros(self._out_h * 3 // 2 * self._out_w, dtype=np.uint8) \
                   .reshape(self._out_h * 3 // 2, self._out_w)
         src = wdnav.rga.wrap_virtual(
@@ -687,8 +806,15 @@ class HdmiInCapture:
         dst = wdnav.rga.wrap_virtual(
             nv12.ctypes.data, self._out_w, self._out_h,
             wdnav.rga.RgaFormat.YCbCr_420_SP,
+            color_space_mode=wdnav.rga.IM_YUV_BT601_FULL_RANGE,
         )
-        wdnav.rga.resize(src, dst)
+        # 同尺寸 = 只换色彩空间，不必让 RGA 再重采样一遍。
+        # （原生 1080p 预览走的就是这条：cvtcolor 3.96 ms，
+        #   比 resize 少一次无谓的插值。）
+        if (self._out_w, self._out_h) == (w, h):
+            wdnav.rga.cvtcolor(src, dst)
+        else:
+            wdnav.rga.resize(src, dst)
 
         enc = self._ensure_encoder()
         packet = enc.encode(nv12)
@@ -702,11 +828,45 @@ _INSTANCE: Optional[HdmiInCapture] = None
 _INSTANCE_LOCK = threading.Lock()
 
 
+def _preview_size_from_env() -> tuple[int, int]:
+    """Read the operator's preview-size override from the environment.
+
+    ``WDNWEBUI_HDMIIN_PREVIEW_SIZE`` accepts ``"<w>x<h>"`` (e.g.
+    ``1280x720``) or ``native`` / empty for the default — which is the
+    **source's own resolution** (1920×1080 on this board).
+
+    Exists because the preview is a bandwidth trade the operator may
+    want to make themselves: native is the sharpest (the page tile is
+    wider than 720p, so a smaller preview gets *upscaled* by the
+    browser and looks soft), but it is also ~2× the bytes per frame.
+    Anything unparseable falls back to native and logs a warning —
+    a typo in a unit file must not take the preview down.
+    """
+    raw = os.environ.get("WDNWEBUI_HDMIIN_PREVIEW_SIZE", "").strip().lower()
+    if not raw or raw in ("native", "auto", "0"):
+        return 0, 0
+    try:
+        parts = raw.replace("×", "x").split("x")
+        if len(parts) != 2:
+            raise ValueError(raw)
+        w, h = int(parts[0]), int(parts[1])
+        if w <= 0 or h <= 0:
+            raise ValueError(raw)
+    except Exception:  # noqa: BLE001 — env var, any parse failure
+        _LOG.warning(
+            "WDNWEBUI_HDMIIN_PREVIEW_SIZE=%r is not '<w>x<h>' — falling "
+            "back to the native capture resolution", raw,
+        )
+        return 0, 0
+    return w, h
+
+
 def get_capture() -> HdmiInCapture:
     """Return the process-wide HdmiInCapture (lazily created)."""
     global _INSTANCE
     if _INSTANCE is None:
         with _INSTANCE_LOCK:
             if _INSTANCE is None:
-                _INSTANCE = HdmiInCapture()
+                out_w, out_h = _preview_size_from_env()
+                _INSTANCE = HdmiInCapture(out_w=out_w, out_h=out_h)
     return _INSTANCE
