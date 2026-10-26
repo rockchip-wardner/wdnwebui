@@ -4950,30 +4950,47 @@ body.dg-modal-open .back-home-btn {
 }
 .vr-cache-refresh:hover { color: var(--accent); }
 .vr-cache-row {
-  display: flex;
+  /* 每条两行：第一行文件名，第二行附加信息（N 段 · 时间）。
+     窄侧栏（320px）下 flex 单行会被 meta + 删除按钮吃光宽度，文件名
+     基本不可见 —— 用 3 列 × 2 行 grid 固定两行，checkbox / 删除按钮
+     跨两行垂直居中。 */
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "chk name del" "chk meta del";
+  column-gap: 8px;
+  row-gap: 1px;
   align-items: center;
-  gap: 8px;
   padding: 4px 6px;
   border-radius: 6px;
   cursor: pointer;
 }
 .vr-cache-row:hover { background: rgba(37, 99, 235, 0.06); }
 .vr-cache-row .vr-cache-name {
-  flex: 1;
+  grid-area: name;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
 }
 .vr-cache-row .vr-cache-meta {
+  grid-area: meta;
+  min-width: 0;
   color: var(--muted);
   font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.vr-cache-row input[type="checkbox"] { flex: none; }
+.vr-cache-row input[type="checkbox"] {
+  grid-area: chk;
+  flex: none;
+  align-self: center;
+}
 .vr-cache-row input[type="checkbox"]:disabled { cursor: not-allowed; }
 .vr-cache-row input[type="checkbox"]:disabled ~ .vr-cache-meta { opacity: 0.45; }
 .vr-cache-del {
+  grid-area: del;
   background: none;
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -4983,6 +5000,7 @@ body.dg-modal-open .back-home-btn {
   line-height: 1;
   padding: 3px 6px;
   flex: none;
+  align-self: center;
 }
 .vr-cache-del:hover { border-color: #dc2626; color: #dc2626; }
 .vr-cache-empty {

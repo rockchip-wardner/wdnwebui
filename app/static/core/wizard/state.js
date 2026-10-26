@@ -1305,7 +1305,14 @@
     const hasSourceField = (stepDef.fields || []).some(
       (f) => f && _isSourceFieldId(f.id));
     if (hasSourceField && cfg.canvas_id) {
-      const prefix = String(cfg.canvas_id).replace(/-grid$/, "");
+      // 多路卡：canvas 是宫格 `*-grid`（每路一个判据，需要"当前在编辑哪一路"）；
+      // 单路卡（VR）：canvas 是 `<prefix>-canvas`，没有"路"，判据也只一组。
+      // 两种都要把 `<prefix>-judge-*` 字段分组，所以 prefix 要同时剥掉
+      // `-grid` / `-canvas` —— 只剥 `-grid` 会让 VR 的 prefix 变成
+      // `vr-canvas`，找不到判据字段、还挂一条无意义的"当前在编辑"。
+      const canvasId = String(cfg.canvas_id);
+      const isMulti = /-grid$/.test(canvasId);
+      const prefix = canvasId.replace(/-(?:grid|canvas)$/, "");
       const judgeFieldIds = [
         prefix + "-judge-mode",
         prefix + "-judge-threshold",
@@ -1332,12 +1339,18 @@
         // 多次 mount 也总是最新的那个生效（旧的 wizard 卸载时 DOM 一起没了）。
         fs.id = prefix + "-wizard-judge-fs";
         const lg = _ce("legend", WIZARD_NS + "judge-legend");
-        lg.appendChild(_ce("span", WIZARD_NS + "channel-hint-label",
-                           "当前在编辑："));
-        const val = _ce("span", WIZARD_NS + "channel-hint-value",
-                        "未选中（点画面里任一格）");
-        val.id = prefix + "-wizard-channel-value";
-        lg.appendChild(val);
+        if (isMulti) {
+          lg.appendChild(_ce("span", WIZARD_NS + "channel-hint-label",
+                             "当前在编辑："));
+          const val = _ce("span", WIZARD_NS + "channel-hint-value",
+                          "未选中（点画面里任一格）");
+          val.id = prefix + "-wizard-channel-value";
+          lg.appendChild(val);
+        } else {
+          // 单路没有"选哪一路"，legend 直接说明判据何时生效。
+          lg.appendChild(_ce("span", WIZARD_NS + "channel-hint-label",
+                             "画面变化判据（开始提取后生效）"));
+        }
         fs.appendChild(lg);
         // 关键顺序：先 insertBefore(fs, anchorWrap) —— 此时 anchorWrap 还在
         // form 里（wrap 在兄弟节点位置上的引用有效），fs 被插到 anchorWrap
@@ -1348,10 +1361,10 @@
         // anchorWrap 被搬走时 form 节点结构变化会让 nextSibling 校验失败。
         form.insertBefore(fs, anchorWrap);
         judgeWraps.forEach((w) => fs.appendChild(w));
-      } else {
+      } else if (isMulti) {
         // 没找到任何判据字段（罕见，比如 wizard.json 改了字段名），仍挂一
         // 个独立 hint 行 —— 不要因为判据字段缺失就不显示"当前在编辑"，否则
-        // 用户连这个反馈都没有。
+        // 用户连这个反馈都没有。单路没有这一行（没有"路"可选）。
         const hint = _ce("div", WIZARD_NS + "channel-hint");
         hint.id = prefix + "-wizard-channel-hint";
         hint.dataset.pfx = prefix;
@@ -1368,20 +1381,23 @@
       // 装好 → 短轮询挂上，避免竞态。注意：上面 if/else 分支里 val.id
       // 都设了同一个 prefix + "-wizard-channel-value"，handler 一定能找到
       // 对应节点（fieldset 的 legend 在文档中依然是 #val 节点可被查到）。
-      const channelValueEl = document.getElementById(prefix + "-wizard-channel-value");
-      if (channelValueEl) {
-        const attachOnSelect = () => {
-          if (!window.FrameJudge || !window.FrameJudge.setOnSelectChannel) {
-            setTimeout(attachOnSelect, 30);
-            return;
-          }
-          window.FrameJudge.setOnSelectChannel(prefix, (idx) => {
-            channelValueEl.textContent = idx == null
-              ? "未选中（点画面里任一格）"
-              : "[" + idx + ", " + (idx + 1) + "] 路";
-          });
-        };
-        attachOnSelect();
+      if (isMulti) {
+        const channelValueEl = document.getElementById(
+          prefix + "-wizard-channel-value");
+        if (channelValueEl) {
+          const attachOnSelect = () => {
+            if (!window.FrameJudge || !window.FrameJudge.setOnSelectChannel) {
+              setTimeout(attachOnSelect, 30);
+              return;
+            }
+            window.FrameJudge.setOnSelectChannel(prefix, (idx) => {
+              channelValueEl.textContent = idx == null
+                ? "未选中（点画面里任一格）"
+                : "[" + idx + ", " + (idx + 1) + "] 路";
+            });
+          };
+          attachOnSelect();
+        }
       }
 
       // 把实时分数曲线搬进 fieldset。FrameJudge 的曲线元素原本挂在

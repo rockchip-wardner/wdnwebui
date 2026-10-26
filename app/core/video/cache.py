@@ -79,6 +79,10 @@ def _build_schema() -> "pa.Schema":
         ("embedding_model", pa.string()),
         ("analyzed_at", pa.float64()),
         ("meta_json", pa.string()),
+        # 切片口径隔离：VR（gscore 动态切片）与微信（固定 4s/1s）共用同一张
+        # 表，必须能区分，否则换判据配置会复用旧索引。
+        ("judge_fp", pa.string()),
+        ("slice_version", pa.string()),
     ])
 
 
@@ -218,6 +222,8 @@ class WechatVideoCache:
 
     def lookup(self, md5: str, embedding_model: str,
                chunk_seconds: int = 0, chunk_overlap_seconds: int = 0,
+               judge_fp: Optional[str] = None,
+               slice_version: Optional[str] = None,
                ) -> Optional[dict]:
         """按 md5 + 模型 + 切片参数取检索索引；未命中返回 None。
 
@@ -249,6 +255,12 @@ class WechatVideoCache:
         if chunk_seconds and chunk_overlap_seconds:
             where += (f" AND chunk_seconds = {int(chunk_seconds)} AND "
                       f"chunk_overlap_seconds = {int(chunk_overlap_seconds)}")
+        # 判据 / 切片版本过滤：None = 不过滤（旧调用），"" = 只匹配空串
+        # （微信固定切片）。VR 传 ``gscore:10.0:10`` / ``gscore-v1``。
+        if judge_fp is not None:
+            where += " AND judge_fp = '%s'" % judge_fp.replace("'", "''")
+        if slice_version is not None:
+            where += " AND slice_version = '%s'" % slice_version.replace("'", "''")
         try:
             tbl = (table.search()
                    .where(where)
@@ -289,6 +301,8 @@ class WechatVideoCache:
             "slices_embedded": int(first("slices_embedded") or 0),
             "chunk_seconds": int(first("chunk_seconds") or 0),
             "chunk_overlap_seconds": int(first("chunk_overlap_seconds") or 0),
+            "judge_fp": str(first("judge_fp") or ""),
+            "slice_version": str(first("slice_version") or ""),
         }
 
     # ------------------------------------------------------------ 写入
@@ -328,10 +342,24 @@ class WechatVideoCache:
                     "embedding_model": [embedding_model] * n,
                     "source_path": [str(meta.get("source_path") or "")] * n,
                     "analyzed_at": [now] * n,
+                    "judge_fp": [str(meta.get("judge_fp") or "")] * n,
+                    "slice_version": [str(meta.get("slice_version") or "")] * n,
                 }
                 arrow = pa.Table.from_pydict(
                     _complete_rows(rows), schema=_build_schema())
-                table.delete(f"md5 = '{md5}'")
+                # 幂等覆盖只删「同一个条目」（md5 + 切片参数 + 判据口径），
+                # 不能只按 md5 删 —— 否则同一视频的其它判据/参数档会被清掉。
+                delete_where = f"md5 = '{md5}'"
+                if meta.get("chunk_seconds"):
+                    delete_where += (f" AND chunk_seconds = "
+                                     f"{int(meta['chunk_seconds'])}")
+                if meta.get("chunk_overlap_seconds") is not None:
+                    delete_where += (f" AND chunk_overlap_seconds = "
+                                     f"{int(meta['chunk_overlap_seconds'])}")
+                delete_where += (" AND judge_fp = '%s' AND slice_version = '%s'"
+                                 % (str(meta.get("judge_fp") or "").replace("'", "''"),
+                                    str(meta.get("slice_version") or "").replace("'", "''")))
+                table.delete(delete_where)
                 table.add(arrow)
                 self._evict_if_needed(table)
                 _LOG.info("wechat video cache: saved md5=%s (%d chunks, "
@@ -380,7 +408,7 @@ class WechatVideoCache:
 
             {md5, filename, source_path, duration_s, fps, updated_at,
              retrieval: [{chunk_seconds, chunk_overlap_seconds, slices,
-                          analyzed_at}]}
+                          analyzed_at, judge_fp, slice_version}]}
 
         排序按 ``updated_at`` 倒序。``frame_enabled`` 由 API 层按
         ``source_path`` 是否仍存在判定（本方法不碰文件系统）。
@@ -416,6 +444,8 @@ class WechatVideoCache:
                 "chunk_overlap_seconds": v["chunk_overlap_seconds"],
                 "slices": v["slices"],
                 "analyzed_at": v["analyzed_at"],
+                "judge_fp": v.get("judge_fp") or "",
+                "slice_version": v.get("slice_version") or "",
             })
 
         for it in items.values():
@@ -471,7 +501,8 @@ class WechatVideoCache:
                 builder = table.search().select(
                     ["md5", "filename", "source_path",
                      "chunk_seconds", "chunk_overlap_seconds",
-                     "duration_s", "analyzed_at"])
+                     "duration_s", "analyzed_at",
+                     "judge_fp", "slice_version"])
                 if where:
                     builder = builder.where(where)
                 tbl = (builder
@@ -490,12 +521,15 @@ class WechatVideoCache:
             spath = str(tbl.column("source_path")[i].as_py() or "")
             dur = float(tbl.column("duration_s")[i].as_py() or 0.0)
             at = float(tbl.column("analyzed_at")[i].as_py() or 0.0)
-            key = (md5, chunk_sec, overlap)
+            jfp = str(tbl.column("judge_fp")[i].as_py() or "")
+            sver = str(tbl.column("slice_version")[i].as_py() or "")
+            key = (md5, chunk_sec, overlap, jfp, sver)
             g = grouped.setdefault(key, {
                 "md5": md5, "filename": fname, "source_path": spath,
                 "chunk_seconds": chunk_sec,
                 "chunk_overlap_seconds": overlap,
                 "duration_s": dur, "slices": 0, "analyzed_at": at,
+                "judge_fp": jfp, "slice_version": sver,
             })
             g["slices"] += 1
             if (at or 0.0) > g["analyzed_at"]:
@@ -505,7 +539,9 @@ class WechatVideoCache:
         return sorted(grouped.values(), key=lambda g: -g["analyzed_at"])
 
     def delete_video(self, md5: str, chunk_seconds: int,
-                     chunk_overlap_seconds: int) -> int:
+                     chunk_overlap_seconds: int,
+                     judge_fp: Optional[str] = None,
+                     slice_version: Optional[str] = None) -> int:
         """按行（md5 × 切片参数三元键）删除条目，返回删除行数。
 
         同 md5 其它切片参数档的索引保留 —— UI 删除按钮按行删除。
@@ -521,6 +557,10 @@ class WechatVideoCache:
         if chunk_overlap_seconds:
             where += (f" AND chunk_overlap_seconds = "
                       f"{int(chunk_overlap_seconds)}")
+        if judge_fp is not None:
+            where += " AND judge_fp = '%s'" % judge_fp.replace("'", "''")
+        if slice_version is not None:
+            where += " AND slice_version = '%s'" % slice_version.replace("'", "''")
         try:
             with self._lock:
                 before = table.count_rows()

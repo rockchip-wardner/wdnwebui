@@ -54,6 +54,13 @@
       this._appliedSig = null;     // 上次 POST 出去的配置，相同则不重复发
       this._metrics = [];          // 服务端放行的算法名（下拉据此剪枝）
       this._built = false;
+      // ``configOnly``：只要配置区（不要浮框 / 曲线）。VR 是单视频文件、
+      // 没有持续解码画面可贴浮框，但同样需要判据配置与「按变化切片」。
+      this.configOnly = !!opts.configOnly;
+      // 兜底帧间隔的默认值。三张多路卡是「解码帧」（600），VR 是
+      // 「秒级采样帧」（10）—— 由宿主 / 后端 ``default_every_n`` 决定。
+      this.defaultEveryN = Math.max(1, parseInt(opts.defaultEveryN, 10) || 600);
+      this._everyN = this.defaultEveryN;
     }
 
     // ---------------------------------------------------------------- //
@@ -61,8 +68,9 @@
       if (this._built) return;
       this._built = true;
       this._buildConfig();
-      this._buildFloats();
+      if (!this.configOnly) this._buildFloats();
       this._load();
+      if (this.configOnly) return;
       // 画布位置会因向导搬运 / 窗口缩放 / 滚动而变，三路都重摆一次。
       window.addEventListener("resize", () => this.sync());
       window.addEventListener("scroll", () => this.sync(), true);
@@ -121,12 +129,11 @@
       this.inpEvery.type = "number";
       this.inpEvery.id = this.prefix + "-judge-every-n";
       this.inpEvery.min = "1"; this.inpEvery.max = "3600"; this.inpEvery.step = "1";
-      // 与后端 ``FrameJudge.__init__`` 默认 600 保持一致 —— 之前是 30，与后端
-      // 不一致的后果是：新会话走 ``_fallbackCfg`` 兜底时拿到 30 而不是后端
-      // 想要的 600，而用户没改配置就提交，服务端用 default 600，前端却显示 30，
-      // 两边对不上浮框上 every_n_eff 的口径。
-      this.inpEvery.value = "600";
-      this._everyN = 600;                 // 提示文案要用，跟控件保持一致
+      // 由宿主 / 后端给的默认值决定（三卡 600、VR 10）。写死一个数会
+      // 让 ``_fallbackCfg`` 与服务端默认值对不上，用户没改配置就提交时
+      // 两边口径不一致。
+      this.inpEvery.value = String(this.defaultEveryN);
+      this._everyN = this.defaultEveryN;  // 提示文案要用，跟控件保持一致
       const eLabel = ce("label", "vj-label");
       eLabel.appendChild(ce("span", null, "帧间隔"));
       eLabel.appendChild(this.inpEvery);
@@ -159,6 +166,16 @@
       // 每个度量的默认阈值由后端给（刻度按算法不同，前端写死必然过期）
       this._defThr = d.default_threshold || {};
       this._metrics = metrics;
+      // 后端可以给一个不同的兜底间隔（VR 的采样口径是秒，三卡是解码帧）。
+      if (d.default_every_n != null) {
+        const de = Math.max(1, parseInt(d.default_every_n, 10)
+          || this.defaultEveryN);
+        if (this.inpEvery && this.inpEvery.value === String(this.defaultEveryN)) {
+          this.inpEvery.value = String(de);
+          this._everyN = de;
+        }
+        this.defaultEveryN = de;
+      }
       // 阈值控件留空时用后端给的默认值回填，免得用户什么都没动就看到一个
       // 空框然后误以为是没配好。
       if (this.inpThr && !String(this.inpThr.value).trim() && metrics.length) {
@@ -223,7 +240,9 @@
       // 没有配置控件时不要 POST（防御：控件尚未构建）。
       if (!this.selMode) return;
       const mode = this.selMode?.value || "manual";
-      const every = Math.max(1, parseInt(this.inpEvery?.value || "600", 10) || 600);
+      const every = Math.max(1, parseInt(
+        this.inpEvery?.value || String(this.defaultEveryN), 10
+      ) || this.defaultEveryN);
       const dflt = this._defaultThreshold(mode);
       const thr = Math.max(0.1, parseFloat(this.inpThr?.value) || dflt);
       if (this.inpEvery) {
@@ -296,7 +315,8 @@
       let txt = mode === "manual"
         ? "手动跳帧：固定间隔送检，不做画面比对。"
         : `按「${mode}」比对画面，超过阈值立刻送检；变化达到阈值一半时，`
-          + `最长 ${this._everyN || 600} 帧兜底送一次，画面完全没变就一直不送。`;
+          + `最长 ${this._everyN || this.defaultEveryN} 帧兜底送一次，`
+          + `画面完全没变就一直不送。`;
       if (!this.applied) txt += "（本轮分析进行中，本次修改从下次开始生效）";
       this.hint.textContent = txt;
     }
@@ -381,6 +401,7 @@
      *   * 画布下沿之下放不下整条曲线 → 曲线藏起来，绝不画到别人的位置上。
      */
     sync() {
+      if (this.configOnly) return;
       const c = $(this.canvasId);
       const r = c ? c.getBoundingClientRect() : null;
       const hide = () => {
@@ -653,7 +674,11 @@
     const inst = registry.get(prefix);
     const thr = inst && inst._defaultThreshold
       ? inst._defaultThreshold(m) : 20;
-    return { mode: m, every_n: 600, threshold: thr };
+    return {
+      mode: m,
+      every_n: (inst && inst.defaultEveryN) || 600,
+      threshold: thr,
+    };
   }
 
   function _onWizardFieldChange(e) {
@@ -792,7 +817,9 @@
       const inst = registry.get(prefix);
       if (!inst) return null;
       const mode = inst.selMode?.value || "manual";
-      const every = Math.max(1, parseInt(inst.inpEvery?.value || "600", 10) || 600);
+      const every = Math.max(1, parseInt(
+        inst.inpEvery?.value || String(inst.defaultEveryN), 10
+      ) || inst.defaultEveryN);
       const thr = Math.max(0.1, parseFloat(inst.inpThr?.value)
         || (registry.get(prefix)?._defaultThreshold(mode) ?? 15));
       return { mode, every_n: every, threshold: thr };

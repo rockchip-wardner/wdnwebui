@@ -3,11 +3,12 @@
 流程（对齐 vl_rag_demo 的语义，但为**单视频 + 内存索引**版本）：
 
 1. ``open(source)`` —— 记录视频文件路径，校验存在。
-2. ``start_extract()`` —— 切片参数固化为 4s / 重叠 1s，后台 daemon
-   线程用 PyAV 按固定时间窗切片，每片取等距帧缩放到 576×576，经 wdnai
+2. ``start_extract()`` —— 每 1 秒采样一帧，经 gscore 判据（``FrameJudge``）
+   决定是否要；按「最多 ``SLICE_MAX_FRAMES`` 个有效帧 / 重叠
+   ``SLICE_OVERLAP_FRAMES`` 个有效帧」累积成片，经 wdnai
    ``LLMSession.embed_video`` 得到 2048 维归一化向量，存内存
-   ``List[{start_time, end_time, chunk_idx, fps, vec}]``。逐片推进
-   ``slices_embedded`` 并 WS 广播 ``progress``。
+   ``List[{start_time, end_time, chunk_idx, fps, vec}]``。跳帧不丢时间：
+   ``start``/``end`` 覆盖首个/最后一个有效帧（含中间跳过的秒）。
 3. ``query(text)`` —— 匹配阈值固定 0.40、检索上限固定 10，
    ``LLMSession.embed_text`` 编码查询向量，遍历内存索引算余弦相似度，
    阈值过滤 + top_k 截断。
@@ -23,8 +24,8 @@ LLMSession 从 ComputeRegistry 取（``swcap_vision_embedding`` capability），
 v0.8：从 ``app/apps/video_search/service.py`` 平移到
 ``app/core/video/search.py`` —— ``video_retrieval`` 卡片（监控反查，只检索）
 检索合并页）通过 ``app.core.*`` 引用检索能力，遵守卡片零跨卡片 import
-规则。原文件缺失的 ``compute_slices`` / ``_read_chunk_frames``
-两个 import 在平移时补齐（此前只在 worker 线程里才触发 NameError）。
+规则。切片实现已抽到 ``app/core/video/slicing.py``（VR 与微信管线共用）；
+v0.27 起 VR 走 gscore 动态切片，不再有固定 4s/1s 参数。
 """
 from __future__ import annotations
 
@@ -41,9 +42,13 @@ from app.core.compute.registry import (
     get_registry,
     get_session_call_lock,
 )
+from app.core.video.frame_judge import EXPOSED_METRICS, FrameJudge
+from app.core.video.slicing import (
+    SLICE_MAX_FRAMES,
+    SLICE_OVERLAP_FRAMES,
+    iter_slices,
+)
 from app.core.video.utils import (
-    _read_chunk_frames,
-    compute_slices,
     cosine_similarity as _cosine_similarity,
     probe_video_meta as _probe_video_meta,
 )
@@ -61,12 +66,13 @@ _VISION_SIZE = 576
 _EMBED_DIM = 2048
 
 # 检索参数固化 —— 页面与向导不暴露；需要调整时直接改这里的值。
-# 取值经 ``start_extract`` / ``query`` 强制覆盖调用方传入值，保证落盘缓存键
-# 与检索口径恒定；历史缓存条目仍按自身记录的切片参数检索。
-FIXED_CHUNK_SECONDS = 4
-FIXED_CHUNK_OVERLAP_SECONDS = 1
+# 切片口径由 ``app.core.video.slicing`` 的 ``SLICE_MAX_FRAMES`` /
+# ``SLICE_OVERLAP_FRAMES`` 决定（每片「有效帧」上限/重叠，不是秒数）。
 FIXED_SIM_THRESHOLD = 0.40
 FIXED_TOP_K = 10
+
+# 判据默认：gscore / 兜底间隔 10 秒（采样是 1 秒/帧，所以 every_n=10 帧）。
+DEFAULT_JUDGE_EVERY_N = 10
 
 
 def _score_hits(qvec: np.ndarray, index: List[dict], sim_threshold: float,
@@ -224,10 +230,20 @@ class VideoSearchService:
         self._error: str = ""
         self._source: str = ""
         self._source_exists: Optional[bool] = None
-        self._chunk_seconds: int = FIXED_CHUNK_SECONDS
-        self._chunk_overlap_seconds: int = FIXED_CHUNK_OVERLAP_SECONDS
+        self._chunk_seconds: int = SLICE_MAX_FRAMES
+        self._chunk_overlap_seconds: int = SLICE_OVERLAP_FRAMES
         self._slices_total: int = 0
         self._slices_embedded: int = 0
+        # 采样统计（1 秒/帧）：已评估 / 取 / 跳过
+        self._frames_evaluated: int = 0
+        self._frames_taken: int = 0
+        self._frames_skipped: int = 0
+        # gscore 判据（每路/每视频一个实例，提取开始时 reset）
+        self._judge = FrameJudge(
+            mode=EXPOSED_METRICS[0],
+            every_n=DEFAULT_JUDGE_EVERY_N,
+            long_side=160,
+        )
         self._query: Optional[dict] = None
         self._hits: List[dict] = []
         self._started_at: float = 0.0
@@ -258,7 +274,12 @@ class VideoSearchService:
                 "chunk_overlap_seconds": self._chunk_overlap_seconds,
                 "slices_total": self._slices_total,
                 "slices_embedded": self._slices_embedded,
+                "duration_s": self._duration_s,
+                "frames_evaluated": self._frames_evaluated,
+                "frames_taken": self._frames_taken,
+                "frames_skipped": self._frames_skipped,
                 "fps": self._fps,
+                "judge": self._judge.snapshot(),
                 "query": self._query,
                 "hits": self._hits,
             }
@@ -300,6 +321,10 @@ class VideoSearchService:
             self._error = ""
             self._slices_total = 0
             self._slices_embedded = 0
+            self._frames_evaluated = 0
+            self._frames_taken = 0
+            self._frames_skipped = 0
+            self._judge.reset()
             self._query = None
             self._hits = []
             self._index = []
@@ -309,18 +334,15 @@ class VideoSearchService:
         self._broadcast({"type": "state", **self.snapshot()})
         return self.snapshot()
 
-    def start_extract(
-            self,
-            chunk_seconds: int = FIXED_CHUNK_SECONDS,
-            chunk_overlap_seconds: int = FIXED_CHUNK_OVERLAP_SECONDS) -> dict:
-        # 切片参数固化：调用方传入值一律忽略，改参数请改模块常量。
-        chunk_seconds = FIXED_CHUNK_SECONDS
-        chunk_overlap_seconds = FIXED_CHUNK_OVERLAP_SECONDS
+    def start_extract(self) -> dict:
+        # 切片口径由 ``slicing.SLICE_MAX_FRAMES`` / ``SLICE_OVERLAP_FRAMES``
+        # 固定（有效帧上限 / 重叠帧数），调用方不再传参。
         # 预检：实例未启用时立即抛 RuntimeError，由 API 层转 503，
         # 避免用户点"开始提取"后还要等 worker 探测元数据才报错。
         # worker 里仍保留二次 _ensure_session 兜底（幂等）。
-        LOG.info("video-retrieval: start_extract requested (chunk=%ds, overlap=%ds, source=%s)",
-                 chunk_seconds, chunk_overlap_seconds, self._source)
+        LOG.info("video-retrieval: start_extract requested (max_frames=%d, "
+                 "overlap_frames=%d, source=%s)",
+                 SLICE_MAX_FRAMES, SLICE_OVERLAP_FRAMES, self._source)
         self._ensure_session()
         with self._lock:
             if self._state == _STATE_EXTRACTING:
@@ -329,15 +351,14 @@ class VideoSearchService:
                 raise ValueError("请先选择视频文件")
             if self._source_exists is False:
                 raise ValueError(f"文件不存在: {self._source}")
-            if not 3 <= chunk_seconds <= 6:
-                raise ValueError("chunk_seconds 必须在 3–6 之间")
-            if chunk_overlap_seconds not in (1, 2):
-                raise ValueError("chunk_overlap_seconds 必须为 1 或 2")
-            if chunk_overlap_seconds >= chunk_seconds:
-                raise ValueError("重叠时长必须小于切片时长")
-            self._chunk_seconds = chunk_seconds
-            self._chunk_overlap_seconds = chunk_overlap_seconds
+            self._chunk_seconds = SLICE_MAX_FRAMES
+            self._chunk_overlap_seconds = SLICE_OVERLAP_FRAMES
             self._slices_embedded = 0
+            self._slices_total = 0
+            self._frames_evaluated = 0
+            self._frames_taken = 0
+            self._frames_skipped = 0
+            self._judge.reset()
             self._query = None
             self._hits = []
             self._index = []
@@ -370,8 +391,10 @@ class VideoSearchService:
             if model_id:
                 try:
                     cached = cache.lookup(
-                        md5_hex, model_id, chunk_seconds,
-                        chunk_overlap_seconds)
+                        md5_hex, model_id, SLICE_MAX_FRAMES,
+                        SLICE_OVERLAP_FRAMES,
+                        judge_fp=self._judge_fingerprint(),
+                        slice_version="gscore-v1")
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("video-retrieval: cache lookup failed (treat as "
                                 "miss): %s", exc)
@@ -390,10 +413,9 @@ class VideoSearchService:
                     self._state = _STATE_READY
                     self._error = ""
                 LOG.info("video-retrieval: cache hit md5=%s (%d segments, "
-                         "chunk=%ds/overlap=%ds) — restored, skipped "
-                         "embedding", md5_hex[:12],
-                         len(cached["index"]), chunk_seconds,
-                         chunk_overlap_seconds)
+                         "judge=%s) — restored, skipped embedding",
+                         md5_hex[:12], len(cached["index"]),
+                         self._judge_fingerprint())
                 snap = self.snapshot()
                 self._broadcast({"type": "state", **snap})
                 return snap
@@ -415,6 +437,9 @@ class VideoSearchService:
                 self._error = ""
                 self._slices_embedded = 0
                 self._slices_total = 0
+                self._frames_evaluated = 0
+                self._frames_taken = 0
+                self._frames_skipped = 0
                 self._index = []
         self._broadcast({"type": "state", **self.snapshot()})
         return self.snapshot()
@@ -514,6 +539,9 @@ class VideoSearchService:
                 self._state = _STATE_IDLE
             self._slices_total = 0
             self._slices_embedded = 0
+            self._frames_evaluated = 0
+            self._frames_taken = 0
+            self._frames_skipped = 0
         snap = self.snapshot()
         self._broadcast({"type": "state", **snap})
         return snap
@@ -543,6 +571,10 @@ class VideoSearchService:
             self._error = ""
             self._slices_total = 0
             self._slices_embedded = 0
+            self._frames_evaluated = 0
+            self._frames_taken = 0
+            self._frames_skipped = 0
+            self._judge.reset()
             self._query = None
             self._hits = []
             self._index = []
@@ -566,117 +598,180 @@ class VideoSearchService:
             self._source_exists = None
             self._slices_total = 0
             self._slices_embedded = 0
+            self._frames_evaluated = 0
+            self._frames_taken = 0
+            self._frames_skipped = 0
+            self._judge.reset()
             self._query = None
             self._hits = []
             self._index = []
 
     # ------------------------------------------------------------------ #
-    # 后台 worker：切片 + embedding
+    # 判据（gscore）
     # ------------------------------------------------------------------ #
-    def _compute_slices(self, fps: float, duration_s: float) -> int:
-        """按 chunk 参数计算切片总数 —— 转调公共 ``compute_slices``
-        （与 ``_worker_loop`` 终止语义一致，微信管线共用同一实现）。"""
-        return compute_slices(fps, duration_s, self._chunk_seconds,
-                              self._chunk_overlap_seconds)
+    def judge_snapshot(self) -> dict:
+        return self._judge.snapshot()
 
+    def set_judge(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            payload = {}
+        try:
+            self._judge.reconfigure(
+                mode=payload.get("mode"),
+                threshold=payload.get("threshold"),
+                every_n=payload.get("every_n"),
+            )
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(str(e))
+        self._judge.reset()
+        snap = self._judge.snapshot()
+        # 广播完整 state（含 judge 子对象）给页面；返回值只给判据快照，
+        # 与三卡 ``/judge`` 端点同契约（共享前端组件 update() 直接吃它）。
+        self._broadcast({"type": "state", **self.snapshot()})
+        return snap
+
+    def reset_judge(self) -> dict:
+        self._judge.reset()
+        return self._judge.snapshot()
+
+    def _judge_fingerprint(self) -> str:
+        j = self._judge
+        return f"{j.mode}:{j.threshold:g}:{j.every_n}"
+
+    # ------------------------------------------------------------------ #
+    # 后台 worker：gscore 切片 + embedding
+    # ------------------------------------------------------------------ #
     def _worker_loop(self) -> None:
         try:
             meta = _probe_video_meta(self._source)
             if meta is None or meta["fps"] <= 0:
                 raise RuntimeError("无法读取视频元数据（fps / 帧数）")
             fps = meta["fps"]
-            duration_s = meta["duration_s"] if meta["duration_s"] > 0 else meta["total_frames"] / fps
-
+            duration_s = (meta["duration_s"] if meta["duration_s"] > 0
+                          else meta["total_frames"] / fps)
+            if duration_s <= 0:
+                raise RuntimeError("视频时长无效")
             with self._lock:
                 self._fps = fps
                 self._duration_s = duration_s
-                self._slices_total = self._compute_slices(fps, duration_s)
-                if self._slices_total <= 0:
-                    self._state = _STATE_ERROR
-                    self._error = (
-                        f"无法计算切片数（fps={fps:.2f}, "
-                        f"duration={duration_s:.1f}s, total_frames={int(duration_s * fps)}）。"
-                        "请检查视频文件是否完整或换一个文件重试。"
-                    )
-                    self._broadcast({"type": "state", **self.snapshot()})
-                    return
-                self._broadcast({"type": "state", **self.snapshot()})
-
+                self._slices_total = 0
+                self._frames_evaluated = 0
+                self._frames_taken = 0
+                self._frames_skipped = 0
+            self._broadcast({"type": "state", **self.snapshot()})
             session = self._ensure_session()
-            step = self._chunk_seconds - self._chunk_overlap_seconds
-            chunk_idx = 0
-            start = 0.0
             lock = get_session_call_lock()
-        except Exception as e:  # pragma: no cover - defensive
+        except Exception as e:  # noqa: BLE001
             LOG.exception("vr extract worker error: %s", e)
             self._set_state(_STATE_ERROR, str(e))
             return
 
-        while start < duration_s:
-            if self._stop_worker.is_set():
-                return
-            frames = _read_chunk_frames(
-                self._source, start, self._chunk_seconds, fps)
-            if not frames:
-                break
-            # 帧采样间隔 1 秒/帧（demo 语义），所以实际覆盖秒数 = 帧数；
-            # 短尾片截断时 end_time 按实际帧数计
-            end_time = start + len(frames)
-            LOG.debug("video-retrieval: chunk %d/%d [%.2fs-%.2fs, %d frames]",
-                      chunk_idx, self._slices_total, start, end_time, len(frames))
-            try:
-                LOG.debug("video-retrieval: chunk %d — calling embed_video", chunk_idx)
-                import time as _time
-                t_chunk = _time.time()
-                vec = None
-                # FastDDS 首次调用 reply topic discovery race → client 端
-                # timeout. 已匹配后不会再 race，所以 timeout 后立即重试即可。
-                for _attempt in range(2):
-                    try:
-                        with lock:
-                            vec = session.embed_video(frames, prompt="")
-                        break
-                    except RuntimeError as rpc_err:
-                        if "timeout" not in str(rpc_err).lower() or _attempt == 1:
-                            raise
-                        LOG.warning("video-retrieval: chunk %d embed_video timeout "
-                                    "(reply discovery race), retrying", chunk_idx)
-                vec = np.asarray(vec, dtype=np.float32)
-                norm = float(np.linalg.norm(vec))
-                if norm > 1e-6:
-                    vec = vec / norm
-                    with self._lock:
-                        self._index.append({
-                            "video_path": os.path.basename(self._source),
-                            "start_time": round(start, 2),
-                            "end_time": round(end_time, 2),
-                            "chunk_idx": chunk_idx,
-                            "fps": fps,
-                            "vec": vec,
-                        })
-                        self._slices_embedded += 1
-                        self._broadcast({
-                            "type": "progress",
-                            "embedded": self._slices_embedded,
-                            "total": self._slices_total,
-                        })
-                LOG.debug("video-retrieval: chunk %d done in %.2fs (slices_embedded=%d/%d)",
-                          chunk_idx, _time.time() - t_chunk,
-                          self._slices_embedded, self._slices_total)
-            except Exception as chunk_err:  # noqa: BLE001
-                LOG.warning(
-                    "video-retrieval: chunk %d [%.2fs-%.2fs] embedding failed after %.2fs: %s — skipping",
-                    chunk_idx, start, end_time, _time.time() - t_chunk, chunk_err)
-            chunk_idx += 1
-            start += step
-            if end_time >= duration_s:
-                break
+        last_progress = {"wall": 0.0}
+
+        def _on_sample(_t: float, take: bool) -> None:
+            with self._lock:
+                self._frames_evaluated += 1
+                if take:
+                    self._frames_taken += 1
+                else:
+                    self._frames_skipped += 1
+                evaluated = self._frames_evaluated
+                embedded = self._slices_embedded
+                total = self._slices_total
+                duration = self._duration_s
+            # 按**墙钟**每 1 秒广播一次（1Hz）。不能用采样时间 ``t`` 做
+            # 节流：一个 block 的 4 帧是瞬间解完的，会一次连发 4 条。
+            # 片段完成时另有一次带精确 embedded 的 progress。
+            # 广播放在锁外 —— 回调（WS 入队）不该拖住计数锁。
+            now = time.monotonic()
+            if last_progress["wall"] == 0.0 or now - last_progress["wall"] >= 1.0:
+                last_progress["wall"] = now
+                self._broadcast({
+                    "type": "progress",
+                    "embedded": embedded,
+                    "total": total,
+                    "frames_evaluated": evaluated,
+                    "duration_s": duration,
+                })
+
+        chunk_idx = 0
+        try:
+            for start, end_time, frames in iter_slices(
+                    self._source, fps, duration_s,
+                    judge=self._judge,
+                    should_stop=self._stop_worker.is_set,
+                    on_sample=_on_sample):
+                if self._stop_worker.is_set():
+                    return
+                with self._lock:
+                    self._slices_total += 1
+                    total = self._slices_total
+                LOG.debug("video-retrieval: slice %d [%.2fs-%.2fs, %d frames]",
+                          chunk_idx, start, end_time, len(frames))
+                try:
+                    import time as _time
+                    t_chunk = _time.time()
+                    vec = None
+                    # FastDDS 首次调用 reply topic discovery race → client 端
+                    # timeout。已匹配后不会再 race，所以 timeout 后立即重试即可。
+                    for _attempt in range(2):
+                        try:
+                            with lock:
+                                vec = session.embed_video(frames, prompt="")
+                            break
+                        except RuntimeError as rpc_err:
+                            if "timeout" not in str(rpc_err).lower() or _attempt == 1:
+                                raise
+                            LOG.warning("video-retrieval: slice %d embed_video "
+                                        "timeout (reply discovery race), retrying",
+                                        chunk_idx)
+                    vec = np.asarray(vec, dtype=np.float32)
+                    norm = float(np.linalg.norm(vec))
+                    if norm > 1e-6:
+                        vec = vec / norm
+                        with self._lock:
+                            self._index.append({
+                                "video_path": os.path.basename(self._source),
+                                "start_time": round(start, 2),
+                                "end_time": round(end_time, 2),
+                                "chunk_idx": chunk_idx,
+                                "fps": fps,
+                                "vec": vec,
+                            })
+                            self._slices_embedded += 1
+                            self._broadcast({
+                                "type": "progress",
+                                "embedded": self._slices_embedded,
+                                "total": total,
+                                "frames_evaluated": self._frames_evaluated,
+                                "duration_s": self._duration_s,
+                            })
+                    LOG.debug("video-retrieval: slice %d done in %.2fs (%d/%d)",
+                              chunk_idx, _time.time() - t_chunk,
+                              self._slices_embedded, total)
+                except Exception as chunk_err:  # noqa: BLE001
+                    LOG.warning(
+                        "video-retrieval: slice %d [%.2fs-%.2fs] embedding failed "
+                        "after %.2fs: %s — skipping",
+                        chunk_idx, start, end_time, _time.time() - t_chunk,
+                        chunk_err)
+                chunk_idx += 1
+        except Exception as e:  # noqa: BLE001
+            LOG.exception("vr extract worker error: %s", e)
+            self._set_state(_STATE_ERROR, str(e))
+            return
 
         if self._stop_worker.is_set():
             return
         with self._lock:
             if self._state == _STATE_EXTRACTING:
-                if self._slices_total > 0 and self._slices_embedded == 0:
+                if self._slices_total == 0:
+                    self._state = _STATE_ERROR
+                    self._error = (
+                        "未能从视频中取到任何片段（解码失败或时长为空），"
+                        "请换文件重试。"
+                    )
+                elif self._slices_embedded == 0:
                     self._state = _STATE_ERROR
                     self._error = (
                         f"提取完成但 0/{self._slices_total} 切片成功 embedding — "
@@ -690,28 +785,34 @@ class VideoSearchService:
                  time.time() - self._started_at)
         self._broadcast({"type": "state", **self.snapshot()})
 
-        # ---- 全成功入库（与微信管线同语义：部分成功不存，重跑可补全）。
-        # 同 model + 同 chunk 参数的条目幂等覆盖。失败仅 LOG 不阻塞。
+        # ---- 全成功入库（部分成功不存，重跑可补全）。
+        # 幂等覆盖键 = md5 + 切片参数 + 判据口径 + 切片版本。
         cache = get_video_cache()
         if (cache is not None and self._md5
+                and self._slices_total > 0
                 and self._slices_embedded >= self._slices_total):
             model_id = (getattr(session, "model_id", None)
                         or getattr(session, "_model_id", "") or "")
             if model_id:
                 try:
-                    cache.save(self._md5, model_id, self._index, {
-                        "filename": os.path.basename(self._source),
-                        "source_path": self._source,
-                        "fps": fps,
-                        "duration_s": duration_s,
-                        "slices_total": self._slices_total,
-                        "slices_embedded": self._slices_embedded,
-                        "chunk_seconds": self._chunk_seconds,
-                        "chunk_overlap_seconds": self._chunk_overlap_seconds,
-                    })
+                    with self._lock:
+                        index_copy = list(self._index)
+                        cache_meta = {
+                            "filename": os.path.basename(self._source),
+                            "source_path": self._source,
+                            "fps": fps,
+                            "duration_s": duration_s,
+                            "slices_total": self._slices_total,
+                            "slices_embedded": self._slices_embedded,
+                            "chunk_seconds": SLICE_MAX_FRAMES,
+                            "chunk_overlap_seconds": SLICE_OVERLAP_FRAMES,
+                            "judge_fp": self._judge_fingerprint(),
+                            "slice_version": "gscore-v1",
+                        }
+                    cache.save(self._md5, model_id, index_copy, cache_meta)
                 except Exception as exc:  # noqa: BLE001
                     LOG.warning("video-retrieval: cache save failed (skipped): %s", exc)
-        elif self._slices_embedded < self._slices_total:
+        elif self._slices_total > 0 and self._slices_embedded < self._slices_total:
             LOG.warning("video-retrieval: partial extraction (%d/%d) — not saved to "
                         "cache; re-extract to complete",
                         self._slices_embedded, self._slices_total)

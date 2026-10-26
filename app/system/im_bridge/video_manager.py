@@ -37,8 +37,12 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from wdnai import SoftwareCapability
 
+from app.core.video.slicing import (
+    SLICE_MAX_FRAMES,
+    SLICE_OVERLAP_FRAMES,
+    iter_slices,
+)
 from app.core.video.utils import (
-    _read_chunk_frames,
     compute_slices,
     cosine_similarity as _cosine_similarity,
     probe_video_meta as _probe_video_meta,
@@ -47,8 +51,10 @@ from app.core.video.cache import file_md5, get_video_cache
 
 _LOG = logging.getLogger("wechat_video_manager")
 
-_CHUNK_SECONDS = 4
-_CHUNK_OVERLAP_SECONDS = 1
+# 微信管线暂不接判据：所有采样帧都算有效帧，切片口径与 VR 共用
+# ``app.core.video.slicing`` 的「有效帧上限 / 重叠帧数」常量。
+_CHUNK_SECONDS = SLICE_MAX_FRAMES
+_CHUNK_OVERLAP_SECONDS = SLICE_OVERLAP_FRAMES
 _SIM_THRESHOLD = 0.4
 _FALLBACK_MIN_RESULTS = 3
 _SEARCH_TOP_K = 5
@@ -428,7 +434,9 @@ class WechatVideoManager:
                 try:
                     cached = cache.lookup(md5_hex, model_id,
                                           _CHUNK_SECONDS,
-                                          _CHUNK_OVERLAP_SECONDS)
+                                          _CHUNK_OVERLAP_SECONDS,
+                                          judge_fp="",
+                                          slice_version="fixed")
                 except Exception as exc:  # noqa: BLE001
                     _LOG.warning("wechat video: cache lookup failed "
                                  "(treat as miss): %s", exc)
@@ -469,12 +477,11 @@ class WechatVideoManager:
             raise RuntimeError(
                 f"视频时长 {_fmt_ts(duration_s)} 超过上限 "
                 f"{_fmt_ts(max_seconds)}，请裁剪后重新发送")
-        step = _CHUNK_SECONDS - _CHUNK_OVERLAP_SECONDS
-        # 段数必须与下方 while 循环实际遍历的段数**严格一致** —— 与 VCS
-        # 提取 worker 共用 ``compute_slices``（按帧号模拟循环终止语义）。
-        # 此前用解析公式 ``(duration - overlap) // step + 1``，不能整除时
-        # 多算 1 段（19s / 4s-1s → 算 7 段、实际 6 段），"段数不足"会被
-        # 误判成"有切片失败"并触发部分成功分支的空 failures 崩溃。
+        # 段数必须与下方 ``iter_slices`` 实际产出的段数**严格一致** ——
+        # 它与 VCS 提取 worker 共用 ``compute_slices``（按帧号模拟循环终止
+        # 语义）。此前用解析公式 ``(duration - overlap) // step + 1``，不能
+        # 整除时多算 1 段（19s / 4s-1s → 算 7 段、实际 6 段），"段数不足"
+        # 会被误判成"有切片失败"并触发部分成功分支的空 failures 崩溃。
         total = max(1, compute_slices(
             fps, duration_s, _CHUNK_SECONDS, _CHUNK_OVERLAP_SECONDS))
         if self._superseded(user_id, seq):
@@ -492,62 +499,60 @@ class WechatVideoManager:
         # ---- 4. 切片 embedding（复用 VCS 底层函数；session/lock 已在
         #         步骤 0.5 获取）----
         chunk_idx = 0
-        start = 0.0
         failures: list = []
-        while start < duration_s:
-            if self._superseded(user_id, seq):
-                _LOG.info("wechat video: %s superseded mid-extraction "
-                          "(chunk %d/%d) — dropped silently",
-                          entry.filename, chunk_idx, total)
-                break
-            frames = _read_chunk_frames(str(path), start, _CHUNK_SECONDS, fps)
-            if not frames:
-                failures.append(
-                    f"c{chunk_idx}: PyAV 解码 0 帧 @ {start:.0f}s")
-                break
-            end_time = start + len(frames)
-            try:
-                vec = None
-                for _attempt in range(2):
-                    try:
-                        with lock:
-                            vec = session.embed_video(frames, prompt="")
-                        break
-                    except RuntimeError as rpc_err:
-                        if ("timeout" not in str(rpc_err).lower()
-                                or _attempt == 1):
-                            raise
-                        _LOG.warning("chunk %d embed timeout (discovery race),"
-                                     " retrying", chunk_idx)
-                vec = np.asarray(vec, dtype=np.float32)
-                norm = float(np.linalg.norm(vec))
-                if norm > 1e-6:
-                    vec = vec / norm
-                    with self._lock:
-                        entry.index.append({
-                            "start_time": round(start, 2),
-                            "end_time": round(end_time, 2),
-                            "chunk_idx": chunk_idx,
-                            "fps": fps,
-                            "vec": vec,
-                        })
-                        entry.slices_embedded += 1
-                        entry.progress = (
-                            entry.slices_embedded / total if total else 1.0)
-                else:
-                    failures.append(
-                        f"c{chunk_idx}: embedding 向量退化 (norm={norm:.3g})")
-            except Exception as chunk_err:  # noqa: BLE001
-                # 单片失败记录后继续（对齐 VCS UI 页行为）——不再单片
-                # 中止整轮。失败原因进 failures，终态聚合错误里可见，
-                # 微信用户直接收到真因而非笼统的 "全部失败"。
-                failures.append(f"c{chunk_idx}: {chunk_err}")
-                _LOG.warning("wechat video: chunk %d/%d embed failed: %s",
-                             chunk_idx, total, chunk_err)
-            chunk_idx += 1
-            start += step
-            if end_time >= duration_s:
-                break
+        try:
+            for start, end_time, frames in iter_slices(
+                    str(path), fps, duration_s, judge=None,
+                    should_stop=lambda: self._superseded(user_id, seq)):
+                if self._superseded(user_id, seq):
+                    _LOG.info("wechat video: %s superseded mid-extraction "
+                              "(chunk %d/%d) — dropped silently",
+                              entry.filename, chunk_idx, total)
+                    break
+                try:
+                    vec = None
+                    for _attempt in range(2):
+                        try:
+                            with lock:
+                                vec = session.embed_video(frames, prompt="")
+                            break
+                        except RuntimeError as rpc_err:
+                            if ("timeout" not in str(rpc_err).lower()
+                                    or _attempt == 1):
+                                raise
+                            _LOG.warning("chunk %d embed timeout (discovery race),"
+                                         " retrying", chunk_idx)
+                    vec = np.asarray(vec, dtype=np.float32)
+                    norm = float(np.linalg.norm(vec))
+                    if norm > 1e-6:
+                        vec = vec / norm
+                        with self._lock:
+                            entry.index.append({
+                                "start_time": round(start, 2),
+                                "end_time": round(end_time, 2),
+                                "chunk_idx": chunk_idx,
+                                "fps": fps,
+                                "vec": vec,
+                            })
+                            entry.slices_embedded += 1
+                            entry.progress = (
+                                entry.slices_embedded / total if total else 1.0)
+                    else:
+                        failures.append(
+                            f"c{chunk_idx}: embedding 向量退化 (norm={norm:.3g})")
+                except Exception as chunk_err:  # noqa: BLE001
+                    # 单片失败记录后继续（对齐 VCS UI 页行为）——不再单片
+                    # 中止整轮。失败原因进 failures，终态聚合错误里可见，
+                    # 微信用户直接收到真因而非笼统的 "全部失败"。
+                    failures.append(f"c{chunk_idx}: {chunk_err}")
+                    _LOG.warning("wechat video: chunk %d/%d embed failed: %s",
+                                 chunk_idx, total, chunk_err)
+                chunk_idx += 1
+        except Exception as decode_err:  # noqa: BLE001
+            # 生成器内部（PyAV 解码）异常 → 整段终止并记录失败原因。
+            failures.append(f"c{chunk_idx}: 切片解码失败: {decode_err}")
+            _LOG.warning("wechat video: slice decode failed at chunk %d: %s",
+                         chunk_idx, decode_err)
 
         # ---- 5. 终态判定 + 完成通知 ----
         if self._superseded(user_id, seq):
@@ -589,6 +594,8 @@ class WechatVideoManager:
                             "slices_embedded": n_hits_src,
                             "chunk_seconds": _CHUNK_SECONDS,
                             "chunk_overlap_seconds": _CHUNK_OVERLAP_SECONDS,
+                            "judge_fp": "",
+                            "slice_version": "fixed",
                         })
                     except Exception as exc:  # noqa: BLE001
                         _LOG.warning("wechat video: cache save failed "

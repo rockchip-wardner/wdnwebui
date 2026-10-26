@@ -4,7 +4,9 @@
 任一张卡上改配置，三张卡同时生效（它们本来就在看同一个视频源）。挂一个
 core 级 router 比让每张卡各抄一份端点更不容易走样。
 
-``video-retrieval``（监控反查）**不在此列** —— 它只保留检索，没有判据。
+``video-retrieval``（监控反查）**不在此列** —— 它的判据挂在
+``/api/video-retrieval/judge*``（操作 ``VideoSearchService._judge``，见
+``app/apps/video_retrieval/api.py``）。
 
 路由前缀由 :func:`register_judge_api` 决定（``app/main.py`` 调）。
 """

@@ -1434,9 +1434,9 @@ VR 另有一个二值的「自动判帧」。现在**只有一份实现**:
 | 算法原语 | `wdnav.scene`（RGA NV12-Y 缩略图 + 可注册度量） |
 | 判据策略 | `app/core/video/frame_judge.py`（模式 / 阈值 / 兜底间隔 / 分数环形缓冲） |
 | vd·vtd·vtl 接线 | 三张卡都 → `app/core/video/multi_session.py`（按 key `"vd"` / `"vtd"` / `"vtl"` 注册的多路会话）。判据实现在 `frame_judge.py` 一份，每路各持一个 `FrameJudge` |
-| video-retrieval | 无判据（只检索） |
-| HTTP | `app/core/video/api.py` → `/api/video/judge*`（三张卡共用）；video-retrieval 无判据端点 |
-| 前端 | `app/static/core/frame-judge.{js,css}`，四张卡各 mount 一个实例（按 prefix 索引） |
+| video-retrieval | `app/core/video/search.py::VideoSearchService._judge`（单实例；每次 `start_extract` / `open` reset，切片时逐秒 `observe`） |
+| HTTP | 三卡共用 `/api/video/judge*`；VR 挂自己的 `/api/video-retrieval/judge{,/metrics,/reset}` |
+| 前端 | `app/static/core/frame-judge.{js,css}`，四张卡各 mount 一个实例（按 prefix 索引）；VR 用 `configOnly: true`（不建浮框/曲线） |
 
 **模式即算法名,v0.21 起放行两个:`gscore`(推荐) 与 `conc`(对比/待下架)**:
 用户可选 `manual`(手动跳帧,逐位保持历史 `pos % n == 0`,零 RGA 开销) +
@@ -5636,14 +5636,27 @@ RIFF header by hand.
   - **进程级 `_llm_session_call_lock`**：`embed_text` / `embed_video` 的
     `reset() + respond` 类推理用该锁与 detector 串行化（embedding 的
     `embed_*` 也是 NPU 推理）。
-  - **切片 embedding**：参数固化为模块常量（`FIXED_CHUNK_SECONDS = 4`
-    / `FIXED_CHUNK_OVERLAP_SECONDS = 1`），`start_extract()` 用它们
-    覆盖调用方传入值。PyAV 按 `[start, start+chunk_seconds)` 时间窗
-    推进（步进 = chunk_seconds - overlap），每片取 `chunk_seconds` 个
-    等距帧（1 秒/帧）缩放到 576×576，`embed_video` 得 2048 维 L2
-    归一化向量，存内存 `List[{video_path, start_time, end_time,
-    chunk_idx, fps, vec}]`。逐片推进 `slices_embedded` 并 WS 广播
-    `progress`。`_probe_video_meta` 用 PyAV 探测 fps / 总帧数 / 时长。
+  - **切片 embedding（gscore 动态切片）**：`start_extract()` 不再收切片
+    参数 —— 每 1 秒采样一帧，交给 `self._judge`（`FrameJudge(mode=gscore,
+    every_n=10, threshold=10, long_side=160)`）判定要不要；**按有效帧**
+    累积成片（`app/core/video/slicing.py`：每片最多 `SLICE_MAX_FRAMES=4`
+    个有效帧、片间重叠 `SLICE_OVERLAP_FRAMES=1` 个有效帧，
+    `start=首个有效帧时间`、`end=最后一个有效帧时间+1`）。跳过的秒不产
+    帧但**仍落在区间内** —— 片段时长会自然变长，所以「4s/1s」不再是
+    准确的描述。每片帧缩放到 576×576，`embed_video` 得 2048 维 L2 归一化
+    向量，存内存 `List[{video_path, start_time, end_time, chunk_idx, fps,
+    vec}]`。逐片推进 `slices_embedded` 并 WS 广播 `progress`（另带
+    `frames_evaluated` / `duration_s`，前端进度按「已分析秒数」算，因为
+    片段总数在 gscore 下是动态的）。`_probe_video_meta` 用 PyAV 探测
+    fps / 总帧数 / 时长。
+
+    > **manual 模式的坑**：`FrameJudge.observe` 的 manual 历史语义是
+    > `pos > 0 and pos % n == 0` —— 直接照搬会让短视频（< every_n 秒）
+    > **一帧都不取、0 个片段**，而 `state` 还会变成 `ready`。所以
+    > `iter_slices` 对**第一个采样帧无条件取**（自动模式本来就取首帧当
+    > 参照帧），并在 `search._worker_loop` 把 `slices_total==0` 判成
+    > `error`（「未能从视频中取到任何片段」）而不是假成功。
+
     **⚠️ `embed_video` 必须传 ndarray 帧列表，绝不能传 `/dev/shm` 路径
     字符串**：worker 端 `_base.py` 把 `payload["frames"]` 交给
     `decode_attachments`，而后者对 **str** 的语义是"能 base64 解码就是
@@ -5667,7 +5680,10 @@ RIFF header by hand.
   - `GET  /` — 快照（state / 进度 / query / hits / fps / source_exists）。
   - `POST /open` `{source}` — 选单个视频文件。
   - `POST /extract` / `POST /extract/stop` — 开始 / 停止切片 embedding；
-    切片参数固化为 4s / 重叠 1s（body 里传了也会被忽略）；实例未启用 503。
+    body 无参数（切片由 gscore 判据 + `SLICE_*` 常量决定）；实例未启用 503。
+  - `GET /judge` / `POST /judge` / `GET /judge/metrics` / `POST /judge/reset`
+    — 判据配置（与三卡同契约；`metrics` 额外返回 `default_every_n=10`，
+    因为 VR 的 `every_n` 单位是**秒级采样帧**而不是解码帧）。
   - `POST /query` `{text, min_results?}` / `POST /query_multi` / `POST /query/clear`
     — 文本检索（阈值 0.40 / 上限 10 固化）、多视频缓存检索、清空结果。
   - `GET  /cache/stats` / `GET /cache/list` / `DELETE /cache/entry` / `POST /cache/clear`
@@ -5683,17 +5699,22 @@ RIFF header by hand.
   - 向导预览：`POST /upload`、`POST /source/{open,close,control}`、
     `GET /source`、`WS /source/ws`（复用共享 `VideoSession`）。
 * **前端** (`app/apps/video_retrieval/static/app.js` `VR` 模块 + `#page-video-retrieval`)：
-  - 左侧：视频源（"浏览…"复用 `VdFsModal._sourceTarget`）+
-    检索问题 / 宽松匹配 + 历史记录（只含检索缓存）+
-    开始 / 停止 + 提取进度（`#vr-progress`）。算力就绪时自动可用，未就绪时检
-    索子区置灰、输入框禁用、开始按钮禁用。
+  - 左侧：视频源（"浏览…"复用 `VdFsModal._sourceTarget`）+ **判帧算法**
+    （`#vr-judge-config[data-judge-layout="inline"]`，共享 `frame-judge.js`
+    的 `configOnly` 模式）+ 检索问题 / 宽松匹配 + 历史记录（只含检索缓存）+
+    开始 / 停止 + 提取进度（`#vr-progress`，文案为「已提取 N 段 · 已分析
+    X/Y 秒」）。算力就绪时自动可用，未就绪时检索子区置灰、输入框禁用、
+    开始按钮禁用。
   - 右侧：播放器 + 命中结果列表（相似度降序，每条带开始/结束时间），
     点卡片 → `vrPlaySegment` 连 `WS /play` 真实帧播放：等比 contain 填满
     播放窗口（`vrSyncCanvasSize` 把 canvas 像素同步为 `.vd-stage` 显示
     尺寸）、进度条按已收帧数/总帧数实时推进、暂停/恢复/停止/播完重播。
-  - 历史记录**一行 = 一条检索缓存**（md5 × 切片参数；后端 `/history` 仍按
-    md5 聚合返回，前端展平）；勾选 ≥1 → `/query_multi` 多视频检索；
-    按行删除 / 清空缓存 / 清空检索结果。
+  - 历史记录**一行 = 一条检索缓存**（md5 × 切片参数 × **判据口径**；后端
+    `/history` 仍按 md5 聚合返回，前端展平）；gscore 条目展示「按变化切片」
+    （不显示 4s/1s —— 跳过的秒不产帧，参数不再描述实际片段），旧固定切片
+    条目保留参数。勾选 ≥1 → `/query_multi` 多视频检索（`entries[]` 带
+    `judge_fp` / `slice_version`，按条目自身口径查）；按行删除 / 清空缓存 /
+    清空检索结果。
   - `DemoGuard` 注册 `video-retrieval`（`active_state_keys: ["search.state","busy"]`），
     离开页面 confirm + 停提取 + `sendBeacon` 兜底。
   - **向导跑完自动播放视频**（`ImApp_video_retrieval.applyWizardSnapshot`）：
@@ -5728,11 +5749,16 @@ RIFF header by hand.
   （`md5 / chunk_idx / start_time / end_time / fps / vec / filename /
   source_path / duration_s / slices_total / slices_embedded /
   chunk_seconds / chunk_overlap_seconds / embedding_model / analyzed_at /
-  meta_json`），已删除 `kind` 与全部分析列。升级时直接删除旧库
-  (`rm -rf app/uploads/lancedb`) 后重建；微信条目也会随之清空。
+  meta_json / judge_fp / slice_version`），已删除 `kind` 与全部分析列。
+  **`judge_fp` / `slice_version` 是切片口径隔离键**：VR 写
+  `judge_fp="<mode>:<threshold>:<every_n>"`（如 `gscore:10:10`）、
+  `slice_version="gscore-v1"`；微信写 `judge_fp=""`、`slice_version="fixed"`。
+  `lookup` / `save` / `list_videos` / `delete_video` 全部按这个键过滤 ——
+  否则改一次阈值就会复用旧索引（时间窗与帧数都对不上）。升级时直接删除
+  旧库 (`rm -rf app/uploads/lancedb`) 后重建；微信条目也会随之清空。
 * **资源预算**：qwen3-vl-embedding-2b 单实例 ~2 GB。检索单视频索引在内存，
-  长视频（>1h @ 4s 片 / 1s 重叠 ≈ 1200 片 × 2048 维 fp32 ≈ 10MB 向量）
-  可忽略。播放走 PyAV 顺序解码，不占 NPU。
+  长视频（>1h，按「有效帧上限 4 / 重叠 1 帧」≈ 900~1200 片 × 2048 维 fp32
+  ≈ 10MB 向量）可忽略。播放走 PyAV 顺序解码，不占 NPU。
 
 ## Text chat (文本对话) page
 
@@ -6451,7 +6477,8 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     中被覆盖的任务按 seq 判定自动跳过。
    - 管线：SDK CDN 下载（`Wechat.download_message()` 同步透传，120s
      上限）→ 落盘 `uploads/wechat_videos/<uid>/` → PyAV 探测 → 逐片
-     **4s 片 / 1s 重叠** embedding（复用 VR 底层函数 `_probe_video_meta`
+     **有效帧上限 4 / 重叠 1 帧** embedding（`iter_slices(judge=None)`
+     = 所有采样帧都算有效帧，行为与旧固定 4s/1s 逐片一致；复用 VR 底层函数 `_probe_video_meta`
      / `_read_chunk_frames` / `_write_frames_to_shm` / `_cosine_similarity`
      + `get_session("swcap_vision_embedding")`，SHM 帧传递 + timeout 重试
      与 UI 页同款）→ ready。
@@ -6491,11 +6518,13 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     维度不匹配）只 LOG warning 降级 —— 缓存层任何异常都不阻塞
     分析管线；`get_video_cache()` 返回 None 表示旁路。
   - **切片参数进缓存键（v0.12.1）**：`lookup/save` 均以
-    `(md5, embedding_model, chunk_seconds, chunk_overlap_seconds)`
-    定位条目 —— UI 检索页的 chunk/overlap 是用户可选的
-    （3-6s / 1-2s），不同参数的索引时间窗与帧数完全不同，混用会
-    时间戳错位。微信管线传固定 4/1；VR 传用户选值；同视频不同
-    参数是**独立条目**（各自占 LRU 槽，命中互不干扰）。
+    `(md5, embedding_model, chunk_seconds, chunk_overlap_seconds,
+    judge_fp, slice_version)` 定位条目 —— 不同切片口径的索引时间窗与
+    帧数完全不同，混用会时间戳错位。微信管线固定
+    `chunk=SLICE_MAX_FRAMES / overlap=SLICE_OVERLAP_FRAMES`、
+    `judge_fp=""` / `slice_version="fixed"`；VR 写判据指纹
+    `gscore:<threshold>:<every_n>` / `slice_version="gscore-v1"`。同视频
+    不同参数 / 判据是**独立条目**（各自占 LRU 槽，命中互不干扰）。
 * **VR 页接入缓存（v0.12.1）**：视频内容检索页与微信管线共享同一
   张表 + 同一单例：
   - `VideoSearchService.start_extract` 参数校验通过后算
@@ -6550,8 +6579,9 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   - **多选检索**：检索按钮在勾选 ≥1 时分叉
     `POST /query_multi {text, min_results, entries[]}` —— 匹配阈值
     固定 0.40、检索上限固定 10（body 里传了也会被忽略）；`entries[]`
-    里的 `chunk_seconds` / `chunk_overlap_seconds` 是缓存条目主键，
-    按条目自身记录的参数检索（历史条目可能是 4s/1s 之外的档位）。
+    里的 `chunk_seconds` / `chunk_overlap_seconds` / `judge_fp` /
+    `slice_version` 是缓存条目主键，按条目自身记录的参数检索（历史条目
+    可能是旧固定切片档位，也可能属于不同判据配置）。
     **embed_text 只算一次**、逐条目 LanceDB lookup
     向量做余弦（`_score_hits` 与单视频 query 共用）；返回
     `groups[{filename, source_path, chunk params, hits, top_score,
