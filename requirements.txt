@@ -28,6 +28,29 @@ gguf>=0.10.0
 # wdnai 目前只在 tokenizer 这条窄路径上用到它们。
 transformers>=4.40,<5
 tokenizers>=0.15,<1
+# v4l2（PyPI，纯 ctypes 的 Video4L2 绑定，GPLv2）—— wdnav.v4l2 的硬依赖，
+# 同属「SDK 声明了、但 --no-deps 装不进来、只能由 wdnwebui 兜」的一类。
+#
+# 故障链：wdnav/src/wdnav/v4l2.py 在**模块级**写死 `import v4l2 as _v4l2`
+# （第三方包，不是标准库），wdnav/pyproject.toml 也确实声明了 v4l2>=0.2，
+# 但 update_rkwhl.sh / README §4 都是 `pip install --no-deps -e` 装 SDK
+# —— --no-deps 直接跳过依赖安装，v4l2 **永远**不会自己进 venv。
+# 缺包时 app/core/hdmiin/capture.py 的懒加载 import 抛
+#   ModuleNotFoundError: No module named 'v4l2'
+# 日志表现为一行 ERROR + HDMI-IN 快照端点持续 503：
+#   GET /api/usb-hid/source/hdmiin/snapshot → 503 Service Unavailable
+#
+# 装上之后还有第二道坎（必须一起处理，否则故障从 503 变成 500）：
+# 上游 v4l2 0.2 发布于 2014，源码里还留着 Python 2 惯用法
+#   ) = range(1, 9) + [0x80]     # v4l2.py:197
+#   ) = range(0, 4) + [2]        # v4l2.py:248
+# py3 的 range 不是序列类型，import 阶段就抛
+#   TypeError: unsupported operand type(s) for +: 'range' and 'list'
+# —— 注意它是 TypeError **不是** ImportError，capture.py 里只 catch
+# ImportError 的分支接不住，会直接变成 500 堆栈。
+# 修法是每行加一层 list()，由 scripts/fix_v4l2_py3.py 幂等完成
+# （update_rkwhl.sh / bootstrap_wdndds_native.sh 会自动调用）。
+v4l2>=0.2
 wechatbot-sdk>=0.3.0,<1.0
 lancedb==0.34.0
 pyarrow==25.0.1

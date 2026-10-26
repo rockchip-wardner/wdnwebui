@@ -89,6 +89,7 @@ from typing import Optional
 
 import numpy as np
 
+from . import load_v4l2_capture
 from .probe import discover_device, detect_format
 
 _LOG = logging.getLogger("core.hdmiin.capture")
@@ -148,6 +149,12 @@ class HdmiInCapture:
         self._encode_errors: int = 0
         self._started_at: float = 0.0
         self._lock = threading.Lock()
+        # 帧的真实布局（wdnav 解析驱动报的四cc + 驱动 quirks 得到）。
+        # start() 之后才有值。
+        self._layout = None
+        # YUV 源用的复用缓冲（避免每帧分配 6MB）。
+        self._bgr_scratch: Optional[np.ndarray] = None
+        self._nv12_scratch: Optional[np.ndarray] = None
         # ---- AI-control side channel ---------------------------------- #
         # ``latest_jpeg`` is all the browser preview needs, but the
         # 智能电脑控制 agent has to hand a *pixel* frame to the VLM and
@@ -241,11 +248,15 @@ class HdmiInCapture:
             # needs the GIL to make progress.
             time.sleep(0.01)
 
-    def _maybe_snapshot_bgr(self, plane: np.ndarray) -> None:
-        """One-shot private copy of ``plane`` for :meth:`grab_bgr`.
+    def _maybe_snapshot_bgr(self, bgr: np.ndarray) -> None:
+        """One-shot private copy of the BGR frame for :meth:`grab_bgr`.
 
-        Called from :meth:`_run` *before* the frame is requeued, and
-        only when :meth:`grab_bgr` has armed the request — so the 30 fps
+        Called from :meth:`_run` with the **already normalised** BGR frame
+        (see :meth:`_frame_bgr`) — so the AI agent and the operator look at
+        one identical picture, and a YUV source is converted once per frame
+        instead of once per consumer.
+
+        No-op unless :meth:`grab_bgr` has armed the request — so the 30 fps
         preview loop pays nothing when no agent is running.
         """
         with self._lock:
@@ -253,22 +264,18 @@ class HdmiInCapture:
                 return
             self._bgr_wanted = False
         try:
-            h, w = self._cap.height, self._cap.width
-            if plane.ndim == 1:
-                plane = plane.reshape(h, w, 3)
-            # ``plane`` is a view onto the V4L2 mmap'd buffer, which the
-            # driver overwrites the moment we requeue it — hence the
-            # copy. No resize happens here on purpose (see
-            # :meth:`grab_bgr`), so no RGA pass is involved either.
+            # copy, not a view: for a YUV source ``bgr`` is a scratch buffer
+            # that gets overwritten next frame; for a BGR24 source it is a
+            # view onto the mmap'd V4L2 buffer, which the driver overwrites
+            # the moment we requeue it.
             #
             # ``.copy()`` and NOT ``np.ascontiguousarray(plane)``: the
-            # plane is already C-contiguous (it's a flat view reshaped
-            # back to (h, w, 3)), and ascontiguousarray documents
-            # "no copy is performed if the array is already
-            # C-contiguous" — it would hand back the *same* aliasing
-            # view. The agent would then be looking at memory the
-            # driver is free to overwrite mid-inference.
-            frame = plane.copy()
+            # frame is already C-contiguous, and ascontiguousarray documents
+            # "no copy is performed if the array is already C-contiguous" —
+            # it would hand back the *same* aliasing view. The agent would
+            # then be looking at memory the driver is free to overwrite
+            # mid-inference.
+            frame = bgr.copy()
         except Exception as e:  # noqa: BLE001
             _LOG.warning("hdmiin bgr snapshot failed: %s", e)
             return
@@ -316,26 +323,28 @@ class HdmiInCapture:
 
         # Lazy import — wdnav / pyav failures shouldn't take the whole
         # process down at module load time.
-        try:
-            from wdnav.v4l2 import V4L2Capture
-        except ImportError as e:
-            _LOG.error("wdnav.v4l2 import failed: %s", e)
+        cap_cls = load_v4l2_capture()
+        if cap_cls is None:
             return False
         try:
-            # NB: pixel_format must be the driver's *native* FourCC.
-            # rk_hdmirx exposes V4L2_PIX_FMT_BGR3 ("bgr3"), not
-            # V4L2_PIX_FMT_NV12 — asking for nv12 makes S_FMT fail with
-            # EINVAL and the whole open() fails. Verified on RK3588:
-            #   nv12 -> FAIL OSError: [Errno 22] Invalid argument
-            #   bgr3 -> OK  negotiated=BGR3 1920x1080
-            # This matches what _negotiate_format always reported
-            # anyway, and what the module docstring describes.
-            cap = V4L2Capture(self._device, width=1920, height=1080,
-                              pixel_format="bgr3", num_buffers=4)
+            # 请求"最好的"格式，实际拿驱动肯给的。
+            #
+            # rk_hdmirx 只接受 type=CAPTURE_MPLANE + 'NV24'（本机实测：
+            # bgr3 / nv12 / rgb3 / yuyv / uyvy 一律
+            # ``OSError: [Errno 22] Invalid argument``），所以**不要**在这里
+            # 猜驱动要什么 —— wdnav 的 V4L2Capture 带 **G_FMT 兜底**：
+            # S_FMT 失败就 G_FMT 问驱动当前格式再重试一次，请求什么都能
+            # 打开。最终格式看 ``cap.pixel_format``（**协商结果**，不是
+            # 请求值）。
+            cap = cap_cls(self._device, width=1920, height=1080,
+                          pixel_format="bgr3", num_buffers=4)
         except (OSError, RuntimeError) as e:
             _LOG.warning("v4l2 open %s failed: %s", self._device, e)
             return False
         cap.start()
+        # 驱动报的四cc可能"撒谎"（rk_hdmirx 报 NV24，实际写的是 8bit
+        # YUV422SP）—— 缓冲区怎么解读以 wdnav 的 frame_layout 为准。
+        self._layout = cap.frame_layout
         info = {"driver": cap.driver, "card": cap.card,
                 "capabilities": getattr(cap, "_caps", 0),
                 "width": cap.width, "height": cap.height,
@@ -466,12 +475,22 @@ class HdmiInCapture:
                 continue
             empty_count = 0
             starved_since = None
+            # 源格式可能是 BGR24，也可能是 YUV（rk_hdmirx 报 NV24、实际是
+            # 8bit YUV422SP）—— 统一在 _frame_bgr 里归一化成全分辨率
+            # BGR888，预览和 VLM 截图**共用同一份**，别每帧转两遍。
+            try:
+                bgr = self._frame_bgr(buf.plane_arrays[0])
+            except Exception as e:  # noqa: BLE001
+                _LOG.warning("hdmiin frame convert failed: %s", e)
+                cap.requeue(buf)
+                next_t = time.time()
+                continue
             # Same frame the preview JPEG is about to encode, so the AI
             # and the operator are looking at one identical picture.
             # No-op unless grab_bgr() armed the one-shot request.
-            self._maybe_snapshot_bgr(buf.plane_arrays[0])
+            self._maybe_snapshot_bgr(bgr)
             try:
-                jpeg = self._encode_jpeg(buf.plane_arrays[0])
+                jpeg = self._encode_jpeg(bgr)
             except Exception as e:  # noqa: BLE001
                 with self._lock:
                     self._encode_errors += 1
@@ -514,7 +533,9 @@ class HdmiInCapture:
         a fresh ``REQBUFS`` (open + start on a new fd) is the only
         documented way to revive ``rk_hdmirx`` here.
         """
-        from wdnav.v4l2 import V4L2Capture
+        cap_cls = load_v4l2_capture()
+        if cap_cls is None:
+            return False
         old = getattr(self, "_cap", None)
         if old is not None:
             try:
@@ -527,9 +548,10 @@ class HdmiInCapture:
                 pass
             self._cap = None
         try:
-            # Must match start(): rk_hdmirx's native FourCC is BGR3.
-            cap = V4L2Capture(self._device, width=1920, height=1080,
-                              pixel_format="bgr3", num_buffers=4)
+            # Same request as start() — the G_FMT fallback inside
+            # V4L2Capture takes whatever the driver is willing to give.
+            cap = cap_cls(self._device, width=1920, height=1080,
+                          pixel_format="bgr3", num_buffers=4)
         except (OSError, RuntimeError) as e:
             _LOG.warning("hdmiin reopen open() failed: %s", e)
             return False
@@ -543,19 +565,89 @@ class HdmiInCapture:
                 pass
             return False
         self._cap = cap
+        # 重开后的格式可能变（信号模式变了），布局要跟着更新。
+        self._layout = cap.frame_layout
         _LOG.info("hdmiin capture reopened on %s %sx%s %s",
                   self._device, cap.width, cap.height, cap.pixel_format)
         return True
 
-    def _encode_jpeg(self, plane: np.ndarray) -> bytes:
-        """V4L2 BGR24 frame ndarray → JPEG bytes via :class:`wdnav.mpp.MppEncoder`.
+    def _frame_bgr(self, plane: np.ndarray) -> np.ndarray:
+        """把一帧 V4L2 平面转成**全分辨率** BGR888。
 
-        ``plane`` comes in as a **flat 1-D numpy view onto the mmap'd
-        V4L2 buffer** — V4L2 exposes each capture plane as a single
-        contiguous byte string. ``rk_hdmirx`` negotiates BGR24 on this
-        kernel regardless of what we request at open() time, so we:
+        * ``bgr24`` 源：零拷贝视图（reshape），调用方要长期持有必须 copy。
+        * YUV 源：两次 RGA ``cvtcolor``（源格式 → NV12 → BGR），结果写进
+          复用的 ``self._bgr_scratch``。
 
-        1. Reshape to ``(H, W, 3)``;
+        为什么 YUV 源要绕这一圈：
+
+        1. 驱动报的 fourcc 未必是真布局。rk_hdmirx 报 'NV24'（V4L2 规范里
+           是 12bit YUV420SP），实际写的是 **8bit YUV422SP**（Y 平面 W*H +
+           交错 UV 平面 W*H）。按 fourcc 猜会读成满屏竖条纹 —— 布局要看
+           ``wdnav.v4l2.frame_layout``（它认这个驱动的 quirk）。
+        2. 本机 librga 1.10.5 的 **YUV 缩放是坏的**：亮度缩放正确
+           （合成图 MAD 0.07），色度完全错位（MAD 57）。BGR 源的缩放
+           反而是对的（合成图 MAD 1.7）。所以 YUV 源统一先转成 BGR，再走
+           BGR 那条（已验证的）缩放路径。
+        3. 中间必须过一道 NV12：RGA 的 422SP→BGR **不解交织**色度
+           （直接转出来的画面偏色），而 422SP→NV12 是像素级正确的
+           （与 numpy 参考逐像素一致，MAD 0.0）。
+
+        三段全在 RGA 硬件里跑，CPU 只碰 numpy 的指针。
+        """
+        h, w = self._cap.height, self._cap.width
+        layout = self._layout
+        payload = getattr(layout, "payload", "") or ""
+
+        if payload == "bgr24":
+            if plane.ndim == 1:
+                return plane.reshape(h, w, 3)
+            return plane
+
+        if payload not in ("yuv422sp", "yuv420sp"):
+            raise RuntimeError(
+                f"unsupported capture payload {payload!r} "
+                f"(fourcc={getattr(layout, 'fourcc', '?')})"
+            )
+
+        import wdnav.rga
+
+        if self._bgr_scratch is None or self._bgr_scratch.shape != (h, w, 3):
+            self._bgr_scratch = np.empty((h, w, 3), dtype=np.uint8)
+            self._nv12_scratch = np.empty((h * w * 3) // 2, dtype=np.uint8)
+        src_fmt = getattr(
+            wdnav.rga.RgaFormat,
+            "YCbCr_422_SP" if payload == "yuv422sp" else "YCbCr_420_SP",
+        )
+
+        # 1) 源格式 → NV12（YUV420SP，同尺寸）
+        wdnav.rga.cvtcolor(
+            wdnav.rga.wrap_virtual(
+                plane.ctypes.data, w, h, src_fmt,
+            ),
+            wdnav.rga.wrap_virtual(
+                self._nv12_scratch.ctypes.data, w, h,
+                wdnav.rga.RgaFormat.YCbCr_420_SP,
+            ),
+        )
+        # 2) NV12 → BGR888（同尺寸）
+        wdnav.rga.cvtcolor(
+            wdnav.rga.wrap_virtual(
+                self._nv12_scratch.ctypes.data, w, h,
+                wdnav.rga.RgaFormat.YCbCr_420_SP,
+            ),
+            wdnav.rga.wrap_virtual(
+                self._bgr_scratch.ctypes.data, w, h,
+                wdnav.rga.RgaFormat.BGR_888,
+            ),
+        )
+        return self._bgr_scratch
+
+    def _encode_jpeg(self, bgr: np.ndarray) -> bytes:
+        """Full-resolution BGR888 frame → JPEG bytes via :class:`wdnav.mpp.MppEncoder`.
+
+        ``bgr`` is what :meth:`_frame_bgr` produced — either a zero-copy
+        view onto the mmap'd V4L2 buffer (BGR24 source) or an RGA-converted
+        buffer (YUV source). We:
         2. Allocate an NV12 destination buffer
            ``(self._out_h * 3 // 2, self._out_w)``;
         3. Run :func:`wdnav.rga.resize` from BGR-888 → YCbCr-420-SP at
@@ -585,14 +677,12 @@ class HdmiInCapture:
         import wdnav.rga
 
         h, w = self._cap.height, self._cap.width
-        if plane.ndim == 1:
-            plane = plane.reshape(h, w, 3)
 
         # RGA resize+colorconvert: 1920x1080 BGR_888 → 1280x720 NV12.
         nv12 = np.zeros(self._out_h * 3 // 2 * self._out_w, dtype=np.uint8) \
                   .reshape(self._out_h * 3 // 2, self._out_w)
         src = wdnav.rga.wrap_virtual(
-            plane.ctypes.data, w, h, wdnav.rga.RgaFormat.BGR_888,
+            bgr.ctypes.data, w, h, wdnav.rga.RgaFormat.BGR_888,
         )
         dst = wdnav.rga.wrap_virtual(
             nv12.ctypes.data, self._out_w, self._out_h,

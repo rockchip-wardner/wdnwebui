@@ -1149,6 +1149,61 @@ app/apps/<card_id>/
               → 等 PC 反应(1.2s) → 下一轮，直到 done / 停止 / 步数上限
 ```
 
+### 踩过的坑：HDMI-IN 的 `v4l2` 依赖装不上就整条链 503
+
+`wdnav/src/wdnav/v4l2.py` 在**模块级**写死 `import v4l2 as _v4l2`（第三方
+PyPI 包，纯 ctypes 绑定，**不是**标准库）。`wdnav` 的 pyproject 里声明了
+`v4l2>=0.2`，但 SDK 一律用 `pip install --no-deps -e` 装 —— **--no-deps
+直接跳过依赖解析**，这个包永远不会自己进 venv。缺它时：
+
+```
+[ERROR] core.hdmiin.capture: wdnav.v4l2 import failed: No module named 'v4l2'
+GET /api/usb-hid/source/hdmiin/snapshot → 503
+```
+
+页面轮询多快，错误日志就刷多快（每 30ms 一条）。修法是把它显式写进
+`requirements.txt`（`v4l2>=0.2`），和 `transformers` / `tokenizers` 同一类
+「SDK 声明了但 --no-deps 装不进来、只能由 wdnwebui 兜」的依赖。
+
+> ⚠️ **装上 ≠ 能用**：上游 0.2（2014）留着 Python 2 惯用法
+> `) = range(1, 9) + [0x80]`（`v4l2.py:197`）和
+> `) = range(0, 4) + [2]`（`v4l2.py:248`），py3 下 **import 阶段**就抛
+> `TypeError: unsupported operand type(s) for +: 'range' and 'list'`。
+> 关键点：那是 **TypeError 不是 ImportError** —— 原来
+> `capture.py` 只 catch `ImportError` 的分支接不住，故障会从「干净的 503」
+> 退化成「未捕获的 500 堆栈」。修法是每行包一层 `list()`，由
+> `scripts/fix_v4l2_py3.py` 幂等完成（`update_rkwhl.sh` /
+> `bootstrap_wdndds_native.sh` 已自动调用）。
+>
+> 现在 `app/core/hdmiin/__init__.py::load_v4l2_capture()` 统一装载并把
+> 两种失败都变成带「怎么办」的可执行提示，`capture.py` / `probe.py` 都走
+> 它 —— **别再各自 `from wdnav.v4l2 import V4L2Capture`**，那样漏 catch
+> 又会退回 500。
+
+> 📌 **第二条链：驱动只认一种格式 → S_FMT 直接 EINVAL**（已修，见下）
+>
+> 依赖装好后，打开设备仍可能 `OSError: [Errno 22] Invalid argument`。
+> 本机 rk_hdmirx 只接受 `type=CAPTURE_MPLANE + 'NV24'`，bgr3 / nv12 /
+> rgb3 / yuyv / uyvy 一律被拒。
+>
+> **wdnav 侧已补 G_FMT 兜底**（`_negotiate_format()`）：S_FMT 失败 →
+> `VIDIOC_G_FMT` 问驱动当前格式 → 用它重试一次。所以 app 侧请求什么都能
+> 打开，最终格式看 `cap.pixel_format`（**协商结果**，不是请求值）。
+> 改这个之前，`app/core/hdmiin/__init__.py` 文档里写的
+> 「G_FMT-then-S_FMT fallback added in v0.5」是**假的**（`git log -S
+> "VIDIOC_G_FMT"` 显示从未实现），别再照着它假设。
+>
+> ⚠️ 驱动报的四cc**可能是撒谎的**：rk_hdmirx 报 'NV24'（V4L2 规范里是
+> 12bit YUV420SP），实际写的是 **8bit YUV422SP**（Y 平面 W*H + 交错 UV
+> 平面 W*H，缓冲区尾部 W*H 字节是空洞）。按 fourcc 猜布局会读成满屏竖
+> 条纹。**布局一律问 `wdnav.v4l2.frame_layout`**（它认这个驱动的 quirk），
+> 别在 wdnwebui 里自己发 ioctl 绕过去。
+>
+> 另有一条 librga 的坑（本机 1.10.5 legacy API）：**YUV 源的缩放是坏的**
+> —— 亮度对（MAD 0.07）色度完全错位（MAD 57）；BGR 源的缩放是对的
+> （MAD 1.7）。所以 `capture.py::_frame_bgr()` 把 YUV 源统一转成 BGR888
+> 再走 BGR 那条缩放路径，三段全在 RGA 硬件里跑。
+
 ### 为什么不单独开一个 swcap（历史包袱已拆除）
 
 原来这里有个 `swcap_computer_control`，理由写的是「`get_session` 命中多实例时按

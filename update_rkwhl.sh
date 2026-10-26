@@ -58,6 +58,23 @@ PIP_TARGET="python -m pip"
 if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
     echo "==> 同步 requirements.txt (wdnwebui 自身依赖)"
     ( cd "$SCRIPT_DIR" && $PIP_TARGET install -r requirements.txt )
+    # ------------------------------------------------------------------------
+    # v4l2 (PyPI) 的 py3 兼容补丁
+    #
+    # requirements.txt 里的 `v4l2>=0.2` 是 wdnav.v4l2 的硬依赖（SDK 用
+    # --no-deps 装，依赖不会自己进来）。但上游 0.2（2014）源码里留着
+    # Python 2 惯用法 `range(...) + [...]`，py3 下 import 阶段就抛
+    # TypeError（不是 ImportError！）—— 装上了照样用不了，且 HDMI-IN
+    # 端点会从 503 退化成 500。补丁一行搞定，脚本幂等。
+    #
+    # 失败不终止本脚本：v4l2 只影响 HDMI-IN 一条链路，其余 SDK 更新
+    # 不该被它拖住。日志里会明确给出补救命令。
+    # ------------------------------------------------------------------------
+    echo "==> 修补 v4l2 的 py3 兼容问题 (scripts/fix_v4l2_py3.py)"
+    if ! ( cd "$SCRIPT_DIR" && python scripts/fix_v4l2_py3.py ); then
+        echo "WARN: v4l2 py3 兼容补丁未成功 —— HDMI-IN 采集将不可用。" >&2
+        echo "      手动执行: python scripts/fix_v4l2_py3.py" >&2
+    fi
 else
     echo "==> 未找到 requirements.txt，跳过 web 依赖同步"
 fi

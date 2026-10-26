@@ -49,6 +49,26 @@ python-multipart, **`gguf`**, **`transformers`** and **`tokenizers`**.
   `*.tokenizer.gguf` files that ship with each RKNN model. The
   `wdnai` SDK imports it but doesn't declare it as a dependency, so
   we pin it here.
+- `v4l2` — the third-party PyPI package (pure-ctypes Video4L2
+  bindings) that `wdnav/src/wdnav/v4l2.py` imports at module level.
+  The `wdnav` SDK declares it, but is installed with
+  `pip install --no-deps -e` (§4b), so it never lands in the venv on
+  its own. Without it every HDMI-IN snapshot request fails with
+  `ModuleNotFoundError: No module named 'v4l2'` → 503.
+
+  > ⚠️ Upstream `v4l2` 0.2 (2014) still contains the Python-2 idiom
+  > `range(...) + [...]`, which raises **at import time** on Python 3:
+  > `TypeError: unsupported operand type(s) for +: 'range' and 'list'`.
+  > That is *not* an `ImportError`, so a plain `pip install v4l2`
+  > turns the clean 503 into an unhandled 500. Run the patcher once
+  > after installing:
+  >
+  > ```bash
+  > .venv/bin/python scripts/fix_v4l2_py3.py
+  > ```
+  >
+  > It is idempotent and self-verifying; `update_rkwhl.sh` and
+  > `bootstrap_wdndds_native.sh` already call it for you.
 - `transformers` / `tokenizers` — `wdnai.gguf_tokenizer` loads every
   RKNN model's `*.tokenizer.gguf` through them, so a model can't even
   *start* without them (`ModuleNotFoundError: No module named

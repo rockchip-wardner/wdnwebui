@@ -12,6 +12,22 @@
 #   1. apt install libfoonathan-memory-dev, libfoonathan-memory0.7.2,
 #      patchelf — build-time deps the _build.py cmake configure step
 #      needs to resolve foonathan_memory_vendor + patch RUNPATH.
+#   2. Check FastDDS 3.6 is vendored under native/lib (hard-fails with
+#      the build_native.sh hint if not).
+#   3. Write native/bin/nodesize_dbg stub if missing — partial native
+#      installs (vendored native/lib + native/include from a tarball
+#      without bin/) trip cmake's IMPORTED-target file-existence check
+#      and abort find_package(fastdds). The debugger helper itself is
+#      never used at runtime (foonathan is statically linked into
+#      libfastdds.so).
+#   4. Run `pip install --force-reinstall --no-deps -e .venv/src/wdndds`
+#      to trigger _build.py.
+#   5. Make the build artefacts owned by the original user.
+#   6. Patch the PyPI `v4l2` package for py3 compatibility.
+#   7. Verify the .so artefacts are in place.
+##   1. apt install libfoonathan-memory-dev, libfoonathan-memory0.7.2,
+#      patchelf — build-time deps the _build.py cmake configure step
+#      needs to resolve foonathan_memory_vendor + patch RUNPATH.
 #   2. Write native/bin/nodesize_dbg stub if missing — partial native
 #      installs (vendored native/lib + native/include from a tarball
 #      without bin/) trip cmake's IMPORTED-target file-existence check
@@ -194,7 +210,55 @@ if [[ "$(id -u)" -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]] \
         2>/dev/null || true
 fi
 
-# -- Step 6: verify --------------------------------------------------------
+# -- Step 6: verify --------------------------------------------------------# -- Step 6: v4l2 (PyPI) 的 py3 兼容补丁 -------------------------------------
+#
+# wdnav/src/wdnav/v4l2.py 在模块级 `import v4l2`（第三方 PyPI 包）。SDK 用
+# `--no-deps` 装，所以它不会自己进 venv —— requirements.txt 里已显式列出
+# `v4l2>=0.2`。但上游 0.2（2014）留着 Python 2 惯用法 `range(...) + [...]`，
+# py3 下 import 阶段就抛 TypeError（**不是** ImportError），装了照样用不了：
+# HDMI-IN 快照端点会从 503 退化成 500。
+#
+# 这里做一次幂等修补（同一个脚本也挂在 update_rkwhl.sh 上）。
+# v4l2 没装（requirements 还没同步）时只提示、不失败 —— 它只影响 HDMI-IN
+# 一条链路，不该把整个 bootstrap 拖死。
+if [[ -f "${REPO_ROOT}/scripts/fix_v4l2_py3.py" ]]; then
+    if [[ -f "${REPO_ROOT}/.venv/bin/python" ]]; then
+        log "patching v4l2 for py3 compatibility (scripts/fix_v4l2_py3.py)"
+        if ! "${REPO_ROOT}/.venv/bin/python" "${REPO_ROOT}/scripts/fix_v4l2_py3.py"; then
+            warn "v4l2 py3 compatibility patch did not succeed — HDMI-IN capture stays unavailable."
+            warn "  fix manually: .venv/bin/python scripts/fix_v4l2_py3.py"
+        fi
+    else
+        warn "no .venv/bin/python yet — skipping the v4l2 py3 patch"
+    fi
+fi
+
+# -- Step 7: audit the SDK-declared dependencies ---------------------------
+#
+# SDK 是用 `--no-deps` 装的，所以它们**自己声明的依赖不会进 venv**。
+# 故障现场离原因很远：v4l2 缺失 → HDMI-IN 端点一直 503；tokenizers 缺失
+# → 算力页「模型启动失败」。
+#
+# check_sdk_deps.py 读 .venv/src/*/pyproject.toml 的 [project].dependencies，
+# 逐条查**已装**发行版（importlib.metadata，不查索引 → 离线可用），并**真的
+# import 一次** —— 「装了但 import 失败」正是 v4l2 那类故障，find_spec 查不出来。
+#
+# 这里不 die：bootstrap 自己的活（wdndds 的 .so）已经干完了，依赖缺失是另一
+# 条链路的事。但必须**大声 warn** 并给出修复命令 —— 否则这条链路的坑又要等
+# 到用户点页面才发现。
+if [[ -f "${REPO_ROOT}/scripts/check_sdk_deps.py" ]] \
+   && [[ -f "${REPO_ROOT}/.venv/bin/python" ]]; then
+    log "auditing SDK-declared dependencies (scripts/check_sdk_deps.py)"
+    if ! "${REPO_ROOT}/.venv/bin/python" "${REPO_ROOT}/scripts/check_sdk_deps.py"; then
+        warn "SDK dependency audit did not pass — declared dependencies are missing / broken."
+        warn "  fix:    ${REPO_ROOT}/.venv/bin/pip install -r ${REPO_ROOT}/requirements.txt"
+        warn "  recheck: ${REPO_ROOT}/.venv/bin/python ${REPO_ROOT}/scripts/check_sdk_deps.py"
+    fi
+else
+    warn "scripts/check_sdk_deps.py or .venv/bin/python missing — skipping the dependency audit"
+fi
+
+# -- Step 7: verify --------------------------------------------------------
 for so in "${CSHIM}" "${IDL}"; do
     [[ -f "${so}" ]] || die "build hook ran but ${so} is still missing"
 done
