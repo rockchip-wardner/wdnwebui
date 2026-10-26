@@ -8,7 +8,7 @@
 # and ComputeRegistry's RpcClient cannot come up
 # (`FileNotFoundError: wdndds: .../libwdndds_cshim.so not found`).
 #
-# This script does the missing piece in three idempotent steps:
+# This script does the missing piece in a series of idempotent steps:
 #   1. apt install libfoonathan-memory-dev, libfoonathan-memory0.7.2,
 #      patchelf — build-time deps the _build.py cmake configure step
 #      needs to resolve foonathan_memory_vendor + patch RUNPATH.
@@ -24,18 +24,8 @@
 #      to trigger _build.py.
 #   5. Make the build artefacts owned by the original user.
 #   6. Patch the PyPI `v4l2` package for py3 compatibility.
-#   7. Verify the .so artefacts are in place.
-##   1. apt install libfoonathan-memory-dev, libfoonathan-memory0.7.2,
-#      patchelf — build-time deps the _build.py cmake configure step
-#      needs to resolve foonathan_memory_vendor + patch RUNPATH.
-#   2. Write native/bin/nodesize_dbg stub if missing — partial native
-#      installs (vendored native/lib + native/include from a tarball
-#      without bin/) trip cmake's IMPORTED-target file-existence check
-#      and abort find_package(fastdds). The debugger helper itself is
-#      never used at runtime (foonathan is statically linked into
-#      libfastdds.so).
-#   3. Run `pip install --force-reinstall --no-deps -e .venv/src/wdndds`
-#      to trigger _build.py.
+#   7. Audit the SDK-declared dependencies (scripts/check_sdk_deps.py).
+#   8. Verify the .so artefacts are in place.
 #
 # v1.4 (2026-10-10) — Step 3 改用 **editable**（`-e`）。此前刻意用非
 # editable，理由有二：①「editable 不 copy 文件所以编不出 .so」→ 实测错误
@@ -210,7 +200,7 @@ if [[ "$(id -u)" -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]] \
         2>/dev/null || true
 fi
 
-# -- Step 6: verify --------------------------------------------------------# -- Step 6: v4l2 (PyPI) 的 py3 兼容补丁 -------------------------------------
+# -- Step 6: v4l2 (PyPI) 的 py3 兼容补丁 -------------------------------------
 #
 # wdnav/src/wdnav/v4l2.py 在模块级 `import v4l2`（第三方 PyPI 包）。SDK 用
 # `--no-deps` 装，所以它不会自己进 venv —— requirements.txt 里已显式列出
@@ -258,7 +248,7 @@ else
     warn "scripts/check_sdk_deps.py or .venv/bin/python missing — skipping the dependency audit"
 fi
 
-# -- Step 7: verify --------------------------------------------------------
+# -- Step 8: verify --------------------------------------------------------
 for so in "${CSHIM}" "${IDL}"; do
     [[ -f "${so}" ]] || die "build hook ran but ${so} is still missing"
 done

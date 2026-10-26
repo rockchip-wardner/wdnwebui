@@ -369,6 +369,40 @@ run_pkg() {
     return 0   # 吞掉失败，保证后续包继续
 }
 
+# ---------------------------------------------------------------------------
+# 依赖审计（--no-deps 的对冲）
+#
+# SDK 一律用 `pip install --no-deps -e` 装 —— 这是**有意为之**，不是历史遗留：
+#   * 私有包不在 PyPI（wdndds → wdnai、插件包 → wdnhid / wdnav），让 pip 去
+#     解析必挂；
+#   * 解析会把 opencv-python（GUI 版）一起拉进来，和已装的
+#     opencv-python-headless 抢同一个 cv2 包；
+#   * av 需要手挑版本；
+#   * 目标机常常根本连不上 PyPI。
+# 详见 README §4b。
+#
+# 代价是 **SDK 自己声明的依赖永远不会自己进 venv**，而故障现场离原因很远：
+#   * v4l2 缺失 → HDMI-IN 快照端点一直 503；
+#   * tokenizers 缺失 → 算力页「模型启动失败」。
+#
+# 所以装完必须**当场核一遍**：读 .venv/src/*/pyproject.toml 的
+# [project].dependencies，逐条查**已装**发行版（不查索引 → 离线可用），
+# 并**真的 import 一次** —— 「装了但 import 失败」正是 v4l2 那类故障，
+# find_spec 查不出来。
+#
+# 判定在 scripts/check_sdk_deps.py（可独立跑）。注意审计读的是**源码树**的
+# pyproject：它可能比已装版本新 —— 这正是我们要的（提前把新依赖报出来）。
+# ---------------------------------------------------------------------------
+audit_sdk_deps() {
+    local checker="$SCRIPT_DIR/scripts/check_sdk_deps.py"
+    if [ ! -f "$checker" ]; then
+        echo "WARN: 找不到 $checker，跳过依赖审计" >&2
+        return 0
+    fi
+    echo "==> 审计 SDK 声明的依赖是否真的可用 (scripts/check_sdk_deps.py)"
+    ( cd "$SCRIPT_DIR" && python "$checker" )
+}
+
 run_pkg wdnav  "git+ssh://git@10.10.10.10/wardner/wdnav.git#egg=wdnav"
 run_pkg wdnai  "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
 run_pkg wdndds "git+ssh://git@10.10.10.10/wardner/wdndds.git#egg=wdndds"
@@ -387,12 +421,25 @@ run_pkg wdnhid "git+ssh://git@10.10.10.10/wardner/wdnhid.git#egg=wdnhid"
 run_pkg wdnapps_video_analyzer "git+ssh://git@10.10.10.10/wardner/wdnapps_video_analyzer.git#egg=wdnapps_video_analyzer"
 run_pkg wdnapps_hdmi_processor "git+ssh://git@10.10.10.10/wardner/wdnapps_hdmi_processor.git#egg=wdnapps_hdmi_processor"
 
-if [ ${#FAILED_PKGS[@]} -eq 0 ]; then
+# 依赖审计放在**所有包都处理完之后**：这时 venv 的状态才是最终状态
+# （前面的包可能刚被重装，依赖也可能刚被 pip 换掉）。审计失败不改 .venv，
+# 所以不打断已经跑完的更新，只影响本脚本的退出码。
+DEPS_AUDIT_OK=1
+audit_sdk_deps || DEPS_AUDIT_OK=0
+
+if [ ${#FAILED_PKGS[@]} -eq 0 ] && [ "$DEPS_AUDIT_OK" = "1" ]; then
     echo "更新完成（wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor 全部成功）。"
     exit 0
 fi
 
 echo "" >&2
-echo "更新部分完成，以下包未更新：${FAILED_PKGS[*]}" >&2
-echo "其余包已按各自状态处理完毕；上述包解决后重跑 $0 即可。" >&2
+if [ ${#FAILED_PKGS[@]} -ne 0 ]; then
+    echo "更新部分完成，以下包未更新：${FAILED_PKGS[*]}" >&2
+    echo "其余包已按各自状态处理完毕；上述包解决后重跑 $0 即可。" >&2
+fi
+if [ "$DEPS_AUDIT_OK" != "1" ]; then
+    echo "依赖审计未通过：SDK 声明的依赖有缺失 / 版本不符 / import 失败。" >&2
+    echo "  补齐： .venv/bin/pip install -r requirements.txt" >&2
+    echo "  再查： .venv/bin/python scripts/check_sdk_deps.py" >&2
+fi
 exit 1

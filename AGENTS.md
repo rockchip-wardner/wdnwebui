@@ -3779,6 +3779,27 @@ wdnwebui 的 `requirements.txt` 提供。** `update_rkwhl.sh`（以及上面那�
 修法：`.venv/bin/pip install -r requirements.txt`（装的是 transformers +
 tokenizers + 它们的传递依赖，**不需要** torch）。
 
+**别再靠「症状反推缺哪个包」了 —— `scripts/check_sdk_deps.py` 把这整类故障
+提前到安装期。** 判据源是 **SDK 自己的 pyproject**（不是 requirements.txt）：
+读 `.venv/src/*/pyproject.toml` 的 `[project].dependencies`，逐条查**已装**
+发行版（`importlib.metadata`，**不查索引** → 离线可用），并**真的 import
+一次**。
+
+> **为什么必须真 import**：`find_spec` 只能回答「装没装」，答不了「装了能不能
+> 用」。上游 `v4l2` 0.2 就是这一类 —— 装了，py3 下 import 阶段抛 **TypeError**
+> （见 `scripts/fix_v4l2_py3.py`）。审计的判据是「能 import」，不是「有 dist-info」。
+
+> **为什么不让 pip 去解析依赖**（即 `--no-deps` → 强制解析是否合理）：
+> 私有包不在 PyPI（`wdndds` → `wdnai`、插件包 → `wdnhid` / `wdnav`），fresh
+> venv 必挂；实测 `pip install --dry-run -e .venv/src/wdndds` 会
+> **`Would install opencv-python-5.0.0.93`** —— GUI 版 opencv 和 headless 版
+> 抢同一个 `cv2` 包；`av` 需手挑版本；本机连不上 PyPI，强制解析会卡住。
+> `--no-deps` 是**选过的**，审计是对冲，不是要改它。
+
+挂载点：`update_rkwhl.sh`（所有包跑完之后，审计不过则整脚本 exit 1）、
+`bootstrap_wdndds_native.sh`（Step 7，只 warn 不 die —— 它自己的活已经干完）。
+退出码：0=全就绪 / 1=有缺失或装坏 / 2=找不到 SDK 源码树。
+
 **wdndds also needs native libs built before `run.py` will boot.** Unlike
 wdnav/wdnai, `pip install wdndds` does not ship pre-built `.so` files —
 the `wdndds/_build.py` `build_py` hook is supposed to compile

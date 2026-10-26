@@ -43,12 +43,26 @@ pip install -r requirements.txt
 ```
 
 That pulls FastAPI, Uvicorn, Pydantic, psutil, opencv-python-headless,
-python-multipart, **`gguf`**, **`transformers`** and **`tokenizers`**.
+python-multipart, **`gguf`**, **`transformers`**, **`tokenizers`** and
+**`v4l2`**.
+
+> ℹ️  These three (`gguf` / `transformers` / `tokenizers`) are listed here
+>  because the SDKs are installed with `--no-deps` (§4) and therefore never
+>  pull their own dependencies in. `scripts/check_sdk_deps.py` (§4c) audits
+>  exactly this — run it after any SDK install or update.
 
 - `gguf` — used by `wdnai.gguf_tokenizer` to parse the
   `*.tokenizer.gguf` files that ship with each RKNN model. The
   `wdnai` SDK imports it but doesn't declare it as a dependency, so
   we pin it here.
+- `transformers` / `tokenizers` — `wdnai.gguf_tokenizer` loads every
+  RKNN model's `*.tokenizer.gguf` through them, so a model can't even
+  *start* without them (`ModuleNotFoundError: No module named
+  'tokenizers'` → 「启动失败」 on the compute page). The `wdnai` SDK
+  declares both in its `pyproject.toml`, but it is installed with
+  `pip install --no-deps -e` (§4b), which skips dependency resolution
+  entirely — so they have to be listed here. No PyTorch needed: only
+  the tokenizer half of `transformers` is used.
 - `v4l2` — the third-party PyPI package (pure-ctypes Video4L2
   bindings) that `wdnav/src/wdnav/v4l2.py` imports at module level.
   The `wdnav` SDK declares it, but is installed with
@@ -69,14 +83,6 @@ python-multipart, **`gguf`**, **`transformers`** and **`tokenizers`**.
   >
   > It is idempotent and self-verifying; `update_rkwhl.sh` and
   > `bootstrap_wdndds_native.sh` already call it for you.
-- `transformers` / `tokenizers` — `wdnai.gguf_tokenizer` loads every
-  RKNN model's `*.tokenizer.gguf` through them, so a model can't even
-  *start* without them (`ModuleNotFoundError: No module named
-  'tokenizers'` → 「启动失败」 on the compute page). The `wdnai` SDK
-  declares both in its `pyproject.toml`, but it is installed with
-  `pip install --no-deps -e` (§4b), which skips dependency resolution
-  entirely — so they have to be listed here. No PyTorch needed: only
-  the tokenizer half of `transformers` is used.
 - `wechatbot-sdk` — async client for the 微信 iLink bot; the synchronous
   wrapper that drives the im-bridge page lives in
   `app/services/wechat_bot.py` (inlined from `wdndds.Wechat` in 0.5+).
@@ -134,6 +140,58 @@ drops every card at boot. For manual single-package sync,
 `pip install --no-deps -e .venv/src/<pkg>` is the minimum; on a fresh
 host, `sudo ./bootstrap_wdndds_native.sh` is still required for apt
 deps + native lib vendoring.
+
+Once every package has been processed, the script audits the SDKs'
+declared dependencies (§4c) and fails the run if any of them is missing or
+unimportable — otherwise a `--no-deps` install would only reveal the gap
+when someone opens the affected page.
+
+## 4c. Audit the SDK dependencies
+
+The SDKs are installed with `pip install --no-deps -e`, so **their own
+declared dependencies never land in the venv**. That is deliberate — the
+private packages aren't on PyPI (`wdndds` → `wdnai`, the card plugins →
+`wdnhid` / `wdnav`), letting pip resolve them fails outright; resolving
+would also pull `opencv-python` (the GUI build) in next to the pinned
+`opencv-python-headless`, and the two fight over the same `cv2` package;
+`av` needs a hand-picked build; and the target board often has no PyPI
+access at all.
+
+The sharp edge is that a missing dependency is only discovered when the
+feature that needs it is used, and the symptom is nowhere near the cause:
+
+| missing | symptom |
+|---|---|
+| `v4l2` | every HDMI-IN snapshot → 503 `No module named 'v4l2'` |
+| `tokenizers` / `transformers` | compute page says 「模型启动失败」 |
+
+So run the audit after installing or updating the SDKs:
+
+```bash
+.venv/bin/python scripts/check_sdk_deps.py
+```
+
+It reads `[project].dependencies` from every SDK under `.venv/src/`, checks
+each entry against the **installed** distributions (`importlib.metadata` —
+never the index, so it works offline), verifies the version constraint, and
+then **really imports** the module. That last step matters: "installed but
+broken" is a real class here — upstream `v4l2` 0.2 raises `TypeError` at
+import time under Python 3 (§3), which `importlib.util.find_spec` cannot
+see.
+
+The exit code is the contract:
+
+| exit | meaning |
+|---|---|
+| 0 | every declared dependency is installed and importable |
+| 1 | something is missing / version-mismatched / unimportable |
+| 2 | the SDK source tree or the venv could not be located |
+
+`update_rkwhl.sh` runs it after all packages are processed and fails the
+whole run if it reports a problem; `bootstrap_wdndds_native.sh` runs it too
+and warns loudly (it doesn't abort — its own job, the wdndds `.so`, is
+already done by then). Each reported dependency comes with the command that
+fixes it.
 
 ## 5. Run the service
 
