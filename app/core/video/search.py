@@ -49,6 +49,7 @@ from app.core.video.slicing import (
     iter_slices,
 )
 from app.core.video.utils import (
+    _VISION_SIZE,
     cosine_similarity as _cosine_similarity,
     probe_video_meta as _probe_video_meta,
 )
@@ -73,6 +74,115 @@ FIXED_TOP_K = 10
 
 # 判据默认：gscore / 兜底间隔 10 秒（采样是 1 秒/帧，所以 every_n=10 帧）。
 DEFAULT_JUDGE_EVERY_N = 10
+
+# ---------------------------------------------------------------- #
+# 图片检索（以图 / 图+文检索视频片段）
+# ---------------------------------------------------------------- #
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+IMAGE_MAX_BYTES = 20 * 1024 * 1024
+# 质量门槛（真机实测标定）：
+#   纯色/近黑 std≈0；随机噪声 Laplacian≈4.9e4；
+#   真实图片（bus/demo/视频帧）Laplacian 68~1.1e4。
+# std 挡纯色，Laplacian 挡随机噪声；常量集中在这里便于按现场素材调整。
+IMAGE_MIN_STD = 3.0
+IMAGE_MAX_LAPLACIAN_VAR = 20000.0
+IMAGE_THUMB_LONG_SIDE = 240
+
+
+def validate_image_path(path: str) -> str:
+    """校验图片路径并返回规范化后的绝对路径（不通过抛 ValueError）。"""
+    p = (path or "").strip()
+    if not p:
+        raise ValueError("图片路径不能为空")
+    if not os.path.isabs(p):
+        raise ValueError("图片路径必须是绝对路径")
+    if not os.path.isfile(p):
+        raise ValueError(f"图片不存在: {p}")
+    if os.path.splitext(p)[1].lower() not in IMAGE_EXTS:
+        raise ValueError("图片格式不支持（支持 jpg/jpeg/png/bmp/webp）")
+    try:
+        size = os.path.getsize(p)
+    except OSError:
+        size = 0
+    if size > IMAGE_MAX_BYTES:
+        raise ValueError(f"图片过大（上限 {IMAGE_MAX_BYTES // 1024 // 1024} MB）")
+    return p
+
+
+def read_image_bgr(path: str) -> np.ndarray:
+    """读原图（BGR ndarray），只做路径校验、不缩放。"""
+    import cv2
+
+    p = validate_image_path(path)
+    image = cv2.imread(p)
+    if image is None:
+        raise ValueError(f"无法读取图片: {p}")
+    return image
+
+
+def read_query_image(path: str) -> np.ndarray:
+    """读图并缩放到 576×576（与 ``_read_chunk_frames`` 的索引帧预处理一致）。"""
+    import cv2
+
+    image = read_image_bgr(path)
+    if (image.shape[0], image.shape[1]) != (_VISION_SIZE, _VISION_SIZE):
+        image = cv2.resize(image, (_VISION_SIZE, _VISION_SIZE),
+                           interpolation=cv2.INTER_LINEAR)
+    return image
+
+
+def load_query_image(path: str, *, check_quality: bool = True) -> np.ndarray:
+    """质量检查在**原图**上做，再缩放到 576×576。
+
+    不能在缩放后的图上检查：把 128×128 的随机噪声双线性放大到 576×576
+    本身就是一次低通滤波，高频噪声会被平滑掉，质量门槛就失效了。
+    """
+    import cv2
+
+    image = read_image_bgr(path)
+    if check_quality:
+        err = image_quality_error(image)
+        if err:
+            raise ValueError(err)
+    if (image.shape[0], image.shape[1]) != (_VISION_SIZE, _VISION_SIZE):
+        image = cv2.resize(image, (_VISION_SIZE, _VISION_SIZE),
+                           interpolation=cv2.INTER_LINEAR)
+    return image
+
+
+def image_quality_error(image: np.ndarray) -> Optional[str]:
+    """图片质量门槛：纯色 / 随机噪声返回中文原因，正常图返回 None。"""
+    import cv2
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if float(gray.std()) < IMAGE_MIN_STD:
+        return "图片几乎是纯色（无法检索），请换一张"
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    if lap_var > IMAGE_MAX_LAPLACIAN_VAR:
+        return "图片噪声过高（无法检索），请换一张"
+    return None
+
+
+def read_image_thumb(path: str, long_side: int = IMAGE_THUMB_LONG_SIDE) -> bytes:
+    """读图并编码成 JPEG 缩略图（只读，不参与检索）。"""
+    import cv2
+
+    p = validate_image_path(path)
+    image = cv2.imread(p)
+    if image is None:
+        raise ValueError(f"无法读取图片: {p}")
+    h, w = image.shape[:2]
+    scale = float(long_side) / max(h, w)
+    if scale < 1.0:
+        image = cv2.resize(
+            image,
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    if not ok:
+        raise ValueError("图片缩略图编码失败")
+    return bytes(buf)
 
 
 def _score_hits(qvec: np.ndarray, index: List[dict], sim_threshold: float,
@@ -444,16 +554,46 @@ class VideoSearchService:
         self._broadcast({"type": "state", **self.snapshot()})
         return self.snapshot()
 
-    def query(self, text: str, sim_threshold: float, top_k: int,
-             min_results: int = 0, debug: bool = False) -> dict:
+    def encode_query(self, text: str = "", image_path: str = "",
+                     check_image_quality: bool = True) -> np.ndarray:
+        """把查询编码成归一化向量（图 / 文 / 图+文）。
+
+        有图走 ``embed_video([img], prompt=text)`` —— 单帧就是图片
+        embedding，与索引里的视频片段同一 2048 维空间；纯文字走
+        ``embed_text``。图片读完统一缩到 576×576（与索引帧一致）。
+        """
+        text = (text or "").strip()
+        image_path = (image_path or "").strip()
+        if not text and not image_path:
+            raise ValueError("请至少填写检索问题或选择一张图片")
+        if text and len(text) > 50:
+            raise ValueError("检索问题不能超过 50 个字")
+        session = self._ensure_session()
+        lock = get_session_call_lock()
+        with lock:
+            if image_path:
+                image = load_query_image(
+                    image_path, check_quality=check_image_quality)
+                vec = session.embed_video([image], prompt=text or "")
+            else:
+                vec = session.embed_text(text)
+        return np.asarray(vec, dtype=np.float32).reshape(-1)
+
+    def query(self, text: str = "",
+              sim_threshold: float = FIXED_SIM_THRESHOLD,
+              top_k: int = FIXED_TOP_K,
+              min_results: int = 0, debug: bool = False, *,
+              image_path: str = "",
+              check_image_quality: bool = True) -> dict:
         # 阈值 / 上限固化：调用方传入值一律忽略，改参数请改模块常量。
         # ``min_results``（宽松匹配兜底条数）仍由调用方决定。
         sim_threshold = FIXED_SIM_THRESHOLD
         top_k = FIXED_TOP_K
         text = (text or "").strip()
-        if not text:
-            raise ValueError("检索问题不能为空")
-        if len(text) > 50:
+        image_path = (image_path or "").strip()
+        if not text and not image_path:
+            raise ValueError("请至少填写检索问题或选择一张图片")
+        if text and len(text) > 50:
             raise ValueError("检索问题不能超过 50 个字")
         if not 0.0 <= sim_threshold <= 1.0:
             raise ValueError("阈值必须在 0–1.0 之间")
@@ -461,15 +601,17 @@ class VideoSearchService:
             raise ValueError("上限必须在 1–10 之间")
         if min_results < 0:
             min_results = 0
-        LOG.info("video-retrieval: query text=%r threshold=%.2f top_k=%d min_results=%d "
-                 "debug=%s (index_size=%d)",
-                 text, sim_threshold, top_k, min_results, debug,
+        image_name = os.path.basename(image_path) if image_path else ""
+        LOG.info("video-retrieval: query text=%r image=%r threshold=%.2f "
+                 "top_k=%d min_results=%d debug=%s (index_size=%d)",
+                 text, image_name, sim_threshold, top_k, min_results, debug,
                  len(self._index) if hasattr(self, "_index") else 0)
         with self._lock:
             if self._state not in (_STATE_READY, _STATE_IDLE):
                 raise ValueError("请先完成视频切片提取")
             if not self._index:
-                self._query = {"text": text, "sim_threshold": sim_threshold, "top_k": top_k}
+                self._query = {"text": text, "image": image_name,
+                               "sim_threshold": sim_threshold, "top_k": top_k}
                 self._hits = []
                 snap = self.snapshot()
                 snap["query_meta"] = {
@@ -482,10 +624,7 @@ class VideoSearchService:
                 self._broadcast({"type": "state", **snap})
                 return snap
 
-        session = self._ensure_session()
-        lock = get_session_call_lock()
-        with lock:
-            qvec = session.embed_text(text)
+        qvec = self.encode_query(text, image_path, check_image_quality)
         qvec = qvec / (np.linalg.norm(qvec) + 1e-9)
 
         with self._lock:
@@ -495,7 +634,8 @@ class VideoSearchService:
 
         snap = None
         with self._lock:
-            self._query = {"text": text, "sim_threshold": sim_threshold, "top_k": top_k}
+            self._query = {"text": text, "image": image_name,
+                           "sim_threshold": sim_threshold, "top_k": top_k}
             self._hits = result_hits
             snap = self.snapshot()
             snap["query_meta"] = {

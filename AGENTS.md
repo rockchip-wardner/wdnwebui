@@ -5740,8 +5740,10 @@ RIFF header by hand.
   - `GET /judge` / `POST /judge` / `GET /judge/metrics` / `POST /judge/reset`
     — 判据配置（与三卡同契约；`metrics` 额外返回 `default_every_n=10`，
     因为 VR 的 `every_n` 单位是**秒级采样帧**而不是解码帧）。
-  - `POST /query` `{text, min_results?}` / `POST /query_multi` / `POST /query/clear`
-    — 文本检索（阈值 0.40 / 上限 10 固化）、多视频缓存检索、清空结果。
+  - `POST /query` `{text?, image_path?, check_image_quality?, min_results?}` /
+    `POST /query_multi`（同样支持图片）/ `POST /query/clear` — 图 / 文 /
+    图+文检索（阈值 0.40 / 上限 10 固化）、多视频缓存检索、清空结果。
+  - `GET /image/thumb?path=` — 查询图缩略图（长边 240 JPEG，只读）。
   - `GET  /cache/stats` / `GET /cache/list` / `DELETE /cache/entry` / `POST /cache/clear`
     — 检索缓存管理（只含检索条目）。
   - `GET  /history` — 按 md5 聚合的历史（只含检索档位）。
@@ -5757,7 +5759,8 @@ RIFF header by hand.
 * **前端** (`app/apps/video_retrieval/static/app.js` `VR` 模块 + `#page-video-retrieval`)：
   - 左侧：视频源（"浏览…"复用 `VdFsModal._sourceTarget`）+ **判帧算法**
     （`#vr-judge-config[data-judge-layout="inline"]`，共享 `frame-judge.js`
-    的 `configOnly` 模式）+ 检索问题 / 宽松匹配 + 历史记录（只含检索缓存）+
+    的 `configOnly` 模式）+ 检索问题 / 检索图片（浏览 / 上传 / 预览 /
+    清除）/ 图片质量检查 / 宽松匹配 + 历史记录（只含检索缓存）+
     开始 / 停止 + 提取进度（`#vr-progress`，文案为「已提取 N 段 · 已分析
     X/Y 秒」）。算力就绪时自动可用，未就绪时检索子区置灰、输入框禁用、
     开始按钮禁用。
@@ -5815,6 +5818,31 @@ RIFF header by hand.
 * **资源预算**：qwen3-vl-embedding-2b 单实例 ~2 GB。检索单视频索引在内存，
   长视频（>1h，按「有效帧上限 4 / 重叠 1 帧」≈ 900~1200 片 × 2048 维 fp32
   ≈ 10MB 向量）可忽略。播放走 PyAV 顺序解码，不占 NPU。
+
+### 图片检索
+
+`POST /query` / `POST /query_multi` 接受 `image_path`（绝对路径）—— 图片、
+文字、图片+文字三种输入任意组合：
+
+* **编码**：`VideoSearchService.encode_query(text, image_path, check_image_quality)`
+  - 有图 → `session.embed_video([img], prompt=text or "")`（**单帧** = 图片
+    embedding，与视频片段同一 2048 维空间）；
+  - 纯文字 → `session.embed_text(text)`。
+  - 读图后统一 `cv2.resize` 到 **576×576**（与 `_read_chunk_frames` 的索引帧
+    预处理一致；不要给图片另设尺寸）。
+* **默认检索策略与文本完全一致**：阈值 `FIXED_SIM_THRESHOLD=0.40`、
+  `min_results=0`（严格；勾选「宽松匹配」才 top-10 兜底）。
+* **图片质量检查**（`check_image_quality`，默认 **true**，页面/向导都有
+  勾选）：在**原图**上判 `std < 3`（纯色）或 `Laplacian var > 20000`
+  （随机噪声）→ 400。必须在缩放前判 —— 128×128 噪声放大到 576 的插值
+  本身就是低通滤波，缩后判会漏（实测）。
+* **路径校验**：绝对路径、存在、后缀 `.jpg/.jpeg/.png/.bmp/.webp`、≤20MB。
+  上传复用 `POST /api/video-retrieval/upload`（任意文件，落 `uploads/`）。
+* **缩略图**：`GET /image/thumb?path=`（长边 240 JPEG，只读、不占 NPU）。
+* **向导**：`state.js` 支持字段级 `"browse": true`（复用 VdFsModal 选服务器
+  文件）与 `"upload": true`（浏览器上传到 `cfg.upload_endpoint`，写回字段 +
+  复用上传在途锁）；VR 的 search 步声明 `vr-search-image` +
+  `vr-check-image-quality`。未声明这两个属性的卡行为零变化。
 
 ## Text chat (文本对话) page
 

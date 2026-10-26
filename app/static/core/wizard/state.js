@@ -1279,6 +1279,67 @@
           const loopField = (stepDef.fields || []).find(f => f.id === inlineLoopFieldId);
           if (loopField) row.appendChild(_buildToggle(loopField, state));
         }
+      } else if ((field.browse || field.upload)
+                 && field.type !== "number" && field.type !== "checkbox"
+                 && field.type !== "select") {
+        // 通用文件字段（图片等）：wizard.json 显式声明 browse / upload 才
+        // 渲染。与视频源字段（-source）互斥 —— 后者有自己的按钮行与画布
+        // 搬运逻辑。existing 卡未声明这两个属性 → 行为零变化。
+        const row = _ce("div", WIZARD_NS + "input-row");
+        (field.type === "textarea" ? wrap : row).appendChild(el);
+        if (field.browse && window.VdFsModal) {
+          const browseBtn = _ce("button", WIZARD_NS + "browse-btn", "浏览");
+          browseBtn.type = "button";
+          browseBtn.title = "选择服务器上的文件";
+          browseBtn.addEventListener("click", () => {
+            try {
+              window.VdFsModal._sourceTarget = el;
+              window.VdFsModal.open("");
+            } catch (e) {
+              console.warn("[wizard-state] browse failed:", e);
+            }
+          });
+          row.appendChild(browseBtn);
+        }
+        if (field.upload && cfg.upload_endpoint) {
+          const fileInput = _ce("input");
+          fileInput.type = "file";
+          fileInput.accept = field.accept || "image/*";
+          fileInput.style.display = "none";
+          const upBtn = _ce("button", WIZARD_NS + "browse-btn", "上传");
+          upBtn.type = "button";
+          upBtn.title = "从本机上传文件";
+          upBtn.addEventListener("click", () => fileInput.click());
+          fileInput.addEventListener("change", async () => {
+            const f = fileInput.files && fileInput.files[0];
+            if (!f) return;
+            upBtn.disabled = true;
+            _setUploadBusy(state, true, field.id);
+            try {
+              const fd = new FormData();
+              fd.append("file", f);
+              const r = await fetch(cfg.upload_endpoint,
+                                    { method: "POST", body: fd });
+              const data = await r.json().catch(() => ({}));
+              if (!r.ok || !data.path) {
+                throw new Error(data.detail || ("HTTP " + r.status));
+              }
+              el.value = data.path;
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+            } catch (e) {
+              console.warn("[wizard-state] upload failed:", e);
+              upBtn.textContent = "上传失败";
+              setTimeout(() => { upBtn.textContent = "上传…"; }, 1500);
+            } finally {
+              upBtn.disabled = false;
+              _setUploadBusy(state, false, field.id);
+              fileInput.value = "";
+            }
+          });
+          row.appendChild(upBtn);
+          row.appendChild(fileInput);
+        }
+        wrap.appendChild(row);
       } else {
         // **非视频源字段**（判据算法 / 阈值 / 帧间隔、检索问题…）走这里。
         // 这个 else 归属的是外层 `if (isSource && …)` 而不是

@@ -560,7 +560,7 @@
               <div class="imb-bridge-row">
                 <label class="imb-bridge-label" for="imb-llm-bridge">
                   <input type="checkbox" id="imb-llm-bridge" />
-                  对接文字对话模型（[LLM]文字对话v3）
+                  对接视觉字对话模型
                 </label>
                 <span class="imb-bridge-hint" id="imb-llm-bridge-hint"></span>
               </div>
