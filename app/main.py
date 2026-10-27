@@ -91,6 +91,18 @@ def create_app() -> FastAPI:
     if isinstance(model_path, str) and model_path.strip():
         os.environ["WDNAI_MODELS_DIR"] = model_path
 
+    # Propagate the user-voice directory to the compute worker. The
+    # worker spawn does ``env = os.environ.copy()`` (see
+    # ``app/core/compute/registry.py``), so setting it here makes the
+    # worker see the same directory — it restores the user-uploaded
+    # voices from disk at startup instead of waiting for the app to
+    # push them back.
+    try:
+        from app.core.uploads import get_tts_user_voices_root
+        os.environ["WDNAI_TTS_USER_VOICES_DIR"] = str(get_tts_user_voices_root())
+    except Exception as exc:               # noqa: BLE001
+        print(f"[main] WDNAI_TTS_USER_VOICES_DIR not set: {exc}", flush=True)
+
     # Best-effort: 板载 ES8388 codec Speaker PA 默认 mute,TTS 启动时
     # aplay 写出 PCM 但听不到声音。boot 时 un-mute ES8388 的 Speaker
     # control(失败不影响其它路径)。

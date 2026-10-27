@@ -2,14 +2,14 @@
 """回归测试: 语音生成卡的音色 / 语种清单与「参考音色 vs 内置音色」分流。
 
 背景: Qwen3-TTS 有两条互不相干的发声路径 ——
-``ref_speaker``(参考音色 / 声音克隆,SDK 内嵌 girl_base / ahu 两个向量)
+``ref_speaker``(参考音色 / 声音克隆,SDK 内嵌 6 个参考音色)
 和 ``speaker``(模型自带的内置音色,SDK ``SPK_ID`` 的 9 个,向量在模型目录
 的 ``talker_input_embed.fp16.bin`` 里)。原来 UI 只露了前一条。
 
 两个坑:
-1. ``POST /api/tts/start`` 原来把 ``ref_speaker`` 默认填成 girl_base,
+1. ``POST /api/tts/start`` 原来把 ``ref_speaker`` 默认填成 news_female,
    而 SDK 里 ``ref_speaker`` 优先级**高于** ``speaker`` —— 就算前端正确
-   传了 ``speaker``,发出来的仍是 girl_base。修法: 两个都不给才回落。
+   传了 ``speaker``,发出来的仍是 news_female。修法: 两个都不给才回落。
 2. 内置音色只在 **CustomVoice** 权重里训练过;Base 权重里那几行是未训练
    的噪声(norm 0.022~0.023,训练过的行 0.056~1.64)—— 塞给 talker 等于
    没给音色条件,模型每次生成都自由发挥。所以清单只列 SDK
@@ -45,7 +45,10 @@ EXPECT_BUILTIN_MAX = {
     "ono_anna", "sohee", "eric", "dylan",
 }
 # 上游 demo 头文件里只有这两个参考音色
-EXPECT_REF = {"girl_base", "ahu"}
+EXPECT_REF = {
+    "news_female", "baby_girl", "lovely_girl",
+    "cool_lady", "male_announcer", "uncle_bass",
+}
 # 带方言的内置音色
 EXPECT_DIALECT = {"eric": "sichuan_dialect", "dylan": "beijing_dialect"}
 
@@ -95,8 +98,12 @@ async def test_api_mapping() -> None:
     tts_api.voice_catalog = lambda model_dir=None: {
         "voices": [
             {"id": "serena", "kind": "builtin", "dialect": ""},
-            {"id": "girl_base", "kind": "ref", "dialect": ""},
-            {"id": "ahu", "kind": "ref", "dialect": ""},
+            {"id": "news_female", "kind": "ref", "dialect": ""},
+            {"id": "baby_girl", "kind": "ref", "dialect": ""},
+            {"id": "lovely_girl", "kind": "ref", "dialect": ""},
+            {"id": "cool_lady", "kind": "ref", "dialect": ""},
+            {"id": "male_announcer", "kind": "ref", "dialect": ""},
+            {"id": "uncle_bass", "kind": "ref", "dialect": ""},
         ],
         "languages": [{"id": "auto"}],
     }
@@ -106,7 +113,7 @@ async def test_api_mapping() -> None:
         await tts_api.tts_start(payload)
         return captured["req"]
 
-    # A1: 只给内置音色 → ref_speaker 必须为空(girl_base 会把路堵死)
+    # A1: 只给内置音色 → ref_speaker 必须为空(news_female 会把路堵死)
     req = await call({"text": "你好", "speaker": "serena"})
     check("A1 只传 speaker → speaker 保留",
           req.speaker == "serena", f"speaker={req.speaker!r}")
@@ -114,16 +121,16 @@ async def test_api_mapping() -> None:
           req.ref_speaker == "", f"ref_speaker={req.ref_speaker!r}")
 
     # A2: 只给参考音色 → speaker 必须为空
-    req = await call({"text": "你好", "ref_speaker": "ahu"})
+    req = await call({"text": "你好", "ref_speaker": "baby_girl"})
     check("A2 只传 ref_speaker → ref_speaker 保留",
-          req.ref_speaker == "ahu", f"ref_speaker={req.ref_speaker!r}")
+          req.ref_speaker == "baby_girl", f"ref_speaker={req.ref_speaker!r}")
     check("A2 只传 ref_speaker → speaker 为空",
           req.speaker == "", f"speaker={req.speaker!r}")
 
     # A3: 两个都不给 → 回落默认参考音色(历史行为不变)
     req = await call({"text": "你好"})
-    check("A3 都不传 → 回落 girl_base",
-          req.ref_speaker == "girl_base" and req.speaker == "",
+    check("A3 都不传 → 回落 news_female",
+          req.ref_speaker == "news_female" and req.speaker == "",
           f"ref_speaker={req.ref_speaker!r} speaker={req.speaker!r}")
 
     # A4: 语言 / instruct 透传
@@ -154,19 +161,19 @@ def test_catalog_endpoint() -> None:
     ref = {v["id"] for v in voices if v.get("kind") == "ref"}
     builtin = {v["id"] for v in voices if v.get("kind") == "builtin"}
 
-    check("B1 参考音色 = girl_base + ahu", ref == EXPECT_REF, str(sorted(ref)))
-    # 顺序跟 SDK 走:第一个是 girl_base → 前端下拉默认选中它 = 历史默认
+    check("B1 参考音色 = SDK 内嵌 6 条", ref == EXPECT_REF, str(sorted(ref)))
+    # 顺序跟 SDK 走:第一个是 news_female → 前端下拉默认选中它 = 历史默认
     ref_list = [v["id"] for v in voices if v.get("kind") == "ref"]
-    check("B1b 参考音色第一个 = girl_base(默认音色)",
-          ref_list[:1] == ["girl_base"], str(ref_list))
+    check("B1b 参考音色第一个 = news_female(默认音色)",
+          ref_list[:1] == ["news_female"], str(ref_list))
     want_builtin = _sdk_builtin()
     check("B2 内置音色 == SDK 的有效性探测结果",
           builtin == want_builtin,
           f"清单={sorted(builtin)} SDK={sorted(want_builtin)}")
     check("B3 内置音色 ⊆ 官方 9 个",
           builtin <= EXPECT_BUILTIN_MAX, str(sorted(builtin - EXPECT_BUILTIN_MAX)))
-    check("B3b 音色总数 = 2 + 内置数",
-          len(voices) == 2 + len(builtin), str(len(voices)))
+    check("B3b 音色总数 = 参考音色数 + 内置数",
+          len(voices) == len(EXPECT_REF) + len(builtin), str(len(voices)))
 
     got_lang = {l["id"] for l in langs}
     check("B4 语种 = auto + 10 种", got_lang == EXPECT_LANGUAGES,
@@ -245,11 +252,11 @@ def test_frontend() -> None:
           "payload.ref_speaker = voice.id" in js)
     check("C8 内置音色走 speaker",
           "payload.speaker = voice.id" in js)
-    # 只看 payload 的**对象字面量**(注释里提到 girl_base 不算)
+    # 只看 payload 的**对象字面量**(注释里提到 news_female 不算)
     m = re.search(r"const payload = \{(.*?)\n\s*\};", js, re.S)
     payload_block = m.group(1) if m else ""
     check("C9 payload 里不再硬编码 ref_speaker",
-          "ref_speaker" not in payload_block and "girl_base" not in payload_block,
+          "ref_speaker" not in payload_block and "news_female" not in payload_block,
           payload_block.strip()[:80].replace("\n", " "))
 
     # 标签表覆盖全部语种 —— 漏了就会在前端露出原始 id
@@ -301,18 +308,19 @@ def test_frontend_browser() -> None:
         want_groups = 2 if want_builtin else 1
         check("D1 音色下拉分组数正确", len(groups) == want_groups,
               f"实得 {len(groups)} 组(期望 {want_groups}) {[len(g) for g in groups]}")
-        check("D2 参考音色组 = girl_base + ahu",
+        check("D2 参考音色组 = SDK 内嵌 6 条",
               set(groups[0]) == EXPECT_REF if groups else False,
               str(groups[0]) if groups else "")
-        check("D2b 参考音色组第一个 = girl_base(默认选中)",
-              groups[0][:1] == ["girl_base"] if groups else False,
+        check("D2b 参考音色组第一个 = news_female(默认选中)",
+              groups[0][:1] == ["news_female"] if groups else False,
               str(groups[0]) if groups else "")
         got_builtin = set(groups[1]) if len(groups) > 1 else set()
         check("D3 内置音色组 == SDK 的有效性探测结果",
               got_builtin == want_builtin,
               f"DOM={sorted(got_builtin)} SDK={sorted(want_builtin)}")
-        check("D4 音色总数 = 2 + 内置数",
-              info["voiceCount"] == 2 + len(want_builtin), str(info["voiceCount"]))
+        check("D4 音色总数 = 参考音色数 + 内置数",
+              info["voiceCount"] == len(EXPECT_REF) + len(want_builtin),
+              str(info["voiceCount"]))
         check("D5 语种数 = 11", info["langCount"] == 11, str(info["langCount"]))
 
         # 方言锁定提示 —— 有方言音色才测得着
@@ -344,7 +352,7 @@ def test_frontend_browser() -> None:
         pg.route("**/api/tts/start", _handler)
         # 分流要验两种音色来源:参考音色一定有;内置音色**看本模型有没有**
         # (声音克隆版权重的模型压根没有内置音色,下拉里就没有那一项)。
-        cases = [("girl_base", "ref")]
+        cases = [("news_female", "ref")]
         builtin_first = sorted(want_builtin)[:1]
         cases += [(v, "builtin") for v in builtin_first]
         for voice, kind in cases:

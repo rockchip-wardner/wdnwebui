@@ -52,9 +52,10 @@ class TtsAlert:
         default="auto",
         description="语种：auto / chinese / english / japanese / korean",
     )
-    ref_speaker: Annotated[str, "声音名：girl_base / ahu"] = WdnaiField(
-        default="girl_base",
-        description="声音名：girl_base / ahu",
+    ref_speaker: Annotated[str, "声音名（留空 = 默认参考音色）"] = WdnaiField(
+        default="",
+        description="声音名：news_female / baby_girl / lovely_girl / cool_lady / "
+                   "male_announcer / uncle_bass（留空则用默认参考音色）",
     )
 
     def __call__(self, frame_bgr, ctx):
@@ -70,7 +71,7 @@ class TtsAlert:
             raise RuntimeError(str(e)) from e
 
         from app.core.audio.tts_bridge import (
-            PLAY_DEVICE, TTSRequest, get_session,
+            PLAY_DEVICE, TTSRequest, default_ref_speaker, get_session,
         )
 
         sess = get_session()
@@ -90,7 +91,7 @@ class TtsAlert:
             text=text,
             language=(self.language or "auto"),
             speaker="",
-            ref_speaker=(self.ref_speaker or "girl_base"),
+            ref_speaker=(self.ref_speaker or default_ref_speaker()),
             instruct="",
             volume=_ALERT_VOLUME,
             no_play=False,

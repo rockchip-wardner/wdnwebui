@@ -72,6 +72,108 @@
           </ol>
         </section>
 
+        <section class="vd-section">
+          <header class="vd-section-head">
+            <h3>音色克隆</h3>
+            <span class="vd-spacer"></span>
+            <span class="vd-meta" id="tts-user-voices-count">0 个</span>
+          </header>
+
+          <div class="tts-clone-hero">
+            <div class="tts-clone-hero-icon">
+              <svg class="tts-ic-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3.5 10.5v3"/><path d="M7.5 7v10"/><path d="M12 3.5v17"/>
+                <path d="M16.5 7v10"/><path d="M20.5 10.5v3"/>
+              </svg>
+            </div>
+            <div class="tts-clone-hero-body">
+              <div class="tts-clone-hero-title">克隆一个你自己的音色</div>
+              <div class="tts-clone-hero-desc">
+                录音或上传一段人声，系统会在板端用 NPU 现场提取音色特征（2048 维），
+                之后就能用这个音色合成语音。
+              </div>
+              <div class="tts-clone-chips">
+                <span class="tts-chip">WAV / PCM</span>
+                <span class="tts-chip">1–30 秒</span>
+                <span class="tts-chip tts-chip-accent">仅前 5 秒参与提取</span>
+                <span class="tts-chip">自动重采样 24 kHz</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="tts-clone-grid">
+            <div class="tts-clone-card" id="tts-voice-recorder">
+              <div class="tts-clone-card-head">
+                <span class="tts-clone-icon">
+                  <svg class="tts-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="2.5" width="6" height="10.5" rx="3"/>
+                    <path d="M5 11v1a7 7 0 0 0 14 0v-1"/>
+                    <path d="M12 19v3"/><path d="M8.5 22h7"/>
+                  </svg>
+                </span>
+                <span class="tts-clone-title">录音取音色</span>
+                <span class="tts-spacer"></span>
+                <span class="tts-meta" id="tts-rec-status">未开始</span>
+              </div>
+              <p class="tts-rec-tip">请用平常的语气朗读下面这段话，说满 5 秒以上，不要刻意压低或者提高声音。</p>
+              <div class="tts-rec-script-box">
+                <p class="tts-rec-script" id="tts-rec-script">今天天气不错，我正在读一段用来提取音色特征的文字。</p>
+              </div>
+              <div class="tts-rec-meter"><div class="tts-rec-meter-fill" id="tts-rec-meter"></div></div>
+              <div class="tts-rec-actions">
+                <button id="tts-rec-start" class="vd-btn vd-btn-primary" type="button">开始录音</button>
+                <button id="tts-rec-stop" class="vd-btn" type="button" disabled>停止</button>
+                <button id="tts-rec-retry" class="vd-btn" type="button" disabled>重录</button>
+                <button id="tts-rec-board" class="vd-btn vd-btn-mini" type="button" title="用板子自己的麦克风录">用板子麦克风录</button>
+              </div>
+              <div class="tts-hint" id="tts-rec-hint"></div>
+            </div>
+
+            <div class="tts-clone-card tts-voice-upload" id="tts-voice-upload">
+              <div class="tts-clone-card-head">
+                <span class="tts-clone-icon">
+                  <svg class="tts-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5z"/>
+                    <path d="M13.5 3v5.5H19"/>
+                    <path d="M12 18v-5.5"/><path d="M9.8 14.4 12 12.2l2.2 2.2"/>
+                  </svg>
+                </span>
+                <span class="tts-clone-title">上传音频文件</span>
+              </div>
+              <div class="tts-voice-pick">
+                <label class="tts-field tts-voice-upload-path">
+                  <span class="tts-label">板上音频文件</span>
+                  <input type="text" id="tts-voice-path" placeholder="点「浏览…」在板子上选，或直接填绝对路径" autocomplete="off" />
+                </label>
+                <button id="tts-voice-browse-btn" class="vd-btn" type="button" title="在板子上浏览文件">浏览…</button>
+              </div>
+
+              <div class="tts-dropzone tts-dropzone-compact" id="tts-voice-dropzone">
+                <div class="tts-dropzone-title">把 PC 上的音频文件拖到这里</div>
+                <div class="tts-dropzone-hint" id="tts-voice-drop-hint">松手后自动填音色名，点「上传并提取」</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tts-clone-submit">
+            <div class="tts-clone-submit-row">
+              <label class="tts-field tts-clone-name">
+                <span class="tts-label">音色名</span>
+                <input type="text" id="tts-voice-name" placeholder="留空则自动按文件名 / 录音时间命名" autocomplete="off" />
+              </label>
+              <button id="tts-voice-upload-btn" class="vd-btn vd-btn-primary" type="button">上传并提取</button>
+            </div>
+            <div class="tts-clone-pending" id="tts-voice-pending"></div>
+            <div class="tts-hint" id="tts-voice-upload-hint"></div>
+          </div>
+
+          <div class="tts-clone-subhead">已提取的音色</div>
+
+          <ol class="vd-event-list" id="tts-user-voices-list">
+            <li class="vd-event-empty">还没有上传音色。上传一段人声参考音频，系统会在板端现场提取音色特征。</li>
+          </ol>
+        </section>
+
         <details class="raw-output">
           <summary>完整 JSON</summary>
           <pre class="payload" id="data-tts"></pre>

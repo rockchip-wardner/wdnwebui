@@ -98,19 +98,16 @@ def _depth_from(target: Path, root: Path) -> int:
     return len(rel.parts)
 
 
-@router.get("/fs")
-async def browse_fs(path: str = "") -> dict:
-    """List one directory on the server's filesystem.
+def resolve_within_root(raw: str) -> Path:
+    """把用户给的路径解析成 **FS 根目录内** 的真实路径。
 
-    The path is resolved and must stay under the configured FS root
-    (``base.resource_dir``, with ``FS_FS_ROOT`` overriding) so the web
-    UI cannot wander outside what's intended. Pseudo-filesystems and
-    well-known system trees are filtered.
+    越界 / 黑名单一律拒（HTTPException）。``/api/fs`` 和「从板子上的
+    文件注册音色」共用这一份校验 —— 别让第二条路径绕过根目录限制，
+    那等于开了个任意读文件的口子。
     """
     fs_root = _get_fs_root()
-    raw = path.strip() or fs_root
     try:
-        target = Path(raw).resolve(strict=False)
+        target = Path((raw or "").strip() or fs_root).resolve(strict=False)
     except (OSError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=f"bad path: {e}")
     if _is_skipped(str(target)):
@@ -124,6 +121,21 @@ async def browse_fs(path: str = "") -> dict:
             status_code=400,
             detail=f"path {target} 超出允许的根目录 {root}",
         )
+    return target
+
+
+@router.get("/fs")
+async def browse_fs(path: str = "") -> dict:
+    """List one directory on the server's filesystem.
+
+    The path is resolved and must stay under the configured FS root
+    (``base.resource_dir``, with ``FS_FS_ROOT`` overriding) so the web
+    UI cannot wander outside what's intended. Pseudo-filesystems and
+    well-known system trees are filtered.
+    """
+    fs_root = _get_fs_root()
+    target = resolve_within_root(path)
+    root = Path(fs_root).resolve(strict=False)
     if not target.exists():
         raise HTTPException(status_code=404, detail=f"不存在: {target}")
     if not target.is_dir():

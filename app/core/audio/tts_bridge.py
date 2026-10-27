@@ -5,6 +5,7 @@ import app.core.*」零耦合铁律,A1 静态扫描发现)。
 本模块暴露:
   - TTSRequest dataclass
   - PLAY_DEVICE / PLAY_BROWSER / PLAY_BOTH 常量
+  - default_ref_speaker() —— 默认参考音色(从 SDK 内嵌表派生)
   - get_session() —— 懒代理,内部再 import apps/tts/service 拿单例,
     避免 core → apps 反向依赖在 import 阶段就触发循环
 """
@@ -21,6 +22,21 @@ PLAY_BOTH = "both"        # SDK 流式 + WAV 同时给浏览器
 PLAY_TARGETS = (PLAY_DEVICE, PLAY_BROWSER, PLAY_BOTH)
 
 
+def default_ref_speaker() -> str:
+    """默认参考音色 —— SDK 内嵌表的**第一条**。
+
+    为什么不写死名字:参考音色表会被整体替换(增删参考音色)。写死的话,
+    删掉那个音色之后请求会带着一个**不存在**的 ref_speaker 去合成 ——
+    表现是「音色没生效」,而不是「音色列表里少了一项」,很难查。
+
+    SDK 侧同名常量 ``wdnai.backends.tts.DEFAULT_REF_SPEAKER`` 是同一个值,
+    两边都从那张表派生,不会漂移。
+    """
+    from wdnai.backends.tts import DEFAULT_REF_SPEAKER
+
+    return DEFAULT_REF_SPEAKER
+
+
 @dataclass
 class TTSRequest:
     """TTS 合成请求。``play_to`` 决定音频去向:device/browser/both 三选一。
@@ -29,7 +45,7 @@ class TTSRequest:
     text:        str = ""
     language:    str = "auto"
     speaker:     str = ""             # SPK_ID (serena / ryan / ...)
-    ref_speaker: str = "girl_base"    # qwen3tts_speaker_embed.h entry
+    ref_speaker: str = ""             # 空 = default_ref_speaker()
     instruct:    str = ""
     volume:      float = 0.1
     no_play:     bool = False

@@ -155,3 +155,39 @@ def get_tts_output_root() -> Path:
         # attempt surface the actual error.
         pass
     return out
+
+
+def get_tts_user_voices_root() -> Path:
+    """Resolve the directory where **user-uploaded TTS voices** live.
+
+    A "user voice" is a voice the user uploaded as a reference clip and
+    whose x-vector was extracted on-device (see
+    ``wdnai.backends.tts.Qwen3TTSDriver.set_user_speaker``). Each one is
+    a pair of files:
+
+        ``<name>.npy``    2048-dim float32 x-vector
+        ``<name>.json``   metadata (original filename / duration / …)
+
+    Sibling of the TTS output root (``<resource_dir>/tts`` → this is
+    ``<resource_dir>/tts_voices``) so it inherits the same
+    non-emmc placement: the emmc partition hosting the wdnwebui repo
+    has limited write endurance and must not take these writes.
+
+    The path is also exported to the worker through the
+    ``WDNAI_TTS_USER_VOICES_DIR`` environment variable (see
+    ``app/main.py``) — the worker reads the directory at startup and
+    restores the voices, so they survive a worker restart.
+    """
+    from app.core.config import default_resource_root, get_config
+    base = get_config().get_section("base", {}) or {}
+    rd = base.get("resource_dir")
+    if isinstance(rd, str) and rd.strip():
+        root = Path(rd.strip())
+    else:
+        root = default_resource_root()
+    out = root / "tts_voices"
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return out

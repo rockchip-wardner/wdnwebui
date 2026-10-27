@@ -8,8 +8,13 @@
 // 显示用标签。音色的**有效性**由后端 /api/tts/voices 给,这里只管
 // 怎么写给人看 —— 没有标签就退回显示原始 id。
 const VOICE_LABELS = {
-  girl_base: "girl_base（参考音色）",
-  ahu: "ahu（参考音色）",
+  news_female: "知性女声",
+  baby_girl: "萌娃奶音",
+  lovely_girl: "甜美萝莉音",
+  cool_lady: "高冷御姐音",
+  male_announcer: "男播音员音",
+  uncle_bass: "磁性大叔音",
+
   vivian: "Vivian · 中文女声",
   serena: "Serena · 中文女声",
   uncle_fu: "Uncle Fu · 中文男声",
@@ -43,7 +48,10 @@ const TTS = {
   ws: null,
   backoff: 1.0,
   lastSnap: null,
+  _autoName: "",       // 上次自动填进名字框的值（用来分辨"用户改过"）
+  _voiceIds: new Set(), // 清单里所有音色 id（自动填名时避开撞名）
   _hasBuiltin: null,   // 清单里有没有内置音色(null = 还没拉清单)
+  _droppedFile: null,  // 拖放区收下的 File（PC 上的文件）
 
   init() {
     if (this.initialized) return;
@@ -81,6 +89,76 @@ const TTS = {
     // 起一个空的 catch，别在控制台刷 unhandled rejection。
     if (startBtn)   startBtn.addEventListener("click", () => { this.start().catch(() => {}); });
     if (stopBtn)    stopBtn.addEventListener("click", () => this.stop());
+    const voiceUploadBtn = document.getElementById("tts-voice-upload-btn");
+    if (voiceUploadBtn) {
+      voiceUploadBtn.addEventListener("click", () => {
+        this.uploadVoice().catch(() => {});
+      });
+    }
+    // 「浏览…」→ 设备端文件浏览器（window.FSModal，走 /api/fs 列板子上的真实文件）。
+    // 不用 <input type="file">：那开的是**浏览器所在机器**的文件对话框 —— 在板子
+    // 自己的浏览器上要枚举板子的文件系统（慢到几十秒），远程访问时又只看得到 PC
+    // 的文件。PC 上的文件走下面的拖放区。
+    const voicePathEl = document.getElementById("tts-voice-path");
+    const voiceBrowseBtn = document.getElementById("tts-voice-browse-btn");
+    if (voiceBrowseBtn) {
+      voiceBrowseBtn.addEventListener("click", () => {
+        try {
+          window.FSModal._sourceTarget = voicePathEl;
+          window.FSModal.open("");
+        } catch (e) {
+          this._setUploadHint("打不开设备端文件浏览器: " + (e && e.message), true);
+        }
+      });
+    }
+    if (voicePathEl) {
+      // 选完文件自动把名字填好 —— 文件名里的空格/点等字符后端不收，
+      // 先净化一遍（中文保留）。
+      voicePathEl.addEventListener("change", () => {
+        this._setDroppedFile(null);
+        this._autofillVoiceName(this._basename(voicePathEl.value));
+      });
+    }
+    // 拖放区：把 PC 上的音频文件拖进来（全程不经过文件对话框）
+    const voiceDropZone = document.getElementById("tts-voice-dropzone");
+    if (voiceDropZone) {
+      voiceDropZone.addEventListener("dragover", (e) => {
+        if (!e.dataTransfer?.types?.includes?.("Files")) return;
+        e.preventDefault();
+        voiceDropZone.classList.add("dragover");
+      });
+      voiceDropZone.addEventListener("dragleave", () => {
+        voiceDropZone.classList.remove("dragover");
+      });
+      voiceDropZone.addEventListener("drop", (e) => {
+        if (!e.dataTransfer?.files?.length) return;
+        e.preventDefault();
+        voiceDropZone.classList.remove("dragover");
+        this._setDroppedFile(e.dataTransfer.files[0]);
+      });
+    }
+    // 录音取音色（浏览器麦克风 / 板子麦克风两条路）
+    const recStart = document.getElementById("tts-rec-start");
+    const recStop = document.getElementById("tts-rec-stop");
+    const recRetry = document.getElementById("tts-rec-retry");
+    const recBoard = document.getElementById("tts-rec-board");
+    if (recStart) {
+      recStart.addEventListener("click", () => {
+        RECORDER.start().catch(() => {});
+      });
+    }
+    if (recStop) {
+      recStop.addEventListener("click", () => RECORDER.stop());
+    }
+    if (recRetry) {
+      recRetry.addEventListener("click", () => RECORDER.reset());
+    }
+    if (recBoard) {
+      recBoard.addEventListener("click", () => {
+        RECORDER.recordFromBoard().catch(() => {});
+      });
+    }
+    if (typeof RECORDER !== "undefined") RECORDER.refreshAvailability();
     if (textEl) {
       textEl.addEventListener("keydown", (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -98,6 +176,46 @@ const TTS = {
         this.refresh().catch(() => {});
       }, 5000);
     }
+
+    this._watchCloneCardHeights();
+  },
+
+  // ------------------------------------------------------------------ //
+  // 音色克隆：两张卡等高
+  //
+  // 并排时靠 CSS grid 的 align-items:stretch 就等高了；窄屏（<900px）
+  // grid 变成竖排、每行各占一行，高度就各算各的 —— 这里用 JS 拉齐。
+  //
+  // 用 ResizeObserver 而不是 load/resize 事件：TTS 页初始是隐藏的
+  // （盒模型尺寸全 0），切过来时容器才从 0 变成真实尺寸，observer
+  // 才会触发；窗口缩放、内容变化也都覆盖到了。
+  // ------------------------------------------------------------------ //
+  _syncCloneCardHeights() {
+    const cards = Array.from(document.querySelectorAll(".tts-clone-card"));
+    if (cards.length < 2) return;
+    // 先复位，量到的才是「内容自然高度」（上一轮可能留了行内 height）
+    cards.forEach((c) => { c.style.height = ""; });
+    const rects = cards.map((c) => c.getBoundingClientRect());
+    if (rects.some((r) => !r.height)) return;   // 页面还藏着，量不准
+    const stacked = Math.abs(rects[0].top - rects[1].top) > 2;
+    // 竖排时给两张卡打个标记：CSS 据此把多出来的高度让给朗读引用块，
+    // 而不是让按钮悬在卡片底部、中间空一块。
+    cards.forEach((c) => c.classList.toggle("is-stacked", stacked));
+    if (!stacked) return;                        // 并排：CSS 已经等高
+    const target = Math.max.apply(null, rects.map((r) => r.height));
+    cards.forEach((c) => { c.style.height = target + "px"; });
+  },
+
+  _watchCloneCardHeights() {
+    const grid = document.querySelector(".tts-clone-grid");
+    if (!grid) return;
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", () => this._syncCloneCardHeights());
+      return;
+    }
+    const ro = new ResizeObserver(() => this._syncCloneCardHeights());
+    ro.observe(grid);
+    this._syncCloneCardHeights();
   },
 
   // ------------------------------------------------------------------ //
@@ -122,10 +240,21 @@ const TTS = {
 
   _fillVoices(voices) {
     const el = document.getElementById("tts-voice");
+    // 记下所有音色 id —— 自动填名时要躲开它们（重名后端只报 409）。
+    this._voiceIds = new Set((voices || []).map((v) => v.id));
     if (!el) return;
+    // 重填清单前先记住当前选择 —— 上传/删除音色后要重拉清单，
+    // 不保留的话用户刚选好的音色会被无声地冲回第一项。
+    const prev = el.value;
     el.innerHTML = "";
-    const ref = [], builtin = [];
-    voices.forEach((v) => (v.kind === "ref" ? ref : builtin).push(v));
+    const ref = [], builtin = [], user = [];
+    // kind: "ref" = 内嵌参考音色, "builtin" = 模型自带的内置音色,
+    // "user" = 用户上传参考音频现场提取的音色。
+    voices.forEach((v) => {
+      if (v.kind === "ref") ref.push(v);
+      else if (v.kind === "user") user.push(v);
+      else builtin.push(v);
+    });
     const addGroup = (list, label) => {
       if (!list.length) return;
       const g = document.createElement("optgroup");
@@ -142,6 +271,206 @@ const TTS = {
     };
     addGroup(ref, "参考音色（声音克隆）");
     addGroup(builtin, "内置音色（模型自带）");
+    addGroup(user, "我的音色（上传提取）");
+    if (prev) {
+      const opt = Array.prototype.find.call(el.options, (o) => o.value === prev);
+      if (opt) opt.selected = true;
+    }
+    this._renderUserVoices(voices);
+  },
+
+  // ------------------------------------------------------------------ //
+  // 我的音色（上传参考音频 → 板端现场提取音色特征）
+  // ------------------------------------------------------------------ //
+  _renderUserVoices(voices) {
+    const listEl = document.getElementById("tts-user-voices-list");
+    const countEl = document.getElementById("tts-user-voices-count");
+    if (!listEl) return;
+    const users = (voices || []).filter((v) => v.kind === "user");
+    if (countEl) countEl.textContent = users.length + " 个";
+    listEl.innerHTML = "";
+    if (!users.length) {
+      const li = document.createElement("li");
+      li.className = "vd-event-empty";
+      li.textContent = "还没有上传音色。上传一段人声参考音频，系统会在板端现场提取音色特征。";
+      listEl.appendChild(li);
+      return;
+    }
+    users.forEach((v) => {
+      const li = document.createElement("li");
+      li.className = "vd-event";
+
+      const meta = document.createElement("div");
+      meta.className = "vd-event-meta";
+      const name = document.createElement("span");
+      name.className = "tag";
+      name.textContent = v.id;
+      meta.appendChild(name);
+      const path = document.createElement("span");
+      path.className = "vd-event-path";
+      path.textContent = "板端提取的音色特征（2048 维 x-vector）";
+      meta.appendChild(path);
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "vd-btn vd-btn-mini vd-event-action";
+      del.textContent = "删除";
+      del.addEventListener("click", () => this.deleteVoice(v.id));
+      meta.appendChild(del);
+
+      li.appendChild(meta);
+      listEl.appendChild(li);
+    });
+  },
+
+  _setUploadHint(text, isError) {
+    const el = document.getElementById("tts-voice-upload-hint");
+    if (!el) return;
+    el.textContent = text || "";
+    el.style.color = isError ? "#dc2626" : "";
+  },
+
+  // 音色名规则必须和后端一致（后端 _sanitize_voice_name / SDK 的
+  // normalize_user_speaker_name）：Unicode 字母、数字、下划线、连字符，以字母或
+  // 数字开头，最长 32 个字符。前端先收一道，是为了选完文件就能给出一个人能用的
+  // 名字，而不是等上传了才吃一个 400。中文保留（名字是给人看的），只把空格、
+  // 点、路径分隔符这些换成 _（后端对它们是直接 400）。
+  _sanitizeVoiceName(raw) {
+    let s = String(raw == null ? "" : raw).normalize("NFC").trim().toLowerCase();
+    s = s.replace(/[^\p{L}\p{N}_-]+/gu, "_");   // 空格/点/斜杠… → _
+    s = s.replace(/^[^\p{L}\p{N}]+/u, "");      // 开头必须是字母或数字
+    if (s.length > 32) s = s.slice(0, 32);
+    s = s.replace(/_+$/, "");             // 尾部多余的 _ 没意义
+    return s;
+  },
+
+  // 选完文件自动填名。用户手打过的名字不动 —— 只覆盖我们自己填的那个。
+  // sourceName 是**原始文件名**（带扩展名）。
+  _autofillVoiceName(sourceName) {
+    const nameEl = document.getElementById("tts-voice-name");
+    if (!nameEl) return;
+    const cur = (nameEl.value || "").trim();
+    if (cur && cur !== this._autoName) return;  // 用户自己改过 → 不动
+
+    const stem = String(sourceName || "").replace(/\.[^.]*$/, "");
+    let base = this._sanitizeVoiceName(stem);
+    if (!base) base = "voice";
+    // 撞名就加序号 —— 后端对重名是 409 报错而不是覆盖，
+    // 内置音色重名同理（下拉里会撞名）。这里先躲开。
+    const taken = this._voiceIds || new Set();
+    let name = base, i = 2;
+    while (taken.has(name)) { name = base + "_" + i; i++; }
+    nameEl.value = name;
+    this._autoName = name;
+  },
+
+  _basename(p) {
+    const s = String(p || "");
+    const parts = s.split("/");
+    return parts[parts.length - 1] || "";
+  },
+
+  // 拖放区收下的文件。存着，等点「上传并提取」时用。
+  _setDroppedFile(file) {
+    this._droppedFile = file || null;
+    // 待提取状态显示在**共用区**（两卡下面那一条）—— 待提取的音频可能来自浏览器
+    // 麦克风录音，也可能来自拖放，两种来源都在共用区提交，状态就该写在提交的地方。
+    const hint = document.getElementById("tts-voice-pending");
+    if (hint) {
+      hint.textContent = file
+        ? ("已就绪：" + file.name + "　点「上传并提取」")
+        : "";
+    }
+    if (file) {
+      // 拖进来的文件和路径框是两条互斥的路 —— 留一个就行。
+      const pathEl = document.getElementById("tts-voice-path");
+      if (pathEl) pathEl.value = "";
+      this._autofillVoiceName(file.name);
+    }
+  },
+
+  _selectVoice(id) {
+    const el = document.getElementById("tts-voice");
+    if (!el || !id) return;
+    const opt = Array.prototype.find.call(el.options, (o) => o.value === id);
+    if (opt) {
+      el.value = id;
+      this._updateVoiceHint();
+    }
+  },
+
+  async uploadVoice() {
+    const pathEl = document.getElementById("tts-voice-path");
+    const nameEl = document.getElementById("tts-voice-name");
+    const btn = document.getElementById("tts-voice-upload-btn");
+    const file = this._droppedFile;
+    const path = (pathEl && pathEl.value || "").trim();
+    if (!file && !path) {
+      this._setUploadHint(
+        "先选一个音频文件：点「浏览…」选板子上的，或把 PC 上的文件拖进来", true);
+      return;
+    }
+    // 名字先按前端自己的规则净化一遍再发 —— 用户手打的「我的 声音」（带空格）
+    // 看着合法，直接发出去会被后端 400，而那句话对用户来说莫名其妙。净化后回填
+    // 到名字框，让他看见最终用的是哪个名字。
+    const rawName = (nameEl && nameEl.value || "").trim();
+    const name = this._sanitizeVoiceName(rawName);
+    if (!name) {
+      this._setUploadHint(
+        "音色名不能为空：至少要有一个字母或数字（中文也可以）", true);
+      return;
+    }
+    if (name !== rawName && nameEl) nameEl.value = name;
+    if (btn) { btn.disabled = true; btn.textContent = "提取中…"; }
+    this._setUploadHint("正在提取音色特征（板端 NPU 推理，约 1 秒）…", false);
+    try {
+      let r;
+      if (file) {
+        const fd = new FormData();
+        fd.append("file", file, file.name);
+        fd.append("name", name);
+        r = await fetch(API_PREFIX + "/tts/voices/upload", {
+          method: "POST", body: fd,
+        });
+      } else {
+        r = await fetch(API_PREFIX + "/tts/voices/upload-from-path", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: path, name: name }),
+        });
+      }
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
+      const vname = data.name || "";
+      this._setUploadHint(
+        "音色「" + vname + "」提取完成，已在下拉里选中。", false);
+      this._setDroppedFile(null);
+      if (pathEl) pathEl.value = "";
+      if (nameEl) nameEl.value = "";
+      this._autoName = "";
+      await this.loadCatalog();
+      this._selectVoice(vname);
+    } catch (err) {
+      this._setUploadHint("上传失败: " + err.message, true);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = "上传并提取"; }
+    }
+  },
+
+  async deleteVoice(name) {
+    if (!window.confirm("删除音色「" + name + "」？该音色将不能再用于合成。")) return;
+    this._setUploadHint("正在删除音色「" + name + "」…", false);
+    try {
+      const r = await fetch(
+        API_PREFIX + "/tts/voices/" + encodeURIComponent(name),
+        { method: "DELETE" });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
+      this._setUploadHint("音色「" + name + "」已删除。", false);
+      await this.loadCatalog();
+    } catch (err) {
+      this._setUploadHint("删除失败: " + err.message, true);
+    }
   },
 
   _fillLanguages(languages) {
@@ -362,11 +691,16 @@ const TTS = {
       volume: volEl ? Number(volEl.value) / 100 : 0.1,
       play_to: playTo,
     };
-    // 音色二选一:参考音色走 ref_speaker,内置音色走 speaker。两个都发
-    // 会被 SDK 的 ref_speaker 优先级吃掉 —— 选了内置音色也是默认音色。
+    // 音色二选一:参考音色和**用户音色**都走 ref_speaker —— 两者同在
+    // SDK 的 speaker_embeddings 那张表里(tts.py 的查表就是
+    // speaker_embeddings[ref_speaker])。内置音色走 speaker。
+    // 两个都发会被 SDK 的 ref_speaker 优先级吃掉 —— 选了内置音色
+    // 也是默认音色。
     const voice = this._selectedVoice();
-    if (voice.kind === "ref") payload.ref_speaker = voice.id;
-    else if (voice.kind === "builtin") payload.speaker = voice.id;
+    if (voice.id) {
+      if (voice.kind === "builtin") payload.speaker = voice.id;
+      else payload.ref_speaker = voice.id;
+    }
     // 网络异常单独 catch —— 卡片自己的错误（_startError）不能再被包一层，
     // 否则状态行里会出现 "提交失败: WizardSnapshotError:start_failed:…"。
     let r, body;
@@ -771,8 +1105,6 @@ const TTS = {
     return v === "browser" || v === "both";
   },
 };
-
-TTS.init();
 
 /* Sidebar 底栏 popover 互相排他 —— 共享 system.js 的 PowerMenu / ConfigMenu /
  * CoprocessorMenu (挂在 ``window.SystemMenus``)。system.js defer 加载顺序
@@ -2492,8 +2824,6 @@ const Discovery = {
  * ------------------------------------------------------------------ */
 
 
-TTS.init();
-
 // ------------------------------------------------------------------ *
 // 应用向导模式 API — wizard 框架 finish 时调用
 // 契约:opts 由 wizard.json 的 steps[].fields[].ui_key 决定:
@@ -2532,7 +2862,251 @@ function _wizardStart(opts) {
   return ws.run(opts);
 }
 
+// --------------------------------------------------------------------------- //
+// 录音取音色
+//
+// 两条路：
+//   1. **浏览器麦克风**（主路）—— getUserMedia + ScriptProcessor 拿原始
+//      PCM，前端编成 WAV，再走 /tts/voices/upload（multipart）。
+//      **前提是安全上下文**：浏览器只在 https 或 http://localhost 下
+//      暴露 navigator.mediaDevices，明文 http://<板子IP>:8000 里它是
+//      undefined，点了也没反应（实测）。
+//   2. **板子麦克风**（兜底）—— 明文 HTTP 下浏览器拿不到麦克风，但板子
+//      自己带麦克风（ES8388），后端录完直接注册。
+// --------------------------------------------------------------------------- //
+const REC_MAX_SECONDS = 15;      // 录太久没意义（提取只用前 5 秒）
+const REC_MIN_SECONDS = 1.0;      // 太短提不出音色
+const REC_BOARD_SECONDS = 6;      // 板子麦克风那条路的默认时长
+
+function recEl(id) { return document.getElementById(id); }
+
+function recSetStatus(text) {
+  const el = recEl("tts-rec-status");
+  if (el) el.textContent = text || "";
+}
+
+function recSetHint(text, isError) {
+  const el = recEl("tts-rec-hint");
+  if (!el) return;
+  el.textContent = text || "";
+  el.style.color = isError ? "#dc2626" : "";
+}
+
+function recSetMeter(level) {
+  const el = recEl("tts-rec-meter");
+  if (el) el.style.width = Math.max(0, Math.min(1, level || 0)) * 100 + "%";
+}
+
+// state: idle | recording | ready
+function recButtons(state) {
+  const s = recEl("tts-rec-start"), st = recEl("tts-rec-stop"),
+        r = recEl("tts-rec-retry");
+  if (s) s.disabled = (state === "recording");
+  if (st) st.disabled = (state !== "recording");
+  // 「重录」只在真的录到东西之后才有意义（idle 时点它没东西可重录）。
+  if (r) r.disabled = (state !== "ready");
+}
+
+// Float32 PCM → 16bit PCM 的 RIFF/WAVE（44 字节头）
+function encodeWav(samples, sampleRate) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const str = (off, s) => {
+    for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+  };
+  str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVE");
+  str(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * 2, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, n * 2, true);
+  let off = 44;
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    off += 2;
+  }
+  return buf;
+}
+
+const RECORDER = {
+  active: false,
+  stream: null,
+  ctx: null,
+  proc: null,
+  mute: null,
+  chunks: [],
+  sampleRate: 0,
+  startedAt: 0,
+  timer: null,
+
+  supported() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && AC);
+  },
+
+  // 页面加载时把不支持的情况说清楚，别让人对着"开始录音"干瞪眼
+  refreshAvailability() {
+    const ok = this.supported();
+    const start = recEl("tts-rec-start");
+    if (start) start.disabled = !ok;
+    if (!ok) {
+      recSetHint("这个页面拿不到麦克风：浏览器只在 HTTPS 或 http://localhost 下"
+        + "才给麦克风（现在这个是明文 HTTP）。可以点「用板子麦克风录」，"
+        + "或者用 http://localhost:8000 打开本页。", true);
+    }
+    return ok;
+  },
+
+  async start() {
+    if (this.active) return;
+    if (!this.supported()) { this.refreshAvailability(); return; }
+    recSetHint("");
+    recButtons("recording");
+    recSetMeter(0);
+    recSetStatus("正在准备…");
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true,
+                 noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (e) {
+      recButtons("idle");
+      recSetStatus("麦克风打不开");
+      recSetHint("麦克风打不开: " + (e && e.message ? e.message : e)
+        + "（浏览器会问你要麦克风权限，选「允许」）", true);
+      return;
+    }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC();
+    // 自动播放策略下 AudioContext 可能一上来就是 suspended，
+    // suspended 的 context 不出音频回调（onaudioprocess 不触发）。
+    try {
+      if (this.ctx.state === "suspended") await this.ctx.resume();
+    } catch (e) { /* resume 失败就让它自己跑 */ }
+    this.sampleRate = this.ctx.sampleRate;
+    const src = this.ctx.createMediaStreamSource(this.stream);
+    this.proc = this.ctx.createScriptProcessor(4096, 1, 1);
+    this.chunks = [];
+    this.proc.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      this.chunks.push(new Float32Array(input));
+      let sum = 0;
+      for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+      recSetMeter(Math.min(1, Math.sqrt(sum / input.length) * 6));
+    };
+    src.connect(this.proc);
+    // 必须接到 destination，onaudioprocess 才会被调用；接一个 0 增益的
+    // 节点是为了**不回放**麦克风声音（不然外放就啸叫了）。
+    this.mute = this.ctx.createGain();
+    this.mute.gain.value = 0;
+    this.proc.connect(this.mute);
+    this.mute.connect(this.ctx.destination);
+
+    this.active = true;
+    this.startedAt = Date.now();
+    recSetStatus("录音中 0.0s");
+    this.timer = setInterval(() => {
+      const sec = (Date.now() - this.startedAt) / 1000;
+      recSetStatus("录音中 " + sec.toFixed(1) + "s");
+      if (sec >= REC_MAX_SECONDS) this.stop();
+    }, 100);
+  },
+
+  stop() {
+    if (!this.active) return;
+    this.active = false;
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    try { if (this.proc) { this.proc.onaudioprocess = null; this.proc.disconnect(); } } catch (e) { /* 已断开 */ }
+    try { if (this.mute) this.mute.disconnect(); } catch (e) { /* 已断开 */ }
+    try { if (this.ctx) this.ctx.close(); } catch (e) { /* 已关闭 */ }
+    try { if (this.stream) this.stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* 已停 */ }
+    this.proc = null; this.mute = null; this.ctx = null; this.stream = null;
+
+    const total = this.chunks.reduce((a, c) => a + c.length, 0);
+    const samples = new Float32Array(total);
+    let off = 0;
+    for (const c of this.chunks) { samples.set(c, off); off += c.length; }
+    this.chunks = [];
+    recSetMeter(0);
+
+    if (total === 0) {
+      recButtons("idle"); recSetStatus("没录到声音");
+      recSetHint("没录到声音 —— 检查一下麦克风有没有被静音，再试一次", true);
+      return;
+    }
+    const sec = total / this.sampleRate;
+    if (sec < REC_MIN_SECONDS) {
+      recButtons("idle"); recSetStatus("太短");
+      recSetHint("只录到 " + sec.toFixed(1) + " 秒，太短了 —— 至少说满 1 秒", true);
+      return;
+    }
+    // 归一化：麦克风电平不可控，太安静的音频提出来的音色不可靠
+    // （和后端板子录音那条路用同一套 RMS 目标）。
+    let sum = 0;
+    for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+    const rms = Math.sqrt(sum / samples.length);
+    if (rms > 1e-5) {
+      const gain = Math.min(0.05 / rms, 20);
+      for (let i = 0; i < samples.length; i++) samples[i] *= gain;
+    }
+    const wav = encodeWav(samples, this.sampleRate);
+    const file = new File([wav], "recording_" + Date.now() + ".wav",
+                          { type: "audio/wav" });
+    TTS._setDroppedFile(file);
+    recButtons("ready");
+    recSetStatus("已录 " + sec.toFixed(1) + "s");
+    recSetHint("录好了，音色名已自动填好 —— 点「上传并提取」开始提取。", false);
+  },
+
+  reset() {
+    recButtons("idle");
+    recSetStatus("未开始");
+    recSetHint("");
+    recSetMeter(0);
+    // 「重录」= 把上一段丢掉。不清掉的话提示还挂着「已就绪：xxx.wav」，
+    // 用户会以为那段还在（名字框倒是该留着，用户可能改过名）。
+    TTS._setDroppedFile(null);
+  },
+
+  // 板子麦克风那条路：音频在板子上，后端录完直接注册（不用再上传一次）
+  async recordFromBoard() {
+    const nameEl = recEl("tts-voice-name");
+    let name = (nameEl && nameEl.value || "").trim();
+    if (!name) {
+      name = "rec_" + Date.now();
+      if (nameEl) nameEl.value = name;
+    }
+    recButtons("recording");
+    recSetStatus("板子录音中…");
+    recSetHint("对着板子的麦克风说话，说满 " + REC_BOARD_SECONDS + " 秒。");
+    try {
+      const r = await fetch(API_PREFIX + "/tts/voices/record-from-board", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seconds: REC_BOARD_SECONDS, name: name }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
+      recButtons("ready");
+      recSetStatus("已录 " + REC_BOARD_SECONDS + "s");
+      recSetHint("板子麦克风录好了，音色「" + (data.name || name)
+        + "」已经注册并在下拉里选中。", false);
+      await TTS.loadCatalog();
+      TTS._selectVoice(data.name || name);
+    } catch (e) {
+      recButtons("idle");
+      recSetStatus("没录成");
+      recSetHint("录音失败: " + (e && e.message ? e.message : e), true);
+    }
+  },
+};
+
 window.ImApp_tts = window.ImApp_tts || {};
+// 把卡片对象挂出去：浏览器控制台里能直接 TTS.snapshot() 查状态。
+window.ImApp_tts.TTS = TTS;
+window.ImApp_tts.RECORDER = RECORDER;
 window.ImApp_tts.applyWizardSnapshot = async function (opts) {
   const result = { text_filled: false, started: false };
   if (opts.text) {
@@ -2570,5 +3144,9 @@ window.ImApp_tts.applyWizardSnapshot = async function (opts) {
   }
   return result;
 };
+
+// 卡片初始化放最后 —— RECORDER 是这个作用域里的 const，init() 里要挂
+// 它的按钮，声明前引用会踩 TDZ（Cannot access before initialization）。
+TTS.init();
 
 })();

@@ -28,11 +28,12 @@ from typing import Any, Callable, List, Optional
 import numpy as np
 
 
-# 播放目标常量 + TTSRequest 已迁至 app.core.audio.tts_bridge,
+# 播放目标常量 + TTSRequest + default_ref_speaker 已迁至 app.core.audio.tts_bridge,
 # 此处仅 re-export 以保持旧 import 路径兼容。
 from app.core.audio.tts_bridge import (  # noqa: F401  (re-export)
     PLAY_DEVICE, PLAY_BROWSER, PLAY_BOTH, PLAY_TARGETS,
     TTSRequest,
+    default_ref_speaker,
 )
 
 LOG = logging.getLogger("tts_session")
@@ -1210,6 +1211,10 @@ def voice_catalog(model_dir=None) -> dict:
     全部取自 SDK 的表,不硬编码:参考音色 = 内嵌的 voice-clone 向量;
     内置音色 = ``available_config_speakers()`` 实测该模型真带的。
     ``dialect`` 非空表示该音色自带方言(SDK 会把语种锁成它)。
+
+    另外合并**用户音色**(上传参考音频现场提取的 x-vector)——
+    目录 ``<resource_dir>/tts_voices`` 下每个 ``<name>.npy`` 算一个,
+    ``kind="user"``,前端按 ``kind`` 分组渲染。
     """
     from wdnai.backends.tts import (
         CODEC_LANGUAGE_ID,
@@ -1226,8 +1231,8 @@ def voice_catalog(model_dir=None) -> dict:
         d = SPK_IS_DIALECT.get(name, "")
         return d if d in dialects else ""
 
-    # 顺序跟着 SDK 走:内嵌字典天然顺序是 girl_base / ahu(girl_base 在前,
-    # 前端下拉默认选中它 = 历史默认行为)。
+    # 顺序跟着 SDK 走:内嵌字典的第一条就是默认音色(前端下拉默认选中
+    # 它)。所以「默认音色」= SDK 内嵌表的**第一条**,不另外写死名字。
     voices = [
         {"id": name, "kind": "ref", "dialect": ""}
         for name in _get_bundled_speaker_embeddings()
@@ -1236,10 +1241,29 @@ def voice_catalog(model_dir=None) -> dict:
         {"id": name, "kind": "builtin", "dialect": _dialect_of(name)}
         for name in available_config_speakers(model_dir)
     ]
+    voices += _user_voice_entries()
     languages = [{"id": "auto"}] + [
         {"id": k} for k in CODEC_LANGUAGE_ID if k not in dialects
     ]
     return {"voices": voices, "languages": languages}
+
+
+def _user_voice_entries() -> list:
+    """列出用户上传的音色（现场提取 x-vector 的那些）。
+
+    目录 ``<resource_dir>/tts_voices``，每个 ``<name>.npy`` 算一个。
+    读不出来 / 目录不存在 → 返回空列表,不影响内建音色的渲染。
+    """
+    try:
+        from app.core.uploads import get_tts_user_voices_root
+        root = get_tts_user_voices_root()
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        names = sorted(p.stem for p in root.glob("*.npy"))
+    except OSError:
+        return []
+    return [{"id": n, "kind": "user", "dialect": ""} for n in names]
 
 
 # --------------------------------------------------------------------------- #

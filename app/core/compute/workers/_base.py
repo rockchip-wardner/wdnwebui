@@ -131,6 +131,18 @@ if not isinstance(sys.stderr, _BrokenPipeSafeStderr):
 _EMBED_TEXT_TIMEOUT = 5.0
 _EMBED_VIDEO_TIMEOUT = 5.0
 
+# Registering a user speaker runs a real NPU inference: it opens the
+# speaker-encoder RKNN context (~0.45 s), runs the ECAPA-TDNN (~20 ms)
+# and closes the context again. 30 s is a generous ceiling that still
+# keeps a wedged NPU from pinning the replier pump forever.
+#
+# Note: unlike ``embed_text``/``embed_video`` a timeout here must NOT
+# call ``session_stop()`` — that cancels the *LLM* session, which would
+# kill an unrelated synthesis that happens to be running. The encoder
+# context is not the LLM session, so there is nothing to stop; we just
+# abandon the thread and report the timeout.
+_REGISTER_SPEAKER_TIMEOUT = 30.0
+
 # How long a single ``respond`` may hold the replier pump before the
 # worker gives up and answers with an error. Must stay comfortably below
 # the main process's inference budget (``proxy._INFER_TIMEOUT_MS``) so
@@ -803,6 +815,149 @@ def embed_video_handler(state: dict, payload: dict) -> dict:
     return {"vec": flat, "dim": len(flat), "n_frames": len(frames)}
 
 
+# --------------------------------------------------------------------------- #
+# User speakers (用户音色)                                                     #
+# --------------------------------------------------------------------------- #
+def _tts_driver(state: dict):
+    """Get the TTS driver's :class:`Qwen3TTSDriver` from the worker session.
+
+    Returns ``None`` when this worker isn't a TTS model or the session
+    isn't loaded yet — the speaker handlers answer with an error instead
+    of raising.
+    """
+    sess = state.get("session")
+    if sess is None:
+        return None
+    backend = getattr(sess, "_backend", None)
+    if backend is None:
+        return None
+    return getattr(backend, "driver", None)
+
+
+def register_speaker_handler(state: dict, payload: dict) -> dict:
+    """Register a user voice: extract its x-vector and inject it into the
+    talker's voice table.
+
+    Payload: ``{"name": str, "path": str}`` — ``path`` is a WAV file on
+    the board (the app process writes the upload there and passes the
+    path; both live on the same filesystem).
+
+    Reply:   ``{"status": "ok", "name": str, "dim": int, "embedding": [...]}``
+
+    The embedding is returned so the **app** can persist it — the app
+    owns user data. The worker keeps its own copy in the talker's voice
+    table, so the new voice is usable for synthesis right away.
+
+    Runs in a separate thread with a Python-level timeout, same as
+    ``embed_text`` — a wedged NPU must not pin the replier pump.
+    """
+    import time as _time
+    import threading as _threading
+    import numpy as _np
+
+    driver = _tts_driver(state)
+    if driver is None:
+        return {"status": "error",
+                "error": "session not loaded; send action='load' first"}
+
+    name = str(payload.get("name") or "").strip()
+    path = str(payload.get("path") or "").strip()
+    if not name:
+        return {"status": "error", "error": "name 不能为空"}
+    if not path:
+        return {"status": "error", "error": "path 不能为空"}
+    if not os.path.isfile(path):
+        return {"status": "error", "error": f"音频文件不存在: {path}"}
+
+    # 名字先过一遍校验，免得白跑一次 NPU 推理。
+    try:
+        key = driver.normalize_user_speaker_name(name)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
+
+    LOG.info("register_speaker: extracting voice '%s' from %s", key, path)
+    t0 = _time.time()
+    holder: list = []
+
+    def _run():
+        try:
+            holder.append(driver.encode_speaker_file(path))
+        except BaseException as e:  # noqa: BLE001
+            holder.append(e)
+
+    th = _threading.Thread(target=_run, name="register_speaker_run", daemon=True)
+    th.start()
+    th.join(timeout=_REGISTER_SPEAKER_TIMEOUT)
+
+    if th.is_alive():
+        # 超时不调 session_stop() —— 理由见 _REGISTER_SPEAKER_TIMEOUT 的注释
+        LOG.error("register_speaker: timed out after %.1fs — abandoning thread "
+                  "(NPU may be wedged; recommend POST /api/compute/restart "
+                  "for model_id=%r)",
+                  _REGISTER_SPEAKER_TIMEOUT, state.get("model_id", "?"))
+        return {"status": "error",
+                "error": f"register_speaker timeout after "
+                        f"{_REGISTER_SPEAKER_TIMEOUT:.0f}s "
+                        f"(NPU may be wedged; restart the instance)"}
+
+    if not holder:
+        return {"status": "error",
+                "error": "register_speaker returned no result"}
+
+    result = holder[0]
+    if isinstance(result, BaseException):
+        LOG.warning("register_speaker: failed after %.2fs: %s",
+                    _time.time() - t0, result)
+        return {"status": "error", "error": f"{type(result).__name__}: {result}"}
+
+    embedding = _np.asarray(result, dtype=_np.float32).reshape(-1)
+    try:
+        key = driver.set_user_speaker(key, embedding)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
+
+    LOG.info("register_speaker: voice '%s' registered in %.2fs (dim=%d)",
+             key, _time.time() - t0, embedding.shape[0])
+    return {
+        "status": "ok",
+        "name": key,
+        "dim": int(embedding.shape[0]),
+        "embedding": [float(v) for v in embedding],
+    }
+
+
+def unregister_speaker_handler(state: dict, payload: dict) -> dict:
+    """Remove a user voice from the talker's voice table.
+
+    Payload: ``{"name": str}``
+    Reply:   ``{"status": "ok", "name": str, "removed": bool}``
+    """
+    driver = _tts_driver(state)
+    if driver is None:
+        return {"status": "error",
+                "error": "session not loaded; send action='load' first"}
+    name = str(payload.get("name") or "").strip().lower()
+    if not name:
+        return {"status": "error", "error": "name 不能为空"}
+    removed = driver.remove_user_speaker(name)
+    LOG.info("unregister_speaker: '%s' removed=%s", name, removed)
+    return {"status": "ok", "name": name, "removed": bool(removed)}
+
+
+def list_user_speakers_handler(state: dict, payload: dict) -> dict:
+    """List the user voices currently registered in the talker's table.
+
+    Payload: ``{}``
+    Reply:   ``{"status": "ok", "names": [...]}``
+    """
+    driver = _tts_driver(state)
+    if driver is None:
+        return {"status": "error",
+                "error": "session not loaded; send action='load' first"}
+    names = driver.list_user_speakers()
+    return {"status": "ok", "names": list(names), "count": len(names)}
+
+
 def reset_handler(state: dict) -> dict:
     sess = state.get("session")
     if sess is None:
@@ -1031,6 +1186,10 @@ def _build_extra_ops(state: dict, model_id: str,
         # Off-pump-thread + timeout, per the note above.
         "embed_text": lambda p: embed_text_handler(state, p),
         "embed_video": lambda p: embed_video_handler(state, p),
+        # 用户音色（现场提取 x-vector → 注入 talker 的音色表）。TTS 专用。
+        "register_speaker": lambda p: register_speaker_handler(state, p),
+        "unregister_speaker": lambda p: unregister_speaker_handler(state, p),
+        "list_user_speakers": lambda p: list_user_speakers_handler(state, p),
     }
 
 

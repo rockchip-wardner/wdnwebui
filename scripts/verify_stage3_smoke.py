@@ -453,7 +453,7 @@ def check_tts(res: Results, reg) -> None:
         max_new_tokens=256,
         no_play=True,               # worker-side playback off
         volume=0.6,
-        ref_speaker="girl_base",
+        ref_speaker="news_female",
     ))
     atts = list(getattr(out, "attachment", []) or [])
     n_bytes = sum(len(getattr(a, "data", b"") or b"") for a in atts)

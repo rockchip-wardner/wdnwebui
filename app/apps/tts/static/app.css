@@ -1,1 +1,342 @@
+/* TTS card — 音色克隆（上传/录制参考音频 → 板端现场提取） */
 
+/* --------------------------------------------------------------------------
+ * 顶部说明块 —— 讲清楚「这是什么、规格是什么」
+ * ------------------------------------------------------------------------ */
+.tts-clone-hero {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: linear-gradient(180deg, #eff6ff 0%, #f9fafb 100%);
+  border: 1px solid #dbeafe;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+
+.tts-clone-hero-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  line-height: 1;
+}
+
+.tts-clone-hero-body { min-width: 0; }
+
+.tts-clone-hero-title {
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: #111827;
+  margin-bottom: 2px;
+}
+
+.tts-clone-hero-desc {
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.6;
+  margin-bottom: 8px;
+}
+
+/* 规格标签 */
+.tts-clone-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tts-chip {
+  font-size: 0.72rem;
+  color: #374151;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+
+.tts-chip-accent {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+/* 音色名 + 「上传并提取」—— 两条路**共用**的一套控件，不属于任何一张卡。
+   放在两张来源卡下面：名字是录完/选完文件才自动填的，提交按钮理应紧跟其后。
+   （用板子麦克风那条路是录完直接注册，不经过这个按钮。） */
+.tts-clone-submit {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #eef1f4;
+}
+
+.tts-clone-submit-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+/* 这一块不在 .tts-voice-upload 里，输入框样式要单独给一份 */
+.tts-clone-submit-row .tts-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 0 1 320px;
+}
+
+.tts-clone-submit-row input[type="text"] {
+  padding: 6px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  background: #fff;
+  color: #111827;
+  min-width: 0;
+}
+
+.tts-clone-submit-row input[type="text"]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 待提取状态（浏览器录音 / 拖放 收下来的音频）—— 也是共用的，
+   显示在提交的地方，不占任何一张来源卡 */
+.tts-clone-pending {
+  font-size: 0.78rem;
+  font-family: var(--mono);
+  color: #374151;
+  margin-top: 6px;
+}
+
+.tts-clone-pending:empty {
+  display: none;
+}
+
+/* --------------------------------------------------------------------------
+ * 两张来源卡 —— 录音 / 上传
+ * align-items: stretch（grid 默认）保证两卡**等高**；窄屏自动竖排
+ * ------------------------------------------------------------------------ */
+.tts-clone-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: stretch;
+}
+
+@media (max-width: 900px) {
+  .tts-clone-grid { grid-template-columns: 1fr; }
+}
+
+.tts-clone-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100%;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f9fafb;
+  padding: 12px 14px;
+  box-sizing: border-box;
+}
+
+.tts-clone-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #eef1f4;
+}
+
+.tts-clone-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.tts-clone-title {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #111827;
+}
+
+/* 图标一律用内联 SVG —— emoji 在没装 emoji 字体的机器上是豆腐块 */
+.tts-ic {
+  width: 1.05rem;
+  height: 1.05rem;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.tts-ic-lg {
+  width: 1.4rem;
+  height: 1.4rem;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+/* 朗读文案放进浅底引用块，提示与内容分层 */
+.tts-rec-script-box {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.tts-clone-card .tts-rec-script { margin: 0; }
+
+/* 两卡的主操作行压到底部 → 两张卡的主按钮横向对齐 */
+.tts-clone-card .tts-rec-actions {
+  margin-top: auto;
+}
+
+/* 上传卡没有主操作行（按钮在下面的共用区）→ 让拖放区吃掉多余高度，
+   拖放目标更大，也避免卡底留一块空白 */
+.tts-clone-card .tts-dropzone {
+  flex: 1;
+}
+
+/* 窄屏竖排时（JS 给两张卡加 is-stacked）：上下叠着就不需要底部对齐，
+   把多出来的高度让给朗读引用块，让内容填满整张卡，而不是中间空一块。 */
+.tts-clone-card.is-stacked .tts-rec-script-box {
+  flex: 1;
+}
+
+.tts-clone-card.is-stacked .tts-rec-actions {
+  /* 必须是 0 而不是 10px —— margin-top:auto 在自动高度的容器里本来就
+     等于 0（间距靠卡片的 flex gap 给），写成 10px 会让这张卡的自然
+     高度凭空多出 10px，两卡就对不齐了。 */
+  margin-top: 0;
+}
+
+/* 「已提取的音色」小标题 */
+.tts-clone-subhead {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 14px 0 6px;
+}
+
+/* --------------------------------------------------------------------------
+ * 上传区控件 —— 沿用原样式（.tts-voice-upload 同时是那张卡）
+ * ------------------------------------------------------------------------ */
+.tts-voice-pick {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.tts-voice-upload .tts-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tts-voice-upload-path {
+  flex: 1 1 320px;
+}
+
+.tts-voice-upload input[type="text"] {
+  padding: 6px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  background: #fff;
+  color: #111827;
+  min-width: 0;
+}
+
+.tts-voice-upload input[type="text"]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.tts-voice-upload button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------------------
+ * 拖放区 —— 把 PC 上的音频文件拖进来
+ * ------------------------------------------------------------------------ */
+.tts-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 22px 16px;
+  text-align: center;
+  border: 2px dashed #d1d5db;
+  border-radius: 10px;
+  background: #f9fafb;
+  cursor: default;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.tts-dropzone.dragover {
+  border-color: var(--accent);
+  background: #eff6ff;
+}
+
+.tts-dropzone-title {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: #374151;
+}
+
+.tts-dropzone-hint {
+  font-size: 0.82rem;
+  color: #6b7280;
+  word-break: break-all;
+}
+
+/* 卡片里的拖放区瘦身，给内容腾地方 */
+.tts-dropzone-compact {
+  padding: 14px 12px;
+}
+
+.tts-dropzone-compact .tts-dropzone-title { font-size: 0.88rem; }
+
+/* --------------------------------------------------------------------------
+ * 录音取音色
+ * ------------------------------------------------------------------------ */
+.tts-rec-tip {
+  font-size: 0.82rem;
+  color: #6b7280;
+  margin: 0 0 4px;
+}
+
+.tts-rec-script {
+  font-size: 0.92rem;
+  color: #111827;
+  margin: 0 0 8px;
+  line-height: 1.6;
+}
+
+/* 电平条 */
+.tts-rec-meter {
+  height: 6px;
+  border-radius: 3px;
+  background: #e5e7eb;
+  overflow: hidden;
+}
+
+.tts-rec-meter-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.08s linear;
+}
+
+.tts-rec-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
