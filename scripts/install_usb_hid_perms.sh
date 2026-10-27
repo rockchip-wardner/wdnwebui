@@ -4,7 +4,17 @@
 # Idempotent: safe to re-run.
 set -euo pipefail
 
-RULES_SRC="/home/rockchip/wdnwebui/scripts/99-wdnwebui-usb-hid-gadget.rules"
+_src="${BASH_SOURCE[0]}"
+while [ -L "${_src}" ]; do
+  _dir="$(cd -P "$(dirname "${_src}")" && pwd)"
+  _src="$(readlink "${_src}")"
+  case "${_src}" in
+    /*) ;;
+    *) _src="${_dir}/${_src}" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${_src}")" && pwd)"
+RULES_SRC="${SCRIPT_DIR}/99-wdnwebui-usb-hid-gadget.rules"
 RULES_DST="/etc/udev/rules.d/99-wdnwebui-usb-hid-gadget.rules"
 GROUP="${WDNWEBUI_USB_HID_GID:-rockchip}"
 MODE="0660"

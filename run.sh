@@ -19,7 +19,37 @@
 #   filesystem — even a 0777 dir will still refuse non-root writes,
 #   so this script must reach root for the bind step. The sudoers
 #   rule is the minimum surface that achieves that.
-sudo -n /home/rockchip/wdnwebui/scripts/setup_usb_hid_gadget.sh \
-  || echo "[run.sh] warning: USB HID gadget setup skipped — sudo NOPASSWD for ${0%/*}/setup_usb_hid_gadget.sh not configured; /api/usb-hid will report 'absent' until setup runs" >&2
+#
+# Paths are derived from this script's own location, NOT hardcoded to
+# /home/rockchip/wdnwebui — the repo may be installed anywhere
+# (/opt/wdnwebui, /usr/local/wdnwebui, a user's home, …). A baked-in
+# path makes the whole script fail on every machine but this one.
+#
+# NOTE: the sudoers rule in /etc/sudoers.d/wdnwebui-usb-hid pins the
+# *absolute* path of the setup script. If the repo is moved, that
+# rule must be updated to the new path too — otherwise `sudo -n`
+# fails and the HID gadget silently stays unconfigured.
+#
+# Resolve the real script location, following symlinks: a wrapper
+# symlinked into /usr/local/bin must still find the repo it belongs
+# to, not look for scripts/ next to the symlink.
+_src="${BASH_SOURCE[0]}"
+while [ -L "${_src}" ]; do
+  _dir="$(cd -P "$(dirname "${_src}")" && pwd)"
+  _src="$(readlink "${_src}")"
+  case "${_src}" in
+    /*) ;;
+    *) _src="${_dir}/${_src}" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${_src}")" && pwd)"
+HID_SETUP="${SCRIPT_DIR}/scripts/setup_usb_hid_gadget.sh"
 
-.venv/bin/python run.py
+# Run from the repo root so relative paths (config.jsonc, static
+# assets, the .venv) resolve the same way they always have.
+cd "${SCRIPT_DIR}"
+
+sudo -n "${HID_SETUP}" \
+  || echo "[run.sh] warning: USB HID gadget setup skipped — sudo NOPASSWD for ${HID_SETUP} not configured; /api/usb-hid will report 'absent' until setup runs" >&2
+
+"${SCRIPT_DIR}/.venv/bin/python" "${SCRIPT_DIR}/run.py" "$@"

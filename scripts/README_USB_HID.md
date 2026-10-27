@@ -7,18 +7,28 @@
 
 ## 一次性配置（root 权限）
 
+在仓库根目录下执行（路径用相对写法，仓库放哪个目录都能用）：
+
 ```bash
 # 1. 加载 configfs + 写 HID gadget + bind OTG UDC
-sudo bash /home/rockchip/wdnwebui/scripts/setup_usb_hid_gadget.sh
+sudo bash scripts/setup_usb_hid_gadget.sh
 
 # 2. 装 udev 规则 + 改 /dev/hidgN 权限给 wdnwebui 用户
-sudo cp /home/rockchip/wdnwebui/scripts/99-wdnwebui-usb-hid-gadget.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-sudo udevadm trigger --name-match=hidg0 --name-match=hidg1
-sudo chmod 660 /dev/hidg0 /dev/hidg1
-sudo chgrp rockchip /dev/hidg0 /dev/hidg1
+#    （install_usb_hid_perms.sh 已包含 copy 规则 + udevadm reload/trigger
+#      + chgrp/chmod，下面两行只是效果确认）
+sudo bash scripts/install_usb_hid_perms.sh
 ls -l /dev/hidg0 /dev/hidg1    # 期望: crw-rw---- root rockchip
 ```
+
+> `run.sh` 每次启动都会自动跑第 1 步（`sudo -n`，非交互）。
+> 想免密需要装 `/etc/sudoers.d/wdnwebui-usb-hid` 规则，该规则里写的是
+> **setup 脚本的绝对路径** —— 仓库换目录后这条规则要同步改，
+> 否则 `sudo -n` 失败、HID gadget 静默保持未配置（页面头部显示
+> "Gadget 未就绪"）。规则示例：
+>
+> ```
+> rockchip ALL=(root) NOPASSWD: /opt/wdnwebui/scripts/setup_usb_hid_gadget.sh
+> ```
 
 PC 端验证：设备管理器里应该出现两个新 HID 设备（HID Keyboard Device + HID-compliant digitizer）。
 
@@ -27,7 +37,7 @@ PC 端验证：设备管理器里应该出现两个新 HID 设备（HID Keyboard
 ## 撤销
 
 ```bash
-sudo bash /home/rockchip/wdnwebui/scripts/teardown_usb_hid_gadget.sh
+sudo bash scripts/teardown_usb_hid_gadget.sh
 ```
 
 ## 端点
@@ -48,7 +58,7 @@ sudo bash /home/rockchip/wdnwebui/scripts/teardown_usb_hid_gadget.sh
 ## 验证
 
 ```bash
-python3 /home/rockchip/wdnwebui/scripts/verify_usb_hid.py
+python3 scripts/verify_usb_hid.py
 ```
 
 期望输出（udev 权限已设的情况下）：12 行全 `[OK]`，最后 `all checks passed ✓`。
