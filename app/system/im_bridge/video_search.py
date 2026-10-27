@@ -12,6 +12,7 @@
 * ``extracting``  — 仍在提取中（附实时进度）
 * ``downloading`` — 视频还在下载
 * ``no_video``    — 该用户从未发送过视频
+* ``no_image``    — ``use_last_image=true`` 但该用户没有缓存的图片
 
 真正的执行失败（embedding 会话缺失、检索异常）以抛错结束 —— 走
 chat-agent 的失败回喂路径。capability 门控
@@ -37,6 +38,18 @@ class VideoSearch:
     top_k: Annotated[int, "最多返回的片段数（1-10）"] = WdnaiField(
         default=5,
         description="最多返回的片段数",
+    )
+    use_last_image: Annotated[
+        bool,
+        "当前文字是否在描述/追问刚发送的那张图片（是则用图片+文字检索）",
+    ] = WdnaiField(
+        default=False,
+        description=(
+            "是否把用户最近发送的一张图片与 query 一起检索。"
+            "仅当当前文字是在描述/追问**刚发送的那张图片**"
+            "（例如“颜色和车型符合的目标”“这张图里还有谁”）时置 true；"
+            "独立的新问题、与那张图无关的追问保持 false（只做文字检索）。"
+        ),
     )
 
     def __call__(self, frame_bgr, ctx):
@@ -76,6 +89,18 @@ class VideoSearch:
                         f"（{status['error']}），可请用户重新发送。",
             }
         # state == ready → 执行检索（内部 threshold 固定 + 兜底质量信号）
-        result = mgr.search(user_id, self.query, top_k=self.top_k)
+        image_path = ""
+        if self.use_last_image:
+            img = mgr.get_last_image(user_id)
+            if not img:
+                return {
+                    "status": "no_image",
+                    "hint": "用户最近没有可用于检索的图片；请让用户先发送"
+                            "一张图片，或把问题改成纯文字描述。",
+                }
+            image_path = img.get("path") or ""
+        result = mgr.search(
+            user_id, self.query, top_k=self.top_k, image_path=image_path)
         result["query"] = (self.query or "").strip()
+        result["use_last_image"] = bool(self.use_last_image)
         return result

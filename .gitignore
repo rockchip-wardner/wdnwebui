@@ -41,3 +41,6 @@ config.jsonc
 # vrepo（多仓库统筹工具）的本地状态目录
 # manifest 记录的是各机器的本地路径 / 远端名，不入仓
 .vrepo/
+
+# 微信运行时媒体缓存（视频 / 图片检索的最近一张）
+app/system/im_bridge/uploads/

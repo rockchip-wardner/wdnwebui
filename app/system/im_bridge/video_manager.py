@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import queue as _queue
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
@@ -69,6 +70,20 @@ _STATE_READY = "ready"
 _STATE_ERROR = "error"
 
 _UPLOAD_ROOT = Path(__file__).resolve().parent / "uploads" / "wechat_videos"
+# 微信图片检索的「最近一张」缓存目录（服务启动时整体清空，用户确认）。
+_IMAGE_ROOT = Path(__file__).resolve().parent / "uploads" / "wechat_images"
+
+
+def clear_image_cache() -> None:
+    """清空微信图片检索缓存（服务启动时调用；用户确认不跨重启保留）。"""
+    try:
+        shutil.rmtree(_IMAGE_ROOT, ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("wechat image: clear cache dir failed: %s", exc)
+    try:
+        _IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _LOG.warning("wechat image: create cache dir failed: %s", exc)
 
 
 @dataclass
@@ -104,11 +119,50 @@ class WechatVideoManager:
         self._lock = threading.RLock()
         self._entries: Dict[str, VideoEntry] = {}
         self._seq = 0
+        # 每用户「最近一张」图片（图片检索用；新图覆盖旧图并删除旧文件）。
+        self._last_images: Dict[str, dict] = {}
         self._queue: "_queue.Queue[Optional[tuple]]" = _queue.Queue()
         self._worker = threading.Thread(
             target=self._worker_loop, name="wechat-video-manager", daemon=True,
         )
+        # 启动清空图片缓存目录（用户明确要求：服务重启不保留旧图）。
+        clear_image_cache()
         self._worker.start()
+
+    # ------------------------------------------------------------ 图片缓存
+    @property
+    def image_dir(self) -> Path:
+        return _IMAGE_ROOT
+
+    def get_last_image(self, user_id: str) -> Optional[dict]:
+        """取该用户「最近一张」检索图片；文件已丢失时自动清空。"""
+        with self._lock:
+            item = self._last_images.get(user_id)
+            if not item:
+                return None
+            path = item.get("path") or ""
+            if path and os.path.isfile(path):
+                return dict(item)
+            self._last_images.pop(user_id, None)
+            return None
+
+    def set_last_image(self, user_id: str, path: str,
+                       caption: str = "") -> None:
+        """设为最近一张；覆盖时删除上一张文件。"""
+        with self._lock:
+            old = self._last_images.get(user_id)
+            self._last_images[user_id] = {
+                "path": path,
+                "caption": caption or "",
+                "ts": time.time(),
+            }
+            if old and old.get("path") and old["path"] != path:
+                try:
+                    os.unlink(old["path"])
+                except OSError:
+                    pass
+            _LOG.info("wechat image: last image for %s -> %s", user_id,
+                      Path(path).name)
 
     # ------------------------------------------------------------ 注册入口
     def enqueue_video(self, user_id: str, msg: Any) -> dict:
@@ -160,10 +214,16 @@ class WechatVideoManager:
                 "slices_total": entry.slices_total,
             }
 
-    def search(self, user_id: str, text: str, top_k: int = _SEARCH_TOP_K) -> dict:
-        """对最新 ready 视频做文本检索（threshold 固定 + 兜底质量信号）。"""
+    def search(self, user_id: str, text: str = "",
+               top_k: int = _SEARCH_TOP_K, image_path: str = "") -> dict:
+        """对最新 ready 视频做检索（文字 / 图片 / 图+文）。
+
+        图片走同一 embedding 模型（``embed_video([img])``），与视频片段
+        向量同一空间；质量检查默认开启（纯色/随机噪声抛 ValueError）。
+        """
         text = (text or "").strip()[:50]
-        if not text:
+        image_path = (image_path or "").strip()
+        if not text and not image_path:
             raise ValueError("检索问题不能为空")
         top_k = max(1, min(10, int(top_k or _SEARCH_TOP_K)))
         with self._lock:
@@ -174,12 +234,11 @@ class WechatVideoManager:
             source_name = entry.filename
             duration_s = entry.duration_s
 
-        from app.core.compute.registry import (
-            get_registry, get_session_call_lock,
-        )
-        session = get_registry().get_session(SoftwareCapability.VISION_EMBEDDING)
-        with get_session_call_lock():
-            qvec = session.embed_text(text)
+        # 与 UI 检索/图片检索共用同一个编码入口（含 576×576 预处理与
+        # 纯色/噪声质量门槛；图片 + 文字时 text 作为 prompt）。
+        from app.core.video.search import get_service as get_search_service
+        qvec = get_search_service().encode_query(
+            text, image_path, check_image_quality=True)
         qvec = np.asarray(qvec, dtype=np.float32)
         qvec = qvec / (np.linalg.norm(qvec) + 1e-9)
 
@@ -203,6 +262,8 @@ class WechatVideoManager:
         all_below = not hits
         if all_below and fallback:
             hits = fallback
+        query_type = ("image+text" if (image_path and text)
+                      else ("image" if image_path else "text"))
         return {
             "status": "ok",
             "video": source_name,
@@ -210,6 +271,7 @@ class WechatVideoManager:
             "hits": hits,
             "top_score": hits[0]["similarity"] if hits else None,
             "all_below_threshold": all_below,
+            "query_type": query_type,
             "hint": (
                 f"所有片段与问题的相似度均低于{_SIM_THRESHOLD}，以上为最接近的"
                 f"{len(hits)}段，请谨慎表述匹配程度" if all_below else ""),

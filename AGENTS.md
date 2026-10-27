@@ -6736,6 +6736,48 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   新视频随即开始分析。SDK 的 `download_message` 同步阻塞无法中途
   打断，最长滞后 = 单次 CDN 传输时长。
 
+### 微信图片检索（v0.28）
+
+微信消息现在支持图片输入（与视频索引同一 embedding 空间）：
+
+* **分流**（`llm.py::handle_incoming`，图片走独立 image worker，不阻塞 SDK 回调）：
+  - 纯图片 → `embed_video([img])`；
+  - 图片 + 同消息文字（caption）→ `embed_video([img], prompt=caption)`
+    —— 但微信客户端**不支持图片与文字同发**（实际是两条消息），
+    所以 caption 分支基本恒为空；保留它只为协议将来支持时直接生效。
+  - 后续任何文字/图片都是**独立重新检索** —— 不做 TTL / pending /
+    跨消息自动绑定。
+* **结果**：命中片段作为 `_system_note` 写入该用户 history，由
+  `swcap_text_chat` 组织回答（`tool_names=[]`：结果已给出，不让模型重复
+  检索）。text_chat 未启用时回「文本对话模型未启用，无法总结检索结果」
+  + 原始命中时间段/相似度。
+* **质量检查**：默认开（与 VR 同一 `encode_query`：`std<3` 纯色 /
+  `Laplacian>20000` 噪声 → 直接回错误文案，不进入 LLM）。
+* **缓存**：每用户只保留**最近一张**图片（`video_manager._last_images` +
+  `uploads/wechat_images/<user>/`）；新图覆盖旧图并删除旧文件；服务启动
+  在 `app/system/__init__.py::register_all` 显式调 `clear_image_cache()`
+  清空（不依赖 video_manager 的 lazy 初始化）。
+* **“文字是否基于刚发的图”由模型自行判断**（不做固定规则）：
+  `VideoSearch.use_last_image` 仅当当前文字是在描述/追问**刚发送的那张
+  图片**时置 true → 用最近一张 + 文字做图文检索；独立问题保持 false。
+  图片检索后写入 history 的系统注记里也会提示模型区分“追问这张图”
+  与“独立新问题”。无缓存图时工具返回 `no_image`。
+* **引用图片：协议层不支持** —— 实测微信引用消息的
+  `ref_msg.message_item` 只有 `msg_id` / `create_time_ms` / `type=0`
+  等元数据，**没有 image_item / media / url，也没有 text_item**；
+  引用图片与引用文字的结构逐字段一致（无法区分）。SDK 也没有按
+  `msg_id` 拉取原消息的 API。因此：
+  - 引用消息一律按**普通文字**处理，不下载、不猜最近一张；
+  - 模型若判断这条引用文字是在追问刚发的图，可自行
+    `VideoSearch(use_last_image=true)` 使用最近一张；
+  - 残余风险：引用的是更早的图片时无法取到，只能拿到最近一张
+    （这是微信协议限制，不是实现缺陷）。
+* **检索口径**：仍走 `video_manager.search` 的阈值 0.40 / top-5 / 3 条兜底；
+  返回 `query_type` 标记 `image` / `image+text`。
+* **回归**：`scripts/verify_wechat_image_search.py`（mock，26 项：caption /
+  search 编码、最近一张覆盖与清空、`use_last_image` 描述与无图状态、
+  成功 / 质量不合格 / 无视频 / text_chat 未启用、图片与引用消息分流）。
+
 
 ## FastDDS discovery — SIMPLE multicast (v0.6+)
 

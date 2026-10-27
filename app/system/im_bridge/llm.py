@@ -24,9 +24,12 @@ from __future__ import annotations
 import logging
 import os
 import queue as _queue
+import re
 import threading
 import time
+import uuid
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque, Dict, Optional
 
 from wdnai import SoftwareCapability
@@ -67,6 +70,14 @@ class _LlmBridge:
             target=self._worker_loop, name="wechat-llm-bridge", daemon=True,
         )
         self._worker.start()
+        # 图片检索独立 worker：下载 / 质量检查 / embedding 可能耗时，
+        # 不能阻塞 SDK 消息回调，也不该和文字对话抢同一条队列。
+        self._image_queue: "_queue.Queue[Optional[tuple]]" = _queue.Queue()
+        self._image_worker = threading.Thread(
+            target=self._image_worker_loop, name="wechat-llm-image",
+            daemon=True,
+        )
+        self._image_worker.start()
 
     # ------------------------------------------------------------- 状态
     def available(self) -> bool:
@@ -123,8 +134,18 @@ class _LlmBridge:
         if not user_id:
             return
         if kind == "text" and text:
+            # 引用消息（微信协议只给被引用消息的 msg_id，不给内容/媒体）
+            # 无法区分引用的是图片还是文字，因此一律按普通文字处理；
+            # 是否“基于最近一张图片追问”由模型调用
+            # ``VideoSearch(use_last_image=true)`` 自行判断。
             self._queue.put((user_id, text, time.time()))
             self._wake.set()
+        elif kind == "image":
+            # 图片消息：下载/质量检查/embedding 全部在 image worker 做。
+            # 微信客户端不支持图片 + 文字同发，caption 基本恒为空；
+            # 后续文字由模型决定是否 use_last_image（不做 TTL 自动绑定）。
+            caption = self._image_caption(msg)
+            self._image_queue.put((user_id, msg, caption))
         elif kind == "video":
             # 视频消息 → 微信视频管理器确定性分流：落盘 + 自动后台提取。
             # 不走 LLM 工具链路（提取是确定性事件无需智能决策，且不能
@@ -143,7 +164,23 @@ class _LlmBridge:
                     f"暂不支持「{fname}」这类文件；请发送文字、视频消息，"
                     f"或视频格式的文件（如 mp4 / mov / mkv）。")
         else:
-            self._reply_no_context(user_id, "当前仅支持文字与视频消息（图片 / 语音暂不支持）。")
+            self._reply_no_context(
+                user_id,
+                "当前仅支持文字、图片与视频消息（语音暂不支持）。")
+
+    @staticmethod
+    def _image_caption(msg: Any) -> str:
+        """图片消息自带的文字（微信把 caption 作为同消息 text_item）。
+
+        SDK 的 ``_extract_text`` 会把图片 URL 也拼进 ``msg.text``，这里
+        剔除 URL / ``[image]`` 后剩下的才是真正的描述文字。
+        """
+        text = (getattr(msg, "text", "") or "").strip()
+        for im in (getattr(msg, "images", None) or []):
+            url = getattr(im, "url", None)
+            if url:
+                text = text.replace(url, "")
+        return text.replace("[image]", "").strip()
 
     def _dispatch_to_video_manager(self, user_id: str, msg: Any) -> None:
         """video 消息与 file 形态的共用分流：capability 预检 → 入队提取
@@ -284,7 +321,8 @@ class _LlmBridge:
                     self._busy = False
                     self._active_sessions -= 1
 
-    def _process(self, user_id: str, text: str) -> None:
+    def _process(self, user_id: str, text: str,
+                 system_note: str = "", tool_names=None) -> None:
         from app.core.chat.agent import run_chat_with_tools
         from app.core.chat.serial import get_chat_run_lock
         from app.core.compute.registry import get_registry
@@ -295,10 +333,14 @@ class _LlmBridge:
             self._reply_no_context(user_id, f"功能未启用: swcap_text_chat（{e}）")
             return
 
-        # 读取该用户历史（惰性建 deque）
+        # 读取该用户历史（惰性建 deque）。图片检索结果先作为系统注记
+        # 写入 history（供本轮回答 + 后续追问引用），再取快照。
         with self._lock:
-            history_snapshot = list(
-                self.histories.setdefault(user_id, deque(maxlen=_HISTORY_MAX)))
+            hist = self.histories.setdefault(user_id, deque(maxlen=_HISTORY_MAX))
+            if system_note:
+                hist.append({"role": "user", "content": system_note,
+                             "ts": time.time(), "_system_note": True})
+            history_snapshot = list(hist)
 
         context_limit = self._resolve_context_limit()
 
@@ -313,7 +355,8 @@ class _LlmBridge:
                     text,
                     context_limit=context_limit,
                     max_new_tokens=self.MAX_NEW_TOKENS,
-                    tool_names=self._resolve_tool_names(),
+                    tool_names=(self._resolve_tool_names()
+                                if tool_names is None else tool_names),
                     user_id=user_id,
                     channel="wechat",
                 )
@@ -352,6 +395,134 @@ class _LlmBridge:
 
         self._reply_no_context(user_id, answer)
 
+    # ------------------------------------------------------------- 图片检索
+    def _image_worker_loop(self) -> None:
+        """图片下载 / 质量检查 / 检索 / 组织回答（串行，独立于文字队列）。"""
+        while True:
+            item = self._image_queue.get()
+            if item is None:
+                break
+            try:
+                user_id, msg, text = item
+                self._process_image(user_id, msg, text)
+            except Exception as exc:  # noqa: BLE001
+                _LOG.exception("wechat image worker failed")
+                _llm_log(f"image worker error: {exc!r}")
+
+    def _process_image(self, user_id: str, msg: Any, text: str) -> None:
+        """下载图片 → 质量检查 → 检索 → 文本模型组织回答。"""
+        from app.system.im_bridge.service_wechat import get_wechat
+        from app.system.im_bridge.video_manager import get_wechat_video_manager
+
+        caption = (text or "").strip()
+        wc = get_wechat()
+        mgr = get_wechat_video_manager()
+
+        try:
+            downloaded = wc.download_message(msg)
+            if downloaded is None or not getattr(downloaded, "data", None):
+                self._reply_no_context(
+                    user_id,
+                    "图片下载失败（未收到图片数据），请重新发送。")
+                return
+            data = downloaded.data
+        except Exception as exc:  # noqa: BLE001
+            _llm_log(f"image download failed for {user_id}: {exc!r}")
+            self._reply_no_context(user_id, f"图片下载失败：{exc}")
+            return
+
+        path = ""
+        try:
+            path = self._save_image(mgr.image_dir, user_id, data)
+            # 质量检查在 encode_query 内部（原图）完成；纯色/噪声抛 ValueError。
+            result = mgr.search(user_id, caption, image_path=path)
+        except ValueError as exc:
+            # 无视频 / 图片质量不合格 —— 直接给用户原因，不进入 LLM。
+            self._reply_no_context(user_id, str(exc))
+            self._discard(path)
+            return
+        except Exception as exc:  # noqa: BLE001
+            _llm_log(f"image search failed for {user_id}: {exc!r}")
+            self._reply_no_context(user_id, f"图片检索失败：{exc}")
+            self._discard(path)
+            return
+
+        # 检索成功 → 保留为「最近一张」（新图覆盖旧图）。
+        mgr.set_last_image(user_id, path, caption)
+
+        if not self.available():
+            self._reply_no_context(
+                user_id,
+                "文本对话模型未启用，无法总结检索结果。原始命中：\n"
+                + self._format_hits(result))
+            return
+
+        user_text = caption or "[用户发送了一张图片]"
+        note = self._image_result_note(result, caption)
+        with self._lock:
+            self._busy = True
+            self._active_sessions += 1
+        try:
+            self._process(user_id, user_text, system_note=note,
+                          tool_names=[])
+        except Exception as exc:  # noqa: BLE001
+            _LOG.exception("wechat image answer failed for %s", user_id)
+            self._reply_no_context(
+                user_id,
+                f"检索完成，但回答生成失败：{exc}\n" + self._format_hits(result))
+        finally:
+            with self._lock:
+                self._busy = False
+                self._active_sessions -= 1
+
+    @staticmethod
+    def _save_image(root: Path, user_id: str, data: bytes) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", user_id or "user")[:40]
+        d = Path(root) / safe
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"image-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.jpg"
+        p.write_bytes(data)
+        return str(p)
+
+    @staticmethod
+    def _discard(path: str) -> None:
+        if not path:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _format_hits(result: dict) -> str:
+        hits = result.get("hits") or []
+        if not hits:
+            return "（没有命中片段）"
+        lines = [f"{h.get('time', '')}（相似度 {h.get('similarity')}）"
+                 for h in hits]
+        if result.get("all_below_threshold"):
+            lines.insert(0, "所有片段相似度均低于阈值，以下是最接近的片段：")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _image_result_note(result: dict, caption: str) -> str:
+        qtype = {"image": "图片", "image+text": "图片+文字"}.get(
+            result.get("query_type") or "", "图片")
+        what = "用户发送了一张图片"
+        if caption:
+            what += f"（附带文字：{caption}）"
+        return (
+            f"[系统] {what}，已用{qtype}检索其最新视频"
+            f"「{result.get('video', '')}」。命中片段：\n"
+            f"{_LlmBridge._format_hits(result)}\n"
+            "请用自然语言告诉用户这些片段与图片/描述的关系；"
+            "若全部低于阈值，请明确说明只是最接近的片段。"
+            "本轮结果已给出，不要再调用 VideoSearch 工具。\n"
+            "注意：用户之后可能继续用文字追问这张图片。若下一条文字是"
+            "在描述/追问这张图（例如颜色、车型、画面里还有谁），调用 "
+            "VideoSearch 时把 use_last_image 设为 true；若是独立的新问题，"
+            "按普通文字检索，不要强行关联这张图。")
+
     def _resolve_context_limit(self) -> int:
         try:
             from app.core.config import get_config
@@ -388,6 +559,7 @@ class _LlmBridge:
 
     def close(self) -> None:
         self._queue.put(None)
+        self._image_queue.put(None)
         with self._lock:
             self._enabled = False
             self.histories.clear()

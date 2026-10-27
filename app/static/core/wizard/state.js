@@ -1288,7 +1288,7 @@
         const row = _ce("div", WIZARD_NS + "input-row");
         (field.type === "textarea" ? wrap : row).appendChild(el);
         if (field.browse && window.VdFsModal) {
-          const browseBtn = _ce("button", WIZARD_NS + "browse-btn", "浏览");
+          const browseBtn = _ce("button", WIZARD_NS + "browse-btn", "浏览…");
           browseBtn.type = "button";
           browseBtn.title = "选择服务器上的文件";
           browseBtn.addEventListener("click", () => {
@@ -1306,7 +1306,7 @@
           fileInput.type = "file";
           fileInput.accept = field.accept || "image/*";
           fileInput.style.display = "none";
-          const upBtn = _ce("button", WIZARD_NS + "browse-btn", "上传");
+          const upBtn = _ce("button", WIZARD_NS + "browse-btn", "上传…");
           upBtn.type = "button";
           upBtn.title = "从本机上传文件";
           upBtn.addEventListener("click", () => fileInput.click());

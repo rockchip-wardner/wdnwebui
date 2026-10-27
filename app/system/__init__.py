@@ -71,3 +71,15 @@ def register_all(app: FastAPI) -> None:
         logging.getLogger("app.system").warning(
             "im_bridge: video_search registration failed: %s", e
         )
+
+    # 微信图片检索缓存：服务启动即清空（不跨重启保留）。这里显式调一次，
+    # 而不是依赖 video_manager 单例的 lazy 初始化 —— 否则用户没进过
+    # im-bridge 页面时，上一轮运行留下的图片会一直躺在磁盘上。
+    try:
+        from app.system.im_bridge.video_manager import clear_image_cache
+        clear_image_cache()
+    except Exception as e:
+        import logging
+        logging.getLogger("app.system").warning(
+            "im_bridge: clear image cache failed: %s", e
+        )
