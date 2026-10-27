@@ -5745,7 +5745,14 @@ RIFF header by hand.
     图+文检索（阈值 0.40 / 上限 10 固化）、多视频缓存检索、清空结果。
   - `GET /image/thumb?path=` — 查询图缩略图（长边 240 JPEG，只读）。
   - `GET  /cache/stats` / `GET /cache/list` / `DELETE /cache/entry` / `POST /cache/clear`
-    — 检索缓存管理（只含检索条目）。
+    — 检索缓存管理（只含检索条目）。**删除当前会话对应条目时必须
+    `reset_session()`**（与 `/cache/clear` 一致，返回 `session_reset`）：
+    否则持久缓存已删、单例仍 `ready` + 旧 `_index`，前端「开始 / 向导完成」
+    会对 ready+同源短路，进度条直接 100%、有结果但不重新提取、也不写
+    新缓存（用户实测）。前端删除按钮据 `session_reset` 清
+    `VR.snap`/进度/旧结果；向导完成改用 `vrStart(true)` **强制走一次
+    `start_extract`**（缓存命中秒回，缓存已删则重新提取并写缓存）。
+    回归：`scripts/verify_vr_cache_entry_reset.py`（不占 NPU）。
   - `GET  /history` — 按 md5 聚合的历史（只含检索档位）。
   - `GET  /frame?source=&t=` — PyAV seek 到 `t` 秒附近取帧 JPEG。
   - `WS   /ws` — server→client：`hello`（连接即发快照）/ `progress` /
