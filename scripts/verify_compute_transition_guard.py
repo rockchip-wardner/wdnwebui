@@ -55,6 +55,7 @@ class FakeInst:
                  source="spawned", caps=("swcap_a",)):
         self.model_id = model_id
         self.npu_index = npu_index
+        self.npu_indices = (npu_index,) if npu_index >= 0 else ()
         self.status = status
         self._source = source
         self.capability_types = list(caps)

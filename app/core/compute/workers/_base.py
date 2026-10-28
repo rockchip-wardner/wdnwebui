@@ -333,7 +333,7 @@ def _load_wdnai() -> dict:
     return _WDNAI
 
 
-def _build_session(model_id: str, npu_index: int):
+def _build_session(model_id: str, npu_index):
     """Construct the session for this worker using its manifest.
 
     ``spec_factory`` in ``workers/<model_id>.json`` names a method on
@@ -353,17 +353,33 @@ def _build_session(model_id: str, npu_index: int):
     ``LLMRPCSession`` — one resolver, one spec, both sides of the wire.
     """
     mod = _load_wdnai()
-    factory_name = (load_manifest(model_id).get("spec_factory") or "").strip()
+    manifest = load_manifest(model_id)
+    factory_name = (manifest.get("spec_factory") or "").strip()
+    try:
+        requires = int(manifest.get("requires_cards", 1) or 1)
+    except (TypeError, ValueError):
+        requires = 1
+    if isinstance(npu_index, (list, tuple)):
+        cards = [int(x) for x in npu_index]
+    else:
+        cards = [int(npu_index)]
+    if len(cards) != requires:
+        raise RuntimeError(
+            f"{model_id} 需要 {requires} 张算力卡，实际传入 {cards}"
+        )
     # Lazy import: the package __init__ owns the manifest scanner, and
     # importing it at module level would close a cycle.
     from app.core.compute.workers import build_model_spec
     spec = build_model_spec(model_id)
-    LOG.info("building LLMLocalSession(model=%s, npu=%d) via %s) ...",
-             model_id, npu_index, factory_name)
+    LOG.info("building LLMLocalSession(model=%s, npu=%s) via %s) ...",
+             model_id, cards, factory_name)
     t0 = time.time()
     # Not the deprecated ``LLMSession(model=…)`` shim: the worker is the
     # one place that genuinely means "inference runs right here".
-    sess = mod["LLMLocalSession"](model=spec, npu=npu_index)
+    if len(cards) > 1:
+        sess = mod["LLMLocalSession"](model=spec, npu_indices=cards)
+    else:
+        sess = mod["LLMLocalSession"](model=spec, npu=cards[0])
     LOG.info("LLMLocalSession ready (%.1fs)", time.time() - t0)
     return sess
 
@@ -407,9 +423,16 @@ def _resolve_available_image_sizes(sess) -> list:
 # Per-call handlers                                                          #
 # --------------------------------------------------------------------------- #
 def info_handler(state: dict, model_id: str,
-                 startup_npu_index: int | None,
+                 startup_npu_index,
                  model_dir: str | None) -> dict:
     npu_index = state.get("npu_index")
+    npu_indices = state.get("npu_indices") or (
+        [npu_index] if isinstance(npu_index, int) else None)
+    startup_indices = (
+        startup_npu_index
+        if isinstance(startup_npu_index, (list, tuple))
+        else ([startup_npu_index] if startup_npu_index is not None else None)
+    )
 
     # Resource self-heal: recheck model_dir on every RPC. The
     # startup check at line 1076 only fires once; if the user
@@ -432,7 +455,9 @@ def info_handler(state: dict, model_id: str,
         "model":              model_id,
         "model_dir":          model_dir,
         "npu_index":          npu_index,
-        "npu_index_startup":  startup_npu_index,
+        "npu_indices":        npu_indices,
+        "npu_index_startup":  (startup_npu_index[0] if isinstance(startup_npu_index, (list, tuple)) and startup_npu_index else startup_npu_index),
+        "npu_indices_startup": startup_indices,
         "load_time_sec":      state.get("load_time_sec"),
         "init_error":         state.get("init_error", ""),
         "wdnai_available":     state.get("wdnai_available", False),
@@ -466,14 +491,35 @@ def info_handler(state: dict, model_id: str,
 
 def load_handler(state: dict, model_id: str,
                  payload_npu_index: Any) -> dict:
-    npu_index = payload_npu_index
-    if npu_index is None:
-        npu_index = state.get("npu_index")
-    if not isinstance(npu_index, int) or npu_index < 0:
+    raw = payload_npu_index
+    if raw is None:
+        raw = state.get("npu_indices") or state.get("npu_index")
+    if isinstance(raw, int):
+        cards = [raw]
+    elif isinstance(raw, (list, tuple)):
+        cards = [int(x) for x in raw]
+    else:
+        cards = []
+    if not cards or any(c < 0 for c in cards):
         return {
             "status": "error",
-            "error": "npu_index 缺失：load action 必须传 npu_index",
+            "error": "npu_index 缺失：load action 必须传 npu_index 或 npu_indices",
         }
+    manifest = load_manifest(model_id)
+    try:
+        requires = int(manifest.get("requires_cards", 1) or 1)
+    except (TypeError, ValueError):
+        requires = 1
+    if len(cards) != requires:
+        return {
+            "status": "error",
+            "error": (f"{model_id} 需要 {requires} 张算力卡，"
+                      f"实际传入 {cards}"),
+            "npu_index": cards[0],
+            "npu_indices": cards,
+        }
+    npu_index = cards[0]
+    npu_indices = cards
     # 资源预检：model_dir 不存在就直接报 missing_model_dir，不再去
     # 撞 rknn（撞了也只是把 FileNotFoundError 当 init_error 报上去，
     # 误诊为"启动失败"）。恢复路径：用户补完目录后再调一次 load，
@@ -488,11 +534,12 @@ def load_handler(state: dict, model_id: str,
         }
     # If already running on the same NPU, idempotent.
     if (state.get("status") == "running"
-            and state.get("npu_index") == npu_index
+            and state.get("npu_indices") == npu_indices
             and state.get("session") is not None):
         return {
             "status": "running",
             "npu_index": npu_index,
+            "npu_indices": npu_indices,
             "load_time_sec": state.get("load_time_sec"),
             "loaded_at": state.get("loaded_at"),
         }
@@ -505,6 +552,7 @@ def load_handler(state: dict, model_id: str,
         state["session"] = None
     state["status"] = "loading"
     state["npu_index"] = npu_index
+    state["npu_indices"] = npu_indices
     state["init_error"] = ""
     state["loaded_at"] = None
     state["load_time_sec"] = None
@@ -536,9 +584,9 @@ def load_handler(state: dict, model_id: str,
     def _do_init():
         try:
             t0 = time.time()
-            LOG.info("building LLMSession(model=%s, npu=%d) ...",
-                     model_id, npu_index)
-            sess = _build_session(model_id, npu_index)
+            LOG.info("building LLMSession(model=%s, npu=%s) ...",
+                     model_id, npu_indices)
+            sess = _build_session(model_id, npu_indices)
             load_sec = round(time.time() - t0, 2)
             # 轮次校验：旧轮的 init 完成后才到，看到 token 不一致
             # 就丢弃结果（新的 load 已经在用 state 了）。
@@ -574,6 +622,7 @@ def load_handler(state: dict, model_id: str,
     return {
         "status": "loading",
         "npu_index": npu_index,
+        "npu_indices": npu_indices,
     }
 
 
@@ -991,8 +1040,12 @@ def set_thinking_mode_handler(state: dict, payload: dict) -> dict:
     sess = state.get("session")
     if sess is None:
         return {"status": "noop (not loaded)", "changed": False}
-    current = bool(state.get("thinking_mode", False))
-    if current == desired:
+    # ``None`` means "the worker has not applied a mode yet". The C session's
+    # default is not guaranteed to be non-thinking (Qwen3.5-9B starts in
+    # thinking mode), so the first request must reset + reapply even when the
+    # caller asks for ``False``.
+    current = state.get("thinking_mode")
+    if current is not None and bool(current) == desired:
         return {"status": "ok", "changed": False}
     try:
         sess.reset()
@@ -1177,7 +1230,8 @@ def _build_extra_ops(state: dict, model_id: str,
     return {
         "info": lambda p: info_handler(
             state, model_id, startup_npu_index, model_dir),
-        "load": lambda p: load_handler(state, model_id, p.get("npu_index")),
+        "load": lambda p: load_handler(
+            state, model_id, p.get("npu_indices") or p.get("npu_index")),
         "unload": lambda p: unload_handler(state),
         "shutdown": _shutdown,
         "reset": lambda p: reset_handler(state),
@@ -1262,6 +1316,14 @@ def _config_path() -> str:
     return os.environ.get('WDNWEBUI_CONFIG') or str(_main_resolve())
 
 
+def _parse_npu_arg(value):
+    """Parse ``--npu 0,1`` into a list of card indices."""
+    if value is None:
+        return None
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    return [int(p) for p in parts]
+
+
 def run_worker(argv=None) -> int:
     """Boot this worker: bring up the Hub, register the replier, serve.
 
@@ -1290,7 +1352,7 @@ def run_worker(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="compute_worker")
     ap.add_argument("--model", required=True,
                     help="model id (key in MODEL_PRESETS)")
-    ap.add_argument("--npu", type=int, required=False, default=None,
+    ap.add_argument("--npu", type=_parse_npu_arg, required=False, default=None,
                     help="开机自动启动的 worker 在 spawn 时由主进程传入"
                          "（config.jsonc 的 compute.autostart[].npu_index）。"
                          "传了就等于注册完 replier 后立刻在后台线程 load，"
@@ -1312,6 +1374,10 @@ def run_worker(argv=None) -> int:
 
     model_id = args.model
     npu_index = args.npu
+    startup_npu_index = (
+        npu_index[0] if isinstance(npu_index, (list, tuple)) and npu_index
+        else npu_index
+    )
 
     # 设置本进程 comm（"worker:<alias>"），让主进程 _find_workers_by_name()
     # 能通过 /proc/<pid>/comm 找到我们做 dedup。必须在 _setup_logging 后
@@ -1362,6 +1428,7 @@ def run_worker(argv=None) -> int:
         "status": initial_status,
         "started_at": time.time(),
         "npu_index": None,
+        "npu_indices": None,
         "load_time_sec": None,
         "loaded_at": None,
         "init_error": "",
@@ -1473,7 +1540,8 @@ def run_worker(argv=None) -> int:
     )
     side_hub.start()
 
-    extra_ops = _build_extra_ops(_worker_state, model_id, npu_index, model_dir)
+    extra_ops = _build_extra_ops(
+        _worker_state, model_id, startup_npu_index, model_dir)
     served = []
     for svc in services:
         served.append(
@@ -1534,7 +1602,7 @@ def run_worker(argv=None) -> int:
     if npu_index is not None:
         def _eager_load():
             try:
-                LOG.info("eager load starting (--npu=%d) for %s",
+                LOG.info("eager load starting (--npu=%s) for %s",
                          npu_index, model_id)
                 load_handler(_worker_state, model_id, npu_index)
             except Exception as e:  # noqa: BLE001

@@ -84,7 +84,7 @@ kept2, dropped2 = _crop_autostart_for_cards(
      {"model": "qwen3-vl-4b", "npu_index": 2},
      {"model": "qwen3-vl-4b", "npu_index": 3}],
     [0, 1])
-check("指向非模型卡（USB 形态）的条目被丢弃",
+check("指向非算力卡（USB 形态）的条目被丢弃",
       ids(kept2) == "qwen3-vl-4b@0" and len(dropped2) == 2, ids(kept2))
 check("model_cards 为空时原样返回（不误杀）",
       ids(_crop_autostart_for_cards(dirty, [])[0]) == ids(dirty))
@@ -224,6 +224,56 @@ def _check_set_active_app_integration():
 
 
 _check_set_active_app_integration()
+
+print("\n【7】set_active_app 多卡模型 —— 9B 写回 [0, 1]")
+
+
+def _check_set_active_app_multicard():
+    from app.core.compute import registry as reg_mod
+
+    class _FakeConfig:
+        def __init__(self, section: dict):
+            self.section = section
+
+        def get_section(self, name: str, default=None):
+            return self.section.get(name, default)
+
+        def set_section(self, name: str, value) -> None:
+            self.section[name] = value
+
+    cfg = _FakeConfig({"compute": {"autostart": [], "active_app": None}})
+    orig_get_config = reg_mod.get_config
+    reg_mod.get_config = lambda: cfg
+    try:
+        reg = reg_mod.ComputeRegistry.__new__(reg_mod.ComputeRegistry)
+        reg._lock = threading.RLock()
+        reg._instances = {
+            (0, "qwen3.5-vl-9b", "spawned"): reg_mod.ModelInstance(
+                key=(0, "qwen3.5-vl-9b", "spawned"),
+                npu_index=0, npu_indices=(0, 1),
+                model_id="qwen3.5-vl-9b",
+                capability_types=["swcap_text_chat", "swcap_vision_chat",
+                                  "swcap_tool_call"],
+                instance_name="qwen3.5-vl-9b", label="qwen3.5-vl-9b",
+                memory_estimate_mb=7000, status="running",
+                queued_at=0.0, started_at=0.0, _source="spawned"),
+        }
+        out = reg.set_active_app("text-chat", ["swcap_text_chat"])
+    finally:
+        reg_mod.get_config = orig_get_config
+
+    written = cfg.get_section("compute")["autostart"]
+    check("9B autostart 写回 [0, 1]",
+          written == [{"model": "qwen3.5-vl-9b", "npu_index": [0, 1]}],
+          str(written))
+    check("9B extended 记录多卡",
+          out.get("autostart_extended")
+          == [{"capability": "swcap_text_chat", "model": "qwen3.5-vl-9b",
+               "npu_index": [0, 1]}],
+          str(out.get("autostart_extended")))
+
+
+_check_set_active_app_multicard()
 
 print("\n" + "=" * 56)
 print(f"通过 {PASS} / {PASS + FAIL}")

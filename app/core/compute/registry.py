@@ -83,7 +83,7 @@ def _resolve_compute_mode() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 模型卡位（model slot）                                                        #
+# 算力卡位（model slot）                                                        #
 # --------------------------------------------------------------------------- #
 # **枚举到的卡 ≠ 能跑模型的卡**。RKNN3 枚举（``get_devices_id()``）里混着
 # 两类东西：PCI BDF 形态（``0003:31:00.0``）是真正的 RK1828 协卡，能加载
@@ -91,14 +91,14 @@ def _resolve_compute_mode() -> str:
 # 上面加载 rknn 模型必然 ``vision init_runtime failed``（AGENTS.md v0.20
 # 实测：4 卡板子上 npu2 / npu3 就是这个形态）。
 #
-# 所以「模型卡位数」= 探测到的 PCI 形态卡数。**每张卡只能放一个模型**
+# 所以「算力卡位数」= 探测到的 PCI 形态卡数。**每张卡只能放一个模型**
 # （AGENTS.md v0.17 实测：同卡叠两个模型 rc=-6），这个数量就是本机
 # 能同时跑几个模型的硬上限。
 _PCI_BDF_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d+$")
 
 
 def card_count_override() -> Optional[int]:
-    """``config.jsonc["compute"]["card_count"]`` —— 手工指定模型卡位数。
+    """``config.jsonc["compute"]["card_count"]`` —— 手工指定算力卡位数。
 
     语义是**对探测结果的上限**，不是强制值：双卡板写 1 → 模拟单卡板；
     单卡板写 2 → 仍然是 1 张（不能凭空变出卡）。值非法（非整数 / < 1 /
@@ -663,23 +663,35 @@ def _parse_autostart_config(raw) -> list[dict]:
                 f"compute.autostart[{idx}].model={model!r} 不在 "
                 f"MODEL_PRESETS {sorted(MODEL_PRESETS.keys())} 中"
             )
-        npu_index = entry.get("npu_index")
-        if not isinstance(npu_index, int) or isinstance(npu_index, bool):
+        raw_npu = entry.get("npu_index")
+        if isinstance(raw_npu, int) and not isinstance(raw_npu, bool):
+            cards = [raw_npu]
+        elif isinstance(raw_npu, (list, tuple)):
+            cards = [int(x) for x in raw_npu]
+        else:
             raise ValueError(
-                f"compute.autostart[{idx}].npu_index 缺失或不是整数 "
-                f"(got {npu_index!r})；可选 0..N 的实际卡号")
-        if npu_index < 0:
+                f"compute.autostart[{idx}].npu_index 缺失或不是整数/整数列表 "
+                f"(got {raw_npu!r})；可选 0..N 的实际卡号")
+        if not cards or any(c < 0 for c in cards):
             raise ValueError(
-                f"compute.autostart[{idx}].npu_index={npu_index} 非法；"
+                f"compute.autostart[{idx}].npu_index={raw_npu} 非法；"
                 "必须是 0 起的实际卡号（主控 NPU 用 0）")
-        key = (model, int(npu_index))
+        if len(set(cards)) != len(cards):
+            raise ValueError(
+                f"compute.autostart[{idx}].npu_index 含重复卡号: {cards}")
+        requires = int(MODEL_PRESETS[model].get("requires_cards", 1) or 1)
+        if len(cards) != requires:
+            raise ValueError(
+                f"compute.autostart[{idx}] model={model!r} 需要 {requires} 张卡，"
+                f"npu_index 给了 {cards}")
+        key = (model, tuple(cards))
         if key in seen:
             raise ValueError(
                 f"compute.autostart 含重复条目 model={model!r} "
-                f"npu_index={npu_index}；同一张卡上不能挂两份同一个模型"
-                "（同卡叠模型会加载失败），换卡请写不同的 npu_index")
+                f"npu_index={raw_npu}")
         seen.add(key)
-        out.append({"model": model, "npu_index": int(npu_index)})
+        out.append({"model": model,
+                    "npu_index": cards[0] if len(cards) == 1 else cards})
     return out
 
 
@@ -699,7 +711,11 @@ def _autostart_npu_map() -> dict[str, int]:
     except ValueError as e:
         LOG.error("compute.autostart 配置非法（默认卡信息按未配置处理）: %s", e)
         return {}
-    return {e["model"]: e["npu_index"] for e in entries}
+    out: dict[str, int] = {}
+    for e in entries:
+        npu = e["npu_index"]
+        out[e["model"]] = npu[0] if isinstance(npu, (list, tuple)) else npu
+    return out
 
 
 def _with_autostart_markers(d: dict, autostart_npus: dict[str, int]) -> dict:
@@ -732,7 +748,11 @@ def _worker_npu_arg(npu_index: int | None,
     """worker 命令行上的 ``--npu`` 参数；不该由 worker 自己加载时是空列表。"""
     if npu_index is None or not _wants_eager_load(eager_load):
         return []
-    return ["--npu", str(int(npu_index))]
+    if isinstance(npu_index, (list, tuple)):
+        value = ",".join(str(int(x)) for x in npu_index)
+    else:
+        value = str(int(npu_index))
+    return ["--npu", value]
 
 
 def _instance_reusable(inst_npu_index: int, inst_source: str,
@@ -749,6 +769,10 @@ def _instance_reusable(inst_npu_index: int, inst_source: str,
     """
     if want_npu is None:
         return True
+    if isinstance(want_npu, (list, tuple)):
+        want_npu = int(want_npu[0]) if want_npu else None
+        if want_npu is None:
+            return True
     if inst_source not in ("spawned", "adopted_local"):
         return True
     if inst_npu_index == want_npu:
@@ -779,7 +803,7 @@ def transition_of(inst) -> str:
 
 def _crop_autostart_for_cards(entries: list[dict],
                               model_cards: list[int]) -> tuple[list[dict], list[dict]]:
-    """按模型卡位裁剪 autostart：非模型卡丢弃，**每张卡只留第一条**。
+    """按算力卡位裁剪 autostart：非算力卡丢弃，**每张卡只留第一条**。
 
     返回 ``(保留的, 丢弃的)``，丢弃的由调用方记日志。保留哪条按 config
     的先后顺序（第一条优先）—— 那是用户写入时的意图顺序。
@@ -791,49 +815,66 @@ def _crop_autostart_for_cards(entries: list[dict],
     dropped: list[dict] = []
     seen_cards: set[int] = set()
     for e in entries:
-        card = e.get("npu_index")
-        if card not in keep_cards or card in seen_cards:
+        raw_card = e.get("npu_index")
+        cards = ([int(x) for x in raw_card]
+                 if isinstance(raw_card, (list, tuple))
+                 else [int(raw_card)])
+        if (any(c not in keep_cards for c in cards)
+                or any(c in seen_cards for c in cards)):
             dropped.append(e)
             continue
-        seen_cards.add(card)
+        seen_cards.update(cards)
         kept.append(e)
     return kept, dropped
 
 
 def _merge_autostart_entry(prev: list[dict], model_id: str,
-                            npu_index: int) -> tuple[list[dict], bool, list[dict]]:
+                            npu_index) -> tuple[list[dict], bool, list[dict]]:
     """把 ``(model_id, npu_index)`` 并入 autostart，保持「一卡一模型」。
 
-    返回 ``(新列表, 是否新增, 被替换掉的同卡旧条目)``。同卡已有**别的**
-    模型时那条旧记录必然陈旧（运行期同卡只可能有一个 running 实例），留着
-    boot 时同卡就起两个 worker（rc=-6）。替换**原地**进行，保持 config
-    的先后顺序。
+    ``npu_index`` 可以是单卡或双卡（9B）。返回
+    ``(新列表, 是否新增, 被替换掉的旧条目)``。
     """
+    cards = ([int(x) for x in npu_index]
+             if isinstance(npu_index, (list, tuple))
+             else [int(npu_index)])
+    card_set = set(cards)
+    canonical = cards[0] if len(cards) == 1 else cards
+
+    def _entry_cards(e: dict) -> set:
+        raw = e.get("npu_index")
+        return set(raw) if isinstance(raw, (list, tuple)) else {raw}
+
     def _is_stale(e: dict) -> bool:
-        return e.get("npu_index") == npu_index and e.get("model") != model_id
+        return (e.get("model") != model_id
+                and bool(_entry_cards(e) & card_set))
 
     stale = [e for e in prev if _is_stale(e)]
-    has_self = any(e.get("model") == model_id
-                   and e.get("npu_index") == npu_index for e in prev)
+    has_self = any(
+        e.get("model") == model_id and _entry_cards(e) == card_set
+        for e in prev
+    )
     out: list[dict] = []
     placed = False
+    kept_self = False
     for e in prev:
         if _is_stale(e):
-            # 陈旧条目：第一个位置给本条目（保持 config 的先后顺序），
-            # 其余直接丢弃 —— 同卡只留一条。
             if not placed:
                 if not has_self:
-                    out.append({"model": model_id, "npu_index": npu_index})
+                    out.append({"model": model_id, "npu_index": canonical})
                 placed = True
             continue
+        if e.get("model") == model_id and _entry_cards(e) == card_set:
+            if kept_self:
+                continue
+            kept_self = True
         out.append(dict(e))
     if not has_self and not placed:
-        out.append({"model": model_id, "npu_index": npu_index})
+        out.append({"model": model_id, "npu_index": canonical})
     return out, not has_self, stale
 
-
 def _autostart_plan(instances: list[ModelInstance], model_id: str,
-                    npu_index: int) -> str:
+                    npu_index) -> str:
     """boot autostart 的判定：**本板**这张卡上有没有在跑的 worker。
 
     ``"skip"`` = 本板这张卡已在跑；``"spawn_local"`` = 本板负责起一个。
@@ -842,11 +883,15 @@ def _autostart_plan(instances: list[ModelInstance], model_id: str,
     「进程在但 not_loaded」不算跑。**peer 不参与判定** —— autostart 声明的
     是本板这张卡，借 peer 的算力会静默失效（对方一 unload 就没人跑）。
     """
-    serving_here = [i for i in instances
-                    if i.model_id == model_id
-                    and i._source in ("spawned", "adopted_local")
-                    and i.npu_index == npu_index
-                    and i.status in ("running", "loading")]
+    cards = ({int(x) for x in npu_index}
+             if isinstance(npu_index, (list, tuple)) else {int(npu_index)})
+    serving_here = [
+        i for i in instances
+        if i.model_id == model_id
+        and i._source in ("spawned", "adopted_local")
+        and cards.issubset(set(i.npu_indices or (i.npu_index,)))
+        and i.status in ("running", "loading")
+    ]
     return "skip" if serving_here else "spawn_local"
 
 
@@ -910,6 +955,8 @@ class ModelInstance:
     key: Tuple[int, str, str]                    # (npu, model_id, source) — source tag 防 spawned/adopted dict key 互撞
     npu_index: int                             # -1 until bound
     model_id: str
+    # 每个worker占用的卡位。单卡模型是空/-1；分段9B worker报(0, 1)。
+    npu_indices: tuple = ()
     device_id: Optional[bytes] = None
     llm_session: Any = None
     capability_types: list[str] = field(default_factory=list)
@@ -1011,6 +1058,7 @@ class ModelInstance:
         preset = MODEL_PRESETS.get(self.model_id, {})
         return {
             "npu_index":          self.npu_index,
+            "npu_indices":        list(self.npu_indices or ()),
             "model_id":           self.model_id,
             "label":              self.label,
             "instance_name":      self.instance_name,
@@ -1021,6 +1069,7 @@ class ModelInstance:
             "stderr_full":        self.stderr_full,
             "capability_types":   list(self.capability_types),
             "memory_estimate_mb": self.memory_estimate_mb,
+            "requires_cards":    int(preset.get("requires_cards", 1) or 1),
             "description":        preset.get("description", ""),
             "available_targets":  list(preset.get("available_targets", ["182x"])),
             "model_dir":          self.model_dir,
@@ -1080,6 +1129,7 @@ class SessionHandle:
     pid: int
     is_remote: bool
     session: Any
+    npu_indices: tuple = ()
 
     @property
     def worker_key(self) -> str:
@@ -1574,7 +1624,7 @@ class ComputeRegistry:
         三种拒绝理由要分开说，用户才知道该怎么改：
 
         * **越界** —— 本机根本没有这张卡（卡号是 0 起连续编号的）；
-        * **不是模型卡位** —— 卡在，但它是 RGA/VPU 设备（USB 序列号形态），
+        * **不是算力卡位** —— 卡在，但它是 RGA/VPU 设备（USB 序列号形态），
           跑不了 rknn 模型；
         * **被 card_count 限掉** —— ``compute.card_count`` 把可用卡位裁短了
           （双卡板写 1 = 模拟单卡板）。
@@ -1600,16 +1650,16 @@ class ComputeRegistry:
         detected = [c["npu_index"] for c in cards]
         if not detected:
             return (f"npu_index={npu_index} 越界：本机没有探测到任何 NPU 卡"
-                    f"（模型卡位 {model_cards}）")
+                    f"（算力卡位 {model_cards}）")
         if npu_index not in detected:
             return (f"npu_index={npu_index} 越界：本机只有 {len(detected)} 张卡"
                     f"（可用卡号 {min(detected)}~{max(detected)}），"
-                    f"模型卡位 {model_cards}")
+                    f"算力卡位 {model_cards}")
         cap = card_count_override()
         if cap is not None and npu_index >= cap:
             return (f"npu_index={npu_index} 不可用：compute.card_count={cap} "
                     f"只允许使用卡号 {model_cards}")
-        return (f"npu_index={npu_index} 不是模型卡位：能承载 RKNN 模型的卡号"
+        return (f"npu_index={npu_index} 不是算力卡位：能承载 RKNN 模型的卡号"
                 f"是 {model_cards}（其余卡是 RGA/VPU 设备，跑不了 rknn 模型）")
 
     def list_supported_models(self) -> list[dict]:
@@ -1915,7 +1965,7 @@ class ComputeRegistry:
 
     def _spawn_compute_worker(self, model_id: str,
                             allow_adopt: bool = True,
-                            npu_index: int | None = None,
+                            npu_index: int | list[int] | None = None,
                             eager_load: bool | None = None) -> ModelInstance:
         """Spawn a fresh ``compute_worker.py --model <id>`` subprocess.
 
@@ -2105,12 +2155,17 @@ class ComputeRegistry:
         # 次会把第一次的实例从 _instances 里挤掉（dict 覆盖）→ 那张卡的 worker
         # 变孤儿 → 随后被 adopt 当「多余孤儿」杀掉。boot 路径不走
         # bind_instance，光靠 bind 时改 key 救不了它。
-        spawn_npu = (npu_index
-                     if isinstance(npu_index, int) and npu_index >= 0
-                     else -1)
+        _cards = (
+            [int(x) for x in npu_index]
+            if isinstance(npu_index, (list, tuple))
+            else ([int(npu_index)] if isinstance(npu_index, int)
+                  and npu_index >= 0 else [])
+        )
+        spawn_npu = _cards[0] if _cards else -1
         inst = ModelInstance(
             key=(spawn_npu, model_id, "spawned"),
             npu_index=spawn_npu,
+            npu_indices=tuple(_cards),
             model_id=model_id,
             capability_types=list(preset["capability_types"]),
             instance_name=preset["instance_name"],
@@ -2621,7 +2676,7 @@ class ComputeRegistry:
         return spawned
 
     def _call_load_with_warmup(self, rpc_client, inst: ModelInstance,
-                               npu_index: int) -> dict:
+                               npu_index) -> dict:
         """Send the ``load`` RPC, retrying while the cshim Requester is
         still matching the worker's per-PID DDS service.
 
@@ -2638,23 +2693,30 @@ class ComputeRegistry:
         ``ok: false`` with a real message, which is returned as-is and
         never retried) — this only rides out discovery.
         """
-        payload = {"action": "load", "op": "load", "npu_index": npu_index}
+        cards = ([int(x) for x in npu_index]
+                 if isinstance(npu_index, (list, tuple))
+                 else [int(npu_index)])
+        payload = {
+            "action": "load", "op": "load",
+            "npu_index": cards if len(cards) > 1 else cards[0],
+            "npu_indices": cards,
+        }
         timeouts = (5_000, 15_000, 30_000)
         r = None
         for attempt, timeout_ms in enumerate(timeouts):
             if attempt:
                 time.sleep(2.0)
             LOG.debug(
-                "load RPC attempt %d/%d model=%s npu=%d timeout=%dms",
-                attempt + 1, len(timeouts), inst.model_id, npu_index,
+                "load RPC attempt %d/%d model=%s npu=%s timeout=%dms",
+                attempt + 1, len(timeouts), inst.model_id, cards,
                 timeout_ms)
             r = rpc_client.call(payload, timeout_ms=timeout_ms)
             if not (r or {}).get("error") == "timeout":
                 return r or {}
             LOG.info(
-                "load RPC timed out (attempt %d/%d) model=%s npu=%d — "
+                "load RPC timed out (attempt %d/%d) model=%s npu=%s — "
                 "likely DDS discovery still settling for worker pid=%s",
-                attempt + 1, len(timeouts), inst.model_id, npu_index,
+                attempt + 1, len(timeouts), inst.model_id, cards,
                 getattr(inst.proc, "pid", None))
         return r or {}
 
@@ -2691,7 +2753,7 @@ class ComputeRegistry:
         inst._probe_thread = probe
         probe.start()
 
-    def bind_instance(self, inst: ModelInstance, npu_index: int) -> ModelInstance:
+    def bind_instance(self, inst: ModelInstance, npu_index) -> ModelInstance:
         """v0.8 fire-and-forget：立即把 ``inst.status="loading"`` 返回，
         让前端 1Hz tick 看到 loading 状态 + 倒计时；后台线程跑 RPC
         ``load``，完成后翻 status=running / error，失败时 npu_index
@@ -2729,8 +2791,13 @@ class ComputeRegistry:
             if inst.rpc_client is None:
                 raise RuntimeError(
                     f"{inst.model_id} worker RPC client 未就绪 (re-setup 失败)")
-        if not isinstance(npu_index, int) or npu_index < 0:
+        if isinstance(npu_index, (list, tuple)):
+            cards = [int(x) for x in npu_index]
+        else:
+            cards = [int(npu_index)]
+        if not cards or any(c < 0 for c in cards):
             raise RuntimeError(f"npu_index 非法: {npu_index!r}")
+        npu_index = cards[0]
 
         # 乐观更新：前端 1Hz tick 立即看到 status="loading" + npu_index。
         #
@@ -2738,6 +2805,7 @@ class ComputeRegistry:
         # 同模型第二张卡的 spawn 会用同一个占位 key 把第一张卡挤掉（见 AGENTS.md）。
         with self._lock:
             inst.npu_index = npu_index
+            inst.npu_indices = tuple(cards)
             inst.status = "loading"
             inst.started_at = time.time()
             inst.error = ""
@@ -2783,10 +2851,10 @@ class ComputeRegistry:
                         return
                     LOG.debug(
                         "compute_registry: _run_load.call load model=%s "
-                        "npu=%d thread=%s",
-                        inst.model_id, npu_index, threading.get_ident())
+                        "npu=%s thread=%s",
+                        inst.model_id, cards, threading.get_ident())
                     r = self._call_load_with_warmup(
-                        rpc_client, inst, npu_index)
+                        rpc_client, inst, cards)
                 data = (r or {}).get("data") or {}
                 if not (r or {}).get("ok"):
                     err_msg = (r or {}).get("error") or "RPC failed"
@@ -2856,8 +2924,8 @@ class ComputeRegistry:
                             self._instances[new_key] = inst
                         # inst.status 已经是 loading（bind_instance 入口
                         # 乐观设置）；保留不要改 running。
-                    LOG.info("bind %s @ npu=%d: async load started, "
-                             "deferring to probe", inst.model_id, npu_index)
+                    LOG.info("bind %s @ npu=%s: async load started, "
+                             "deferring to probe", inst.model_id, cards)
                     return
                 # 翻 running + 更新 key + 加载耗时
                 new_key = (npu_index, inst.model_id, inst._source)
@@ -2870,8 +2938,8 @@ class ComputeRegistry:
                     inst.load_time_sec = data.get("load_time_sec")
                     inst.loaded_at = data.get("loaded_at")
                     inst.finished_at = time.time()
-                LOG.info("bound %s @ npu=%d (load=%.1fs)",
-                         inst.model_id, npu_index, inst.load_time_sec or 0.0)
+                LOG.info("bound %s @ npu=%s (load=%.1fs)",
+                         inst.model_id, cards, inst.load_time_sec or 0.0)
             except Exception as e:  # noqa: BLE001
                 # RPC call itself raised (transport-level error before
                 # we even got a JSON reply). Best-effort drain worker
@@ -3059,10 +3127,12 @@ class ComputeRegistry:
             raise RuntimeError(f"{model_id} 不在 registry")
         t0 = time.time()
         for inst in targets:
-            npu = inst.npu_index      # stop 会把它重置成 -1，先记卡号
+            npus = tuple(inst.npu_indices or (inst.npu_index,))
             self._stop_inst(model_id, inst)
             with self._lock:
-                self._recently_stopped[(model_id, npu)] = time.time()
+                for npu in npus:
+                    if isinstance(npu, int) and npu >= 0:
+                        self._recently_stopped[(model_id, npu)] = time.time()
         LOG.info(
             "compute_registry: stop_instance_local exit model=%s "
             "instances=%d elapsed=%.2fs thread=%s",
@@ -3524,7 +3594,8 @@ class ComputeRegistry:
         with self._lock:
             found = [i for i in self._instances.values()
                      if i.model_id == model_id
-                     and (npu_index is None or i.npu_index == npu_index)]
+                     and (npu_index is None
+                          or npu_index in (i.npu_indices or (i.npu_index,)))]
         found.sort(key=lambda i: (local_first.get(i._source, 9),
                                   i.npu_index))
         return found
@@ -3555,8 +3626,11 @@ class ComputeRegistry:
             kind = transition_of(inst)
             if not kind:
                 continue
-            npu = (inst._stop_npu if kind == "stopping" else inst.npu_index)
-            out.append((npu, kind))
+            cards = (inst.npu_indices if kind == "stopping"
+                     else inst.npu_indices) or (inst.npu_index,)
+            for npu in cards:
+                if isinstance(npu, int) and npu >= 0:
+                    out.append((npu, kind))
         return out
 
     def was_recently_stopped(self, model_id: str,
@@ -3651,11 +3725,13 @@ class ComputeRegistry:
                 "instance_name":      preset["instance_name"],
                 "capability_types":   list(preset["capability_types"]),
                 "memory_estimate_mb": preset["memory_estimate_mb"],
+                "requires_cards":    int(preset.get("requires_cards", 1) or 1),
                 "description":        preset.get("description", ""),
                 "available_targets":  list(preset.get("available_targets", ["182x"])),
                 "status":             "unavailable",
                 "error":              "",
                 "npu_index":          -1,
+                "npu_indices":        [],
                 "pid":                0,
                 "load_time_sec":      None,
                 "loaded_at":          None,
@@ -3756,7 +3832,7 @@ class ComputeRegistry:
         except ValueError as e:
             LOG.error("compute.autostart 配置非法，已跳过开机启动: %s", e)
             entries = []
-        # autostart 裁剪：非模型卡的条目丢弃 + 每张卡只留第一条
+        # autostart 裁剪：非算力卡的条目丢弃 + 每张卡只留第一条
         # （理由与规则见 _crop_autostart_for_cards）。
         model_cards = self.model_cards()
         if entries:
@@ -3764,7 +3840,7 @@ class ComputeRegistry:
             for e in dropped:
                 if e["npu_index"] not in model_cards:
                     LOG.info("boot: autostart 跳过 %s @ npu%s —— 该卡不在"
-                             "模型卡位 %s 内", e["model"], e["npu_index"],
+                             "算力卡位 %s 内", e["model"], e["npu_index"],
                              model_cards)
                 else:
                     LOG.info("boot: autostart 跳过 %s @ npu%s —— 一张卡只能"
@@ -3791,7 +3867,11 @@ class ComputeRegistry:
 
         for entry in entries:
             model_id = entry["model"]
-            npu_index = entry["npu_index"]
+            raw_npu = entry["npu_index"]
+            npu_cards = ([int(x) for x in raw_npu]
+                         if isinstance(raw_npu, (list, tuple))
+                         else [int(raw_npu)])
+            npu_index = npu_cards[0]
 
             with self._lock:
                 already = [i for i in self._instances.values()
@@ -3808,15 +3888,15 @@ class ComputeRegistry:
             # 判据：**本板**这张卡上有没有在跑的 worker。规则见
             # _autostart_plan（纯函数，可单测）。
             if _autostart_plan(list(self._instances.values()),
-                               model_id, npu_index) == "skip":
-                LOG.info("boot: %s 已在 npu=%d 跑着，跳过 adopt/spawn",
-                         model_id, npu_index)
+                               model_id, npu_cards) == "skip":
+                LOG.info("boot: %s 已在 npu=%s 跑着，跳过 adopt/spawn",
+                         model_id, npu_cards)
                 continue
 
             # 本板负责：起一个带 --npu N 的 worker。_boot_spawn_async 内部
             # allow_adopt=False → 不去 adopt peer（否则会捡回那个空壳，
             # 本板照样空转）。
-            self._boot_spawn_async(model_id, npu_index)
+            self._boot_spawn_async(model_id, raw_npu)
 
         # NOTE: the orphan sweep already ran above the loop. Do not add a
         # second one here — it would race the fire-and-forget spawn
@@ -3930,7 +4010,7 @@ class ComputeRegistry:
         except Exception:  # noqa: BLE001
             return None
 
-    def _boot_spawn_async(self, model_id: str, npu_index: int) -> None:
+    def _boot_spawn_async(self, model_id: str, npu_index) -> None:
         """Fire-and-forget spawn for one ``compute.autostart`` entry.
 
         The card travels to the worker as ``--npu``, so the model starts
@@ -3954,19 +4034,22 @@ class ComputeRegistry:
         这个模型」，捡回 peer 的实例（哪怕它正在跑）也会让本板这张卡空着
         ——「借算力」是省卡优化，由 boot 循环单独判定，这里一律不 adopt。
         """
+        cards = ([int(x) for x in npu_index]
+                 if isinstance(npu_index, (list, tuple))
+                 else [int(npu_index)])
         def _runner():
             try:
                 inst = self.ensure_worker_for_model(
-                    model_id, allow_adopt=False, npu_index=npu_index)
+                    model_id, allow_adopt=False, npu_index=cards)
                 inst._autostart = "enabled"
-                inst._default_npu_index = npu_index
+                inst._default_npu_index = cards[0]
                 # 报 worker 命令行里**实际**的 --npu 值：ensure_worker_for_model
                 # 也可能返回复用的实例，不能自称「spawned」。
                 argv = [str(a) for a in
                         (getattr(getattr(inst, "proc", None), "args", None) or [])]
                 i = argv.index("--npu") if "--npu" in argv else -1
-                LOG.info("boot autostart: %s @ npu=%d → %s（worker %s）",
-                         model_id, npu_index, inst.status,
+                LOG.info("boot autostart: %s @ npu=%s → %s（worker %s）",
+                         model_id, cards, inst.status,
                          "命令行带 --npu %s" % argv[i + 1]
                          if 0 <= i < len(argv) - 1
                          else "复用已绑定 npu=%s 的实例" % inst.npu_index)
@@ -3976,12 +4059,12 @@ class ComputeRegistry:
                     info = self._worker_info(inst)
                     if _autostart_needs_load(argv, (info or {}).get("status")):
                         LOG.info("boot autostart: %s 复用的 worker 没带 --npu"
-                                 "（%s），补发 load 让它加载到 npu=%d",
-                                 model_id, inst._source, npu_index)
-                        self.bind_instance(inst, npu_index)
+                                 "（%s），补发 load 让它加载到 npu=%s",
+                                 model_id, inst._source, cards)
+                        self.bind_instance(inst, cards)
             except Exception as e:  # noqa: BLE001
-                LOG.warning("boot autostart failed for %s @ npu=%d: %s",
-                            model_id, npu_index, e)
+                LOG.warning("boot autostart failed for %s @ npu=%s: %s",
+                            model_id, cards, e)
         threading.Thread(target=_runner,
                          name=f"boot-autostart-{model_id}",
                          daemon=True).start()
@@ -4361,7 +4444,17 @@ class ComputeRegistry:
                     if worker_status == "running":
                         with self._lock:
                             inst.status = "running"
+                            raw_indices = data.get("npu_indices")
                             worker_npu = data.get("npu_index")
+                            if isinstance(raw_indices, (list, tuple)):
+                                cards = tuple(int(x) for x in raw_indices)
+                            elif isinstance(worker_npu, int):
+                                cards = (worker_npu,)
+                            else:
+                                cards = ()
+                            if cards:
+                                inst.npu_indices = cards
+                                worker_npu = cards[0]
                             if (isinstance(worker_npu, int)
                                     and worker_npu >= 0
                                     and inst.npu_index != worker_npu):
@@ -4518,6 +4611,7 @@ class ComputeRegistry:
             out.append(SessionHandle(
                 model_id=inst.model_id,
                 npu_index=inst.npu_index,
+                npu_indices=tuple(inst.npu_indices or ()),
                 source=inst._source,
                 pid=pid,
                 is_remote=(inst._source == "adopted"),
@@ -4829,10 +4923,15 @@ class ComputeRegistry:
         for cap, insts in cap_to_local.items():
             # 同一个模型跑两张卡时两张卡都要记 —— 只记一张的话下次开机另一张卡空着。
             for inst in insts:
+                cards = tuple(inst.npu_indices or ())
+                target_npu = (
+                    list(cards) if len(cards) > 1
+                    else (cards[0] if cards else inst.npu_index)
+                )
                 # 维护「一卡一模型」不变量 —— 同卡的旧条目是陈旧的，替换掉
                 # （理由见 _merge_autostart_entry）。
                 new_autostart, added, stale = _merge_autostart_entry(
-                    new_autostart, inst.model_id, inst.npu_index)
+                    new_autostart, inst.model_id, target_npu)
                 replaced.extend(stale)
                 for e in stale:
                     LOG.info("compute.active_app=%s: autostart 移除同卡旧条目 "
@@ -4842,7 +4941,7 @@ class ComputeRegistry:
                     continue
                 extended.append({"capability": cap,
                                  "model": inst.model_id,
-                                 "npu_index": inst.npu_index})
+                                 "npu_index": target_npu})
 
         section["autostart"] = new_autostart
         section["active_app"] = app_id

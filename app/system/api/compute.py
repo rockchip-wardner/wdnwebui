@@ -50,7 +50,7 @@ Endpoints
 
 错误码：
 
-* 400 —— 业务校验失败（**npu_index 越界 / 不是模型卡位**）。
+* 400 —— 业务校验失败（**npu_index 越界 / 不是算力卡位**）。
 * 403 —— 操作的是 adopted / unavailable service（本机无权启停）。
 * 404 —— list_cards 返回空（未检测到 NPU）或 stop 时实例不存在。
 * 409 —— 该模型在这张卡上还处于过渡态（loading / stopping），排队等完
@@ -195,7 +195,7 @@ class AutostartEntry(BaseModel):
     model_config = {"extra": "forbid"}
 
     model: str
-    npu_index: int
+    npu_index: int | list[int]
 
     @field_validator("model")
     @classmethod
@@ -208,13 +208,31 @@ class AutostartEntry(BaseModel):
 
     @field_validator("npu_index")
     @classmethod
-    def _npu_nonnegative(cls, v: int) -> int:
-        if isinstance(v, bool) or not isinstance(v, int):
-            raise ValueError(f"npu_index 必须是整数，got {v!r}")
-        if v < 0:
+    def _npu_cards(cls, v):
+        items = [v] if isinstance(v, int) else list(v)
+        if not items:
+            raise ValueError("npu_index 不能为空列表")
+        out: list[int] = []
+        for n in items:
+            if isinstance(n, bool) or not isinstance(n, int):
+                raise ValueError(f"npu_index 必须是整数，got {n!r}")
+            if n < 0:
+                raise ValueError(
+                    f"npu_index 必须 >= 0（实际卡号，0 起），got {n}")
+            if n not in out:
+                out.append(n)
+        return out[0] if len(out) == 1 else out
+
+    @model_validator(mode="after")
+    def _requires_cards(self):
+        requires = int(MODEL_PRESETS[self.model].get("requires_cards", 1) or 1)
+        cards = (self.npu_index if isinstance(self.npu_index, list)
+                 else [self.npu_index])
+        if len(cards) != requires:
             raise ValueError(
-                f"npu_index 必须 >= 0（实际卡号，0 起），got {v}")
-        return v
+                f"model={self.model!r} 需要 {requires} 张卡，"
+                f"npu_index={self.npu_index!r}")
+        return self
 
 
 class ComputeConfigPayload(BaseModel):
@@ -237,7 +255,7 @@ class ComputeConfigPayload(BaseModel):
     model_config = {"extra": "ignore"}
 
     autostart: list[AutostartEntry] = Field(default_factory=list)
-    #: 模型卡位数上限（手工指定）。**必须在这里声明** —— 本端点是全量替换
+    #: 算力卡位数上限（手工指定）。**必须在这里声明** —— 本端点是全量替换
     #: ``compute`` section，未声明的字段会被 ``extra="ignore"`` 丢掉，运维
     #: 手写的 ``card_count`` 会在任何一次保存后静默消失。
     #: 语义是「对探测结果的上限」：双卡板写 1 → 模拟单卡板。
@@ -258,9 +276,12 @@ class ComputeConfigPayload(BaseModel):
     @classmethod
     def _unique_models(cls, v: list[AutostartEntry]) -> list[AutostartEntry]:
         """唯一性按 (model, npu_index)：跨卡重复是并行推理要的，同卡重复才是冲突。"""
-        seen: set[tuple[str, int]] = set()
+        seen: set[tuple[str, tuple]] = set()
         for entry in v:
-            key = (entry.model, entry.npu_index)
+            cards = (tuple(entry.npu_index)
+                     if isinstance(entry.npu_index, list)
+                     else (entry.npu_index,))
+            key = (entry.model, cards)
             if key in seen:
                 raise ValueError(
                     f"compute.autostart 含重复条目: model={entry.model!r} "
@@ -378,7 +399,7 @@ async def get_compute_config() -> dict:
     ``compute.services`` 一起删除，这里保留为**只读**，方便脚本 / 运维
     确认当前开机自启配置。写入仍走 Pydantic 的 ``AutostartEntry`` 校验。
 
-    ``card_count`` 是模型卡位数上限（未配置 = 按探测结果）。
+    ``card_count`` 是算力卡位数上限（未配置 = 按探测结果）。
     """
     from app.core.config import get_config
     section = get_config().get_section("compute", {})
@@ -432,13 +453,31 @@ async def start_instance(req: InstanceRequest) -> dict:
     渲染部分成功的状态。
 
     Raises:
-        400: npu_index 越界 / 不是模型卡位。
+        400: npu_index 越界 / 不是算力卡位。
         403: model 是 adopted from peer，本机无权 bind。
         422: pydantic 校验失败（缺字段 / model 未知 / npu_index 不是整数）。
     """
     reg = get_registry()
     npu_indices = (req.npu_index if isinstance(req.npu_index, list)
                    else [req.npu_index])
+    preset = MODEL_PRESETS.get(req.model, {})
+    requires_cards = int(preset.get("requires_cards", 1) or 1)
+    if requires_cards > 1:
+        if len(npu_indices) != requires_cards:
+            if len(npu_indices) == 1:
+                npu_indices = list(reg.model_cards())[:requires_cards]
+            if len(npu_indices) != requires_cards:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(f"{req.model} 需要 {requires_cards} 张协处理器卡同时"
+                            f"运行（例如 npu_index=[0, 1]）"),
+                )
+        if len(reg.model_cards()) < requires_cards:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"{req.model} 需要 {requires_cards} 张算力卡，本机只有 "
+                        f"{len(reg.model_cards())} 张"),
+            )
     # 卡位校验**必须在过渡态排队之前**（v0.29 补）：越界的卡号等再久也
     # 起不来（worker 会 IndexError 秒退），先排队只会让用户白等 120s
     # 再收到一个语焉不详的 409。docstring 早就承诺了「npu_index 越界 → 400」，
@@ -457,6 +496,31 @@ async def start_instance(req: InstanceRequest) -> dict:
         )
     created: list[dict] = []
     errors: list[dict] = []
+    if requires_cards > 1:
+        with reg.model_op_lock(req.model):
+            try:
+                inst = reg.ensure_worker_for_model(
+                    req.model, allow_adopt=False,
+                    npu_index=list(npu_indices), eager_load=False)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            if inst._source == "adopted":
+                raise HTTPException(
+                    status_code=403,
+                    detail=(f"{req.model} 是远端 peer 提供的 service，"
+                            "本机无权 bind"),
+                )
+            if (tuple(inst.npu_indices or ()) == tuple(npu_indices)
+                    and inst.status in ("loading", "running")):
+                created.append(inst.to_dict())
+            else:
+                try:
+                    inst = reg.bind_instance(inst, list(npu_indices))
+                    created.append(inst.to_dict())
+                except RuntimeError as e:
+                    errors.append({"npu_index": npu_indices, "detail": str(e)})
+        return {"ok": not errors, "instances": created,
+                "errors": errors, "snapshot": reg.snapshot()}
     for n in npu_indices:
         # 同一模型的启停串行化 —— 排队的多个请求可能同时醒来。
         with reg.model_op_lock(req.model):

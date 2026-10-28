@@ -100,6 +100,9 @@ class WorkerManifest:
     model_dir_name: str = ""
     #: Default instance name written into a fresh ``config.jsonc``.
     instance_name: str = ""
+    #: Number of RK182x cards one worker instance must occupy. ``1`` for
+    #: every single-card model; the segmented 9B export needs two.
+    requires_cards: int = 1
     memory_estimate_mb: int = 0
     estimated_init_seconds: int = 60
     description: str = ""
@@ -162,6 +165,7 @@ class WorkerManifest:
             "worker_name": self.worker_name,
             "model_dir_name": self.model_dir_name,
             "instance_name": self.instance_name,
+            "requires_cards": self.requires_cards,
             "memory_estimate_mb": self.memory_estimate_mb,
             "estimated_init_seconds": self.estimated_init_seconds,
             "description": self.description,
@@ -237,8 +241,8 @@ def _validate(raw: Any, stem: str) -> tuple[Optional[WorkerManifest], List[str]]
 
     known = {
         "id", "label", "capability_types", "spec_factory", "worker_name",
-        "model_dir_name", "instance_name", "memory_estimate_mb",
-        "estimated_init_seconds", "description", "notes",
+        "model_dir_name", "instance_name", "requires_cards",
+        "memory_estimate_mb", "estimated_init_seconds", "description", "notes",
         "available_targets", "hidden", "display_order",
     }
     return WorkerManifest(
@@ -249,6 +253,7 @@ def _validate(raw: Any, stem: str) -> tuple[Optional[WorkerManifest], List[str]]
         worker_name=raw.get("worker_name") or worker_id[:8],
         model_dir_name=raw.get("model_dir_name", ""),
         instance_name=raw.get("instance_name", ""),
+        requires_cards=int(raw.get("requires_cards", 1)),
         memory_estimate_mb=int(raw.get("memory_estimate_mb", 0)),
         estimated_init_seconds=int(raw.get("estimated_init_seconds", 60)),
         description=raw.get("description", ""),

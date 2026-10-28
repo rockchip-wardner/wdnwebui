@@ -2003,7 +2003,7 @@ const ComputeConfigPage = {
     // 按 npu_index 升序固定位置 —— 与 label "RK182x #N" 完全对齐，
     // 位置 1 ↔ #0、位置 2 ↔ #1，跨刷新稳定。详见 _sortNpuCards。
     //
-    // **只列模型卡位**（``_modelCards``）：多画一格跑不了模型的卡，会让
+    // **只列算力卡位**（``_modelCards``）：多画一格跑不了模型的卡，会让
     // 用户以为还有第二张卡可用（选它就会失败）。
     let rk182xCards = this._sortNpuCards(this._modelCards(cards))
       .slice(0, MAX_RK182X_CARDS);
@@ -2176,14 +2176,14 @@ const ComputeConfigPage = {
           let line;
           if (inst._source === "adopted_local") {
             const pid = inst.pid ? ` · PID ${inst.pid}` : "";
-            line = `${label}${pid} · NPU #${inst.npu_index}`;
+            line = `${label}${pid} · NPU #${this._npuLabel(inst)}`;
             head.title = `本机孤儿 worker（uvicorn reload 残留），无 Popen 句柄；要清理请 kill ${inst.pid}`;
           } else if (inst._source === "adopted") {
             const peerLabel = inst._peer_name || "远端";
-            line = `${label} @ ${peerLabel} · NPU #${inst.npu_index}`;
+            line = `${label} @ ${peerLabel} · NPU #${this._npuLabel(inst)}`;
             head.title = `远端 peer 提供的 service，本机无权操作`;
           } else {
-            line = `${label} · NPU #${inst.npu_index}`;
+            line = `${label} · NPU #${this._npuLabel(inst)}`;
           }
           head.textContent = line;
           li.appendChild(head);
@@ -2255,7 +2255,7 @@ const ComputeConfigPage = {
       ul.className = "cc-banner-list";
       for (const s of stuck) {
         const li = document.createElement("li");
-        li.textContent = `${s.label} · NPU #${s.npu_index} · ${s.status} 累计 ${s.elapsed}s`;
+        li.textContent = `${s.label} · NPU #${this._npuLabel(s)} · ${s.status} 累计 ${s.elapsed}s`;
         ul.appendChild(li);
       }
       stack.appendChild(this._makeBanner({
@@ -2503,6 +2503,7 @@ const ComputeConfigPage = {
         // 渲染端 (_makeLocalCard) 仍读这个字段，故保留。
         submodels:            [],
         description:          s.description || "",
+        requires_cards:       Number(s.requires_cards || 1),
         available_targets:    s.available_targets || ["182x"],
       };
       const isLocal = s._source !== "adopted";
@@ -2512,6 +2513,8 @@ const ComputeConfigPage = {
         s._source,
         s.status,
         s.npu_index,
+        (s.npu_indices || []).join(","),
+        s.requires_cards || 1,
         s.pid,
         s.error || "",
         s.label,
@@ -2821,6 +2824,12 @@ const ComputeConfigPage = {
     const isPeer   = svc._source === "adopted";
     // 后端过渡态:"" | "loading" | "stopping" —— 启停操作进行中。
     const trans    = svc.transition || "";
+    const requiresCards = Number(
+      (meta && meta.requires_cards) || svc.requires_cards || 1
+    );
+    const modelCardCount = this._modelCards(cards || []).length;
+    const insufficientCards = requiresCards > 1
+      && modelCardCount < requiresCards;
 
     // ---- card 整体 class
     card.dataset.source = svc._source || "spawned";
@@ -2867,7 +2876,8 @@ const ComputeConfigPage = {
     h.toggle.classList.toggle("is-on", isOn);
     h.toggle.classList.toggle("is-load", isLoad);
     h.toggle.classList.toggle("is-err", isErr);
-    h.toggle.classList.toggle("is-disabled", noCards || isPeer);
+    h.toggle.classList.toggle(
+      "is-disabled", noCards || isPeer || insufficientCards);
 
     const targetPicked = this._hasTargetPicked(card.dataset.model, svc);
     const needsTarget = !isOn && !isErr && !isMissingDir
@@ -2875,6 +2885,7 @@ const ComputeConfigPage = {
     // 过渡态("loading"/"stopping")也锁住 toggle —— 后端会排队或 409,
     // 前端先锁掉能少一轮无谓请求。
     const toggleBlocked = noCards
+                       || insufficientCards
                        || isLoad
                        || isErr
                        || isPeer
@@ -2886,6 +2897,9 @@ const ComputeConfigPage = {
         const peerLabel = svc._peer_name || "其他板子";
         h.toggleInput.setAttribute("aria-label",
           `${meta.label}：由远端 ${peerLabel} 提供，本机无权启停`);
+    } else if (insufficientCards) {
+      h.toggleInput.setAttribute("aria-label",
+        `${meta.label}：需要 ${requiresCards} 张算力卡，本机只有 ${modelCardCount} 张`);
     } else {
       h.toggleInput.setAttribute("aria-label",
         `${meta.label}：${isOn ? "已启用" : "未启用"}，点击切换`);
@@ -2893,6 +2907,9 @@ const ComputeConfigPage = {
 
     if (trans === "stopping") {
       h.toggle.title = "正在关闭中，已锁定";
+    } else if (insufficientCards) {
+      h.toggle.title =
+        `需要 ${requiresCards} 张算力卡（本机只有 ${modelCardCount} 张），无法启用`;
     } else if (noCards) {
       h.toggle.title = "无可用 NPU 卡";
     } else if (isLoad) {
@@ -2994,6 +3011,13 @@ const ComputeConfigPage = {
   },
 
   // 该模型当前**所有**实例占用的卡（同一个模型可能同时跑在多张卡上）。
+  _npuLabel(inst) {
+    const cards = inst && Array.isArray(inst.npu_indices) ? inst.npu_indices : [];
+    if (cards.length > 1) return cards.join(" + ");
+    if (cards.length === 1) return cards[0];
+    return inst ? inst.npu_index : "";
+  },
+
   _modelNpus(modelId) {
     const svcs = (this._snapshot && this._snapshot.services) || [];
     return Array.from(new Set(
@@ -3297,6 +3321,9 @@ const ComputeConfigPage = {
     const MAX_RK182X_OPTIONS = CC_MAX_RK182X_CARDS;
     const sorted = this._sortNpuCards(this._modelCards(cards));
     const sortedIndices = sorted.map(c => c.npu_index);
+    const requiresCards = Number(
+      (meta && meta.requires_cards) || (inst && inst.requires_cards) || 1
+    );
 
     // v0.8: 模型本身只支持某些 target（available_targets，如 ["182x"]）；
     // 不支持的卡灰掉 + 不可点。
@@ -3308,26 +3335,46 @@ const ComputeConfigPage = {
             : ["182x"]
     );
 
+    if (requiresCards > 1 && sortedIndices.length < requiresCards) {
+      this._selectedTarget[modelId] = [];
+      const ph = document.createElement("span");
+      ph.className = "cc-mem-empty";
+      ph.style.fontSize = "12px";
+      if (sortedIndices.length > 0) {
+        ph.textContent =
+          `需要 ${requiresCards} 张算力卡（本机 ${sortedIndices.length} 张），无法启用`;
+      } else {
+        ph.textContent = "未检测到 NPU 卡 —— 等待 enumerate…";
+      }
+      opts.appendChild(ph);
+      fs.appendChild(opts);
+      return fs;
+    }
+
     // 默认勾选：用户在「运行在」里选过的那些卡；其次是当前实例实际占用的
     // 卡（多卡时全部勾上）；再其次 config.compute.autostart 里声明的
     // npu_index；最后兜底第一个 supported target。
-    let defaults = new Set(this._selectedTargets(modelId));
-    if (defaults.size === 0) {
-      // 模型当前实际占用的卡（同时跑两张卡时两张都勾上）
-      const running = this._modelNpus(modelId);
-      if (running.length) defaults = new Set(running);
-    }
-    if (defaults.size === 0 && inst && inst.npu_index >= 0) {
-      defaults.add(inst.npu_index);
-    }
-    if (defaults.size === 0 && inst
-        && Number.isInteger(inst._default_npu_index)
-        && inst._default_npu_index >= 0) {
-      defaults.add(inst._default_npu_index);
-    }
-    if (defaults.size === 0) {
-      for (const idx of sortedIndices) {
-        if (supported.has("182x")) { defaults.add(idx); break; }
+    let defaults;
+    if (requiresCards > 1) {
+      defaults = new Set(sortedIndices.slice(0, requiresCards));
+    } else {
+      defaults = new Set(this._selectedTargets(modelId));
+      if (defaults.size === 0) {
+        const running = this._modelNpus(modelId);
+        if (running.length) defaults = new Set(running);
+      }
+      if (defaults.size === 0 && inst && inst.npu_index >= 0) {
+        defaults.add(inst.npu_index);
+      }
+      if (defaults.size === 0 && inst
+          && Number.isInteger(inst._default_npu_index)
+          && inst._default_npu_index >= 0) {
+        defaults.add(inst._default_npu_index);
+      }
+      if (defaults.size === 0) {
+        for (const idx of sortedIndices) {
+          if (supported.has("182x")) { defaults.add(idx); break; }
+        }
       }
     }
     // 只保留真实枚举出来的卡，避免 snapshot 里的陈旧卡号留下幽灵勾选。
@@ -3351,7 +3398,9 @@ const ComputeConfigPage = {
       input.value = String(npuIndex);
       input.className = "cc-target-radio";
       if (defaults.has(npuIndex)) input.checked = true;
+      if (requiresCards > 1) input.disabled = true;
       input.addEventListener("change", () => {
+        if (requiresCards > 1) return;
         const cur = new Set(this._selectedTargets(modelId));
         if (input.checked) cur.add(npuIndex); else cur.delete(npuIndex);
         this._selectedTarget[modelId] = Array.from(cur);
@@ -3370,6 +3419,7 @@ const ComputeConfigPage = {
     // 排序按 npu_index 升序，与顶部 182x 内存条位置完全对齐。
     for (const card of sorted) {
       if (rendered >= MAX_RK182X_OPTIONS) break;
+      if (requiresCards > 1 && rendered >= requiresCards) break;
       const idx = card.npu_index;
       renderOpt(idx, `RK182x #${idx}`,
                 card.device_id || `npu #${idx}`,
@@ -3393,7 +3443,7 @@ const ComputeConfigPage = {
   },
 
   // 只保留「能跑 rknn 模型」的卡。``snapshot.cards`` 里混着 USB 序列号形态
-  // 的 RGA/VPU 设备（模型一上去就 vision init_runtime failed）。模型卡位由
+  // 的 RGA/VPU 设备（模型一上去就 vision init_runtime failed）。算力卡位由
   // 后端 ``model_cards`` 给出；老后端没这字段时不过滤。
   _modelCards(cards) {
     const mc = this._snapshot && this._snapshot.model_cards;
