@@ -61,6 +61,13 @@ def _sdk_builtin(model_dir=None) -> set:
         model_dir = get_session().model_dir
     return set(available_config_speakers(model_dir))
 
+
+def _api_voices() -> list:
+    """后端清单里的全部音色(含用户音色)。"""
+    import urllib.request
+    with urllib.request.urlopen(f"{API_BASE}/api/tts/voices", timeout=10) as r:
+        return json.loads(r.read().decode()).get("voices") or []
+
 ok_count = 0
 failed: list = []
 
@@ -160,6 +167,8 @@ def test_catalog_endpoint() -> None:
     langs = data.get("languages") or []
     ref = {v["id"] for v in voices if v.get("kind") == "ref"}
     builtin = {v["id"] for v in voices if v.get("kind") == "builtin"}
+    # 用户音色(上传/录制人声现场提取)也在清单里 —— 总数要算上它们。
+    user = {v["id"] for v in voices if v.get("kind") == "user"}
 
     check("B1 参考音色 = SDK 内嵌 6 条", ref == EXPECT_REF, str(sorted(ref)))
     # 顺序跟 SDK 走:第一个是 news_female → 前端下拉默认选中它 = 历史默认
@@ -172,8 +181,9 @@ def test_catalog_endpoint() -> None:
           f"清单={sorted(builtin)} SDK={sorted(want_builtin)}")
     check("B3 内置音色 ⊆ 官方 9 个",
           builtin <= EXPECT_BUILTIN_MAX, str(sorted(builtin - EXPECT_BUILTIN_MAX)))
-    check("B3b 音色总数 = 参考音色数 + 内置数",
-          len(voices) == len(EXPECT_REF) + len(builtin), str(len(voices)))
+    check("B3b 音色总数 = 参考音色数 + 内置数 + 用户音色数",
+          len(voices) == len(EXPECT_REF) + len(builtin) + len(user),
+          str(len(voices)))
 
     got_lang = {l["id"] for l in langs}
     check("B4 语种 = auto + 10 种", got_lang == EXPECT_LANGUAGES,
@@ -284,8 +294,14 @@ def test_frontend_browser() -> None:
         b = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
         pg = b.new_page()
         errs: list = []
-        pg.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
+        bad_res: list = []
+        # 资源加载失败在 console 里也会冒一条 "Failed to load resource" ——
+        # 那是同一件事,归到 bad_res 里按 URL 判责,别重复算。
+        pg.on("console", lambda m: errs.append(m.text)
+              if m.type == "error" and "Failed to load resource" not in m.text else None)
         pg.on("pageerror", lambda e: errs.append("PAGEERROR: " + str(e)))
+        pg.on("response", lambda r: bad_res.append(f"{r.status} {r.url}")
+              if r.status >= 400 else None)
         pg.goto(f"{API_BASE}/#tts", wait_until="domcontentloaded", timeout=20000)
         pg.wait_for_timeout(2500)
         # headless 直开时 framework 的初始路由不会切到卡片页,手动切
@@ -297,33 +313,54 @@ def test_frontend_browser() -> None:
           const l = document.getElementById('tts-language');
           return {
             groups: v ? Array.from(v.querySelectorAll('optgroup')).map(
-                g => Array.from(g.children).map(o => o.value)) : [],
+                g => ({label: g.label,
+                      values: Array.from(g.children).map(o => o.value)})) : [],
             voiceCount: v ? v.options.length : -1,
             langCount: l ? l.options.length : -1,
           };
         }""")
         groups = info["groups"]
+        by_label = {g["label"]: g["values"] for g in groups}
         want_builtin = _sdk_builtin()
-        # 内置音色组**只在模型真带内置音色时**才存在
-        want_groups = 2 if want_builtin else 1
-        check("D1 音色下拉分组数正确", len(groups) == want_groups,
-              f"实得 {len(groups)} 组(期望 {want_groups}) {[len(g) for g in groups]}")
+        # 三类音色各一组(默认音色 / 内置音色 / 我的音色),**空的组不渲染**。
+        # 断言要按**分组标题**认领,不能按下标 —— 用户音色那一组存在与否
+        # 取决于用户有没有上传过,下标会随之下移。
+        api_voices = _api_voices()
+        want_user = {v["id"] for v in api_voices if v.get("kind") == "user"}
+        want_labels = ["默认音色"]
+        if want_builtin:
+            want_labels.append("内置音色（模型自带）")
+        if want_user:
+            want_labels.append("我的音色")
+        got_labels = [g["label"] for g in groups]
+        check("D1 音色下拉分组与顺序正确", got_labels == want_labels,
+              f"实得 {got_labels} 期望 {want_labels}")
         check("D2 参考音色组 = SDK 内嵌 6 条",
-              set(groups[0]) == EXPECT_REF if groups else False,
-              str(groups[0]) if groups else "")
+              set(by_label.get("默认音色", [])) == EXPECT_REF,
+              str(by_label.get("默认音色")))
         check("D2b 参考音色组第一个 = news_female(默认选中)",
-              groups[0][:1] == ["news_female"] if groups else False,
-              str(groups[0]) if groups else "")
-        got_builtin = set(groups[1]) if len(groups) > 1 else set()
+              by_label.get("默认音色", [])[:1] == ["news_female"],
+              str(by_label.get("默认音色")))
+        got_builtin = set(by_label.get("内置音色（模型自带）", []))
         check("D3 内置音色组 == SDK 的有效性探测结果",
               got_builtin == want_builtin,
               f"DOM={sorted(got_builtin)} SDK={sorted(want_builtin)}")
-        check("D4 音色总数 = 参考音色数 + 内置数",
-              info["voiceCount"] == len(EXPECT_REF) + len(want_builtin),
+        check("D4 音色总数 = 参考音色数 + 内置数 + 用户音色数",
+              info["voiceCount"] == len(EXPECT_REF) + len(want_builtin) + len(want_user),
               str(info["voiceCount"]))
+        check("D4b 我的音色组 = 清单里的用户音色",
+              set(by_label.get("我的音色", [])) == want_user,
+              str(by_label.get("我的音色")))
         check("D5 语种数 = 11", info["langCount"] == 11, str(info["langCount"]))
 
-        # 方言锁定提示 —— 有方言音色才测得着
+        # 提示文案:只有「方言音色 + auto/chinese」才需要解释(语种会被锁定),
+        # 其余情况**不提示** —— 「当前模型不含内置音色…」和「语种 auto = …」
+        # 两句已删,提示不能再靠它们撑场。
+        hint = pg.evaluate(
+            "() => document.getElementById('tts-voice-hint').textContent")
+        check("D6b 普通音色 → 提示为空", not hint.strip(), hint)
+
+        # 方言锁定提示 —— 有真方言音色才测得着
         dialect_voice = next((v for v in sorted(want_builtin)
                               if v in EXPECT_DIALECT), None)
         if dialect_voice:
@@ -335,11 +372,34 @@ def test_frontend_browser() -> None:
             hint = pg.evaluate(
                 "() => document.getElementById('tts-voice-hint').textContent")
             check("D6 方言音色 + auto → 提示锁定方言", "方言" in hint, hint)
-        else:
-            hint = pg.evaluate(
-                "() => document.getElementById('tts-voice-hint').textContent")
-            check("D6b 无内置音色 → 提示说明原因",
-                  "不含内置音色" in hint, hint)
+
+        # 本板部署的是声音克隆版权重,清单里没有内置音色 → 上面的方言分支
+        # 根本跑不到。造一个带 dialect 标记的探针选项验它 —— 那条提示跟
+        # 音色来源无关,只看 option 上的 dialect 字段。
+        pg.evaluate("""() => {
+          const v = document.getElementById('tts-voice');
+          const o = document.createElement('option');
+          o.value = '__dialect_probe__';
+          o.textContent = '方言探针';
+          o.dataset.kind = 'ref';
+          o.dataset.dialect = 'sichuan_dialect';
+          v.appendChild(o);
+          v.value = '__dialect_probe__';
+          v.dispatchEvent(new Event('change'));
+        }""")
+        pg.wait_for_timeout(300)
+        hint = pg.evaluate(
+            "() => document.getElementById('tts-voice-hint').textContent")
+        check("D6c 探针音色带方言 → 提示锁定方言", "方言" in hint, hint)
+        # 收尾:撤掉探针,恢复默认选中(后面的 payload 分流要干净的下拉)
+        pg.evaluate("""() => {
+          const v = document.getElementById('tts-voice');
+          const o = v.querySelector('option[value="__dialect_probe__"]');
+          if (o) o.remove();
+          v.value = 'news_female';
+          v.dispatchEvent(new Event('change'));
+        }""")
+        pg.wait_for_timeout(200)
 
         # payload 分流(拦下 /tts/start,不发真请求)
         captured: dict = {}
@@ -373,6 +433,10 @@ def test_frontend_browser() -> None:
             check(f"D7 {voice} 的 payload 分流正确", ok, str(captured))
 
         check("D8 页面无 JS 报错", not errs, "; ".join(errs[:3]))
+        # 资源失败按 URL 归责:别的卡的接口 404 不该算成 TTS 的问题
+        # (目前 /api/video-retrieval/metrics 一直是 404,VR 卡不在本仓库)。
+        tts_bad = [x for x in bad_res if "/api/tts/" in x]
+        check("D9 TTS 自己的请求无失败", not tts_bad, "; ".join(tts_bad[:3]))
         b.close()
 
 

@@ -50,7 +50,6 @@ const TTS = {
   lastSnap: null,
   _autoName: "",       // 上次自动填进名字框的值（用来分辨"用户改过"）
   _voiceIds: new Set(), // 清单里所有音色 id（自动填名时避开撞名）
-  _hasBuiltin: null,   // 清单里有没有内置音色(null = 还没拉清单)
   _voices: null,       // 最近一次拉到的音色清单（向导页也要用）
   _catalogPromise: null, // 清单请求的 promise（向导可能在清单到达前就挂载）
   _wizardVoice: "",    // 向导里选中的音色（换步重建 select 后要还原）
@@ -238,7 +237,6 @@ const TTS = {
       const data = await r.json() || {};
       const voices = data.voices || [];
       this._voices = voices;
-      this._hasBuiltin = voices.some((v) => v.kind === "builtin");
       this._fillVoices(voices);
       this._fillLanguages(data.languages || []);
       this._updateVoiceHint();
@@ -606,22 +604,16 @@ const TTS = {
 
   // SDK 里「方言音色 + 语种 auto/chinese」会把语言 id 锁成该方言 ——
   // 不说清楚,用户选了 auto 却听到四川话,看着像 bug。
+  // 其余情况不提示 —— 少说两句比解释一堆更好。
   _updateVoiceHint() {
     const hintEl = document.getElementById("tts-voice-hint");
     if (!hintEl) return;
-    // 本模型没有内置音色 → 说清楚原因,免得用户以为那一组是加载失败。
-    if (this._hasBuiltin === false) {
-      hintEl.textContent = "当前模型不含内置音色（部署的是声音克隆版权重），只有参考音色可选。";
-      return;
-    }
     const voice = this._selectedVoice();
     const langEl = document.getElementById("tts-language");
     const lang = langEl ? langEl.value : "auto";
     if (voice.dialect && (lang === "auto" || lang === "chinese")) {
       const d = DIALECT_LABELS[voice.dialect] || voice.dialect;
       hintEl.textContent = `「${voice.label}」自带${d}：语种 ${lang} 会锁定为${d}，改选其它语种可解除。`;
-    } else if (lang === "auto") {
-      hintEl.textContent = "语种 auto = 由模型自动判断文本语种。";
     } else {
       hintEl.textContent = "";
     }
