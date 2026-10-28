@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.core.config import get_config
+from app.core.forwarded import XForwardedProtoMiddleware
 from app.core.html_assembly import assemble_index_html
 from app.core.manifest import discover as discover_cards
 from app.core.compute.registry import get_registry
@@ -125,6 +126,12 @@ def create_app() -> FastAPI:
         version=__version__,
         description="wdnwebui service (plugin-driven frontend)",
     )
+
+    # 0. TLS 转发（scripts/tls_relay.py）在前面终结 TLS 时会把原始 scheme
+    #    用 X-Forwarded-Proto 送过来 —— 这一层把它落到 scope["scheme"]，
+    #    后端生成的绝对 URL（307 的 Location 等）才是对的。
+    #    详见 app/core/forwarded.py 的说明。
+    app.add_middleware(XForwardedProtoMiddleware)
 
     # 1. Discover cards (manifest scan + validation)
     manifests = discover_cards()
