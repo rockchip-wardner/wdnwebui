@@ -1477,6 +1477,18 @@
       attachCurve();
     }
 
+    // 字段渲染完 → 通知卡片：有些字段的选项是**运行时**才知道的
+    // （音色清单来自后端、用户音色随时会变），wizard.json 是静态的写不了。
+    // 卡片收到事件后往自己的字段里塞选项。框架不认识任何卡片字段。
+    try {
+      window.dispatchEvent(new CustomEvent("wizard:step-rendered", {
+        detail: {
+          appId: state.app && state.app.id,
+          stepId: stepDef.id,
+        },
+      }));
+    } catch (_) { /* 订阅方抛异常不影响向导 */ }
+
     _renderFootNext(foot, cfg, state, true);
   }
 

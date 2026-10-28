@@ -2267,6 +2267,22 @@ env 步 —— 看上去就像「回不去」（用户实测）。
 ROUTER 看到 `_loadedApps.has(page)` 为 true 直接跳过 `_loadCardJS`,
 wizard 永远不会再挂载。
 
+### `wizard:step-rendered` 事件 —— 运行时才知道选项的字段
+
+`wizard.json` 是静态的,但有些字段的选项**运行时**才知道(tts 的音色
+清单来自后端,用户音色随时会变)。`_renderFormStep` 渲染完字段后 dispatch
+`window` 上的 `wizard:step-rendered`(detail `{appId, stepId}`),卡片收到
+后往自己的字段里塞选项 —— 框架仍然不认识任何字段名,零耦合不变。
+
+**卡片自己填选项时必须记住自己选的值**。换步会 `body.innerHTML=""`
+重建整个 step,新的 `<select>` 是空的 —— 框架恢复 `state.values` 只能
+恢复**已经存在的选项**,而选项是卡片后填的。卡片重建选项后若回落成
+「功能页当前值」,用户在向导里挑的音色会被无声冲掉:实测选「高冷御姐音」
+→ 下一步 → 上一步 → 变回第一个音色,合成请求也跟着用错音色。
+
+解法:用 `wizard:field-change`(已有事件,detail 带 `values` 快照)记住
+向导里自己的选择,重建时优先还原。
+
 ### 应用页启用 wizard 模式
 
 应用页(`app/apps/<id>/`)启用 wizard 仅需两步,**无需改 framework.js**:

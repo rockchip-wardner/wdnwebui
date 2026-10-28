@@ -230,6 +230,38 @@
   gap: 12px;
 }
 
+/* 音色下拉 + 试听按钮：一行放不下就换行，按钮不跟着拉宽 */
+.tts-voice-field .tts-voice-pick {
+  align-items: center;
+  gap: 8px;
+}
+.tts-voice-field .tts-select {
+  min-width: 12rem;
+  max-width: 20rem;
+}
+/* 试听按钮（功能页与向导页共用）。
+ * 向导里复用 .wd-wizard-browse-btn 的位置，但那个是「主动作」的蓝底大按钮
+ * —— 试听只是辅助动作，蓝底满行会让人以为它是这一步的主按钮。改成白底
+ * 小按钮，左对齐。 */
+.tts-preview-btn {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  color: #374151;
+  padding: 4px 12px;
+  font-size: 13px;
+  font-weight: 400;
+}
+.tts-preview-btn:hover {
+  background: #f3f4f6;
+  border-color: #9ca3af;
+}
+.tts-preview-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .tts-voice-upload .tts-field {
   display: flex;
   flex-direction: column;

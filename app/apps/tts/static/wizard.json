@@ -11,6 +11,7 @@
     { "id": "text", "title": "合成文本",       "kind": "form",
       "fields": [
         { "id": "tts-text", "ui_key": "text", "label": "例:你好,这是一个语音合成测试。", "summary_label": "要合成的文本", "type": "textarea" },
+        { "id": "tts-voice", "ui_key": "voice", "label": "音色", "summary_label": "音色", "type": "select", "options": [] },
         { "id": "tts-play-to", "ui_key": "playTo", "label": "试听目标", "type": "select",
           "options": [
             { "value": "browser", "label": "浏览器", "selected": true },

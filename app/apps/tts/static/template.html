@@ -19,9 +19,13 @@
                     placeholder="请输入要合成的文本，例如：你好，这是一个语音合成测试。"></textarea>
 
           <div class="tts-controls">
-            <label class="tts-field">
-              <span class="tts-label">声音</span>
-              <select id="tts-voice" class="tts-select"></select>
+            <label class="tts-field tts-voice-field">
+              <span class="tts-label">音色</span>
+              <div class="tts-voice-pick">
+                <select id="tts-voice" class="tts-select"></select>
+                <button id="tts-voice-preview" class="vd-btn vd-btn-mini" type="button"
+                        title="播放这个音色的试听样例">试听</button>
+              </div>
             </label>
             <label class="tts-field">
               <span class="tts-label">语种</span>
@@ -59,6 +63,7 @@
             <span class="tts-audio-chip" id="tts-audio-chip">浏览器音频待启动</span>
             <audio id="tts-audio" class="hidden" preload="auto" controls></audio>
           </div>
+          <audio id="tts-voice-preview-audio" class="hidden" preload="none"></audio>
         </div>
 
         <section class="vd-section">
@@ -124,7 +129,7 @@
                 <button id="tts-rec-start" class="vd-btn vd-btn-primary" type="button">开始录音</button>
                 <button id="tts-rec-stop" class="vd-btn" type="button" disabled>停止</button>
                 <button id="tts-rec-retry" class="vd-btn" type="button" disabled>重录</button>
-                <button id="tts-rec-board" class="vd-btn vd-btn-mini" type="button" title="用板子自己的麦克风录">用板子麦克风录</button>
+                <button id="tts-rec-board" class="vd-btn vd-btn-mini" type="button" title="用板子自己的麦克风录">板载麦克风录音</button>
               </div>
               <div class="tts-hint" id="tts-rec-hint"></div>
             </div>

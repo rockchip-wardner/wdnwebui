@@ -1205,6 +1205,22 @@ class TtsSession:
 # --------------------------------------------------------------------------- #
 # Voice / language catalog
 # --------------------------------------------------------------------------- #
+#: 试听样例目录 —— 卡片 static 下，每个自带音色一个 ``<id>.wav``。
+#: 离线生成（scripts/gen_voice_previews.py），不在运行时算：一个音色合成
+#: 一段要十几秒，放到页面上等不得。
+VOICE_PREVIEW_DIR = Path(__file__).resolve().parent / "static" / "previews"
+
+
+def _preview_url(name: str) -> str:
+    """自带音色的试听样例 URL；没有样例文件 → 空串（前端就不显示试听）。"""
+    try:
+        if not (VOICE_PREVIEW_DIR / (name + ".wav")).is_file():
+            return ""
+    except OSError:
+        return ""
+    return "/api/tts/voice-preview/" + name
+
+
 def voice_catalog(model_dir=None) -> dict:
     """可用音色 + 语种清单(前端下拉的数据源)。
 
@@ -1215,6 +1231,9 @@ def voice_catalog(model_dir=None) -> dict:
     另外合并**用户音色**(上传参考音频现场提取的 x-vector)——
     目录 ``<resource_dir>/tts_voices`` 下每个 ``<name>.npy`` 算一个,
     ``kind="user"``,前端按 ``kind`` 分组渲染。
+
+    自带音色额外带 ``preview``（试听样例的 URL，没有样例文件时为空串）——
+    用户选音色前先听一段,不然只能凭名字猜。
     """
     from wdnai.backends.tts import (
         CODEC_LANGUAGE_ID,
@@ -1234,7 +1253,7 @@ def voice_catalog(model_dir=None) -> dict:
     # 顺序跟着 SDK 走:内嵌字典的第一条就是默认音色(前端下拉默认选中
     # 它)。所以「默认音色」= SDK 内嵌表的**第一条**,不另外写死名字。
     voices = [
-        {"id": name, "kind": "ref", "dialect": ""}
+        {"id": name, "kind": "ref", "dialect": "", "preview": _preview_url(name)}
         for name in _get_bundled_speaker_embeddings()
     ]
     voices += [

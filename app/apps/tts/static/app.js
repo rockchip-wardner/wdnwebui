@@ -51,6 +51,9 @@ const TTS = {
   _autoName: "",       // 上次自动填进名字框的值（用来分辨"用户改过"）
   _voiceIds: new Set(), // 清单里所有音色 id（自动填名时避开撞名）
   _hasBuiltin: null,   // 清单里有没有内置音色(null = 还没拉清单)
+  _voices: null,       // 最近一次拉到的音色清单（向导页也要用）
+  _catalogPromise: null, // 清单请求的 promise（向导可能在清单到达前就挂载）
+  _wizardVoice: "",    // 向导里选中的音色（换步重建 select 后要还原）
   _droppedFile: null,  // 拖放区收下的 File（PC 上的文件）
 
   init() {
@@ -66,9 +69,16 @@ const TTS = {
     const stopBtn = document.getElementById("tts-stop");
     const audioEl = document.getElementById("tts-audio");
 
-    if (voiceEl) voiceEl.addEventListener("change", () => this._updateVoiceHint());
+    if (voiceEl) voiceEl.addEventListener("change", () => {
+      this._updateVoiceHint();
+      this._updatePreviewButton();
+    });
     if (langEl) langEl.addEventListener("change", () => this._updateVoiceHint());
-    this.loadCatalog();
+    const previewBtn = document.getElementById("tts-voice-preview");
+    if (previewBtn) {
+      previewBtn.addEventListener("click", () => { this.previewVoice(); });
+    }
+    this._catalogPromise = this.loadCatalog();
 
     if (volEl && volValEl) {
       volEl.addEventListener("input", () => {
@@ -227,6 +237,7 @@ const TTS = {
       if (!r.ok) throw new Error("HTTP " + r.status);
       const data = await r.json() || {};
       const voices = data.voices || [];
+      this._voices = voices;
       this._hasBuiltin = voices.some((v) => v.kind === "builtin");
       this._fillVoices(voices);
       this._fillLanguages(data.languages || []);
@@ -246,16 +257,35 @@ const TTS = {
     // 重填清单前先记住当前选择 —— 上传/删除音色后要重拉清单，
     // 不保留的话用户刚选好的音色会被无声地冲回第一项。
     const prev = el.value;
-    el.innerHTML = "";
+    this._appendVoiceOptions(el, voices);
+    if (prev) {
+      const opt = Array.prototype.find.call(el.options, (o) => o.value === prev);
+      if (opt) opt.selected = true;
+    }
+    this._updatePreviewButton(el);
+    this._renderUserVoices(voices);
+  },
+
+  // 音色分三组渲染（应用页的下拉、向导页的下拉共用一份）。
+  // kind: "ref" = 内嵌参考音色, "builtin" = 模型自带的内置音色,
+  // "user" = 用户上传参考音频现场提取的音色。
+  _voiceGroups(voices) {
     const ref = [], builtin = [], user = [];
-    // kind: "ref" = 内嵌参考音色, "builtin" = 模型自带的内置音色,
-    // "user" = 用户上传参考音频现场提取的音色。
-    voices.forEach((v) => {
+    (voices || []).forEach((v) => {
       if (v.kind === "ref") ref.push(v);
       else if (v.kind === "user") user.push(v);
       else builtin.push(v);
     });
-    const addGroup = (list, label) => {
+    return [
+      ["默认音色", ref],
+      ["内置音色（模型自带）", builtin],
+      ["我的音色", user],
+    ];
+  },
+
+  _appendVoiceOptions(sel, voices) {
+    sel.innerHTML = "";
+    this._voiceGroups(voices).forEach(([label, list]) => {
       if (!list.length) return;
       const g = document.createElement("optgroup");
       g.label = label;
@@ -265,18 +295,58 @@ const TTS = {
         o.textContent = VOICE_LABELS[v.id] || v.id;
         o.dataset.kind = v.kind || "";
         o.dataset.dialect = v.dialect || "";
+        // 试听样例的 URL（没有样例 → 空 → 该音色不给试听按钮）
+        if (v.preview) o.dataset.preview = v.preview;
         g.appendChild(o);
       });
-      el.appendChild(g);
-    };
-    addGroup(ref, "参考音色（声音克隆）");
-    addGroup(builtin, "内置音色（模型自带）");
-    addGroup(user, "我的音色（上传提取）");
-    if (prev) {
-      const opt = Array.prototype.find.call(el.options, (o) => o.value === prev);
-      if (opt) opt.selected = true;
+      sel.appendChild(g);
+    });
+  },
+
+  // ------------------------------------------------------------------ //
+  // 向导里的音色下拉
+  //
+  // 选项是**运行时**才知道的（音色清单来自后端，用户音色随时会变），
+  // wizard.json 是静态的写不了 —— 卡片自己填。
+  // ------------------------------------------------------------------ //
+  async onWizardStepRendered(appId) {
+    if (appId !== "tts") return;
+    const sel = document.querySelector(
+      '#wd-wizard-root-tts [data-field-id="tts-voice"]');
+    if (!sel) return;
+    if (this._catalogPromise) await this._catalogPromise;
+    const voices = this._voices || [];
+    this._appendVoiceOptions(sel, voices);
+    // 选谁：向导里之前选的 > 功能页当前选的 > 清单第一条（= SDK 默认音色）。
+    //
+    // 第一项必须是「向导里之前选的」—— 换步会重建整个 body，新 select 是空的，
+    // 若回落成功能页的值，用户在向导里挑的音色会被无声地冲掉（实测：选
+    // 「高冷御姐音」→ 下一步 → 上一步 → 变回第一个音色）。
+    const appSel = document.getElementById("tts-voice");
+    const ids = voices.map((v) => v.id);
+    const want = [this._wizardVoice, appSel ? appSel.value : "",
+                  ids.length ? ids[0] : ""]
+      .find((id) => id && ids.indexOf(id) >= 0);
+    if (want) {
+      sel.value = want;
+      // 派发 change → 向导把值记进 state.values，否则 finish 拿不到。
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
     }
-    this._renderUserVoices(voices);
+    this._attachWizardPreviewBtn(sel);
+  },
+
+  // 向导的音色字段旁挂一个「试听」按钮（与功能页同一个）。
+  _attachWizardPreviewBtn(sel) {
+    const wrap = sel.closest(".wd-wizard-field");
+    if (!wrap) return;
+    if (wrap.querySelector(".tts-preview-btn")) return;   // 已经在上面了
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "wd-wizard-browse-btn tts-preview-btn";
+    btn.textContent = "试听";
+    btn.title = "播放这个音色的试听样例";
+    btn.addEventListener("click", () => { this.previewVoice(sel); });
+    wrap.appendChild(btn);
   },
 
   // ------------------------------------------------------------------ //
@@ -306,10 +376,6 @@ const TTS = {
       name.className = "tag";
       name.textContent = v.id;
       meta.appendChild(name);
-      const path = document.createElement("span");
-      path.className = "vd-event-path";
-      path.textContent = "板端提取的音色特征（2048 维 x-vector）";
-      meta.appendChild(path);
 
       const del = document.createElement("button");
       del.type = "button";
@@ -396,6 +462,7 @@ const TTS = {
     if (opt) {
       el.value = id;
       this._updateVoiceHint();
+      this._updatePreviewButton();
     }
   },
 
@@ -487,7 +554,7 @@ const TTS = {
 
   _selectedVoice() {
     const el = document.getElementById("tts-voice");
-    const opt = el && el.selectedOptions ? el.selectedOptions[0] : null;
+    const opt = this._voiceOpt(el);
     if (!opt || !opt.value) return { id: "", kind: "", dialect: "", label: "" };
     return {
       id: opt.value,
@@ -495,6 +562,46 @@ const TTS = {
       dialect: opt.dataset.dialect || "",
       label: opt.textContent || opt.value,
     };
+  },
+
+  // 当前选中的 <option>（功能页与向导页共用）。
+  _voiceOpt(sel) {
+    return sel && sel.selectedOptions ? sel.selectedOptions[0] : null;
+  },
+
+  // 试听按钮的可用性：当前音色没有样例 → 置灰（用户自己的音色就没有）。
+  _updatePreviewButton(selectEl) {
+    const btn = document.getElementById("tts-voice-preview");
+    if (!btn) return;
+    const opt = this._voiceOpt(selectEl || document.getElementById("tts-voice"));
+    btn.disabled = !(opt && opt.dataset.preview);
+  },
+
+  // 试听：播放这个音色的样例（离线生成的一段 WAV）。
+  // 样例只覆盖**自带音色** —— 用户自己的音色没有样例（那是 ta 本人的声音，
+  // 也不该由系统替 ta 决定念哪句话）。
+  async previewVoice(selectEl) {
+    const opt = this._voiceOpt(selectEl || document.getElementById("tts-voice"));
+    const url = opt ? (opt.dataset.preview || "") : "";
+    const label = opt ? (VOICE_LABELS[opt.value] || opt.value) : "";
+    if (!url) {
+      this.setStatus("「" + (label || "当前音色") + "」没有试听样例", true);
+      return;
+    }
+    const audio = document.getElementById("tts-voice-preview-audio");
+    if (!audio) return;
+    try {
+      if (audio.dataset.src !== url) {
+        audio.src = url;           // 换源 → 播放头自动回到 0
+        audio.dataset.src = url;
+      } else {
+        audio.currentTime = 0;     // 同一段 → 手动回到开头重播
+      }
+      await audio.play();
+      this.setStatus("正在试听「" + label + "」");
+    } catch (err) {
+      this.setStatus("试听失败: " + (err && err.message ? err.message : err), true);
+    }
   },
 
   // SDK 里「方言音色 + 语种 auto/chinese」会把语言 id 锁成该方言 ——
@@ -3107,6 +3214,18 @@ window.ImApp_tts = window.ImApp_tts || {};
 // 把卡片对象挂出去：浏览器控制台里能直接 TTS.snapshot() 查状态。
 window.ImApp_tts.TTS = TTS;
 window.ImApp_tts.RECORDER = RECORDER;
+// 向导里音色下拉的选项是运行时才有的 → 卡片自己填（详见 TTS.onWizardStepRendered）。
+window.addEventListener("wizard:step-rendered", (ev) => {
+  const d = ev && ev.detail;
+  TTS.onWizardStepRendered(d && d.appId).catch(() => {});
+});
+// 向导里改了音色 → 记住。换步会重建 body，select 会被清空，没有这份记忆
+// 用户在向导里选的音色会被无声地冲回功能页的值。
+window.addEventListener("wizard:field-change", (ev) => {
+  const vals = ev && ev.detail && ev.detail.values;
+  const v = vals && vals["tts-voice"];
+  if (v) TTS._wizardVoice = v;
+});
 window.ImApp_tts.applyWizardSnapshot = async function (opts) {
   const result = { text_filled: false, started: false };
   if (opts.text) {
@@ -3118,6 +3237,11 @@ window.ImApp_tts.applyWizardSnapshot = async function (opts) {
     document.querySelectorAll('input[name="tts-play-to"]').forEach((r) => {
       r.checked = (r.value === opts.playTo);
     });
+  }
+  // 音色：向导里选的写回功能页的下拉 —— TTS.start() 就是从那个下拉读
+  // 音色（_selectedVoice），写回即可，不用在这里重写一遍 payload 装配。
+  if (opts.voice) {
+    TTS._selectVoice(opts.voice);
   }
   // 文本非空 → 启动合成。**不能 btn.click()**:启动按钮的 disabled 由
   // 卡片快照的 capability_ready 决定,模型刚就绪时按钮还是灰的,而

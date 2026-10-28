@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -32,6 +33,7 @@ from app.apps.tts.service import (
     PLAY_DEVICE,
     PLAY_TARGETS,
     TTSRequest,
+    VOICE_PREVIEW_DIR,
     default_ref_speaker,
     get_session,
     voice_catalog,
@@ -64,6 +66,21 @@ def _voice_catalog() -> dict:
 async def tts_voices() -> dict:
     """可用音色 + 语种清单。前端下拉按这个渲染,不在页面里硬编码。"""
     return _voice_catalog()
+
+
+@router.get("/voice-preview/{name}")
+async def tts_voice_preview(name: str):
+    """自带音色的试听样例(WAV)。
+
+    样例是离线生成的(见 ``scripts/gen_voice_previews.py``)。名字必须白名单
+    校验,否则 ``../`` 能把目录外面的文件读出来。
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        raise HTTPException(status_code=400, detail="音色名不合法")
+    path = VOICE_PREVIEW_DIR / (name + ".wav")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="该音色没有试听样例")
+    return FileResponse(str(path), media_type="audio/wav")
 
 
 # --------------------------------------------------------------------------- #
