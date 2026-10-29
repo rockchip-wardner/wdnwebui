@@ -57,6 +57,11 @@
       // ``configOnly``：只要配置区（不要浮框 / 曲线）。VR 是单视频文件、
       // 没有持续解码画面可贴浮框，但同样需要判据配置与「按变化切片」。
       this.configOnly = !!opts.configOnly;
+      // VR 是单 canvas，没有 MultiGrid tile badge；用全局 vj-badge。
+      // 曲线默认等用户点击画面后再显示（与 VD 的实际操作节奏一致）。
+      this.singleCanvas = !!opts.singleCanvas;
+      this.curveVisible = opts.curveVisible !== false;
+      this.curveOnCanvasClick = !!opts.curveOnCanvasClick;
       // 兜底帧间隔的默认值。三张多路卡是「解码帧」（600），VR 是
       // 「秒级采样帧」（10）—— 由宿主 / 后端 ``default_every_n`` 决定。
       this.defaultEveryN = Math.max(1, parseInt(opts.defaultEveryN, 10) || 600);
@@ -71,14 +76,31 @@
       if (!this.configOnly) this._buildFloats();
       this._load();
       if (this.configOnly) return;
+      if (this.singleCanvas && this.curveOnCanvasClick) {
+        const c = $(this.canvasId);
+        if (c) {
+          this._canvasClick = () => this.showCurve();
+          c.addEventListener("click", this._canvasClick);
+        }
+      }
       // 画布位置会因向导搬运 / 窗口缩放 / 滚动而变，三路都重摆一次。
       window.addEventListener("resize", () => this.sync());
       window.addEventListener("scroll", () => this.sync(), true);
       this._timer = setInterval(() => this.sync(), 500);
     }
 
+    showCurve() {
+      this.curveVisible = true;
+      this.sync();
+    }
+
     destroy() {
       clearInterval(this._timer);
+      if (this._canvasClick) {
+        try { $(this.canvasId)?.removeEventListener("click", this._canvasClick); }
+        catch (_) { /* ignore */ }
+        this._canvasClick = null;
+      }
       this._built = false;
     }
 
@@ -329,6 +351,9 @@
       // 全局 vj-badge 仍保留 DOM 节点（兼容旧卡片引用），但默认隐藏、
       // 不再 sync() 摆位 —— 否则会盖在画面右下与 tile.badge 重叠。
       const badge = ce("div", "vj-badge");
+      // 单画面卡片（VR）没有 MultiGrid tile，用这一个全局 badge；给它一套
+      // 与 .vd-tile-badge 完全一致的紧凑样式（右下角、单行、10px）。
+      if (this.singleCanvas) badge.classList.add("vj-badge-single");
       badge.id = this.prefix + "-judge-badge";
       badge.style.display = "none";
       badge.innerHTML =
@@ -413,14 +438,21 @@
       // —— 因为它的容器已经跟画布解耦了（fieldset 始终在文档流里）。
       // canvas 不存在 / 0 尺寸时只调 _drawCurve（自适应容器宽度），
       // 不 hide。tag: v0.25 wizard 曲线搬入判据框。
+      if (this.singleCanvas) this._attachSingleBadge();
       const inFs = this.curve && this.curve.parentNode &&
         this.curve.parentNode.id &&
         this.curve.parentNode.id.endsWith("-wizard-judge-fs");
       if (inFs) {
+        // 栏本身始终显示（与其它卡片一致）。``curveVisible`` 只控制
+        // **画布内容**：未点击画面时显示“采集中…”，并保留 88px 高度。
+        this.curve.style.display = "";
         if (this.curveCanvas.height !== CURVE_H) {
           this.curveCanvas.height = CURVE_H;
         }
-        this.curve.style.display = "";
+        if (!this.curveVisible) {
+          this._drawCurvePlaceholder();
+          return;
+        }
         this._drawCurve();
         return;
       }
@@ -433,6 +465,11 @@
 
       // 曲线**只在向导里**：向导会把 canvas 搬进 .wd-wizard-canvas-wrap。
       if (this.curve) {
+        if (!this.curveVisible) {
+          this.curve.style.display = "none";
+          this._reserve(false, c);
+          return;
+        }
         const inWizard = !!c.closest(".wd-wizard-canvas-wrap");
         if (!inWizard) { this.curve.style.display = "none"; this._reserve(false, c); return; }
         // **已搬到 fieldset 里**（曲线 parent === 该 prefix 的 -wizard-judge-fs）：
@@ -494,6 +531,7 @@
         ? j.per_channel : [{channel: 0, cur: j.cur, changed: j.changed,
                             mode: j.mode, every_n: j.every_n, threshold: j.threshold}];
       this._paintPerChannel(per);
+      this._paintGlobalBadge(per);
 
       // 控件只反映**当前选中路**的状态。v0.22 单路 / 未选路时用顶层。
       const sel = this._selectedChannel;
@@ -546,6 +584,48 @@
      * 通过 window.MultiGrid.setBadge 注入。per_channel 是 [{channel,
      * cur, changed, ...}, ...]；空 / 未启动判据 → 设 null 让 tile 角标藏起来。
      */
+    _paintGlobalBadge(per) {
+      if (!this.singleCanvas || !this.badge) return;
+      const p = (per && per[0]) || {};
+      const cur = p.cur;
+      const s = Number(cur);
+      const label = p.changed ? "变化" : "无变化";
+      // 与 MultiGrid.setBadge() 的压缩文案逐字一致：4 路宫格每格 200~400px
+      // 也放得下；单画面同样不显示第二行 / 圆点。
+      const txt = cur == null ? ""
+        : !Number.isFinite(s) ? `${label} ${cur}`
+        : s >= 100 ? `${label} ${s.toFixed(0)}`
+        : s >= 10 ? `${label} ${s.toFixed(1)}`
+        : `${label} ${s.toFixed(2)}`;
+      this.badgeTxt.textContent = txt;
+      this.badgeNum.textContent = "";
+      this.badgeSub.textContent = "";
+      this.badge.classList.remove("on");
+      this.badge.classList.toggle("changed", !!p.changed);
+      this.badge.classList.toggle("idle", cur != null && !p.changed && s < 0.5);
+      const wasHidden = this.badge.style.display === "none";
+      this.badge.style.display = cur == null ? "none" : "";
+      // 第一次出现时立刻摆位，别让它在默认位置停到下一次 500ms sync。
+      if (cur != null && wasHidden) this.sync();
+    }
+
+    _attachSingleBadge() {
+      if (!this.singleCanvas || !this.badge) return false;
+      const c = $(this.canvasId);
+      const parent = c && c.parentElement;
+      // canvas 已被向导切步移除 / 自身脱离文档 → 角标也一起藏起来，
+      // 不再留在 body 上（这是与 .vd-tile-badge 生命周期对齐的关键）。
+      if (!parent || !parent.isConnected) {
+        this.badge.style.display = "none";
+        return false;
+      }
+      if (this.badge.parentNode !== parent) {
+        parent.classList.add("vj-badge-host");
+        parent.appendChild(this.badge);
+      }
+      return true;
+    }
+
     _paintPerChannel(per) {
       const MG = window.MultiGrid;
       if (!MG) return;
@@ -573,10 +653,7 @@
       return false;
     }
 
-    _drawCurve() {
-      // 防御：曲线 DOM 尚未创建时直接返回（静态 draw() 的调用点可能无条件）。
-      if (!this.curve || !this.curveCanvas || !this.curveCtx) return;
-      const ctx = this.curveCtx;
+    _curveGeometry() {
       const cv = this.curveCanvas;
       // 自适应容器宽度：曲线在 fieldset 里时容器是 fieldset，在画布下
       // 时容器宽 = 画布宽。优先读 offsetParent（fieldset），fallback 到
@@ -585,12 +662,40 @@
         ? this.curve.offsetParent
         : ($(this.canvasId) || this.curve.offsetParent);
       const targetW = host ? host.clientWidth : cv.width;
-      const W = (targetW > 0 ? targetW : 640) - 12;  // 留 6px padding
-      const H = cv.height;
+      return { W: (targetW > 0 ? targetW : 640) - 12, H: cv.height };
+    }
+
+    _drawCurvePlaceholder() {
+      if (!this.curve || !this.curveCanvas || !this.curveCtx) return;
+      const { W, H } = this._curveGeometry();
+      if (this.curveCanvas.width !== W) this.curveCanvas.width = W;
+      const ctx = this.curveCtx;
+      ctx.clearRect(0, 0, W, H);
+      // 与音视频描述的“无数据”状态逐字一致：同字体、同颜色、同位置。
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "12px sans-serif";
+      ctx.fillText("采集中…", 10, H / 2);
+    }
+
+    _drawCurve() {
+      // 防御：曲线 DOM 尚未创建时直接返回（静态 draw() 的调用点可能无条件）。
+      if (!this.curve || !this.curveCanvas || !this.curveCtx) return;
+      // VR 单画面：未点击视频时保留栏与空白高度，只显示“采集中…”。
+      if (this.singleCanvas && !this.curveVisible) {
+        this._drawCurvePlaceholder();
+        return;
+      }
+      const ctx = this.curveCtx;
+      const cv = this.curveCanvas;
+      const { W, H } = this._curveGeometry();
       if (cv.width !== W) cv.width = W;
       ctx.clearRect(0, 0, W, H);
       const j = this.judge;
-      if (!j) return;
+      if (!j) {
+        // 点击后但还没有判据快照时，单画面也与其它应用一样显示占位文案。
+        if (this.singleCanvas) this._drawCurvePlaceholder();
+        return;
+      }
       let pts = j.recent || [];
       // **按选中路过滤**：recent 形如 [pos, score, ch_idx]（multi_session
       // judge_snapshot 里 extend 时加的 ch.idx），点哪路就画哪路的曲线。
@@ -717,6 +822,36 @@
       const inst = registry.get(prefix);
       if (inst) inst.update(judge);
     },
+    /** 清掉本地历史分数，不改后端配置。向导重进 / 换源时调用。 */
+    clear(prefix) {
+      const inst = registry.get(prefix);
+      if (!inst) return false;
+      inst.judge = null;
+      inst._selectedChannel = null;
+      inst.curveVisible = false;
+      if (inst.badge) inst.badge.style.display = "none";
+      if (inst.curve) {
+        if (inst.singleCanvas) {
+          // VR：曲线栏常驻，未点击时显示与其它应用一致的“采集中…”占位。
+          inst._drawCurvePlaceholder();
+          const fs = document.getElementById(prefix + "-wizard-judge-fs");
+          const inFs = fs && inst.curve.parentNode === fs;
+          inst.curve.style.display = inFs ? "" : "none";
+          if (!inFs) inst._reserve(false, $(inst.canvasId));
+        } else {
+          inst.curve.style.display = "none";
+          if (typeof inst._drawCurve === "function") inst._drawCurve();
+        }
+      }
+      return true;
+    },
+    /** 点击单路画面后显示实时曲线。 */
+    showCurve(prefix) {
+      const inst = registry.get(prefix);
+      if (!inst) return false;
+      inst.showCurve();
+      return true;
+    },
     /** applyWizardSnapshot 调：把 wizard 字段同步到控件。 */
     setConfig(prefix, cfg) {
       const inst = registry.get(prefix);
@@ -771,7 +906,13 @@
       const fs = document.getElementById(prefix + "-wizard-judge-fs");
       if (!fs) return false;
       if (inst.curve.parentNode === fs) {
+        // 栏始终显示；未点击时显示“采集中…”占位。
         inst.curve.style.display = "";
+        if (!inst.curveVisible && inst.singleCanvas) {
+          inst._drawCurvePlaceholder();
+        } else if (inst.curveVisible && typeof inst._drawCurve === "function") {
+          inst._drawCurve();
+        }
         return true;
       }
       // 从 body 搬到 fieldset。position/left/top/width 由 frame-judge.css 里
@@ -780,8 +921,27 @@
       // （外部调试 / 改皮肤时只动 CSS 即可）。
       fs.appendChild(inst.curve);
       inst.curve.style.display = "";
-      // 重画一次 —— 容器宽度变了 + 已有 j.recent 数据
-      if (typeof inst._drawCurve === "function") inst._drawCurve();
+      if (!inst.curveVisible && inst.singleCanvas) {
+        inst._drawCurvePlaceholder();
+      } else if (inst.curveVisible && typeof inst._drawCurve === "function") {
+        // 重画一次 —— 容器宽度变了 + 已有 j.recent 数据
+        inst._drawCurve();
+      }
+      return true;
+    },
+    /** VR 单画面：曲线回到“采集中…”占位，保留栏和高度。 */
+    resetCurve(prefix) {
+      const inst = registry.get(prefix);
+      if (!inst || !inst.singleCanvas || !inst.curve) return false;
+      inst.curveVisible = false;
+      inst._drawCurvePlaceholder();
+      const fs = document.getElementById(prefix + "-wizard-judge-fs");
+      if (fs && inst.curve.parentNode === fs) {
+        inst.curve.style.display = "";
+      } else {
+        inst.curve.style.display = "none";
+        inst._reserve(false, $(inst.canvasId));
+      }
       return true;
     },
     /**

@@ -213,6 +213,49 @@
 }
 .vj-badge.warn .vj-dot { background: #fcd34d; }
 .vj-badge.warn .vj-badge-sub { color: #fde68a; }
+
+/* ---- 单画面卡片的紧凑角标（VR）----
+   与 multi-grid.css 的 .vd-tile-badge 保持同一视觉规格：10px、右下角、
+   单行「变化 12.9」。定位也照搬 tile badge：不挂在 body 上做 fixed，
+   而是作为 canvas 当前父容器的 absolute 子元素 —— 向导把 canvas 搬走 /
+   切下一步移除容器时，角标跟着一起走 / 一起消失。 */
+.vj-badge.vj-badge-single {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: block;
+  padding: 2px 7px;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #cbd5e1;
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 15px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  transition: background-color 0.15s, color 0.15s;
+}
+.vj-badge.vj-badge-single .vj-badge-main {
+  display: inline;
+  font-weight: 400;
+}
+.vj-badge.vj-badge-single .vj-dot,
+.vj-badge.vj-badge-single .vj-badge-sub {
+  display: none;
+}
+.vj-badge.vj-badge-single.changed {
+  background: #f59e0b;
+  color: #ffffff;
+}
+.vj-badge.vj-badge-single.idle {
+  color: #94a3b8;
+}
+/* badge 的定位上下文：.vd-stage 本身已是 relative；向导的
+   .wd-wizard-canvas-wrap 是 static，靠这个 class 补上。 */
+.vj-badge-host {
+  position: relative;
+}
 @keyframes vj-pulse {
   from { box-shadow: 0 0 0 0 rgba(253, 186, 116, 0.9); transform: scale(1.4); }
   to   { box-shadow: 0 0 8px 2px rgba(253, 186, 116, 0.7); transform: scale(1); }

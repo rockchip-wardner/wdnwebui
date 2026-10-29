@@ -1352,6 +1352,32 @@
           row.appendChild(upBtn);
           row.appendChild(fileInput);
         }
+        if (field.image_preview && field.thumbnail_endpoint) {
+          const preview = _ce("div", WIZARD_NS + "image-preview");
+          const img = _ce("img");
+          const name = _ce("span", WIZARD_NS + "image-preview-name");
+          const syncPreview = () => {
+            const path = String(el.value || "").trim();
+            if (!path) {
+              preview.style.display = "none";
+              return;
+            }
+            const sep = field.thumbnail_endpoint.includes("?") ? "&" : "?";
+            img.src = field.thumbnail_endpoint + sep
+              + "path=" + encodeURIComponent(path);
+            name.textContent = path;
+            preview.style.display = "";
+          };
+          img.alt = "图片预览";
+          img.addEventListener("error", () => { preview.style.display = "none"; });
+          el.addEventListener("input", syncPreview);
+          el.addEventListener("change", syncPreview);
+          preview.appendChild(img);
+          preview.appendChild(name);
+          preview.style.display = "none";
+          syncPreview();
+          wrap.appendChild(preview);
+        }
         wrap.appendChild(row);
       } else {
         // **非视频源字段**（判据算法 / 阈值 / 帧间隔、检索问题…）走这里。
@@ -1480,12 +1506,22 @@
       // 判据框里跟 "当前在编辑 [x, y] 路" 一起显示。mountInWizard 把曲线
       // 从 body 搬到 fieldset、改成普通流式布局、随后按 _selectedChannel
       // 过滤 recent 数据。
+      let curveTries = 0;
       const attachCurve = () => {
+        // FrameJudge 实例 / fieldset 可能晚于本步骤一步就绪。返回 false
+        // 时不能只试一次，否则曲线会留在 body，直到用户点击视频、canvas
+        // 被搬进 wizard 才以 legacy fixed 形式出现（VR 实测）。
         if (!window.FrameJudge || !window.FrameJudge.mountInWizard) {
-          setTimeout(attachCurve, 30);
+          if (curveTries++ < 100) setTimeout(attachCurve, 30);
           return;
         }
-        window.FrameJudge.mountInWizard(prefix);
+        // VR 单画面：每次渲染视频源步骤都从“栏在、曲线空”开始。
+        // 多路卡 resetCurve() 内部 no-op，曲线保持常显。
+        if (window.FrameJudge.resetCurve) {
+          window.FrameJudge.resetCurve(prefix);
+        }
+        if (window.FrameJudge.mountInWizard(prefix)) return;
+        if (curveTries++ < 100) setTimeout(attachCurve, 30);
       };
       attachCurve();
     }

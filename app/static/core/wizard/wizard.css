@@ -865,3 +865,30 @@
   }
   .wd-wizard-step-todo .wd-wizard-step-lbl { display: none; }
 }
+/* 通用 wizard 图片字段预览（如 VR 检索图片） */
+.wd-wizard-image-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f9fafb;
+}
+.wd-wizard-image-preview img {
+  display: block;
+  max-width: 160px;
+  max-height: 110px;
+  object-fit: contain;
+  border-radius: 4px;
+  background: #fff;
+}
+.wd-wizard-image-preview-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #6b7280;
+  font-size: 12px;
+}

@@ -832,6 +832,8 @@ class VideoSearchService:
                     "total": total,
                     "frames_evaluated": evaluated,
                     "duration_s": duration,
+                    # 实时分数曲线：VR 向导在提取阶段继续消费 judge 快照。
+                    "judge": self._judge.snapshot(),
                 })
 
         chunk_idx = 0
@@ -885,6 +887,7 @@ class VideoSearchService:
                                 "total": total,
                                 "frames_evaluated": self._frames_evaluated,
                                 "duration_s": self._duration_s,
+                                "judge": self._judge.snapshot(),
                             })
                     LOG.debug("video-retrieval: slice %d done in %.2fs (%d/%d)",
                               chunk_idx, _time.time() - t_chunk,
