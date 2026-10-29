@@ -111,6 +111,21 @@
     catch (_) {}
   }
 
+  // 显式重开向导时清掉指定字段的上一次持久化值。声明在 wizard.json
+  // 的 ``force_reset_fields`` 里，框架不认识具体字段语义。
+  function _lsClearFields(app, cfg, fieldIds) {
+    if (!app || !Array.isArray(fieldIds) || !fieldIds.length) return;
+    const values = _lsLoad(app.id, cfg);
+    let changed = false;
+    for (const id of fieldIds) {
+      if (Object.prototype.hasOwnProperty.call(values, id)) {
+        delete values[id];
+        changed = true;
+      }
+    }
+    if (changed) _lsSave(app.id, cfg, values);
+  }
+
   // "退出应用" 兜底:framework 在 back-home 按钮 handler 里调。
   // 把该 app 的整个 wizard 状态从 localStorage 抹掉,下次进入时
   // wizard 就像首次启动一样 —— 从第 1 步、空字段开始。
@@ -2256,6 +2271,7 @@
     isCompleted: (app, cfg) => _lsLoadCompleted(app.id, cfg),
     clearCompleted: (app, cfg) => _lsClearCompleted(app.id, cfg),
     clearStep: (app, cfg) => _lsClearStep(app.id, cfg),
+    clearFields: (app, cfg, fields) => _lsClearFields(app, cfg, fields),
     clearAll: (appId) => _lsClearAllFor(appId),
   };
 

@@ -52,6 +52,12 @@
         // 跳过条件仍然生效(没人能"强制"挂一个 disabled 的向导)。
         try { window.WizardState?.clearCompleted?.(manifest, cfg); } catch (_) {}
         try { window.WizardState?.clearStep?.(manifest, cfg); } catch (_) {}
+        // 只清 wizard.json 显式声明的字段 —— 例如 VR 上一次的检索图片 /
+        // 检索文字不能带进下一次显式重开的新任务。
+        try {
+          window.WizardState?.clearFields?.(
+            manifest, cfg, cfg.force_reset_fields);
+        } catch (_) {}
       } else if (window.WizardState?.isCompleted?.(manifest, cfg)) {
         // 自动挂载路径(framework 在 showPage 里调):用户之前已经走完
         // _finish (applyWizardSnapshot 成功落到了下游),再次进入不应
