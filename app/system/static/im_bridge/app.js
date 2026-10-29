@@ -242,7 +242,7 @@ window.ImBridge = {
 
     if (hint) {
       if (!available) {
-        hint.textContent = "文本对话模型未启用，请在算力配置页启用 [VLLM]视觉文字多模态v3.5";
+        hint.textContent = "文本对话模型未启用，请在算力配置页启用 [VLLM] 系列能力";
         hint.className = "imb-bridge-hint danger";
       } else if (enabled) {
         hint.textContent = b.busy ? "已对接，生成中…" : "已对接，微信消息将自动回复";

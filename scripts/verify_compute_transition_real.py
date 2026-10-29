@@ -98,14 +98,14 @@ def pick_npu(model: str, requested: int | None) -> int:
     if not model_cards:
         failed = snap.get("cards_failed") or ""
         raise SystemExit(
-            "本机没有可用模型卡位（model_cards=[]）"
+            "本机没有可用算力卡位（model_cards=[]）"
             + (f"；探测失败原因：{failed}" if failed else "")
             + " —— 跑不了这个验证（先看 /api/compute 的 cards_failed）")
     if requested is not None:
         if requested not in model_cards:
             avail = "/".join(str(c) for c in model_cards)
             raise SystemExit(
-                f"npu{requested} 不在本机模型卡位 {model_cards} 内 —— "
+                f"npu{requested} 不在本机算力卡位 {model_cards} 内 —— "
                 f"别在单卡板上指定不存在的卡（会造出永远起不来的僵尸实例）。"
                 f"可用卡位：--npu {avail}")
         return requested
@@ -123,7 +123,7 @@ def pick_npu(model: str, requested: int | None) -> int:
         if not [m for m in busy.get(n, []) if m != model]:
             return n
     n = model_cards[0]
-    print(f"⚠️ 所有模型卡位都被别的模型占着（{busy}），只能试 npu{n} —— "
+    print(f"⚠️ 所有算力卡位都被别的模型占着（{busy}），只能试 npu{n} —— "
           f"若该卡上有别的模型，本脚本会因显存不足失败（rc=-6）。",
           flush=True)
     return n

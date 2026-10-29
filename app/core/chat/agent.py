@@ -240,7 +240,7 @@ def _tool_classes(names: List[str]) -> list:
 
 
 def _trim(history: List[dict], session, context_limit: int,
-          max_new_tokens: int) -> List[dict]:
+          max_new_tokens: int, current_text: str = "") -> List[dict]:
     """Drop the oldest turns until the transcript fits the context window.
 
     Counts come from the worker's tokenizer via a cheap control-plane
@@ -256,7 +256,12 @@ def _trim(history: List[dict], session, context_limit: int,
     reserve = min(max_new_tokens or MAX_NEW_TOKENS,
                   max(1, context_limit // 8))
     contents = [(m.get("content") or "") for m in history]
-    user_text = next(
+    # The current user turn is not in ``history`` yet — it is appended by
+    # the prompt builder after trimming. Count it explicitly, otherwise both
+    # the context limit and the UI token counter ignore the question just
+    # asked (the old code searched only ``history`` and got ``""`` on the
+    # first turn).
+    user_text = current_text or next(
         (m.get("content") or "" for m in reversed(history)
          if m.get("role") == "user"), "")
     # Index 0 is the trailing user turn the prompt will append; the rest
@@ -276,6 +281,10 @@ def _trim(history: List[dict], session, context_limit: int,
             break
         selected.insert(0, msg)
         total += c
+    # ``_run_turn`` reads this back for the UI's context-usage counter.
+    # It was previously computed here but never stored, so text-chat always
+    # reported ``0 / context_limit``.
+    session._last_prompt_tokens = total
     return selected
 
 
@@ -330,7 +339,10 @@ def _run_turn(
     from app.core.chat.runner import sanitize_chat_output, split_thinking
 
     classes = _tool_classes(tool_names)
-    trimmed = _trim(history, session, context_limit, max_new_tokens)
+    trimmed = _trim(
+        history, session, context_limit, max_new_tokens,
+        current_text=text,
+    )
     result = _run_coro(session.respond(
         prompt=text,
         history=trimmed,

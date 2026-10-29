@@ -6,6 +6,7 @@
 * ``GET    /api/text-chat``        — 当前 snapshot（state / busy / error /
                                      history_count / history_tokens /
                                      context_limit / current_request_id）。
+* ``GET    /api/text-chat/history`` — 当前对话消息（刷新页面后恢复气泡）。
 * ``POST   /api/text-chat/send``   — ``{text}`` → 发起一轮推理，返回
                                      ``{request_id, snapshot}``。400 / 409 / 502。
 * ``POST   /api/text-chat/stop``   — 立即停止正在跑的推理。
@@ -16,7 +17,7 @@
 错误码
 ======
 
-* 400 —— text 为空 / 对话过长（prompt 超过 16K 上下文）。
+* 400 —— text 为空 / 对话过长（prompt 超过当前模型上下文）。
 * 409 —— 上一条请求还在生成中。
 * 502 —— ``RuntimeError("功能未启用: swcap_text_chat")``（未启动任何对话模型）。
 
@@ -64,6 +65,13 @@ class SendPayload(BaseModel):
 async def get_text_chat_snapshot() -> dict:
     """完整 snapshot；UI 在进入页面时拉一次，后续靠 WS 推送增量。"""
     return get_chat_service().snapshot()
+
+
+@router.get("/history")
+async def get_text_chat_history() -> dict:
+    """Return user-visible turns for restoring the page after a reload."""
+    svc = get_chat_service()
+    return {"messages": svc.history()}
 
 
 @router.post("/send")

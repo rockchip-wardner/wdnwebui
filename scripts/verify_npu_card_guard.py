@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""回归：启模型前的**卡位校验**（npu_index 越界 / 不是模型卡位）。
+"""回归：启模型前的**卡位校验**（npu_index 越界 / 不是算力卡位）。
 
 背景（v0.29 补）：``POST /api/compute/instances`` 以前只校验
 ``npu_index >= 0``，**越界的卡号照样往下走** —— 单卡板上传 ``npu=1``，
@@ -11,7 +11,7 @@ range``，进程秒退，registry 里留下一个**起不来也删不掉**的僵
 两组断言：
 
   U1 ``ComputeRegistry.npu_card_error()`` —— 各种卡位布局下的判定
-     （越界 / 非模型卡位 / 被 card_count 限掉 / 探测失败不拦）。
+     （越界 / 非算力卡位 / 被 card_count 限掉 / 探测失败不拦）。
   U2 API 层 ``start_instance`` —— 越界必须**立刻 400**，而且
      **不进入过渡态排队**（排队要白等 120s）。
 
@@ -82,9 +82,9 @@ def card(idx: int, dev: str) -> dict:
 def scen_u1():
     print("\n=== U1 npu_card_error() 的判定 ===")
 
-    # (a) 双卡板，两张都是模型卡
+    # (a) 双卡板，两张都是算力卡
     reg = make_reg([card(0, PCI0), card(1, PCI1)])
-    check("U1 模型卡位认得两张卡", reg.model_cards() == [0, 1],
+    check("U1 算力卡位认得两张卡", reg.model_cards() == [0, 1],
           str(reg.model_cards()))
     check("U1 npu0 通过", reg.npu_card_error(0) is None)
     check("U1 npu1 通过", reg.npu_card_error(1) is None)
@@ -106,16 +106,16 @@ def scen_u1():
     check("U1 越界原因说明本机只有 1 张卡",
           bool(err1) and "1 张卡" in err1, str(err1))
 
-    # (c) 卡在，但不是模型卡位（RGA/VPU 设备，USB 序列号形态）
+    # (c) 卡在，但不是算力卡位（RGA/VPU 设备，USB 序列号形态）
     regm = make_reg([card(0, USB0), card(1, PCI1)])
     check("U1 混合卡只认 PCI 形态", regm.model_cards() == [1],
           str(regm.model_cards()))
     errm = regm.npu_card_error(0)
-    check("U1 非模型卡位单独提示", bool(errm) and "不是模型卡位" in errm,
+    check("U1 非算力卡位单独提示", bool(errm) and "不是算力卡位" in errm,
           str(errm))
-    check("U1 非模型卡位不是「越界」", bool(errm) and "越界" not in errm,
+    check("U1 非算力卡位不是「越界」", bool(errm) and "越界" not in errm,
           str(errm))
-    check("U1 真模型卡仍通过", regm.npu_card_error(1) is None)
+    check("U1 真算力卡仍通过", regm.npu_card_error(1) is None)
 
     # (d) compute.card_count 把可用卡位裁短（双卡板模拟单卡板）
     reg2 = make_reg([card(0, PCI0), card(1, PCI1)])

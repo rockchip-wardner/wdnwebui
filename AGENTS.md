@@ -3151,7 +3151,7 @@ registry 里留下一个 `status=error` 却**占着卡位**的实例（过渡态
 |---|---|---|
 | 卡号在 `model_cards` 里 | 通过 | — |
 | 卡号超出探测到的卡数 | 400 越界 | 「本机只有 N 张卡（可用卡号 0~N-1）」 |
-| 卡在，但不是 PCI 形态 | 400 非模型卡位 | 「能承载 RKNN 模型的卡号是 [...]」 |
+| 卡在，但不是 PCI 形态 | 400 非算力卡位 | 「能承载 RKNN 模型的卡号是 [...]」 |
 | 被 `compute.card_count` 限掉 | 400 | 「card_count=1 只允许使用卡号 [...]」 |
 | **卡位探测失败**（`/dev/rknn3` 被 worker 占着） | **放行** | 未知 ≠ 越界 |
 
@@ -3161,7 +3161,7 @@ registry 里留下一个 `status=error` 却**占着卡位**的实例（过渡态
 
 实测（2026-10-23，单卡板）：同一个 `{"model":"qwen3-vl-4b","npu_index":1}`
 —— 修复前排队 120s 后 409；修复后 **7ms 返回 400**，detail =
-「npu_index=1 越界：本机只有 1 张卡（可用卡号 0~0），模型卡位 [0]」，
+「npu_index=1 越界：本机只有 1 张卡（可用卡号 0~0），算力卡位 [0]」，
 registry 里**没有**留下任何实例。合法卡号（npu0）照常 200 → 42s → running。
 
 > 400 的 detail 会摆到 UI 上（向导的「启动失败: …」/ 算力页的 alert）。
@@ -3218,12 +3218,12 @@ npu2/npu3 只在 RGA / VPU 侧可见，对算力页来说它们是「枚举得�
 | `0003:31:00.0`（PCI BDF） | 真正的 RK1828 协卡 | ✅ |
 | `180B6D6C…`（USB 序列号） | 只在 RGA / VPU 侧可见的设备 | ❌ `vision init_runtime failed` |
 
-所以「**模型卡位**」= 探测到的 PCI 形态卡数 = 本机能同时跑几个模型的硬上限
+所以「**算力卡位**」= 探测到的 PCI 形态卡数 = 本机能同时跑几个模型的硬上限
 （每卡一个模型，见上文「一卡一模型」）。
 
 ```
 registry.py::_PCI_BDF_RE          判定 PCI BDF 形态
-registry.py::ComputeRegistry.model_cards()   → [npu_index, ...] 模型卡位
+registry.py::ComputeRegistry.model_cards()   → [npu_index, ...] 算力卡位
 snapshot() 新增 model_cards / card_count 两个字段
 ```
 
@@ -3358,7 +3358,7 @@ tryMount 返回才标记 → 同一页可能并发挂两次 → 序号守卫会�
 
 ### 开机自启也要裁
 
-`boot_compute_services()` 按模型卡位裁 `compute.autostart`：
+`boot_compute_services()` 按算力卡位裁 `compute.autostart`：
 
 * 指向「跑不了模型的卡」的条目 → 跳过（否则开机就是一屏 rc=-6 的 error）
 * **每张卡只保留第一条** —— 一卡一模型是硬约束（[见「一卡一模型」是不变量](#一卡一模型是不变量由三层共同保证v025-修)）。
@@ -4688,7 +4688,7 @@ slot 上打架。
 |---|---|---|
 | 配置生成 | `set_active_app()` | 追加 `(model, npu)` 时把**同卡的其它条目替换掉**（旧条目必然陈旧：运行期同卡只可能有一个 running 实例） |
 | 配置解析 | `_parse_autostart_config()` | 拒掉「同模型同卡」重复 |
-| boot | `boot_compute_services()` | `_crop_autostart_for_cards()`：非模型卡的条目丢弃 + **每卡只留第一条** |
+| boot | `boot_compute_services()` | `_crop_autostart_for_cards()`：非算力卡的条目丢弃 + **每卡只留第一条** |
 
 > boot 那层的裁剪**不是「猜测性预检」**：卡位唯一性是已实测确认的硬
 > 事实，不是按 `memory_estimate_mb` 猜显存还剩多少（后者会误杀合法
@@ -5928,9 +5928,10 @@ qwen3.5-vl-4b 提供），
   - **history_tokens 语义**：每次 done 后覆盖为 worker 返回的
     `prompt_tokens`（最近一次实际喂给模型的 prompt token 数），前端据此
     显示上下文占用。
-  - **context_limit 可配置**：`config.jsonc["compute"]["text_chat"]["context_limit"]`，
-    默认 16384；每次推理前热读（`_resolve_context_limit`）。测试多轮裁剪
-    可设 2048。
+  - **上下文跟随模型 spec**：`context_limit` 取当前 session 的
+    `spec.max_context_len`；`max_new_tokens` 固定使用共享
+    `chat_runner.MAX_NEW_TOKENS`（2048），不再读取
+    `compute.text_chat.context_limit`。文本对话优先 9B，其次 4B。
   - WS broadcaster pattern：worker 线程 push 到 `asyncio.Queue` 列表，
     WS handler 在主 event loop 里 `await queue.get()` drain；observer
     也走同一条路径，避免第二条 channel。

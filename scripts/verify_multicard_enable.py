@@ -13,7 +13,7 @@
   2. **adopt 找不到它 → 另建一条 adopted_local**：peer listener 触发
      `_maybe_adopt_from_peer` → probe 命中本机 worker → 因为 1. 把它挤出
      了，`_find_inst_by_worker_pid` 找不到 → 新建 adopted_local → 算力页
-     出现两张同模型卡。
+     出现两张同算力卡。
   3. **adopt 把第二张卡的 worker 当孤儿杀掉**：「清理多余孤儿」把 `/proc`
      里所有**不是**被 adopt 的同 model worker SIGTERM 掉 → 第二张卡的
      worker 死了 → 那张卡永远加载不上。

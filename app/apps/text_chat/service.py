@@ -3,9 +3,10 @@
 设计要点
 ========
 
-* **LLMSession 必须从 ComputeRegistry 取**（``get_session("swcap_text_chat")``）；
-  拿到的是 ``wdndds.LLMRPCSession``，找不到抛
-  ``RuntimeError("功能未启用: swcap_text_chat")``，调用方决定如何上报。
+* **LLMSession 必须从 ComputeRegistry 取**：优先
+  ``get_session_for_model("swcap_text_chat", "qwen3.5-vl-9b")``，找不到再回退
+  ``qwen3.5-vl-4b``；拿到的是 ``wdndds.LLMRPCSession``，都找不到抛
+  ``RuntimeError("功能未启用: swcap_text_chat")``。
 * **推理在 compute_worker 子进程里跑**：``session.respond(...)`` 经 wdndds
   RPC 发出 ``{prompt, history, tools, options}``；worker 跑完
   ``LLMLocalSession`` 并把**原始文本**回传。ChatML 拼接在调用方完成
@@ -21,8 +22,10 @@
   tokenizer 精确计数（一次无推理的 ``count_tokens`` 控制调用）从最旧历史
   滚动裁剪（超 ``context_limit - max_new_tokens`` 就丢更早的）。历史只写
   ``content:answer``，不写 thinking，下一轮看不到。
-* **context_limit 可配置**：``config.jsonc["compute"]["text_chat"]["context_limit"]``，
-  默认 4096（= qwen3.5-vl-4b 的 max_context_len）；每次推理前热读。超限自动裁剪最旧历史，仅单条消息超限才报错。
+* **上下文跟随模型**：``context_limit`` 从实际 session 的
+  ``spec.max_context_len`` 读取；``max_new_tokens`` 固定使用共享
+  ``chat_runner.MAX_NEW_TOKENS``（2048）。超限自动裁剪最旧历史，仅单条
+  消息超限才报错。
 * **停止 = 真中断**：``stop()`` 置 ``_worker_stop_event`` 并调 ``session.stop()``；
   标志经旁路 topic 送到 worker，``ServedSession.request_stop()`` 转发给
   ``LLMLocalSession.stop()``，由 rknn3 侧真正中止本轮并释放 NPU。
@@ -66,8 +69,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, List, Optional
 
-from app.core.chat.runner import split_thinking
-from app.core.config import get_config
+from app.core.chat.runner import MAX_NEW_TOKENS, split_thinking
+from app.apps.text_chat.thinking_9b import Thinking9BParser, split_9b_thinking
 
 
 _LOG = logging.getLogger("text_chat")
@@ -107,15 +110,8 @@ class _TextChatManager:
 
     # ---- 限制 ----
     HISTORY_MAX        = 200          # deque maxlen
-    MAX_NEW_TOKENS     = 2048         # spec max_new_tokens
-    # 对话窗口上限。**必须 ≤ 实际服务模型的 max_context_len**，否则
-    # 裁剪会放进一个装不下的历史 —— 症状不是报错，而是 rknn3 在 prefill 阶段长挂
-    #
-    # 4096 是 ``swcap_text_chat`` 唯一 provider
-    # ``qwen3.5-vl-4b`` 的真实窗口（原 qwen3-4b 专用文本 worker 已
-    # 删除，它的 16384 不再适用）。换 provider 时必须同步改这里 ——
-    # 这是 manifest 与 spec 之间唯一需要手工对齐的常量。
-    CONTEXT_LIMIT      = 4096
+    #: 文本对话优先使用的模型。9B 占两张卡；4B 是回退（手动启用时）。
+    PREFERRED_MODELS   = ("qwen3.5-vl-9b", "qwen3.5-vl-4b")
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -134,6 +130,9 @@ class _TextChatManager:
         # Handle on the in-flight session, so ``stop()`` can publish a
         # cancel out-of-band while a turn is blocked in inference.
         self._session = None
+        self._active_model_id: Optional[str] = None
+        self._context_limit: Optional[int] = None
+        self._max_new_tokens: Optional[int] = None
         self._request_queue: "_queue.Queue[Optional[ChatRequest]]" = _queue.Queue()
         self._wake_event = threading.Event()
 
@@ -177,7 +176,51 @@ class _TextChatManager:
                 _LOG.warning("broadcast failed: %s", e)
 
     # -------------------------------------------------------------- 状态
+    def _ensure_model_meta(self) -> None:
+        """Populate model_id/context before the first request.
+
+        Opening the page without sending (e.g. skipping the wizard) used to
+        leave these fields at ``None`` even when a model was already
+        running, so the token counter showed "模型未就绪". Enumeration via
+        ``list_sessions`` does not invoke inference or emit the
+        ``get_session_for_model`` info log on every 1 Hz snapshot.
+        """
+        from app.core.compute.registry import get_registry
+
+        try:
+            handles = get_registry().list_sessions(
+                "swcap_text_chat", include_remote=True,
+            )
+        except Exception:  # noqa: BLE001
+            handles = []
+        selected = None
+        for model_id in self.PREFERRED_MODELS:
+            selected = next(
+                (h for h in handles if h.model_id == model_id), None,
+            )
+            if selected is not None:
+                break
+        if selected is None:
+            with self._lock:
+                self._session = None
+                self._active_model_id = None
+                self._context_limit = None
+                self._max_new_tokens = None
+            return
+        try:
+            context_limit, max_new_tokens = self._limits_for_session(
+                selected.session,
+            )
+        except RuntimeError:
+            return
+        with self._lock:
+            self._session = selected.session
+            self._active_model_id = selected.model_id
+            self._context_limit = context_limit
+            self._max_new_tokens = max_new_tokens
+
     def snapshot(self) -> dict:
+        self._ensure_model_meta()
         with self._lock:
             return {
                 "state":             self._state,
@@ -185,12 +228,36 @@ class _TextChatManager:
                 "error":             self._error,
                 "history_count":     len(self._history),
                 "history_tokens":    self._history_tokens,
-                "context_limit":     self._resolve_context_limit(),
-                "max_new_tokens":    self.MAX_NEW_TOKENS,
+                "model_id":          self._active_model_id,
+                "context_limit":     self._context_limit,
+                "max_new_tokens":    self._max_new_tokens,
                 "current_request_id": self._current_request_id,
                 "last_result":       self._last_result,
                 "last_started":      self._last_started,
             }
+
+    def history(self) -> list[dict]:
+        """User-visible conversation history for a page reload.
+
+        ``_history`` also carries internal tool transcript entries
+        (``_system_note`` / ``_placeholder``); those are prompt plumbing, not
+        chat bubbles. Only normal user/assistant turns are exposed here.
+        """
+        with self._lock:
+            out: list[dict] = []
+            for msg in self._history:
+                if msg.get("_system_note") or msg.get("_placeholder"):
+                    continue
+                role = msg.get("role")
+                content = msg.get("content")
+                if role not in ("user", "assistant") or not content:
+                    continue
+                out.append({
+                    "role": role,
+                    "content": str(content),
+                    "ts": float(msg.get("ts") or 0.0),
+                })
+            return out
 
     def _set_state(self, state: str, *, error: str = "") -> None:
         with self._lock:
@@ -284,11 +351,9 @@ class _TextChatManager:
     def _run_one(self, req: ChatRequest) -> None:
         """一轮推理：拿 proxy session → 拼 ChatML → 上下文检查 → reset+respond →
         切 thinking/answer → 推 WS → 写历史。"""
-        from app.core.compute.registry import get_registry
-
-        # 1. 拿 LLMRPCSession（ComputeRegistry 不存在 / capability 未启用 → RuntimeError）
+        # 1. 拿 LLMRPCSession：9B 优先，4B 回退。实际用哪个以运行中的实例为准。
         try:
-            session = get_registry().get_session("swcap_text_chat")
+            model_id, session = self._select_session()
         except RuntimeError as e:
             with self._lock:
                 self._set_state(self.STATE_ERROR, error=str(e))
@@ -299,17 +364,27 @@ class _TextChatManager:
             })
             self._broadcast({"type": "state", "state": self.snapshot()})
             return
+        context_limit, max_new_tokens = self._limits_for_session(session)
         with self._lock:
             self._session = session
+            self._active_model_id = model_id
+            self._context_limit = context_limit
+            self._max_new_tokens = max_new_tokens
 
         with self._lock:
             history_snapshot = list(self._history)
-        context_limit = self._resolve_context_limit()
 
-        router = _ThinkingRouter(
-            emit_fn=lambda payload: self._broadcast(payload),
-            request_id=req.id,
-        )
+        if model_id == "qwen3.5-vl-9b":
+            router = Thinking9BParser(
+                emit_fn=lambda payload: self._broadcast(payload),
+                request_id=req.id,
+                enabled=req.enable_thinking,
+            )
+        else:
+            router = _ThinkingRouter(
+                emit_fn=lambda payload: self._broadcast(payload),
+                request_id=req.id,
+            )
 
         # 5. state → running
         with self._lock:
@@ -330,7 +405,7 @@ class _TextChatManager:
                     history_snapshot,
                     req.text,
                     context_limit=context_limit,
-                    max_new_tokens=self.MAX_NEW_TOKENS,
+                    max_new_tokens=max_new_tokens,
                     enable_thinking=req.enable_thinking,
                     tool_names=self._resolve_tool_names(),
                     on_delta=lambda d: router.push(d),
@@ -364,6 +439,8 @@ class _TextChatManager:
         # result.text 本地兜底仅在两者皆空时使用。
         thinking = agent.get("thinking") or ""
         answer = agent.get("answer") or ""
+        if self._active_model_id == "qwen3.5-vl-9b":
+            thinking, answer = split_9b_thinking(answer, req.enable_thinking)
         if not thinking and not answer:
             full_text = ""
             thinking, answer = split_thinking(full_text)
@@ -427,26 +504,27 @@ class _TextChatManager:
         })
         self._broadcast({"type": "state", "state": self.snapshot()})
 
-    def _resolve_context_limit(self) -> int:
-        """读 ``config.jsonc["compute"]["text_chat"]["context_limit"]``。
+    def _select_session(self):
+        from app.core.compute.registry import get_registry
 
-        缺失 / 类型错 / <1 → 回退 :attr:`CONTEXT_LIMIT`（4096，即 qwen3.5-vl-4b
-        的真实窗口）。每次推理前重读，配置热生效 —— 但用户把它调大到
-        模型装不下的值时不会被拦，只会变成 prefill 长挂。
-        """
-        try:
-            cfg = get_config().get_section("compute", {})
-            if not isinstance(cfg, dict):
-                return self.CONTEXT_LIMIT
-            tc = cfg.get("text_chat")
-            if not isinstance(tc, dict):
-                return self.CONTEXT_LIMIT
-            v = int(tc.get("context_limit") or self.CONTEXT_LIMIT)
-            if v < 1:
-                return self.CONTEXT_LIMIT
-            return v
-        except Exception:  # noqa: BLE001
-            return self.CONTEXT_LIMIT
+        reg = get_registry()
+        last_error: Optional[RuntimeError] = None
+        for model_id in self.PREFERRED_MODELS:
+            try:
+                return model_id, reg.get_session_for_model(
+                    "swcap_text_chat", model_id,
+                )
+            except RuntimeError as e:
+                last_error = e
+        raise RuntimeError("功能未启用: swcap_text_chat") from last_error
+
+    @staticmethod
+    def _limits_for_session(session):
+        spec = getattr(session, "spec", None)
+        context_limit = int(getattr(spec, "max_context_len", 0) or 0)
+        if context_limit <= 0:
+            raise RuntimeError("模型未提供 max_context_len，无法计算上下文窗口")
+        return context_limit, MAX_NEW_TOKENS
 
     def _resolve_tool_names(self) -> List[str]:
         """列出**当前可用**的 ``@Callable`` class 名（capability + 渠道过滤）。
@@ -498,26 +576,39 @@ class _ThinkingRouter:
     # 下一段 delta 的开头，只留 8 个字符会缺首字符而识别不出来。
     _ANSWER_KEEP = max(len("<answer>"), len("</answer>"))
 
-    def __init__(self, emit_fn: Callable[[dict], None], request_id: int) -> None:
+    def __init__(
+        self,
+        emit_fn: Callable[[dict], None],
+        request_id: int,
+        *,
+        start_mode: str = "thinking",
+        boundary: str = "</think>",
+        start_seen: bool = False,
+        saw_open: bool = False,
+    ) -> None:
         self._emit = emit_fn
         self._request_id = request_id
-        self._mode = "thinking"          # thinking / answer
+        self._start_mode = start_mode
+        self._boundary = boundary
+        self._start_seen_default = start_seen
+        self._saw_open_default = saw_open
+        self._mode = start_mode          # thinking / answer
         self._buf = ""
-        self._start_seen = False
-        self._saw_open = False
+        self._start_seen = start_seen
+        self._saw_open = saw_open
         self._saw_close = False
         self._suppress_thinking = False
         self._answer_buf = ""
 
     def begin_retry(self) -> None:
         """切换为「只流式答案」：重试的思考丢弃，第一次的思考已展示过。"""
-        # 先把第一次残留的尾部（不足一个 </think> 长度的缓冲）补发，
-        # 否则 done 帧的 thinking 会比流式拼出来的多几个字符。
+        # 先把第一次残留的尾部补发，否则 done 帧的 thinking 会比流式
+        # 拼出来的多几个字符。
         self.flush()
-        self._mode = "thinking"
+        self._mode = self._start_mode
         self._buf = ""
-        self._start_seen = False
-        self._saw_open = False
+        self._start_seen = self._start_seen_default
+        self._saw_open = self._saw_open_default
         self._saw_close = False
         self._suppress_thinking = True
         self._answer_buf = ""
@@ -570,17 +661,18 @@ class _ThinkingRouter:
                 self._start_seen = True
 
         if self._mode == "thinking":
-            idx = self._buf.find(self._CLOSE)
+            boundary = self._boundary or self._CLOSE
+            idx = self._buf.find(boundary)
             if idx >= 0:
                 head = self._buf[:idx]
-                rest = self._buf[idx + len(self._CLOSE):]
+                rest = self._buf[idx + len(boundary):]
                 self._saw_close = True
                 self._emit_thinking(head)
                 self._mode = "answer"
                 self._buf = ""
                 self._emit_answer(rest)
                 return
-            keep = len(self._CLOSE) - 1
+            keep = len(boundary) - 1
             if len(self._buf) > keep:
                 emit = self._buf[:-keep]
                 self._buf = self._buf[-keep:]

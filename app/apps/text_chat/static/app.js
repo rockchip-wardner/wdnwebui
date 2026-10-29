@@ -10,6 +10,7 @@ const TextChat = {
   _sending: false,          // in-flight 防抖：fetch 完成前忽略重复 send()
   pending: new Map(),       // request_id -> {userLi, assistantLi, thinkingEl, answerEl, errorEl, cursorEl}
   messages: [],             // local history mirror: [{role:"user"|"assistant", content, ts}]
+  _historyLoaded: false,    // backend history has been rendered into the DOM
 
   init() {
     if (this._inited) return;
@@ -52,6 +53,50 @@ const TextChat = {
       }, 5000);
     }
     this.ensureWs();
+    this.loadHistory().catch(() => {});
+  },
+
+  async loadHistory(force = false) {
+    if (this._historyLoaded && !force) return;
+    let data;
+    try {
+      const r = await fetch(API_PREFIX + "/text-chat/history", { cache: "no-store" });
+      if (!r.ok) return;
+      data = await r.json();
+    } catch (_) {
+      return;
+    }
+    this._historyLoaded = true;
+    this._renderHistory((data && data.messages) || []);
+  },
+
+  _renderHistory(messages) {
+    const ul = document.getElementById("text-chat-conv-ul");
+    const empty = document.getElementById("text-chat-empty");
+    if (!ul) return;
+    ul.innerHTML = "";
+    this.pending.clear();
+    this.messages = [];
+    if (!messages.length) {
+      if (empty) empty.style.display = "";
+      return;
+    }
+    if (empty) empty.style.display = "none";
+    for (const msg of messages) {
+      const role = msg.role === "assistant" ? "assistant" : "user";
+      const li = document.createElement("li");
+      li.className = "imb-msg " + (role === "user" ? "imb-msg--out" : "imb-msg--in");
+      li.dataset.role = role;
+      const ts = this._fmtTime(Number(msg.ts || 0) * 1000);
+      const who = role === "user" ? "你" : "模型";
+      li.innerHTML = `
+        <span class="imb-msg-meta">${who}${ts ? " · " + ts : ""}</span>
+        <div class="imb-msg-body">${this._esc(msg.content || "")}</div>
+      `;
+      ul.appendChild(li);
+      this._recordMessage(role, msg.content || "", Number(msg.ts || 0) * 1000);
+    }
+    this._scrollToBottom();
   },
 
   async refresh() {
@@ -249,9 +294,11 @@ const TextChat = {
     const tokens = document.getElementById("text-chat-tokens");
     if (tokens) {
       const ht = s.history_tokens || 0;
-      const limit = s.context_limit || 16384;
-      const maxNew = s.max_new_tokens || 2048;
-      tokens.textContent = `${ht} / ${limit} tokens（预留 ${maxNew} 给输出）`;
+      const limit = Number(s.context_limit || 0);
+      const maxNew = Number(s.max_new_tokens || 0);
+      tokens.textContent = limit > 0
+        ? `${ht} / ${limit} tokens（Max tokens ${maxNew}）`
+        : "模型未就绪";
     }
 
     const sendBtn = document.getElementById("text-chat-send-btn");
@@ -535,20 +582,54 @@ const TextChat = {
     }
   },
 
+  async _getSnapshot() {
+    const r = await fetch(API_PREFIX + "/text-chat", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  },
+
+  _clearConversation() {
+    const ul = document.getElementById("text-chat-conv-ul");
+    if (ul) ul.innerHTML = "";
+    const empty = document.getElementById("text-chat-empty");
+    if (empty) empty.style.display = "";
+    this.pending.clear();
+    this._activeThinking = undefined;
+    this.messages = [];
+    this._historyLoaded = true;
+  },
+
+  async resetForWizard() {
+    // Wizard completion starts a fresh conversation. If the previous turn
+    // is still running, stop it and wait for the backend to leave busy
+    // before clearing history; otherwise the old _run_one could append its
+    // result after reset and resurrect the old context.
+    let snap = await this._getSnapshot();
+    if (snap && snap.busy) {
+      await fetch(API_PREFIX + "/text-chat/stop", { method: "POST" });
+      const deadline = Date.now() + 70000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        try { snap = await this._getSnapshot(); } catch (_) { continue; }
+        if (!snap.busy) break;
+      }
+      if (snap && snap.busy) {
+        throw new Error("上一轮仍在生成，无法清空对话，请稍后再试");
+      }
+    }
+    const r = await fetch(API_PREFIX + "/text-chat/reset", { method: "POST" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const body = await r.json().catch(() => ({}));
+    if (body.snapshot) this._applySnapshot(body.snapshot);
+    this._clearConversation();
+    this._setHint("已清空", false);
+    return body.snapshot || null;
+  },
+
   async reset() {
     if (!confirm("确认清空对话历史？")) return;
     try {
-      const r = await fetch(API_PREFIX + "/text-chat/reset", { method: "POST" });
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      // 清空本地 UI
-      const ul = document.getElementById("text-chat-conv-ul");
-      if (ul) ul.innerHTML = "";
-      const empty = document.getElementById("text-chat-empty");
-      if (empty) empty.style.display = "";
-      this.pending.clear();
-      this._activeThinking = undefined;
-      this.messages = [];
-      this._setHint("已清空", false);
+      await this.resetForWizard();
     } catch (err) {
       this._setHint("清空失败: " + err.message, true);
     }
@@ -591,6 +672,8 @@ TextChat.init();
 window.ImApp_text_chat = window.ImApp_text_chat || {};
 window.ImApp_text_chat.applyWizardSnapshot = async function (opts) {
   const result = { prompt_filled: false, sent: false };
+  // 向导完成 = 开始一轮全新的文本对话；不能把上一轮未清空的历史带进来。
+  await TextChat.resetForWizard();
   // 向导的「深度思考」选择 → 同步页面开关 + localStorage（页面级持久），
   // 让随后的 send() 按它决定 enable_thinking。向导默认关；未传也显式置关，
   // 避免主界面上次开启的残留影响向导结果。

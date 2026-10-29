@@ -300,8 +300,8 @@ function runningInstancesFor(cfg) {
 /**
  * 跑一遍「挂载 → 渲染环境检查页」。
  * @param appId  应用 id（读它的 wizard.json + manifest.json）
- * @param cardCount  后端报告的模型卡位数
- * @param modelCards 后端报告的模型卡位
+ * @param cardCount  后端报告的算力卡位数
+ * @param modelCards 后端报告的算力卡位
  */
 async function mountEnv(appId, cardCount, modelCards) {
   const cfg = loadWizard(appId);

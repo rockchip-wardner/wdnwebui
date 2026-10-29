@@ -184,7 +184,7 @@ def main():
               json.dumps(snap.get("model_cards")))
         # 枚举到的设备数随硬件变（USB 形态的 RGA/VPU 也算进去），不能写死
         # —— 只断言「能跑模型的卡比枚举到的少」这个不变量。
-        check("枚举到的设备多于能跑模型的卡（USB 形态的不算模型卡）",
+        check("枚举到的设备多于能跑模型的卡（USB 形态的不算算力卡）",
               len(snap.get("model_cards") or []) == 1
               and len(snap.get("cards") or []) > 1,
               f"cards={len(snap.get('cards') or [])} "

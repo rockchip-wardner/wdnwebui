@@ -305,6 +305,18 @@
   // npu0 那份」判成就绪 → env 步显示 ✓、无「一键开启」按钮 → 用户走到
   // 完成配置页才死等第二张卡。卡位级口径与 finish 步的等待一致。
   // 详见 AGENTS.md「env 步的「就绪」判据也必须是 (模型, 卡位) 对级」。
+  // 一个实例实际占用的卡。9B 这类分段模型有 ``npu_index=0``（主卡）
+  // + ``npu_indices=[0,1]``；只读 ``npu_index`` 会把第二张卡判成没启动。
+  // 旧快照没有 ``npu_indices`` 时回退到单卡 ``npu_index``。
+  function _instanceCards(inst) {
+    const raw = inst && inst.npu_indices;
+    if (Array.isArray(raw) && raw.length) {
+      return raw.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 0);
+    }
+    const n = Number(inst && inst.npu_index);
+    return Number.isInteger(n) && n >= 0 ? [n] : [];
+  }
+
   function _modelSlots(cfg, instances) {
     // instances 必须是本机实例（_localInstances 过滤后）
     const local = instances || [];
@@ -322,7 +334,8 @@
         continue;
       }
       for (const n of npus) {
-        const inst = local.find((i) => i.model_id === m.model_id && i.npu_index === n);
+        const inst = local.find((i) => i.model_id === m.model_id
+          && _instanceCards(i).includes(Number(n)));
         const up = !!(inst && (inst.status === "running" || inst.status === "loading"));
         slots.push({ cap, model_id: m.model_id, npu_index: n, up });
       }
@@ -658,7 +671,7 @@
       if (r.ok) {
         const data = await r.json();
         instances = _localInstances(data);
-        // 模型卡位数（能跑 rknn 模型的卡）。1 → 单卡板，2 → 双卡板。
+        // 算力卡位数（能跑 rknn 模型的卡）。1 → 单卡板，2 → 双卡板。
         // 探测失败留 0 —— 0 不等于 1,单卡分支不会被误触发。
         cardCount = (typeof data.card_count === "number") ? data.card_count : 0;
         modelCards = Array.isArray(data.model_cards) ? data.model_cards : [];
@@ -1967,8 +1980,16 @@
           // 就绪判据分两种：声明了卡号的要**那张卡**running；没声明卡号的
           // （多数卡片的旧写法）任意一张卡 running 即可。
           const running = instances.filter((i) => i.status === "running");
-          const runningExact = new Set(running.map((i) => _targetKey(
-            { model_id: i.model_id, npu_index: i.npu_index })));
+          // 多卡模型一个实例要展开成多条 ``model@card``：9B 的
+          // ``npu_indices=[0,1]`` 覆盖 @0 和 @1 两行进度。
+          const runningExact = new Set();
+          for (const inst of running) {
+            for (const n of _instanceCards(inst)) {
+              runningExact.add(_targetKey({
+                model_id: inst.model_id, npu_index: n,
+              }));
+            }
+          }
           const runningAny = new Set(running.map((i) => i.model_id));
           if (targets.every((t) => (t.npu_index == null
                 ? runningAny.has(t.model_id)
@@ -1988,7 +2009,8 @@
             const est = perModel[m.model_id] != null
               ? perModel[m.model_id] : defaultEst;
             const inst = instances.find((i) => i.model_id === m.model_id
-              && (m.npu_index == null || i.npu_index === m.npu_index));
+              && (m.npu_index == null
+                  || _instanceCards(i).includes(Number(m.npu_index))));
             if (!inst) {
               // 一直不出现 = 没启动（被关了 / 压根没开），不是「还在启动」。
               // 超过宽限就中止 —— 盯一条不变的进度条等满 90s 比报错更像死机。
