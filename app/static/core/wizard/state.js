@@ -1174,9 +1174,10 @@
                 if (loopEl) loopEl.checked = readLoopChecked();
                 const appSrcEl = document.getElementById(field.id);
                 if (appSrcEl) appSrcEl.value = data.path;
-                document.getElementById(cfg.open_source_button)?.click();
-                // 把 canvas 搬到 wizard 内(替换 drop-zone)
+                // 先搬 canvas 再触发 app 的 open：应用侧也会用
+                // getElementById 找 canvas/grid，搬晚了它会拿到 null。
                 moveCanvasToWizard();
+                document.getElementById(cfg.open_source_button)?.click();
                 dropStatus.textContent = `✓ 已上传,加载中...`;
                 dropStatus.className = WIZARD_NS + "drop-status " + WIZARD_NS + "drop-status-ok";
               } catch (e) {
@@ -1220,7 +1221,12 @@
           }
 
           const moveCanvasToWizard = () => {
-            const canvas = document.getElementById(canvasId);
+            // 切到下一步时 body.innerHTML="" 会把 canvas 连同旧 wrap 一起
+            // 移出文档，document.getElementById() 从此找不到它。必须优先
+            // 用 _active.movedCanvas 里保存的对象引用，否则返回本步再点
+            // 播放会静默 nothing（关闭按钮能恢复，正是因为它用的是对象）。
+            const saved = _active && _active.movedCanvas && _active.movedCanvas.canvas;
+            const canvas = saved || document.getElementById(canvasId);
             if (!canvas || canvas.parentNode === canvasWrap) return;
             // 记下原 parent **和它后面的兄弟**，unmount() 据此按原位搬回
             // （appendChild 只能还原到末尾，见 _restoreCanvas）。不记的话
@@ -1247,6 +1253,13 @@
               _active.movedCanvas = { canvas, originalParent, nextSibling };
             }
           };
+          // 从下一步返回本步：canvas 可能仍在已移除的旧 wrap 里。
+          // 此时自动接回新 wrap（如果用户已点「关闭」，_restoreCanvas 会
+          // 把它放回应用页，isConnected=true，不会误搬）。
+          if (_active && _active.movedCanvas && _active.movedCanvas.canvas
+              && !_active.movedCanvas.canvas.isConnected) {
+            moveCanvasToWizard();
+          }
           openBtn.addEventListener("click", () => {
             // 上传在途时点「播放视频」会放旧源,同「下一步」一并锁住
             if (_active && _active.uploadBusy) { _flashUploadHint(); return; }
@@ -1256,10 +1269,10 @@
                 ? document.getElementById(inlineLoopFieldId) : null;
               if (srcEl) srcEl.value = el.value || "";
               if (loopEl) loopEl.checked = readLoopChecked();
-              document.getElementById(cfg.open_source_button)?.click();
-              // 等 vd-open 的同步逻辑跑完再搬(下一帧前 canvas 已在 wizard 内,
-              // ws 推过来的 jpg 直接画到 wizard 内的 canvas)
+              // **先搬再调 app open** —— app 的 open handler 也会
+              // getElementById 找 canvas/grid，顺序反了会拿不到。
               moveCanvasToWizard();
+              document.getElementById(cfg.open_source_button)?.click();
             } catch (e) {
               console.warn("[wizard-state] open failed:", e);
             }
