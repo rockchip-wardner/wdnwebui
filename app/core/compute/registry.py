@@ -3115,16 +3115,23 @@ class ComputeRegistry:
            None there, so 4/5 are skipped).
         4. 3 s grace, then SIGKILL.
 
-        Raises ``RuntimeError`` if the instance is adopted (proc is
-        None) — the caller (API layer) turns this into HTTP 403.
+        Raises ``RuntimeError`` if **only** adopted instances exist (proc
+        is None) — the caller (API layer) turns this into HTTP 403.
 
-        Acts on **every** instance of the model, matching
-        :meth:`unload_instance` — a model loaded on two cards must not
-        leave one of them running behind the UI's back.
+        Acts on every **local** instance of the model (spawned /
+        adopted_local), matching :meth:`unload_instance` — a model loaded
+        on two cards must not leave one of them running behind the UI's
+        back. Peer (adopted) duplicates are skipped: the same model can
+        exist both locally and on a LAN peer at the same npu index, and
+        stopping the local copy must not be aborted by the peer entry.
         """
-        targets = self._instances_of(model_id, npu_index)
-        if not targets:
+        all_targets = self._instances_of(model_id, npu_index)
+        if not all_targets:
             raise RuntimeError(f"{model_id} 不在 registry")
+        targets = [i for i in all_targets if i._source != "adopted"]
+        if not targets:
+            raise RuntimeError(
+                f"{model_id} 是远端 peer 提供的 service，本机无权停止")
         t0 = time.time()
         for inst in targets:
             npus = tuple(inst.npu_indices or (inst.npu_index,))
