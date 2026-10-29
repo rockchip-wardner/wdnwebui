@@ -24,9 +24,10 @@ CARDS = [
     ("video-target-localization", "视频任意目标定位"),
     ("video-retrieval", "监控反查"),
     ("usb-hid", "智能电脑控制"),
+    ("tts", "语音生成"),
 ]
 # 内置卡对照，确认"插件化没有把原来就正常的卡弄坏"
-BUILTIN = [("text-chat", "文本对话"), ("tts", "语音生成")]
+BUILTIN = [("text-chat", "文本对话")]
 
 errors: list[str] = []
 page_errors: list[str] = []

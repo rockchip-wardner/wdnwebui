@@ -9,7 +9,8 @@ routes + static mounts + frontend asset references.
 Two discovery channels feed the same validation pipeline:
 
 1. **Built-in** — ``app/apps/<card_id>/manifest.json`` scanned from disk.
-   After the v0.25 split this holds only ``text_chat`` + ``tts``.
+   After the v0.25 split this holds only ``text_chat`` (``tts`` moved out
+   to the ``wdnapps_audio_chat`` plugin package).
 2. **Installed plugins** — any distribution advertising an entry point in
    the ``wdnwebui.cards`` group. The entry point *name* is the card id and
    its *value* is the importable card module; the card directory is that

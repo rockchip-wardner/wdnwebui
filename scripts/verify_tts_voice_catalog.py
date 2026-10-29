@@ -28,7 +28,6 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
 API_BASE = "http://127.0.0.1:8000"
 
 # 官方 Qwen3-TTS 的 10 种语言 + auto
@@ -57,7 +56,7 @@ def _sdk_builtin(model_dir=None) -> set:
     """SDK 探测到的、本模型真正可用的内置音色。"""
     from wdnai.backends.tts import available_config_speakers
     if model_dir is None:
-        from app.apps.tts.service import get_session
+        from wdnapps_audio_chat.cards.tts.service import get_session
         model_dir = get_session().model_dir
     return set(available_config_speakers(model_dir))
 
@@ -87,7 +86,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 # --------------------------------------------------------------------------- #
 async def test_api_mapping() -> None:
     print("\n=== A. API 层: speaker / ref_speaker 二选一 ===")
-    from app.apps.tts import api as tts_api
+    from wdnapps_audio_chat.cards.tts import api as tts_api
 
     captured = {}
 
@@ -200,7 +199,7 @@ def test_catalog_endpoint() -> None:
     # 确认「清单里出现的每个内置音色」那一行确实是训练过的(不是噪声)。
     import numpy as np
     from wdnai.backends.tts import SPK_ID, TALKER_VOCAB_SIZE, QWEN3_TTS_EMBED_DIM
-    from app.apps.tts.service import get_session
+    from wdnapps_audio_chat.cards.tts.service import get_session
     mdir = get_session().model_dir
     emb = np.fromfile(mdir / "talker_input_embed.fp16.bin",
                       dtype=np.float16).reshape(TALKER_VOCAB_SIZE,
@@ -241,10 +240,23 @@ def test_catalog_endpoint() -> None:
 # --------------------------------------------------------------------------- #
 # C. 前端静态检查
 # --------------------------------------------------------------------------- #
+def _card_dir() -> Path:
+    """TTS 卡目录。
+
+    卡片已拆成插件包 ``wdnapps_audio_chat`` —— 走 ``scripts/card_dirs.py`` 的
+    双通道解析(内置目录 + entry point 插件包),不写死路径。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from card_dirs import card_dir
+
+    return card_dir("tts")
+
+
 def test_frontend() -> None:
     print("\n=== C. 前端静态检查 ===")
-    tpl = (ROOT / "app/apps/tts/static/template.html").read_text(encoding="utf-8")
-    js = (ROOT / "app/apps/tts/static/app.js").read_text(encoding="utf-8")
+    card_dir = _card_dir()
+    tpl = (card_dir / "static/template.html").read_text(encoding="utf-8")
+    js = (card_dir / "static/app.js").read_text(encoding="utf-8")
 
     check("C1 模板有 #tts-voice 下拉", 'id="tts-voice"' in tpl)
     check("C2 模板有 #tts-language 下拉", 'id="tts-language"' in tpl)

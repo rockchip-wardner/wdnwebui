@@ -13,7 +13,7 @@
 --------------------
 1. **裁掉起始静音** —— 提取器只取 5 秒窗口，且「帧轴前面补零最差」。
 2. **挑最稳的 5 秒窗口**（不是死用前 5 秒）—— 见下面「为什么挑窗口」。
-3. **RMS 归一化到 0.05**（增益上限 20x）—— 与 ``app/apps/tts/api.py``
+3. **RMS 归一化到 0.05**（增益上限 20x）—— 与 ``wdnapps_audio_chat`` 包的 ``cards/tts/api.py``
    的 ``_normalize_wav`` 完全一致，用户音色和参考音色就站在同一条
    起跑线上。
 
@@ -65,7 +65,7 @@ SILENCE_ABS = 10 ** (-55 / 20)
 PREROLL_SECONDS = 0.05
 #: 选窗时要求的有声帧率下限
 MIN_VOICED_RATIO = 0.5
-#: 归一化目标 RMS —— 与 app/apps/tts/api.py 的 _normalize_wav 一致
+#: 归一化目标 RMS —— 与 cards/tts/api.py 的 _normalize_wav 一致
 TARGET_RMS = 0.05
 #: 归一化增益上限
 MAX_GAIN = 20.0
@@ -205,7 +205,7 @@ def pick_window(pcm: np.ndarray, sr: int = SR) -> tuple:
 def normalize_rms(pcm: np.ndarray) -> tuple:
     """RMS 归一化到 :data:`TARGET_RMS`。返回 ``(pcm, gain, rms_before)``。
 
-    和 ``app/apps/tts/api.py`` 的 ``_normalize_wav`` 同规则：
+    和 ``wdnapps_audio_chat`` 包的 ``cards/tts/api.py`` 的 ``_normalize_wav`` 同规则：
     增益上限 :data:`MAX_GAIN`，|gain-1|<0.2 时视为不动。
     """
     if pcm.size == 0:

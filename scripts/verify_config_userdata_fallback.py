@@ -407,7 +407,7 @@ def main() -> int:
         ok,
     ))
     # 也确认 service 层 _default_output_path 走的就是新 helper
-    from app.apps.tts.service import TtsSession
+    from wdnapps_audio_chat.cards.tts.service import TtsSession
     sample_path = TtsSession._default_output_path(None)
     ok = str(sample_path).startswith(tts_out)
     results.append(_check(

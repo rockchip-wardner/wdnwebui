@@ -6,11 +6,20 @@ import app.core.*」零耦合铁律,A1 静态扫描发现)。
   - TTSRequest dataclass
   - PLAY_DEVICE / PLAY_BROWSER / PLAY_BOTH 常量
   - default_ref_speaker() —— 默认参考音色(从 SDK 内嵌表派生)
-  - get_session() —— 懒代理,内部再 import apps/tts/service 拿单例,
-    避免 core → apps 反向依赖在 import 阶段就触发循环
+  - get_session() —— 懒代理,内部再 import 卡片 service 拿单例,
+    避免 core → 卡片 反向依赖在 import 阶段就触发循环
+
+为什么 get_session() 是「候选路径列表」而不是写死一个
+----------------------------------------------------
+语音生成卡已从 app/apps/tts 拆成插件包 wdnapps_audio_chat(见该包
+README)。core **不得**硬依赖某一个具体包路径 —— 那会让「插件没装」
+从「一张卡缺席」变成「core 报错」。所以按候选列表逐个试,插件包优先、
+树内旧路径兜底(开发期/过渡),都没有就抛 ImportError,由调用方(内置
+工具 tts_alert,注册时已 try/except)按「工具不可用」软失败处理。
 """
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -54,15 +63,32 @@ class TTSRequest:
     non_streaming_mode: bool = False
 
 
-def get_session():
-    """返回 ``app.apps.tts.service.TtsSession`` 单例。
+#: TTS 会话实现所在模块的候选路径 —— 插件包优先,树内旧路径兜底。
+_TTS_SESSION_MODULES = (
+    "wdnapps_audio_chat.cards.tts.service",
+    "app.apps.tts.service",
+)
 
-    懒加载避免 core → apps.tts.service → core 循环;boot 时 tts.service
+
+def get_session():
+    """TTS 会话单例(``TtsSession``)。
+
+    懒加载避免 core → 卡片 service → core 循环;boot 时 service
     还未 import,第一次调用 ``get_session`` 时所有模块都已就绪。
+
+    候选路径全试完仍拿不到 → 抛 ImportError(插件没装 / 卡片还没搬完),
+    调用方负责降级。
     """
-    from app.apps.tts.service import get_session as _impl
-    return _impl()
+    for mod_path in _TTS_SESSION_MODULES:
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        return mod.get_session()
+    raise ImportError(
+        "TTS 会话实现不可用:候选路径全部 import 失败: "
+        + ", ".join(_TTS_SESSION_MODULES))
 
 
 if TYPE_CHECKING:  # 仅类型提示用,运行时无副作用
-    from app.apps.tts.service import TtsSession  # noqa: F401
+    from wdnapps_audio_chat.cards.tts.service import TtsSession  # noqa: F401

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 更新 .venv/src 下以 editable 模式安装的 wdnav / wdnai / wdndds / wdnhid
-# 以及两个应用插件包 wdnapps_video_analyzer / wdnapps_hdmi_processor
+# 以及三个应用插件包 wdnapps_video_analyzer / wdnapps_hdmi_processor /
+# wdnapps_audio_chat
 # 用法：./update_rkwhl.sh
 #
 # 每个包的流程（v1.3 起）：
@@ -165,7 +166,7 @@ verify_outputs() {
             # wdnwebui 卡片侧 import wdnhid，必须保证本包可用即可。
             return 0
             ;;
-        wdnapps_video_analyzer|wdnapps_hdmi_processor)
+        wdnapps_video_analyzer|wdnapps_hdmi_processor|wdnapps_audio_chat)
             # 应用插件包也是 pure-Python，同样没有 .so；但要验的东西更重要
             # ——卡片是不是真的注册上了（见 verify_plugin_cards 的说明）。
             verify_plugin_cards "$pkg"
@@ -420,6 +421,7 @@ run_pkg wdnhid "git+ssh://git@10.10.10.10/wardner/wdnhid.git#egg=wdnhid"
 # 而那正是文件头 v1.3 要根治的"实体目录遮挡 editable 安装"问题。
 run_pkg wdnapps_video_analyzer "git+ssh://git@10.10.10.10/wardner/wdnapps_video_analyzer.git#egg=wdnapps_video_analyzer"
 run_pkg wdnapps_hdmi_processor "git+ssh://git@10.10.10.10/wardner/wdnapps_hdmi_processor.git#egg=wdnapps_hdmi_processor"
+run_pkg wdnapps_audio_chat "git+ssh://git@10.10.10.10/wardner/wdnapps_audio_chat.git#egg=wdnapps_audio_chat"
 
 # 依赖审计放在**所有包都处理完之后**：这时 venv 的状态才是最终状态
 # （前面的包可能刚被重装，依赖也可能刚被 pip 换掉）。审计失败不改 .venv，
@@ -428,7 +430,7 @@ DEPS_AUDIT_OK=1
 audit_sdk_deps || DEPS_AUDIT_OK=0
 
 if [ ${#FAILED_PKGS[@]} -eq 0 ] && [ "$DEPS_AUDIT_OK" = "1" ]; then
-    echo "更新完成（wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor 全部成功）。"
+    echo "更新完成（wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor / wdnapps_audio_chat 全部成功）。"
     exit 0
 fi
 

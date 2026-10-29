@@ -1067,7 +1067,7 @@ app/apps/<card_id>/
 依赖方向是单向的：插件 → `app.core.*`。core 不得依赖插件，否则插件没装
 时 core 会静默降级。
 
-> **脚本别再硬编码 `app/apps/<id>/`** —— 6 张卡的源码在插件包里，不在仓库
+> **脚本别再硬编码 `app/apps/<id>/`** —— 7 张卡的源码在插件包里，不在仓库
 > 里。verify 脚本要取卡片的 wizard.json / manifest.json / app.js，走
 > `scripts/card_dirs.py`（内置 + 插件双通道解析，返回 id / 目录名 / 路径 /
 > import 命名空间）。否则轻则 ENOENT 崩掉，重则**扫不到任何东西却照样报
@@ -1077,7 +1077,7 @@ app/apps/<card_id>/
 | `id` | capability（能力组） | 后端入口 | 来源 |
 |---|---|---|---|
 | `text-chat` | `swcap_text_chat` | `app.apps.text_chat` | 内置 |
-| `tts` | `swcap_text_to_speech` | `app.apps.tts` | 内置 |
+| `tts` | `swcap_text_to_speech` | `wdnapps_audio_chat.cards.tts` | `wdnapps_audio_chat` |
 | `audio-analysis` | `swcap_audio_chat` | `wdnapps_video_analyzer.cards.audio_analysis` | `wdnapps_video_analyzer` |
 | `video-retrieval` | `swcap_vision_embedding` | `wdnapps_video_analyzer.cards.video_retrieval`（检索） | `wdnapps_video_analyzer` |
 | `video-detection` | `swcap_vision_chat` + `swcap_audio_chat`（两个模型） | `wdnapps_video_analyzer.cards.video_detection` | `wdnapps_video_analyzer` |
@@ -2064,7 +2064,7 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
 
 * `92dd883` 把宿主共享启动器 `core/wizard-start.js` 落地时,只改了**插件包里
   的四张视频卡**(vd / vtd / vtl / vr)。**仓库内的 tts 卡漏改**,`applyWizardSnapshot`
-  还在用 `btn.click()`(见 `app/apps/tts/static/app.js`)。
+  还在用 `btn.click()`(见 `wdnapps_audio_chat` 包的 `cards/tts/static/app.js`)。
 * tts 的启动按钮 `disabled` 判据是 `!capReady`,而 `capReady` 来自
   **卡片自己的快照** `snapshot.capability_ready`(后端 = registry 里有没有
   running 的 TTS 实例)。卡片快照的刷新周期是 **5s**,而向导的
@@ -4009,8 +4009,8 @@ advance. For one-off sync of a single SDK, `pip install -e
 fresh host, `bootstrap_wdndds_native.sh` is still required for apt
 deps + native lib vendoring.
 
-`update_rkwhl.sh` 同样驱动两个**卡片插件包**（`wdnapps_video_analyzer` /
-`wdnapps_hdmi_processor`），但它们是 pure-Python、没有 `.so` 可断言，改由
+`update_rkwhl.sh` 同样驱动三个**卡片插件包**（`wdnapps_video_analyzer` /
+`wdnapps_hdmi_processor` / `wdnapps_audio_chat`），但它们是 pure-Python、没有 `.so` 可断言，改由
 `verify_plugin_cards` → `scripts/check_plugin_entrypoints.py` 校验
 「entry point 能解析 → manifest `"id"` 与 entry point 名逐字相同 → 卡片
 目录有 `static/`」。这组断言挡的是另一个静默失败：entry point 名照着包目录
@@ -4025,23 +4025,24 @@ deps + native lib vendoring.
 
 ## `vrepo` —— 工作区多仓库统筹（对标 Android `repo`）
 
-工作区里其实有 **7 个独立 git 仓库**（不是一个 submodule 树）：
+工作区里其实有 **8 个独立 git 仓库**（不是一个 submodule 树）：
 
 | 仓库 | 路径 | 远端 | 说明 |
 |---|---|---|---|
 | wdnwebui | `.` | `origin` | 本仓（.venv/ 已被 .gitignore 排除） |
 | wdnai | `.venv/src/wdnai` | `origin` | editable 安装，VLM/LLM SDK |
+| wdnapps_audio_chat | `.venv/src/wdnapps_audio_chat` | `origin` | editable 安装，语音生成卡片插件 |
 | wdnapps_hdmi_processor | `.venv/src/wdnapps_hdmi_processor` | `origin` | editable 安装，HDMI 卡片插件 |
 | wdnapps_video_analyzer | `.venv/src/wdnapps_video_analyzer` | `origin` | editable 安装，视频卡片插件 |
 | wdnav | `.venv/src/wdnav` | `origin` | editable 安装，MPP/RGA/V4L2 |
 | wdndds | `.venv/src/wdndds` | `origin` | editable 安装，DDS/RPC |
 | wdnhid | `.venv/src/wdnhid` | **`rk`** | editable 安装，USB Gadget HID |
 
-根目录的 `vrepo`（纯标准库、单文件、可执行）把这 7 个仓当**一个 manifest**
+根目录的 `vrepo`（纯标准库、单文件、可执行）把这 8 个仓当**一个 manifest**
 统筹，避免「逐个 cd 进去手工来一遍」：
 
 ```bash
-./vrepo status            # 一屏看清 7 个仓的状态（最常用）
+./vrepo status            # 一屏看清 8 个仓的状态（最常用）
 ./vrepo status --fetch    # 先刷新远端跟踪引用再看
 ./vrepo sync -j 4         # 并行 fetch + ff-only 前进
 ./vrepo sync --reinstall  # 顺带重装 HEAD 变动 / 版本漂移的 editable 包
@@ -5604,7 +5605,7 @@ are all documented in
 ``.venv/src/wdnai/src/wdnai/models/README.md`` and
 ``.venv/src/wdnai/src/wdnai/backends/tts.py``.
 
-* **Service** (`app/apps/tts/service.py`):
+* **Service** (`wdnapps_audio_chat` 包的 `cards/tts/service.py`):
   - ``TtsSession`` singleton, lazy-imports wdnai at first use so a
     non-RK dev box still boots (just reports ``state="unavailable"``).
   - State machine mirrors ``VideoSession``/``WdnaiDetector``:
@@ -5617,7 +5618,7 @@ are all documented in
     thread is still draining.
   - Output history is an in-memory deque (max 50). Each entry:
     ``{ts, text, language, speaker, output, size, audio_sec, frames}``.
-* **Endpoints** (`app/apps/tts/api.py`):
+* **Endpoints** (`wdnapps_audio_chat` 包的 `cards/tts/api.py`):
   - ``POST /api/tts/start`` ``{text, language, speaker, ref_speaker,
     volume, instruct, no_play, non_streaming_mode, output}`` — kicks
     off a synthesis. Refuses with 503 if a run is in flight.

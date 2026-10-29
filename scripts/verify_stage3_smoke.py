@@ -439,7 +439,7 @@ def check_tts(res: Results, reg) -> None:
     the real TTS page uses, not a bare prompt. A ``str`` here would mean
     the audio silently vanished, which is the failure worth catching.
     """
-    from app.apps.tts.service import _get_tts_result_cls
+    from wdnapps_audio_chat.cards.tts.service import _get_tts_result_cls
     from wdnai import Attachment
 
     TTSResult = _get_tts_result_cls()
