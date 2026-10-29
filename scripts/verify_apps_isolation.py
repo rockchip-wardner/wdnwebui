@@ -34,8 +34,6 @@ def _cards() -> list[dict]:
     6 张卡已迁到 wdnapps_* 插件包，只扫 app/apps/ 等于**几乎没扫** ——
     跨卡 import 的检查会假绿。
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from card_dirs import resolve_cards
     return resolve_cards()
 
 
@@ -67,18 +65,42 @@ SYS_DIR = REPO / "app" / "system"
 TEST_PORT = 18080
 TEST_BASE = f"http://localhost:{TEST_PORT}"
 
-# 当前 7 个 app（audio_analysis 是 hidden,但仍参与测试）
-EXPECTED_APPS = [
-    "audio-analysis",
-    "text-chat",
-    "tts",
-    "video-retrieval",
-    "video-detection",
-    "video-target-detection",
-    "video-target-localization",
-]
-# 仅面板可见的 6 个（hidden=true 的不进 runtime check）
-VISIBLE_APPS = [a for a in EXPECTED_APPS if a != "audio-analysis"]
+# 当前所有卡 —— **动态发现**，不写死。
+#
+# 卡片有两类来源：内置 app/apps/ 与 entry point 插件包。插件是**可选**的
+# （装了才有那张卡），所以清单不能写死 —— 写死的话，卸掉任一插件包，
+# 这个宿主级脚本就会因为「那张卡不在」而报 FAIL，那是脚本的锅不是代码的锅。
+#
+# hidden=true 的卡（audio_analysis）不在 runtime check 里，但不参与 A 段
+# 静态扫描（它照样是被检查的对象）。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from card_dirs import resolve_cards  # noqa: E402
+
+
+def _manifest_of(card_dir: Path) -> dict:
+    try:
+        return json.loads((card_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _all_card_ids() -> list[str]:
+    """已发现的全部卡 id（含 hidden）。"""
+    return [c["id"] for c in resolve_cards()]
+
+
+def _visible_card_ids() -> list[str]:
+    """面板可见的卡（hidden=true 的排除）。"""
+    out = []
+    for c in resolve_cards():
+        if _manifest_of(Path(c["dir"])).get("hidden"):
+            continue
+        out.append(c["id"])
+    return out
+
+
+EXPECTED_APPS = _all_card_ids()
+VISIBLE_APPS = _visible_card_ids()
 
 
 # ---------------------------------------------------------------------------

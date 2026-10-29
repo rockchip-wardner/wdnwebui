@@ -12,22 +12,43 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 BASE = "http://localhost:8000"
 
+# 卡片清单**动态发现**，不写死。
+#
+# 插件包是**可选**的 —— 装了的才有那张卡。写死清单的话，卸掉任一插件包
+# 这个脚本就会因为「那张卡不在」而 FAIL，那是脚本的锅不是代码的锅。
+# 内置卡(app/apps/)与插件卡(entry point)按 import 命名空间区分：
+# 内置是 app.apps，插件是 <包>.cards。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from card_dirs import resolve_cards  # noqa: E402
+
+
+def _card_list() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """``(插件卡, 内置卡)``，元素都是 ``(卡 id, 标题)``。
+
+    标题取 manifest.json 的 ``title`` —— 那是页面上真正显示的文字，断言
+    用它才准（写死一份标题的话，manifest 改了就红）。
+    """
+    plugin: list[tuple[str, str]] = []
+    builtin: list[tuple[str, str]] = []
+    for c in resolve_cards():
+        try:
+            raw = json.loads(
+                (Path(c["dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        title = raw.get("title") or c["id"]
+        (builtin if c["ns"] == "app.apps" else plugin).append((c["id"], title))
+    return plugin, builtin
+
+
 # 每个插件卡至少点进一次，验证静态资源 + 前端 IIFE 能跑起来。
-CARDS = [
-    ("video-detection", "音视频描述"),
-    ("video-target-detection", "视频目标监控"),
-    ("video-target-localization", "视频任意目标定位"),
-    ("video-retrieval", "监控反查"),
-    ("usb-hid", "智能电脑控制"),
-    ("tts", "语音生成"),
-]
-# 内置卡对照，确认"插件化没有把原来就正常的卡弄坏"
-BUILTIN = [("text-chat", "文本对话")]
+CARDS, BUILTIN = _card_list()
 
 errors: list[str] = []
 page_errors: list[str] = []
