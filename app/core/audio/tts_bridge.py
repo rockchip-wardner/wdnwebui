@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
+from importlib.util import find_spec
 from typing import TYPE_CHECKING
 
 
@@ -68,6 +69,28 @@ _TTS_SESSION_MODULES = (
     "wdnapps_audio_chat.cards.tts.service",
     "app.apps.tts.service",
 )
+
+
+def session_available() -> bool:
+    """TTS 会话实现是否可用（语音生成卡装了吗）—— **只探测，不建单例**。
+
+    给内置工具注册用：插件包没装时就不该注册 tts_alert —— 让模型看到
+    一个「一调就抛 ImportError」的工具，比看不到这个工具更糟（它会真的
+    去调，然后拿到一个错误）。
+
+    探的是**卡片包**（父模块）而不是叶子模块：``find_spec`` 不执行目标
+    模块的代码，只 import 它的父包（插件的顶层 ``__init__`` 是空的），
+    所以探测既便宜又无副作用。
+    """
+    for mod_path in _TTS_SESSION_MODULES:
+        pkg = mod_path.rsplit(".", 1)[0]
+        try:
+            if find_spec(pkg) is None:
+                continue
+        except (ImportError, ValueError):
+            continue
+        return True
+    return False
 
 
 def get_session():

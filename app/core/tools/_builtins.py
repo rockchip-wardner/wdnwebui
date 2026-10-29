@@ -107,7 +107,17 @@ def _register_tts_alert(registry) -> None:
     路径不走 chat_run,因此不受 channels 限定影响（detector 直接传
     ``tools=[TtsAlert]`` 给 ``session.respond``,不走
     ``resolve_available_tool_names``）。
+
+    **语音生成卡不在时整个工具不注册**（不是注册了再报错）：卡片已拆成
+    插件包 ``wdnapps_audio_chat``,插件没装 → TTS 会话实现不可用 → 模型
+    不该看见这个工具。注册了的话模型会真的去调,然后拿到一个
+    ImportError —— 那比没有这个工具更糟。
     """
+    from app.core.audio.tts_bridge import session_available
+
+    if not session_available():
+        _LOG.warning("builtins: 语音生成卡未安装，tts_alert 不可用，跳过注册")
+        return
     try:
         from app.core.tools.tts_alert import TtsAlert
     except Exception as e:  # noqa: BLE001
