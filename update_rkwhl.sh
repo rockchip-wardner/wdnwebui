@@ -267,6 +267,22 @@ purge_install_traces() {
         rm -rf "$sp/$pkg"
         removed=1
     fi
+    # pip 升级/卸载时会把旧目录/旧 dist-info 改名成 ``~`` 前缀再删；
+    # 进程被打断就留下 ``~dndds`` / ``~-ndds`` / ``~dndds-*.dist-info`` 这类
+    # 垃圾。它们的命名**不固定**（pip 各版本改名策略不同，实测同一个
+    # wdndds 能留下三种），所以按包名去 glob 是抓不全的。
+    #
+    # 但 ``~`` 不是合法的 Python 标识符首字符 —— 合法包名不可能以它开头，
+    # 所以 site-packages 里的 ``~*`` **一律是 pip 垃圾**，整个扫掉即可。
+    # 不这么做的后果：importlib.metadata 会把 ``~xxx.dist-info`` 当成一个
+    # 非法发行版，pip 每条命令都刷 "Ignoring invalid distribution"，
+    # 还可能让对应的包从 pip list 里整个消失（实测 wdndds 就这样没了）。
+    for f in "$sp"/'~'*; do
+        [ -e "$f" ] || continue
+        echo "    [$pkg] 删除 pip 中断残留 $f"
+        rm -rf "$f"
+        removed=1
+    done
     for f in "$sp/$pkg"-*.dist-info "$sp/$pkg".dist-info \
              "$sp/__editable__.$pkg"-*.pth "$sp/__editable__.$pkg.pth"; do
         [ -e "$f" ] || continue
