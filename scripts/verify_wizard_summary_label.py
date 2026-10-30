@@ -8,7 +8,6 @@ CASES = [
     ("video-target-detection",   "detect", "vtd-prompt",      "检测提示词"),
     ("text-chat",                "prompt", "tc-prompt",       "首次提问"),
     ("tts",                      "text",   "tts-text",        "要合成的文本"),
-    ("video-retrieval",          "search", "vr-text",         "检索问题"),
 ]
 
 async def main():

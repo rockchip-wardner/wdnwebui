@@ -122,12 +122,12 @@ def main():
         page.wait_for_timeout(300)
         s3 = page.evaluate("""() => ({
             stepTitle: document.querySelector('.wd-wizard-step-title')?.textContent,
-            hasSearchTextarea: !!document.querySelector('[data-field-id="vr-text"]'),
+            hasQueryGroups: !!document.querySelector('[data-field-id="vr-query-groups"] .qg-text'),
             hasStalePromptField: !!document.querySelector('[data-field-id="vr-prompt"]'),
         })""")
         print("\n=== 3) search step ===")
         print(f"  {s3}")
-        if s3['hasSearchTextarea'] and s3['stepTitle'] == '检索问题' and not s3['hasStalePromptField']:
+        if s3['hasQueryGroups'] and s3['stepTitle'] == '检索问题' and not s3['hasStalePromptField']:
             print("  ✅ search 步骤 OK")
             ok += 1
         else:
@@ -185,7 +185,7 @@ def main():
         page.evaluate("window.WizardState.stepForward()")
         page.wait_for_timeout(400)
         filled = page.evaluate("""() => {
-            const el = document.querySelector('[data-field-id="vr-text"]');
+            const el = document.querySelector('[data-field-id="vr-query-groups"] .qg-text');
             if (!el) return false;
             el.value = '视频里有没有人';
             el.dispatchEvent(new Event('input', {bubbles: true}));

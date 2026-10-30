@@ -28,7 +28,6 @@ CASES = [
     ("video-target-detection", "vtd-prompt"),
     ("text-chat",              "tc-prompt"),
     ("tts",                    "tts-text"),
-    ("video-retrieval",        "vr-text"),
 ]
 
 FAILED: list[str] = []

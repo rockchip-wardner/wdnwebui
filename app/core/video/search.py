@@ -189,7 +189,7 @@ def _score_hits(qvec: np.ndarray, index: List[dict], sim_threshold: float,
                 top_k: int, min_results: int = 0) -> "tuple[List[dict], dict]":
     """对一组归一化向量索引做余弦检索（threshold 过滤 + top_k 截断 +
     min_results 兜底）—— ``VideoSearchService.query`` 与
-    ``POST /query_multi`` 共用的评分实现。
+    ``POST /query_batch`` 共用的评分实现。
 
     返回 ``(hits: [{video_path, start_time, end_time, chunk_idx,
     similarity, above_threshold}], meta: {top_score, above_count,
@@ -653,6 +653,79 @@ class VideoSearchService:
                 }
         self._broadcast({"type": "state", **snap})
         return snap
+
+    def query_batch(self, queries: list[dict], *,
+                    check_image_quality: bool = True,
+                    min_results: int = 0) -> dict:
+        """Run one or more text/image queries against the current index.
+
+        This is the unified source-video query path used by both single-group
+        and multi-group UI. It deliberately does **not** mutate ``_query`` /
+        ``_hits`` or broadcast WS state: a batch has many results, while the
+        legacy singleton snapshot can only describe one of them.
+        """
+        if not isinstance(queries, list) or not queries:
+            raise ValueError("queries 不能为空")
+        if len(queries) > 5:
+            raise ValueError("最多支持 5 组检索描述")
+        with self._lock:
+            if self._state not in (_STATE_READY, _STATE_IDLE):
+                raise ValueError("请先完成视频切片提取")
+            index = list(self._index)
+            source = self._source
+            fps = self._fps
+        min_results = max(0, int(min_results or 0))
+        out = []
+        for i, raw in enumerate(queries):
+            q = raw if isinstance(raw, dict) else {}
+            text = (q.get("text") or "").strip()
+            image_path = (q.get("image_path") or q.get("imagePath") or "").strip()
+            image_name = os.path.basename(image_path) if image_path else ""
+            item = {
+                "index": i,
+                "text": text,
+                "image_path": image_path,
+                "image_name": image_name,
+                "error": "",
+                "hits": [],
+                "query_meta": {
+                    "index_size": len(index),
+                    "top_score": None,
+                    "above_threshold_count": 0,
+                    "below_threshold_count": 0,
+                    "fallback_used": False,
+                },
+            }
+            if not text and not image_path:
+                item["error"] = "请至少填写检索问题或选择一张图片"
+                out.append(item)
+                continue
+            if text and len(text) > 50:
+                item["error"] = "检索问题不能超过 50 个字"
+                out.append(item)
+                continue
+            if not index:
+                out.append(item)
+                continue
+            try:
+                qvec = self.encode_query(text, image_path, check_image_quality)
+                qvec = np.asarray(qvec, dtype=np.float32).reshape(-1)
+                qvec = qvec / (np.linalg.norm(qvec) + 1e-9)
+                hits, meta = _score_hits(
+                    qvec, index, FIXED_SIM_THRESHOLD, FIXED_TOP_K, min_results)
+                item["hits"] = hits
+                item["query_meta"] = {
+                    "index_size": len(index),
+                    "top_score": meta["top_score"],
+                    "above_threshold_count": meta["above_threshold_count"],
+                    "below_threshold_count": meta["below_threshold_count"],
+                    "fallback_used": meta["fallback_used"],
+                }
+            except ValueError as exc:
+                item["error"] = str(exc)
+            out.append(item)
+        return {"mode": "source", "source": source, "fps": fps,
+                "queries": out}
 
     def _ensure_session(self):
         """从 ComputeRegistry 拿 embedding session。未启用抛 RuntimeError。"""

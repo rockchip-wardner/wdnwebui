@@ -1,0 +1,314 @@
+/* Repeatable query groups: app-page entries and wizard inline rows. */
+.qg-root {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.qg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.qg-empty {
+  padding: 14px 10px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  color: #94a3b8;
+  font-size: 13px;
+  text-align: center;
+}
+.qg-empty[hidden] { display: none; }
+.qg-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.qg-add {
+  padding: 5px 10px;
+  font-size: 12px;
+}
+.qg-count {
+  font-size: 12px;
+  color: #94a3b8;
+}
+.qg-disabled { opacity: .65; }
+
+/* ---- app page: compact entries ---- */
+.qg-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 7px 9px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f8fafc;
+  cursor: pointer;
+  transition: border-color .15s, background-color .15s;
+}
+.qg-entry:hover,
+.qg-entry:focus-visible {
+  border-color: #93c5fd;
+  background: #f0f7ff;
+  outline: none;
+}
+.qg-entry-num {
+  flex: 0 0 20px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+.qg-entry-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #334155;
+  font-size: 12px;
+}
+.qg-entry-edit,
+.qg-entry-remove {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: #64748b;
+  font-size: 12px;
+  padding: 2px 5px;
+  cursor: pointer;
+}
+.qg-entry-edit:hover { color: #2563eb; }
+.qg-entry-remove {
+  color: #94a3b8;
+  font-size: 17px;
+  line-height: 1;
+}
+.qg-entry-remove:hover { color: #dc2626; }
+
+/* ---- wizard: collapsible rows (VTL prompt_rows style) ---- */
+.qg-inline-item {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+.qg-inline-head {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 24px 24px;
+  gap: 6px;
+  align-items: center;
+  min-height: 38px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.qg-inline-head:hover { background: #f8fafc; }
+.qg-inline-num {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+}
+.qg-inline-item.is-open .qg-inline-num {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+.qg-inline-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #475569;
+  font-size: 13px;
+}
+.qg-inline-toggle,
+.qg-inline-remove {
+  border: 0;
+  background: transparent;
+  color: #94a3b8;
+  padding: 2px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.qg-inline-toggle:hover { color: #2563eb; }
+.qg-inline-remove { font-size: 18px; line-height: 1; }
+.qg-inline-remove:hover { color: #dc2626; }
+.qg-inline-body {
+  padding: 8px;
+  border-top: 1px solid #eef2f7;
+  background: #fbfdff;
+}
+.qg-inline-body[hidden] { display: none; }
+.qg-inline-done {
+  margin-top: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+/* ---- shared editor ---- */
+.qg-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.qg-text-wrap {
+  position: relative;
+  display: block;
+}
+.qg-text {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 8px 10px 18px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: #111827;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.qg-textarea {
+  min-height: 54px;
+  resize: vertical;
+}
+.qg-input {
+  height: 34px;
+  padding-bottom: 8px;
+}
+.qg-text:focus,
+.qg-image:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, .12);
+}
+.qg-text-count {
+  position: absolute;
+  right: 8px;
+  bottom: 4px;
+  color: #94a3b8;
+  font-size: 11px;
+}
+.qg-text-count.over { color: #dc2626; }
+.qg-image-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 6px;
+}
+.qg-image {
+  flex: 1 1 auto;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  font: inherit;
+  font-size: 12px;
+}
+.qg-image-row .vd-btn {
+  flex: 0 0 auto;
+  min-height: 0;
+  height: 28px;
+  padding: 3px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: #111827;
+  font-size: 12px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+.qg-image-row .vd-btn:hover { background: #f3f4f6; }
+.qg-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.qg-preview[hidden] { display: none; }
+.qg-preview-img {
+  max-width: 160px;
+  max-height: 100px;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  background: #000;
+  object-fit: contain;
+}
+.qg-mode-entries .qg-preview-img {
+  max-width: 300px;
+  max-height: 190px;
+}
+.qg-preview-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+/* ---- app-page editor modal ---- */
+.qg-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(17, 24, 39, .48);
+}
+.qg-modal.hidden { display: none; }
+.qg-modal-card {
+  box-sizing: border-box;
+  width: min(520px, 94vw);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, .22);
+  overflow: hidden;
+}
+.qg-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid #e5e7eb;
+}
+.qg-modal-title {
+  color: #111827;
+  font-size: 15px;
+  font-weight: 600;
+}
+.qg-modal-close {
+  border: 0;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 20px;
+  cursor: pointer;
+}
+.qg-modal-close:hover { color: #111827; }
+.qg-modal-body {
+  padding: 14px 16px;
+  overflow-y: auto;
+}
+.qg-modal-hint {
+  min-height: 16px;
+  padding: 0 16px;
+  color: #dc2626;
+  font-size: 12px;
+}
+.qg-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 16px 14px;
+}

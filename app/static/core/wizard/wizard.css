@@ -564,6 +564,10 @@
   color: #111827;
   word-break: break-all;
 }
+.wd-wizard-summary-item {
+  padding: 1px 0;
+  line-height: 1.55;
+}
 .wd-wizard-finish-error {
   margin-top: 16px;
   padding: 10px 14px;

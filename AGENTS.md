@@ -5757,9 +5757,9 @@ RIFF header by hand.
   - `GET /judge` / `POST /judge` / `GET /judge/metrics` / `POST /judge/reset`
     — 判据配置（与三卡同契约；`metrics` 额外返回 `default_every_n=10`，
     因为 VR 的 `every_n` 单位是**秒级采样帧**而不是解码帧）。
-  - `POST /query` `{text?, image_path?, check_image_quality?, min_results?}` /
-    `POST /query_multi`（同样支持图片）/ `POST /query/clear` — 图 / 文 /
-    图+文检索（阈值 0.40 / 上限 10 固化）、多视频缓存检索、清空结果。
+  - `POST /query_batch` `{queries: [{text?, image_path?}], entries?, check_image_quality?, min_results?}`
+    — 统一单组 / 1~5 组检索（阈值 0.40 / 上限 10 固化；传 `entries`
+    走缓存多视频，否则读当前单视频索引）；`POST /query/clear` — 清空结果。
   - `GET /image/thumb?path=` — 查询图缩略图（长边 240 JPEG，只读）。
   - `GET  /cache/stats` / `GET /cache/list` / `DELETE /cache/entry` / `POST /cache/clear`
     — 检索缓存管理（只含检索条目）。**删除当前会话对应条目时必须
@@ -5795,7 +5795,7 @@ RIFF header by hand.
   - 历史记录**一行 = 一条检索缓存**（md5 × 切片参数 × **判据口径**；后端
     `/history` 仍按 md5 聚合返回，前端展平）；gscore 条目展示「按变化切片」
     （不显示 4s/1s —— 跳过的秒不产帧，参数不再描述实际片段），旧固定切片
-    条目保留参数。勾选 ≥1 → `/query_multi` 多视频检索（`entries[]` 带
+    条目保留参数。勾选 ≥1 → `/query_batch` 多视频检索（`entries[]` 带
     `judge_fp` / `slice_version`，按条目自身口径查）；按行删除 / 清空缓存 /
     清空检索结果。
   - `DemoGuard` 注册 `video-retrieval`（`active_state_keys: ["search.state","busy"]`），
@@ -5845,7 +5845,7 @@ RIFF header by hand.
 
 ### 图片检索
 
-`POST /query` / `POST /query_multi` 接受 `image_path`（绝对路径）—— 图片、
+`POST /query_batch` 接受每组 `image_path`（绝对路径）—— 图片、
 文字、图片+文字三种输入任意组合：
 
 * **编码**：`VideoSearchService.encode_query(text, image_path, check_image_quality)`
@@ -6685,8 +6685,8 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
   - **互斥**（前端 `vrApplyMutualExclusion`）：路径 text 非空 → 勾
     选框全 disabled；勾选 ≥1 → `#vr-source` / `#vr-browse` /
     `#vr-start` disabled。
-  - **多选检索**：检索按钮在勾选 ≥1 时分叉
-    `POST /query_multi {text, min_results, entries[]}` —— 匹配阈值
+  - **多选检索**：检索按钮在勾选 ≥1 时走
+    `POST /query_batch {queries, min_results, entries[]}` —— 匹配阈值
     固定 0.40、检索上限固定 10（body 里传了也会被忽略）；`entries[]`
     里的 `chunk_seconds` / `chunk_overlap_seconds` / `judge_fp` /
     `slice_version` 是缓存条目主键，按条目自身记录的参数检索（历史条目
@@ -6699,7 +6699,7 @@ im-bridge 页「调试收发」卡片顶部新增一个「对接文字对话模�
     用条目 source；`frame_enabled=false` 时卡片置灰"取帧失败"，
     点击提示）。**无状态批量语义** —— 不污染单例的 `_index` /
     `_source` / 状态机。
-  - **宽松匹配全局化（v0.12.4）**：`query_multi` 改**两阶段**评分
+  - **宽松匹配全局化（v0.12.4）**：缓存批量查询改**两阶段**评分
     —— 阶段 1 每组严格检索（`min_results=0`，阈值过滤 + 组内
     top_k）累计全组合计达标数；阶段 2 仅当**合计零达标**且
     lenient 时，收集各组低于阈值候选**全局降序**取 top

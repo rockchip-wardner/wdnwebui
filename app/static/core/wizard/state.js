@@ -879,6 +879,28 @@
     return toggleLbl;
   }
 
+  /** Form-step validation for fields that are rendered as components. */
+  function _formStepCanNext(stepDef) {
+    for (const field of (stepDef.fields || [])) {
+      if (field.type === "query_groups" && field.required !== false) {
+        const el = _q('[data-field-id="' + field.id + '"]');
+        if (!el || !window.QueryGroups) return false;
+        if (!window.QueryGroups.getValues(el).length) return false;
+      } else if (field.required) {
+        const el = _q('[data-field-id="' + field.id + '"]');
+        if (!el) return false;
+        const cb = el.matches?.('input[type="checkbox"]')
+          ? el : el.querySelector?.('input[type="checkbox"]');
+        if (cb) {
+          if (!cb.checked) return false;
+        } else if (!String(el.value || "").trim()) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
   function _renderFormStep(body, foot, cfg, stepDef, state) {
     body.innerHTML = "";
     const titleEl = _ce("h3", WIZARD_NS + "step-title", stepDef.title);
@@ -921,7 +943,17 @@
         wrap.appendChild(lbl);
       }
       let el;
-      const cur = state.values[field.id];
+      let cur = state.values[field.id];
+      // 旧的 VR 单组字段迁移成 query_groups 的第一组。只在没有新结构值时
+      // 迁移，后续用户编辑仍以 vr-query-groups 为准。
+      if (field.type === "query_groups" && !Array.isArray(cur)
+          && Array.isArray(field.legacy_fields)) {
+        const legacyText = state.values[field.legacy_fields[0]] || "";
+        const legacyImage = state.values[field.legacy_fields[1]] || "";
+        if (legacyText || legacyImage) {
+          cur = [{ text: String(legacyText), imagePath: String(legacyImage) }];
+        }
+      }
       switch (field.type) {
         case "textarea":
           el = _ce("textarea", WIZARD_NS + "input");
@@ -956,6 +988,31 @@
             }
             el.appendChild(o);
           });
+          break;
+        case "query_groups":
+          // 通用多组“文字 + 图片”编辑器；应用页和向导共用
+          // core/query-groups.js。值是一个数组，由 _captureValues 读取。
+          el = _ce("div", "qg-root");
+          el.dataset.fieldId = field.id;
+          el.dataset.fieldType = "query_groups";
+          if (window.QueryGroups) {
+            window.QueryGroups.mount(el, {
+              presentation: "inline",
+              maxGroups: Number(field.max_groups) || 5,
+              minGroups: 0,
+              emptyRows: 1,
+              maxTextLength: Number(field.max_text_length) || 50,
+              textPlaceholder: field.placeholder || "",
+              imagePlaceholder: field.image_placeholder || "图片路径（可选）",
+              browse: field.browse !== false,
+              upload: field.upload !== false,
+              uploadEndpoint: field.upload_endpoint || cfg.upload_endpoint || "",
+              thumbnailEndpoint: field.thumbnail_endpoint || "",
+              initial: Array.isArray(cur) ? cur : [],
+            });
+          } else {
+            el.textContent = "多组描述组件未加载";
+          }
           break;
         case "prompt_rows":
           // 多行 prompt 输入 UI(类似 vtl 的"定位提示词"):rows 每行一个
@@ -1322,7 +1379,7 @@
         }
       } else if ((field.browse || field.upload)
                  && field.type !== "number" && field.type !== "checkbox"
-                 && field.type !== "select") {
+                 && field.type !== "select" && field.type !== "query_groups") {
         // 通用文件字段（图片等）：wizard.json 显式声明 browse / upload 才
         // 渲染。与视频源字段（-source）互斥 —— 后者有自己的按钮行与画布
         // 搬运逻辑。existing 卡未声明这两个属性 → 行为零变化。
@@ -1566,7 +1623,14 @@
       }));
     } catch (_) { /* 订阅方抛异常不影响向导 */ }
 
-    _renderFootNext(foot, cfg, state, true);
+    _renderFootNext(foot, cfg, state, _formStepCanNext(stepDef));
+    const refreshNext = () => {
+      const btn = _q("#" + WIZARD_NS + "next-btn", foot);
+      if (btn) btn.disabled = !_formStepCanNext(stepDef);
+    };
+    form.addEventListener("change", refreshNext);
+    form.addEventListener("input", refreshNext);
+    setTimeout(refreshNext, 0);
   }
 
   function _renderFinishStep(body, foot, cfg, stepDef, state) {
@@ -1586,11 +1650,28 @@
         // 「否」，让用户在完成页确认自己的选择。
         const showFalse = isCheckbox && f.summary_show_false === true;
         if (v == null || v === "" || (v === false && !showFalse)) return;
-        hasAny = true;
         const row = _ce("div", WIZARD_NS + "summary-row");
         // 完成配置摘要优先用 summary_label(短标题),否则用 label/form id
         const summaryLabel = f.summary_label || f.label || f.id;
         row.appendChild(_ce("span", null, summaryLabel + ":"));
+        if (f.type === "query_groups" && Array.isArray(v)) {
+          const groups = v.filter((g) => g && (g.text || g.imagePath));
+          if (!groups.length) return;
+          hasAny = true;
+          const valWrap = _ce("div", WIZARD_NS + "summary-val");
+          groups.forEach((g, i) => {
+            const text = String(g.text || "").trim();
+            const img = String(g.imagePath || g.image_path || "").trim();
+            const name = img ? img.split(/[\\/]/).pop() : "";
+            let line = `${i + 1}. ${text || "以图检索"}`;
+            if (name) line += `（图片：${name}）`;
+            valWrap.appendChild(_ce("div", WIZARD_NS + "summary-item", line));
+          });
+          row.appendChild(valWrap);
+          summary.appendChild(row);
+          return;
+        }
+        hasAny = true;
         const val = isCheckbox ? (v ? "是" : "否") : String(v);
         row.appendChild(_ce("span", WIZARD_NS + "summary-val", val));
         summary.appendChild(row);
@@ -1749,6 +1830,13 @@
     const body = _q("#" + WIZARD_NS + "body");
     body.querySelectorAll("[data-field-id]").forEach((el) => {
       const fid = el.dataset.fieldId;
+      if (el.dataset.fieldType === "query_groups") {
+        const groups = window.QueryGroups
+          ? window.QueryGroups.getValues(el) : [];
+        if (groups.length > 0) state.values[fid] = groups;
+        else delete state.values[fid];
+        return;
+      }
       // prompt_rows:容器内部多个 text input,值合成数组(空值过滤)
       // 写回 state.values[fid] = [v1, v2, ...];空数组则删除 key。
       if (el.dataset.fieldType === "prompt_rows") {
