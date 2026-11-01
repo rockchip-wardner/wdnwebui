@@ -10,7 +10,7 @@
   "memory_estimate_mb": 3000,
   "estimated_init_seconds": 30,
   "description": "视觉深度信息v3，给定图像输出逐像素深度图与置信度（Depth Anything V3 单目深度估计）",
-  "notes": "单目深度估计（kind=\"depth\"，图像 → 深度图 + 置信度，不是文本）。RKNN 导出被拆成三段：local（逐图 token）→ global（跨 view 融合）→ head（出深度/置信度），三段**共享**一份按 NPU 核分配的内部显存（C++ demo 的 da3_init_internal_mem_share，约 1.6GB），少了这一步 model_init 会 MODEL_SETUP fail。view 数（10）烤进了 global 的输入形状 [V,L,1,D]，不是运行期参数 —— 送图张数必须与之一致。权重目录由 wdnai 内部的 _default_depth_anything_v3_paths 解析，可用 WDNAI_DEPTH_ANYTHING_V3_DIR 覆写。模型未部署时 load 会抛 FileNotFoundError，由 worker 的 load 流程转成 errored 状态。",
+  "notes": "【当前限制】目前只完成基础的 10-view（多视图融合）版本：global 段在 10 张图之间做融合，送图张数必须正好是 10（view 数烤进了 global 的输入形状 [V,L,1,D]，不是运行期参数）。**单路（单图）深度估计尚未实现** —— 需要重新导出 V=1 的 RKNN 模型，后续版本补齐。单目深度估计本身（kind=\"depth\"，图像 → 深度图 + 置信度，不是文本）。RKNN 导出被拆成三段：local（逐图 token）→ global（跨 view 融合）→ head（出深度/置信度），三段**共享**一份按 NPU 核分配的内部显存（C++ demo 的 da3_init_internal_mem_share，约 1.6GB），少了这一步 model_init 会 MODEL_SETUP fail。权重目录由 wdnai 内部的 _default_depth_anything_v3_paths 解析，可用 WDNAI_DEPTH_ANYTHING_V3_DIR 覆写。模型未部署时 load 会抛 FileNotFoundError，由 worker 的 load 流程转成 errored 状态。",
   "available_targets": [
     "182x"
   ],
