@@ -7656,3 +7656,65 @@ replier pump**。诊断时别被这批日志带偏 —— **先看有没有真�
 > **registry 层面的根治**（本地 worker 存活探测）**本期未做** —— 那是共享
 > 组件，影响所有模型/应用，应该单独评估。当前熔断只保证音轨功能不会
 > 无限空转。
+
+## 视觉深度信息v3（Depth Anything V3）—— 本地算力的第三个「非 LLM」模型
+
+「算力配置 → 本地算力」里新增了一个模型条目 **`[Depth]视觉深度信息v3`**
+（worker manifest：`app/core/compute/workers/DepthAnythingV3.json`）。
+
+### 它为什么和别的模型不一样
+
+前 7 个 worker 全是「文本生成器」（llm / vlm / tts / omni / asr / embedding），
+走的是同一条路：`LLMLocalSession` → `respond()` → **文本**。
+DA3 不是生成器 —— 它是**单目深度估计**：图像进，**逐像素深度图 + 置信度**出。
+
+所以它需要三处新的东西：
+
+1. **新的能力词表** `swcap_vision_depth`
+   （`wdnai/capability.py::SoftwareCapability.VISION_DEPTH`）——
+   能力词表是 SDK 里的**封闭枚举**，manifest 里写没写过的能力会在
+   `workers/__init__.py::_validate` 直接被判非法，模型**根本不会出现在
+   本地算力列表里**（不是报错，是静默消失）。
+2. **新的 backend kind** `"depth"`
+   （`wdnai/backends/depth_anything.py`）—— `build_backend` 按 `kind`
+   选实现，认不出来就 `ValueError`。
+3. **新的 ModelSpec 路径字段** `depth_local_path` / `depth_global_path` /
+   `depth_head_path` —— DA3 的 RKNN 导出是**三段**，不是一段。
+
+### 三段式 + 共享显存：不共享就 MODEL_SETUP fail
+
+```
+local   images [1,280,280,3] uint8 NHWC  -> local_tokens [1,401,768]  fp16
+global  tokens [10,401,1,768]            -> feat_5/7/9/11 [10,400,1,1536] fp16
+head    feat_* [10,400,1536]             -> depth / depth_conf [1,10,280,280] fp16
+```
+
+三段**共享**一份按 NPU 核分配的内部显存（C++ demo 的
+`da3_init_internal_mem_share`，8 核合计 ~1.6 GB）。少这一步
+（`config.user_mem_internal = 1` + `rknn3_set_internal_mem`）
+→ `rknn3_model_init` 直接 **`MODEL_SETUP fail`**，表现为
+「功能未启用: swcap_vision_depth」。
+
+> **view 数（10）是烤进导出的**，不是运行期参数：`global` 的输入形状就是
+> `[V,L,1,D]`，V=10 的模型只吃 10 张图。送 3 张会被 backend 明确拒绝。
+
+### 像素侧：对着 C++ demo 逐位对齐（含三个坑）
+
+参考实现是 `rknn3-model-zoo/examples/depth_anything_v3/cpp/main.cpp`，
+wdnai 侧必须和它的输出**逐位相同**，否则深度图会差一两个 fp16 ULP。
+三处不对齐就会翻车：
+
+| 环节 | C++ 的实际行为 | 不对齐的后果 |
+|---|---|---|
+| 预处理 resize | GCC 把表达式**融合成 FMA**（`-ffp-contract=fast`） | 0.4 % 像素差 1 LSB → depth 均值差 ~5e-4 |
+| fp16→fp32 | `float16.h` 的 `fp16_to_fp32` **不处理 fp16 非规格化数**（指数域 0 按 0 处理） | DA3 的 token 里确实有这类值 → 81 % 的 global 特征差 1 个 fp16 ULP |
+| 统计均值 | `double sum` 累加 | numpy float32 `.mean()` 在第 6 位小数上偏一 |
+
+回归防线：`python -m scripts.verify_da3_parity`（**占 NPU**）——
+并排跑 C++ demo 与 `wdnai/examples/depth_anything_v3.py`，逐项比对
+张量统计与热力图。
+
+> **别在 NPU 调用中途 kill 进程**：SIGTERM 落在 `rknn3_run` 里会把 RK1820
+> 的 PCIe 链路弄坏（`rknn3_startup` 之后报
+> `ddr load addr request failed`，C++ demo 也跑不动），**只能整机重启恢复**。
+> 排查时用 `py-spy dump --pid <pid>` 看栈，别急着 kill。
