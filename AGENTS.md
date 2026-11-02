@@ -7734,3 +7734,167 @@ wdnai 侧必须和它的输出**逐位相同**，否则深度图会差一两个 
 > 的 PCIe 链路弄坏（`rknn3_startup` 之后报
 > `ddr load addr request failed`，C++ demo 也跑不动），**只能整机重启恢复**。
 > 排查时用 `py-spy dump --pid <pid>` 看栈，别急着 kill。
+
+## 视频实时深度估计卡片（`video-depth`，插件仓 `wdnapps_video_analyzer`）
+
+把 DA3 做成一张**多路实时**卡片：左半边播放多路视频流，右半边显示**每一路
+对应的深度热力图**。卡片源码在插件仓
+`wdnapps_video_analyzer/cards/video_depth/`，宿主侧只提供能力
+（`app/core/depth/`）。
+
+> **DA3 已按 V=1 重新导出**（2026-11-02）—— 上面那节写的「单路深度估计
+> 尚未实现」是导出时的状态。单 view 的实测：稳态推理 ≈116 ms（local 14.8 +
+> global 50.3 + head 51.5，≈8.6 FPS），比 V=10 快 11.5×。卡片按**单 view**
+> 实现（送图张数必须 == 模型 view 数）。
+
+### DepthDetector：为什么不继承 `WdnaiDetector`
+
+`app/core/depth/depth_detector.py` 是**另写**一份，不是 `WdnaiDetector`
+的子类。`WdnaiDetector.start()` 里全是 VLM 专属逻辑（image_size 校验、
+工具注册表、prompt 必填、schema 解析），继承过来会剩一堆永不执行的死代码；
+而且共享模块的改动要**真实测试所有受影响的后端**，违反「改动只触及目标
+功能及其直接依赖」。
+
+它只实现 `multi_api` / `multi_session` 需要的**鸭子类型契约**：
+`slot_count` / `start` / `stop` / `snapshot` / `events` / `events_since` /
+`latest` / `clear` / `diag_history` / `clear_diagnostics` /
+`register_broadcaster` / `submit_frame` / `submit_frame_to` /
+`wait_idle` / `wait_slot_idle`。
+
+`snapshot()` 的**字段名必须与 `WdnaiDetector.snapshot()` 逐字对齐**
+（`available` / `init_error` / `session_ready` / `model_loading` /
+`slot_count` / `queue_size` / …）—— 前端状态条、`wizard-start.js` 的能力
+探测、`model-pick.js` 的多卡判定都按那套字段名读，改名会让共享组件读到
+`undefined`。
+
+### turbo 调色板：宿主**自实现**，不能 import 上游
+
+`wdnai.backends.depth_anything` 在模块顶层 import 了 `._common` →
+`.._librknn` → `rknn3lite`。**宿主进程碰 NPU runtime 是越界的**（模型归
+worker 所有），所以 `app/core/depth/palette.py` 自己实现了一份纯 numpy 的
+turbo：5 次多项式 + `[0,1]` clamp + `(uint8_t)(c*255+0.5)` 舍入，与 C++
+demo 的 `turbo_color` **逐位一致**。
+
+回归防护在 `scripts/verify_video_depth.py`：**从上游源码里 `ast.unparse`
+出三个通道的多项式表达式并直接求值**，与本地实现的输出逐字节比 ——
+不 import 上游（import 就会拖起 rknn3lite），但比的是「多项式本身」。
+
+> **显示量是 `1/depth`，越大越近**（红端）。方向搞反了画面**不会报错**，
+> 只是把近处画成远处 —— 所以测试里钉死了这个方向。
+
+### 深度图走**事件通道**，不走二进制帧通道
+
+二进制帧通道是「视频流」：每路每帧一张显示尺寸 JPEG，由解码线程广播。
+深度图不是视频流 —— 它是**推理产物**（频率低一个量级），而且必须与深度
+数值（色标窗口、统计量）严格配对。走事件通道能顺带把 `stats` /
+`infer_ms` / 通道号一起带上，前端画右栏时不必再猜「这张热力图是哪一路、
+什么时候的」。
+
+深度图**不进** WS 的二进制帧（32 路时带宽直接爆），也**不改**
+`multi_api.py`（共享代码）—— 卡片自己的 `app.js` 消费事件即可。
+
+worker 只回**原始深度数组**；turbo 着色、色标窗口、JPEG 编码都在主进程做
+（符合「worker 是薄 RPC server」）。
+
+### 色标窗口：跨路共享
+
+`DepthWindow` 每路各自维护一档 EMA（alpha=0.3），`shared=True`（默认）
+时取**跨路并集** —— 同一个窗口才能横向比较不同摄像头。渲染用「先更新本路
+EMA、再取窗口」的两段式，避免同一轮里先到的路被后到的路立刻改色。
+
+### 深度事件历史：从 UI 挪到 log，用 debug 开关控制
+
+UI 上**不再有**「深度事件历史」列表（`vdp-event-list` / `vdp-events-count`
+连同 `app.js` 里那一整套事件列表渲染代码一起删了）。原因有两个：页面里挂
+200 条历史 + 每条一张整帧热力图是实打实的内存账（单条 JPEG 20~29 KB），
+而**看历史**这件事本身是排障需求，不是日常操作。
+
+历史改由 `core.depth` 的日志承担，**默认关**：
+
+```python
+LOG.info("[depth-event] id=%d ch=%d npu=%s pos=%d "
+         "depth=[%.3f,%.3f] mean=%.3f window=[%.3f,%.3f] infer=%.0fms", ...)
+```
+
+开关有两个入口（`app/core/depth/depth_detector.py::depth_debug_enabled`）：
+
+| 入口 | 取值 | 生效时机 |
+|---|---|---|
+| 环境变量 `WDNWEBUI_DEPTH_DEBUG` | `1/true/yes/on` 开，`0/false/no/off` 关 | **不用重启**（每次调用都读 `os.environ`） |
+| `config.jsonc` 的 `debug.depth_event_log` | bool | 改完要重启服务 |
+
+* **环境变量显式写了 `0/false` 时压过配置项** —— 否则运维想在这台机器上
+  临时关掉日志却关不掉（配置项仍然是 true）。
+* 读不到配置（异常 / 文件缺失）按**关**处理，不抛异常。
+* `snapshot()` 里带 `debug_log` 字段 → 前端状态条会追加「· 事件日志:开」，
+  页面上能直接看出当前这台机器是不是开着日志。
+* 后端的 `GET /events` **仍然保留**（诊断 / 排障用），只是前端不再拉它 ——
+  `refreshVdpDetector()` 改拉 `GET /prompt`（detector 快照），几百 KB 的
+  事件历史不再每轮刷新都拖一遍。
+
+真机验证（本机 RK3588，两路 720p）：开关关 → journal 里 0 条
+`[depth-event]`；开关开 → 12 秒 44 条，字段齐全。
+
+### 色标图例：说明文字放在色标条**下面**
+
+原来「远 ← 1/深度 → 近」是**横排**在色标条右边的，读起来像右边那一段另有所指
+（到底是「这一段是远」还是「这一段另有一个意思」）。改成**条在上、说明在下**
+（`.vdp-legend` → `flex-direction: column`），压在这条色标下面才是「这条色标的
+含义」。
+
+浏览器端验证脚本会做**几何断言**（说明文字的顶边必须 ≥ 色标条的底边）——
+只看「有没有这个元素」红不了这种排版回归。
+
+### 送检尺寸：**不覆盖**
+
+`MultiChannelSession` 的送检尺寸默认按源算（720p → 640 长边）。深度页
+**不**强制覆盖成 DA3 的 280×280：DA3 的输入是固定 280×280 的**拉伸**
+（不是 letterbox），没有「vision 变体」可选，送检尺寸不决定精度档位；
+两次轴对齐缩放可复合，中间尺寸越大重采样质量越高；而送检帧是**每次推理
+才产出一张**，640 长边的 RGA 开销在 8.6 FPS 的节奏下可忽略。
+
+深度图按**送检帧的宽高比**回拉（长边 560），于是左右两栏覆盖同一个视场
+（实测：视频 canvas 960×785 vs 深度 canvas 560×458，比例 1.2229 vs 1.2227）。
+
+### 踩过的坑：卡片不在 `index.html.template` 里 = 卡片**不存在**
+
+卡片模板**不是运行时 fetch 的** —— `app/core/html_assembly.py` 在拼
+`index.html` 时就把每张卡的 `static/template.html` **内联**进去，占位符是
+`{% card_slot "<card_id>" %}`。
+
+漏了这一行的症状极其隐蔽：manifest 能发现、`/static/apps/<id>/template.html`
+返回 200、API 全在、卡片也出现在应用网格里 —— 但**页面上根本没有这个卡片**
+（`ROUTER.showPage` 遍历 `.page` 元素时找不到它，表现为「点了卡片没反应 /
+白屏」）。`scripts/verify_video_depth.py` 现在会断言这个占位符存在。
+
+### 踩过的坑：`swcap_to_model` 的 `npu_index` 决定向导的**就绪判定**
+
+`wizard.json` 的 `swcap_to_model` 写 `npu_index: [0,1]` → 就绪要求
+**那几张卡**上有 running 实例；写 `null` → 任意一张卡 running 即可（但
+「一键开启」的 POST 会带 `npu_index: null`，后端会拒）。
+深度页写 `[0, 1]`（与 vtl / vtd 同款）：实例跑在别的卡上时向导会显示 ✗，
+用户会以为功能没启用。
+
+### 踩过的坑：关掉浏览器标签会**停掉后端会话**
+
+DemoGuard 的 `beforeunload` 钩子会 `sendBeacon` 打 `/close` + `/prompt/stop`。
+所以「先在别处开好视频 → 再开浏览器验证」的流程必然看到**空画面** ——
+不是卡片坏了，是上一个标签关掉时把会话停了。浏览器端验证脚本必须
+**自己**拉链路（开路 → 启动检测 → 再看画面）。
+
+### 真机实测（本机 RK3588，两路 720p 源）
+
+| 项 | 值 |
+|---|---|
+| 单次深度推理（含 RPC + 着色 + JPEG） | **176~210 ms** |
+| 深度事件 | 两路交替，≈3.7 条/秒（两路合计） |
+| WS 视频帧 | ≈50 fps 合计（两路各 ≈25 fps） |
+| 深度热力图 JPEG | 20~29 KB/张，事件历史只留最近 12 条带图 |
+| 色标窗口 | 跨路共享（两路事件用同一档窗口） |
+
+**本机 NPU 现状（2026-11-02）**：`pcie_upgrade_tool ld` 只枚举到
+`0003:31:00.0` 与 `0004:41:00.0` 两张卡；**`0004:41:00.0`（卡号 2）上
+DA3 的 `rknn3_init` 会挂死**，最终报 `rknn_local init_runtime failed`
+（同机的 LocateAnything 在卡 1 上正常）。**卡 0 / 卡 1 上 DA3 正常**。
+排查用 `py-spy dump --pid <pid>`（栈会停在 `wdnai/_librknn.py` 的
+`rknn3_init`），**别 kill** —— 见上文「别在 NPU 调用中途 kill 进程」。
