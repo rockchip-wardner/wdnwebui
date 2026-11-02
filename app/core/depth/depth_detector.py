@@ -105,6 +105,81 @@ def depth_debug_enabled() -> bool:
         return False
 
 
+def _rga_resize_to(frame: "np.ndarray", dst_w: int,
+                   dst_h: int) -> "np.ndarray":
+    """RGA 把 BGR 帧**拉伸**到 ``(dst_w, dst_h)``（不保宽高比）。
+
+    直接用 :func:`wdnav.rga.resize_bgr` 做不到 280 这种宽度 —— RGA 要求
+    bgr888 目标缓冲的 **width stride 16 对齐**，而 280 不是 16 的倍数：
+
+        im2d 'imresize' failed: status=-1 Unsupported function:
+        dst unsupport width stride 280, bgr888 width stride should be 16
+
+    所以这里自己开目标缓冲：**可见宽度 = dst_w，行跨度 = 16 对齐的
+    wstride**，RGA 写进这个缓冲后把可见区域切出来。stride 只是每行的
+    字节步长，RGA 按 ``width`` 算可见范围，多出来的填充字节不会被写。
+
+    只做**纯缩小**：RGA 的 bilinear 不支持「一边缩一边放」（x 缩 y 放
+    会直接 ``failed to generate task req``），目标比源还大时这里不缩。
+    """
+    import ctypes
+
+    from wdnav.rga import (
+        INTER_LINEAR, RgaFormat, flush, resize, wrap_virtual,
+    )
+
+    src_h, src_w = frame.shape[:2]
+    if (src_h, src_w) == (dst_h, dst_w):
+        return frame
+    if dst_h > src_h or dst_w > src_w:
+        return frame                      # 一边缩一边放 → RGA 不支持
+    if not frame.flags["C_CONTIGUOUS"]:
+        # wrap_virtual 拿的是裸指针，非连续数组会读到错位的像素。
+        frame = np.ascontiguousarray(frame)
+
+    wstride = (int(dst_w) + 15) // 16 * 16
+    storage = (ctypes.c_uint8 * (wstride * int(dst_h) * 3))()
+    dst = wrap_virtual(ctypes.addressof(storage), int(dst_w), int(dst_h),
+                       RgaFormat.BGR_888, wstride=wstride)
+    src_buf = wrap_virtual(frame.ctypes.data, int(src_w), int(src_h),
+                           RgaFormat.BGR_888)
+    resize(src_buf, dst, interpolation=INTER_LINEAR, sync=True)
+    flush()
+    out = np.frombuffer(storage, dtype=np.uint8).reshape(int(dst_h), wstride, 3)
+    return np.ascontiguousarray(out[:, :int(dst_w), :])
+
+
+def _rga_resize_for_model(frame: "np.ndarray",
+                          size: Tuple[int, int]) -> "np.ndarray":
+    """把送检帧缩到**模型输入尺寸**（纯拉伸），缩放走 RGA。
+
+    DA3 的模型输入是固定 280×280 的**拉伸**（不是 letterbox）。原本这条
+    拉伸在 worker 侧做（``preprocess_image_rgb`` 是 numpy 实现，实测
+    ~18 ms），而且上行负载是整张 640×523 的 BGR（981 KB）。
+
+    宿主侧先用 RGA 缩到模型尺寸再送：
+
+    * 上行负载 981 KB → 230 KB（4.3×）
+    * worker 侧 ``preprocess_image_rgb`` 走「源尺寸 == 目标尺寸」分支，
+      只剩一个通道翻转，~18 ms → ~0
+
+    **缩放必须走 wdnav 的 RGA**（项目规则：resize / 格式转换不许用
+    cv2.resize / numpy 兜底）。RGA 的插值核与 worker 侧那份 numpy 实现
+    不完全一样（后者是照 C++ demo 逐行复刻的），所以深度值会有极小的
+    差异 —— 几何等价，但不是逐位相同。
+
+    RGA 失败时**不缩**（原样送整帧）：worker 侧还会照常拉伸到模型尺寸，
+    结果依然正确，只是慢一点。**不做软件缩放兜底**（项目规则）。
+    """
+    th, tw = size
+    try:
+        return _rga_resize_to(frame, int(tw), int(th))
+    except Exception as exc:  # noqa: BLE001 — 缩放失败不是致命错误
+        LOG.warning("depth: RGA 预缩到 %dx%d 失败，送整帧（%s）",
+                    tw, th, exc)
+        return frame
+
+
 @dataclass
 class _Slot:
     """一条推理 slot —— 一个模型实例一条线程。
@@ -117,6 +192,11 @@ class _Slot:
     pending: threading.Event = field(default_factory=threading.Event)
     model_id: str = ""
     npu_index: Optional[int] = None
+    #: 模型的**真实输入尺寸** (h, w)，从 worker 回的负载里学。
+    #: 学到之前送整帧（640×523），学到之后按这个尺寸在宿主侧缩好再送。
+    input_size: Optional[Tuple[int, int]] = None
+    #: 统计：已经预缩过多少帧（诊断用）。
+    prescaled: int = 0
 
 
 class DepthDetector:
@@ -254,7 +334,14 @@ class DepthDetector:
             "worker_alive":           bool(slots),
             "slot_count":             len(slots),
             "slots":                  [{"model_id": s.model_id,
-                                       "npu_index": s.npu_index}
+                                       "npu_index": s.npu_index,
+                                       # 模型真实输入尺寸 (h, w) —— 从
+                                       # worker 回包学来的，None = 还没学到
+                                       # （第一帧送的是整帧）。
+                                       "input_size": list(s.input_size)
+                                       if s.input_size else None,
+                                       # 已经预缩过的帧数（诊断用）。
+                                       "prescaled": s.prescaled}
                                       for s in slots],
             "queue_size":             queue_size,
             "enabled_tools":          [],
@@ -541,18 +628,32 @@ class DepthDetector:
         """
         from wdnai import ImageAttachment
 
+        # 送检帧：**按模型真实的输入尺寸在宿主侧缩好**再送
+        # （见 :func:`_rga_resize_for_model`）。第一次推理还不知道模型
+        # 尺寸（学自 worker 回包），送整帧；之后每帧都缩。
+        send_frame = frame
+        want = slot.input_size
+        if want is not None:
+            send_frame = _rga_resize_for_model(frame, want)
+            if send_frame is not frame:
+                slot.prescaled += 1
+
         t0 = time.perf_counter()
         coro = session.respond(
             prompt="",
-            attachment=[ImageAttachment(frame)],
+            attachment=[ImageAttachment(send_frame)],
             include_maps=True,
         )
         text = asyncio.run(coro)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        depth = self._decode_depth_payload(text)
-        if depth is None:
+        parsed = self._parse_depth_payload(text)
+        if parsed is None:
             raise RuntimeError("深度结果里没有 depth_b64")
+        depth, model_size = parsed
+        # 学到模型的输入尺寸 → 下一帧开始就按它缩（DA3 是 280×280）
+        if slot.input_size != model_size:
+            slot.input_size = model_size
 
         inv = inverse_depth(depth)
         win = self._window.update(channel, inv)
@@ -650,12 +751,16 @@ class DepthDetector:
                 ev.pop("depth_b64", None)
 
     @staticmethod
-    def _decode_depth_payload(text: Any) -> Optional["np.ndarray"]:
-        """从 worker 回的 JSON 里解出深度数组（fp16 → float32）。
+    def _parse_depth_payload(
+            text: Any) -> Optional[Tuple["np.ndarray", Tuple[int, int]]]:
+        """解析 worker 回的 JSON → ``(深度数组, 模型输入尺寸 (h, w))``。
 
         ``DepthResult.text`` 带 ``depth_b64``（fp16 base64，形状
         ``(views, H, W)``）与 ``height`` / ``width`` / ``views``。深度卡是
         **单 view**，所以只取第 0 张。
+
+        ``height`` / ``width`` 是**模型真实的输入尺寸**（DA3 是 280×280，
+        导出时烤进 local 段）—— 宿主侧靠它把送检帧缩到该尺寸再送。
         """
         if not isinstance(text, str):
             return None
@@ -682,7 +787,13 @@ class DepthDetector:
             raise ValueError(
                 f"深度数据尺寸不符: 收到 {arr.size}，期望 {expect}（{views}×{h}×{w}）")
         arr = arr.reshape(views, h, w)
-        return arr[0]
+        return arr[0], (h, w)
+
+    @classmethod
+    def _decode_depth_payload(cls, text: Any) -> Optional["np.ndarray"]:
+        """只要深度数组那一半（兼容旧调用；测试也走这个）。"""
+        parsed = cls._parse_depth_payload(text)
+        return parsed[0] if parsed is not None else None
 
     def _push_diag(self, item: dict) -> None:
         with self._diag_lock:

@@ -603,6 +603,103 @@ def test_detector_multichannel() -> None:
     det.stop()
 
 
+def test_host_prescale() -> None:
+    print("\n[8] 宿主端预缩：送检帧缩到模型输入尺寸")
+    from app.core.depth.depth_detector import (
+        DepthDetector, _rga_resize_to,
+    )
+
+    # RGA 是硬件能力：没有就跳过（不是失败）。尺寸照真机来 ——
+    # 源 640×523 → 目标 280×280（纯缩小，RGA 的 bilinear 不支持
+    # 「一边缩一边放」，倍率也超过 ~4× 就会被 RGA 拒）。
+    probe = np.zeros((523, 640, 3), dtype=np.uint8)
+    try:
+        rga_out = _rga_resize_to(probe, 280, 280)
+        rga_ok = rga_out.shape == (280, 280, 3)
+    except Exception as exc:  # noqa: BLE001
+        rga_ok = False
+        print(f"  [skip] 本机 RGA 不可用：{exc}")
+    if not rga_ok:
+        print("  [skip] 跳过宿主端预缩验证（需要 RGA）")
+        return
+
+    # 假 session 回的深度是 280×280（DA3 的真实输出尺寸）→ 宿主应当把
+    # 「模型输入尺寸」学成 (280, 280)，之后每帧先缩到该尺寸再送。
+    depth = np.linspace(0.5, 1.5, 280 * 280, dtype=np.float32).reshape(280, 280)
+    sess = FakeDepthSession(depth)
+    install_fake_registry([sess])
+
+    det = DepthDetector()
+    det.start(models=[{"model_id": "DepthAnythingV3", "npu_index": 0}])
+    slot = det._slots[0]
+
+    frame = np.zeros((523, 640, 3), dtype=np.uint8)
+    det.submit_frame_to(0, frame, 1, channel=0)
+    det.wait_slot_idle(0, timeout=5.0)
+    check(slot.input_size == (280, 280),
+          "第一帧的回包把模型输入尺寸学成了 (280, 280)",
+          f"实际 {slot.input_size}")
+    check(slot.prescaled == 0,
+          "第一帧还没学到尺寸 → 送的是整帧（不缩）",
+          f"实际 prescaled={slot.prescaled}")
+    first_shape = _attachment_shape(sess)
+    check(first_shape == (523, 640, 3),
+          "第一帧送的是原始尺寸", f"实际 {first_shape}")
+
+    # 第二帧：尺寸已知 → 宿主侧缩好再送
+    det.submit_frame_to(0, frame, 2, channel=0)
+    det.wait_slot_idle(0, timeout=5.0)
+    check(slot.prescaled == 1,
+          "第二帧被预缩了一次", f"实际 prescaled={slot.prescaled}")
+    second_shape = _attachment_shape(sess)
+    check(second_shape == (280, 280, 3),
+          "第二帧送的是模型输入尺寸 280×280",
+          f"实际 {second_shape}")
+
+    # **关键**：深度图回拉用的是**原帧**的宽高比，不是预缩后的正方形
+    evs = det.events()
+    if evs:
+        check((evs[-1]["width"], evs[-1]["height"]) == (560, 458),
+              "深度图仍按原帧宽高比回拉（640×523 → 560×458）",
+              f"实际 {evs[-1]['width']}×{evs[-1]['height']}")
+    else:
+        fail("没有产生深度事件")
+
+    # 快照里能看到学到的尺寸（诊断用）
+    snap = det.snapshot()
+    slots = snap.get("slots") or []
+    if slots:
+        check(slots[0].get("input_size") == [280, 280],
+              "snapshot 里能看到 slot 的 input_size",
+              f"实际 {slots[0].get('input_size')}")
+    else:
+        fail("snapshot 里没有 slot")
+
+    det.stop()
+
+
+def _attachment_shape(sess: FakeDepthSession) -> Optional[tuple]:
+    """假 session 收到的最后一张图（attachment）是什么形状。
+
+    ``respond(attachment=[ImageAttachment(frame)])`` 收到的是**列表**，
+    ``ImageAttachment`` 自己把 ndarray 放在 ``images`` 里。
+    """
+    att = sess.last_attachment
+    if att is None:
+        return None
+    if isinstance(att, (list, tuple)):
+        att = att[0] if att else None
+    if att is None:
+        return None
+    imgs = getattr(att, "images", None)
+    if not imgs:
+        return None
+    try:
+        return tuple(imgs[0].shape)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def test_restart_no_leak() -> None:
     print("\n[8] 反复 start/stop 不泄漏线程")
     from app.core.depth.depth_detector import DepthDetector
@@ -961,6 +1058,7 @@ def main() -> int:
     test_duck_contract()
     test_detector_lifecycle()
     test_detector_multichannel()
+    test_host_prescale()
     test_restart_no_leak()
     test_card_contract()
     test_host_discovery()
