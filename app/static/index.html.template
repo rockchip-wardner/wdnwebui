@@ -433,6 +433,8 @@
           <h2>算力配置</h2>
           <div class="header-meta">
             <span class="collected-at" id="cc-collected-at">--</span>
+            <button class="vd-btn" id="cc-refresh-models"
+                    title="重新扫描模型目录，刷新「本板安装了哪些模型」">刷新模型</button>
             <button class="vd-btn" id="cc-stop-all">全部停止</button>
           </div>
         </header>
@@ -446,7 +448,7 @@
           <div class="cc-col cc-col-local">
             <header class="cc-col-head">
               <h3>本地算力</h3>
-              <span class="cc-col-hint">本机 spawn 的 compute_worker 进程（PID 可见）</span>
+              <span class="cc-col-hint">本机 spawn 的 compute_worker 进程（PID 可见）；卡片只列出<b>本板已安装</b>的模型</span>
             </header>
             <div class="cc-services" id="cc-local-cards"></div>
           </div>

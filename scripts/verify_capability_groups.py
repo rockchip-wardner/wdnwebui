@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -106,13 +107,16 @@ class _FakeRegistry:
 
 # --------------------------------------------------------------------------- #
 print("=== 1. 能力词表（wdnai 唯一权威定义）===")
+# 9 个成员。``swcap_vision_depth``（Depth Anything V3）与
+# ``swcap_text_to_image``（Qwen-Image）是 SDK 后续加入的，之前的断言还写
+# 着 7 个 —— 词表以 SDK 为准，这里同步过来。
 EXPECTED = {
     "swcap_text_chat", "swcap_vision_chat", "swcap_vision_grounding",
     "swcap_audio_chat", "swcap_vision_embedding", "swcap_text_to_speech",
-    "swcap_tool_call",
+    "swcap_tool_call", "swcap_vision_depth", "swcap_text_to_image",
 }
 check(set(SoftwareCapability.values()) == EXPECTED,
-      "枚举恰为 7 个成员", str(SoftwareCapability.values()))
+      "枚举恰为 9 个成员", str(SoftwareCapability.values()))
 
 print("\n=== 2. worker manifest 校验必须拒绝非枚举能力 ===")
 from app.core.compute.workers import _validate                  # noqa: E402
@@ -135,13 +139,44 @@ ok, errors = _validate({**_BASE_WORKER,
                         "capability_types": ["swcap_vision_chat"]}, "probe")
 check(ok is not None and not errors, "接受 swcap_vision_chat", str(errors))
 
-print("\n=== 3. 全部 worker manifest 加载且只用枚举内的能力 ===")
+print("\n=== 3. 已安装 worker 只用枚举内的能力 ===")
 declared = {c for p in MODEL_PRESETS.values()
             for c in (p.get("capability_types") or [])}
-check(declared <= EXPECTED, "MODEL_PRESETS 里没有枚举外能力",
+check(declared <= EXPECTED, "已安装 worker 声明的能力都在词表内",
       str(sorted(declared - EXPECTED)))
-check(declared == EXPECTED, "7 个能力全部有 provider",
-      str(sorted(EXPECTED - declared)))
+
+# provider 是**板子状态**，不是词表属性：worker manifest 随模型文件夹一起
+# 分发（``<models_root>/<ModelDir>/<model_id>.json``），没装模型就没有
+# provider。原来「词表每个能力都有 provider」是恒真的，因为 MODEL_PRESETS
+# 是代码仓里的全量清单；现在 MODEL_PRESETS = **本板已安装的模型**，那条
+# 断言不再成立 —— 而且它**不该**成立：没装 Depth-Anything-V3 的板子本来
+# 就没有 swcap_vision_depth 的 provider。
+#
+# 真正要守的是这两条：
+#   1. 出厂清单（tools/worker_manifests/）声明的能力都在词表内；
+#   2. 本板已安装的模型 ⊆ 出厂清单（板上不会出现清单外的 worker）。
+STAGING = ROOT / "tools" / "worker_manifests"
+if STAGING.is_dir():
+    shipped: set[str] = set()
+    shipped_ids: set[str] = set()
+    for f in sorted(STAGING.glob("*.json")):
+        try:
+            raw = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        shipped |= set(raw.get("capability_types") or [])
+        shipped_ids.add(str(raw.get("id") or f.stem))
+    check(shipped <= EXPECTED, "出厂清单没有枚举外能力",
+          str(sorted(shipped - EXPECTED)))
+    check(set(MODEL_PRESETS) <= shipped_ids,
+          "本板已安装的模型都在出厂清单内",
+          str(sorted(set(MODEL_PRESETS) - shipped_ids)))
+    uncovered = sorted(EXPECTED - shipped)
+    print(f"  [INFO] 词表里没有 worker 提供的能力: {uncovered or '无'}"
+          "（合法：词表封闭 ≠ 每个能力都必须有实现）")
+else:
+    print("[SKIP] 出厂清单目录不存在（manifest 已全部随模型分发）—— "
+          "跳过出厂清单对照检查")
 
 print("\n=== 4. 卡片 manifest 校验（capability_groups 派生 + 引用完整性）===")
 from app.core.manifest import _derive_capability_groups, discover  # noqa: E402

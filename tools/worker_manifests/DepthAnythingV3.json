@@ -6,6 +6,7 @@
   "spec_factory": "depth_anything_v3",
   "worker_name": "depth-v3",
   "model_dir_name": "Depth-Anything-V3",
+  "model_dir_env": "WDNAI_DEPTH_ANYTHING_V3_DIR",
   "instance_name": "depth-v3",
   "memory_estimate_mb": 3000,
   "estimated_init_seconds": 30,

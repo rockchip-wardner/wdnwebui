@@ -528,6 +528,50 @@ def _resolve_worker_model_id(comm: str) -> Optional[str]:
 # buffer，保证倒计时结束时实际加载大概率已就绪，避免 UI 卡很久才更新。
 MODEL_PRESETS: dict[str, dict] = _model_presets()
 
+#: Guards writes to :data:`MODEL_PRESETS` (see :func:`refresh_model_presets`).
+#: Readers do not take it — the update is done "add/update first, drop
+#: removed second" so a reader can never observe an empty dict.
+_MODEL_PRESETS_LOCK = threading.RLock()
+
+#: How often the background thread re-scans the models root. The manifests
+#: ship inside the model folders, so the installed model set is board state
+#: and can change at any time (the user clones a model from HuggingFace).
+#: The scan is cheap: one directory listing plus a handful of small JSON.
+_MODEL_RESCAN_INTERVAL_SEC = 2.0
+
+
+def _models_root_str() -> str:
+    """The models root this board scans, as a string (for the UI)."""
+    try:
+        from app.core.compute.workers import models_root
+        return str(models_root())
+    except Exception:  # noqa: BLE001
+        return os.environ.get("WDNAI_MODELS_DIR", "")
+
+
+def refresh_model_presets() -> bool:
+    """Re-scan the models root and update :data:`MODEL_PRESETS` in place.
+
+    Returns ``True`` when the installed model set changed.
+
+    *In place* rather than rebinding the module attribute: ~60 call sites
+    read ``MODEL_PRESETS`` and several did ``from ... import MODEL_PRESETS``
+    at import time — rebinding would leave them holding the old dict.
+
+    Entries are added/updated **first** and removed **afterwards**, so a
+    concurrent reader never sees an empty dict. At worst it briefly sees a
+    model that was just uninstalled, which renders as "not installed".
+    """
+    from app.core.compute.workers import model_presets
+    new = model_presets()
+    with _MODEL_PRESETS_LOCK:
+        if new == MODEL_PRESETS:
+            return False
+        MODEL_PRESETS.update(new)
+        for stale in [k for k in MODEL_PRESETS if k not in new]:
+            del MODEL_PRESETS[stale]
+    return True
+
 
 # --------------------------------------------------------------------------- #
 # Legacy capability_type migration (kept for backward compat with old configs) #
@@ -625,74 +669,94 @@ def _parse_autostart_config(raw) -> list[dict]:
 
     Returns ``[{"model": str, "npu_index": int}, ...]`` in file order.
 
-    * non-list (None / dict / scalar) → ``[]`` (nothing autostarts)
-    * list entry not a dict → **raise** ``ValueError``
-    * ``model`` not in ``MODEL_PRESETS`` → **raise** ``ValueError``
-    * ``npu_index`` not a non-negative int → **raise** ``ValueError``
-    * duplicate ``(model, npu_index)`` → **raise** ``ValueError``. 同一模型
-      跑多张卡是并行推理要的形态；同一张卡上重复才是真冲突（同卡叠两个模型
-      会 rc=-6）。
+    A malformed entry is **skipped with a warning**, not raised: one bad
+    line must not stop the other models from coming up. Entries naming a
+    model that is **not installed** are skipped for the same reason — the
+    manifests ship inside the model folders, so which models exist is a
+    property of this board, not of the config file. That used to raise,
+    which killed the whole autostart list: one entry naming an uninstalled
+    model silently prevented every other model from coming up at boot.
 
-    Rejecting loudly matters here: a typo in this file means a model the
-    operator expects to be up at boot is silently not there.
+    Still rejected (per entry): unknown fields, missing ``model``, bad
+    ``npu_index``, wrong card count, duplicate ``(model, npu_index)``.
     """
     if not isinstance(raw, list):
         return []
     out: list[dict] = []
     seen: set[tuple[str, int]] = set()
     for idx, entry in enumerate(raw):
-        if not isinstance(entry, dict):
-            raise ValueError(
-                f"compute.autostart[{idx}] 必须是 object "
-                "{{model, npu_index}}；例如 "
-                '{"model": "qwen3-vl-4b", "npu_index": 0}'
-            )
-        unknown = set(entry) - _VALID_AUTOSTART_KEYS
-        if unknown:
-            raise ValueError(
-                f"compute.autostart[{idx}] 含未知字段 {sorted(unknown)}；"
-                f"只接受 {sorted(_VALID_AUTOSTART_KEYS)}（label / device 等"
-                "旧 services 字段已删除，label 见 workers/<model_id>.json）"
-            )
-        model = entry.get("model")
-        if not isinstance(model, str) or not model:
-            raise ValueError(
-                f"compute.autostart[{idx}].model 缺失或非字符串")
+        try:
+            model, cards = _validate_autostart_entry(entry, idx)
+        except ValueError as e:
+            LOG.warning("compute.autostart 忽略一条无效配置: %s", e)
+            continue
         if model not in MODEL_PRESETS:
-            raise ValueError(
-                f"compute.autostart[{idx}].model={model!r} 不在 "
-                f"MODEL_PRESETS {sorted(MODEL_PRESETS.keys())} 中"
+            LOG.warning(
+                "compute.autostart[%d].model=%r 未安装在本板，已跳过该条目"
+                "（本板已安装: %s）",
+                idx, model, sorted(MODEL_PRESETS.keys()),
             )
-        raw_npu = entry.get("npu_index")
-        if isinstance(raw_npu, int) and not isinstance(raw_npu, bool):
-            cards = [raw_npu]
-        elif isinstance(raw_npu, (list, tuple)):
-            cards = [int(x) for x in raw_npu]
-        else:
-            raise ValueError(
-                f"compute.autostart[{idx}].npu_index 缺失或不是整数/整数列表 "
-                f"(got {raw_npu!r})；可选 0..N 的实际卡号")
-        if not cards or any(c < 0 for c in cards):
-            raise ValueError(
-                f"compute.autostart[{idx}].npu_index={raw_npu} 非法；"
-                "必须是 0 起的实际卡号（主控 NPU 用 0）")
-        if len(set(cards)) != len(cards):
-            raise ValueError(
-                f"compute.autostart[{idx}].npu_index 含重复卡号: {cards}")
+            continue
+        key = (model, tuple(cards))
+        if key in seen:
+            LOG.warning(
+                "compute.autostart 含重复条目 model=%r npu_index=%s，已忽略",
+                model, cards)
+            continue
+        seen.add(key)
+        out.append({"model": model,
+                    "npu_index": cards[0] if len(cards) == 1 else cards})
+    return out
+
+
+def _validate_autostart_entry(entry, idx: int) -> tuple[str, list[int]]:
+    """Validate one ``compute.autostart`` entry.
+
+    Returns ``(model, cards)``; raises ``ValueError`` with an
+    operator-readable message when the entry is malformed. Split out of
+    :func:`_parse_autostart_config` so the caller can skip a bad entry
+    instead of aborting the whole list.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"compute.autostart[{idx}] 必须是 object "
+            "{{model, npu_index}}；例如 "
+            '{"model": "qwen3-vl-4b", "npu_index": 0}'
+        )
+    unknown = set(entry) - _VALID_AUTOSTART_KEYS
+    if unknown:
+        raise ValueError(
+            f"compute.autostart[{idx}] 含未知字段 {sorted(unknown)}；"
+            f"只接受 {sorted(_VALID_AUTOSTART_KEYS)}（label / device 等"
+            "旧 services 字段已删除，label 见模型目录下的 worker manifest）"
+        )
+    model = entry.get("model")
+    if not isinstance(model, str) or not model:
+        raise ValueError(
+            f"compute.autostart[{idx}].model 缺失或非字符串")
+    raw_npu = entry.get("npu_index")
+    if isinstance(raw_npu, int) and not isinstance(raw_npu, bool):
+        cards = [raw_npu]
+    elif isinstance(raw_npu, (list, tuple)):
+        cards = [int(x) for x in raw_npu]
+    else:
+        raise ValueError(
+            f"compute.autostart[{idx}].npu_index 缺失或不是整数/整数列表 "
+            f"(got {raw_npu!r})；可选 0..N 的实际卡号")
+    if not cards or any(c < 0 for c in cards):
+        raise ValueError(
+            f"compute.autostart[{idx}].npu_index={raw_npu} 非法；"
+            "必须是 0 起的实际卡号（主控 NPU 用 0）")
+    if len(set(cards)) != len(cards):
+        raise ValueError(
+            f"compute.autostart[{idx}].npu_index 含重复卡号: {cards}")
+    if model in MODEL_PRESETS:
         requires = int(MODEL_PRESETS[model].get("requires_cards", 1) or 1)
         if len(cards) != requires:
             raise ValueError(
                 f"compute.autostart[{idx}] model={model!r} 需要 {requires} 张卡，"
                 f"npu_index 给了 {cards}")
-        key = (model, tuple(cards))
-        if key in seen:
-            raise ValueError(
-                f"compute.autostart 含重复条目 model={model!r} "
-                f"npu_index={raw_npu}")
-        seen.add(key)
-        out.append({"model": model,
-                    "npu_index": cards[0] if len(cards) == 1 else cards})
-    return out
+    return model, cards
 
 
 def _autostart_npu_map() -> dict[str, int]:
@@ -1664,27 +1728,36 @@ class ComputeRegistry:
 
     def list_supported_models(self) -> list[dict]:
         base = get_config().get_section("base", {})
-        # Priority: config → env var → on-disk model root chosen by
+        # Priority: env var → config → on-disk model root chosen by
         # ``default_models_root`` (/userdata/models → /mnt/oem/models →
-        # <HOME>/models). Keeps this fallback chain in lock-step with
-        # ``ConfigStore._seed_defaults`` so the file-existence probe
-        # below agrees with what a fresh install would write to
-        # config.jsonc.
+        # <HOME>/models).
+        #
+        # **env first** on purpose: the env var is what the wdnai SDK and
+        # the workers actually use, so it is the *effective* root. Reading
+        # config first would report a path the loader never looks at
+        # (config is only flushed into the env at boot) — "the UI says the
+        # model is missing" while the model is loaded from elsewhere.
         model_path = (
-            base.get("model_path")
-            or os.environ.get("WDNAI_MODELS_DIR")
+            os.environ.get("WDNAI_MODELS_DIR")
+            or base.get("model_path")
             or f"{default_models_root()}/"
         )
         root = Path(model_path)
         out = []
         for model_id, preset in MODEL_PRESETS.items():
-            dir_name = preset["model_dir_name"]
-            d = root / dir_name if dir_name else None
+            # The model directory is where the manifest was found — the
+            # folder carries both the weights and the manifest.
+            model_dir = preset.get("model_dir") or ""
+            d = Path(model_dir) if model_dir else (
+                root / preset["model_dir_name"] if preset.get("model_dir_name")
+                else None
+            )
             out.append({
                 "id":                 model_id,
                 "label":              preset["label"],
                 "description":        preset.get("description", ""),
                 "exists":             d.is_dir() if d else None,
+                "model_dir":          str(d) if d else "",
                 "memory_estimate_mb": preset["memory_estimate_mb"],
                 "capability_types":   list(preset["capability_types"]),
                 "available_targets":  list(preset.get("available_targets", ["182x"])),
@@ -1831,6 +1904,10 @@ class ComputeRegistry:
                 key=lambda mid: (MODEL_PRESETS[mid].get("display_order", 9999),
                                  mid),
             ),
+            # The models root this board scans for installed models. The
+            # compute page shows it in its empty state so the user knows
+            # where to put a model folder (or where the clone should land).
+            "models_root":       _models_root_str(),
             "worker_alive":      True,
             "last_updated":      time.time(),
             "capabilities":      capabilities,
@@ -3783,6 +3860,40 @@ class ComputeRegistry:
                                 x.get("model_id", "")))
         return out
 
+    # ------------------------------------------------------------------ #
+    # Installed-model catalog refresh                                     #
+    # ------------------------------------------------------------------ #
+    def _start_model_rescan_thread(self) -> None:
+        """Start the daemon that keeps :data:`MODEL_PRESETS` in sync.
+
+        Idempotent — calling it twice does not start two threads.
+        """
+        with self._lock:
+            if getattr(self, "_model_rescan_started", False):
+                return
+            self._model_rescan_started = True
+        threading.Thread(
+            target=self._model_rescan_loop,
+            name="compute-model-rescan",
+            daemon=True,
+        ).start()
+
+    def _model_rescan_loop(self) -> None:
+        """Re-scan the models root every few seconds.
+
+        Cheap by design: one directory listing plus a handful of small
+        JSON files. The catalog is only rewritten when something actually
+        changed, so the compute page does not re-render every tick.
+        """
+        while True:
+            time.sleep(_MODEL_RESCAN_INTERVAL_SEC)
+            try:
+                if refresh_model_presets():
+                    LOG.info("已安装模型集合变化，算力卡片列表已更新: %s",
+                             sorted(MODEL_PRESETS.keys()))
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("模型目录重扫失败: %s", e)
+
     def boot_compute_services(self) -> None:
         """App boot: start every model listed in ``compute.autostart``.
 
@@ -3825,6 +3936,11 @@ class ComputeRegistry:
             self.list_cards()
         except Exception:
             pass
+        # The installed model set is board state (the manifests ship inside
+        # the model folders) and the user can clone a model at any time —
+        # keep the catalog in sync so a fresh clone shows up without a
+        # restart.
+        self._start_model_rescan_thread()
         try:
             self._cleanup_unregistered_workers()
         except Exception as e:  # noqa: BLE001
@@ -4844,13 +4960,20 @@ class ComputeRegistry:
         if not isinstance(app_id, str) or not app_id:
             raise ValueError("app_id 必须是非空字符串")
 
-        # 1. 校验 capability 拼写：所有 req 必须在 MODEL_PRESETS 至少一
-        #    个 preset 的 capability_types 里出现。否则就是用户 manifest
-        #    拼错 / 老字段。
-        registered_caps: set[str] = set()
-        for preset in MODEL_PRESETS.values():
-            for c in (preset.get("capability_types") or []):
-                registered_caps.add(c)
+        # 1. 校验 capability 拼写：所有 req 必须是 SDK 封闭词表里的合法
+        #    能力名（``wdnai.SoftwareCapability``）。
+        #
+        #    刻意**不**用「MODEL_PRESETS 里出现过的 capability 并集」：
+        #    worker manifest 随模型文件夹分发，各板子装的模型不一样，
+        #    并集是**运行期状态**而不是词表。用并集的话，没装 grounding
+        #    模型的板子连「激活」这张卡都做不了（422），而不是像运行期
+        #    那样报「功能未启用」。词表归词表，能不能提供归 registry。
+        try:
+            from app.core.compute.workers import known_capability_types
+            registered_caps: set[str] = set(known_capability_types())
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("known_capability_types unavailable: %s", e)
+            registered_caps = set()
         unknown = [
             c for c in required_capabilities
             if c not in registered_caps

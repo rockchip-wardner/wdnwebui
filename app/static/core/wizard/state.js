@@ -311,6 +311,30 @@
     return box;
   }
 
+  // 本板**没安装**的模型。
+  //
+  // worker manifest 随模型文件夹分发，所以「装了哪些模型」是板子状态：
+  // 没装模型 → 没有 worker → 连 unavailable 占位卡都没有 → 不在已安装
+  // 集合里。这跟「装了但没启用」是两回事：后者**在**集合里、有占位卡、
+  // 可以一键启用；前者启用不了（后端只认已安装的 model，未知 model 422）。
+  //
+  // installedModels 来自后端 snapshot.preset_order（= MODEL_PRESETS
+  // keys）。拿不到时（老后端 / 探测失败）返回空数组 = 不提示，宁可不说，
+  // 也不要误报「没装」。
+  function _missingModels(cfg, installedModels) {
+    if (!Array.isArray(installedModels)) return [];
+    const have = new Set(installedModels);
+    const out = [];
+    const map = (cfg && cfg.swcap_to_model) || {};
+    for (const [cap, m] of Object.entries(map)) {
+      if (!m || !m.model_id) continue;
+      if (!have.has(m.model_id)) {
+        out.push({cap: cap, model_id: m.model_id});
+      }
+    }
+    return out;
+  }
+
   // ------------------------------------------------------------------ //
   // 就绪判据：capability 级 + **(模型, 卡位) 对**级                          //
   // ------------------------------------------------------------------ //
@@ -401,9 +425,15 @@
       String(label).split(" + ").forEach((c) => groupFail.add(c.trim()));
     });
     const capStates = _capStates(swRequired, swMissing, slots, groupFail);
+    // 本板没装的模型（worker 随模型文件夹分发 → 装没装是板子状态）。
+    // 进 view 是为了让 _envSig 把它算进指纹：用户 clone 完模型 → 算力页
+    // 刷新 → 已安装集合变了 → 提示要消失，得重绘。
+    const missingModels = _missingModels(
+      cfg || state.cfg, (state.envCheck || {}).installedModels);
     return {
       swRequired,
       capStates,
+      missingModels,
       // 就绪 = 每条要求的能力都是 ok；warn/fail 都算没齐 → 出「一键开启」
       // 按钮 + 禁用「下一步」。空 swRequired（不依赖模型）→ 可继续。
       swOK: swRequired.every((c) => capStates[c] === "ok"),
@@ -414,8 +444,11 @@
   // env 结论的指纹（每条要求的能力的最终态）—— 后台刷新只在结论**变了**
   // 时才重绘，否则会擦掉「一键开启」刚写的状态文案。
   function _envSig(view) {
+    const missing = (view.missingModels || [])
+      .map((m) => m.model_id).sort().join(",");
     return view.swRequired
-      .map((c) => c + ":" + (view.capStates[c] || "-")).join(",");
+      .map((c) => c + ":" + (view.capStates[c] || "-")).join(",")
+      + "|missing:" + missing;
   }
 
   function _renderEnvStep(body, foot, cfg, stepDef, state) {
@@ -534,9 +567,29 @@
     if (!swRequired.length) {
       card2.appendChild(_envNoReqRow("本应用不依赖模型 / 软件能力"));
     }
+    // 本板没装的模型 → 明确说出来，并**禁用**「一键开启」（启不了：
+    // 后端只认已安装的 model，未知 model 直接 422）。这跟「装了没启用」
+    // 是两回事 —— 后者有占位卡、可以一键起。
+    const missingModels = view.missingModels || [];
+    if (missingModels.length) {
+      card2.appendChild(_singleCardNotice(
+        "block",
+        "⚠ 本板未安装所需模型",
+        missingModels.map((x) => `「${x.cap}」需要模型 ${x.model_id} —— 本板未安装。`)
+          .concat([
+            "worker 配置随模型文件夹一起分发：把模型文件夹放到模型根目录后，" +
+            "在「算力配置」页点「刷新模型」即可出现该卡片。",
+          ])));
+    }
     if (!swOK && !blocked) {
       const bringBtn = _ce("button", WIZARD_NS + "primary-btn", "一键开启所需模型");
       bringBtn.id = WIZARD_NS + "env-bring-btn";
+      if (missingModels.length) {
+        // 模型没装 —— 点了也启不起来（后端 422）。禁用并说明原因，
+        // 免得用户点了只看到一句"未知 model"。
+        bringBtn.disabled = true;
+        bringBtn.title = "本板未安装所需模型，无法启用";
+      }
       const status = _ce("div", WIZARD_NS + "env-bring-status");
       status.id = WIZARD_NS + "env-bring-status";
       card2.appendChild(bringBtn);
@@ -604,12 +657,17 @@
   // 结论变了 → 重绘当前步（按钮 / 明细行 / 「下一步」跟着变）；
   // 结论没变 → 什么都不动（保住「一键开启」刚写的状态文案）。
   async function _refreshEnv(state, sig) {
-    let instances, judged;
+    let instances, judged, installedModels;
     try {
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (!r.ok) return;
       const data = await r.json();
       instances = _localInstances(data);
+      // 已安装模型集合（= MODEL_PRESETS keys）。用户 clone 完模型后在
+      // 算力页点「刷新模型」，这里跟着更新 → 「未安装」提示消失。
+      if (Array.isArray(data.preset_order)) {
+        installedModels = data.preset_order.slice();
+      }
       // 用**探针那份** cfg 复判(srcCfg),别用裁剪后的 —— 两处口径必须一致
       judged = _capJudgement(state.app, state.envCheck.srcCfg || state.cfg, instances);
     } catch (_) { return; }
@@ -617,6 +675,7 @@
     const stepDef = (state.cfg.steps || [])[state.currentStep];
     if (!stepDef || stepDef.kind !== "env_check") return;
     state.envCheck.instances = instances;
+    if (installedModels) state.envCheck.installedModels = installedModels;
     state.envCheck.swMissing = judged.swMissing;
     state.envCheck.groupsUnsatisfied = judged.groupsUnsatisfied;
     if (_envSig(_envView(state, state.cfg)) === sig) return;  // 结论没变
@@ -681,6 +740,14 @@
     // 本机实例全量 —— 卡位级判据要用（只留 capability 名会把「跑在第几张
     // 卡」这个信息整个丢掉，vtd 就因此判错）。
     let instances = [];
+    // 本板**已安装**的模型 id（= 后端的 MODEL_PRESETS keys，即
+    // snapshot.preset_order）。worker manifest 随模型文件夹一起分发，
+    // 所以这个集合是板子状态：装了模型但没启用 → 仍在集合里（且算力页
+    // 有 unavailable 占位卡）；没装 → 不在集合里。
+    //
+    // 注意不能用 instances 判「装没装」：instances 只有真正跑起来的，
+    // 「装了但没启用」的模型压根不在里面，会被误判成没装。
+    let installedModels = null;
     try {
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (r.ok) {
@@ -690,6 +757,9 @@
         // 探测失败留 0 —— 0 不等于 1,单卡分支不会被误触发。
         cardCount = (typeof data.card_count === "number") ? data.card_count : 0;
         modelCards = Array.isArray(data.model_cards) ? data.model_cards : [];
+        if (Array.isArray(data.preset_order)) {
+          installedModels = data.preset_order.slice();
+        }
       }
     } catch (_) { /* keep all missing */ }
     // capability 缺失判定 —— env 步与后台刷新共用同一份口径。
@@ -701,6 +771,7 @@
       swMissing: judged.swMissing,
       groupsUnsatisfied: judged.groupsUnsatisfied,
       instances,
+      installedModels,
       // 后台刷新要用**同一份** cfg 复判（单卡裁剪后的 cfg 组集合会变小）
       srcCfg: cfg,
       cardCount,

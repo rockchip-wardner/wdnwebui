@@ -6,6 +6,7 @@
   "spec_factory": "qwen3_tts",
   "worker_name": "tts",
   "model_dir_name": "Qwen3-TTS",
+  "model_dir_env": "WDNAI_QWEN3_TTS_DIR",
   "instance_name": "tts-q30",
   "memory_estimate_mb": 1900,
   "estimated_init_seconds": 30,

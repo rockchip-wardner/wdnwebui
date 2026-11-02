@@ -6,6 +6,7 @@
   "spec_factory": "locate_anything",
   "worker_name": "ground",
   "model_dir_name": "LocateAnything-3B",
+  "model_dir_env": "WDNAI_LOCATE_ANYTHING_DIR",
   "instance_name": "llm-ground-3b",
   "memory_estimate_mb": 5500,
   "estimated_init_seconds": 60,

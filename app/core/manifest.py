@@ -30,7 +30,8 @@ Validation covers:
 
 * required fields present + correctly typed
 * ``id`` globally unique across all manifests
-* ``software_capabilities`` references existing ``swcap_*`` in MODEL_PRESETS
+* ``software_capabilities`` references existing ``swcap_*`` in the SDK's closed
+  vocabulary (``wdnai.SoftwareCapability``)
 * ``hardware_capabilities`` references existing ``hwcap_*`` in HARDWARE_CAPABILITIES
 * ``model_paths[required=true]`` paths actually exist on disk
 * ``requires_core`` modules importable
@@ -479,21 +480,27 @@ def _derive_capability_groups(card_dir: Path) -> list[list[str]]:
 
 
 def _known_software_capabilities() -> set[str]:
-    """Return the set of swcap_* strings declared by any MODEL_PRESETS entry.
+    """Return the closed set of legal ``swcap_*`` names.
 
-    Lazily imported so the manifest loader doesn't drag in the entire
-    compute registry (with its wdndds native deps) at import time.
+    The vocabulary comes from the SDK (:class:`wdnai.SoftwareCapability`),
+    **not** from the union of whatever worker manifests happen to be
+    installed on this board.
+
+    Worker manifests are distributed alongside the model weights (one per
+    model folder under the models root), so the installed set differs from
+    board to board. Deriving the vocabulary from it would make a card's
+    validity depend on which models happen to be present — a board missing
+    the grounding model would silently lose the ``video-target-localization``
+    card (FATAL on ``unknown software_capability``) and its API routes
+    would never register. The card would vanish instead of reporting
+    "功能未启用".
     """
     try:
-        from app.core.compute.registry import MODEL_PRESETS
+        from app.core.compute.workers import known_capability_types
     except Exception as e:  # noqa: BLE001
-        LOG.warning("could not import MODEL_PRESETS: %s", e)
+        LOG.warning("could not import known_capability_types: %s", e)
         return set()
-    caps: set[str] = set()
-    for preset in MODEL_PRESETS.values():
-        for cap in preset.get("capability_types") or []:
-            caps.add(cap)
-    return caps
+    return known_capability_types()
 
 
 def _known_hardware_capabilities() -> set[str]:

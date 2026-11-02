@@ -1856,6 +1856,52 @@ const ComputeConfigPage = {
     if (this.initialized) return;
     this.initialized = true;
     document.getElementById("cc-stop-all")?.addEventListener("click", () => this.stopAll());
+    document.getElementById("cc-refresh-models")
+      ?.addEventListener("click", () => this.refreshModels());
+  },
+
+  // 重新扫描模型根目录。
+  //
+  // worker manifest 随模型文件夹分发，所以「装了哪些模型」是板子状态：
+  // 用户从 HuggingFace clone 一个模型下来，本板就多一个模型。后台每
+  // ~2s 自动扫一次，这个按钮是显式版本 —— clone 完等不及时点一下立刻生效。
+  async refreshModels() {
+    const btn = document.getElementById("cc-refresh-models");
+    if (btn) btn.disabled = true;
+    try {
+      const r = await fetch(API_PREFIX + "/compute/refresh-models", {method: "POST"});
+      if (!r.ok) {
+        const text = await r.text();
+        alert("刷新模型失败: " + text);
+        return;
+      }
+      const data = await r.json();
+      const installed = (data.installed || []).length;
+      await this._reloadSnapshot();
+      this._flashRefreshResult(installed);
+    } catch (e) {
+      alert("请求失败: " + e.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  },
+
+  // 刷新结果提示 —— 用「刷新模型」按钮自己的 title 提示，避免弹窗打断。
+  _flashRefreshResult(installedCount) {
+    const btn = document.getElementById("cc-refresh-models");
+    if (!btn) return;
+    const old = btn.getAttribute("title") || "";
+    btn.setAttribute("title", `已刷新：当前安装 ${installedCount} 个模型`);
+    setTimeout(() => btn.setAttribute("title", old), 4000);
+  },
+
+  // load() 有 _loading 守卫 —— 正在飞的时候直接调会立刻返回，界面停在旧
+  // 快照。显式刷新时先等在飞的那次结束。
+  async _reloadSnapshot() {
+    for (let i = 0; i < 40 && this._loading; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    await this.load();
   },
 
   async load() {
@@ -2374,7 +2420,14 @@ const ComputeConfigPage = {
     if (!services.length) {
       const empty = document.createElement("div");
       empty.className = "cc-services-empty";
-      empty.textContent = "未声明任何 compute service —— 检查 MODEL_PRESETS 配置。";
+      // 空列表现在的含义变了：worker manifest 随模型文件夹一起分发，
+      // 所以「一张卡都没有」= **本板一个模型都没装**（而不是「manifest
+      // 没声明」）。文案要说清楚下一步做什么。
+      empty.innerHTML = "本板尚未安装任何模型 —— worker 配置随模型文件夹一起分发，"
+        + "把模型文件夹放到模型根目录（"
+        + "<code>"
+        + (snap.models_root || "（见基础配置的模型路径）")
+        + "</code>）后点「刷新模型」。";
       localRoot.appendChild(empty);
       return;
     }

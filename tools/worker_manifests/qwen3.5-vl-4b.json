@@ -8,6 +8,7 @@
   "spec_factory": "qwen3_5_vl_4b",
   "worker_name": "q5-vl",
   "model_dir_name": "Qwen3.5-4B",
+  "model_dir_env": "WDNAI_QWEN3_5_4B_VL_DIR",
   "instance_name": "vlm-q35-4b",
   "memory_estimate_mb": 3500,
   "estimated_init_seconds": 60,

@@ -6,6 +6,7 @@
   "spec_factory": "qwen3_vl_embedding",
   "worker_name": "emb-2b",
   "model_dir_name": "Qwen3-VL-Embedding-2B",
+  "model_dir_env": "WDNAI_QWEN3_VL_EMBEDDING_2B_DIR",
   "instance_name": "vlemb-q30-2b",
   "memory_estimate_mb": 2000,
   "estimated_init_seconds": 30,

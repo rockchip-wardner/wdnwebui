@@ -8,6 +8,7 @@
   "spec_factory": "qwen3_5_vl_9b",
   "worker_name": "vl9b",
   "model_dir_name": "Qwen3.5-VL-9B",
+  "model_dir_env": "WDNAI_QWEN3_5_VL_9B_DIR",
   "instance_name": "vlm-q35-9b",
   "requires_cards": 2,
   "memory_estimate_mb": 7000,

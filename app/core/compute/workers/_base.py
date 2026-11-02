@@ -254,29 +254,33 @@ _AUDIO_CHUNK_WRITER: Any = None
 # --------------------------------------------------------------------------- #
 _WDNAI = None
 
-#: Absolute path of ``workers/`` — every manifest sits next to this module
-#: as ``<model_id>.json``.
+#: Absolute path of this package (the **code** directory). The per-model
+#: manifests do *not* live here any more — they ship inside the model
+#: folders, see :func:`load_manifest`.
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def load_manifest(model_id: str) -> dict:
-    """Read ``workers/<model_id>.json``.
+    """Read the worker manifest for ``model_id``.
 
-    Resolved from the model id rather than a caller-supplied folder:
-    every model now has exactly one manifest file, so the id *is* the
-    path. Read from this package rather than imported from the registry —
-    the registry spawns workers, so importing back into it would close
-    the cycle.
+    The manifest lives **inside the model folder** next to the weights it
+    describes, so the lookup walks the models root instead of this
+    package: ``<root>/<ModelDir>/<model_id>.json`` (canonical) or
+    ``<root>/<ModelDir>/worker.json`` (id taken from the body).
+
+    Read from the model folders rather than imported from the registry —
+    the registry spawns workers, so importing back into it would close the
+    cycle.
     """
-    import json as _json
-    path = os.path.join(HERE, f"{model_id}.json")
-    try:
-        with open(path, encoding="utf-8") as f:
-            return _json.load(f)
-    except FileNotFoundError:
+    from app.core.compute.workers import find_manifest_path, models_root
+    path = find_manifest_path(model_id)
+    if path is None:
         raise RuntimeError(
             f"compute_worker: no manifest for model {model_id!r} "
-            f"(expected {path})") from None
+            f"(looked for {model_id}.json / worker.json under "
+            f"{models_root()}/*/)")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def worker_comm_name(model_id: str) -> str:
@@ -1389,16 +1393,15 @@ def run_worker(argv=None) -> int:
         LOG.warning("could not set comm name for %s: %s", model_id, e)
 
     # Resolve model_dir for the info reply (don't fail if missing).
+    # The model directory is **where the manifest was found** — the model
+    # folder carries both the weights and the manifest, so there is no
+    # separate name to look up.
     model_dir = None
     try:
-        # Match the main process's ``default_models_root()`` priority so
-        # off-device workers don't pin to a non-existent ``/userdata/models``.
-        from app.core.config import default_models_root
-        base_dir = os.environ.get("WDNAI_MODELS_DIR", f"{default_models_root()}/")
-        manifest = load_manifest(model_id)
-        dir_name = manifest.get("model_dir_name")
-        if dir_name:
-            model_dir = os.path.join(base_dir, dir_name)
+        from app.core.compute.workers import find_manifest_path
+        manifest_path = find_manifest_path(model_id)
+        if manifest_path:
+            model_dir = os.path.dirname(manifest_path)
     except Exception:
         pass
 

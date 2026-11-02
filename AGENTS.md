@@ -96,15 +96,15 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
 6. **worker 进程是薄 RPC server，类云端 AI 调用语义**。
    **一个共享入口 + 一个 per-model manifest**：
    `app/core/compute/workers/compute_worker.py`（**唯一**进程入口，所有
-   model 共用）+ `workers/<model_id>.json`（每个模型一个文件，声明身份 +
-   `spec_factory`）。进程只负责：
+   model 共用）+ `<模型目录>/<model_id>.json`（每个模型一个文件，**随模型
+   权重一起分发**，声明身份 + `spec_factory`）。进程只负责：
    * 接收 `wdndds.serve_local_session` 定义的
      `{prompt, attachments, options}`；
    * 透传给 `wdnai.LLMLocalSession.run_prompt(...)`（**跳过** prompt 重新
      组装 —— prompt 是调用方拼好的）；
    * 把模型返回的**原始文本**原样发回。
 
-   **加模型 = 放一个 `workers/<id>.json`**，不用再写一份 45 行的入口脚本。
+   **加模型 = 放一个 `<模型目录>/<id>.json`**，不用再写一份 45 行的入口脚本。
    曾短暂用过「一模型一文件夹」（`workers/<id>/{manifest.json,
    compute_worker.py}`），但 6 份入口脚本只差一个 docstring 和一行
    `mod["SystemLanguageModel"].<factory>()` —— 6 份近似副本正是这次拆分
@@ -123,6 +123,8 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    `/proc/<pid>/cmdline` 里的 `compute_worker.py\x00--model\x00<id>\x00`
    （`registry.py:_find_workers_by_name`）。改其中任何一个都会**静默**破坏
    孤儿检测与去重。扁平布局只改路径的目录部分，这个 needle 逐字节不变。
+   > **manifest 搬出仓库后，入口脚本仍留在 `app/core/compute/workers/`**
+   > —— 它是**代码**不是模型的一部分，且上面那个 needle 依赖它的路径。
 
    worker **不应做**：
    * schema 字段语义理解（如 bbox 单位归一化、bbox 是否全画面、
@@ -160,6 +162,96 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    `chat_runner.build_chatml_prompt` 也一并消失 —— 不是"不该做"，是
    **没有信息可做**。
 
+## 模型分发：worker 配置随模型文件夹（v0.9.2 之后）
+
+worker manifest 从**代码仓**搬到了**模型文件夹里**：
+
+```
+/userdata/models/
+└── Qwen3-VL-4B/               ← 一个模型文件夹 = 一个分发单元
+    ├── qwen3-vl-4b.json       ← worker 配置（随模型一起分发）
+    ├── llm_Qwen3-VL-4B.1828.rknn
+    └── ...
+```
+
+于是三件事同时成立：
+
+1. **一个模型文件夹自描述** —— 权重和描述它的配置同住，HuggingFace 上
+   一个 repo 就是完整安装包，用户 `git clone` 即装好。
+2. **「本板装了哪些模型」是板子状态** —— 模型文件夹不在 → 该 worker 在
+   算力配置页的「本地算力」里**不出现**（不是灰掉，是根本没有卡片）。
+3. **clone 完不用重启** —— 后台每 ~2s 重扫一次模型根目录（`registry.py::
+   _model_rescan_loop`），算力页另有「刷新模型」按钮
+   （`POST /api/compute/refresh-models`）。
+
+### 发现机制
+
+`app/core/compute/workers/__init__.py`：
+
+* `models_root()` —— `WDNAI_MODELS_DIR`（boot 时由 `base.model_path`
+  写入）→ `default_models_root()`（`/userdata/models` →
+  `/mnt/oem/models` → `~/models`）。**必须与 `wdnai.model._models_root()`
+  同源**，否则 worker 找权重的地方和 SDK 找的不是同一个目录。
+* `discover()` —— 遍历模型根下的子目录，每个目录里找 worker manifest：
+  `<model_id>.json`（出厂约定）或 `worker.json`（id 从 body 取）。
+  模型目录里的**其它 json**（tokenizer config 之类）不会被误认 —— 只有
+  带 `spec_factory` 的才算。
+* `find_manifest_path(model_id)` —— 定位单个 manifest（worker 侧热路径用，
+  不解析全部 manifest）。
+
+### 目录名不再由 SDK 决定
+
+改造前，模型目录名在**两处**各写了一遍：manifest 的 `model_dir_name`
+和 SDK 里硬编码的 `_models_root() / "Qwen3-VL-4B"`。两份漂移了就是
+「文件明明在，模型却报 missing_model_dir」。
+
+现在：**manifest 所在目录就是模型目录**，SDK 通过 per-model 环境变量
+（`WDNAI_QWEN3_VL_4B_DIR` 等）跟随它 —— env 名由 manifest 的
+`model_dir_env` 字段声明，所以**模型文件夹可以任意命名**（HF repo 名
+不受 SDK 内部常量约束）。
+
+`build_model_spec()` 在造 spec **之前**设 env，造完**之后**校验
+spec 的所有路径字段都落在该模型目录内（`_assert_spec_under_model_dir`）。
+老版本 SDK 不认这个 env 时会**立刻报错**，而不是静默去另一个目录找文件。
+
+> SDK 侧为 `Qwen3-VL-Embedding-2B` / `Qwen3-TTS` 补了这两个 env 覆盖
+> （此前 9 个模型里只有 7 个有）。env 名由 manifest 自带，SDK 不反向
+> 依赖 webui。
+
+### 「能力词表」与「provider」是两件事（本次拆开的硬约束）
+
+`app/core/manifest.py::_known_software_capabilities()` 现在返回
+**SDK 封闭枚举**（`wdnai.SoftwareCapability`），**不再**是
+「本板已安装 worker 声明的能力并集」。
+
+> 改造前用并集 → 板子少装一个模型 → 依赖它的**卡片**被判 FATAL →
+> 卡片从应用网格消失、API 路由不注册。现在词表归词表、provider 归
+> registry：卡片始终在，缺模型时运行期报「功能未启用」。
+>
+> `workers/__init__.py::known_capability_types()` 早就写好了这个函数，
+> 但**一直没有调用点** —— 这次终于接上。
+
+### autostart：一条坏的不再拖垮整份
+
+`compute.autostart` 里指向**未安装**模型的条目 → **跳过该条 + 记日志**，
+其余条目照常自启。改造前是 raise → boot 时 catch → **整份 autostart 作废**，
+其他模型也一起不开机自启（`_parse_autostart_config` 现在逐条容错，
+`_validate_autostart_entry` 负责单条校验）。
+
+### 不动的三样东西
+
+1. **worker 入口脚本** `app/core/compute/workers/compute_worker.py`
+   留在原位（`/proc` needle 依赖它的路径）。
+2. **`--model <id>` 参数**不变。
+3. **`MODEL_PRESETS` 的引用方式**不变 —— 它仍是**同一个 dict 对象**，
+   动态刷新只做原地 mutate（`registry.py::refresh_model_presets`），
+   所以 ~60 处 `from ... import MODEL_PRESETS` 的调用点零改动。
+   原地 mutate 用「先 update 后删」的顺序，避免并发读看到空 dict。
+
+### 回归
+
+`python -m scripts.verify_model_packaging` —— 发现 / 命名 / SDK 跟随 /
+词表解耦 / autostart 容错 / 动态刷新 / 静态审计，21 条断言。
 ## 视频三卡：1~32 路并发（vtd / vtl / vd，v0.21~v0.22）
 
 `video-target-detection` 已从「单路 canvas」改成「1~32 路宫格 + VLM 逐路轮转」。

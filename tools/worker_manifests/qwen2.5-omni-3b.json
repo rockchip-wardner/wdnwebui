@@ -6,6 +6,7 @@
   "spec_factory": "qwen_2_5_omni_3b",
   "worker_name": "audio-3b",
   "model_dir_name": "Qwen2.5-Omni-3B",
+  "model_dir_env": "WDNAI_QWEN_2_5_OMNI_3B_DIR",
   "instance_name": "omni-q25-3b",
   "memory_estimate_mb": 2500,
   "estimated_init_seconds": 50,

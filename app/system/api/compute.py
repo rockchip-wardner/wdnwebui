@@ -26,6 +26,9 @@ Endpoints
                                           走 boot 流程（不自动 bind）。
                                           仅 spawned 允许。
 * ``POST   /api/compute/stop-all``         全部停止（仅 spawned，adopted 不动）。
+* ``POST   /api/compute/refresh-models``   重新扫描模型根目录，刷新「本板
+                                            装了哪些模型」（后台每 ~2s 自动
+                                            扫一次，这个端点是显式版本）。
 * ``GET    /api/compute/capabilities``     discovery 页用：``sw_capabilities``
                                           + ``hw_capabilities``。
 * ``PUT    /api/compute/hardware-capabilities``   HW 能力 enable/disable。
@@ -70,6 +73,7 @@ from app.core.compute.registry import (
     MODEL_PRESETS,
     card_count_override,
     get_registry,
+    refresh_model_presets,
     transition_of,
 )
 
@@ -884,6 +888,26 @@ async def clear_errors(payload: ClearErrorsRequest) -> dict:
     reg = get_registry()
     cleared = reg.clear_error(payload.model_id)
     return {"ok": True, "cleared": cleared, "snapshot": reg.snapshot()}
+
+
+@router.post("/compute/refresh-models")
+async def refresh_models() -> dict:
+    """重新扫描模型根目录，刷新「本板安装了哪些模型」。
+
+    worker 的 manifest 随模型文件夹一起分发，所以**装了哪些模型是板子
+    的状态**：用户从 HuggingFace clone 一个模型下来，本板就多一个模型。
+
+    后台已有 ~2s 一次的自动重扫（``_model_rescan_loop``），这个端点是
+    显式版本 —— clone 完等不及时点一下立刻生效。不会启停任何 worker。
+    """
+    reg = get_registry()
+    changed = refresh_model_presets()
+    return {
+        "ok": True,
+        "changed": changed,
+        "installed": sorted(MODEL_PRESETS.keys()),
+        "snapshot": reg.snapshot(),
+    }
 
 
 # --------------------------------------------------------------------------- #

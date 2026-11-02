@@ -6,6 +6,7 @@
   "spec_factory": "qwen3_vl_4b",
   "worker_name": "vlm-4b",
   "model_dir_name": "Qwen3-VL-4B",
+  "model_dir_env": "WDNAI_QWEN3_VL_4B_DIR",
   "instance_name": "vlm-q30-4b",
   "memory_estimate_mb": 3500,
   "estimated_init_seconds": 60,
