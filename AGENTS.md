@@ -8071,3 +8071,79 @@ DA3 的 `rknn3_init` 会挂死**，最终报 `rknn_local init_runtime failed`
 （同机的 LocateAnything 在卡 1 上正常）。**卡 0 / 卡 1 上 DA3 正常**。
 排查用 `py-spy dump --pid <pid>`（栈会停在 `wdnai/_librknn.py` 的
 `rknn3_init`），**别 kill** —— 见上文「别在 NPU 调用中途 kill 进程」。
+
+## 算力配置页卡「加载中」：两条根因（2026-11-03 实测）
+
+用户报「浏览器打开 `#compute-config` 一直卡在加载中」。**不是**模型缺失、
+也不是 NPU 没起来 —— 是两条各自独立的缺陷叠在一起。
+
+### 根因 1：远程（ETH）NPU 的 SMI 命令**永不返回**
+
+`/api/system-monitor` 60s 超时都不返回（curl exit=28、HTTP 000、0 bytes）。
+`py-spy dump --pid <pid>` 抓到 6 个线程全停在同一处：
+
+    get_device_info (wdnai/_librknnsmi.py:583)   ← C 层，无内部超时
+    device_id = 2
+
+SMI 设备表是 `[0:pcie, 1:pcie, 2:eth]` —— device_id=2 是**经网口接入的
+另一台** RK 板（`172.16.9.x:11900`）。SMI 的设备级命令（`get_device_info`
+/ `get_device_temperature` / `get_device_power` …）要过 PCIe/ETH 通道去问
+对端 EP 固件要遥测，对端不保证应答，而 **C 层没有超时**。
+
+> **这条会拖垮全站，不止这一个页**：这些调用跑在 `asyncio.to_thread` 里
+> —— 用的是 **event loop 的默认线程池**（上限 `min(32, cpu+4)` = 12）。
+> 前端每 3s 轮询一次 → 每轮漏一个**永久卡死**的线程 → 约 36s 内默认
+> 线程池被占满 → 全站所有 `asyncio.to_thread` 一起排队阻塞。
+
+修法（代码在 `app/system/api/system_monitor.py`）：ETH 设备一个 SMI 命令都
+不发；采集走**专用线程池**（不占全站默认池）+ 整体超时；超时后熔断；
+NPU 遥测加 10s TTL 缓存。超时后**不要**再走 CLI fallback —— CLI 问的是同
+一批设备，只会再 fork 一个注定超时的子进程、白等 5s。
+
+### 根因 2：模型目录里的**大 JSON** 被当 manifest 解析
+
+`/api/compute` 每秒轮询，`discover()` 会把模型目录里**每个** `*.json` 都
+`json.loads` 解析一遍 —— 包括 `tokenizer.json`：
+
+    /userdata/models/Qwen3-TTS/tokenizer.json   11,423,986 B (11.4 MB)
+
+单次全量解析 ~2s。`discover()` 在**请求路径**（`/api/compute` 每秒轮询）
+和**后台路径**（`_model_rescan_loop` 每 2s 重扫）各跑一次 → event loop
+常年被堵 + GIL 被抢。
+
+`py-spy record` 采样（14s、60Hz、853 个样本）：**671 个样本停在
+`json.loads`** —— 占 80%。
+
+修法：只解析 `< MAX_MANIFEST_BYTES`（64KB）的 json。canonical 名
+（`worker.json`）超限时**仍然解析**，好让它走「解析失败 → `status=fatal`」
+的既有分支，而不是静默消失。
+
+> **教训**：模型目录**不是**「只有 manifest」的地方。往里放 tokenizer /
+> config 这类大 json 是**正常**的 —— 扫描端必须假设目录里有任意大小的
+> json，不能靠文件名猜。
+
+### 实测
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `/api/system-monitor` | 60s 不返回 | **0.13s** |
+| `/api/compute` | 2.36s | **0.015s** |
+| `discover()` | 340ms | **0.7ms** |
+| 首屏并行拉两端点 | — | **0.15s** |
+| 15s 内 20 次轮询 | — | 0 失败，最慢 0.401s |
+| 卡死线程 | 6（且持续泄漏） | **0** |
+
+### 诊断手法（下次照样用）
+
+1. **`py-spy dump --pid <pid> --locals`** —— 看卡死线程停在哪一行、局部
+   变量是什么（本次靠 `device_id: 2` + `devs` 里的 `"mode": "eth"` 定位到
+   远程设备）。
+2. **`py-spy record --pid <pid> --duration N --format raw`** —— 采样
+   profiler，按栈聚类看时间花在哪（本次 80% 落在 `json.loads`）。
+3. **访问日志里没有这一条 = 请求发出去了但没返回**，而不是没发出 ——
+   uvicorn 在**请求结束时**才记访问日志。
+
+### 回归
+
+- `python -m scripts.verify_smi_eth_guard`（17 条，不占 NPU）
+- `python -m scripts.verify_manifest_scan_cost`（8 条，不占 NPU）
