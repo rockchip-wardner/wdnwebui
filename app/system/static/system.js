@@ -2044,6 +2044,22 @@ const ComputeConfigPage = {
     const devices = (sys.npu && sys.npu.devices) || [];
     const npuByIdx = new Map(devices.map(d => [d.index, d]));
     const cardByIdx = new Map(cards.map(c => [c.npu_index, c]));
+    // 遥测行 ↔ 算力卡：**按 bus_id 对齐**，不要按 index。
+    //
+    // 两边的枚举顺序不是一回事：卡片的 npu_index 来自 wdnai 的
+    // RKNN3Lite 探测，遥测行的 index 是 wdnai get_devices_id() 的下标 ——
+    // 两次探测看到的设备集合可以不同（mdns 发现的对端机器上下线、
+    // PCIe 卡重新枚举），一旦不同，按 index 配对就会把 A 卡的温度画到
+    // B 卡上（静默出错，不报错）。
+    const npuByBus = new Map(
+      devices.filter(d => d.bus_id).map(d => [d.bus_id, d])
+    );
+    // 遥测链路无响应时，/api/system-monitor 会带 reason 且 available=false。
+    // 把原因写到每张算力卡上 —— 否则用户只看到一堆 "--"，分不清是
+    // 「没数据」还是「链路坏了」。
+    const npuNote = (sys.npu && sys.npu.available === false && sys.npu.reason)
+      ? sys.npu.reason
+      : null;
 
     const MAX_RK182X_CARDS = CC_MAX_RK182X_CARDS;
     // 按 npu_index 升序固定位置 —— 与 label "RK182x #N" 完全对齐，
@@ -2065,6 +2081,8 @@ const ComputeConfigPage = {
         fallback.push({
           npu_index: d.index,
           device_id: d.id || null,
+          // 这张卡本来就是从遥测行造出来的，直接挂上，别再绕 index 猜。
+          telemetry: d,
         });
         if (fallback.length >= MAX_RK182X_CARDS) break;
       }
@@ -2099,7 +2117,10 @@ const ComputeConfigPage = {
       // 排序已固定（见上方 _sortNpuCards），每张物理卡始终落在同一格。
       for (const card of rk182xCards) {
         const idx = card.npu_index;
-        const dev = npuByIdx.get(idx);
+        // 优先按 bus_id 配对；card.device_id 为空（只知道序号）时才退回 index。
+        const dev = card.telemetry
+          || npuByBus.get(card.device_id)
+          || (card.device_id ? null : npuByIdx.get(idx));
         strip.appendChild(this._makeMemCell({
           title: `RK182x #${idx}`,
           sub:   card.device_id || `npu #${idx}`,
@@ -2113,12 +2134,13 @@ const ComputeConfigPage = {
             npuPct:  dev.npu_percent,
             status:  dev.status,
           } : null,
+          note:    npuNote,
         }));
       }
     }
   },
 
-  _makeMemCell({title, sub, usedMb, totalMb, pct, extra}) {
+  _makeMemCell({title, sub, usedMb, totalMb, pct, extra, note}) {
     const cell = document.createElement("div");
     cell.className = "cc-mem-cell";
 
@@ -2176,6 +2198,15 @@ const ComputeConfigPage = {
       if (extra.status)         parts.push(extra.status);
       ex.textContent = parts.join(" · ");
       cell.appendChild(ex);
+    }
+    // 遥测链路无响应时，把**原因**直接写在卡上 —— 否则用户只看到一堆
+    // "--"，分不清是「没有数据」还是「链路坏了」。
+    if (note) {
+      const nt = document.createElement("div");
+      nt.className = "cc-mem-cell-meta is-warn";
+      nt.textContent = note;
+      nt.title = note;
+      cell.appendChild(nt);
     }
     return cell;
   },

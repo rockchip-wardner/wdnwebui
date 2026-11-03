@@ -8147,3 +8147,61 @@ NPU 遥测加 10s TTL 缓存。超时后**不要**再走 CLI fallback —— CLI
 
 - `python -m scripts.verify_smi_eth_guard`（17 条，不占 NPU）
 - `python -m scripts.verify_manifest_scan_cost`（8 条，不占 NPU）
+
+### 补充（2026-11-03 晚）：`mode` 字段不可靠 + EP 哑了 39 小时
+
+上面那条「ETH 设备靠 `mode` 认」的修法有个前提：**`get_device_list()` 的
+`mode` 字段跟这个库的版本对不上**。本机实测的设备表：
+
+```
+slot 0  mode=0x0      → 0001:11:00.0   （PCIe，本机）
+slot 1  mode=0x10001  → 0003:31:00.0   （PCIe，本机）
+slot 2  mode=0x20002  → 0004:41:00.0   （PCIe，本机）
+slot 3  mode=0x3      → ETH peer      ← **不是本机卡**
+```
+
+* PCIe 设备填的是 `0` / `0x10001` / `0x20002`，**不是** `CommMode.PCIE == 0`；
+* 那个 ETH 槽位**有时**填 `2`（`"eth"`，上游能认出）、**有时**填 `0x3`
+  （`"unknown(3)"`，**上游认不出**）—— 同一台机器、不同的设备表状态。
+
+认不出时的后果（实测）：对端不应答 → `nsmi_eth.c` 的 socket 没有超时 →
+**永久阻塞**；对端应答 → 回的是**垃圾**（`received error status 344100`、
+`Data size exceeds max allowed size: 28 > 4`）→ C 层每轮刷 10 行 ERROR
+（实测 69 行 / 37 秒），偶尔还被当成温度读出来（页面显示成 59℃）。
+
+**补的判据：槽位规则** —— 只探前 N 个槽位，N = 本机 `/dev/pcie-rkep-*`
+节点数（N 和 NSMI 的 PCIe 槽位数一致 —— 同一套 PCIe 枚举）。
+实测：69 行 / 37s → **4 行 / 36s**，温度照常（45/42/45℃），
+对端机器仍出现在结果里、标记 `status="Remote"`。
+
+**另一件独立的事：EP 哑了 39 小时。** 2026-11-01 12:00~12:02 连续三次
+`rknn3_startup stop/start`（每次都 `pcie_upgrade_tool uf
+/lib/firmware/rknn3_rk1820.img -reset` 重刷并复位 EP）之后，EP 的 NSMI
+遥测全哑 —— cmd 2/4/6/9/11/13 超时、cmd 7/12 有应答但回 error、
+`rknn-smi info` 全 NA，持续到 **2026-11-03 03:40**（约 39 小时）。
+
+排除了三种解释：固件被降级（镜像 md5 与 10-24 那份一致 `f7244237…`）、
+PCIe 链路坏（`pcie_err` 全 0、5GT/s x1 无 AER）、存在旁路（hwmon 里
+**没有**协卡温度 —— `hwmon6=npu_thermal` 是 RK3588 自带的 NPU，
+`hwmon8=ina226` 是功耗传感器）。恢复动作：`rknn3_startup restart`
+（重刷 + 复位）之后 EP 在几小时内恢复应答（chip 温度 40/44/44℃、
+固件 1.1.0、`Total EP device num: 3`）。→ **「EP 不应答」是可恢复的状态，
+不是固件能力缺失。**
+
+这个状态下**每条命令是「超时失败」而不是「挂死」**（110ms 一条），
+所以上游那条「超时才熔断」的机制**不会触发** —— 探针能跑完，但每轮
+（10s TTL 缓存）刷十几行 ERROR。补三条「**不发注定失败的命令**」：
+
+1. **chip 列表为空 → 跳过全部 chip 级命令**（npu 占用 / 显存 / health）。
+   原来 fallback 到 `chip_id = 0` 照发不误 → 每卡每轮白发 3 条。
+2. **温度这条路不通 → TTL 内不再发温度命令**（`_TEMP_STATE`，120s）。
+   SDK 的回退只在 **chip 级成功** 时才记住「设备级不通」，chip 级也失败
+   时它每次都重发 cmd 12 → C 层每轮每卡刷一行。
+3. **PCIe 相关命令全灭 → 静默期**（`_SMI_QUIET_UNTIL`，60s）：期间
+   **一个 SMI 命令都不发**（没有调用 = 没有 C 层 ERROR），并把
+   「链路无响应」如实带给前端。
+
+### 回归（补充部分）
+
+- `python -m scripts.verify_smi_local_slot_guard`（13 条，不占 NPU）
+- `python -m scripts.verify_compute_npu_telemetry_note`（8 条，起浏览器）

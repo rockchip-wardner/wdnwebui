@@ -17,6 +17,7 @@ file the process can't write fails with EACCES on some kernels).
 from __future__ import annotations
 
 import asyncio
+import glob
 import os
 import re
 import shutil
@@ -83,11 +84,61 @@ def _smi_is_remote(mode: Optional[str]) -> bool:
     return (mode or "").strip().lower() == "eth"
 
 
+def _local_pcie_ep_count() -> int:
+    """本机 PCIe EP（RK1828）协卡数 = ``/dev/pcie-rkep-*`` 的节点数。
+
+    NSMI 的 ``device_list`` 顺序是 **[PCIe × N] + [USB × M] + [ETH × K]**
+    （C 库里 rk_nsmi 的 init 顺序就是 pcie → usb → eth）。本机实测：
+
+        slot 0  mode=0x0      → 0001:11:00.0   （PCIe，本机）
+        slot 1  mode=0x10001  → 0003:31:00.0   （PCIe，本机）
+        slot 2  mode=0x20002  → 0004:41:00.0   （PCIe，本机）
+        slot 3  mode=0x3      → ETH peer      ← **不是本机卡**
+
+    那段 ETH 是 **mdns 发现的对端机器**（``/tmp/rk-mdns.ini`` 里的 IP），
+    不是本机协卡。对它发 NSMI 命令有两个后果（2026-11-03 实测）：
+
+    * 对端不应答时**永久阻塞**（``nsmi_eth.c`` 的 socket 没有超时）；
+    * 对端应答时回的是**垃圾**（``received error status 344100``、
+      ``Data size exceeds max allowed size: 28 > 4``）—— 之前把这种垃圾
+      当温度读出来过（显示成 59℃）。
+
+    所以：**只探前 N 个槽位**，N = 本机 rkep 字符设备数（N 和 NSMI 的
+    PCIe 槽位数一致 —— 两者来自同一套 PCIe 枚举）。
+
+    判据为什么不用 mode：``get_device_list()`` 的 mode 字段跟这个库的版本
+    对不上（PCIe 设备填的是 ``0`` / ``0x10001`` / ``0x20002``，不是
+    ``CommMode.PCIE == 0``；ETH 填 ``0x3``，而枚举里根本没有 3）——
+    ``_smi_is_remote`` 按 ``mode == "eth"`` 判，**认不出 0x3 这一种**。
+    """
+    try:
+        return len(glob.glob("/dev/pcie-rkep-*"))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 # NPU 遥测是慢变量（温度/功耗/显存），而一轮 SMI 实测 3~5s —— 前端 3s
 # 轮询不该每次都真采。10s TTL 缓存；降级结果也缓存，免得每轮再等超时。
 _NPU_CACHE_TTL_S = 10.0
 _npu_cache: Optional[dict] = None
 _npu_cache_ts: float = 0.0
+
+#: 温度这条路通不通：index → (通吗, 记下时刻)。
+#:
+#: SDK 的回退（设备级 → chip 级）只在 **chip 级成功** 时才记住「设备级
+#: 不通」；chip 级也失败（EP 完全不应答）时它每次都重发设备级温度命令
+#: → C 层每轮每卡刷一行 ERROR。这层记忆必须宿主自己兜。
+_TEMP_STATE: dict[int, tuple[bool, float]] = {}
+_TEMP_STATE_TTL_S = 120.0
+
+#: 「PCIe 相关命令全灭」时的静默期（秒）。
+#:
+#: EP 不应答时每条命令要等 ~110ms 超时，一轮探测下来 C 层会刷十几行
+#: ERROR（每 10s 一轮 → ~100 行/分钟）。这段静默期里**一个命令都不发**
+#: —— 没有调用 = 没有 C 层 ERROR（那行 ERROR 是 librknnsmi.so 直接写
+#: stderr 的，宿主侧限流限不住）。
+_SMI_QUIET_UNTIL: float = 0.0
+_SMI_QUIET_TTL_S = 60.0
 
 _BLOCK_SEP = re.compile(r"^\+[-=]+\+\s*$", re.MULTILINE)
 _THERMAL_ROOT = Path("/sys/class/thermal")
@@ -136,6 +187,31 @@ _SKIP_THERMAL_TYPES = {"acpitz", "acpi"}
 # ---------------------------------------------------------------------------
 _POWER_CACHE: dict[int, tuple[float, float]] = {}   # index → (mW, 取值时刻)
 _POWER_TTL_S = 30.0                           # 慢变量；tooltip 显示，30s 足够新鲜
+
+
+def _read_temp_c(smi, idx: int) -> Optional[float]:
+    """读 NPU 温度（°C），并记住「这条路通不通」。
+
+    「不通」就在 :data:`_TEMP_STATE_TTL_S` 内**不再发温度命令**（返回 None，
+    前端显示空即可）—— 这不是软件兜底，是「不查一条注定失败的命令」。
+    """
+    now = time.time()
+    hit = _TEMP_STATE.get(idx)
+    if hit is not None and now - hit[1] < _TEMP_STATE_TTL_S and not hit[0]:
+        # 这条路不通 → TTL 内**不再发温度命令**（不发 = C 层不打 ERROR）
+        return None
+    try:
+        val = smi.get_device_temperature(idx)
+    except Exception as e:  # noqa: BLE001
+        _smi_warn_once(
+            f"device_temp:{idx}",
+            "rknnsmi get_device_temperature(%d) failed: %s: %s",
+            idx, type(e).__name__, e,
+        )
+        _TEMP_STATE[idx] = (False, now)
+        return None
+    _TEMP_STATE[idx] = (True, now)
+    return float(val)
 
 
 def _read_power_mw(smi, idx: int) -> Optional[float]:
@@ -443,9 +519,19 @@ async def _collect_npu_via_smi() -> list[dict]:
     from wdnai import RknnSmi  # local import: wdnai pulls cv2 + gguf
 
     def _probe() -> list[dict]:
+        global _SMI_QUIET_UNTIL
         smi = RknnSmi()
         devs = smi.get_device_list()
+        # 本机的 PCIe EP（RK1828）协卡数。NSMI 的 device_list 里前 N 个是
+        # 本机卡，后面那些（USB / mdns 发现的对端机器）不是 —— 对它们发
+        # NSMI 命令会挂死或读到垃圾（见 _local_pcie_ep_count 的说明）。
+        n_local = _local_pcie_ep_count()
         out: list[dict] = []
+        # PCIe 相关命令的成败统计 —— 用来判断「EP 整体不应答」。
+        # 不算进去的两条：get_pcie_info（BDF 是本地读的，跟 EP 固件无关）、
+        # get_device_power（库内部会回退到板级 hwmon，值是对的）。
+        pcie_ok = 0
+        pcie_fail = 0
         for d in devs:
             idx = int(d["index"])
             mode = d.get("mode")
@@ -464,44 +550,64 @@ async def _collect_npu_via_smi() -> list[dict]:
                 "mem_raw": None,
                 "rknn_smi_idx": idx,
             }
-            if _smi_is_remote(mode):
+            if _smi_is_remote(mode) or (n_local and idx >= n_local):
                 # 远程设备：任何 SMI 命令都会永久阻塞在 C 层 —— 只留枚举信息。
+                #
+                # 判据两条、互相补位：
+                #   a) mode 明确是 eth —— _smi_is_remote 的判据；
+                #   b) 槽位号 ≥ 本机 EP 数 —— mode 不可靠时的兜底（本机那个
+                #      ETH 槽位的 mode 是 0x3 → "unknown(3)"，a) 认不出来，
+                #      而它回的是垃圾 → C 层每轮刷 10 行 ERROR）。
                 row["status"] = "Remote"
                 out.append(row)
                 continue
             # device_info / chip_info — best-effort, log on failure
             try:
                 info = smi.get_device_info(idx)
+                pcie_ok += 1
                 if info.get("product_name"):
                     row["id"] = info["product_name"]
             except Exception as e:  # noqa: BLE001
+                pcie_fail += 1
                 _smi_warn_once(
                     f"device_info:{idx}",
                     "rknnsmi get_device_info(%d) failed: %s: %s",
                     idx, type(e).__name__, e,
                 )
+            # chip 列表：**空 = 这块卡这条通道拿不到 chip**（EP 不应答时的
+            # 典型表现）。此时所有 chip 级命令（npu 占用 / 显存 / health）
+            # 都没有目标 —— 原来 fallback 到 chip_id=0 照发不误，每卡每轮
+            # 白白发 3 条注定超时的命令，现在直接跳过。
+            chip_id = None
             try:
                 chips = smi.get_chip_list(idx)
-                chip_id = chips[0] if chips else 0
+                pcie_ok += 1
+                chip_id = chips[0] if chips else None
             except Exception as e:  # noqa: BLE001
+                pcie_fail += 1
                 _smi_warn_once(
                     f"chip_list:{idx}",
                     "rknnsmi get_chip_list(%d) failed: %s: %s",
                     idx, type(e).__name__, e,
                 )
-                chip_id = 0
             try:
-                pcie = smi.get_pcie_info(idx, chip_id)
+                pcie = smi.get_pcie_info(idx, chip_id or 0)
                 if pcie.get("bus_id"):
                     row["bus_id"] = pcie["bus_id"]
             except Exception:
                 # USB / ETH devices don't expose PCIe BDF; leave None.
                 pass
-            # 温度：wdnai 已内建「设备级失败 → 回退 chip 级」并记住该卡
-            # 设备级不通（见文件头的说明），这里就是一次普通调用。
+            # 温度：宿主这层记住「这条路通不通」，不通就不再发命令
+            # （SDK 的回退只在 chip 级成功时才记住设备级不通；chip 级
+            # 也不通时 SDK 每次都重发 cmd 12 → C 层每次刷一行 ERROR）。
             try:
-                row["temp_c"] = smi.get_device_temperature(idx)
+                row["temp_c"] = _read_temp_c(smi, idx)
+                if row["temp_c"] is not None:
+                    pcie_ok += 1
+                else:
+                    pcie_fail += 1
             except Exception as e:  # noqa: BLE001
+                pcie_fail += 1
                 _smi_warn_once(
                     f"device_temp:{idx}",
                     "rknnsmi get_device_temperature(%d) failed: %s: %s",
@@ -509,10 +615,16 @@ async def _collect_npu_via_smi() -> list[dict]:
                 )
             # 功耗：值来自库内部的 hwmon 回退（PCIe 路径坏），带 TTL 缓存。
             row["power_mw"] = _read_power_mw(smi, idx)
+            if chip_id is None:
+                # 没有 chip → 下面三条 chip 级命令没有目标，跳过
+                out.append(row)
+                continue
             try:
                 npu = smi.get_npu_info(idx, chip_id)
+                pcie_ok += 1
                 row["npu_percent"] = float(npu.get("util_rate_pct", 0) or 0)
             except Exception as e:  # noqa: BLE001
+                pcie_fail += 1
                 _smi_warn_once(
                     f"npu_info:{idx}:{chip_id}",
                     "rknnsmi get_npu_info(%d, %d) failed: %s: %s",
@@ -520,6 +632,7 @@ async def _collect_npu_via_smi() -> list[dict]:
                 )
             try:
                 mem = smi.get_memory_info(idx, chip_id)
+                pcie_ok += 1
                 total = int(mem.get("total_size", 0))
                 free = int(mem.get("free_size", 0))
                 if total > 0:
@@ -531,6 +644,7 @@ async def _collect_npu_via_smi() -> list[dict]:
                         f"{int(total / (1024 * 1024))}"
                     )
             except Exception as e:  # noqa: BLE001
+                pcie_fail += 1
                 _smi_warn_once(
                     f"memory_info:{idx}:{chip_id}",
                     "rknnsmi get_memory_info(%d, %d) failed: %s: %s",
@@ -538,16 +652,30 @@ async def _collect_npu_via_smi() -> list[dict]:
                 )
             try:
                 health = smi.get_chip_health(idx, chip_id)
+                pcie_ok += 1
                 row["health"] = health.name
             except Exception as e:  # noqa: BLE001
+                pcie_fail += 1
                 _smi_warn_once(
                     f"chip_health:{idx}:{chip_id}",
                     "rknnsmi get_chip_health(%d, %d) failed: %s: %s",
                     idx, chip_id, type(e).__name__, e,
                 )
             out.append(row)
+        # PCIe 相关命令全军覆没 → EP 固件整体不应答 → 静默一段时间，
+        # 期间**一个 SMI 命令都不发**（刷屏的根治点）。
+        if pcie_fail and not pcie_ok:
+            _SMI_QUIET_UNTIL = time.monotonic() + _SMI_QUIET_TTL_S
         return out
 
+    if time.monotonic() < _SMI_QUIET_UNTIL:
+        # 静默期：EP 不应答时每条命令都要等 ~110ms 超时，一轮下来 C 层
+        # 刷十几行 ERROR。期间不发任何命令，直接降级返回。
+        left = max(0.0, _SMI_QUIET_UNTIL - time.monotonic())
+        raise _SmiTimeout(
+            f"PCIe 遥测链路无响应（EP 固件不应答 NSMI 命令），"
+            f"已暂停探测，{left:.0f}s 后重试"
+        )
     if time.monotonic() < _npu_smi_trip_until:
         # 熔断中：池的 worker 很可能已被卡死的调用占住，再提交只会排队。
         raise _SmiTimeout(

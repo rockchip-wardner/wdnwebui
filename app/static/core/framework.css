@@ -2657,6 +2657,10 @@ body.dg-modal-open .back-home-btn {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* 算力卡上的「遥测失败原因」—— 琥珀色，和普通灰字区分开 */
+.cc-mem-cell-meta.is-warn {
+  color: #b45309;
+}
 .cc-mem-empty {
   padding: 18px;
   font-size: 13px;
