@@ -62,6 +62,13 @@ MANIFEST_SUFFIX = ".json"
 #: then comes from the manifest's ``id`` field.
 CANONICAL_MANIFEST_NAME = "worker.json"
 
+#: Manifest 文件大小上限（字节）：只有小于这个尺寸的 json 才会被解析成
+#: manifest。模型目录里还有 tokenizer.json 这类大文件（实测
+#: ``Qwen3-TTS/tokenizer.json`` 是 11.4 MB），全量 json.loads 要 ~2s，而
+#: discover() 在请求路径上每秒都跑一遍，会把 event loop 堵死。manifest 本身
+#: 只有几百字节到 2KB，64KB 余量绰绰有余。
+MAX_MANIFEST_BYTES = 64 * 1024
+
 
 # --------------------------------------------------------------------------- #
 # Model root
@@ -330,6 +337,15 @@ def _discover_in_model_dir(model_dir: Path) -> List[WorkerManifest]:
         return out
     for path in candidates:
         if path.name.startswith((".", "_")):
+            continue
+        # 只解析「小」文件（见 MAX_MANIFEST_BYTES）。canonical 名超限时
+        # 仍然解析 —— 让它走「解析失败 → status=fatal」的既有分支，而不是
+        # 静默消失。
+        try:
+            oversized = path.stat().st_size > MAX_MANIFEST_BYTES
+        except OSError:
+            continue
+        if oversized and path.name != CANONICAL_MANIFEST_NAME:
             continue
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
