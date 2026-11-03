@@ -620,6 +620,7 @@
       {% card_slot "video-retrieval" %}
       {% card_slot "tts" %}
       {% card_slot "text-chat" %}
+      {% card_slot "media-generator" %}
       {% card_slot "usb-hid" %}
       <section id="page-system-logs"     class="page hidden" data-page="system-logs">
         <header class="page-header">

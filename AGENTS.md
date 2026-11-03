@@ -1230,6 +1230,62 @@ app/apps/<card_id>/
 
 新增卡片示例(如加一个"图像 OCR"应用)有两条路：**内置卡** = `mkdir app/apps/ocr && 写 manifest.json + api.py + service.py + __init__.py + static/`；**插件卡** = 在某个插件包里加 `cards/ocr/`(同样一套文件)并在该包 `pyproject.toml` 的 `[project.entry-points."wdnwebui.cards"]` 注册 `"ocr" = "<包>.cards.ocr"` + `package-data`。两条路都**不动** `app/main.py` 或任何 core 模块。
 
+### 文生图卡（`media-generator`，插件卡形态的第一个实例）
+
+插件包 `wdnapps_media_generator`（源码在 `.venv/src/wdnapps_media_generator/`）里的
+一张卡：**输入一段文字 → 生成并展示 512×512 图片**。后端是 Qwen-Image-2.1。
+
+| 项 | 值 |
+|---|---|
+| 卡片 id | `media-generator`（前端 JS 命名空间 `window.ImApp_media_generator`） |
+| 能力 | `swcap_text_to_image` |
+| 模型 | `qwenimage21`（`tools/worker_manifests/qwenimage21.json`） |
+| 产物目录 | `<resource_dir>/media_generator/runs/<run_id>/img01.png`（默认 `/home/rockchip/assets/...`，在 NVMe 上） |
+
+```
+浏览器 ──POST /api/media-generator/generate──▶ Web UI 进程（插件 service.py）
+                                                   │ DDS RPC run_prompt(prompt, output_dir=…)
+                                                   ▼
+                                    worker 进程（compute_worker.py --model qwenimage21）
+                                                   │ cshim → TE(卡0) + DiT(卡1) + VAE(卡1)
+                                                   ▼
+                                    PNG 落盘（worker 自己写 ⇒ 与运行时基线逐字节一致）
+```
+
+模型**不在 Web UI 进程里跑** —— NPU 由算力注册中心统一分配，worker 崩了不影响 UI。
+
+#### 装配清单（少任何一条都表现为「卡片能开但不出图 / 出不了图」）
+
+1. **插件包装上并注册**：`pip install -e .`（或装 wheel）⇒
+   `[project.entry-points."wdnwebui.cards"]` 里有
+   `"media-generator" = "wdnapps_media_generator.cards.media_generator"`。
+2. **`package-data` 必须含 `manifest.json` + `static/*`**。漏了 `static/*` ⇒
+   卡片**仍会被发现**（manifest 在包外层），但 `/static/apps/media-generator/`
+   是空的 ⇒ 前端 404。**editable 装法看不出来，只有真 wheel 才暴露。**
+3. **`app/static/index.html.template` 要有 `{% card_slot "media-generator" %}`**。
+   没有占位符 ⇒ 卡片在应用列表里正常显示，**点开是空白页**。
+4. **模型目录在 `models_root` 下**：`/mnt/oem/models/qwenimage21/`。
+   本板 `/mnt/oem` 只有 558 MB 空闲（放不下 9.4 GB 的模型包）⇒ 用**软链**：
+   `ln -s /home/rockchip/models/qwenimage21 /mnt/oem/models/qwenimage21`。
+5. **worker manifest 在模型目录里**：`/mnt/oem/models/qwenimage21/qwenimage21.json`
+   （出厂清单在 `tools/worker_manifests/qwenimage21.json`，用
+   `scripts/migrate_worker_manifests.py` 拷过去）。`requires_cards: 2` ——
+   TE 常驻卡 0、DiT+VAE 在卡 1。
+
+#### ⚠️ 本卡踩到的三个坑（都不是「配置写错」，是链路本身有洞）
+
+1. ⭐⭐⭐ **出图产物过不去 RPC**：`wdndds` 的 `encode_attachments_out` 只认
+   `item.data`（**音频专有属性**），于是 `ImageAttachment` 被整条丢掉 ——
+   reply 的 `attachments_out` 是空的，调用方只拿到一句 prompt 回显，
+   **看不出「图丢了」**。⇒ wdndds 侧补了图像分支（`/dev/shm` 原样搬 BGR
+   ndarray + shape，回程还原）。**任何「产物型」附件都要在这里显式列出。**
+2. ⭐⭐⭐ **第一次出图必然超时**：cshim 是**懒加载**的 ⇒ 第一次推理 = 90 s init
+   + 34 s 生成 = 124 s > webui 的 **120 s RPC 推理超时**（`proxy._INFER_TIMEOUT_MS`）。
+   ⇒ wdnai 侧给 backend 加了可选的 `warmup()` 钩子，`LLMLocalSession` 构造完
+   就调 ⇒ init 挪到 worker 的 **load** 阶段（UI 显示「加载中」），推理只剩 34 s。
+3. ⭐ **模型包不能直接搬进 `/mnt/oem`**：emmc 只剩 558 MB。软链既满足
+   「manifest 所在目录 = 模型目录」的发现规则，又不占 emmc。
+
 ## AI 电脑控制（usb-hid 的任务循环）
 
 `usb-hid` 卡从 v0.25 起不只是「手动把点击/按键透传给 PC」，还多了一条

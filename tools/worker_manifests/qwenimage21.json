@@ -1,0 +1,20 @@
+{
+  "label": "[文生图]Qwen-Image-2.1",
+  "capability_types": [
+    "swcap_text_to_image"
+  ],
+  "spec_factory": "qwen_image_21_512",
+  "worker_name": "qwenimg",
+  "model_dir_name": "qwenimage21",
+  "model_dir_env": "WDNAI_QWEN_IMAGE_21_DIR",
+  "instance_name": "qwenimage21",
+  "requires_cards": 2,
+  "memory_estimate_mb": 9400,
+  "estimated_init_seconds": 90,
+  "description": "文生图：提示词 → 512×512 图片（Qwen-Image-2.1，RKNN3 / rk1820）",
+  "notes": "需要两张卡：卡0 常驻 text encoder（486 MiB）+ DiT 头模型（6.4 MiB），卡1 常驻 DiT 4 段（525 MiB）；VAE 4 段在 DiT 释放后流式加载（峰值 516.5 MiB）。worker 首次 load 约 90 s（TE + DiT 常驻），之后每张图 8 步约 34 s、20 步约 55 s。模型包只含模型文件（9.4 GB），不含任何可执行文件或 .so —— 运行时在 wdnai 的 C shim 里，只链系统自带 librknn3_api.so。",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 35
+}
