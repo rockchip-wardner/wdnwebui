@@ -14,7 +14,7 @@
   "memory_estimate_mb": 7000,
   "estimated_init_seconds": 60,
   "description": "Qwen3.5-VL-9B 两段式（seg0/seg1）多模态模型，必须同时占用 RK182x #0 和 #1 两张协处理器卡；支持文本、图片与工具调用",
-  "notes": "两段 LLM 各占一张 RK182x 卡；rknn3lite vendor pipeline 驱动，vision 在 stage0 卡上。max_ctx_len=106496，max_new_tokens 默认按 1/8 上下文设置。swcap_vision_chat 已声明，视频类应用对接留待下一阶段。",
+  "notes": "两段 LLM 各占一张 RK182x 卡；通过 wdnai ctypes shim 驱动，vision 在 stage0 卡上。max_ctx_len=106496，max_new_tokens 默认按 1/8 上下文设置。swcap_vision_chat 已声明，视频类应用对接留待下一阶段。",
   "available_targets": [
     "182x"
   ],

@@ -1,6 +1,6 @@
 """Qwen3.5-VL-9B thinking output adapter.
 
-9B's vendor rknn3lite pipeline emits a plain ``Thinking Process:`` block
+9B's segmented ctypes pipeline emits a plain ``Thinking Process:`` block
 instead of the ``<think>...</think>`` markers used by the 4B C template.
 Keep this parser app-local so the 4B / WeChat paths and the shared
 ``chat_runner.split_thinking`` remain unchanged.
