@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,59 @@ router = APIRouter(tags=["system-monitor"])
 # CLI 拿数。前端永远看到相同 shape 的 JSON。
 _RKNNSMI_BIN = "rknn-smi"
 _RKNNSMI_TIMEOUT_S = 5
+
+# ---------------------------------------------------------------------------
+# SMI 采集：专用线程池 + 超时
+#
+# ``librknnsmi.so`` 的设备级命令是**没有内部超时**的 ctypes 调用 —— 对不
+# 响应的设备永久阻塞在 C 层。实测（2026-11-03）远程 ETH NPU 上
+# ``rknnsmi_get_device_info(2)`` 永不返回；若它跑在 ``asyncio.to_thread``
+# 里就会漏掉 event loop 的默认线程池（上限 12），几十秒内把全站的
+# ``to_thread`` 一起堵死。所以：专用池（不占全站）+ 整体超时（端点照常
+# 返回降级结果）。真正的修复是别对不响应的设备发命令 —— 见 _smi_is_remote。
+# ---------------------------------------------------------------------------
+_NPU_SMI_POOL_WORKERS = 2
+_NPU_SMI_TIMEOUT_S = 8.0
+_NPU_SMI_POOL: Optional[ThreadPoolExecutor] = None
+
+#: 熔断时长（秒）：超时后这段时间内不再提交新的 SMI 采集。卡在 C 层的
+#: 线程杀不掉，专用池的 worker 被占住后再提交只会排队白等一轮超时。
+_NPU_SMI_TRIP_S = 30.0
+_npu_smi_trip_until: float = 0.0
+
+
+def _npu_smi_pool() -> ThreadPoolExecutor:
+    """SMI 采集专用线程池（懒建，进程内单例）。
+
+    不用 ``asyncio.to_thread``：那个走 event loop 的默认 executor，与全站
+    共享，SMI 卡死会把默认池吃光。
+    """
+    global _NPU_SMI_POOL
+    if _NPU_SMI_POOL is None:
+        _NPU_SMI_POOL = ThreadPoolExecutor(
+            max_workers=_NPU_SMI_POOL_WORKERS,
+            thread_name_prefix="npu-smi",
+        )
+    return _NPU_SMI_POOL
+
+
+def _smi_is_remote(mode: Optional[str]) -> bool:
+    """SMI 设备是不是**远程**（ETH）设备。
+
+    ``get_device_list()`` 的 ``mode`` 对应 ``NSMI_COMM_MODE``：pcie / usb /
+    eth。ETH 是经网口（``ip:port``）接入的**另一台** RK 板的 NPU —— RKNN
+    驱动侧照样能用它跑模型，但 SMI 的设备级命令要过通道问对端 EP 固件要
+    遥测，对端不应答时永不返回。所以 ETH 设备一律不发 SMI 命令。
+    """
+    return (mode or "").strip().lower() == "eth"
+
+
+# NPU 遥测是慢变量（温度/功耗/显存），而一轮 SMI 实测 3~5s —— 前端 3s
+# 轮询不该每次都真采。10s TTL 缓存；降级结果也缓存，免得每轮再等超时。
+_NPU_CACHE_TTL_S = 10.0
+_npu_cache: Optional[dict] = None
+_npu_cache_ts: float = 0.0
+
 _BLOCK_SEP = re.compile(r"^\+[-=]+\+\s*$", re.MULTILINE)
 _THERMAL_ROOT = Path("/sys/class/thermal")
 _THERMAL_NAME_OVERRIDES = {
@@ -384,6 +438,8 @@ async def _collect_npu_via_smi() -> list[dict]:
     list if the SO can't be opened at all; callers should fall back
     to the CLI parser.
     """
+    global _npu_smi_trip_until
+
     from wdnai import RknnSmi  # local import: wdnai pulls cv2 + gguf
 
     def _probe() -> list[dict]:
@@ -392,10 +448,11 @@ async def _collect_npu_via_smi() -> list[dict]:
         out: list[dict] = []
         for d in devs:
             idx = int(d["index"])
+            mode = d.get("mode")
             row: dict = {
                 "index": idx,
                 "id": None,
-                "type": d.get("mode"),
+                "type": mode,
                 "bus_id": None,
                 "status": "Online",
                 "health": None,
@@ -407,6 +464,11 @@ async def _collect_npu_via_smi() -> list[dict]:
                 "mem_raw": None,
                 "rknn_smi_idx": idx,
             }
+            if _smi_is_remote(mode):
+                # 远程设备：任何 SMI 命令都会永久阻塞在 C 层 —— 只留枚举信息。
+                row["status"] = "Remote"
+                out.append(row)
+                continue
             # device_info / chip_info — best-effort, log on failure
             try:
                 info = smi.get_device_info(idx)
@@ -486,8 +548,24 @@ async def _collect_npu_via_smi() -> list[dict]:
             out.append(row)
         return out
 
+    if time.monotonic() < _npu_smi_trip_until:
+        # 熔断中：池的 worker 很可能已被卡死的调用占住，再提交只会排队。
+        raise _SmiTimeout(
+            f"SMI 采集熔断中（{_NPU_SMI_TRIP_S:.0f}s 内不再重试）"
+        )
     try:
-        return await asyncio.to_thread(_probe)
+        # 专用线程池 + 整体超时：SMI 卡死时不拖垮全站的 to_thread，也不让
+        # 端点无限期挂起。
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(_npu_smi_pool(), _probe)
+        return await asyncio.wait_for(fut, timeout=_NPU_SMI_TIMEOUT_S)
+    except asyncio.TimeoutError as e:
+        # 超时 = 有设备不应答。**不要**再走 CLI fallback —— CLI 问的是
+        # 同一批设备，只会再 fork 一个注定超时的子进程、白等 5s。
+        _npu_smi_trip_until = time.monotonic() + _NPU_SMI_TRIP_S
+        raise _SmiTimeout(
+            f"SMI 采集超时（>{_NPU_SMI_TIMEOUT_S:.0f}s，设备无应答）"
+        ) from e
     except Exception as e:  # noqa: BLE001
         # RknnSmi init failed (no SO, no root, no driver). Let caller
         # try the CLI fallback. We do NOT raise — the endpoint should
@@ -504,7 +582,30 @@ class _SmiUnavailable(Exception):
     """
 
 
+class _SmiTimeout(Exception):
+    """Marker: SMI 采集超时 —— 有设备不应答。
+
+    与 :class:`_SmiUnavailable` 分开：后者是「库都起不来」（CLI 也许还有
+    戏），本类是「设备本身不应答」（CLI 只会重复同样的失败）。
+    """
+
+
 async def _collect_npu() -> dict:
+    """NPU 遥测，带 TTL 缓存（见 :data:`_NPU_CACHE_TTL_S`）。
+
+    返回的是缓存本体 —— 调用方只读不改。
+    """
+    global _npu_cache, _npu_cache_ts
+
+    if _npu_cache is not None and time.time() - _npu_cache_ts < _NPU_CACHE_TTL_S:
+        return _npu_cache
+
+    data = await _collect_npu_uncached()
+    _npu_cache = data
+    _npu_cache_ts = time.time()
+    return data
+
+async def _collect_npu_uncached() -> dict:
     """Aggregate NPU device telemetry, with graceful degradation.
 
     Tries the in-process :class:`wdnai.RknnSmi` ctypes shim first
@@ -524,6 +625,17 @@ async def _collect_npu() -> dict:
             "available": True,
             "source": "wdnai.RknnSmi",
             "devices": devices,
+            "raw_output": "",
+            "stderr": "",
+        }
+    except _SmiTimeout as e:
+        # 设备不应答 → CLI fallback 只会再问一次同一批设备、白等一轮 5s
+        # 超时。直接降级返回，端点不挂起。
+        return {
+            "available": False,
+            "source": "wdnai.RknnSmi",
+            "reason": str(e),
+            "devices": [],
             "raw_output": "",
             "stderr": "",
         }
