@@ -61,6 +61,8 @@ import time
 import uuid
 from typing import Any, Optional, Tuple
 
+from app.core.compute import cards as cards_mod
+
 LOG = logging.getLogger("compute_worker")
 
 
@@ -337,7 +339,93 @@ def _load_wdnai() -> dict:
     return _WDNAI
 
 
-def _build_session(model_id: str, npu_index):
+def _probe_devices() -> Optional[list]:
+    """枚举驱动设备列表（**原始顺序**，不滤 EP）。
+
+    返回 ``None`` 表示「枚举不出来」（不是「枚举到 0 个设备」）。
+
+    与主进程用**同一套规则**（:mod:`app.core.compute.cards`）：卡号 =
+    本机 EP 卡按 PCI BDF 排序后的序号。
+
+    为什么 worker 要自己枚举一遍：卡号是**跨进程句柄**，而 wdnai 的
+    ``npu=`` 是**位置语义**（直接索引 ``get_devices_id()``）。那个位置会被
+    mdns 发现的对端机器挤动 —— 主进程枚举时对端离线、worker 枚举时对端
+    上线，同一个卡号就指向不同的物理卡（最坏情况：模型被加载到远端板子
+    上，而 UI 显示的是本机卡 #0）。
+
+    所以两边各枚举各的、各自换算，**规则相同 → 结果必然相同**。
+    """
+    try:
+        from wdnai._librknn import RKNN3Lite
+        return list(RKNN3Lite().get_devices_id())
+    except Exception as e:  # noqa: BLE001
+        LOG.warning("enumerate devices failed: %s: %s", type(e).__name__, e)
+        return None
+
+
+def _resolve_card_targets(cards: list, device_id: Optional[str]) -> Tuple[dict, str]:
+    """把卡号解析成 wdnai 能用的选卡参数。
+
+    返回 ``(kwargs, 说明)``：
+
+    * 单卡 + 已知 device_id → ``{"device_id": "<BDF>"}``。**物理身份**，
+      与枚举顺序完全无关 —— 最强的一档。
+    * 单卡、只有卡号 → worker 自己枚举 → ``{"device_id": "<BDF>"}``。
+    * 多卡 → wdnai 的 ``npu_indices`` 是位置语义，没有 device_id 形态
+      → 换算成**本进程枚举里**的原始下标（同样是「各算各的」）。
+
+    ``device_id`` 是主进程告诉 worker 的**物理身份**：主进程按自己的
+    快照解析出卡号对应的 BDF 一并发过来，worker 优先采用它 —— 这样
+    「主进程说的卡」与「worker 加载的卡」不可能不一致。
+
+    **解析不出来时绝不静默换一张卡**：枚举成功但卡号不在里面 = 这张卡
+    真的不存在 → 报错；连枚举都失败 → 退回按卡号直传（此时 wdnai 自己
+    也会用同一份枚举，报错信息更贴近 wdnai 的原文），并记一条 WARNING。
+    """
+    if len(cards) == 1:
+        if device_id:
+            return {"device_id": device_id}, f"device_id={device_id}"
+        devices = _probe_devices()
+        if devices is None:
+            LOG.warning("设备枚举失败，card#%s 按卡号直传（可能选错卡）",
+                        cards[0])
+            return {"npu": cards[0]}, f"card#{cards[0]}（枚举失败，按卡号直传）"
+        did = cards_mod.card_no_to_device_id(devices, cards[0])
+        if did:
+            return {"device_id": did}, f"card#{cards[0]} -> device_id={did}"
+        raise RuntimeError(
+            f"卡号 {cards[0]} 在本进程枚举到的协卡里不存在"
+            f"（枚举到 {cards_mod.local_ep_device_ids(devices)}）—— "
+            f"这张卡可能已经掉线"
+        )
+    # 多卡：把卡号换算成本进程枚举里的原始下标。
+    devices = _probe_devices()
+    if devices is None:
+        LOG.warning("设备枚举失败，多卡 %s 按卡号直传（可能选错卡）", cards)
+        return {"npu_indices": list(cards)}, f"cards {cards}（枚举失败，直传）"
+    raw: list = []
+    missing: list = []
+    for no in cards:
+        idx = cards_mod.card_no_to_raw_index(devices, no)
+        if idx is None:
+            missing.append(no)
+        else:
+            raw.append(idx)
+    if missing:
+        raise RuntimeError(
+            f"卡号 {missing} 在本进程枚举到的协卡里不存在"
+            f"（枚举到 {cards_mod.local_ep_device_ids(devices)}）—— "
+            f"设备可能在主进程快照之后掉线"
+        )
+    if device_id:
+        # 主进程给的物理身份与本地换算对不上 → 说明设备集变了。
+        # 以主进程为准（那是用户点的那张卡），但要说清楚。
+        LOG.warning("device_id %s 与本地枚举 %s 不一致 —— 以主进程为准",
+                    device_id, cards_mod.local_ep_device_ids(devices))
+    return {"npu_indices": raw}, f"cards {cards} -> raw {raw}"
+
+
+def _build_session(model_id: str, npu_index, device_id: Optional[str] = None):
     """Construct the session for this worker using its manifest.
 
     ``spec_factory`` in ``workers/<model_id>.json`` names a method on
@@ -355,6 +443,9 @@ def _build_session(model_id: str, npu_index):
     :func:`app.core.compute.workers.build_model_spec` so the **main
     process** can resolve the very same spec when it builds its
     ``LLMRPCSession`` — one resolver, one spec, both sides of the wire.
+
+    ``npu_index`` 是**卡号**（本机 EP 卡按 PCI BDF 排序后的序号），不是
+    驱动枚举列表里的位置 —— 见 :func:`_resolve_card_targets`。
     """
     mod = _load_wdnai()
     manifest = load_manifest(model_id)
@@ -375,15 +466,13 @@ def _build_session(model_id: str, npu_index):
     # importing it at module level would close a cycle.
     from app.core.compute.workers import build_model_spec
     spec = build_model_spec(model_id)
-    LOG.info("building LLMLocalSession(model=%s, npu=%s) via %s) ...",
-             model_id, cards, factory_name)
+    sel_kwargs, sel_desc = _resolve_card_targets(cards, device_id)
+    LOG.info("building LLMLocalSession(model=%s, %s) via %s) ...",
+             model_id, sel_desc, factory_name)
     t0 = time.time()
     # Not the deprecated ``LLMSession(model=…)`` shim: the worker is the
     # one place that genuinely means "inference runs right here".
-    if len(cards) > 1:
-        sess = mod["LLMLocalSession"](model=spec, npu_indices=cards)
-    else:
-        sess = mod["LLMLocalSession"](model=spec, npu=cards[0])
+    sess = mod["LLMLocalSession"](model=spec, **sel_kwargs)
     LOG.info("LLMLocalSession ready (%.1fs)", time.time() - t0)
     return sess
 
@@ -460,6 +549,9 @@ def info_handler(state: dict, model_id: str,
         "model_dir":          model_dir,
         "npu_index":          npu_index,
         "npu_indices":        npu_indices,
+        # 卡号对应的**物理身份**（PCI BDF）—— 主进程用它核对「worker 到底
+        # 加载到了哪张卡」，与枚举顺序无关。
+        "device_id":          state.get("device_id"),
         "npu_index_startup":  (startup_npu_index[0] if isinstance(startup_npu_index, (list, tuple)) and startup_npu_index else startup_npu_index),
         "npu_indices_startup": startup_indices,
         "load_time_sec":      state.get("load_time_sec"),
@@ -494,7 +586,8 @@ def info_handler(state: dict, model_id: str,
 
 
 def load_handler(state: dict, model_id: str,
-                 payload_npu_index: Any) -> dict:
+                 payload_npu_index: Any,
+                 payload_device_id: Optional[str] = None) -> dict:
     raw = payload_npu_index
     if raw is None:
         raw = state.get("npu_indices") or state.get("npu_index")
@@ -509,6 +602,9 @@ def load_handler(state: dict, model_id: str,
             "status": "error",
             "error": "npu_index 缺失：load action 必须传 npu_index 或 npu_indices",
         }
+    # device_id = 主进程解析出来的**物理身份**（PCI BDF）。有它就用它选卡 ——
+    # 那样「主进程说的卡」与「本进程加载的卡」不可能不一致。
+    device_id = payload_device_id or state.get("device_id")
     manifest = load_manifest(model_id)
     try:
         requires = int(manifest.get("requires_cards", 1) or 1)
@@ -557,6 +653,7 @@ def load_handler(state: dict, model_id: str,
     state["status"] = "loading"
     state["npu_index"] = npu_index
     state["npu_indices"] = npu_indices
+    state["device_id"] = device_id
     state["init_error"] = ""
     state["loaded_at"] = None
     state["load_time_sec"] = None
@@ -588,9 +685,9 @@ def load_handler(state: dict, model_id: str,
     def _do_init():
         try:
             t0 = time.time()
-            LOG.info("building LLMSession(model=%s, npu=%s) ...",
-                     model_id, npu_indices)
-            sess = _build_session(model_id, npu_indices)
+            LOG.info("building LLMSession(model=%s, card=%s device_id=%s) ...",
+                     model_id, npu_indices, device_id)
+            sess = _build_session(model_id, npu_indices, device_id)
             load_sec = round(time.time() - t0, 2)
             # 轮次校验：旧轮的 init 完成后才到，看到 token 不一致
             # 就丢弃结果（新的 load 已经在用 state 了）。
@@ -1235,7 +1332,8 @@ def _build_extra_ops(state: dict, model_id: str,
         "info": lambda p: info_handler(
             state, model_id, startup_npu_index, model_dir),
         "load": lambda p: load_handler(
-            state, model_id, p.get("npu_indices") or p.get("npu_index")),
+            state, model_id, p.get("npu_indices") or p.get("npu_index"),
+            p.get("device_id")),
         "unload": lambda p: unload_handler(state),
         "shutdown": _shutdown,
         "reset": lambda p: reset_handler(state),
@@ -1363,6 +1461,10 @@ def run_worker(argv=None) -> int:
                          "所以 worker 一起来 info probe 就有应答，不会 boot 超时。"
                          "不传则只注册 DDS endpoint，等用户在算力页选卡后通过 "
                          "RPC ``action=load npu_index=N`` 加载。")
+    ap.add_argument("--device-id", required=False, default=None,
+                    help="主进程解析出的**物理身份**（PCI BDF，如 0001:11:00.0）"
+                         "—— 卡号对应的真实协卡。有它就按身份选卡，与枚举顺序"
+                         "无关（枚举顺序会被 mdns 发现的对端机器挤动）。")
     ap.add_argument("--local-only", action="store_true",
                     help="主进程 spawn 本机 worker 时传:worker 只注册 per-PID "
                          "service (wdndds/rpc/<model_id>/worker-<pid>)，不注册 "
@@ -1382,6 +1484,7 @@ def run_worker(argv=None) -> int:
         npu_index[0] if isinstance(npu_index, (list, tuple)) and npu_index
         else npu_index
     )
+    startup_device_id = args.device_id
 
     # 设置本进程 comm（"worker:<alias>"），让主进程 _find_workers_by_name()
     # 能通过 /proc/<pid>/comm 找到我们做 dedup。必须在 _setup_logging 后
@@ -1432,6 +1535,7 @@ def run_worker(argv=None) -> int:
         "started_at": time.time(),
         "npu_index": None,
         "npu_indices": None,
+        "device_id": startup_device_id,
         "load_time_sec": None,
         "loaded_at": None,
         "init_error": "",
@@ -1605,9 +1709,10 @@ def run_worker(argv=None) -> int:
     if npu_index is not None:
         def _eager_load():
             try:
-                LOG.info("eager load starting (--npu=%s) for %s",
-                         npu_index, model_id)
-                load_handler(_worker_state, model_id, npu_index)
+                LOG.info("eager load starting (--npu=%s --device-id=%s) for %s",
+                         npu_index, startup_device_id, model_id)
+                load_handler(_worker_state, model_id, npu_index,
+                             startup_device_id)
             except Exception as e:  # noqa: BLE001
                 LOG.warning("eager load raised: %s", e)
         threading.Thread(target=_eager_load, name="eager-load",

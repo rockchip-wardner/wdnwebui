@@ -155,6 +155,48 @@ def main():
                 f"读不到 /api/compute/config（拿到 {orig_cfg!r}）—— "
                 "为免把真机配置写空，本次不跑。")
         orig_autostart = orig_cfg.get("autostart") or []
+        # **兜底还原**：本脚本把 card_count 临时设成 1（模拟单卡板），
+        # 正常路径在【8】还原。但任何一步抛异常（最常见是 playwright 等不到
+        # 可点的元素而超时）就**跳过**了【8】—— 真机就被留在「单卡」状态：
+        # 整个板子只剩一张卡能跑模型，而日志里什么线索都没有
+        # （2026-11-03 实测踩过：跑完这个脚本后 card_count=1 没还原）。
+        #
+        # 用 atexit 注册：正常退出、异常退出、SystemExit 都会触发。
+        # 还原走 HTTP 而不是 page.evaluate —— 退出时浏览器已经关了。
+        #
+        # 注意 ``PUT /api/compute/config`` 是**全量替换** ``compute`` section
+        # （后端 set_section 的语义），所以它只还原本脚本改过的两个字段
+        # （autostart / card_count）；``active_app`` 不在其中 —— 唯一能写它
+        # 的 ``PUT /api/compute/active-app`` 会**顺带增量改写 autostart**，
+        # 拿它来「还原」反而更乱。active_app 由前端下次进卡片时自己补上
+        # （framework.js 的 _evaluate → PUT /api/compute/active-app）。
+        _orig_card_count = orig_cfg.get("card_count")
+
+        def _restore_cfg():
+            import json as _json
+            import urllib.request as _u
+            body = _json.dumps({
+                "autostart": orig_autostart,
+                "card_count": _orig_card_count,
+            }).encode()
+            req = _u.Request(f"{BASE}/api/compute/config", data=body,
+                             headers={"Content-Type": "application/json"},
+                             method="PUT")
+            try:
+                _u.urlopen(req, timeout=10).read()
+                print(f"\n【兜底】已还原真机配置"
+                      f"（card_count={_orig_card_count!r}）")
+            except Exception as e:  # noqa: BLE001
+                print(f"\n【兜底】还原真机配置失败（card_count="
+                      f"{_orig_card_count!r}）：{e} —— 手动执行："
+                      f"curl -X PUT {BASE}/api/compute/config "
+                      f"-H 'Content-Type: application/json' "
+                      f"-d '{{\"autostart\": {orig_autostart!r}, "
+                      f"\"card_count\": {_orig_card_count!r}}}'")
+
+        import atexit
+        atexit.register(_restore_cfg)
+
         page.evaluate(
             """async (cfg) => {
                 await fetch('/api/compute/config', {

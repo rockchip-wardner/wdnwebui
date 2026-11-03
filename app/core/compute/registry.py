@@ -38,7 +38,6 @@ import ctypes
 import ctypes.util
 import logging
 import os
-import re
 import signal
 import socket
 import subprocess
@@ -52,6 +51,7 @@ from typing import Any, List, Optional, Tuple
 from wdnai import RetiredCapabilityError, migrate_legacy
 
 from app.core.config import default_models_root, get_config
+from app.core.compute import cards as cards_mod
 from app.core.compute.workers import (
     WorkerManifest,
     build_model_spec,
@@ -94,7 +94,12 @@ def _resolve_compute_mode() -> str:
 # 所以「算力卡位数」= 探测到的 PCI 形态卡数。**每张卡只能放一个模型**
 # （AGENTS.md v0.17 实测：同卡叠两个模型 rc=-6），这个数量就是本机
 # 能同时跑几个模型的硬上限。
-_PCI_BDF_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d+$")
+#
+# **卡号的口径见 :mod:`app.core.compute.cards`** —— 卡号 = 本机 EP 协卡按
+# PCI BDF 排序后的序号（0 起），**不是**驱动枚举列表里的位置。后者会被
+# mdns 发现的对端机器挤动（对端上线 → 本机卡整体后移 1，config 里写死的
+# 卡号随之失效）。这里的正则只是别名，规则本身只有 cards 模块一处实现。
+_PCI_BDF_RE = cards_mod.PCI_BDF_RE
 
 
 def card_count_override() -> Optional[int]:
@@ -1222,6 +1227,9 @@ class ComputeRegistry:
         self._instances: dict[Tuple[int, str], ModelInstance] = {}
         self._cards: list[dict] = []            # not used by RPC path
         self._cards_failed: str = ""
+        # boot 时被裁掉的 autostart 条目（用户配了但没生效的）—— 暴露到
+        # snapshot，让算力页能提示，别只在日志里躺一行。
+        self._autostart_skipped: list[dict] = []
         # Cache for list_cards() — see that method for the full rationale.
         self._rknn_probe = None
         self._rknn_device_ids: Optional[list] = None
@@ -1636,12 +1644,26 @@ class ComputeRegistry:
             self._rknn_probe = holder["probe"]
             self._rknn_device_ids = holder["device_ids"]
 
+        # 卡号 = **本机 EP 协卡按 PCI BDF 排序后的序号**（见 cards 模块）。
+        #
+        # 为什么不用驱动枚举下标：那个列表里混着 mdns 发现的对端机器
+        # （device_id 是 ``IP:端口``）和本机 RGA/VPU（USB 序列号形态）。
+        # 对端机器随时会上下线，一旦在就占住列表最前面的下标 —— 本机协卡
+        # 的编号整体后移 1，``config.jsonc`` 里写死的卡号就失效了
+        # （真机症状：autostart 的一条被静默丢弃，少起一个实例）。
+        #
+        # 改成「只数本机 EP 卡」之后，对端在不在，本机卡的卡号都不变。
+        raw_devices = list(self._rknn_device_ids or [])
         cards = []
-        for i, x in enumerate(self._rknn_device_ids):
-            raw = x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8")
+        for card_no, did in enumerate(cards_mod.local_ep_device_ids(raw_devices)):
+            raw_index = cards_mod.card_no_to_raw_index(raw_devices, card_no)
+            raw = did.encode("utf-8")
             cards.append({
-                "npu_index": i,
-                "device_id": raw.decode("utf-8", errors="replace"),
+                # 稳定卡号 —— 用户在 config / UI 里看到并写下的就是这个。
+                "npu_index": card_no,
+                "device_id": did,
+                # 驱动枚举里的原始下标：仅供诊断（「卡 #0 对应驱动第几个」）。
+                "raw_index": raw_index,
                 "_raw_device_id": raw,
             })
         with self._lock:
@@ -1654,10 +1676,11 @@ class ComputeRegistry:
             return self._cards_failed
 
     def model_cards(self, cards: Optional[list[dict]] = None) -> List[int]:
-        """能承载 RKNN 模型的协卡索引（每张卡一个模型）。
+        """能承载 RKNN 模型的协卡卡号（每张卡一个模型）。
 
-        权威来源 —— ``list_cards()`` 会把 USB 序列号形态的 RGA/VPU 设备
-        也算进去（见 :data:`_PCI_BDF_RE`）。受 ``compute.card_count``
+        权威来源 —— ``list_cards()`` 已经只保留**本机 EP 协卡**并按 PCI
+        BDF 排序编号（0 起），所以这里只是再按 device_id 形态兜一层
+        （防住外部塞进来的非 EP 条目）。受 ``compute.card_count``
         上限约束（双卡板可用它模拟单卡板）。
 
         ``cards`` 可传入**已经取好的**卡片列表 —— 避免调用方为了同一份
@@ -1666,12 +1689,67 @@ class ComputeRegistry:
         detected = [
             c["npu_index"] for c in (cards if cards is not None
                                       else self.list_cards())
-            if _PCI_BDF_RE.match(c.get("device_id") or "")
+            if cards_mod.is_ep_device_id(c.get("device_id"))
         ]
         cap = card_count_override()
         if cap is not None:
             detected = detected[:cap]
         return detected
+
+    def card_device_id(self, npu_index: Optional[int]) -> Optional[str]:
+        """卡号 → 物理身份（PCI BDF，如 ``0001:11:00.0``）。
+
+        卡号是**跨进程句柄**；wdnai 的 ``npu=`` 是**位置语义**（直接索引
+        ``get_devices_id()``）。主进程把物理身份一起发给 worker，worker 就
+        按身份选卡 —— 两边各枚举各的也不会选错卡（枚举位置会被 mdns 发现
+        的对端机器挤动）。
+
+        卡号不存在（越界 / 探测失败）时返回 ``None`` —— 调用方应把
+        ``npu_index`` 一起带上，让 worker 自己解析。
+        """
+        if npu_index is None:
+            return None
+        for c in self.list_cards():
+            if c.get("npu_index") == npu_index:
+                return c.get("device_id")
+        return None
+
+    def _crop_autostart(self, entries: list[dict]) -> list[dict]:
+        """按本机算力卡位裁剪 autostart 条目，**并记录被裁掉的那些**。
+
+        裁剪规则见 :func:`_crop_autostart_for_cards`：不在算力卡位内的
+        条目丢弃、一张卡只留第一条。
+
+        被丢弃的条目记进 ``self._autostart_skipped``（并由 ``snapshot()``
+        暴露给算力页）—— **不能静默**：一条 autostart 没生效 = 少起一个
+        实例，用户在 UI 上必须看得见。以前这里只打一行 INFO 日志，
+        真机上表现为「深度实例莫名其妙少了一个」（根因是卡号漂移，见
+        :mod:`app.core.compute.cards`）。
+        """
+        model_cards = self.model_cards()
+        skipped: list[dict] = []
+        kept = list(entries)
+        if entries:
+            kept, dropped = _crop_autostart_for_cards(entries, model_cards)
+            for e in dropped:
+                cards = (e["npu_index"]
+                         if isinstance(e["npu_index"], (list, tuple))
+                         else [e["npu_index"]])
+                if any(c not in model_cards for c in cards):
+                    reason = (f"该卡不在本机算力卡位 {model_cards} 内"
+                              f"（本机共 {len(model_cards)} 张协卡）")
+                else:
+                    reason = "一张卡只能承载一个模型（同卡叠模型 rc=-6）"
+                # **WARNING 而不是 INFO**：这条被丢弃 = 「用户配的自启没
+                # 生效」。只打 INFO 等于静默少起一个实例。
+                LOG.warning("boot: autostart 跳过 %s @ npu%s —— %s",
+                            e["model"], e["npu_index"], reason)
+                skipped.append({"model": e["model"],
+                                "npu_index": e["npu_index"],
+                                "reason": reason})
+        with self._lock:
+            self._autostart_skipped = skipped
+        return kept
 
     def npu_card_error(self, npu_index: int) -> str | None:
         """``npu_index`` 是否落在本机「能承载 RKNN 模型的卡位」内。
@@ -1688,10 +1766,14 @@ class ComputeRegistry:
         三种拒绝理由要分开说，用户才知道该怎么改：
 
         * **越界** —— 本机根本没有这张卡（卡号是 0 起连续编号的）；
-        * **不是算力卡位** —— 卡在，但它是 RGA/VPU 设备（USB 序列号形态），
-          跑不了 rknn 模型；
+        * **不是算力卡位** —— 卡号在，但那个位置不是能跑 rknn 模型的协卡
+          （v0.30 起卡号只数本机 EP 协卡，正常路径下不会出现；留着兜底）；
         * **被 card_count 限掉** —— ``compute.card_count`` 把可用卡位裁短了
           （双卡板写 1 = 模拟单卡板）。
+
+        **卡号的口径见 :mod:`app.core.compute.cards`** —— 卡号 = 本机 EP
+        协卡按 PCI BDF 排序后的序号（0 起），与驱动枚举列表里的位置无关
+        （那个位置会被 mdns 发现的对端机器挤动）。
 
         **探测失败时不拦截**：``/dev/rknn3`` 被 worker 占着是常态（见
         :meth:`list_cards` 的注释），这时候卡位是**未知**的，拦下来会让
@@ -1724,7 +1806,8 @@ class ComputeRegistry:
             return (f"npu_index={npu_index} 不可用：compute.card_count={cap} "
                     f"只允许使用卡号 {model_cards}")
         return (f"npu_index={npu_index} 不是算力卡位：能承载 RKNN 模型的卡号"
-                f"是 {model_cards}（其余卡是 RGA/VPU 设备，跑不了 rknn 模型）")
+                f"是 {model_cards}（卡号 = 本机 EP 协卡按 PCI BDF 排序后的序号，"
+                f"RGA/VPU 与对端机器不占卡号）")
 
     def list_supported_models(self) -> list[dict]:
         base = get_config().get_section("base", {})
@@ -1802,7 +1885,10 @@ class ComputeRegistry:
             ]
 
         cards = [
-            {"npu_index": c["npu_index"], "device_id": c["device_id"]}
+            {"npu_index": c["npu_index"], "device_id": c["device_id"],
+             # 驱动枚举里的原始下标：诊断用（「卡 #0 对应驱动第几个」）。
+             # 卡号本身是稳定的，这个会随对端机器上下线变。
+             "raw_index": c.get("raw_index")}
             for c in self.list_cards()
         ]
         supported = self.list_supported_models()
@@ -1868,11 +1954,15 @@ class ComputeRegistry:
         return {
             "cards":             cards,
             "cards_failed":      self.cards_failed_reason(),
-            # 能跑 rknn 模型的卡。``cards`` 里还混着 USB 序列号形态的
-            # RGA/VPU 设备 —— 那些卡选不得（见 _PCI_BDF_RE）。
+            # 能跑 rknn 模型的卡（= 卡号列表，0 起连续）。``cards`` 现在
+            # **只含本机 EP 协卡**（按 PCI BDF 排序编号），RGA/VPU 与
+            # mdns 对端机器不占卡号 —— 详见 app.core.compute.cards。
             # ``card_count`` == 1 → 单卡板；== 2 → 双卡板。
             "model_cards":       model_cards,
             "card_count":        len(model_cards),
+            # boot 时被裁掉的 autostart 条目（配了但没生效）—— 算力页据此
+            # 提示用户，别让「少起一个实例」变成无声无息。
+            "autostart_skipped": list(self._autostart_skipped),
             "supported_models":  supported,
             "services":          services,
             "instances":         instances,
@@ -2289,6 +2379,24 @@ class ComputeRegistry:
         # keep answering while the weights load. The compute page passes
         # eager_load=False and loads over RPC instead — see the docstring.
         cmd += _worker_npu_arg(npu_index, eager_load)
+        # 卡号对应的物理身份一起交给 worker（eager-load 路径用）。
+        #
+        # 放在 ``--model <id>`` **之后**是有意的：registry 的 spawn 去重
+        # needle 与 system_monitor 的进程扫描都匹配 cmdline 里的
+        # ``compute_worker.py\x00--model\x00<id>\x00`` —— 追加参数不改这个
+        # 前缀，孤儿检测与去重不受影响（AGENTS.md 明确要求这两个参数不可改）。
+        if npu_index is not None:
+            dev_id = None
+            first_card = (npu_index[0]
+                          if isinstance(npu_index, (list, tuple)) and npu_index
+                          else npu_index)
+            if isinstance(first_card, int) and not isinstance(first_card, bool):
+                try:
+                    dev_id = self.card_device_id(first_card)
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning("card_device_id(%s) failed: %s", first_card, e)
+            if dev_id:
+                cmd += ["--device-id", dev_id]
         try:
             # v0.8.6 改:worker stdout/stderr 写独立 log file,而不是 PIPE。
             # 原因:PIPE 在 parent(uwsgi worker / uvicorn)死掉时 read 端
@@ -2777,6 +2885,12 @@ class ComputeRegistry:
             "action": "load", "op": "load",
             "npu_index": cards if len(cards) > 1 else cards[0],
             "npu_indices": cards,
+            # 卡号对应的**物理身份**（PCI BDF）。worker 按身份选卡 →
+            # 「主进程说的卡」与「worker 加载的卡」不可能不一致（卡号是
+            # 跨进程句柄，wdnai 的 npu= 是位置语义，那个位置会被 mdns
+            # 发现的对端机器挤动）。
+            "device_id": (self.card_device_id(cards[0])
+                          if len(cards) == 1 else None),
         }
         timeouts = (5_000, 15_000, 30_000)
         r = None
@@ -3957,19 +4071,7 @@ class ComputeRegistry:
             entries = []
         # autostart 裁剪：非算力卡的条目丢弃 + 每张卡只留第一条
         # （理由与规则见 _crop_autostart_for_cards）。
-        model_cards = self.model_cards()
-        if entries:
-            kept, dropped = _crop_autostart_for_cards(entries, model_cards)
-            for e in dropped:
-                if e["npu_index"] not in model_cards:
-                    LOG.info("boot: autostart 跳过 %s @ npu%s —— 该卡不在"
-                             "算力卡位 %s 内", e["model"], e["npu_index"],
-                             model_cards)
-                else:
-                    LOG.info("boot: autostart 跳过 %s @ npu%s —— 一张卡只能"
-                             "承载一个模型（同卡叠模型 rc=-6）",
-                             e["model"], e["npu_index"])
-            entries = kept
+        entries = self._crop_autostart(entries)
         # v0.4+: 顺便读一下 active_app 标记 —— boot 后日志会顺手打印
         # 一下当前记的"用户上次所在的卡片"。前端 bootRestore 会读
         # 这个值并跳过去，这里**不**做导航（主进程没有 webview），

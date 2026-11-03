@@ -30,6 +30,8 @@ from pathlib import Path
 import psutil
 from fastapi import APIRouter
 
+from app.core.compute import cards as cards_mod
+
 router = APIRouter(tags=["system-monitor"])
 
 # 旧 fallback 路径：``rknn-smi info`` 子进程。默认不再走，保留是因为
@@ -427,15 +429,20 @@ def _parse_memory(s: str) -> tuple[float | None, float | None]:
 
 def _wdnai_canonical_device_index(bus_id: str | None) -> int | None:
     """Resolve a ``bus_id`` (PCI BDF, e.g. ``0001:11:00.0``) to its
-    enumerate-index in ``RKNN3Lite().get_devices_id()``.
+    **卡号**（= 本机 EP 协卡按 PCI BDF 排序后的序号）。
 
-    wdnai (and therefore 算力配置页) uses ``enumerate(get_devices_id())``
-    as the canonical ``npu_index``; the SMI driver numbers devices by
-    its own internal order, which doesn't always match. This helper
-    bridges the two so 系统信息 / 算力卡信息 and 算力配置 label the same
-    physical card with the same ``#K``. Returns ``None`` when wdnai is
-    unavailable (non-RK dev box) or ``bus_id`` is missing/unmatched —
-    callers fall back to the rknn-smi native idx in that case.
+    算力配置页（registry）用的就是这套卡号（见
+    :mod:`app.core.compute.cards`），而 SMI 驱动按它自己的内部顺序给设备
+    编号，两者对不上。这个函数把两边桥接起来，让 系统信息 / 算力卡信息
+    与 算力配置 对同一张物理卡标同一个 ``#K``。
+
+    **为什么不是「驱动枚举下标」**：那个下标会被 mdns 发现的对端机器挤动
+    （对端上线 → 本机卡整体后移 1），用它当卡号会跟算力配置页对不上。
+    卡号只数本机 EP 卡，两边口径才一致。
+
+    Returns ``None`` when wdnai is unavailable (non-RK dev box) or
+    ``bus_id`` is missing/unmatched — callers fall back to the rknn-smi
+    native idx in that case.
 
     Caches the ``RKNN3Lite`` probe and the resolved lookup map at
     module scope. ``/api/system-monitor`` calls this once per
@@ -456,10 +463,16 @@ def _wdnai_canonical_device_index(bus_id: str | None) -> int | None:
             _wdnai_dev_ids = _wdnai_probe.get_devices_id()
         except Exception:
             return None
-    for i, x in enumerate(_wdnai_dev_ids):
+    for x in _wdnai_dev_ids:
         raw = x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8")
         if raw.decode("utf-8", errors="replace") == bus_id:
-            return i
+            # 卡号 = 本机 EP 卡按 PCI BDF 排序后的序号（与 registry /
+            # worker 同一套规则，见 app.core.compute.cards）。
+            ep_ids = cards_mod.local_ep_device_ids(_wdnai_dev_ids)
+            try:
+                return ep_ids.index(bus_id)
+            except ValueError:
+                return None
     return None
 
 

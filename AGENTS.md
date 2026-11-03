@@ -8205,3 +8205,79 @@ PCIe 链路坏（`pcie_err` 全 0、5GT/s x1 无 AER）、存在旁路（hwmon �
 
 - `python -m scripts.verify_smi_local_slot_guard`（13 条，不占 NPU）
 - `python -m scripts.verify_compute_npu_telemetry_note`（8 条，起浏览器）
+
+## 算力卡号（`npu_index`）的稳定口径（2026-11-03 晚，v0.30）
+
+### 现象
+
+`config.jsonc` 的 `compute.autostart[].npu_index` 是用户写死的**稳定句柄**
+（「这个模型跑在卡 1」）。但某天开机后，深度实例**少起了一个** —— 而
+`config.jsonc` 一个字没改。
+
+### 根因：驱动枚举列表里混着「对端机器」
+
+`RKNN3Lite.get_devices_id()` 返回的列表里混着三类设备：
+
+| 类别 | device_id 形态 | 真机实例 |
+|---|---|---|
+| 本机 PCIe EP 协卡 | PCI BDF | `0001:11:00.0` / `0003:31:00.0` / `0004:41:00.0` |
+| **mdns 发现的对端机器** | `IP:端口` | `172.16.9.139:11900`（后变 `.159`） |
+| 本机 RGA / VPU 设备 | USB 序列号 | `180B6D6C…` |
+
+对端机器**随时会上下线**（实验室里另一台板子），而它一旦在，就占住列表
+**最前面**的下标 —— 本机协卡的下标整体后移 1：
+
+```
+对端离线：[0001:11:00.0, 0003:31:00.0, 0004:41:00.0, …]   → 卡号 0/1/2
+对端在线：[172.16.9.139:11900, 0001:11:00.0, 0003:31:00.0, …] → 驱动下标 1/2/3
+```
+
+旧实现直接拿**驱动枚举下标**当卡号，于是：
+
+1. `config` 里的 `npu_index: 0` 在对端上线后**不再指向本机卡 #0**；
+   `_crop_autostart_for_cards` 判定「该卡不在算力卡位内」→ **静默丢弃**
+   那条 autostart（只留一行 `LOG.info`）→ 少起一个实例，UI 上完全无感。
+2. 更危险的是主进程与 worker **各枚举各的**：两次枚举结果不一致时
+   （主进程枚举时对端离线、worker 枚举时对端上线），同一个卡号在两边
+   指向**不同的物理卡** —— 模型会被加载到另一张卡上。
+
+### 修复：卡号 = 本机 EP 协卡按 PCI BDF 排序后的序号
+
+规则只有**一处实现**（`app/core/compute/cards.py`），三个使用者共用：
+
+| 使用者 | 怎么用 |
+|---|---|
+| `registry.list_cards()` | 枚举一次、编号一次；`cards` **只含本机 EP 协卡**，`npu_index` = 卡号 |
+| `workers/_base._build_session()` | 自己再枚举一次，用**同一套规则**把卡号解析成真实设备 |
+| `system_monitor._wdnai_canonical_device_index()` | `bus_id` → 同一个卡号，系统信息页与算力页的 `#N` 对齐 |
+
+三层保障：
+
+1. **卡号稳定** —— 对端在不在，本机卡的卡号都不变（`card_no → device_id`
+   映射恒定）。
+2. **按物理身份选卡** —— 主进程把卡号对应的 **PCI BDF**（`device_id`）随
+   load RPC / `--device-id` 一起发给 worker，worker 用
+   `LLMLocalSession(model=spec, device_id=…)` 选卡 —— **与枚举顺序完全
+   无关**。wdnai 的 `npu=` 是位置语义，只有 `device_id=` 才是物理身份。
+   worker 侧仍保留「自己枚举 + 同一套规则换算」作为兜底（老主进程没发
+   `device_id` 时）。
+3. **失败不再静默** —— autostart 条目被裁掉时：
+   * 日志级别从 `INFO` 提到 **`WARNING`**；
+   * 条目记进 `registry._autostart_skipped`，经 `snapshot["autostart_skipped"]`
+     暴露，算力页顶部渲染一条**黄色横幅**（「N 条开机自启配置未生效」）。
+
+> **不要用驱动枚举下标当卡号。** 它会被 mdns 对端机器挤动。
+> 新增代码里凡是要表达「哪张卡」，一律走 `app/core/compute/cards.py`。
+
+### 为什么按 BDF 排序而不是按出现顺序
+
+驱动枚举顺序**不保证稳定**（对端插队、PCIe 重枚举都可能改变）。BDF 是
+物理拓扑，排序后是确定的 —— 而且真机实测驱动本来就是按 BDF 递增给出的
+（`0001` < `0003` < `0004`），所以换成 BDF 排序**不改变对端离线时的既有
+卡号**，只是把「对端在线时的漂移」消掉了。
+
+### 回归
+
+- `python -m scripts.verify_card_number_stability`（39 条，不占 NPU）
+  —— A 卡号规则 / B registry 编号 / C autostart 不被丢弃且留痕 /
+  D worker 按卡号解析到同一张物理卡 / E 监控侧 `bus_id → 卡号` 对齐。

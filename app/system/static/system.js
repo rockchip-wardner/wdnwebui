@@ -2037,10 +2037,11 @@ const ComputeConfigPage = {
     }));
 
     // 182x cells：以 wdnai 枚举（cards）作为唯一可信源。系统拓扑
-    // 是 1× RK3588 主控（不占"算力卡"位置）+ N× RK182x 协卡；
-    // wdnai 当前会把单个 RK1828 物理卡拆成多个 context 索引（同卡
-    // 多个 npu_index），按物理卡数 cap 住。后续如增减协卡，调这里的
-    // MAX_RK182X_CARDS 即可。
+    // 是 1× RK3588 主控（不占"算力卡"位置）+ N× RK182x 协卡。
+    // v0.30 起 cards **只含本机 EP 协卡**，且 npu_index 就是**卡号**
+    // （本机 EP 卡按 PCI BDF 排序后的序号，0 起）—— 对端机器上下线
+    // 不再让这里的编号漂移。后端口径见 app.core.compute.cards。
+    // 后续如增减协卡，调这里的 MAX_RK182X_CARDS 即可。
     const devices = (sys.npu && sys.npu.devices) || [];
     const npuByIdx = new Map(devices.map(d => [d.index, d]));
     const cardByIdx = new Map(cards.map(c => [c.npu_index, c]));
@@ -2320,6 +2321,38 @@ const ComputeConfigPage = {
         kind: "is-warn",
         icon: "⚠",
         title: `${missingDirs.length} 个算力模型目录缺失（不算"启动失败"，补齐后 toggle 一下）`,
+        body: ul,
+        actions: [
+          {label: "刷新", onClick: () => this.load()},
+        ],
+      }));
+    }
+
+    // boot 时被裁掉的 autostart 条目 —— 「配了自启但没起来」必须让用户
+    // 看见。以前只在服务日志里躺一行 INFO，UI 上完全无感（真机症状：
+    // 卡号漂移导致一条 autostart 被丢弃 → 少起一个实例，用户不知道）。
+    const skipped = snap.autostart_skipped || [];
+    if (skipped.length) {
+      const ul = document.createElement("ul");
+      ul.className = "cc-banner-list";
+      for (const s of skipped) {
+        const li = document.createElement("li");
+        const head = document.createElement("div");
+        const no = Array.isArray(s.npu_index)
+          ? s.npu_index.join("+")
+          : String(s.npu_index);
+        head.textContent = `${s.model} · NPU #${no}`;
+        li.appendChild(head);
+        const msg = document.createElement("pre");
+        msg.className = "cc-banner-msg";
+        msg.textContent = s.reason || "(未生效)";
+        li.appendChild(msg);
+        ul.appendChild(li);
+      }
+      stack.appendChild(this._makeBanner({
+        kind: "is-warn",
+        icon: "⚠",
+        title: `${skipped.length} 条开机自启配置未生效（卡号不存在或与其它模型冲突）`,
         body: ul,
         actions: [
           {label: "刷新", onClick: () => this.load()},
@@ -3526,9 +3559,12 @@ const ComputeConfigPage = {
     return sorted.length ? sorted[0].npu_index : 0;
   },
 
-  // 只保留「能跑 rknn 模型」的卡。``snapshot.cards`` 里混着 USB 序列号形态
-  // 的 RGA/VPU 设备（模型一上去就 vision init_runtime failed）。算力卡位由
-  // 后端 ``model_cards`` 给出；老后端没这字段时不过滤。
+  // 只保留「能跑 rknn 模型」的卡。
+  //
+  // v0.30 起 ``snapshot.cards`` **只含本机 EP 协卡**（后端已按 PCI BDF
+  // 排序编号，卡号 = 0 起连续），RGA/VPU 与 mdns 对端机器都不在里面 ——
+  // 所以这个过滤在新后端上是恒等的；留着是为了兼容老后端。
+  // 卡号口径见后端 ``app.core.compute.cards``。
   _modelCards(cards) {
     const mc = this._snapshot && this._snapshot.model_cards;
     if (!Array.isArray(mc)) return cards;
@@ -3536,14 +3572,12 @@ const ComputeConfigPage = {
     return (cards || []).filter((c) => keep.has(c.npu_index));
   },
 
-  // NPU 卡片按 enumerate index (npu_index) 升序，与 label "RK182x #N"
-  // 完全对齐。早期版本按 device_id 字符串排序，会让 Position 1 显示
-  // "RK182x #1" 而 Position 2 显示 "RK182x #0"（label 与位置错位），
-  // 跟系统信息页 / 勾选 #N 实际跑在 #N 上对不上。
+  // NPU 卡片按卡号 (npu_index) 升序，与 label "RK182x #N" 完全对齐。
   //
-  // 真相：wdnai 枚举的 npu_index 本身就是 canonical 编号（与系统
-  // 信息页 / librknnsmi 对齐后的 index 同源），按 npu_index 排即按
-  // 物理编号从左到右。每张物理卡始终落在同一格，位置 = label。
+  // **卡号 = 本机 EP 协卡按 PCI BDF 排序后的序号**（0 起），不是驱动
+  // 枚举列表里的位置 —— 后者会被 mdns 发现的对端机器挤动（对端上线 →
+  // 本机卡整体后移 1，label 与实际卡就对不上了）。
+  //
   // ties 时按 device_id 字符串作 tiebreaker 稳定顺序。
   // 入参可能是 [{npu_index, device_id, ...}, ...]；按 npu_index 去重。
   _sortNpuCards(cards) {
