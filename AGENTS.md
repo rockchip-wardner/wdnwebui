@@ -7752,7 +7752,8 @@ replier pump**。诊断时别被这批日志带偏 —— **先看有没有真�
 ## 视觉深度信息v3（Depth Anything V3）—— 本地算力的第三个「非 LLM」模型
 
 「算力配置 → 本地算力」里新增了一个模型条目 **`[Depth]视觉深度信息v3`**
-（worker manifest：`app/core/compute/workers/DepthAnythingV3.json`）。
+（worker manifest：`tools/worker_manifests/DepthAnythingV3.json`，随模型文件夹
+一起分发到 `/userdata/models/Depth-Anything-V3/`）。
 
 ### 它为什么和别的模型不一样
 
@@ -7760,9 +7761,9 @@ replier pump**。诊断时别被这批日志带偏 —— **先看有没有真�
 走的是同一条路：`LLMLocalSession` → `respond()` → **文本**。
 DA3 不是生成器 —— 它是**单目深度估计**：图像进，**逐像素深度图 + 置信度**出。
 
-> **当前限制**：本版本**只完成基础的 10-view（多视图融合）** —— `global`
-> 段在 10 张图之间做融合，送图张数必须正好是 10。
-> **单路（单图）深度估计尚未实现**。
+> **当前部署的是 1-view / 280×280 导出**（2026-11-02 重新导出）——
+> `global` 段输入 `[1,401,1,768]`、`head` 段输出 `[1,1,280,280]`，
+> **一张图即可出深度图 + 置信度**。
 >
 > **换 V 不用改代码** —— view 数是**导出时**参数（model-zoo 的 `--views`，
 > 已验证 1-10），backend 从模型上读 V，重新导出三段 RKNN 即可。
@@ -7792,10 +7793,14 @@ DA3 不是生成器 —— 它是**单目深度估计**：图像进，**逐像�
 ### 三段式 + 共享显存：不共享就 MODEL_SETUP fail
 
 ```
-local   images [1,280,280,3] uint8 NHWC  -> local_tokens [1,401,768]  fp16
-global  tokens [10,401,1,768]            -> feat_5/7/9/11 [10,400,1,1536] fp16
-head    feat_* [10,400,1536]             -> depth / depth_conf [1,10,280,280] fp16
+local   images [1,280,280,3] uint8 NHWC  -> local_tokens [1,401,768]   fp16
+global  tokens [1,401,1,768]             -> feat_5/7/9/11 [1,400,1,1536] fp16
+head    feat_* [1,400,1536]              -> depth / depth_conf [1,1,280,280] fp16
 ```
+
+> 上面这组形状是**当前部署的 1-view 导出**的实测值（从 model report 的
+> `modelData` 里读出来的，不是从文件名推的）。多视图导出时 V 那一维变 10，
+> `head` 的输出变成 `[1,10,280,280]`。
 
 三段**共享**一份按 NPU 核分配的内部显存（C++ demo 的
 `da3_init_internal_mem_share`，8 核合计 ~1.6 GB）。少这一步
@@ -7803,8 +7808,33 @@ head    feat_* [10,400,1536]             -> depth / depth_conf [1,10,280,280] fp
 → `rknn3_model_init` 直接 **`MODEL_SETUP fail`**，表现为
 「功能未启用: swcap_vision_depth」。
 
-> **view 数（10）是烤进导出的**，不是运行期参数：`global` 的输入形状就是
-> `[V,L,1,D]`，V=10 的模型只吃 10 张图。送 3 张会被 backend 明确拒绝。
+> **view 数是烤进导出的**，不是运行期参数：`global` 的输入形状就是
+> `[V,L,1,D]`，V=1 的模型只吃 1 张图。送 3 张会被 backend 明确拒绝。
+
+### 部署侧文件命名（跟 LocateAnything-3B 同一套约定）
+
+模型文件**不再做软链** —— 直接从 model-zoo 的产物 copy 成真实文件，命名跟
+`/userdata/models/LocateAnything-3B` 一致：
+
+```
+local_DepthAnythingV3.280x280.1view.1828.rknn   + local_DepthAnythingV3.280x280.1view.weight
+global_DepthAnythingV3.280x280.1view.1828.rknn  + global_DepthAnythingV3.280x280.1view.weight
+head_DepthAnythingV3.280x280.1view.1828.rknn    + head_DepthAnythingV3.280x280.1view.weight
+```
+
+即 `<role>_<Model>.<WxH>.<N>view.1828.rknn`，`.weight` 是**去掉 `.1828` 段**
+的同名文件（不是把 `.rknn` 换成 `.weight`）。SDK 侧
+`wdnai/backends/depth_anything.py::depth_weight_path()` 按
+`.1828.rknn` → `.weight` 派生，老的「`.rknn` → `.weight`」只作兼容兜底。
+
+> **`.280x280` / `.1view` 只是文档**：backend 从张量属性上读真实几何
+> （分辨率 / view 数 / token 数），**从不解析文件名**。改了导出只需重发
+> 文件 + 改 SDK 的 `_DEPTH_ANYTHING_V3_REQUIRED` / `_default_depth_anything_v3_paths`。
+>
+> **model-zoo 侧的 `da3_base_*.rknn` 保持原名** —— C++ 参考实现的
+> `make_weight_path()` 只做「`.rknn` → `.weight`」，读不了新命名；
+> `scripts/verify_da3_parity.py` 就是拿 model-zoo 的原始文件当 C++ 侧、
+> 拿部署侧的新命名当 Python 侧，两边比的是**实现**不是权重。
 
 ### 像素侧：对着 C++ demo 逐位对齐（含三个坑）
 
