@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 
 from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
@@ -227,6 +227,29 @@ def create_app() -> FastAPI:
             media_type="text/html; charset=utf-8",
             headers={"Cache-Control": "no-store, must-revalidate"},
         )
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        """Serve the favicon at the root path.
+
+        Browsers request ``/favicon.ico`` **by default** when the page
+        declares no icon — and some (Safari / iOS, crawlers, bookmarks)
+        request it even when it does. Without this route every visit
+        leaves a 404 in the console and in the access log.
+
+        The page itself points at ``/static/core/favicon.svg`` (plus the
+        ``.ico`` fallback), so modern browsers never hit this route; it
+        exists to keep the root path from 404-ing.
+
+        Note: routes are registered at boot → this one only exists after
+        a restart (the ``<link rel=icon>`` in the page takes effect
+        immediately, because ``/`` re-assembles the HTML per request).
+        """
+        ico = STATIC_DIR / "core" / "favicon.ico"
+        if not ico.is_file():
+            return Response(status_code=404)
+        return FileResponse(ico, media_type="image/x-icon",
+                            headers={"Cache-Control": "no-cache"})
 
     @app.get("/health")
     async def health() -> dict:

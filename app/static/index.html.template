@@ -4,6 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>守望者系统演示</title>
+  <!-- favicon：现代浏览器用 SVG，不认 SVG 的（Safari / iOS）退回 ICO。
+       放在这里是为了让浏览器**不再**去请求 /favicon.ico（默认会请求，
+       而根路径没有这个文件 → 每次访问都一条 404）。/favicon.ico 本身
+       仍由 app/main.py 的同名路由兜底（见那里的注释）。 -->
+  <link rel="icon" href="/static/core/favicon.ico" sizes="32x32" />
+  <link rel="icon" href="/static/core/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/static/core/framework.css" />
   <link rel="stylesheet" href="/static/core/wizard/wizard.css" />
   <link rel="stylesheet" href="/static/core/frame-judge.css" />
