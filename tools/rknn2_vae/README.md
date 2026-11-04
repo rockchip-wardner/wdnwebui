@@ -175,6 +175,33 @@ rknn_run ret=0 (9557.7 ms)
 [qi] ⭐ VAE 走本机 rknn2（RK3588 NPU，1 段）⇒ DiT 全程常驻
 ```
 
+### ⭐ 兜底路径验收（模拟「板子没装 rknn2 runtime」）
+
+cshim 用 **dlopen** 加载 `librknnrt` ⇒ 没装 rknn2 的板子**照常工作**。
+实测方法：把模型包里的 rknn2 模型挪走，重启 worker：
+
+```bash
+mv /home/rockchip/models/qwenimage21/vae_qwenimage21-512.rknn2.rknn \
+   /home/rockchip/models/vae_rknn2_int8_C2.rknn.disabled
+# 重启 webui ⇒ worker 重新 load
+```
+
+worker 日志应出现：
+
+```
+[qi] ℹ️ 模型包里没有 rknn2 的 VAE ⇒ 用 rknn3 VAE 链（DiT 与 VAE 共卡）
+```
+
+进度流变成 `flow → release（释放 DiT）→ vae_init → vae 1/4..4/4 → save`
+⇒ **比 rknn2 路径多一次 DiT 释放**（批量出图时下一张要重建 DiT，+39 s）。
+
+**实测**：单张 43.59 s，出图内容正确 ✅。
+**跨路径对拍**：同提示词同潜变量，rknn2 路径 vs rknn3 路径端到端像素差
+**mean 1.315/255、p95 3.0、p99 5.0** ⇒ 两条独立量化路径实质一致
+（这是对 rknn2 路径的**独立佐证**，不是自证）。
+
+⚠️ 记得把模型**放回去**，否则板子就一直走慢路径了。
+
 ---
 
 ## 5. 「3 核只给 1.37x」和「手术的 CPU 回落净收益」（实测，非推测）
