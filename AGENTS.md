@@ -1272,8 +1272,24 @@ app/apps/<card_id>/
    `scripts/migrate_worker_manifests.py` 拷过去）。`requires_cards: 2` ——
    TE 常驻卡 0、DiT+VAE 在卡 1。
 
-#### ⚠️ 本卡踩到的四个坑（都不是「配置写错」，是链路本身有洞）
+#### ⚠️ 本卡踩到的五个坑（都不是「配置写错」，是链路本身有洞）
 
+0. ⭐⭐⭐ **「点了没反应」= 三个反馈空窗叠在一起**（2026-11-04 用户反馈：
+   「点了生成图片就一直卡在那，进度条要非常久之后才出来，也没提示在做什么」）。
+   查下来后端进度其实是**及时的**（VAE 每段都推），空窗全在前端：
+   1. worker 的第一条 `qi|` 事件要等它真开始干活才到（最快 1~4 s）⇒ 这之前
+      快照里 `progress` 是 `None` ⇒ **前端把进度条整个 `hidden` 了**
+      （`renderProgress(null)`）⇒ 用户看着像「点了没反应」；
+   2. `doGenerate()` 里 `await postJSON()` 之后**直接返回** ⇒ 界面一动不动，
+      要等下一次 WS 帧（最快 1 s）或兜底轮询（最慢 5 s）才知道「点了」
+      ⇒ 修：点击即刻禁用按钮 + 变「提交中…」+ 进度条亮起来，POST 成功后
+      **立刻** `pollSnapshot()`；
+   3. 向导模式里自动出图时**卡片页是隐藏的** ⇒ 向导界面自己又没有进度显示
+      ⇒ 修：向导完成后明确提示「已开始生成，请到「图片生成」页看实时进度」。
+   ⇒ 后端也补了一条：`start()` 立刻塞 `stage="start"` 事件（带总步数），
+   让「正在跑」这件事**零延迟**可见。
+   ⇒ 复现/回归脚本：`scripts/probe_click_timeline.py`（headless chromium
+   点一次，每 100 ms 抓 DOM + 记 WS 帧时刻）。实测 **t = 0.22 s** 就有反馈。
 1. ⭐⭐⭐ **出图产物过不去 RPC**：`wdndds` 的 `encode_attachments_out` 只认
    `item.data`（**音频专有属性**），于是 `ImageAttachment` 被整条丢掉 ——
    reply 的 `attachments_out` 是空的，调用方只拿到一句 prompt 回显，
