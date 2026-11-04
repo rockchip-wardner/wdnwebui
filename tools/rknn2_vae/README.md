@@ -15,7 +15,9 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）。
 |---|---|---|
 | `to4d.py` | 119（转换服务器） | **ONNX 手术**：把 5D「通道族」张量换标签成 4D 友好排布（internal 内存 -48.6% 的关键） |
 | `quant_build.py` | 119 | 按 rknn-toolkit2 2.5.0 的 `config()`/`build()` 参数构建 + **模拟器对拍**（x86 上就能判精度，省得每次上板） |
+| `acc_analysis.py` | 119 | rknn-toolkit2 文档里的 `accuracy_analysis` —— **逐层**精度分析（哪几层量化误差大） |
 | `probe_vae4d.c` | 板子 | 板端探针：`rknn_init` + `rknn_run`（可指定核数）+ 与 ORT 参考对拍 rel_L2 / cosine |
+| `accept_vae2.sh` | 板子 | 探针对拍 → 部署进模型包 → 端到端出图（2 张，验证零 model_init） |
 
 ---
 
@@ -94,6 +96,37 @@ RESULT tag=c2_ah999 status=ok rel_L2=0.0350972 cosine=0.999389 build_s=1367
 > `auto_hybrid` 的阈值语义是「**相似度**」——越高 ⇒ 越多层判为敏感 ⇒ 留在 fp16。
 > 逐层分析（`accuracy_analysis`，412 层）显示**单层误差最大的全是 `exNorm`（GroupNorm）**
 > （单层 cosine 0.086~0.089），`auto_hybrid` 正是把它们留回 fp16 的那个机制。
+
+### 3.3 逐层精度分析（回答「哪些层该留在 fp16」）
+
+rknn-toolkit2 文档里的 `accuracy_analysis` 会为**每一层**产出 fp32 与 qnt 两份快照
+并算出量化误差 ⇒ **直接回答「哪几层量化误差大」**，也就是混合量化该把哪些层留在 fp16。
+
+```bash
+cd /datasets/Qwen-Image-2.1/rknn2_vae
+nohup setsid env TMPDIR=/datasets/tmp/rknnbuild \
+  /datasets/Qwen-Image-2.1/.venv2/bin/python -u acc_analysis.py \
+    --tag acc1 --algorithm kl_divergence \
+    --onnx onnx/vae512_ps_g2g.onnx \
+    --dataset calib_real/dataset.txt \
+    --inputs /datasets/tmp/vae512_in.npy > logs/acc_acc1.log 2>&1 </dev/null & disown
+```
+
+产出（实测耗时 **4h29m**）：
+
+```
+acc_acc1/error_analysis.txt   （41 KB）—— 逐层 entire（累积）/ single（单层）cosine + 欧氏距离表
+acc_acc1/golden/               412 层 fp32 快照
+acc_acc1/simulator/            412 层 qnt 快照
+acc_acc1/map_name_to_file.txt
+```
+
+**结论：单层误差最大的全是 `exNorm`（GroupNorm）** ——
+`mul_75_sw_sw` 单层 cosine **0.08939**、`add_64_rs_sw` **0.08702**、
+`mul_71_sw_sw` **0.08655**；其余层基本 **> 0.98**。
+
+⇒ **量化毁在 GroupNorm 上**，不是均匀地毁在所有层。
+这正是 `auto_hybrid` 能一把救回 0.715 → 0.035 的原因。
 
 ---
 
