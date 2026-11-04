@@ -1535,12 +1535,17 @@ app/apps/<card_id>/
                                                    │ DDS RPC run_prompt(prompt, output_dir=…)
                                                    ▼
                                     worker 进程（compute_worker.py --model qwenimage21）
-                                                   │ cshim → TE(卡0) + DiT(卡1) + VAE(卡1)
+                                                   │ cshim → TE(卡0) + DiT(卡1) + VAE(本机 3588 NPU)
                                                    ▼
                                     PNG 落盘（worker 自己写 ⇒ 与运行时基线逐字节一致）
 ```
 
 模型**不在 Web UI 进程里跑** —— NPU 由算力注册中心统一分配，worker 崩了不影响 UI。
+
+⭐ **VAE 跑在本机 RK3588 的 NPU 上**（rknn2 / RKNN2 runtime 2.5.0），
+TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
+⇒ **DiT 全程常驻 ⇒ 生成过程零 model_init**。
+详见 §「图片生成卡 → VAE 走本机 rknn2 NPU」。
 
 #### 装配清单（少任何一条都表现为「卡片能开但不出图 / 出不了图」）
 
@@ -1558,9 +1563,55 @@ app/apps/<card_id>/
 5. **worker manifest 在模型目录里**：`/mnt/oem/models/qwenimage21/qwenimage21.json`
    （出厂清单在 `tools/worker_manifests/qwenimage21.json`，用
    `scripts/migrate_worker_manifests.py` 拷过去）。`requires_cards: 2` ——
-   TE 常驻卡 0、DiT+VAE 在卡 1。
+   TE 常驻卡 0、DiT 在卡 1；**VAE 不占 1828 卡**（在本机 3588 的 NPU 上，见下）。
 
-#### ⚠️ 本卡踩到的五个坑（都不是「配置写错」，是链路本身有洞）
+#### ⭐ VAE 走本机 rknn2 NPU（2026-11-04）
+
+旧拓扑里 **VAE 和 DiT 同在 1828 卡上**，而两者**物理上不能共卡**
+（VAE 4 段 internal 合计 1471.2 MiB/核 > 池 639.5 MiB）
+⇒ 每批图跑完必须**释放 DiT**，下一批重新 init（**39 s**）。
+
+改成：
+
+```
+卡0  0000:01:00.0 :  TE 常驻（486.0 MiB/核）+ 头（6.4 MiB/核）        [RKNN3/rk1820]
+卡1  0003:31:00.0 :  DiT 4 段（--share-internal，525.0 MiB/核）常驻   [RKNN3/rk1820]
+本机  RK3588 NPU   :  VAE 整图（rknn2，int8 混合量化）常驻，3 核全用  [RKNN2/本地]
+```
+
+⇒ **DiT 全程常驻 ⇒ 生成过程零 model_init**（flow 每步都打「零 load / 零 model_init」）。
+
+**cshim 侧**（`wdnai/_cshim/qi/{rknn2_runner,vae_rknn2}.{h,cpp}` +
+`api.cpp::find_vae2_models`）：
+
+* **dlopen** `librknnrt.so.2.5.0`（不是链接）⇒ 没装 rknn2 runtime 的板子
+  **照常编译运行**，自动退回 rknn3 的 VAE 链（行为与改造前一致）。
+* `core_mask=0_1_2` ⇒ **本机 3 个 NPU 核全用**（板端实测 3 核比 1 核快 ~9~15.7%）。
+* 模型名：`vae_qwenimage21-512.rknn2.rknn`（整图，优先），
+  没有就找 `vae_qwenimage21-512.rknn2.seg{0..7}.rknn`（分段流式）。
+* 整图装不下 ⇒ **必须返回失败让调用方退回 rknn3**（分段流式在这里毫无意义：
+  流式只是把 init 推迟到解码那一刻，那一刻**同样装不下**）。
+
+**量化侧**（在 119 转换服务器做，板端无法转换）：
+
+* ⭐⭐⭐ **5D「通道族」张量让工具链把通道轴放大 16~32 倍** ——
+  RKNN-Toolkit2 把 5D 按 NCHW 解释成 `(d0*d1, d2, d3, d4)`，
+  于是 `[1,C,1,H,W]`（D=1）被解释成 `(C,1,H,W)` ⇒ C=1 ⇒ NC1HWC2 补到 16。
+  修法是**换标签**：挪动的轴长度=1 ⇒ 扁平下标逐字节不变 ⇒ 数值逐位不变。
+  ⇒ **internal 3852 → 1980 MiB（-48.6%）**。手术脚本 `tools/rknn2_vae/to4d.py`。
+* **纯 w8a8 会彻底毁掉 VAE**（输出塌成平色，rel_L2 0.715）⇒ 必须
+  `auto_hybrid`（阈值语义是「相似度」，越高 ⇒ 越多层留 fp16）。
+  逐层分析（`accuracy_analysis`，412 层）显示**单层误差最大的全是 `exNorm`
+  （GroupNorm）**，cosine 0.086~0.089 —— `auto_hybrid` 正是把它们留回 fp16。
+* 成品：internal 1825 + weight 483 = **2308 MiB**（池上限实测 ≈ 4080 MiB，
+  限制是 internal+weight **总和**）⇒ 装得下 ⇒ 整图单模型常驻。
+* 板端实测：init 1.85 s、解码 9.3~10.2 s（3 核）、rel_L2 **0.0415** / cosine **0.99915**。
+* ⚠️ **板端 fp16 与模拟器 fp16 也差 1.79%**（NPU 的 fp16 kernel vs 模拟器用
+  float32 模拟 fp16 的固有差）⇒ 读板端精度数字必须带这个基线。
+
+⇒ 完整构建/验收流水线在 **`tools/rknn2_vae/`**（含 README 与踩坑清单）。
+
+
 
 0. ⭐⭐⭐ **「点了没反应」= 三个反馈空窗叠在一起**（2026-11-04 用户反馈：
    「点了生成图片就一直卡在那，进度条要非常久之后才出来，也没提示在做什么」）。
