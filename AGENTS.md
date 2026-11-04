@@ -1286,6 +1286,50 @@ app/apps/<card_id>/
 3. ⭐ **模型包不能直接搬进 `/mnt/oem`**：emmc 只剩 558 MB。软链既满足
    「manifest 所在目录 = 模型目录」的发现规则，又不占 emmc。
 
+#### 进度条（每一步在做什么 / 每一步多久 / 还需多久）
+
+出图是重操作（首次 load ~90 s、每张 8 步 ~34 s），只给一个黑转圈等于没有
+反馈 ⇒ 这张卡有**实时进度条**。链路（每一环都已打通）：
+
+```
+cshim(C)  qi_progress_cb  ──►  backend.sink.emit("qi|stage=flow|step=3|…")
+   ▲ on_delta（worker 侧）      │
+   │                            ▼
+   └── DDS delta 通道 ◄── 卡片 service.py 的 parse_progress → ProgressTracker
+                                        │  快照的 progress 字段
+                                        ▼
+                                 前端进度条（阶段 / 步序 / 本步耗时 / ETA）
+```
+
+* **C 侧**（wdnai `_cshim/qi/progress.h`）：阶段 = init / te / flow / vae /
+  vae_init / release / save / done；flow 每跑完一步报一次。
+* **口径**：`elapsed_ms` = **距上一次计时基准**的毫秒数；换阶段时用
+  `qi_progress_stage()` 重置基准 ⇒ 「这一步花了多久」是真的
+  （不重置的话，新请求的第一条会把「worker 空等了多久」当成耗时）。
+* **⚠️ 全局只有一个时钟**：`qi_progress_ctx` 由会话持有、各层共享指针 ——
+  每层各自计时的版本会让跨层事件（release 报 21 s）对不上。
+* **卡片侧**：`service.py` 的 `ProgressTracker` 把事件折成
+  `{stage, step, total, percent, step_ms, step_avg_ms, eta, detail}`；
+  `on_delta` 回调跑在 **DDS 读线程**上 ⇒ 只改状态、**不**在里面广播
+  （前端靠 WS 的 1 秒节拍取）。
+* **ETA** = 本阶段剩余步数 × 本阶段平均每步 + 后续阶段的固定预估值。
+
+#### ⚠️ 关停挂死（2026-11-04 定位，宿主侧兜底）
+
+浏览器会**同时**挂着 8 张卡的 WS。只要有一条 WS 的服务端协程不返回，
+uvicorn 的优雅关停就**永久挂死**（日志停在 "Waiting for background
+tasks to complete"，端口 8000 起不来）。两个已知触发条件：
+
+* 只在「状态变化时」才发帧 ⇒ 客户端断开后它**永远发现不了**
+  （7 张卡都是这个写法；图片生成卡已改成「读一次 + send 超时 + 心跳」）。
+* 对端「消失但不干净关闭」⇒ 服务端 send 卡在写缓冲上
+  （socket 停在 CLOSE-WAIT 且还有数据没发出去）⇒ 协程不返回。
+
+⇒ **宿主侧必须兜一个上限**：`run.py` 里给 uvicorn 传
+`timeout_graceful_shutdown=10`（默认 None = 无限等）⇒ 超时后 uvicorn
+取消这些任务继续关停（日志会打一行 "Cancel N running task(s)"）。
+**任何新增的 WS 卡片都该自己处理断开**，但宿主这个上限不能省。
+
 ## AI 电脑控制（usb-hid 的任务循环）
 
 `usb-hid` 卡从 v0.25 起不只是「手动把点击/按键透传给 PC」，还多了一条

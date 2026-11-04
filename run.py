@@ -617,6 +617,25 @@ def main() -> None:
         reload_dirs=[str(_ROOT / "app"), str(_ROOT / ".venv" / "src")],
         ws_ping_interval=5.0,
         ws_ping_timeout=60.0,
+        # ⭐⭐⭐ **优雅关停必须有上限**（2026-11-04 实测踩到）
+        #
+        # uvicorn 的 ``timeout_graceful_shutdown`` 默认是 **None** = 无限等
+        # ⇒ ``_wait_tasks_to_complete()`` 会一直等 ``server_state.tasks``
+        # 清空。而 WebSocket 连接**算 task** —— 只要有一条 WS 的服务端
+        # 处理协程不返回（典型：只在「状态变化时」才发帧 ⇒ 客户端断开
+        # 后它永远发现不了；或 send 卡在写缓冲上），关停就**永久挂死**：
+        #     日志停在 "Waiting for background tasks to complete"
+        #     端口 8000 一直被占着，新进程起不来 ⇒ 整个 webui 不可用。
+        #
+        # 实测：浏览器会**同时**挂着 8 张卡的 WS（text_chat / tts /
+        # video_* / audio_analysis / media_generator …），其中任何一条
+        # 处理协程不返回就足以拖死关停。⇒ 必须在宿主侧兜一个上限：
+        # 超时 ⇒ uvicorn 取消这些任务、继续关停（日志会打一行
+        # "Cancel N running task(s), timeout graceful shutdown exceeded"）。
+        #
+        # 10 秒：正常情况下 WS 早就自己收了（浏览器关页即断），
+        # 10 秒足够；真有卡死的也只多等 10 秒。
+        timeout_graceful_shutdown=10,
     )
 
 
