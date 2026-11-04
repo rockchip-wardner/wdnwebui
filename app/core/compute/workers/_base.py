@@ -150,6 +150,12 @@ _REGISTER_SPEAKER_TIMEOUT = 30.0
 # the main process's inference budget (``proxy._INFER_TIMEOUT_MS``) so
 # the failure surfaces as a worker reply with a reason attached rather
 # than as an opaque client-side timeout.
+#
+# The value is **per model**: a manifest may declare ``infer_timeout_s``
+# (see :func:`app.core.compute.workers.manifest_infer_timeout_s`), because
+# one global budget cannot fit both a chat turn and a diffusion step —
+# Qwen-Image-2.1 at 28 steps needs ~90 s on this board and used to die on
+# the 60 s default with "inference exceeded 60.0s".
 _INFER_TIMEOUT_SEC = 60.0
 
 
@@ -1349,7 +1355,8 @@ def _build_extra_ops(state: dict, model_id: str,
     }
 
 
-def _serve_one(hub, side_hub, service_name: str, session, extra_ops: dict):
+def _serve_one(hub, side_hub, service_name: str, session, extra_ops: dict,
+               infer_timeout_s: float = _INFER_TIMEOUT_SEC):
     """Attach ``serve_local_session`` to one already-registered service.
 
     The worker advertises **two** names for itself — the per-PID one the
@@ -1392,7 +1399,11 @@ def _serve_one(hub, side_hub, service_name: str, session, extra_ops: dict):
         # is abandoned on timeout, so the NPU slot stays occupied until
         # the driver returns on its own. A timeout therefore means "this
         # worker needs restarting", not "retry this call".
-        infer_timeout_s=_INFER_TIMEOUT_SEC,
+        #
+        # ``infer_timeout_s`` comes from the model's own manifest, so a
+        # long-running model (diffusion) gets a budget that fits it while
+        # a chat model keeps the tight 60 s default.
+        infer_timeout_s=infer_timeout_s,
     )
 
 
@@ -1649,10 +1660,22 @@ def run_worker(argv=None) -> int:
 
     extra_ops = _build_extra_ops(
         _worker_state, model_id, startup_npu_index, model_dir)
+
+    # Per-model inference budget. The manifest owns it (``infer_timeout_s``)
+    # because only the manifest knows what one inference of *this* model
+    # costs: a chat turn is seconds, a 28-step diffusion sample is ~90 s on
+    # this board. Read once and shared by both service names — they serve
+    # the same session, so they must share the same bound.
+    from app.core.compute.workers import manifest_infer_timeout_s
+    infer_timeout_s = manifest_infer_timeout_s(model_id) or _INFER_TIMEOUT_SEC
+    LOG.info("infer budget: %.1fs per inference (model=%s)",
+             infer_timeout_s, model_id)
+
     served = []
     for svc in services:
         served.append(
-            _serve_one(hub, side_hub, svc, _LazySession(), extra_ops))
+            _serve_one(hub, side_hub, svc, _LazySession(), extra_ops,
+                       infer_timeout_s=infer_timeout_s))
 
     # 内置 @Callable 工具注册：与主进程共用同一份 registry 真源
     # (详见 app/core/tools/_builtins.py)。

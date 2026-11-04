@@ -151,6 +151,21 @@ class WorkerManifest:
     requires_cards: int = 1
     memory_estimate_mb: int = 0
     estimated_init_seconds: int = 60
+    #: How long **one** inference of this model may take, in seconds.
+    #: ``0`` means "unset" ⇒ the transport default (60 s) applies.
+    #:
+    #: This is a **resource fact about the model**, in the same family as
+    #: ``estimated_init_seconds`` — not model *behaviour*. It exists because
+    #: one budget has to fit both a chat turn (~5 s) and a diffusion step
+    #: (28-step Qwen-Image-2.1 ≈ 90 s on one board): a single global 60 s
+    #: silently kills the long one, and raising the global one would let a
+    #: wedged chat worker pin its pump for minutes.
+    #:
+    #: The worker uses it as its replier pump bound; the main process uses
+    #: it (plus a margin) as the client-side RPC budget, so the failure
+    #: still surfaces as a **worker reply with a reason** instead of an
+    #: opaque client-side timeout.
+    infer_timeout_s: float = 0.0
     description: str = ""
     #: Free-form operator notes. The old per-worker docstrings carried
     #: real knowledge (why an option is set to a particular value, what a
@@ -216,6 +231,7 @@ class WorkerManifest:
             "requires_cards": self.requires_cards,
             "memory_estimate_mb": self.memory_estimate_mb,
             "estimated_init_seconds": self.estimated_init_seconds,
+            "infer_timeout_s": self.infer_timeout_s,
             "description": self.description,
             "notes": self.notes,
             "available_targets": list(self.available_targets),
@@ -297,8 +313,17 @@ def _validate(raw: Any, stem: str, *, canonical: bool = False
         "id", "label", "capability_types", "spec_factory", "worker_name",
         "model_dir_name", "model_dir", "model_dir_env", "instance_name",
         "requires_cards", "memory_estimate_mb", "estimated_init_seconds",
+        "infer_timeout_s",
         "description", "notes", "available_targets", "hidden", "display_order",
     }
+    try:
+        infer_timeout_s = float(raw.get("infer_timeout_s") or 0.0)
+    except (TypeError, ValueError):
+        errors.append("'infer_timeout_s' 不是数字（单位：秒）")
+        infer_timeout_s = 0.0
+    if infer_timeout_s < 0:
+        errors.append("'infer_timeout_s' 不能为负数")
+        infer_timeout_s = 0.0
     return WorkerManifest(
         id=worker_id,
         label=raw["label"],
@@ -311,6 +336,7 @@ def _validate(raw: Any, stem: str, *, canonical: bool = False
         requires_cards=int(raw.get("requires_cards", 1)),
         memory_estimate_mb=int(raw.get("memory_estimate_mb", 0)),
         estimated_init_seconds=int(raw.get("estimated_init_seconds", 60)),
+        infer_timeout_s=infer_timeout_s,
         description=raw.get("description", ""),
         notes=raw.get("notes", ""),
         available_targets=list(raw.get("available_targets", [])),
@@ -457,6 +483,44 @@ def find_manifest_path(worker_id: str) -> Optional[str]:
         if isinstance(raw, dict) and raw.get("id") == worker_id:
             return str(cand)
     return None
+
+
+#: Default inference budget (seconds) when a manifest declares none.
+#: 60 s is a generous ceiling for a chat / VLM turn — the point of the
+#: bound is to catch a **wedged** worker, not to race a slow one.
+DEFAULT_INFER_TIMEOUT_S = 60.0
+
+
+def manifest_infer_timeout_s(model_id: str) -> float:
+    """The inference budget (seconds) declared by ``model_id``'s manifest.
+
+    Returns ``0.0`` when the manifest is missing, unreadable, or does not
+    declare ``infer_timeout_s`` — callers then fall back to their own
+    default (:data:`DEFAULT_INFER_TIMEOUT_S`).
+
+    Reads the manifest file directly instead of going through
+    :func:`discover`, which parses *every* installed model's manifest:
+    both the worker process and the main process need this value on a
+    startup path, and they must not each pay for a full scan.
+
+    Both processes read the **same file** ⇒ the worker's own bound and the
+    client's RPC budget can never drift apart.
+    """
+    path = find_manifest_path(model_id)
+    if path is None:
+        return 0.0
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return 0.0
+    if not isinstance(raw, dict):
+        return 0.0
+    try:
+        val = float(raw.get("infer_timeout_s") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return val if val > 0 else 0.0
 
 
 def model_presets() -> Dict[str, Dict[str, Any]]:

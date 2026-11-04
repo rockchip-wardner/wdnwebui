@@ -94,6 +94,8 @@ SDK 在这个模型目录里找不到它期望的那些具体文件名。每个�
 | `model_dir_name` | 建议的文件夹名（迁移/校验用；实际以所在目录为准） |
 | `model_dir_env` | SDK 用来定位该模型文件的 per-model 环境变量名 |
 | `requires_cards` | 需要几张算力卡 |
+| `estimated_init_seconds` | 首次 load 的经验秒数（算力页「加载中」倒计时的起点） |
+| `infer_timeout_s` | **一次推理的预算（秒）**，可选，缺省 60。长耗时模型（扩散/文生图）必须声明，否则会被 60 s 砍掉 |
 | `display_order` | 算力配置页里的显示顺序 |
 
 完整字段表见 `app/core/compute/workers/__init__.py::WorkerManifest`。

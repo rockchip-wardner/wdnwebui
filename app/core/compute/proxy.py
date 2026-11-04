@@ -46,7 +46,18 @@ LOG = logging.getLogger("compute_proxy")
 # at a 768px letterboxed frame runs ~35s per call, and the point of the
 # timeout is to catch a *wedged* worker, not to race a slow one. The
 # transport retries a structural wedge once with a fresh requester.
+#
+# This is the **default**; a model that takes longer declares its own
+# budget in its manifest (``infer_timeout_s``) and gets
+# ``that + _INFER_TIMEOUT_MARGIN_S`` instead — see
+# :func:`_infer_timeout_ms_for`.
 _INFER_TIMEOUT_MS = 120_000
+
+#: How much **longer** than the worker's own bound the client's RPC budget
+#: is. The client must outlast the worker: a worker that gives up replies
+#: "inference exceeded Ns" *with a reason*, while a client that gives up
+#: first produces an opaque timeout with no diagnosis at all.
+_INFER_TIMEOUT_MARGIN_S = 30.0
 
 # Control-plane verbs (``info`` / ``load`` / ``unload`` / ``count_tokens``)
 # answer in milliseconds and must not inherit the inference budget, or a
@@ -120,6 +131,29 @@ def _wrap_thinking_mode(sess: Any, service_name: str) -> None:
     sess.respond = respond
 
 
+def _infer_timeout_ms_for(model_id: str) -> int:
+    """Client-side inference budget for ``model_id``, in milliseconds.
+
+    The worker publishes its own bound in the model manifest
+    (``infer_timeout_s``); the client budget is that plus
+    :data:`_INFER_TIMEOUT_MARGIN_S`. Both processes read the **same
+    manifest file**, so the worker's bound and the client's budget can
+    never drift apart — a drift would show up as an opaque client-side
+    timeout instead of the worker's explanatory reply.
+
+    Models without the field keep the global default.
+    """
+    worker_s = 0.0
+    try:
+        from app.core.compute.workers import manifest_infer_timeout_s
+        worker_s = manifest_infer_timeout_s(model_id)
+    except Exception:  # noqa: BLE001 — a missing manifest must not break RPC
+        worker_s = 0.0
+    if worker_s <= 0:
+        return _INFER_TIMEOUT_MS
+    return int(round((worker_s + _INFER_TIMEOUT_MARGIN_S) * 1000))
+
+
 def make_rpc_session(
     *,
     model: Any,
@@ -153,7 +187,7 @@ def make_rpc_session(
         side_hub=side_hub,
         _svc=_svc,
         is_remote=is_remote,
-        infer_timeout_ms=_INFER_TIMEOUT_MS,
+        infer_timeout_ms=_infer_timeout_ms_for(model_id),
         timeout_ms=_CONTROL_TIMEOUT_MS,
     )
     # The registry addresses instances by model_id; the session only knows

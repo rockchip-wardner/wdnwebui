@@ -1272,7 +1272,7 @@ app/apps/<card_id>/
    `scripts/migrate_worker_manifests.py` 拷过去）。`requires_cards: 2` ——
    TE 常驻卡 0、DiT+VAE 在卡 1。
 
-#### ⚠️ 本卡踩到的三个坑（都不是「配置写错」，是链路本身有洞）
+#### ⚠️ 本卡踩到的四个坑（都不是「配置写错」，是链路本身有洞）
 
 1. ⭐⭐⭐ **出图产物过不去 RPC**：`wdndds` 的 `encode_attachments_out` 只认
    `item.data`（**音频专有属性**），于是 `ImageAttachment` 被整条丢掉 ——
@@ -1285,6 +1285,22 @@ app/apps/<card_id>/
    就调 ⇒ init 挪到 worker 的 **load** 阶段（UI 显示「加载中」），推理只剩 34 s。
 3. ⭐ **模型包不能直接搬进 `/mnt/oem`**：emmc 只剩 558 MB。软链既满足
    「manifest 所在目录 = 模型目录」的发现规则，又不占 emmc。
+4. ⭐⭐⭐ **一次推理的预算是「每模型」的，不能是全局常量**：
+   worker 侧原来写死 `_INFER_TIMEOUT_SEC = 60.0`（`app/core/compute/workers/_base.py`），
+   客户端写死 `proxy._INFER_TIMEOUT_MS = 120_000` ⇒ **20/28 步出图（实测
+   103 s / 124 s）必然被砍掉**，报
+   `TimeoutError: inference exceeded 60.0s`。
+   ⇒ 改成 **manifest 声明 `infer_timeout_s`**（文生图 = 300 s）：
+   - worker：`manifest_infer_timeout_s(model_id)` → 传给 `serve_local_session`
+     的 `infer_timeout_s`（这是 replier pump 的上限，超了就回一条带原因的
+     错误，而不是把 pump 焊死）；
+   - 客户端：`proxy._infer_timeout_ms_for(model_id)` = **worker 预算 + 30 s
+     margin**（客户端必须比 worker **活得久**，否则先超时的是客户端 ⇒ 报错
+     没有原因可查）；
+   - 两边读**同一个 manifest 文件** ⇒ 预算不会漂移。
+   ⇒ 验证脚本：`scripts/test_infer_timeout.py`（不碰 NPU）。
+   ⛔ 新增 manifest 字段时记得同步 `workers/__init__.py` 的 `known` 集合
+   （决定哪些键会掉进 `extra`）。
 
 #### 进度条（每一步在做什么 / 每一步多久 / 还需多久）
 
