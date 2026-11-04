@@ -8072,6 +8072,98 @@ DA3 的 `rknn3_init` 会挂死**，最终报 `rknn_local init_runtime failed`
 排查用 `py-spy dump --pid <pid>`（栈会停在 `wdnai/_librknn.py` 的
 `rknn3_init`），**别 kill** —— 见上文「别在 NPU 调用中途 kill 进程」。
 
+### 面板动态预览：`preview_video` 与素材落位
+
+首页应用网格里每张卡的缩略图**不是静态图**，而是
+`manifest.preview_video` 指向的一段 mp4 —— `framework.js:renderAppPanel`
+把它渲染成 `<video class="app-card-video" autoplay muted playsinline
+preload="metadata" loop>`（`app/static/core/framework.css` 的
+`.app-card-video` 用 `object-fit: cover` 铺满 16:9 的占位框）。
+
+`video-depth` 这张卡以前 `preview_video` 是空的 → 面板里那块位置是**空的**
+（不报错，只是没东西）。现在指向
+`cards/video_depth/static/preview.mp4`（608×352 / 24fps / 3.0s，左半边原画、
+右半边 turbo 深度热力图），与 `video-detection` / `vtd` / `vtl` 同款。
+
+三条容易踩的：
+
+* **素材必须落在卡片自己的 `static/` 目录**（`cards/<card>/static/preview.mp4`）。
+  服务把 `/static/apps/<id>/` 挂到**卡片目录**上，不是仓库根 —— 把 mp4 丢在
+  仓库根不会被任何卡片看到。
+* **改 `preview_video` 不用重启服务**：`index` 路由每次请求都重新
+  `assemble_index_html(discover_cards())`（`app/main.py:index`），所以 manifest
+  的改动下一次刷新就生效。但**新增卡片**要重启 —— `/static/apps/<id>/` 的
+  挂载和 API 注册都是启动时做的。
+* **预览要能真的播**：文件得是浏览器能解的 mp4（H.264 + AAC），而且必须
+  **faststart**（`moov` 排在 `mdat` 前面）—— 否则浏览器要**下完整个文件**
+  才起播，面格里先黑一阵。
+
+#### faststart：`scripts/mp4_faststart.py`（无损改容器，不重编码）
+
+`moov`（索引）在文件尾 = 浏览器必须先把整个文件拉完才知道怎么播。本机
+**没有 ffmpeg**（也没有 ffprobe / PIL / cairosvg），所以这个脚本是纯
+Python 实现：搬 box（`ftyp` → `moov` → `mdat`）+ 修偏移表。
+
+搬 `moov` 会让 `mdat` 的载荷整体后移 `delta` 字节，于是 `stbl` 里
+`stco`（32-bit）/ `co64`（64-bit）的**绝对偏移**必须跟着加 `delta` ——
+漏了就是「能播但画面是花的 / 直接解不出帧」。脚本**只改容器**，像素数据
+一个字节都不动，落地前会**逐帧哈希比对**（OpenCV 解码，改写前后必须
+逐帧一致）才替换原文件。
+
+出现 `sidx` / `saio` / `iloc` / `mfra` 这类本脚本不理解的偏移机制时，
+**拒绝处理**并报错 —— 那些表的语义不同，瞎改会得到「能播但坏」的文件。
+
+```bash
+.venv/bin/python scripts/mp4_faststart.py --check <mp4>...   # 只体检
+.venv/bin/python scripts/mp4_faststart.py --fix  <mp4>...    # 就地改写
+```
+
+> 本机曾有两张卡的素材是 `moov` 在尾：`tts`（`wdnapps-audio-chat` 仓）
+> 与 `video-target-localization`。已用该脚本改成 faststart —— 改写后
+> 视频轨 73 个样本、音频轨 97 个样本**逐字节哈希不变**。
+
+回归：`scripts/verify_app_panel_preview.py` —— 对**所有**声明了
+`preview_video` 的卡断言：文件在磁盘上存在且是**合法且 faststart 的**
+mp4 → HTTP 200 + `Content-Type: video/*` → 浏览器里那张 `<video>`
+解出画面（`videoWidth > 0`）、**在动**（`currentTime` 推进，注意 loop
+短视频会回卷）、且画到 canvas 上**不是黑屏**（只看 DOM 存在红不了
+黑屏/不播）。
+
+```bash
+.venv/bin/python scripts/verify_app_panel_preview.py            # 默认打 8000
+.venv/bin/python scripts/verify_app_panel_preview.py --base http://127.0.0.1:8000
+```
+
+### favicon：`/favicon.ico` 的 404
+
+页面没声明图标时，浏览器会**默认去请求 `/favicon.ico`** —— 根路径本来没
+这个文件，于是每次访问都留一条 404（console 里是一条 `Failed to load
+resource`，access log 里是一条 404）。
+
+修法两处，缺一不可：
+
+* `app/static/index.html.template` 的 `<head>` 里声明图标（**下次刷新就
+  生效**，因为 `/` 每次请求都重新拼 HTML）：
+  ```html
+  <link rel="icon" href="/static/core/favicon.ico" sizes="32x32" />
+  <link rel="icon" href="/static/core/favicon.svg" type="image/svg+xml" />
+  ```
+  ICO 在前、SVG 在后：认 SVG 的浏览器（Chrome / Edge / Firefox）用 SVG，
+  不认的（Safari / iOS）自动退回 ICO。
+* `app/main.py` 里加一条 `/favicon.ico` 路由兜底（Safari / iOS / 书签
+  / 爬虫**即使页面声明了图标也可能直接请求根路径**）。**路由是启动时
+  注册的** → 这条要**重启服务**才生效；页面里那两条 `<link>` 不用重启。
+
+图标本体由 `scripts/make_favicon.py` 生成（SVG + 16/32/48 三档 ICO，
+**从同一份描述**产出，不会走样）：图形沿用侧栏「应用面板」那个
+`#i-app-list`（蓝底 + 三条横线 + 右端三点），底色取产品的 `--accent`
+`#2563eb`。本机没有 PIL / cairosvg，ICO 是 numpy + OpenCV 画 4 倍尺寸
+再降采样（抗锯齿），编成 PNG 后按 ICO 容器格式打包。
+
+```bash
+.venv/bin/python scripts/make_favicon.py     # 重新生成两个图标
+```
+
 ## 算力配置页卡「加载中」：两条根因（2026-11-03 实测）
 
 用户报「浏览器打开 `#compute-config` 一直卡在加载中」。**不是**模型缺失、
