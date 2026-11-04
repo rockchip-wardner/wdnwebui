@@ -1230,7 +1230,7 @@ app/apps/<card_id>/
 
 新增卡片示例(如加一个"图像 OCR"应用)有两条路：**内置卡** = `mkdir app/apps/ocr && 写 manifest.json + api.py + service.py + __init__.py + static/`；**插件卡** = 在某个插件包里加 `cards/ocr/`(同样一套文件)并在该包 `pyproject.toml` 的 `[project.entry-points."wdnwebui.cards"]` 注册 `"ocr" = "<包>.cards.ocr"` + `package-data`。两条路都**不动** `app/main.py` 或任何 core 模块。
 
-### 文生图卡（`media-generator`，插件卡形态的第一个实例）
+### 图片生成卡（`media-generator`，插件卡形态的第一个实例）
 
 插件包 `wdnapps_media_generator`（源码在 `.venv/src/wdnapps_media_generator/`）里的
 一张卡：**输入一段文字 → 生成并展示 512×512 图片**。后端是 Qwen-Image-2.1。
