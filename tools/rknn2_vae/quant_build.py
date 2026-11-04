@@ -133,8 +133,11 @@ def main():
         return 1
 
     t0 = time.perf_counter()
+    # quantize_weight=True 时即使 do_quantization=False 也要给校准集
+    # （权重量化要用数据来定 per-channel scale）。
+    _need_data = (not args.no_quant) or args.quantize_weight
     ret = rknn.build(do_quantization=not args.no_quant,
-                     dataset=None if args.no_quant else args.dataset,
+                     dataset=args.dataset if _need_data else None,
                      auto_hybrid=args.auto_hybrid)
     build_s = time.perf_counter() - t0
     if ret != 0:

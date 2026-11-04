@@ -1576,7 +1576,7 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
 ```
 卡0  0000:01:00.0 :  TE 常驻（486.0 MiB/核）+ 头（6.4 MiB/核）        [RKNN3/rk1820]
 卡1  0003:31:00.0 :  DiT 4 段（--share-internal，525.0 MiB/核）常驻   [RKNN3/rk1820]
-本机  RK3588 NPU   :  VAE 整图（rknn2，int8 混合量化）常驻，3 核全用  [RKNN2/本地]
+本机  RK3588 NPU   :  VAE 整图（rknn2，**纯 fp16**）常驻，3 核全用  [RKNN2/本地]
 ```
 
 ⇒ **DiT 全程常驻 ⇒ 生成过程零 model_init**（flow 每步都打「零 load / 零 model_init」）。
@@ -1603,10 +1603,33 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
   ⇒ **internal 3852 → 1980 MiB（-48.6%）**。手术脚本 `tools/rknn2_vae/to4d.py`。
 * **纯 w8a8 会彻底毁掉 VAE**（输出塌成平色，rel_L2 0.715）⇒ 必须
   `auto_hybrid`（阈值语义是「相似度」，越高 ⇒ 越多层留 fp16）。
-  逐层分析（`accuracy_analysis`，412 层）显示**单层误差最大的全是 `exNorm`
-  （GroupNorm）**，cosine 0.086~0.089 —— `auto_hybrid` 正是把它们留回 fp16。
   ⚠️ **换标定算法救不回来**：`normal` 0.715、`kl_divergence` 0.715（输出 std
   0.0140 vs 参考 0.5102 ⇒ 特征被压成常数）。
+* ⭐⭐⭐ **手动混合量化（文档正路）全流程实测 ⇒ 3588 上 int8 不可得**
+  （工具：`tools/rknn2_vae/hyb_{step1,cfg,step2}.py` + `hyb_run.sh`；
+  流程 = User_Guide 6.3.2 的三步：`hybrid_quantization_step1` → 手改
+  `<name>.quantization.cfg` 的 `custom_quantize_layers` → `hybrid_quantization_step2`）：
+
+  | 留 fp16 的张量数 | 119 模拟器 rel_L2 | cosine |
+  |---|---|---|
+  | 0（纯 int8 对照） | 0.714497 | 0.734726 |
+  | 2（最前面 2 个 conv） | 0.714207 | 0.735059 |
+  | 12（逐层分析挑的最差 12 层） | 0.714455 | 0.734555 |
+  | 36（**全部** exNorm/GroupNorm） | 0.714701 | 0.734399 |
+  | 200 | 0.232147 | 0.974974 |
+  | 300 | 0.102505 | 0.994799 |
+  | **403（全部可标记张量）** | **0.000831** | **1.000008** |
+
+  ⇒ **机制本身完全正常**（403 层 fp16 逐位复现纯 fp16），
+  **但精度损失沿全图弥散累积** ⇒ 前端留 fp16 没用、**全部 GroupNorm 留 fp16
+  也没用** ⇒ **3588 上不存在「可用的 int8 VAE 解码器」**。
+  ⚠️ 顺带**证伪**了「量化毁在 GroupNorm 上」这条旧结论（单层误差最大确实是
+  GroupNorm，但把它们全留回 fp16 对端到端精度毫无改善）。
+* ⭐⭐ **平台硬限制：3588 上没有「int8 权重 + fp16 激活」档位** ——
+  `quantized_dtype='w8a16'` / `'w4a16'` 均被拒（`not support in 'rk3588'`），
+  而 `config(quantize_weight=True)`（配 `do_quantization=False`）**内部就是设
+  `w8a16`** ⇒ 同样被拒。`w16a16i_dfp` 配置层放行但那是 int16 NPU 档、权重 16bit
+  ⇒ 无体积收益。**唯一可用的量化档位就是 `w8a8`**。
 * **阈值扫描（出货件 = 0.9999）**：
 
   | cos_thresh | internal | weight | 合计 | 模拟器 rel_L2 | cosine |
@@ -1617,9 +1640,12 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
 
   ⇒ 0.9995→0.9999 有明显拐点，直接跳到 fp16 水平。
   **手术之后内存不再是约束 ⇒ 精度可以白拿**。
-* ⚠️ 诚实说明：0.9999 内部**几乎全是 fp16**（weight 487 MiB 与纯 fp16 一样，
-  输入张量也报 float16）；真正的全 int8 权重那份（纯 w8a8）只有 242~244 MiB，
-  但精度塌陷。`auto_hybrid` 是**混合**量化。
+* ⚠️ **诚实说明：0.9999 出来的就是纯 fp16 图** ——
+  逐算子表实测 **268/268 全 FLOAT16、零个 int8**（`auto_hybrid 0.9995` 才有
+  8 个 int8 算子：输入 + 前两个 conv + 2 个 exNorm + 3 个转换节点，
+  那 8 个就把精度从 8.3e-4 拉到 0.0343）。
+  **别把它叫「int8 混合量化」** —— 它是 fp16 图。
+  真正的全 int8 权重那份（纯 w8a8）只有 242~244 MiB，但精度塌陷。
 * 板端实测（出货件）：init 1.88 s、解码 9.5~9.9 s（3 核）、
   rel_L2 **0.0178823** / cosine **0.99984105**（追平纯 fp16 的 0.0179853）。
 * ⚠️ **板端 fp16 与模拟器 fp16 也差 1.79%**（NPU 的 fp16 kernel vs 模拟器用

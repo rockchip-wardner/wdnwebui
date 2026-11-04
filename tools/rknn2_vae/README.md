@@ -16,6 +16,10 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）。
 | `to4d.py` | 119（转换服务器） | **ONNX 手术**：把 5D「通道族」张量换标签成 4D 友好排布（internal 内存 -48.6% 的关键） |
 | `quant_build.py` | 119 | 按 rknn-toolkit2 2.5.0 的 `config()`/`build()` 参数构建 + **模拟器对拍**（x86 上就能判精度，省得每次上板） |
 | `acc_analysis.py` | 119 | rknn-toolkit2 文档里的 `accuracy_analysis` —— **逐层**精度分析（哪几层量化误差大） |
+| `hyb_step1.py` | 119 | **混合量化第 ① 步**：生成 `.model` / `.data` / `.quantization.cfg`（文档 API 2.12.1） |
+| `hyb_cfg.py` | 119 | **混合量化第 ② 步**：文本级改写 cfg 的 `custom_quantize_layers`（不重排 quantize_parameters） |
+| `hyb_step2.py` | 119 | **混合量化第 ③ 步**：`hybrid_quantization_step2` → `export_rknn` → 模拟器对拍 |
+| `hyb_run.sh` | 119 | 一条命令跑一个混合量化变体（独立工作目录 + 独立 TMPDIR，可并发） |
 | `op_table.py` | 任意 | 解析构建日志里的**逐算子表** —— 统计 CPU 回落 / NPU 算力分配，并做核数标度拟合 |
 | `probe_vae4d.c` | 板子 | 板端探针：`rknn_init` + `rknn_run`（可指定核数）+ 与 ORT 参考对拍 rel_L2 / cosine |
 | `accept_vae2.sh` | 板子 | 探针对拍 → 部署进模型包 → 端到端出图（2 张，验证零 model_init） |
@@ -95,8 +99,8 @@ RESULT tag=c2_ah999 status=ok rel_L2=0.0350972 cosine=0.999389 build_s=1367
 > ⚠️ **纯 w8a8（不加 `--auto-hybrid`）会把 VAE 彻底毁掉**：
 > 输出塌成一片平色，模拟器 rel_L2 **0.715**（特征被 per-tensor int8 量化压垮）。
 > `auto_hybrid` 的阈值语义是「**相似度**」——越高 ⇒ 越多层判为敏感 ⇒ 留在 fp16。
-> 逐层分析（`accuracy_analysis`，412 层）显示**单层误差最大的全是 `exNorm`（GroupNorm）**
-> （单层 cosine 0.086~0.089），`auto_hybrid` 正是把它们留回 fp16 的那个机制。
+> ⚠️ **别把 auto_hybrid 0.9999 当成「int8 图」**：它的算子表 268/268 全是 FLOAT16，
+> **零个 int8**。它就是纯 fp16 图 —— 见 §3.4 的实测矩阵与平台硬限制。
 
 ### 3.3 逐层精度分析（回答「哪些层该留在 fp16」）
 
@@ -122,12 +126,90 @@ acc_acc1/simulator/            412 层 qnt 快照
 acc_acc1/map_name_to_file.txt
 ```
 
-**结论：单层误差最大的全是 `exNorm`（GroupNorm）** ——
+**单层误差最大的全是 `exNorm`（GroupNorm）** ——
 `mul_75_sw_sw` 单层 cosine **0.08939**、`add_64_rs_sw` **0.08702**、
 `mul_71_sw_sw` **0.08655**；其余层基本 **> 0.98**。
 
-⇒ **量化毁在 GroupNorm 上**，不是均匀地毁在所有层。
-这正是 `auto_hybrid` 能一把救回 0.715 → 0.035 的原因。
+> ⚠️ **这条结论后来被证伪了**，别照着它选层 —— 见 §3.4。
+> 单层误差最大的确实是 GroupNorm，但**把全部 36 个 GroupNorm 留回 fp16
+> 对端到端精度毫无改善**（0.714701 vs 纯 int8 的 0.714497）。
+> 真正的机制是**误差沿全图弥散累积**，不是集中在某几层。
+
+---
+
+## 3.4 ⭐⭐⭐ 手动混合量化：文档正路全流程实测（结论：3588 上 int8 不可得）
+
+按 rknn-toolkit2 文档的混合量化三步走
+（User_Guide 6.3.2 + API_Reference 2.12 + 官方 example `examples/functions/hybrid_quant/`）：
+
+```
+① rknn.hybrid_quantization_step1(dataset=...)   → <name>.model / .data / .quantization.cfg
+② 手改 <name>.quantization.cfg 的 custom_quantize_layers（指定哪些张量留 fp16）
+③ rknn.hybrid_quantization_step2(model_input=<name>.model, data_input=<name>.data,
+                                  model_quantization_cfg=<name>.quantization.cfg)
+   → rknn.export_rknn(...)
+```
+
+本仓库的工具：`hyb_step1.py`（①）、`hyb_cfg.py`（②，文本级改写 cfg）、
+`hyb_step2.py`（③）、`hyb_run.sh`（一条命令跑一个变体）。
+
+### 实测矩阵（C2 图，403 个可标记张量）
+
+| 留 fp16 的张量 | 模拟器 rel_L2 | cosine | 模型大小 |
+|---|---|---|---|
+| 0（纯 int8 对照） | 0.714497 | 0.734726 | 307 MB |
+| 2（最前面 2 个 conv） | 0.714207 | 0.735059 | — |
+| 12（逐层分析挑的最差 12 层）\* | 0.714455 | 0.734555 | 332 MB |
+| 36（**全部** exNorm/GroupNorm）\* | 0.714701 | 0.734399 | — |
+| 30（single_cos 最差的 30 层）\* | 0.714923 | 0.734099 | — |
+| 200 | 0.232147 | 0.974974 | — |
+| 403（**全部**） | **0.000831** | **1.000008** | 582 MB |
+
+\* 这三行跑在旧的 5D 图上（纯 int8 基线 0.71496，与 C2 的 0.714497 等价，可比）。
+
+### 结论
+
+1. **机制本身完全正常**：403 个张量全留 fp16 ⇒ rel_L2 **0.000831**、
+   cosine **1.000008**，与纯 fp16 / `auto_hybrid 0.9999` 逐位一致。
+2. **但精度损失是沿全图弥散累积的**：前端留 fp16 没用（0.7142 vs 0.7145）、
+   全部 GroupNorm 留 fp16 也没用（0.7147）。只有**几乎全部**留 fp16 才回到 fp16 水平。
+   ⇒ **rk3588 上不存在「可用的 int8 VAE 解码器」**。
+3. **出货件其实是 100% fp16**：`auto_hybrid` 阈值 0.9999 出来的算子表
+   **268/268 全是 FLOAT16、零个 int8**；阈值 0.9995 才有 8 个 int8 算子
+   （`InputOperator:latents` + `Conv:node_conv2d` + `Conv:node_conv2d_1`
+   + 2 个 exNorm + 3 个转换节点），而那 8 个就把精度从 0.00083 拉到 0.0343。
+   ⇒ 「auto_hybrid 混合量化」这个说法**容易被误读成「主要是 int8」**，
+   实际它是**纯 fp16 图**，只是靠 auto_hybrid 这条路径产出。
+
+### 平台硬限制：3588 上没有「int8 权重 + fp16 激活」这种档位
+
+| 想用的档位 | 结果 |
+|---|---|
+| `config(quantized_dtype='w8a16')` | ✘ `ValueError: The quantized_dtype = 'w8a16' not support in 'rk3588'!` |
+| `config(quantized_dtype='w4a16')` | ✘ 同上（`'w4a16' not support in 'rk3588'`） |
+| `config(quantize_weight=True)` + `build(do_quantization=False)` | ✘ **内部就是设 `quantized_dtype='w8a16'`**，同样被拒 |
+| `config(quantized_dtype='w16a16i_dfp')` | ✔ 配置层放行，但那是 int16 NPU 的档，权重 16bit ⇒ **没有体积收益** |
+
+⇒ **rk3588 上唯一可用的量化档位就是 `w8a8`**（8bit 权重 + 8bit 激活）。
+想「权重 int8、激活 fp16」只能被平台校验挡死。
+
+### 混合量化的三个工具链坑
+
+1. **`hybrid_quantization_step1(proposal=True)` 会崩** ——
+   `KeyError: 'add_2-rs'`。根因：工具链的优化规则 `fuse_two_reshape` 把
+   `add_2-rs` 这个节点删了，但量化映射表里还留着它 ⇒ 悬空引用（工具链自己的 bug）。
+   **绕法**：`proposal=False`（官方 example 也是这么用的），
+   然后自己按逐层分析手改 cfg。
+2. **`custom_quantize_layers` 的张量名在这张图上是「裸名」** ——
+   文档示例写的是 `Conv__350:0: float16`（带 `:0`），
+   这张图要写 `mul_71_sw_sw: float16`。
+   写成 `mul_71_sw_sw:0: float16` 会报
+   `ValueError: Invalid operands name 'mul_53_sw_sw:0' in custom_quantize_layers!`。
+3. **图输入 `latents` 不是合法操作数** —— 报
+   `Invalid operands name 'latents'`。
+   `custom_quantize_layers` 的键空间是「**算子输出**」，
+   而 `quantize_parameters` 的键空间是「激活张量 + 权重名」（两者不同域）。
+   ⇒ **输入张量的精度在混合量化流程里改不了**。
 
 ---
 
@@ -271,3 +353,24 @@ B（固定开销）        = 7712 ms（57.2%）
 * **119 磁盘**：每构建一次往 `/tmp` 写 ~1.5 GB ⇒ 必须 `TMPDIR=/datasets/tmp/rknnbuild`；
   外置 .data 拷贝很慢 ⇒ 用**硬链接**。
 * **本机 `/tmp` 是 tmpfs 只有 3.9 GB** ⇒ 大模型要及时 `rm`。
+
+---
+
+## 7. 附：混合量化实验用的 fp16 名单（`fp16_*.txt`）
+
+`hyb_cfg.py --fp16-file <这些文件>` 用的候选名单，每行一个 tensor 名
+（`#` 后是注释）。全部取自 **C2 图**的 `vae512_c2.quantization.cfg`
+（439 个 key，其中 403 个是合法操作数、其余是 ONNX 风格的权重名）。
+
+| 文件 | 内容 | 实测 rel_L2 |
+|---|---|---|
+| `fp16_layers.txt` | 逐层分析挑的最差 12 层（含 7 个 GroupNorm） | 0.714455 |
+| `fp16_exnorm_all.txt` | **全部 36 个** exNorm/GroupNorm | 0.714701 |
+| `fp16_top30.txt` | single_cos 最差的 30 层 | 0.714923 |
+| `fp16_front.txt` | 最前面 2 个 conv（`conv2d` / `conv2d_1`） | 0.714207 |
+| `fp16_norm2.txt` | 0.9995 档里那 2 个 exNorm 的输出张量 | — |
+| `fp16_200.txt` / `fp16_300.txt` | 名单的前 200 / 300 个（扫精度-体积曲线） | 0.232147 / 0.102505 |
+| `fp16_tensors.txt` | **全部 403 个合法操作数** | **0.000831** ✅ |
+
+> `fp16_layers.txt` / `fp16_exnorm_all.txt` / `fp16_top30.txt` 三行跑在**旧的 5D 图**上
+> （纯 int8 基线 0.71496，与 C2 的 0.714497 等价，可比）。

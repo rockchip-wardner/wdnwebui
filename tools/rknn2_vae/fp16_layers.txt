@@ -1,0 +1,20 @@
+# 由 acc_acc1/error_analysis.txt 逐层分析得出（410 层，按 single cos 排序）
+# 格式：每行一个 tensor 名（# 开头是注释），交给 hyb_cfg.py --fp16-file
+#
+# 【A 组】exNorm(GroupNorm) —— 量化毁在这里，7 层 single_cos < 0.80
+mul_53_sw_sw            # 0.79568
+mul_57_sw_sw            # 0.20699
+mul_61_sw_sw            # 0.24945
+mul_67_sw_sw            # 0.11265
+mul_71_sw_sw            # 0.08655
+mul_75_sw_sw            # 0.08939
+add_64_rs_sw            # 0.08702
+#
+# 【B 组】非 exNorm 但同样退化 —— 5 层 single_cos < 0.89
+permute_11_rs           # 0.73313
+conv2d_29               # 0.73736
+conv2d_29_tile1_conv    # 0.82854
+add_43-rs               # 0.81456
+add_46-rs-rs            # 0.88052
+#
+# 合计 12 层留 fp16，其余全部 int8。
