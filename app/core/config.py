@@ -26,6 +26,11 @@ from typing import Any
 
 from app.core.compute.jsonc import dump_jsonc, parse_jsonc
 
+try:
+    import pwd as _pwd
+except ImportError:  # pragma: no cover — 非 POSIX
+    _pwd = None
+
 
 _DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "config.jsonc"
@@ -59,54 +64,84 @@ def _random_device_name() -> str:
     )
 
 
-# Models-root candidates in priority order.
-#   1. /userdata/models  — Rockchip device default (post-install layout)
-#   2. /mnt/oem/models   — factory pre-loaded boards that ship models
-#                          under the OEM partition instead of /userdata
-#   3. <HOME>/models     — last-resort fallback for off-device
-#                          deployments (dev workstation, CI, container
-#                          without either mount). <HOME> here is the
-#                          user's home **before** sudo (see
-#                          :func:`_user_home`).
-# The first candidate that is actually a directory wins. Operators are
-# expected to populate whichever root applies for their setup; this
-# helper does NOT auto-create the directory because creating an empty
-# ``models/`` tree without weights in it is just clutter.
+# Models-root candidates in priority order. The first one that actually
+# exists wins (see :func:`default_models_root`); this helper does NOT
+# auto-create the directory — an empty ``models/`` tree without weights
+# in it is just clutter.
 _MODEL_ROOT_CANDIDATES: tuple[Path, ...] = (
     Path("/userdata/models"),
     Path("/mnt/oem/models"),
 )
 
 
+def model_root_candidates(current_root: Path | str | None = None) -> list[Path]:
+    """模型根目录候选 —— 网页端「模型下载」的目录选择器用的就是这份清单。
+
+    顺序：
+
+    1. **当前配置的模型根**（``base.model_path``）—— 它是默认值，必须在
+       列表里，否则 operator 把模型路径改到 ``/data/models`` 时就没得选；
+    2. ``/userdata/models``；
+    3. ``/mnt/oem/models``；
+    4. ``<HOME>/models``（``<HOME>`` = 操作员家目录，见 :func:`_user_home`）。
+
+    ⚠️ 这份清单必须和基础配置里「RKNN 模型权重存放的绝对路径」那段说明
+    文字**同源**，否则用户在下载框里选的目录和配置里写的探测顺序对不上。
+    """
+    out: list[Path] = []
+    if current_root:
+        p = Path(current_root)
+        if p not in out:
+            out.append(p)
+    for cand in [*_MODEL_ROOT_CANDIDATES, _user_home() / "models"]:
+        if cand not in out:
+            out.append(cand)
+    return out
+
+
 def _user_home() -> Path:
-    """Return the HOME directory of the user **before** sudo.
+    """操作员（装机用户）的家目录。
 
-    ``Path.home()`` follows ``$HOME``, which under ``sudo`` typically
-    points at the target user (``/root`` when running ``sudo -H`` /
-    ``sudo -i``). That breaks the off-device fallback path:
-    ``<HOME>/models`` would land in ``/root/models`` instead of the
-    operator's actual home, even though they're the one who runs the
-    server (just elevated to root for emmc access).
+    ⚠️ **不能是 ``/root``** —— 服务（systemd ``wdnwebui.service``）以 root
+    跑，``$HOME=/root``，而 ``/root`` 通常在**小分区**上（根分区只有 14G）。
+    有些板子会把 ``/home`` 挂到固态硬盘 / 外接盘上，模型放那儿才对 ——
+    所以 ``<HOME>`` 的含义是 ``/home/<用户名>``，不是 ``$HOME``。
 
-    Detection: when ``SUDO_USER`` is set in env (set by sudo for the
-    duration of the elevated process), look up that user's home in
-    NSS via :func:`pwd.getpwnam`. Falls back to :meth:`Path.home` if
-    ``SUDO_USER`` is unset (no elevation) or the user can't be
-    resolved (rare, e.g. user deleted from /etc/passwd).
+    解析顺序（先准后粗）：
+
+    1. ``SUDO_USER`` —— sudo 之前的那个用户（手动 sudo 跑时最准）；
+    2. **装机目录的属主** —— 服务进程的 cwd（``WorkingDirectory``）归谁所有，
+       那人的家目录就是操作员的家目录。systemd 场景下最可靠
+       （``/home/<user>/work/wdnwebui`` 归 ``<user>`` 所有）；
+    3. 系统用户库里**唯一一个** uid≥1000 且家在 ``/home`` 下的用户；
+    4. 兜底 ``Path.home()``（实在认不出来时）。
 
     Cheap; called from :func:`default_models_root` and
     :func:`default_resource_root` once per config seed. No caching
     needed.
     """
+    if _pwd is None:
+        return Path.home()
+
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user:
         try:
-            import pwd as _pwd
             return Path(_pwd.getpwnam(sudo_user).pw_dir)
-        except (KeyError, ImportError):
-            # User no longer in NSS, or pwd module unavailable
-            # (Windows?). Either way, fall through to $HOME.
-            pass
+        except KeyError:
+            pass  # 用户已不在 NSS 里，继续往下找
+
+    try:
+        st = os.stat(os.getcwd())
+        if st.st_uid != 0:
+            return Path(_pwd.getpwuid(st.st_uid).pw_dir)
+    except (KeyError, OSError):
+        pass
+
+    # 系统用户库里唯一的「有家目录的普通用户」
+    cands = [p.pw_dir for p in _pwd.getpwall()
+             if 1000 <= p.pw_uid < 65534 and p.pw_dir.startswith("/home/")]
+    if len(cands) == 1:
+        return Path(cands[0])
     return Path.home()
 
 
@@ -118,9 +153,8 @@ def default_models_root() -> Path:
     appended by the caller (``default_base_paths``) so the result
     matches the historical JSON shape. Pure (no I/O beyond ``is_dir()``).
 
-    ``<HOME>`` is resolved via :func:`_user_home` — when running under
-    ``sudo``, that's the *original* user's home (``/home/<user>``),
-    not ``/root``.
+    ``<HOME>`` is resolved via :func:`_user_home` — the operator's home
+    (``/home/<user>``), not ``/root``.
     """
     for cand in _MODEL_ROOT_CANDIDATES:
         if cand.is_dir():

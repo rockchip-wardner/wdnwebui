@@ -5864,3 +5864,169 @@ body.dg-modal-open .back-home-btn {
   .vfa-frame-modal-body { grid-template-columns: 1fr; }
   .vfa-frame-modal-img-wrap { min-height: 220px; }
 }
+
+/* ===========================================================================
+ * 模型下载（算力配置页「本地算力」栏最后一张卡片 + 模型下载弹框）
+ * ========================================================================= */
+.cc-download-card {
+  /* 跟普通 service 卡片同底色，但边框用虚线 —— 它不是"某台算力上的模型"，
+     是个"工具入口"，视觉上要能一眼分开。 */
+  border-style: dashed;
+  background: #fbfcfe;
+}
+.cc-download-card .cc-service-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 16px;
+}
+.cc-download-badge {
+  margin-left: auto;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--muted);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cc-download-badge-active { color: var(--accent); border-color: var(--accent); }
+.cc-download-badge-ok     { color: #16a34a; border-color: #16a34a; }
+.cc-download-badge-err    { color: var(--danger); border-color: var(--danger); }
+.cc-download-desc {
+  font-size: 0.82rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.cc-download-idle { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+.cc-download-busy { display: flex; flex-direction: column; gap: 8px; }
+.cc-download-line {
+  font-size: 0.82rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cc-dl-muted { color: var(--muted); font-size: 0.75rem; font-family: var(--mono); }
+.cc-dl-bar {
+  height: 8px;
+  background: #e5e7eb;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.cc-dl-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+.cc-download-actions { display: flex; justify-content: flex-end; }
+
+/* ---------- 模型下载弹框 ---------- */
+.mdl-card { width: min(720px, 94vw); }
+.mdl-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+}
+.mdl-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 220px;
+  max-height: 56vh;
+}
+.mdl-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 0.8rem;
+  border-bottom: 1px solid #f3f4f6;
+  font-size: 0.85rem;
+}
+.mdl-row:hover { background: #f9fafb; }
+.mdl-row.done { background: #fcfcfd; }
+.mdl-row-main {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1 1 auto;
+  min-width: 0;
+  cursor: pointer;
+}
+.mdl-row.done .mdl-row-main { cursor: default; }
+.mdl-check { flex: 0 0 auto; }
+.mdl-name { font-weight: 600; color: var(--text); flex: 0 0 auto; }
+.mdl-repo {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mdl-meta {
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.mdl-badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  background: #fff;
+}
+.mdl-badge-done   { color: #16a34a; border-color: #16a34a; background: #f0fdf4; }
+.mdl-badge-local  { color: var(--muted); }
+.mdl-badge-remote { color: var(--accent); border-color: var(--accent); background: #eff6ff; }
+.mdl-foot { flex-wrap: wrap; }
+.mdl-dest-label { font-size: 0.82rem; color: var(--muted); flex: 0 0 auto; }
+/* 下载目录下拉框（3 选 1）。
+ * ⚠️ **不能设死宽度上限，也不能让它被 flex 挤扁** —— select 的收起态
+ * 会把选中的 option 文本**裁掉**（浏览器原生行为，scrollWidth 看不出来）。
+ * 实测最长的那条 `/home/rockchip/models（将自动创建）` 需要 229px，
+ * 而 265px 宽的 select 扣掉箭头和 padding 只剩 228px —— 差 1px 就被裁。
+ * 宽度交给内容（浏览器按最宽 option 定宽），不许 shrink，空间不够时
+ * 让 footer 换行（.mdl-foot 有 flex-wrap）。
+ */
+.mdl-dest-select {
+  flex: 0 0 auto;
+  max-width: 100%;
+  min-width: 8rem;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  padding: 0.35rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--text);
+}
+.mdl-dest-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+/* 「下载目录 ≠ 当前模型根」的警告行（挂在 footer 下面，独占一行） */
+.mdl-dest-warn {
+  padding: 0 0.9rem 0.7rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.mdl-warn { color: var(--danger) !important; }
+.mdl-empty, .mdl-error {
+  padding: 1.6rem 0.8rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.mdl-error { color: var(--danger); }

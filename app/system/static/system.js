@@ -60,6 +60,27 @@ function fmtBytes(mb) {
   return mb.toFixed(1) + " MB";
 }
 
+// 字节 → 可读体积（模型下载进度用；注意 fmtBytes 收的是 **MB**）
+function fmtSizeBytes(n) {
+  if (n == null) return "--";
+  const v = Number(n);
+  if (!isFinite(v)) return "--";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let x = v;
+  while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+  return (i === 0 ? x.toFixed(0) : x.toFixed(2)) + " " + units[i];
+}
+
+// 秒 → 可读时长
+function fmtDuration(sec) {
+  if (sec == null || !isFinite(sec) || sec < 0) return "--";
+  const s = Math.round(sec);
+  if (s < 60) return s + " 秒";
+  if (s < 3600) return Math.round(s / 60) + " 分钟";
+  return (s / 3600).toFixed(1) + " 小时";
+}
+
 function fmtNum(n, digits = 1) {
   if (n == null) return "--";
   return Number(n).toFixed(digits);
@@ -1851,6 +1872,12 @@ const ComputeConfigPage = {
   _loading: false,
   _selectedTarget: {},  // {model_id: [npu_index, ...]} —— 用户勾选的卡（可多张）
   _pendingModels: new Set(),  // 在飞的启停请求（model_id）—— 防连点
+  // 「已装 N/M」角标的数据源：/api/compute/model-repos 的清单（和下载弹框
+  // 同一个口径）。30s 刷新一次 —— 不能 1Hz 拉，那个端点要扫本地模型目录。
+  _repoInv: null,
+  _repoInvAt: 0,
+  _repoInvFetching: false,
+  _dlHadActive: false,  // 上一 tick 是否有下载在跑 —— 用来发现「刚下载完」
 
   init() {
     if (this.initialized) return;
@@ -1922,9 +1949,21 @@ const ComputeConfigPage = {
       // 再高频轮询 —— 每次都会过 librknnsmi.so + libfastdds，3s 一
       // 次即可（v0.5 之前 fork rknn-smi 时它更扛不住，被砍到 3s）。
       const firstLoad = this._snapshot == null;
+      // 下载状态与 compute 快照**并行**拉 —— 进度要在卡片上实时动，
+      // 不能等 compute 回来再串行拉一次。
+      const dlPromise = fetch(API_PREFIX + "/compute/model-download/status", {
+        cache: "no-store",
+      }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      // 「已装 N/M」角标的数据源 —— 30s 节流（见 _maybeFetchRepoInv）。
+      // **不 await**：首次调用要访问镜像，可能几秒，不能拖慢 1Hz tick。
+      this._maybeFetchRepoInv().then((j) => {
+        if (j) this._updateDownloadCard();
+      });
       const rComp = await fetchCompute();
       if (!rComp.ok) throw new Error("compute HTTP " + rComp.status);
       this._snapshot = await rComp.json();
+      const dl = await dlPromise;
+      if (dl) this._downloadStatus = dl;
       this._systemTickCount = (this._systemTickCount || 0) + 1;
       if (firstLoad || this._systemTickCount % 3 === 0) {
         // 每 3 个 compute tick（约 3s）刷新一次 system-monitor，
@@ -2482,18 +2521,28 @@ const ComputeConfigPage = {
     const services = rawServices;
 
     if (!services.length) {
-      const empty = document.createElement("div");
-      empty.className = "cc-services-empty";
       // 空列表现在的含义变了：worker manifest 随模型文件夹一起分发，
       // 所以「一张卡都没有」= **本板一个模型都没装**（而不是「manifest
       // 没声明」）。文案要说清楚下一步做什么。
+      // 复用同一个空态节点 —— 原来每次 tick 新建一个并 append，
+      // DOM 会无限增长（本板一个模型都没装时，1Hz × N 个空 div）。
+      const empty = this._emptyNode
+        || (this._emptyNode = document.createElement("div"));
+      empty.className = "cc-services-empty";
       empty.innerHTML = "本板尚未安装任何模型 —— worker 配置随模型文件夹一起分发，"
         + "把模型文件夹放到模型根目录（"
         + "<code>"
         + (snap.models_root || "（见基础配置的模型路径）")
-        + "</code>）后点「刷新模型」。";
-      localRoot.appendChild(empty);
+        + "</code>）后点「刷新模型」，或点下方「模型下载」卡片直接拉取。";
+      if (empty.parentNode !== localRoot) localRoot.appendChild(empty);
+      // 本板一个模型都没装时，**「模型下载」卡片是唯一的安装入口** ——
+      // 所以这条分支也必须把它渲染出来。
+      this._appendDownloadCard(localRoot);
       return;
+    }
+    // 有模型了 —— 空态节点摘掉
+    if (this._emptyNode && this._emptyNode.parentNode) {
+      this._emptyNode.remove();
     }
 
     // 按 snapshot.preset_order 排序（= manifest 的 display_order 升序），
@@ -2734,6 +2783,11 @@ const ComputeConfigPage = {
       }
     }
 
+    // 「模型下载」卡片：固定排在**本地栏最后一张模型卡片之后**。
+    // 必须**在下面那段排序之前**把它塞进 newOrder —— 排序循环消费完
+    // newOrder 才跑，事后 push 等于没插进 DOM（卡片永远不出现）。
+    this._appendDownloadCard(localRoot, newOrder);
+
     // 按 ordered 顺序把卡片放到对应 container 的正确位置（不 detach
     // 已存在的）。insertBefore + nextSibling 比较：已在正确位置则不动
     // （focus / select dropdown 保留），否则只移动一次。
@@ -2774,6 +2828,246 @@ const ComputeConfigPage = {
       const hasFrames = peerFrameOrder.length > 0;
       peerEmpty.classList.toggle("hidden", hasFrames);
     }
+  },
+
+  // ---------- 「模型下载」卡片 --------------------------------------------
+  //
+  // 需求：本地算力栏的最后一张模型卡片**后面**多一张下载卡片；点它弹出
+  // 模型下载框；有下载任务时卡片上显示进度。
+  //
+  // 节点只创建一次并复用（1Hz tick 不重建它）—— 否则进度条每 tick 重建，
+  // 动画/滚动位置全丢。
+  _appendDownloadCard(container, newOrder) {
+    if (!this._downloadCard) this._downloadCard = this._makeDownloadCard();
+    const card = this._downloadCard;
+    if (newOrder) {
+      // 作为本地栏的**最后一项**参与排序
+      newOrder.push({ model_id: "__model_download__", container, card });
+    } else if (card.parentNode !== container) {
+      container.appendChild(card);
+    }
+    this._updateDownloadCard();
+    return card;
+  },
+
+  _makeDownloadCard() {
+    const card = document.createElement("article");
+    card.className = "cc-service-card cc-download-card";
+    card.id = "cc-download-card";
+    card.innerHTML = `
+      <header class="cc-service-head">
+        <h3 class="cc-service-title">模型下载</h3>
+        <span class="cc-download-badge" id="cc-dl-badge"></span>
+      </header>
+      <div class="cc-service-body">
+        <div class="cc-download-idle" id="cc-dl-idle">
+          <div class="cc-download-desc">从 HuggingFace 把 wardner 的模型仓库拉到本板</div>
+          <div class="cc-download-line cc-dl-muted hidden" id="cc-dl-last"></div>
+          <button class="vd-btn vd-btn-primary" id="cc-dl-open" type="button">打开模型下载</button>
+        </div>
+        <div class="cc-download-busy hidden" id="cc-dl-busy">
+          <div class="cc-download-line" id="cc-dl-line1"></div>
+          <div class="cc-dl-bar"><div class="cc-dl-bar-fill" id="cc-dl-fill"></div></div>
+          <div class="cc-download-line cc-dl-muted" id="cc-dl-line2"></div>
+          <div class="cc-download-actions">
+            <button class="vd-btn" id="cc-dl-cancel" type="button">取消下载</button>
+          </div>
+        </div>
+      </div>`;
+    const openBtn = card.querySelector("#cc-dl-open");
+    if (openBtn) {
+      openBtn.addEventListener("click", () => {
+        if (window.ModelDownloadModal) window.ModelDownloadModal.open();
+      });
+    }
+    const cancelBtn = card.querySelector("#cc-dl-cancel");
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", () => this._cancelDownload());
+    }
+    return card;
+  },
+
+  _updateDownloadCard() {
+    const card = this._downloadCard;
+    if (!card) return;
+    const st = this._downloadStatus || {};
+    const active = st.active || null;
+    const idle = card.querySelector("#cc-dl-idle");
+    const busy = card.querySelector("#cc-dl-busy");
+    const badge = card.querySelector("#cc-dl-badge");
+    const line1 = card.querySelector("#cc-dl-line1");
+    const line2 = card.querySelector("#cc-dl-line2");
+    const lastLine = card.querySelector("#cc-dl-last");
+    const fill = card.querySelector("#cc-dl-fill");
+    const cancelBtn = card.querySelector("#cc-dl-cancel");
+
+    // ---- 库存：已装 N/M ----
+    // 角标报的是**真实库存**，不是「上一次下载任务的结果」—— 后者会撒谎：
+    // 任务流水在服务进程内存里，用户把模型目录删了，流水照样留着
+    // state=done，角标就永远绿着「已安装」，而板上那个模型早没了。
+    // N/M 用 /api/compute/model-repos（和下载弹框同一个口径）：
+    // 分子 = 远端清单里且本板已装的个数，分母 = 远端仓库总数。
+    // 本地自有模型（local_only）不计入 —— 它不在远端清单里。
+    const inv = this._repoInv;
+    const models = (inv && inv.models) || [];
+    const remote = models.filter((m) => m.repo_id);
+    const installedCount = remote.filter((m) => m.installed).length;
+    const remoteTotal = remote.length;
+    const invKnown = remoteTotal > 0;
+    const invTitle = invKnown
+      ? `本板已安装 ${installedCount} 个 / 远端共 ${remoteTotal} 个 wardner 仓库`
+      : "";
+
+    // 最近一次**终态**任务。history 按 finished_at 倒序 → [0] 就是最近那次。
+    // ⚠️ 不要用 `history.find(h => h.state === "done")` —— 只要历史里
+    // 有一条 done，绿色分支就短路，红色「失败」永远轮不到（死代码）。
+    const history = st.history || [];
+    const lastJob = history[0] || null;
+
+    // 下载刚结束 → 强制刷一次库存计数（否则要等 30s 才更新）
+    const hadActive = !!this._dlHadActive;
+    this._dlHadActive = !!active;
+    if (hadActive && !active) {
+      this._maybeFetchRepoInv(true).then((j) => {
+        if (j) this._updateDownloadCard();
+      });
+    }
+
+    if (active) {
+      if (idle) idle.classList.add("hidden");
+      if (busy) busy.classList.remove("hidden");
+      if (badge) {
+        badge.textContent = active.name || active.repo || "";
+        badge.title = active.repo || "";
+        badge.className = "cc-download-badge cc-download-badge-active";
+      }
+      const done = active.bytes_done || 0;
+      const total = active.bytes_total || 0;
+      const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+      if (fill) fill.style.width = pct.toFixed(1) + "%";
+      if (line1) {
+        line1.textContent = `${active.name || active.repo} · `
+          + `${fmtSizeBytes(done)} / ${fmtSizeBytes(total)}`;
+      }
+      const speed = active.speed_bps || 0;
+      const eta = active.eta_seconds;
+      const parts = [];
+      if (speed > 1024) parts.push(`${fmtSizeBytes(speed)}/s`);
+      if (eta != null) parts.push(`剩余约 ${fmtDuration(eta)}`);
+      if (active.current_file) parts.push(active.current_file);
+      if (active.notice) parts.push(active.notice);
+      if (line2) {
+        line2.textContent = parts.join(" · ");
+        line2.title = parts.join(" · ");
+      }
+      if (cancelBtn) cancelBtn.disabled = false;
+      return;
+    }
+
+    // 空闲态
+    if (idle) idle.classList.remove("hidden");
+    if (busy) busy.classList.add("hidden");
+    if (badge) {
+      if (lastJob && lastJob.state === "failed") {
+        // 最近一次下载失败了 —— 这是**任务**事实，不是库存事实，
+        // 所以不覆盖库存计数之外的任何信息（标题里仍然带上库存）。
+        badge.textContent = "✗ 下载失败";
+        badge.title = (lastJob.error || "下载失败")
+          + (invTitle ? "\n" + invTitle : "");
+        badge.className = "cc-download-badge cc-download-badge-err";
+      } else if (invKnown) {
+        badge.textContent = `已装 ${installedCount}/${remoteTotal}`;
+        badge.title = invTitle;
+        // 全装齐了才是绿的；没齐保持中性，不给「差一点」的误导性绿灯
+        badge.className = "cc-download-badge"
+          + (installedCount === remoteTotal ? " cc-download-badge-ok" : "");
+      } else {
+        badge.textContent = "";
+        badge.title = "";
+        badge.className = "cc-download-badge";
+      }
+    }
+
+    // 卡片正文：**只保留异常信息**。
+    // 成功的下载流水（"上次：X 下载完成 · <path>"）是**操作流水**不是
+    // **当前状态** —— 模型目录被用户删了它也照样留着，对用户没有价值；
+    // 库存已由角标「已装 N/M」表达，正文再写一遍「本板已装 8/8」纯属重复。
+    // 所以这里只在**失败 / 取消**时给一行，正常态整行隐藏。
+    if (lastLine) {
+      let txt = "";
+      let tip = "";
+      if (lastJob) {
+        if (lastJob.state === "failed") {
+          txt = `上次：${lastJob.name} 下载失败`
+            + (lastJob.error ? ` · ${lastJob.error}` : "");
+          tip = txt;
+        } else if (lastJob.state === "cancelled") {
+          txt = `上次：${lastJob.name} 已取消`;
+          tip = txt;
+        }
+      }
+      lastLine.textContent = txt;
+      lastLine.title = tip;
+      lastLine.classList.toggle("hidden", !txt);
+    }
+    if (fill) fill.style.width = "0%";
+  },
+
+  // 拉远端仓库清单（算「已装 N/M」用）。30s 节流；force=true 时立刻拉。
+  // 不 await 它 —— 首次调用可能要几秒（镜像 tree API 慢），不能拖慢 1Hz tick。
+  _maybeFetchRepoInv(force) {
+    const now = Date.now();
+    if (!force && now - (this._repoInvAt || 0) < 30000) {
+      return Promise.resolve(this._repoInv);
+    }
+    if (this._repoInvFetching) return Promise.resolve(this._repoInv);
+    this._repoInvFetching = true;
+    return fetch(API_PREFIX + "/compute/model-repos", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j) this._repoInv = j;
+        return j;
+      })
+      .catch(() => null)
+      .finally(() => {
+        // 成功失败都记时间 —— 端点挂了就别 1Hz  hammer 它
+        this._repoInvAt = Date.now();
+        this._repoInvFetching = false;
+      });
+  },
+
+  // 下载弹框推清单过来 —— 弹框一打开，卡片上的计数立刻同步，
+  // 不用等下一次 30s 轮询。
+  setRepoInventory(inv) {
+    if (!inv) return;
+    this._repoInv = inv;
+    this._repoInvAt = Date.now();
+    this._updateDownloadCard();
+  },
+
+  async _cancelDownload() {
+    const st = this._downloadStatus || {};
+    const active = st.active;
+    if (!active || !active.id) return;
+    try {
+      const r = await fetch(API_PREFIX + "/compute/model-download/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: active.id }),
+      });
+      if (!r.ok) {
+        const detail = await r.text().catch(() => "");
+        console.warn("取消下载失败:", detail || r.status);
+      }
+    } catch (e) {
+      console.warn("取消下载失败:", e.message);
+    }
+    await this.load();
+  },
+
+  // 弹框提交完下载请求后回调：立刻拉一次快照，卡片马上进入进度态。
+  onDownloadStarted() {
+    this.load();
   },
 
   // 本机 worker —— spawned（本次启动由 Popen 起的）或 adopted_local
@@ -3998,5 +4292,9 @@ if (typeof fetchVersion === "function") fetchVersion();
 // Sidebar 底栏 popover 互相排他(TTS 卡片需要引用)—— TTS 在 defer 加载后
 // 找到 ``window.SystemMenus`` 即把三菜单的 .open() wrap 上 "打开前先关别人"。
 window.SystemMenus = { PowerMenu, ConfigMenu, CoprocessorMenu };
+
+// 「模型下载」弹框（app/static/core/model-download-modal.js）提交完下载
+// 请求后要立刻拉一次快照，让卡片进入进度态 —— 它通过 window 回调这里。
+window.ComputeConfigPage = ComputeConfigPage;
 
 })();

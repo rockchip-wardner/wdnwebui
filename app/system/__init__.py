@@ -27,6 +27,7 @@ def register_all(app: FastAPI) -> None:
         coprocessor,
         fs_browser,
         im_bridge,
+        model_download,
         power,
         system_logs,
         system_monitor,
@@ -35,6 +36,7 @@ def register_all(app: FastAPI) -> None:
     app.include_router(system_monitor.router, prefix="/api")
     app.include_router(system_logs.router,    prefix="/api")
     app.include_router(compute.router,        prefix="/api")
+    app.include_router(model_download.router, prefix="/api")
     app.include_router(config.router,         prefix="/api")
     app.include_router(power.router,          prefix="/api")
     app.include_router(coprocessor.router,    prefix="/api")
