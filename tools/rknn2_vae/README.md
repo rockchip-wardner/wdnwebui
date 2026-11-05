@@ -4,7 +4,8 @@ VAE 解码器跑在**本机 RK3588 的 NPU**（rknn2 / RKNN2 runtime 2.5.0），
 TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）。
 因为两者**物理分开**，DiT 可以全程常驻 ⇒ **生成过程零 model_init**。
 
-模型包里的成品是 `vae_qwenimage21-512.rknn2.rknn`（int8 混合量化，整图单模型）。
+模型包里的成品是 `vae_qwenimage21-512.3588.rknn`（**纯 fp16**，整图单模型；
+后缀 = 跑在哪块 SoC，与 DiT/TE 的 `.1828.rknn` 同一套规则）。
 这个目录放的是**怎么把它做出来**和**怎么验收它**。
 
 ---
@@ -277,7 +278,7 @@ g++ -O2 -std=c++14 -Iinclude -o /tmp/probe_vae4d \
 
 # 跑（参数：模型 输入 输出 [参考] [core_mask=7 ⇒ 3 核]）
 /tmp/probe_vae4d \
-    /home/rockchip/models/qwenimage21/vae_qwenimage21-512.rknn2.rknn \
+    /home/rockchip/models/qwenimage21/vae_qwenimage21-512.3588.rknn \
     /tmp/vae512_in_c2.bin /tmp/out.bin /tmp/vae512_ref.bin 7
 ```
 
@@ -311,32 +312,48 @@ rknn_run ret=0 (9557.7 ms)
 [qi] ⭐ VAE 走本机 rknn2（RK3588 NPU，1 段）⇒ DiT 全程常驻
 ```
 
-### ⭐ 兜底路径验收（模拟「板子没装 rknn2 runtime」）
+### ⭐⭐ 拓扑：只有两种合法布局，没有独占设备就 **fail fast**（2026-11-05）
 
-cshim 用 **dlopen** 加载 `librknnrt` ⇒ 没装 rknn2 的板子**照常工作**。
-实测方法：把模型包里的 rknn2 模型挪走，重启 worker：
+拓扑**由模型包里的文件名声明**，不是运行时猜：
+
+| 布局 | VAE 文件 | VAE 跑在哪 |
+|---|---|---|
+| **A：2×1828 + 3588** | `vae_qwenimage21-512.3588.rknn`（rknn2 整图） | **本机 RK3588 的 NPU**（3 核全用） |
+| **B：3×1828** | `vae_qwenimage21-512.seg{0..3}.1828.rknn`（rknn3 4 段） | **第三张 1828 卡**（独占） |
+
+两者都没有 ⇒ **`open` 阶段直接失败**（不再退回「VAE 与 DiT 共卡」那条慢路径 ——
+它要求每批图结束释放 DiT、下一批重建，**+39 s**）。
+全部模型在 open 阶段**一次装好并全程常驻**，推理过程中**不卸载/不重装载**。
+
+**fail-fast 实测**（把 rknn2 模型挪走模拟「板子没装 rknn2 runtime」）：
 
 ```bash
-mv /home/rockchip/models/qwenimage21/vae_qwenimage21-512.rknn2.rknn \
-   /home/rockchip/models/vae_rknn2_int8_C2.rknn.disabled
+mv /home/rockchip/models/qwenimage21/vae_qwenimage21-512.3588.rknn \
+   /home/rockchip/models/qwenimage21/.hidden_vae_3588.rknn
 # 重启 webui ⇒ worker 重新 load
 ```
 
 worker 日志应出现：
 
 ```
-[qi] ℹ️ 模型包里没有 rknn2 的 VAE ⇒ 用 rknn3 VAE 链（DiT 与 VAE 共卡）
+LLMSession init failed for qwenimage21 @ npu=0: RuntimeError: wdnai cshim 打开会话失败：
+VAE 没有可独占的 NPU 设备：模型包里既没有 vae_qwenimage21-512.3588.rknn（本机 3588 跑 rknn2），
+也没给第三张 1828 卡（跑 rknn3 的 4 段 VAE）。**不再退回「与 DiT 共卡」** —— 那会让每批图多 39 s 的 DiT 重建。
 ```
 
-进度流变成 `flow → release（释放 DiT）→ vae_init → vae 1/4..4/4 → save`
-⇒ **比 rknn2 路径多一次 DiT 释放**（批量出图时下一张要重建 DiT，+39 s）。
+⇒ 算力页上该实例 `capability_ready=false`，前端按钮禁用。
 
-**实测**：单张 43.59 s，出图内容正确 ✅。
-**跨路径对拍**：同提示词同潜变量，rknn2 路径 vs rknn3 路径端到端像素差
+⚠️ **这个检查必须放在 `open` 的最前面**（`api.cpp` 的「0.」段）：VAE 的可用性只取决于
+模型包里有没有那个文件 ⇒ 几个 `access()` 就够。放在 TE/DiT 加载**之后**的话，
+用户要**白等 2 分钟**（TE 37 s + DiT 60 s）才知道开不了工 ——
+实测：检查前 **125 s** 才失败，检查后 **4 s** 失败。
+
+⚠️ 记得把模型**放回去**，否则板子就一直开不了工。
+
+**跨路径对拍**（历史记录，2026-11-04 那版的共卡慢路径）：
+同提示词同潜变量，rknn2 路径 vs rknn3 路径端到端像素差
 **mean 1.315/255、p95 3.0、p99 5.0** ⇒ 两条独立量化路径实质一致
 （这是对 rknn2 路径的**独立佐证**，不是自证）。
-
-⚠️ 记得把模型**放回去**，否则板子就一直走慢路径了。
 
 ---
 

@@ -5,14 +5,14 @@
 #
 # 步骤:
 #   1) probe_vae4d：init + run(3核) + 与 ORT 参考对拍 rel_L2/cosine
-#   2) 备份模型包里现有的 vae_qwenimage21-512.rknn2.rknn，拷入新模型
+#   2) 备份模型包里现有的 vae_qwenimage21-512.3588.rknn，拷入新模型
 #   3) /tmp/e2e_qwenimage21.py 出 2 张图（验证零 model_init）
 set -u
 
 MODEL="${1:?用法: accept_vae2.sh <model.rknn> [tag]}"
 TAG="${2:-$(basename "$MODEL" .rknn)}"
 PKG=/home/rockchip/models/qwenimage21
-WHOLE="$PKG/vae_qwenimage21-512.rknn2.rknn"
+WHOLE="$PKG/vae_qwenimage21-512.3588.rknn"
 PROBE=/tmp/probe_vae4d
 IN=/tmp/vae512_in_c2.bin
 REF=/tmp/vae512_ref.bin

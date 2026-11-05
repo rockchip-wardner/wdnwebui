@@ -1545,7 +1545,9 @@ app/apps/<card_id>/
 ⭐ **VAE 跑在本机 RK3588 的 NPU 上**（rknn2 / RKNN2 runtime 2.5.0），
 TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
 ⇒ **DiT 全程常驻 ⇒ 生成过程零 model_init**。
-详见 §「图片生成卡 → VAE 走本机 rknn2 NPU」。
+拓扑**由模型包的文件名声明**（只有「2×1828+3588」和「3×1828」两种布局），
+**没有独占设备就在 open 阶段 fail fast**，推理过程中**不卸载/不重装载**任何模型。
+详见 §「图片生成卡 → VAE 走本机 rknn2 NPU」与 §「拓扑重构」。
 
 #### 装配清单（少任何一条都表现为「卡片能开但不出图 / 出不了图」）
 
@@ -1585,14 +1587,19 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
 `api.cpp::find_vae2_models`）：
 
 * **dlopen** `librknnrt.so.2.5.0`（不是链接）⇒ 没装 rknn2 runtime 的板子
-  **照常编译运行**，自动退回 rknn3 的 VAE 链（行为与改造前一致）。
+  **照常编译运行**（不会因为缺 so 而编不过）。
+  ⚠️ 但**不再自动退回 rknn3 的共卡慢路径** —— 现在是 **open 阶段直接失败**
+  并说清「本机 3588 的 NPU 跑不了这个 VAE；请检查 rknn2-runtime 是否装好」。
+  要走 rknn3 就走**布局 B**（第三张 1828 卡 + `.seg{0..3}.1828.rknn`）。
 * `core_mask=0_1_2` ⇒ **本机 3 个 NPU 核全用**（板端实测 1/2/3 核
   = 13490.7 / 10601.4 / 9872.4 ms ⇒ 3 核比 1 核快 **26.8%**，
   且三种核数下数值**逐位相同**）。
-* 模型名：`vae_qwenimage21-512.rknn2.rknn`（整图，优先），
-  没有就找 `vae_qwenimage21-512.rknn2.seg{0..7}.rknn`（分段流式）。
-* 整图装不下 ⇒ **必须返回失败让调用方退回 rknn3**（分段流式在这里毫无意义：
-  流式只是把 init 推迟到解码那一刻，那一刻**同样装不下**）。
+* 模型名：`vae_qwenimage21-512.3588.rknn`（整图，优先；后缀 = 跑在哪块 SoC，
+  与 DiT/TE 的 `.1828.rknn` 同一套规则）。旧名 `vae_qwenimage21-512.rknn2.rknn`
+  仍兼容；没有整图就找 `vae_qwenimage21-512.seg{0..7}.3588.rknn`（分段流式）。
+* 整图装不下 ⇒ **必须返回失败**（分段流式在这里毫无意义：流式只是把 init
+  推迟到解码那一刻，那一刻**同样装不下**）。
+  ⚠️ 失败**不会**再「退回 rknn3」—— 布局是**模型包说了算**，不是运行时猜。
 
 **量化侧**（在 119 转换服务器做，板端无法转换）：
 
@@ -1666,10 +1673,17 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
 `fixed_noise=true` 同提示词两次独立请求 ⇒ PNG **逐字节相同**（md5 `2e9251f0…`）
 ⇒ 可当回归基线用。两张图之间 VAE 段 9481 → 9747 ms ⇒ **零 model_init**。
 
-**rknn3 兜底路径实测**（把 rknn2 模型挪走模拟「板子没装 rknn2 runtime」）：
-`[qi] ℹ️ 模型包里没有 rknn2 的 VAE ⇒ 用 rknn3 VAE 链` ⇒ 进度流
-flow → **release（释放 DiT）** → vae_init → vae 1/4..4/4 → save ⇒
-单张 43.59 s，**出图内容正确** ✅ ⇒ 没装 rknn2 的板子照常工作。
+**⚠️ 旧的「rknn3 兜底路径」已删除**（2026-11-05 拓扑重构）：把 rknn2 的 VAE
+挪走**不再**退回 rknn3 的共卡慢路径，而是 **open 阶段 fail fast**：
+
+```
+LLMSession init failed for qwenimage21 @ npu=0: RuntimeError: wdnai cshim 打开会话失败：
+VAE 没有可独占的 NPU 设备：模型包里既没有 vae_qwenimage21-512.3588.rknn（本机 3588 跑 rknn2），
+也没给第三张 1828 卡（跑 rknn3 的 4 段 VAE）。**不再退回「与 DiT 共卡」** —— 那会让每批图多 39 s 的 DiT 重建。
+```
+
+⇒ 算力页上该实例 `capability_ready=false`，前端按钮禁用。
+板端实测（藏起 `.3588.rknn`）：**4 s 内失败、零模型加载日志**。
 
 **⭐ 跨路径交叉验证**：同提示词同潜变量，rknn2 路径（3588/auto_hybrid/整图）
 与 rknn3 路径（1828/w4a16/4 段）端到端像素差 **mean 1.315/255、p99 = 5**
@@ -1731,6 +1745,87 @@ A 从 2781 ms **翻倍**到 5779 ms。
    ⇒ 验证脚本：`scripts/test_infer_timeout.py`（不碰 NPU）。
    ⛔ 新增 manifest 字段时记得同步 `workers/__init__.py` 的 `known` 集合
    （决定哪些键会掉进 `extra`）。
+
+#### ⭐⭐ 拓扑重构：两种固定布局，**推理过程中不卸载/不重装载**（2026-11-05）
+
+**旧行为**（2026-11-04 之前）：模型包里有 rknn2 的 VAE 就走 3588，没有就**自动退回**
+rknn3 的 4 段 VAE 链 —— 而 rknn3 的 VAE 与 DiT **物理上不能共卡**
+（VAE 4 段 internal 合计 1471.2 MiB/核 > 池 639.5 MiB）⇒ 每批图跑完**释放 DiT**、
+下一批重新 init（**+39 s**），进度流里会看到 `release → vae_init → vae 1/4..4/4`。
+「运行时调度」= 每次推理都得判断当前哪块卡空着。
+
+**现在**：拓扑由**模型包里的文件名**声明，**只有两种合法布局**，
+全部模型在 `open` 阶段**一次装好并全程常驻**：
+
+| 布局 | 模型包里的 VAE 文件 | VAE 跑在哪 | DiT 跑在哪 |
+|---|---|---|---|
+| **A：2×1828 + 3588** | `vae_qwenimage21-512.3588.rknn`（rknn2 整图） | **本机 RK3588 的 NPU**（3 核全用） | 卡1（1828） |
+| **B：3×1828** | `vae_qwenimage21-512.seg{0..3}.1828.rknn`（rknn3 4 段） | **第三张 1828 卡**（独占） | 卡1（1828） |
+
+* 布局 A 由 `api.cpp::find_vae2_models()` 命中 `.3588.rknn` 决定；
+  布局 B 由 `card_vae`（第三张卡 BDF）非空 + 4 个 `.seg{0..3}.1828.rknn` 都在决定。
+* **两者都没有 ⇒ `open` 直接失败**（不再退回共卡慢路径），错误信息是中文的、
+  说清楚缺什么（见上面「旧的 rknn3 兜底路径已删除」）。
+* `generate_batch` 里**删掉了** `s->dit.release()` 与「释放后重建 DiT」的分支，
+  改成**常驻断言**：`dit_ready` / (`vae2_ready` || `vae_ready`) 为假 ⇒ 直接报错，
+  **拒绝推理中重建模型**。
+* C 入口从 `qi_qwen_open_ex2` 扩成 **`qi_qwen_open_ex3`**（多一个 `card_vae`）；
+  `ex2` 保留成 wrapper（`card_vae=""` ⇒ 只能走布局 A）。
+
+**fail-fast 的检查必须放在 `open` 的最前面**（`api.cpp` 的「0.」段）：
+VAE 的可用性只取决于「模型包里有没有那个文件」⇒ 几个 `access()` 就够。
+⚠️ 若把检查放在 TE/DiT 加载**之后**，用户要**白等 2 分钟**（TE 37 s + DiT 60 s）
+才知道开不了工 —— 板端实测：检查前 **125 s** 才失败，检查后 **4 s** 失败。
+
+**卡分配不再硬编码**（`backends/image.py::_ep_card_ids()`）：
+用 `RKNN3Lite().get_devices_id()` 枚举本机 EP 协卡，只留 **PCI BDF 形态**
+（`^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d+$`；USB 序列号形态的 RGA/VPU 设备
+**跑不了 rknn 模型**），按 BDF 升序：`[0]` = TE + 头、`[1]` = DiT 4 段、
+`[2]` = VAE(rknn3) 独占第三张卡。枚举失败才退回硬编码兜底
+（`0000:01:00.0` / `0003:31:00.0`）。
+⇒ **3 卡板子不用改代码**。本板实测枚举 = `['0000:01:00.0','0003:31:00.0']`
+（与原硬编码一致）。
+
+**验收（2026-11-05，板端实机，重构后）**：
+连续两张 8 步图 **各 36.57 s**（cshim 内 33.5 s）、**真实 `model_init` 次数 = 0**
+（worker 日志里 28 处 "model_init" 全是「零 load / 零 model_init」横幅里的字样）；
+20 步 70.07 s。PNG md5 `240286b5a7a494f01e7231e66ef265a2` —— 与**重构前**的
+历史基线**逐字节相同** ⇒ 拓扑重构没有改变数值行为。
+
+#### ⚠️ ctypes 的 `restype` 必须显式声明（踩过的坑）
+
+新增 C 入口 `qi_qwen_open_ex3` 时**忘了**在 `_qwen_image_c.py` 里写
+`lib.qi_qwen_open_ex3.restype = ctypes.c_void_p` ⇒ ctypes 默认 `restype=c_int`
+⇒ **64 位会话指针被截断成 32 位**。
+
+症状极有欺骗性：
+
+* `open` 阶段**看起来完全正常**（C 侧把模型全加载完、打印
+  「VAE 走本机 rknn2 ⇒ DiT 全程常驻」、worker 报 ready）；
+* 一直到**第一次推理**才 **SIGSEGV**（`/proc/<pid>/stat` 的 exit_code = 11）
+  —— 因为 `generate_batch` 拿到的是**截断过的指针**，一解引用就炸；
+* worker 变成僵尸（`<defunct>`），**日志里一行新东西都没有**（见下一节）。
+
+⇒ **凡是通过 ctypes 调 C 入口，一律显式写 `restype` + `argtypes`**；
+新增 C 符号后第一件事是 `nm -D --defined-only lib*.so | grep <新符号>` 确认导出，
+再核对 ctypes 声明的**参数个数与顺序**。
+
+#### ⚠️ worker 日志的 stdout 缓冲会把崩溃现场吃掉
+
+worker 的 stdout/stderr 重定向到 `/tmp/wdnwebui-worker/<model>.log`（v0.8.6 起，
+为了避免 parent 死掉时 worker 收到 SIGPIPE）。但 **stdout 重定向到文件时默认是
+全缓冲（4~8 KB）** ⇒ 进程被 SIGSEGV / SIGKILL 时**缓冲区里的日志全部丢失**
+⇒ 现场看起来「worker 莫名其妙就死了，没有任何线索」。
+
+修法：`api.cpp` 里加一个静态初始化对象，把 stdout 改成**行缓冲**：
+
+```cpp
+struct StdoutLineBuffer {
+  StdoutLineBuffer() { setvbuf(stdout, nullptr, _IOLBF, 0); }
+} g_stdout_line_buffer;
+```
+
+⇒ 每行 `printf` 立刻落盘，**崩溃点前最后一行就是断点**。
 
 #### 进度条（每一步在做什么 / 每一步多久 / 还需多久）
 
