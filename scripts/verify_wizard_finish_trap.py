@@ -4,7 +4,7 @@
   1. 进「智能电脑控制」卡直接就是「完成配置」页
   2. 完成配置页没有「上一页」按钮,回不到向导第一页
 
-复现路径(本脚本逐步走一遍,不靠 mock):
+复现路径(本脚本逐步走一遍;算力快照 mock 掉,理由见下面 on_compute):
   env(0) → task(1) → finish(2) → 点右上角返回(不清 step)
   → 重新进卡 → 断言落在哪一步 + footer 有哪些按钮
 
@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from pathlib import Path
@@ -101,6 +102,34 @@ def run(exe: str) -> None:
         ctx = browser.new_context(viewport={"width": 1400, "height": 900})
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
+
+        # mock 掉算力快照：脚本要验的是 **footer 结构 + 持久化语义**，
+        # 与 env 步的能力判定无关，但它得先从 env 步走到 task 步。
+        # 真板子上没人同时提供 usb-hid 要求的整组能力（swcap_vision_chat
+        # + swcap_tool_call，且必须**同一个实例**）→ env 步判 fail →
+        # 「下一步」被禁用 → 脚本连第一步都走不出去。
+        # 快照 mock 掉就跟板子上跑什么模型无关了。
+        def on_compute(route):
+            route.fulfill(
+                status=200, headers={"Content-Type": "application/json"},
+                body=json.dumps({
+                    "instances": [{
+                        "model_id": "mock-vlm", "npu_index": 0, "npu_indices": [0],
+                        "status": "running", "_source": "spawned",
+                        "capability_types": ["swcap_vision_chat", "swcap_tool_call"],
+                    }],
+                    "card_count": 1, "model_cards": [0],
+                    "cards": [{"npu_index": 0}],
+                }))
+
+        def on_active_app(route):
+            # 进卡片时框架会 PUT /api/compute/active-app，后端会往
+            # compute.autostart 写配置 —— 回归脚本不该改生产配置。
+            route.fulfill(status=200, headers={"Content-Type": "application/json"},
+                          body=json.dumps({"ok": True}))
+
+        page.route("**/api/compute/active-app", on_active_app)
+        page.route("**/api/compute", on_compute)
 
         print("=== 1. open homepage, wipe any leftover usb-hid wizard state ===")
         # 用 domcontentloaded 而不是 networkidle —— 首页常驻 WS 连接

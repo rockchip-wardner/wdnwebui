@@ -18,11 +18,11 @@ finish 步的等待（_waitForModelsRunning）同口径。
 本脚本守住七条：
   B1 半就绪（只起 npu0）→ ⚠ 黄 + 出现「一键开启所需模型」按钮
   B2 半就绪 → **不再**暴露模型名 / 卡号明细行（用户不需要知道这么具体）
-  B3 半就绪 → 「下一步」禁用（走不到完成配置页死等）
+  B3 半就绪 → 能力仍可用 → 「下一步」**不**禁用（finish 步不等缺卡位）
   B4 全就绪（两张卡都有）→ ✓ 绿、**不**出现按钮，「下一步」可用
-  B5 peer adopt 的实例不算本机就绪（远端算力本机无权用）
+  B5 peer adopt 的实例不算本机就绪（远端算力本机无权用），但本机那份仍提供能力 → 「下一步」不禁用
   B6 点按钮 → DELETE 带 npu_index 腾掉 omni@#1，POST 带 npu_index=[0,1]
-  B7 三态齐全：完全没开 → ✗ 红；正在启动中 → ✓ 绿（就绪在途）
+  B7 就绪态齐全：完全没开 → ✗ 红；正在启动中 → ✓ 绿（就绪在途）
 
 全 mock，不占 NPU、不碰真机。
 
@@ -114,7 +114,15 @@ def open_wizard(browser, instances):
                       body=json.dumps({"ok": True, "instances": [],
                                        "errors": []}))
 
+    def on_active_app(route):
+        # 框架进卡片时会 PUT /api/compute/active-app，后端会把承载该卡
+        # caps 的 (model, npu) 增量写进 compute.autostart —— 回归脚本不该
+        # 改生产配置。
+        route.fulfill(status=200, headers={"Content-Type": "application/json"},
+                      body=json.dumps({"ok": True}))
+
     page.route("**/api/compute/instances", on_instances)
+    page.route("**/api/compute/active-app", on_active_app)
     page.route("**/api/compute", on_compute)
 
     page.goto(BASE, wait_until="domcontentloaded", timeout=20000)
@@ -196,8 +204,10 @@ def main() -> int:
               bring_btn_count(page) == 1, f"count={bring_btn_count(page)}")
         check("B2 不再显示模型名 / 卡号明细行",
               no_model_detail_rows(rows), f"rows={rows}")
-        check("B3 「下一步」禁用（走不到完成配置页死等）",
-              next_disabled(page) is True, f"disabled={next_disabled(page)}")
+        # 半就绪（cfg 要两张卡，只起了一张）→ 能力照样可用（本机那份
+        # qwen3-vl-4b 正在提供 swcap_vision_chat）→ 不阻塞「下一步」。
+        check("B3 半就绪但能力可用 → 「下一步」不禁用",
+              next_disabled(page) is False, f"disabled={next_disabled(page)}")
 
         # ---- 场景 B：点「一键开启」→ 腾卡 + 两张卡都起 ---------------------
         print("\n=== B: 点「一键开启所需模型」 ===")
@@ -248,8 +258,8 @@ def main() -> int:
               f"state={cap_state(page, 'swcap_vision_chat')}")
         check("B5 peer adopt 不算就绪 → 仍出现「一键开启」按钮",
               bring_btn_count(page) == 1, f"count={bring_btn_count(page)}")
-        check("B5 「下一步」禁用",
-              next_disabled(page) is True, f"disabled={next_disabled(page)}")
+        check("B5 peer adopt 不算本机，但本机那份仍提供能力 → 「下一步」不禁用",
+              next_disabled(page) is False, f"disabled={next_disabled(page)}")
         ctx.close()
 
         # ---- 场景 E：完全没开启 ------------------------------------------

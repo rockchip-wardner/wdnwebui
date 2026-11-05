@@ -2645,93 +2645,71 @@ swcap_audio_chat → qwen2.5-omni-3b   @ npu1
 回归:`scripts/verify_wizard_multicard_bringup.py`(5 断言,mock 驱动,
 断言「停的是多余那张卡、不是需要的那张、DELETE 带卡号」)。
 
-#### env 步的「就绪」判据也必须是 **(模型, 卡位) 对**级(v0.28 修)
+### 向导 env 步的能力判定与模型启动等待
 
-用户实测 BUG(视频目标监控 / vtd 卡):`qwen3-vl-4b` 跑在 RK182x#0、
-`qwen2.5-omni-3b` 跑在 RK182x#1,点「视频目标监控」进向导模式:
-
-* 第 1 步「运行环境检查」显示「✓ swcap_vision_chat 已就绪」
-  → **不显示「一键开启所需模型」按钮**
-* 一路走到最后一步「完成配置」→ 点完成 → **永久等待**「[VLM]视觉描述v3
-  启动在 RK182x#1」(npu1 上跑的是 omni,不是它)
-
-根因:env 步只按 **capability(模型级)** 判就绪。vtd 的 `swcap_to_model` 是
-`{swcap_vision_chat: {model_id: qwen3-vl-4b, npu_index: [0, 1]}}` ——
-同一个模型要**两张卡都跑**。qwen3-vl-4b 在 npu0 上 running → capability
-命中 → 判成就绪 → **卡位缺口被整个忽略**。
-
-> 与 finish 步的等待口径**必须一致**:`_waitForModelsRunning` 早就按
-> `(model_id, npu_index)` 对逐个等(否则用户要两张卡却只等到一张,推理
-> 退化成单卡还不报错)。env 步判「就绪」却按模型级 → 两处口径不一致 →
-> 用户被放行到 finish 步死等。
-
-**改法**(`app/static/core/wizard/state.js`):
+**判定链路**(`app/static/core/wizard/state.js`):
 
 | 位置 | 作用 |
 |---|---|
-| `_modelSlots(cfg, instances)` | 纯函数:把 `swcap_to_model` 展开成 (模型, 卡位) 对,逐个标 `up`(running **或** loading —— 启动中算就绪在途;`npu_index` 为 null 的模型 → 任意卡即可,与 finish 步一致) |
-| `_envView(state, cfg)` | 判定结果:每条能力一个三态 `capStates`(ok / warn / fail),`swOK = 全部 ok`;渲染与后台刷新共用同一份口径 |
+| `_modelSlots(cfg, instances)` | 纯函数:把 `swcap_to_model` 展开成 (模型, 卡位) 对,逐个标 `up`(running **或** loading —— 启动中算就绪在途)与 `err`(该槽位上的实例进了 error 终态);`npu_index` 为 null 的模型 → 任意卡即可 |
+| `_envView(state, cfg)` | 判定结果:每条能力一个四态 `capStates`,`swOK = 无 fail`;渲染与后台刷新共用同一份口径 |
 | `_localInstances` / `_capJudgement` | 本机实例过滤 + capability 缺失判定(peer adopt 不算本机算力,与 finish 步同口径) |
-| `_renderEnvStep` | 能力行**三态**(✓ 全开或都在启动中 / ⚠ 半就绪 / ✗ 没开);**不外露模型名与卡号**;`swOK` 假 → 出「一键开启所需模型」按钮 + 「下一步」禁用 |
+| `_renderEnvStep` | 能力行四态;**不外露模型名与卡号** |
 | `_refreshEnv` | env 步后台刷新一次:结论**变了**才重绘(否则会擦掉「一键开启」刚写的状态文案) |
 
 > **卡位级判据必须用「裁剪后」的 cfg** —— 单卡模式下 `_planSingleCard` 把
 > `npu_index` 换成唯一卡号;按原始 cfg 算会算出**不存在的卡位**。所以
 > slots 在**渲染时**算(`_envView` 收 `cfg` 参数),不在 `mount` 里算。
 
-回归:`scripts/verify_wizard_slot_readiness.py`(20 断言,mock 驱动,覆盖三态
-+「半就绪 → 出按钮 + 下一步禁用」「全就绪 → 无按钮」)。
+**env 步的「软件能力」行按「能力是否可用」分四态** —— 判据是「本机有没有
+running/loading 实例提供这个 cap」,不是「cfg 里指定的模型起没起」(卡片按
+capability 取 session,`get_session`,不认 model_id):
 
-### 向导 finish 步的等待必须遇终态立即中止（v0.28 修）
+| 态 | 条件 | 图形 | 阻塞下一步 |
+|---|---|---|---|
+| `ok` | 配置的槽位全 up | ✓ 绿 | 否 |
+| `alt` | 配置的槽位都没 up,但别人提供该能力 | ⚠ 黄 | 否 |
+| `warn` | 配置的模型开了但卡位缺 | ⚠ 黄 | 否 |
+| `fail` | 没人提供该能力,或配置槽位上的 worker 挂了 | ✗ 红 | 是 |
 
-用户实测死锁（视频目标定位 / vtl）：向导 env 步点「一键开启模型」→
-**另开一个页面**把模型全关 → 回到向导点「完成配置」→ 永远卡在
-「等待模型加载完毕」，回不到第 1 步、进不了应用页 —— 该应用彻底不可用。
+- ok / alt / warn 都不挡「下一步」,只有 fail 挡;alt 与 warn 都画 ⚠ 黄,
+  区别只在配置匹配度。
+- 能力组(`groupFail`)优先于 alt —— 组要求同一个实例满足整组能力。
+- alt 态不额外弹说明块;「一键开启所需模型」与「下一步」是否可用解耦
+  (能力没配齐就出该按钮);「本板未安装所需模型」提示排除 alt 态的 cap。
 
-根因：`_waitForModelsRunning` 的收敛条件只有两个 ——「全部 running」或
-「90s 超时」。模型被关掉后实例要么从 registry 消失（**缺席**），要么
-status 变 `error`（**终态**），两种都让等待永远等下去；进度条还按旧
-`started_at` 从 24% 一路涨到 99% 封顶，**看上去像还在加载** —— 这正是
-「像死机」而不是「报错」的原因。
+**finish 步等模型就绪**(`_waitForModelsRunning`)的目标带 `cap`,按目标
+自己的状态判:
 
-> 用户给的方案是「改浏览器缓存策略：切走 / 跳过后再进来回到第 1 步」。
-> 方向合理，但**不是这个 bug 的成因**：finish 步刻意不落盘 `.step`
-> （`_gotoStep` 里 `kind === "finish"` → `_lsClearStep`），重新进入
-> **本来就**回到第 1 步（实测确认）。死锁发生在**同一次挂载内**的
-> finish 等待上，缓存救不了。缓存策略仍按用户要求改了（见下），但
-> 根因必须单独修 —— 别把「改了缓存」当成「修好了」。
+| 目标状态 | 处理 |
+|---|---|
+| `running` | 就绪 |
+| `loading` | 还在起,等它(不能被别人顶替) |
+| `error` | 终态故障 → 立刻中止报「启动失败」(不能被顶替掩盖) |
+| 缺席 / `not_loaded` | 「没起」→ 本机有人提供该 cap 就顶替 |
 
-**三条不变量**（`state.js::_waitForModelsRunning`）：
+三条不变量:
 
-1. **终态立即中止**：`inst.status === "error"` → 立刻抛错，不等宽限期
-   （实测 62~78ms）。`abort` 必须在 `try/catch` **外面**抛 ——
-   `catch (_) { /* retry */ }` 会把中止吞掉。
-2. **缺席有宽限**：`MISSING_GRACE_MS = 15s`。POST 之后实例 ~1s 才注册，
-   15s 足够宽松；宽限只用来区分「刚 POST 还没注册」和「压根没跑」。
-   关键在**卡号匹配**：`unload_instance` 会把 `npu_index` 重置成 -1，
-   所以「被停掉的实例」对 `npu_index: 0` 的 target 就是**缺席**。
-   （现有 7 张卡的 `swcap_to_model` 全都声明了具体卡号，没有
-   `npu_index: null` 的卡 —— 那是唯一会漏判的形态。）
-3. **等待可被打断**：向导被卸载（点「上一步」/「跳过向导」/切页）时
-   `statusBox.isConnected` 为 false → **抛错**中止，不能 `return`。
-   静默 `return` 等于「等待成功」，`_finish` 会接着调
-   `applyWizardSnapshot` —— 模型没就绪就把应用拉起来（半个死锁）。
+1. **终态立即中止**:`status === "error"` → 立刻抛错,不等宽限期。`abort`
+   必须在 `try/catch` **外面**抛 —— `catch (_) { /* retry */ }` 会把中止吞掉。
+2. **缺席有宽限**:`MISSING_GRACE_MS = 15s`。POST 之后实例 ~1s 才注册,
+   宽限只用来区分「刚 POST 还没注册」和「压根没跑」。卡号要严格匹配 ——
+   `unload_instance` 会把 `npu_index` 重置成 -1,所以「被停掉的实例」对
+   `npu_index: 0` 的 target 就是**缺席**。
+3. **等待可被打断**:向导被卸载时 `statusBox.isConnected` 为 false →
+   **抛错**中止,不能 `return`(静默 return 等于「等待成功」,`_finish` 会
+   接着调 `applyWizardSnapshot`,模型没就绪就把应用拉起来)。
 
-**失败必须给出口**：finish 失败时渲染错误 + 「重新开启模型」按钮
-（`#wd-wizard-finish-retry-btn`，调 `window._wizardBringUpModels(cfg)`
-后重试 `_finish`）。没有它，用户唯一的出路是连点三次「上一步」回到
-env 步 —— 看上去就像「回不去」（用户实测）。
+**失败必须给出口**:finish 失败时渲染错误 + 「重新开启模型」按钮
+(`#wd-wizard-finish-retry-btn`,调 `window._wizardBringUpModels(cfg)` 后
+重试 `_finish`)。
 
-**用户方案（已实现）**：`unmount(silent=true)`（= `onNavAway` 切页路径）
-与「跳过向导」都清掉 `.step`（**保留 `.values`**，回来仍预填）→ 再次
-进入该卡从第 1 步开始。**reload 不清**（reload 不走 `onNavAway`）——
-既有语义「刷新后回到上次停留的步骤」保持不变（`test_wizard_vd.py` T10
-依赖它）。
+**缓存语义**:`unmount(silent=true)`(切页路径)与「跳过向导」都清掉 `.step`
+(**保留 `.values`**,回来仍预填)→ 再次进入该卡从第 1 步开始。**reload
+不清**(不走 `onNavAway`)—— 「刷新后回到上次停留的步骤」保持不变。
 
-回归：`scripts/verify_wizard_finish_abort.py`（7 场景，全 mock
-`/api/compute`，**不碰真机算力**）：缺席 15s 内中止 / error <0.5s 中止 /
-等待中离开不调 applyWizardSnapshot / 重试按钮可恢复 / 切走再进回第 1 步 /
-跳过再进回第 1 步 / reload 仍恢复步骤。
+**找实例统一走 `_pickInst(cands)`**:优先 running/loading,其次 error 终态 ——
+同模型可能有多个卡位的实例,取首个未必是活的那个。
 
 ### `wizard:unmounted` 事件 + 重新挂载
 

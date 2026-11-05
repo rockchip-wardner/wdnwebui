@@ -356,6 +356,15 @@
     return Number.isInteger(n) && n >= 0 ? [n] : [];
   }
 
+  // 在候选实例里挑「代表」那个：优先活着的（running/loading），其次
+  // error 终态。同一 (模型, 卡位) 只会有一条实例，但**同模型可能有多个
+  // 卡位的实例**，find 的首个未必是活的那个 —— 挑错会把活着的判成故障。
+  function _pickInst(cands) {
+    return cands.find((i) => i.status === "running" || i.status === "loading")
+      || cands.find((i) => i.status === "error")
+      || null;
+  }
+
   function _modelSlots(cfg, instances) {
     // instances 必须是本机实例（_localInstances 过滤后）
     const local = instances || [];
@@ -364,40 +373,48 @@
       if (!m || !m.model_id) continue;
       const npus = (m.npu_index == null) ? null
         : (Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index]);
-      if (!npus) {
-        // npu_index 为 null → 任意卡即可（与 finish 步一致）。
-        // up = 已开启**或**正在启动中（启动中算「就绪在途」）。
-        const up = local.some((i) => i.model_id === m.model_id
-          && (i.status === "running" || i.status === "loading"));
-        slots.push({ cap, model_id: m.model_id, npu_index: null, up });
-        continue;
-      }
-      for (const n of npus) {
-        const inst = local.find((i) => i.model_id === m.model_id
-          && _instanceCards(i).includes(Number(n)));
+      // npus 为 null → 任意卡即可（与 finish 步一致），展开成一个通配槽位。
+      for (const n of (npus || [null])) {
+        const inst = _pickInst(local.filter((i) => i.model_id === m.model_id
+          && (n == null || _instanceCards(i).includes(Number(n)))));
         const up = !!(inst && (inst.status === "running" || inst.status === "loading"));
-        slots.push({ cap, model_id: m.model_id, npu_index: n, up });
+        // err = 该槽位上的实例进了 **error 终态**（worker 挂了）。它跟
+        // 「没起」不是一回事 —— 「没起」可以等 / 可以被别人顶替，
+        // 「挂了」是明确的故障，用户得知道。
+        const err = !!(inst && inst.status === "error");
+        slots.push({ cap, model_id: m.model_id, npu_index: n, up, err });
       }
     }
     return slots;
   }
 
   // 每个 capability 的就绪态（渲染只出 swcap_*，模型名/卡号不外露）：
-  //   ok   = 所需模型全开或都在启动中 → ✓ 绿
-  //   warn = 半就绪（要的卡位只起了一部分）→ ⚠ 黄
-  //   fail = 没起 → ✗ 红
+  //   ok   = 配置的模型全开或都在启动中 → ✓ 绿
+  //   alt  = 配置的槽位一个都没 up，但**别的实例**提供这个能力 → ⚠ 黄
+  //   warn = 配置的模型开了但卡位只起一部分 → ⚠ 黄
+  //   fail = 能力不可用 → ✗ 红
+  //
+  // 能不能继续只看「能力可用吗」：ok/alt/warn 都是本机有实例提供这个 cap
+  // （卡片按 capability 取 session，不认 model_id）→ 都不挡路，只有 fail 挡。
+  // alt 与 warn 的区别只在配置匹配度上。
   function _capStates(swRequired, swMissing, slots, groupFail) {
     const out = {};
     for (const cap of swRequired) {
-      // 能力组没被同一个实例满足 → 组内每项都判缺（逐项看都 ✓ 的话用户
+      // 组没被同一个实例满足 → 组内每项都判缺（逐项看都 ✓ 的话用户
       // 以为能用，进卡才发现不行）。
       if (groupFail.has(cap)) { out[cap] = "fail"; continue; }
-      // 没有任何运行中/启动中的实例提供这个能力 → 没就绪
+      // 没人提供这个能力 → 没人能顶，功能不可用
       if (swMissing.includes(cap)) { out[cap] = "fail"; continue; }
       const mine = slots.filter((s) => s.cap === cap);
       if (!mine.length) { out[cap] = "ok"; continue; }
+      // 配置槽位上的 worker 挂了 → 故障，挡路（放行的话用户走到 finish
+      // 步才撞「启动失败」，那时候已经白填了一堆表单）
+      if (mine.some((s) => s.err)) { out[cap] = "fail"; continue; }
       const up = mine.filter((s) => s.up).length;
-      out[cap] = up === mine.length ? "ok" : (up > 0 ? "warn" : "fail");
+      if (up === mine.length) { out[cap] = "ok"; continue; }
+      if (up > 0) { out[cap] = "warn"; continue; }
+      // 配置的槽位一个都没 up → alt：能用，只是用的不是配置里指定的那个
+      out[cap] = "alt";
     }
     return out;
   }
@@ -434,9 +451,11 @@
       swRequired,
       capStates,
       missingModels,
-      // 就绪 = 每条要求的能力都是 ok；warn/fail 都算没齐 → 出「一键开启」
-      // 按钮 + 禁用「下一步」。空 swRequired（不依赖模型）→ 可继续。
-      swOK: swRequired.every((c) => capStates[c] === "ok"),
+      // 能不能继续 = 每条要求的能力都可用（只有 fail 挡路）。
+      swOK: swRequired.every((c) => capStates[c] !== "fail"),
+      // 「一键开启所需模型」按钮要不要出：能力没配齐就出（alt/warn/fail）——
+      // 它是用户想换成配置里指定的那个模型时唯一的入口，与 swOK 解耦。
+      needBring: swRequired.some((c) => capStates[c] !== "ok"),
       blocked: !!(singleOn && single.blocked),
     };
   }
@@ -544,14 +563,14 @@
     // ------------------------------------------------------------------ //
 
     swRequired.forEach((cap) => {
-      // 三态：✓ 绿（全开或在启动中）/ ⚠ 黄（半就绪）/ ✗ 红（没开）。
-      // 被阻断时一律 fail —— 把已跑起的显示成 ✓ 会让人以为差一点就能用。
-      // 不列模型名 / 卡号：用户不需要知道模型跑在哪张卡上。
+      // 四态：✓ 绿（配置全开）/ ⚠ 黄（能力可用但配置没配齐）/ ✗ 红（没人
+      // 提供，或配置槽位上的 worker 挂了）。被阻断时一律 fail —— 把已跑起
+      // 的显示成 ✓ 会让人以为差一点就能用。不列模型名 / 卡号。
       const st = blocked ? "fail" : (view.capStates[cap] || "fail");
       const row = _ce("div", WIZARD_NS + "env-row");
       row.classList.add(st === "ok" ? WIZARD_NS + "env-ok"
-        : (st === "warn" ? WIZARD_NS + "env-warn" : WIZARD_NS + "env-fail"));
-      row.textContent = (st === "ok" ? "✓ " : (st === "warn" ? "⚠ " : "✗ ")) + cap;
+        : (st === "fail" ? WIZARD_NS + "env-fail" : WIZARD_NS + "env-warn"));
+      row.textContent = (st === "ok" ? "✓ " : (st === "fail" ? "✗ " : "⚠ ")) + cap;
       card2.appendChild(row);
     });
     // vd 二选一时把没选中的那条也列出来(中性样式)—— 用户得看到
@@ -570,7 +589,11 @@
     // 本板没装的模型 → 明确说出来，并**禁用**「一键开启」（启不了：
     // 后端只认已安装的 model，未知 model 直接 422）。这跟「装了没启用」
     // 是两回事 —— 后者有占位卡、可以一键起。
-    const missingModels = view.missingModels || [];
+    // alt 态的 cap 排除在外 —— 那个能力已经有人顶上，配置里指定的
+    // 模型装没装都不影响使用，提示「未安装」只会让人以为不能继续。
+    const altCaps = swRequired.filter((c) => view.capStates[c] === "alt");
+    const missingModels = (view.missingModels || [])
+      .filter((x) => altCaps.indexOf(x.cap) === -1);
     if (missingModels.length) {
       card2.appendChild(_singleCardNotice(
         "block",
@@ -581,7 +604,7 @@
             "在「算力配置」页点「刷新模型」即可出现该卡片。",
           ])));
     }
-    if (!swOK && !blocked) {
+    if (view.needBring && !blocked) {
       const bringBtn = _ce("button", WIZARD_NS + "primary-btn", "一键开启所需模型");
       bringBtn.id = WIZARD_NS + "env-bring-btn";
       if (missingModels.length) {
@@ -2091,7 +2114,7 @@
     // 还不报错。
     const targets = [];
     const seen = new Set();
-    for (const [, m] of Object.entries(cfg.swcap_to_model || {})) {
+    for (const [cap, m] of Object.entries(cfg.swcap_to_model || {})) {
       const cards = Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index];
       for (const n of cards) {
         // 同组能力指向同一个模型时会展开出重复对 —— 进度行会多出几行
@@ -2099,7 +2122,7 @@
         const key = m.model_id + "@" + n;
         if (seen.has(key)) continue;
         seen.add(key);
-        targets.push({ model_id: m.model_id, npu_index: n });
+        targets.push({ model_id: m.model_id, npu_index: n, cap });
       }
     }
     if (targets.length === 0) return;
@@ -2200,23 +2223,31 @@
           // _probeEnv 一致;_wizardBringUpModels 已保证 POST 成功 = 本机就绪。
           const instances = (data.instances || [])
             .filter((i) => i._source !== "adopted");
-          // 就绪判据分两种：声明了卡号的要**那张卡**running；没声明卡号的
-          // （多数卡片的旧写法）任意一张卡 running 即可。
-          const running = instances.filter((i) => i.status === "running");
-          // 多卡模型一个实例要展开成多条 ``model@card``：9B 的
-          // ``npu_indices=[0,1]`` 覆盖 @0 和 @1 两行进度。
-          const runningExact = new Set();
-          for (const inst of running) {
-            for (const n of _instanceCards(inst)) {
-              runningExact.add(_targetKey({
-                model_id: inst.model_id, npu_index: n,
-              }));
-            }
+          // 「有人顶替」：本机有 running/loading 实例提供这个 cap 就顶掉 ——
+          // 卡片按 capability 取 session（get_session），不认 model_id，等下
+          // 去只是白耗 90s 再报「本机未运行 xxx」。
+          //
+          // ⚠️ **缺席 ≠ error**：running 就绪；loading 还在起（等它）；error
+          // 是终态故障，必须报出来、不能被顶替掩盖；缺席 = 没起，可被顶替。
+          const providedCaps = new Set();
+          for (const inst of instances) {
+            if (inst.status !== "running" && inst.status !== "loading") continue;
+            for (const c of (inst.capability_types || [])) providedCaps.add(c);
           }
-          const runningAny = new Set(running.map((i) => i.model_id));
-          if (targets.every((t) => (t.npu_index == null
-                ? runningAny.has(t.model_id)
-                : runningExact.has(_targetKey(t))))) {
+          const ownInst = (t) => _pickInst(instances.filter((i) => i.model_id === t.model_id
+            && (t.npu_index == null || _instanceCards(i).includes(Number(t.npu_index)))));
+          const targetReady = (t) => {
+            const own = ownInst(t);
+            if (own) {
+              if (own.status === "running") return true;
+              // loading：还在起 → 等它。error：终态 → 不就绪（下面 abort）。
+              if (own.status === "loading" || own.status === "error") return false;
+              // not_loaded 之类 = 没起 → 落到下面看能不能被顶替
+            }
+            // 没起 → 有人提供这个能力就顶替（能力可用，功能是通的）
+            return providedCaps.has(t.cap);
+          };
+          if (targets.every(targetReady)) {
             // 模型全部就绪 → 清空 statusBox,避免误导用户"是不是出错了"
             clearBox();
             return;
@@ -2231,9 +2262,9 @@
             const key = _targetKey(m);
             const est = perModel[m.model_id] != null
               ? perModel[m.model_id] : defaultEst;
-            const inst = instances.find((i) => i.model_id === m.model_id
+            const inst = _pickInst(instances.filter((i) => i.model_id === m.model_id
               && (m.npu_index == null
-                  || _instanceCards(i).includes(Number(m.npu_index))));
+                  || _instanceCards(i).includes(Number(m.npu_index)))));
             if (!inst) {
               // 一直不出现 = 没启动（被关了 / 压根没开），不是「还在启动」。
               // 超过宽限就中止 —— 盯一条不变的进度条等满 90s 比报错更像死机。
@@ -2432,6 +2463,11 @@
     clearStep: (app, cfg) => _lsClearStep(app.id, cfg),
     clearFields: (app, cfg, fields) => _lsClearFields(app, cfg, fields),
     clearAll: (appId) => _lsClearAllFor(appId),
+    // _capStates / _modelSlots 都是**纯函数**，暴露出来给
+    // scripts/verify_wizard_cap_states.py 直接断言四种就绪态与「活着的
+    // 优先」口径，不用来回启停真机上的模型。
+    __capStates: _capStates,
+    __modelSlots: _modelSlots,
   };
 
   // ------------------------------------------------------------------ #
