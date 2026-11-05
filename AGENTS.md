@@ -6058,11 +6058,19 @@ RIFF header by hand.
   chunk_seconds / chunk_overlap_seconds / embedding_model / analyzed_at /
   meta_json / judge_fp / slice_version`），已删除 `kind` 与全部分析列。
   **`judge_fp` / `slice_version` 是切片口径隔离键**：VR 写
-  `judge_fp="<mode>:<threshold>:<every_n>"`（如 `gscore:10:10`）、
+  `judge_fp="<mode>:<threshold>:<every_n>"`（默认 `gscore:25:10`）、
   `slice_version="gscore-v1"`；微信写 `judge_fp=""`、`slice_version="fixed"`。
   `lookup` / `save` / `list_videos` / `delete_video` 全部按这个键过滤 ——
   否则改一次阈值就会复用旧索引（时间窗与帧数都对不上）。升级时直接删除
   旧库 (`rm -rf app/uploads/lancedb`) 后重建；微信条目也会随之清空。
+* **判据默认阈值独立于三卡**：VR 是 1 秒/帧采样，gscore 默认 **25**
+  （`app/core/video/search.py: DEFAULT_JUDGE_THRESHOLD`）；三卡仍是 25fps
+  逐帧口径的 10（`frame_judge.DEFAULT_THRESHOLD_BY_MODE`）。`/judge/metrics`
+  返回 VR 自己的 `default_threshold`，`wizard.json` 的
+  `vr-judge-threshold.default` 也是 25。`FrameJudge.reconfigure` 在
+  “模式变化 + 未传 threshold”时会回落到共享的 10，所以
+  `VideoSearchService.set_judge` 在切到 gscore 时补 25 —— 改这块时别把
+  它删掉，否则 `gscore → manual → gscore` 会静默回 10。
 * **资源预算**：qwen3-vl-embedding-2b 单实例 ~2 GB。检索单视频索引在内存，
   长视频（>1h，按「有效帧上限 4 / 重叠 1 帧」≈ 900~1200 片 × 2048 维 fp32
   ≈ 10MB 向量）可忽略。播放走 PyAV 顺序解码，不占 NPU。

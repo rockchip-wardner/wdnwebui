@@ -42,7 +42,7 @@ from app.core.compute.registry import (
     get_registry,
     get_session_call_lock,
 )
-from app.core.video.frame_judge import EXPOSED_METRICS, FrameJudge
+from app.core.video.frame_judge import EXPOSED_METRICS, FrameJudge, normalize_mode
 from app.core.video.slicing import (
     SLICE_MAX_FRAMES,
     SLICE_OVERLAP_FRAMES,
@@ -74,6 +74,11 @@ FIXED_TOP_K = 10
 
 # 判据默认：gscore / 兜底间隔 10 秒（采样是 1 秒/帧，所以 every_n=10 帧）。
 DEFAULT_JUDGE_EVERY_N = 10
+# VR 的采样口径是「每秒 1 帧」，与三张视频卡的 25fps 逐帧不同 —— 同一个
+# gscore = 10 在 1 秒间隔上 p50 就已经接近阈值，几乎每帧都放行。所以 VR
+# 单独标定默认阈值（固定机位监控实测：1s 采样下降噪后的操作点 20~30）。
+# **不要**改 frame_judge.DEFAULT_THRESHOLD_BY_MODE["gscore"]，那会连带三卡。
+DEFAULT_JUDGE_THRESHOLD = 25
 
 # ---------------------------------------------------------------- #
 # 图片检索（以图 / 图+文检索视频片段）
@@ -352,6 +357,7 @@ class VideoSearchService:
         self._judge = FrameJudge(
             mode=EXPOSED_METRICS[0],
             every_n=DEFAULT_JUDGE_EVERY_N,
+            threshold=DEFAULT_JUDGE_THRESHOLD,
             long_side=160,
         )
         self._query: Optional[dict] = None
@@ -828,6 +834,20 @@ class VideoSearchService:
     def set_judge(self, payload: dict) -> dict:
         if not isinstance(payload, dict):
             payload = {}
+        cur = self._judge.snapshot()
+        raw_mode = payload.get("mode")
+        new_mode = (cur["mode"] if raw_mode is None or raw_mode == ""
+                    else normalize_mode(raw_mode))
+        # 模式切到 gscore 且调用方没显式给阈值 → 用 VR 默认 25。
+        # FrameJudge.reconfigure 在“模式变化 + threshold=None”时会回落到共享
+        # 的 default_threshold(gscore)=10 —— 那是三卡 25fps 口径的值，会让
+        # VR 的 25 在 gscore→manual→gscore 后静默失效。这里把它补上。
+        # 只改 every_n / 显式给阈值时不触发，避免冲掉用户的自定义值。
+        if (payload.get("threshold") is None
+                and new_mode == "gscore"
+                and cur["mode"] != "gscore"):
+            payload = {**payload, "mode": "gscore",
+                       "threshold": DEFAULT_JUDGE_THRESHOLD}
         try:
             self._judge.reconfigure(
                 mode=payload.get("mode"),

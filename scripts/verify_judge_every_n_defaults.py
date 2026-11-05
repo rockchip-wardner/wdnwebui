@@ -21,8 +21,10 @@
 所以本脚本钉两件事：
 
   1. **三处默认值一致**：后端 ``frame_judge.DEFAULT_EVERY_N``、共享前端组件
-     ``app/static/core/frame-judge.js``、每张卡的 ``wizard.json`` 里
+     ``app/static/core/frame-judge.js``、三张多路卡的 ``wizard.json`` 里
      ``<prefix>-judge-every-n.default`` —— 全部等于 600。
+     **监控反查是例外**：它按「秒级采样帧」计，默认 10（1 秒/帧 + 10 秒兜底），
+     不在 600 口径内。
   2. **行为正确**：用真实的 ``FrameJudge`` 跑一轮"多路轮转"模拟，
      断言 every_n=30 时兜底恒成立（门失效）、every_n=600 时门真的挡得住。
 
@@ -75,16 +77,21 @@ def check_frontend() -> None:
     src = (REPO / "app" / "static" / "core" / "frame-judge.js").read_text(
         encoding="utf-8")
 
-    # 2a) 控件初值
-    m = re.search(r'this\.inpEvery\.value\s*=\s*"(\d+)"', src)
+    # 2a) 控件初值的兜底常量（控件值现在由 defaultEveryN 决定）
+    m = re.search(
+        r"this\.defaultEveryN\s*=\s*Math\.max\(1,\s*"
+        r"parseInt\(opts\.defaultEveryN,\s*10\)\s*\|\|\s*(\d+)\)",
+        src)
     check(bool(m) and int(m.group(1)) == EXPECTED,
-          f'inpEvery.value == "{EXPECTED}"',
+          f"defaultEveryN 兜底 == {EXPECTED}",
           m.group(1) if m else "未找到")
 
-    # 2b) _fallbackCfg 的 every_n
-    m = re.search(r"every_n:\s*(\d+)", src)
+    # 2b) _fallbackCfg 的 every_n 兜底
+    m = re.search(
+        r"every_n:\s*\(inst\s*&&\s*inst\.defaultEveryN\)\s*\|\|\s*(\d+)",
+        src)
     check(bool(m) and int(m.group(1)) == EXPECTED,
-          f"_fallbackCfg every_n == {EXPECTED}",
+          f"_fallbackCfg every_n 兜底 == {EXPECTED}",
           m.group(1) if m else "未找到")
 
     # 2c) 输入框为空时的 fallback 不能再是 30
@@ -119,8 +126,11 @@ def check_wizards() -> None:
                     continue
                 found += 1
                 default = field.get("default")
-                check(default == EXPECTED,
-                      f"{card_id}: {fid}.default == {EXPECTED}",
+                # VR 的 every_n 单位是「秒级采样帧」，默认 10；其余多路卡
+                # 是「解码帧」，默认 600。两者不可统一。
+                expected = 10 if card_id == "video-retrieval" else EXPECTED
+                check(default == expected,
+                      f"{card_id}: {fid}.default == {expected}",
                       f"实测 {default}")
     check(found > 0, "至少找到一张带判据字段的卡",
           f"找到 {found} 个字段")
@@ -198,7 +208,8 @@ def main() -> int:
         for f in fails:
             print(f"  - {f}")
         return 1
-    print("\n✅ 帧间隔默认值三处一致（600）；every_n=30 架空判据门的行为已钉住")
+    print("\n✅ 多路卡帧间隔默认值三处一致（600；VR 为秒级采样 10）；"
+          "every_n=30 架空判据门的行为已钉住")
     return 0
 
 
