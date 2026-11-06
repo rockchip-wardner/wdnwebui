@@ -200,6 +200,109 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    > 回归脚本不该改生产配置。`PUT` 会把承载该卡 caps 的 `(model, npu)`
    > 增量写进 `compute.autostart`。
 
+## 加一张新卡：卡位占位符是**硬要求**（2026-11-06）
+
+每张卡的页面模板是**服务端注入**进首页 HTML 的，不是前端拉的：
+
+```
+app/static/index.html.template   ←  每张卡一行 {% card_slot "<id>" %}
+app/core/html_assembly.py::assemble_index_html  ←  逐个替换成该卡的 static/template.html
+```
+
+⇒ **加一张新卡，必须在 `index.html.template` 里加一行**
+`{% card_slot "<card_id>" %}`。**漏了不会报错**，只会静默错乱：
+
+* `#page-<id>` 这个 section **从来没被注入** ⇒ `ROUTER.showPage()` 找不到
+  page section ⇒ 内容区一片空白；
+* `wizard/state.js::mount()` 拿不到 pageSection ⇒ 向导容器 fallback 到
+  `document.body.appendChild()` ⇒ **向导面板被挤到 `main.content` 外面**，
+  落在屏幕下沿 ⇒ 用户看到「一大片空白 + 面板在下面」（2026-11-06 实测，
+  `image-editor` 卡）；
+* 运行期只有一条 WARNING（`no {{card_slot}} placeholder`）⇒ 没人看日志。
+
+> ⚠️ 注意顺序：`showPage` 的 page 切换在 `framework.js` 里注册，
+> 向导的 `onNavAway`（hashchange）在 mount 时才注册 ⇒ **framework 的先跑**。
+> 所以「切到另一张卡」时，旧向导是被 `mount()` 里的 `unmount()` 拆掉的。
+> ⇒ **`mount()` 里的跨卡卸载必须传 `silent=true`**，否则 `unmount()` 的
+> 「非静默 ⇒ 把原 page 重新显示出来」语义会把**上一张卡**的页面留在屏幕上
+> （两张卡叠在一起）。这条 2026-11-06 已修（`state.js::mount`）。
+
+### 回归
+
+* `python -m scripts.verify_card_slots` —— 断言每张已发现的卡都有卡位占位符，
+  且渲染出的首页里都有 `id="page-<id>"`；
+* `python -m scripts.smoke_wizard_all` —— 8 张带向导的卡逐个 mount 一遍
+  （含 `media-generator` / `image-editor`）；
+* `python -m scripts.verify_image_editor_ui` —— **真实浏览器**点一遍
+  「生成图片」，断言无 JS 错误 + 请求体带 `strength`。
+  ⚠️ 只走 HTTP API 的验收（`scripts/verify_image_editor.py`）**抓不到前端
+  错误** —— 那次 `state is not defined` 就是这么漏过去的。
+* `python -m scripts.verify_wizard_image_field` —— 向导的 `type: "image"`
+  拖拽上传全链路（见下）。
+
+> ⚠️ **向导类回归脚本对「后端记的 active_app」敏感**：
+> 开机时 `ActivateManager.bootRestore()` 会把它还原成 `location.hash`
+> ⇒ **上一张卡**（谁刚用过就留谁）的向导会先挂上，再在切页时被卸载
+> ⇒ 脚本断言的「第一个向导事件」看到的是别的卡的 `wizard:unmounted`
+> ⇒ **假失败**。⇒ 跑之前 `DELETE /api/compute/active-app`（`verify_usb_hid_wizard.py`
+> 已经这么加固了）。
+
+### 向导的 `type: "image"` 字段（拖拽上传一张图）
+
+图生图这类卡片**必须有输入图**。向导原本只能填文本/数字/勾选 —— 视频卡的
+「源」是另一套机制（值是**路径**，还要 `upload_endpoint` + `thumbnail_endpoint`）。
+⇒ 用户被卡在「向导里没法给图 ⇒ 必须先跳过向导、去功能页上传」。
+
+2026-11-06 给宿主向导加了 **`"type": "image"`**：一个**拖拽上传区**
+（`_buildImageField()`，`app/static/core/wizard/state.js`）。
+
+| 口径 | 值 | 备注 |
+|---|---|---|
+| 字段值 | **data URL**（`data:image/png;base64,....`） | 预览直接拿它当 `<img src>` |
+| 落盘 | **不落 localStorage** | 字段声明 `"transient": true` |
+| 取值 key | `opts[ui_key]` | 卡片剥掉 `data:...;base64,` 前缀拿裸 base64 |
+| 文件名 | `state.values[<fieldId>__name]` | 完成页摘要显示它，**不是** base64 |
+
+⚠️ **为什么不落盘**：`localStorage.setItem` 是**整体覆盖** —— 一张图的
+base64 就几百 KB~几 MB，配额爆了会抛异常 ⇒ **整个 values 对象都存不进去**
+（连提示词、步数这些小字段一起丢）。⇒ `_publishValues()` 落盘前把
+`transient` 字段剔掉（`_persistableValues()`）。
+
+⚠️ **`el.value` 用 `Object.defineProperty` 代理到 hidden input** ——
+这样 `_formStepCanNext()`（required 判定）和 `_captureValues()`（取值）
+两条**通用**路径**零改动**就能用（它们只看 `el.value`）。
+
+⚠️ **别把整段 base64 打进完成页摘要** —— `_renderFinishStep()` 对
+`type: "image"` 特判，只显示文件名。
+
+**卡片侧怎么用**（`image-editor` 为例）：
+
+```json
+{ "id": "image-editor-original", "ui_key": "original", "type": "image",
+  "label": "要处理的原图", "summary_label": "原图",
+  "required": true, "transient": true,
+  "accept": "image/png,image/jpeg,image/webp", "max_bytes": 12582912 }
+```
+
+`applyWizardSnapshot(opts)` 里剥前缀回填：
+
+```js
+if (opts.original) {
+  const dataUrl = String(opts.original);
+  const bare = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  setSourceImage(bare, "原图（向导上传）", dataUrl);
+}
+```
+
+回归：`python -m scripts.verify_wizard_image_field` —— 拖拽上传 → 断言
+**localStorage 里没有 base64** → 完成页摘要显示文件名 → 回填并自动开跑。
+
+### 板端**没有 emoji / 符号字体**
+
+`🖼 ✕ ⚠ ✓ ☑ ▯ 🗑 📁` 在板端全部渲染成**豆腐块 □**（实测：同宽 21px 的
+同一字形）。板端可用的只有 `× ● ■ ▶ ← → ↑ ↓`。
+⇒ 卡片模板里**不要用 emoji**；要图标就用**内联 SVG**。
+
 ## 模型分发：worker 配置随模型文件夹（v0.9.2 之后）
 
 worker manifest 从**代码仓**搬到了**模型文件夹里**：
@@ -540,6 +643,102 @@ if (lastDone) { badge.textContent = "✓ 已安装"; ... }   // ← 只看任务
 > **教训**：**任务态 ≠ 库存态**。凡是「N 个已完成 / N 个共 M」的指示器，
 > 数字必须来自**被计数对象的当前状态**，不能来自**操作流水**。
 > 凡是文案会被读成库存陈述的（「已安装」「已就绪」），就别拿任务事件驱动。
+
+## 设备拓扑：模型要占几个 NPU 设备（`requires_cards` 不够）
+
+`requires_cards` 数的是**本机 EP 协卡**（`cards.py::card_no` 口径）。
+但有些模型还要占住**第三个 NPU 设备**，而那个设备**不是 EP 协卡** ——
+算力卡列表里**看不见**它。
+
+Qwen-Image-2.1 就是：TE/DiT 占 2 张 RK1828，**VAE 必须独占**第三个 NPU：
+
+* **A：2×RK1828 + 本机 RK3588** —— VAE 跑本机 rknn2 NPU（模型包里有
+  `vae_qwenimage21-512.3588.rknn`）；
+* **B：3×RK1828** —— VAE 独占第三张协卡（模型包里有
+  `vae_qwenimage21-512.seg{0..3}.1828.rknn`）。
+
+两者都没有 ⇒ **不允许运行这个模型**（不是"运行时报错"，是**禁用 + 400**）。
+
+### manifest 怎么声明
+
+worker manifest 多一个 `card_requirements` 字段（**可选**，没声明的模型
+行为完全不变）：
+
+```json
+"card_requirements": {
+  "total_devices": 3,
+  "layouts": [
+    {"id": "2x182x+3588", "label": "2×RK1828 协卡 + 本机 RK3588 NPU",
+     "ep_cards": 2, "local_npu": 1,
+     "local_label": "本机 RK3588 NPU（VAE 解码）",
+     "required_files": ["vae_qwenimage21-512.3588.rknn"]},
+    {"id": "3x182x", "label": "3×RK1828 协卡",
+     "ep_cards": 3, "local_npu": 0,
+     "required_files": ["vae_qwenimage21-512.seg0.1828.rknn", "..."]}
+  ]
+}
+```
+
+`layouts` 是**可选布局**，按顺序取第一个本机满足的；一个都不满足 ⇒
+禁止运行。`required_files` 检查模型包里对应文件在不在（布局 A 要
+3588 的 VAE、布局 B 要 4 段 1828 的 VAE —— **模型包的文件名就是拓扑
+声明**）。
+
+### ⚠️ `requires_cards` 是**动态**的，不是 manifest 里的静态值
+
+EP 协卡要绑几张**取决于选中的布局**：A 绑 2 张、B 绑 3 张。静态
+`requires_cards: 2` 只能表达 A。
+
+⇒ **真正的口径**是 `registry.effective_requires_cards(model_id)` ——
+取选中布局的 `ep_cards`，没有布局声明才回退静态值。这个值被三处共用：
+
+| 位置 | 用途 |
+|---|---|
+| `api/compute.py::start_instance` + `InstanceRequest` 校验 | 绑定几张卡 |
+| `registry.snapshot()` → `svc.requires_cards` | 前端「运行在」列几张卡 |
+| `workers/_base.py::allowed_card_counts` | worker 侧校验传入卡数 |
+
+worker 侧校验的是**集合**（`{2, 3}`）而不是单一数字 —— 绑错卡数会让
+VAE 找不到独占设备（2 张 → VAE 跑本机 NPU；3 张 → VAE 跑第三张协卡）。
+
+### 三道闸门，缺一不可
+
+1. **主进程启动闸门** —— `registry.check_device_requirements()`，
+   `ensure_worker_for_model()` **第一行**就调它；不满足抛 `ValueError`
+   ⇒ API 转 **400**（`api/compute.py` 两条分支都有 `except ValueError`）。
+   autostart 路径已有 `except Exception` 兜底 ⇒ 只记 warning，不拖垮
+   其它模型。
+2. **前端禁用** —— 算力卡页显示「需要 N 个 NPU 设备 + 选中布局」，
+   不满足时显示**缺什么**（逐条列出每个布局的缺项）并把 toggle 锁掉。
+3. **worker 侧兜底** —— 收到的卡数不在允许集合里 ⇒ 拒绝 load。
+
+### 「运行在」要把**第三个设备**显示出来
+
+本机 NPU **不在算力卡列表里**（那列表只列 EP 协卡）⇒ 光看
+「RK182x #0/#1」用户会以为模型只占 2 张卡。
+
+所以「运行在」里追加一个**固定条目**（`.cc-target-fixed`，不可勾选 ——
+它不是通过 `npu_index` 绑定的，由 worker 在 open 阶段自己挑）：
+
+```
+运行在  [☑ RK182x #0] [☑ RK182x #1]  ▣ 本机 RK3588 NPU（VAE 解码）[自动]
+```
+
+文案来自布局的 `local_label`（manifest 声明，前端不写死）。
+
+### 本机 NPU 探测只做**文件存在性**检查
+
+`cards.py::local_npu_ready()` 查 `librknnrt.so*` 在不在
+（**不 dlopen**）—— 不在 webui 主进程里加载 NPU 运行时。结果**缓存 10 秒**
+（算力页每秒拉一次 snapshot，`ctypes.util.find_library` 会在热路径上
+反复跑 `ldconfig`）。
+
+### 回归
+
+`python -m scripts.verify_compute_device_req.py` —— 算力卡页三个场景：
+满足（显示 + toggle 可用 + 「运行在」有第三个设备）/ 不满足（显示缺什么
++ toggle 禁用）/ 单卡模型（不显示设备要求块）。
+
 ## 视频三卡：1~32 路并发（vtd / vtl / vd，v0.21~v0.22）
 
 `video-target-detection` 已从「单路 canvas」改成「1~32 路宫格 + VLM 逐路轮转」。
@@ -1559,12 +1758,22 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
    是空的 ⇒ 前端 404。**editable 装法看不出来，只有真 wheel 才暴露。**
 3. **`app/static/index.html.template` 要有 `{% card_slot "media-generator" %}`**。
    没有占位符 ⇒ 卡片在应用列表里正常显示，**点开是空白页**。
-4. **模型目录在 `models_root` 下**：`/mnt/oem/models/qwenimage21/`。
+4. **模型目录在 `models_root` 下**：`/mnt/oem/models/Qwen-Image-2.1/`
+   （目录名 = **HF 仓库名**，与 `Qwen3-VL-4B` / `Qwen3-TTS` 等同规则；2026-11-05
+   由 `qwenimage21` 改名而来）。
    本板 `/mnt/oem` 只有 558 MB 空闲（放不下 9.4 GB 的模型包）⇒ 用**软链**：
-   `ln -s /home/rockchip/models/qwenimage21 /mnt/oem/models/qwenimage21`。
-5. **worker manifest 在模型目录里**：`/mnt/oem/models/qwenimage21/qwenimage21.json`
+   `ln -s /home/rockchip/models/Qwen-Image-2.1 /mnt/oem/models/Qwen-Image-2.1`。
+   ⭐ **目录名可以随便改**：发现规则是「**manifest 所在目录 = 模型目录**」
+   （`workers/__init__.py::discover()` 扫模型根下每个子目录找
+   `<model_id>.json`），SDK 通过 manifest 的 `model_dir_env`
+   （`WDNAI_QWEN_IMAGE_21_DIR`）跟随 ⇒ 改名不需要改代码，只要同步 manifest 的
+   `model_dir_name`。
+5. **worker manifest 在模型目录里**：`/mnt/oem/models/Qwen-Image-2.1/qwenimage21.json`
    （出厂清单在 `tools/worker_manifests/qwenimage21.json`，用
-   `scripts/migrate_worker_manifests.py` 拷过去）。`requires_cards: 2` ——
+   `scripts/migrate_worker_manifests.py` 拷过去）。⚠️ **manifest 的文件名 =
+   model_id**（`qwenimage21`）⇒ 它同时是 worker 的 `--model qwenimage21`
+   参数和 `/proc` 里的去重 needle ⇒ **改名会连带改 worker 参数与去重逻辑**，
+   目录改名**不需要**动它。`requires_cards: 2` ——
    TE 常驻卡 0、DiT 在卡 1；**VAE 不占 1828 卡**（在本机 3588 的 NPU 上，见下）。
 
 #### ⭐ VAE 走本机 rknn2 NPU（2026-11-04）
@@ -1669,7 +1878,9 @@ TE + DiT 仍在 2×RK1828 上（rk1820 / RKNN3）⇒ 两者**物理分开**
 
 **验收（2026-11-04，全部板端实机）**：webui app 路径
 `POST /api/media-generator/generate` —— **8 步 33.61 s / 20 步 69.32 s /
-28 步 93.04 s**，进度流（flow 1→N → vae → save）完整；
+28 步 93.04 s / 40 步 128.91 s**（40 步 = 官方 Qwen-Image-2.1 README 三个示例
+统一使用的推荐值，2026-11-05 加入 `VALID_STEPS`），进度流（flow 1→N → vae →
+save）完整；
 `fixed_noise=true` 同提示词两次独立请求 ⇒ PNG **逐字节相同**（md5 `2e9251f0…`）
 ⇒ 可当回归基线用。两张图之间 VAE 段 9481 → 9747 ms ⇒ **零 model_init**。
 
