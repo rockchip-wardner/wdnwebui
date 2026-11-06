@@ -3222,14 +3222,24 @@ class ComputeRegistry:
         showed it as stopped.
         """
         for inst in self._instances_of(model_id):
-            inst._probe_gen += 1  # 失效 in-flight probe 的 r
-            # 「关闭中」:置位期间并发启停请求会排队等它结束,而不是
-            # 把正在卸载的实例当成可复用的再 load 一次(rc=-6)。
-            inst._stop_depth += 1
-            try:
-                self._unload_one(inst, teardown)
-            finally:
-                inst._stop_depth -= 1
+            self.unload_one_instance(inst, teardown)
+
+    def unload_one_instance(self, inst: ModelInstance,
+                            teardown: bool = True) -> None:
+        """只卸载**这一个**实例（带 probe 失效 + 停止计数护栏）。
+
+        ``unload_instance(model_id)`` 按模型名**全量**遍历 —— 卸一张卡会连带
+        把同模型在别的卡上的实例一起卸掉（含 peer）。要「每个实例各卸一次」
+        走这个。不同于内部的 ``_unload_one``（裸操作，不带护栏）。
+        """
+        inst._probe_gen += 1  # 失效 in-flight probe 的 r
+        # 「关闭中」:置位期间并发启停请求会排队等它结束,而不是
+        # 把正在卸载的实例当成可复用的再 load 一次(rc=-6)。
+        inst._stop_depth += 1
+        try:
+            self._unload_one(inst, teardown)
+        finally:
+            inst._stop_depth -= 1
 
     def _unload_one(self, inst: ModelInstance, teardown: bool) -> None:
         """对单个实例跑 unload RPC + 状态回收(见 unload_instance)。"""
@@ -3437,6 +3447,10 @@ class ComputeRegistry:
         Per "走 run.py 启动流程" semantics: we do NOT auto-bind after
         respawn. The worker comes back up in ``not_loaded`` and the
         user must re-select an NPU on the compute-config page.
+
+        ``allow_adopt=False``：重启**本机**模型就该起**本机**的 worker。
+        默认 True 会 adopt LAN 上的同名 peer（或把 ``_instances`` 里已有的
+        peer 实例直接交出去）→「重启本机服务」变成「本机改用 peer 的算力」。
         """
         try:
             self.stop_instance_local(model_id)
@@ -3444,7 +3458,7 @@ class ComputeRegistry:
             raise
         except Exception as e:  # noqa: BLE001
             LOG.warning("restart: stop %s raised: %s", model_id, e)
-        self.ensure_worker_for_model(model_id)
+        self.ensure_worker_for_model(model_id, allow_adopt=False)
 
     def stop_all_local(self) -> None:
         """Stop every spawned worker (proc != None). Adopted peers

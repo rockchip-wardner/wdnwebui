@@ -162,7 +162,7 @@ def _job(state: str, name: str = "Probe-Model", error: str = "") -> dict:
 
 
 with sync_playwright() as pw:
-    browser = pw.chromium.launch(args=["--no-sandbox"])
+    browser = pw.chromium.launch(args=["--no-sandbox", "--mute-audio"])
     page = browser.new_page(viewport={"width": 1600, "height": 1200})
     errs: list[str] = []
     page.on("pageerror", lambda e: errs.append(str(e)))

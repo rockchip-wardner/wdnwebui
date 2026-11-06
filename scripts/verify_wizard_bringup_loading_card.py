@@ -73,7 +73,7 @@ VTD_CFG = {
 def main() -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True,
-                                    args=["--no-sandbox", "--disable-gpu"])
+                                    args=["--no-sandbox", "--disable-gpu", "--mute-audio"])
         ctx = browser.new_context()
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))

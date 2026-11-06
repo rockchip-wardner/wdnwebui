@@ -62,7 +62,7 @@ def main() -> int:
     posts: list[dict] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--mute-audio"])
         page = browser.new_context(viewport={"width": 1400, "height": 900}).new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 

@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--mute-audio"])
         ctx = await browser.new_context()
         page = await ctx.new_page()
         # 注入 wizard.js 源码到 page 上下文

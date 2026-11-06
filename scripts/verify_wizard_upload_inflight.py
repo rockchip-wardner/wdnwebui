@@ -95,7 +95,7 @@ def main():
         print(f"  {'✅' if ok else '❌'} {name}" + (f"  — {detail}" if detail else ""))
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--mute-audio"])
         page_errors = []
 
         # ---------------- 主用例:上传在途 ---------------- #

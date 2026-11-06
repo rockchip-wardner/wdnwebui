@@ -88,7 +88,7 @@ ALT_SCENE = [
 print("=== 1. _capStates 四态判定（纯函数）===")
 
 with sync_playwright() as pw:
-    browser = pw.chromium.launch(args=["--no-sandbox"])
+    browser = pw.chromium.launch(args=["--no-sandbox", "--mute-audio"])
     ctx = browser.new_context(viewport={"width": 1600, "height": 1200})
     page = ctx.new_page()
     errs: list[str] = []

@@ -12,7 +12,7 @@ from playwright.sync_api import sync_playwright
 
 def main():
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--mute-audio"])
         ctx = browser.new_context()
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))

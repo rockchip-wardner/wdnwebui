@@ -190,7 +190,7 @@ def next_disabled(page) -> bool | None:
 
 def main() -> int:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--mute-audio"])
 
         # ---- 场景 A：用户场景（只起 npu0，#1 上是 omni）--------------------
         print("\n=== A: 半就绪（qwen3-vl-4b 只在 #0，#1 上是 omni） ===")

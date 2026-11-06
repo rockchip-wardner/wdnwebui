@@ -46,7 +46,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 async def main() -> int:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--mute-audio"])
         ctx = await browser.new_context(viewport={"width": 1500, "height": 1000})
         page = await ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))

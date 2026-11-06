@@ -382,7 +382,7 @@ def main() -> int:
     failed = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True,
-                                    args=["--no-sandbox", "--disable-gpu"])
+                                    args=["--no-sandbox", "--disable-gpu", "--mute-audio"])
         for name, fn in SCENARIOS:
             print(f"\n=== {name} ===", flush=True)
             ctx = browser.new_context(viewport={"width": 1400, "height": 900})

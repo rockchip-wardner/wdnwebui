@@ -97,7 +97,7 @@ def run(exe: str) -> None:
             headless=True,
             executable_path=exe,
             args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage"],
+                  "--disable-dev-shm-usage", "--mute-audio"],
         )
         ctx = browser.new_context(viewport={"width": 1400, "height": 900})
         page = ctx.new_page()

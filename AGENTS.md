@@ -14,10 +14,17 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
 
 - **Web framework**: FastAPI + Uvicorn (`run.py` boots `app.main:app` on
   `0.0.0.0:8000` with `reload=True`).
-  - **必须用 `run.py` 起**（不能直接 `uvicorn app.main:app`）：`run.py` 的
+  - **手动起服务时必须用 `run.py`**（不能直接 `uvicorn app.main:app`）：`run.py` 的
     `_ensure_wdndds_native_path()` 会把 wdndds 的原生库目录加进
     `LD_LIBRARY_PATH`；缺了它，spawn 出去的 `compute_worker` 加载不了
     cshim，会**秒退**（rc=0，表现为「功能未启用: swcap_vision_grounding」）。
+  - **生产 = systemd 单元 `wdnwebui.service`**，`ExecStart` 直接跑
+    `uvicorn app.main:app --host 0.0.0.0 --port 8000`，**不带 `--reload`**
+    → 改了后端代码必须 `sudo systemctl restart wdnwebui` 才生效。
+  - ⚠️ **重启会连坐杀掉 worker**：systemd 的 `KillMode=control-group` 把
+    cgroup 里的 `compute_worker` 一起 SIGTERM 掉 → 重启前确认
+    `compute.autostart` 有值，否则重启后板子没有任何算力，得手工
+    `POST /api/compute/instances` 把模型拉回来。
   - **别和 systemd 单元 `wdnwebui.service` 同时跑**：该单元
     `Restart=on-failure` + `RestartSec=5`，抢不到 8000 端口就每 5 秒
     重启一轮，而**每轮重启都会把 cgroup 里的 `compute_worker` 一起
@@ -161,6 +168,37 @@ wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
    `_resolve_tool_classes` / `_parse_qwen_tool_call` /
    `chat_runner.build_chatml_prompt` 也一并消失 —— 不是"不该做"，是
    **没有信息可做**。
+
+5. **本地算力与网络算力(peer)的权限边界：每块板子只管自己的算力**
+
+   实例 `_source`：`spawned` / `adopted_local` 是本机的，`adopted` 是**别的
+   板子**通过 LAN 提供的 service。卸载/停止 peer 的实例等于去动另一块板子
+   的 NPU 显存。
+
+   | 端点 | 本机实例 | peer(adopted) |
+   |---|---|---|
+   | `POST /compute/instances` | 启用（`allow_adopt=False`） | 403 |
+   | `DELETE /compute/instances` | 停该模型本机全部实例 | 403 |
+   | `POST /compute/restart` | 重启 → 起**本机** worker | 403 |
+   | `POST /compute/stop-all` | 逐实例 unload，进程保留 | **跳过**（进 `skipped`） |
+
+   两条实现约束：
+
+   - **按实例卸，不按模型名**。`unload_instance(model_id)` 按模型名**全量**
+     遍历 —— 卸一张卡会连带卸掉同模型在其它卡上的实例（含 peer）。要「每个
+     本机实例各卸一次」走 `unload_one_instance(inst)`。
+   - **重启不许 adopt peer**。`restart_instance_local` 调
+     `ensure_worker_for_model(model_id)` 必须带 `allow_adopt=False` ——
+     默认 True 会 adopt 同名 peer、或把 `_instances` 里已有的 peer 实例交出去
+     →「重启本机服务」变成「本机改用 peer 的算力」。
+
+   回归：`scripts/verify_peer_isolation.py`（API 层）+
+   `scripts/verify_stop_local_skips_adopted.py`（registry 层）。
+
+   > ⚠️ **回归脚本必须 mock `PUT`/`DELETE /api/compute/active-app`** ——
+   > `DELETE` 会把 `compute.autostart` **一起清空**（`clear_active_app`），
+   > 回归脚本不该改生产配置。`PUT` 会把承载该卡 caps 的 `(model, npu)`
+   > 增量写进 `compute.autostart`。
 
 ## 模型分发：worker 配置随模型文件夹（v0.9.2 之后）
 

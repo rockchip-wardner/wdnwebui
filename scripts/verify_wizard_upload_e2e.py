@@ -61,7 +61,7 @@ def main():
         print(f"  {'✅' if ok else '❌'} {name}" + (f"  — {detail}" if detail else ""))
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--mute-audio"])
         ctx = browser.new_context()
         page = ctx.new_page()
         errors = []

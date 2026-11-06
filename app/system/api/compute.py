@@ -833,13 +833,15 @@ async def put_hardware_capabilities(payload: HardwareCapabilityUpdate) -> dict:
 
 @router.post("/compute/stop-all")
 async def stop_all_instances() -> dict:
-    """全部停止 — 释放所有 model 的 LLMSession (worker 进程保留)。
-    spawned / adopted_local 走本机 RPC;adopted peers 也走 RPC 让对端
-    释放,但本机不终止 worker。
+    """全部停止 — 释放所有**本机** model 的 LLMSession (worker 进程保留)。
+
+    只动本机实例(spawned / adopted_local)。**adopted peer 不动** —— 那是
+    别的板子的算力,本机无权启停(每块板子只管自己的本地算力,与
+    ``DELETE /api/compute/instances`` 的 403 护栏同一条原则)。
 
     **有意与 ``DELETE /api/compute/instances`` 语义不同**：那个端点
     （算力页"禁用"单个）现在会关闭 worker 进程,这个不会。它只
-    ``unload_instance`` —— 进程留着,重新点"启用"走 RPC load 重载。
+    ``unload`` —— 进程留着,重新点"启用"走 RPC load 重载。
     别把两者当成同一件事。"""
     reg = get_registry()
     stopped: list[str] = []
@@ -853,9 +855,15 @@ async def stop_all_instances() -> dict:
         if kind:
             skipped.append(f"{inst.model_id}:{kind}")
             continue
+        # peer 是别的板子的算力 → 本机无权卸。
+        if inst._source == "adopted":
+            skipped.append(f"{inst.model_id}:peer")
+            continue
         try:
-            reg.unload_instance(inst.model_id)
-            stopped.append(inst.model_id)
+            # 按**实例**卸(按模型名会连带卸掉同模型在其它卡上的实例,含 peer)。
+            reg.unload_one_instance(inst)
+            if inst.model_id not in stopped:
+                stopped.append(inst.model_id)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{inst.model_id}: {e}")
     return {
