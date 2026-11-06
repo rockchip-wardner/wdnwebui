@@ -896,3 +896,120 @@
   color: #6b7280;
   font-size: 12px;
 }
+
+/* ------------------------------------------------------------------ *
+ * 图片字段（`"type": "image"`）的拖拽上传区
+ *
+ * 与上面的 `.wd-wizard-image-preview`（文件字段的预览，走 thumbnail
+ * 端点）是**两套**：那个的值是**路径**，这个的值是**data URL**。
+ * ------------------------------------------------------------------ */
+.wd-wizard-image {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wd-wizard-image-drop {
+  position: relative;
+  border: 1.5px dashed #d1d5db;
+  border-radius: 8px;
+  background: #fbfbfd;
+  padding: 10px;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.wd-wizard-image-drop:hover {
+  border-color: #2563eb;
+  background: #f7f9ff;
+}
+.wd-wizard-image-drop:focus-visible {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, .12);
+}
+.wd-wizard-image-drop.is-drag {
+  border-color: #2563eb;
+  border-style: solid;
+  background: #eef3ff;
+}
+.wd-wizard-image-drop.is-error {
+  border-color: #dc2626;
+  background: #fef2f2;
+}
+.wd-wizard-image-file {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.wd-wizard-image-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 8px;
+  text-align: center;
+}
+.wd-wizard-image-icon {
+  width: 28px;
+  height: 28px;
+  color: #6b7280;
+}
+.wd-wizard-image-text {
+  font-size: 13px;
+  color: #374151;
+}
+.wd-wizard-image-note {
+  font-size: 11px;
+  color: #6b7280;
+  opacity: .8;
+}
+.wd-wizard-image-preview-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.wd-wizard-image-preview-img {
+  width: 88px;
+  height: 88px;
+  object-fit: contain;
+  border-radius: 6px;
+  border: 1px solid #e5e7eb;
+  background: #f3f4f6;
+  display: block;
+}
+.wd-wizard-image-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #6b7280;
+  min-width: 0;
+}
+.wd-wizard-image-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+.wd-wizard-image-clear {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  color: inherit;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.wd-wizard-image-clear:hover {
+  border-color: #dc2626;
+  color: #dc2626;
+}
+.wd-wizard-image-error {
+  font-size: 12px;
+  color: #b91c1c;
+}

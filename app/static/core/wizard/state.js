@@ -973,6 +973,203 @@
     return toggleLbl;
   }
 
+  /**
+   * 图片字段（`type: "image"`）—— **拖拽上传**一张图。
+   *
+   * 为什么要有这个类型：图生图这类卡片**必须有输入图**，而向导原本只能
+   * 填文本/数字/勾选（视频卡的「源」是另一套机制，值是**路径**）。
+   * 用户被卡在「向导里没法给图 ⇒ 必须先跳过向导去功能页上传」。
+   *
+   * 值的口径：**data URL**（`data:image/png;base64,....`）。
+   *  - 预览直接拿它当 `<img src>` ⇒ 不需要 thumbnail_endpoint；
+   *  - 应用侧（卡片）剥掉前缀就是裸 base64 ⇒ 和「文件字段存路径」那套
+   *    完全不同的口径，卡片得自己处理。**字段类型不同、语义不同，别混用**。
+   *
+   * ⚠️ **不落 localStorage**：base64 一张图就几百 KB~几 MB，
+   * `localStorage.setItem` 是**整体覆盖**的 —— 写不下时抛配额异常，
+   * 整个 values 对象（连其它字段）都存不进去。
+   * ⇒ 字段声明 `"transient": true` ⇒ `_publishValues` 落盘前把它剔掉。
+   * 代价：向导刷新/切走再回来，图要重新拖（这是对的 —— 几百 KB 的
+   * base64 不该躺在 localStorage 里）。
+   */
+  function _buildImageField(field, state) {
+    const cur = state.values[field.id];
+    const box = _ce("div", WIZARD_NS + "image");
+    box.dataset.fieldId = field.id;
+    box.dataset.fieldType = "image";
+    box.dataset.fileName = state.values[field.id + "__name"] || "";
+
+    // 值藏在 hidden input 里；box.value 用 defineProperty 代理到它 ⇒
+    // `_formStepCanNext`（required 判定）和 `_captureValues`（取值）
+    // 这两条**通用**路径**零改动**就能用（它们只看 el.value）。
+    const valueInput = _ce("input", WIZARD_NS + "image-value");
+    valueInput.type = "hidden";
+    box.appendChild(valueInput);
+    Object.defineProperty(box, "value", {
+      get() { return valueInput.value; },
+      set(v) { valueInput.value = v == null ? "" : String(v); },
+      configurable: true,
+    });
+
+    const fileInput = _ce("input", WIZARD_NS + "image-file");
+    fileInput.type = "file";
+    fileInput.accept = field.accept || "image/png,image/jpeg,image/webp";
+    const maxBytes = Number(field.max_bytes) || (12 * 1024 * 1024);
+
+    const drop = _ce("div", WIZARD_NS + "image-drop");
+    drop.tabIndex = 0;
+    drop.setAttribute("role", "button");
+    drop.setAttribute("aria-label", "选择或拖入图片");
+
+    const empty = _ce("div", WIZARD_NS + "image-empty");
+    // ⚠️ 板端**没有 emoji / 符号字体**（🖼 会渲染成豆腐块 □）⇒ 内联 SVG
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.setAttribute("class", WIZARD_NS + "image-icon");
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("aria-hidden", "true");
+    icon.setAttribute("fill", "none");
+    icon.setAttribute("stroke", "currentColor");
+    icon.setAttribute("stroke-width", "1.6");
+    icon.setAttribute("stroke-linecap", "round");
+    icon.setAttribute("stroke-linejoin", "round");
+    icon.innerHTML =
+      '<rect x="3" y="4" width="18" height="16" rx="2.5"/>' +
+      '<circle cx="8.6" cy="9.6" r="1.6"/>' +
+      '<path d="M3.6 17.6l4.7-4.6a2 2 0 0 1 2.7 0l3.1 3 1.6-1.5a2 2 0 0 1 2.7 0l2.4 2.3"/>';
+    empty.appendChild(icon);
+    empty.appendChild(_ce("span", WIZARD_NS + "image-text",
+      field.placeholder || "点击选择图片，或把图片拖到这里"));
+    empty.appendChild(_ce("span", WIZARD_NS + "image-note",
+      "PNG / JPEG / WebP · 最大 " + Math.round(maxBytes / 1024 / 1024) + " MB"));
+
+    const preview = _ce("div", WIZARD_NS + "image-preview-wrap");
+    const img = _ce("img", WIZARD_NS + "image-preview-img");
+    img.alt = "已选择的图片";
+    const meta = _ce("div", WIZARD_NS + "image-meta");
+    const nameEl = _ce("span", WIZARD_NS + "image-name", "");
+    const clearBtn = _ce("button", WIZARD_NS + "image-clear", "×");
+    clearBtn.type = "button";
+    clearBtn.title = "换一张";
+    meta.appendChild(nameEl);
+    meta.appendChild(clearBtn);
+    preview.appendChild(img);
+    preview.appendChild(meta);
+
+    drop.appendChild(empty);
+    drop.appendChild(preview);
+    box.appendChild(drop);
+    box.appendChild(fileInput);
+
+    const errEl = _ce("div", WIZARD_NS + "image-error");
+    errEl.style.display = "none";
+    box.appendChild(errEl);
+
+    function showError(msg) {
+      if (msg) {
+        errEl.textContent = msg;
+        errEl.style.display = "";
+        drop.classList.add("is-error");
+      } else {
+        errEl.textContent = "";
+        errEl.style.display = "none";
+        drop.classList.remove("is-error");
+      }
+    }
+
+    function paint() {
+      const v = box.value;
+      const has = !!v;
+      empty.style.display = has ? "none" : "";
+      preview.style.display = has ? "" : "none";
+      if (has) img.src = v;
+      else img.removeAttribute("src");
+    }
+
+    function accept(file) {
+      if (!file) return;
+      if (!/^image\//.test(file.type || "")) {
+        showError("请选择图片文件（当前是 " + (file.type || "未知类型") + "）");
+        return;
+      }
+      if (file.size > maxBytes) {
+        showError("图片太大：" + Math.round(file.size / 1024 / 1024) + " MB"
+          + "（上限 " + Math.round(maxBytes / 1024 / 1024) + " MB）");
+        return;
+      }
+      showError("");
+      const reader = new FileReader();
+      reader.onerror = () => showError("读取图片失败，请重试。");
+      reader.onload = () => {
+        const dataUrl = String(reader.result || "");
+        if (!dataUrl.startsWith("data:")) {
+          showError("图片读取结果异常，请重试。");
+          return;
+        }
+        box.value = dataUrl;
+        box.dataset.fileName = file.name || "";
+        nameEl.textContent = file.name || "";
+        paint();
+        // 冒泡的 change ⇒ _bindFieldLive → _captureValues 落进 state.values
+        box.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      reader.readAsDataURL(file);
+    }
+
+    fileInput.addEventListener("change", () => {
+      const f = fileInput.files && fileInput.files[0];
+      fileInput.value = "";
+      accept(f);
+    });
+    clearBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      box.value = "";
+      box.dataset.fileName = "";
+      nameEl.textContent = "";
+      paint();
+      showError("");
+      box.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    drop.addEventListener("click", (e) => {
+      if (e.target === clearBtn) return;
+      fileInput.click();
+    });
+    drop.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        fileInput.click();
+      }
+    });
+    ["dragenter", "dragover"].forEach((ev) =>
+      drop.addEventListener(ev, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        drop.classList.add("is-drag");
+      }));
+    ["dragleave", "dragend"].forEach((ev) =>
+      drop.addEventListener(ev, (e) => {
+        e.preventDefault();
+        drop.classList.remove("is-drag");
+      }));
+    drop.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      drop.classList.remove("is-drag");
+      const dt = e.dataTransfer;
+      const f = dt && dt.files && dt.files[0];
+      accept(f);
+    });
+
+    // 恢复上次（内存态）已选的值
+    if (cur) {
+      box.value = cur;
+      nameEl.textContent = state.values[field.id + "__name"] || "";
+    } else {
+      nameEl.textContent = "";
+    }
+    paint();
+    return box;
+  }
+
   /** Form-step validation for fields that are rendered as components. */
   function _formStepCanNext(stepDef) {
     for (const field of (stepDef.fields || [])) {
@@ -1070,6 +1267,10 @@
           break;
         case "checkbox":
           el = _buildToggle(field, state);
+          break;
+        case "image":
+          // 拖拽上传区（值 = data URL，见 _buildImageField 的注释）
+          el = _buildImageField(field, state);
           break;
         case "select":
           el = _ce("select", WIZARD_NS + "input");
@@ -1473,10 +1674,17 @@
         }
       } else if ((field.browse || field.upload)
                  && field.type !== "number" && field.type !== "checkbox"
-                 && field.type !== "select" && field.type !== "query_groups") {
+                 && field.type !== "select" && field.type !== "query_groups"
+                 && field.type !== "image") {
         // 通用文件字段（图片等）：wizard.json 显式声明 browse / upload 才
         // 渲染。与视频源字段（-source）互斥 —— 后者有自己的按钮行与画布
         // 搬运逻辑。existing 卡未声明这两个属性 → 行为零变化。
+        //
+        // ⚠️ **排除 `type: "image"`**：那套的值是**服务端路径**
+        // （`el.value = data.path`，要 upload_endpoint），而 image 字段
+        // 的值是 **data URL**（本地文件直接读成 base64）。两套语义混在
+        // 一个字段上 ⇒ 值口径自相矛盾（应用侧拿到路径还是 base64？）。
+        // image 字段有自己的拖拽区实现，别让它落进这条分支。
         const row = _ce("div", WIZARD_NS + "input-row");
         (field.type === "textarea" ? wrap : row).appendChild(el);
         if (field.browse && window.VdFsModal) {
@@ -1748,6 +1956,15 @@
         // 完成配置摘要优先用 summary_label(短标题),否则用 label/form id
         const summaryLabel = f.summary_label || f.label || f.id;
         row.appendChild(_ce("span", null, summaryLabel + ":"));
+        if (f.type === "image") {
+          // 图片字段的值是**整段 data URL**（几百 KB~几 MB）⇒ 绝对不能
+          // 打进摘要页。只显示文件名（另存在 <fid>__name）。
+          const nm = state.values[f.id + "__name"] || "";
+          hasAny = true;
+          row.appendChild(_ce("span", WIZARD_NS + "summary-val", nm || "已选择"));
+          summary.appendChild(row);
+          return;
+        }
         if (f.type === "query_groups" && Array.isArray(v)) {
           const groups = v.filter((g) => g && (g.text || g.imagePath));
           if (!groups.length) return;
@@ -1881,12 +2098,50 @@
   // Step navigation
   // ------------------------------------------------------------------ #
 
+  /** 声明了 `"transient": true` 的字段 id（图片 base64 之类的大 blob）。 */
+  function _transientFieldIds(cfg) {
+    const ids = [];
+    (cfg.steps || []).forEach((s) => (s.fields || []).forEach((f) => {
+      if (f && f.transient === true) ids.push(f.id);
+    }));
+    return ids;
+  }
+
+  /** 落盘用的 values 副本 —— 剔掉 transient 字段。
+   *
+   * 为什么要剔：`localStorage.setItem` 是**整体覆盖**，配额爆了会抛异常
+   * ⇒ **整个 values 对象都存不进去**（连提示词、步数这些小字段一起丢）。
+   * 一张图的 base64 就几百 KB~几 MB，不剔必然爆。
+   */
+  function _persistableValues(cfg, values) {
+    const drop = _transientFieldIds(cfg);
+    if (!drop.length) return values;
+    const out = {};
+    Object.keys(values).forEach((k) => {
+      if (drop.indexOf(k) >= 0) return;
+      if (k.slice(-6) === "__name" && drop.indexOf(k.slice(0, -6)) >= 0) return;
+      out[k] = values[k];
+    });
+    return out;
+  }
+
   // 落 localStorage + 刷新 debug hook;抽出来是为了让「上传成功直写
   // state.values」这条不经 _captureValues 的路径保持同一落盘口径。
   function _publishValues(state, cfg) {
-    _lsSave(state.app.id, cfg, state.values);
+    const persist = _persistableValues(cfg, state.values);
+    _lsSave(state.app.id, cfg, persist);
     // debug hook for test/e2e visibility(零开销,生产环境无副作用)
-    try { window._wd_wizard_values = JSON.parse(JSON.stringify(state.values)); } catch (_) {}
+    try { window._wd_wizard_values = JSON.parse(JSON.stringify(persist)); } catch (_) {}
+    // transient 字段（图片 base64）单独一个 hook：它**不进 localStorage**，
+    // 也不进上面的深拷贝 —— 几百 KB 的字符串每次按键都拷一遍太浪费。
+    try {
+      const t = {};
+      _transientFieldIds(cfg).forEach((id) => {
+        if (state.values[id] != null) t[id] = state.values[id];
+        if (state.values[id + "__name"] != null) t[id + "__name"] = state.values[id + "__name"];
+      });
+      window._wd_wizard_transient = t;
+    } catch (_) {}
   }
 
   /**
@@ -1924,6 +2179,19 @@
     const body = _q("#" + WIZARD_NS + "body");
     body.querySelectorAll("[data-field-id]").forEach((el) => {
       const fid = el.dataset.fieldId;
+      if (el.dataset.fieldType === "image") {
+        // 图片字段：值 = data URL；文件名另存一条（summary 要显示，
+        // 不能把整段 base64 打到完成页上）。
+        const v = el.value || "";
+        if (v) {
+          state.values[fid] = v;
+          state.values[fid + "__name"] = el.dataset.fileName || "";
+        } else {
+          delete state.values[fid];
+          delete state.values[fid + "__name"];
+        }
+        return;
+      }
       if (el.dataset.fieldType === "query_groups") {
         const groups = window.QueryGroups
           ? window.QueryGroups.getValues(el) : [];
@@ -2317,7 +2585,19 @@
   // Mount / Unmount
   // ------------------------------------------------------------------ #
   async function mount(app, cfg) {
-    if (_active) unmount();
+    // ⭐ 卸载上一张卡的向导时，**跨卡**要静默（silent=true）。
+    //
+    // 踩过的坑（2026-11-06）：这里原来是 `unmount()`（非静默），而
+    // unmount(silent=false) 的语义是「用户主动跳过/完成向导 → 把原
+    // page 重新显示出来」。于是**从卡 A（向导挂着）切到卡 B** 时：
+    //   showPage(B) → mount(B) → unmount(A) → **把 A 的 page 重新显示**
+    // ⇒ 屏幕上同时出现「B 的向导」和「A 的页面」(A 排在下面)，
+    //   布局看起来像两张卡叠在一起。
+    //
+    // 静默卸载只做「拆 DOM」，不动 page 的显隐 ⇒ A 的 page 保持
+    // ROUTER 已经隐藏好的状态。同一张卡重挂向导时保持原行为
+    // （非静默：page 先亮后暗，看不出来；而且「上次停在哪一步」要保留）。
+    if (_active) unmount(_active.app.id !== app.id);
     // 隐藏原应用 page
     const pageSection = document.getElementById("page-" + app.id);
     if (pageSection) pageSection.classList.add("hidden");
