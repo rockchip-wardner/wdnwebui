@@ -1,5 +1,5 @@
 {
-  "label": "[文生图]Qwen-Image-2.1",
+  "label": "[GEN]图片生成v2.1",
   "capability_types": [
     "swcap_text_to_image"
   ],
