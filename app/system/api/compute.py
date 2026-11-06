@@ -229,7 +229,10 @@ class AutostartEntry(BaseModel):
 
     @model_validator(mode="after")
     def _requires_cards(self):
-        requires = int(MODEL_PRESETS[self.model].get("requires_cards", 1) or 1)
+        # ⚠️ 用**动态**卡数（选中布局的 ep_cards），不是 manifest 里的静态
+        #    requires_cards —— 「3×1828」布局要绑 3 张 EP 卡，「2×1828+3588」
+        #    只绑 2 张。静态值只能表达后者。
+        requires = get_registry().effective_requires_cards(self.model)
         cards = (self.npu_index if isinstance(self.npu_index, list)
                  else [self.npu_index])
         if len(cards) != requires:
@@ -464,8 +467,9 @@ async def start_instance(req: InstanceRequest) -> dict:
     reg = get_registry()
     npu_indices = (req.npu_index if isinstance(req.npu_index, list)
                    else [req.npu_index])
-    preset = MODEL_PRESETS.get(req.model, {})
-    requires_cards = int(preset.get("requires_cards", 1) or 1)
+    # ⚠️ 动态卡数：EP 卡数**取决于选中的硬件布局**（「2×1828+3588」绑 2 张，
+    #    「3×1828」绑 3 张），静态 requires_cards 只能表达前者。
+    requires_cards = reg.effective_requires_cards(req.model)
     if requires_cards > 1:
         if len(npu_indices) != requires_cards:
             if len(npu_indices) == 1:

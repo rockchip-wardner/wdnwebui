@@ -149,6 +149,35 @@ class WorkerManifest:
     #: Number of RK182x cards one worker instance must occupy. ``1`` for
     #: every single-card model; the segmented 9B export needs two.
     requires_cards: int = 1
+    #: **设备拓扑要求**（可选）：这个模型一共要占几个 NPU 设备、允许哪几种
+    #: 硬件布局。``requires_cards`` 只数**本机 EP 协卡**，而有些模型还要
+    #: 占住**第三个 NPU 设备** —— 那个设备不是 EP 协卡，算力卡列表里
+    #: **看不见**：Qwen-Image-2.1 的 TE/DiT 占 2 张 RK1828，**VAE 必须独占**
+    #: 第三个 NPU（第三张 1828 协卡，或本机 RK3588 自带的 NPU / rknn2）。
+    #:
+    #: 结构（``layouts`` 是**可选布局**，按顺序取第一个本机满足的）::
+    #:
+    #:     "card_requirements": {
+    #:       "total_devices": 3,
+    #:       "layouts": [
+    #:         {"id": "2x182x+3588", "label": "2×RK1828 协卡 + 本机 RK3588 NPU",
+    #:          "ep_cards": 2, "local_npu": 1,
+    #:          "local_label": "本机 RK3588 NPU（VAE 解码）",
+    #:          "required_files": ["vae_qwenimage21-512.3588.rknn"]},
+    #:         {"id": "3x182x", "label": "3×RK1828 协卡",
+    #:          "ep_cards": 3, "local_npu": 0,
+    #:          "required_files": ["vae_qwenimage21-512.seg0.1828.rknn"]}
+    #:       ]
+    #:     }
+    #:
+    #: ⚠️ **EP 协卡数是动态的**：布局 A 绑 2 张、布局 B 绑 3 张 ⇒
+    #: 静态 ``requires_cards`` 只能表达前者。真正口径是**选中布局**的
+    #: ``ep_cards``（``registry.effective_requires_cards()``）；worker
+    #: 侧校验的是**允许数量的集合**（``workers/_base.py::allowed_card_counts``）。
+    #:
+    #: 判定见 ``app/core/compute/cards.py::evaluate_card_requirements``；
+    #: 一个布局都不满足 ⇒ **不允许运行这个模型**（算力页禁用 + 后端 400）。
+    card_requirements: Dict[str, Any] = field(default_factory=dict)
     memory_estimate_mb: int = 0
     estimated_init_seconds: int = 60
     #: How long **one** inference of this model may take, in seconds.
@@ -229,6 +258,7 @@ class WorkerManifest:
             "model_dir_env": self.model_dir_env,
             "instance_name": self.instance_name,
             "requires_cards": self.requires_cards,
+            "card_requirements": dict(self.card_requirements),
             "memory_estimate_mb": self.memory_estimate_mb,
             "estimated_init_seconds": self.estimated_init_seconds,
             "infer_timeout_s": self.infer_timeout_s,
@@ -249,6 +279,48 @@ class WorkerManifest:
 # --------------------------------------------------------------------------- #
 # Scanning
 # --------------------------------------------------------------------------- #
+def _parse_card_requirements(raw: Any) -> Dict[str, Any]:
+    """把 manifest 的 ``card_requirements`` 归一化成 dict。
+
+    结构见 :attr:`WorkerManifest.card_requirements` 的说明。**宽容解析**：
+    字段缺失 / 类型不对就退化成空 dict（⇒ 该模型不受设备拓扑约束），
+    绝不因为声明写歪了就把整个 manifest 判 fatal —— 那是「模型不可用」
+    与「声明有笔误」两件事，后者在日志里说一声更合适。
+    """
+    if not isinstance(raw, dict):
+        if raw:
+            LOG.warning("card_requirements 不是对象，已忽略")
+        return {}
+    layouts = raw.get("layouts")
+    if not isinstance(layouts, list):
+        layouts = []
+    out: Dict[str, Any] = {}
+    try:
+        out["total_devices"] = int(raw.get("total_devices") or 0)
+    except (TypeError, ValueError):
+        out["total_devices"] = 0
+    clean = []
+    for lay in layouts:
+        if not isinstance(lay, dict):
+            continue
+        item: Dict[str, Any] = {
+            "id": str(lay.get("id") or ""),
+            "label": str(lay.get("label") or lay.get("id") or ""),
+        }
+        for key in ("ep_cards", "local_npu"):
+            try:
+                item[key] = int(lay.get(key) or 0)
+            except (TypeError, ValueError):
+                item[key] = 0
+        # 本机 NPU 那部分的说明（前端「运行在」要显示第三个设备）
+        item["local_label"] = str(lay.get("local_label") or "")
+        files = lay.get("required_files")
+        item["required_files"] = [str(f) for f in files] if isinstance(files, list) else []
+        clean.append(item)
+    out["layouts"] = clean
+    return out
+
+
 def _validate(raw: Any, stem: str, *, canonical: bool = False
               ) -> tuple[Optional[WorkerManifest], List[str]]:
     errors: List[str] = []
@@ -312,7 +384,8 @@ def _validate(raw: Any, stem: str, *, canonical: bool = False
     known = {
         "id", "label", "capability_types", "spec_factory", "worker_name",
         "model_dir_name", "model_dir", "model_dir_env", "instance_name",
-        "requires_cards", "memory_estimate_mb", "estimated_init_seconds",
+        "requires_cards", "card_requirements",
+        "memory_estimate_mb", "estimated_init_seconds",
         "infer_timeout_s",
         "description", "notes", "available_targets", "hidden", "display_order",
     }
@@ -334,6 +407,7 @@ def _validate(raw: Any, stem: str, *, canonical: bool = False
         model_dir_env=raw.get("model_dir_env", ""),
         instance_name=raw.get("instance_name", ""),
         requires_cards=int(raw.get("requires_cards", 1)),
+        card_requirements=_parse_card_requirements(raw.get("card_requirements")),
         memory_estimate_mb=int(raw.get("memory_estimate_mb", 0)),
         estimated_init_seconds=int(raw.get("estimated_init_seconds", 60)),
         infer_timeout_s=infer_timeout_s,

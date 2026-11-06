@@ -3037,6 +3037,33 @@ body.dg-modal-open .back-home-btn {
   cursor: not-allowed;
 }
 
+/* v0.16: 「运行在」里的**第三个设备**（本机 SoC 自带的 NPU）。
+ * 它不是 EP 协卡 ⇒ 不可勾选 —— 由 worker 在 open 阶段自己挑（Qwen-Image-2.1
+ * 的 VAE 跑本机 rknn2 NPU）。用 chip 样式与可选的卡区分开。 */
+.cc-target-fixed {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  padding: 2px 8px;
+  border: 1px dashed var(--border, #d1d5db);
+  border-radius: 4px;
+  color: var(--text-muted, #6b7280);
+  background: rgba(0, 0, 0, 0.03);
+  cursor: default;
+  user-select: none;
+}
+.cc-target-fixed-icon {
+  opacity: 0.7;
+}
+.cc-target-fixed-tag {
+  font-size: 10px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.08);
+  color: var(--text-muted, #6b7280);
+}
+
 /* v0.8: 加载倒计时（loading 状态显示在 NPU picker 下方） */
 .cc-load-countdown {
   margin-top: 4px;
@@ -3079,6 +3106,48 @@ body.dg-modal-open .back-home-btn {
   font-size: 11px;
   color: #92400e;
   opacity: 0.85;
+}
+
+/* v0.16: 设备拓扑要求块 —— 「这个模型要占几个 NPU 设备 / 本机凑不凑得齐」。
+ * 绿底=满足（并显示选中的布局）；红底=不满足（并逐条列出缺什么）。
+ * 与 cc-missing-dir（黄底，目录缺失）区分开：这是**硬件**问题，不是路径。 */
+.cc-device-req {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  border-radius: 6px;
+}
+.cc-device-req.is-blocked {
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+.cc-device-req-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #065f46;
+}
+.cc-device-req.is-blocked .cc-device-req-label {
+  color: #991b1b;
+}
+.cc-device-req-ok {
+  font-size: 11px;
+  color: #047857;
+  font-weight: 600;
+}
+.cc-device-req-bad {
+  font-size: 11px;
+  color: #b91c1c;
+}
+.cc-device-req-layout {
+  font-size: 11px;
+  color: #6b7280;
+  font-family: var(--mono);
+}
+.cc-device-req.is-blocked .cc-device-req-layout {
+  color: #9ca3af;
 }
 
 /* v0.8: 错误 banner 单条右上的 ✕ 按钮 */

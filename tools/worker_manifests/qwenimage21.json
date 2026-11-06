@@ -5,10 +5,37 @@
   ],
   "spec_factory": "qwen_image_21_512",
   "worker_name": "qwenimg",
-  "model_dir_name": "qwenimage21",
+  "model_dir_name": "Qwen-Image-2.1",
   "model_dir_env": "WDNAI_QWEN_IMAGE_21_DIR",
   "instance_name": "qwenimage21",
   "requires_cards": 2,
+  "card_requirements": {
+    "total_devices": 3,
+    "layouts": [
+      {
+        "id": "2x182x+3588",
+        "label": "2×RK1828 协卡 + 本机 RK3588 NPU",
+        "ep_cards": 2,
+        "local_npu": 1,
+        "local_label": "本机 RK3588 NPU（VAE 解码）",
+        "required_files": [
+          "vae_qwenimage21-512.3588.rknn"
+        ]
+      },
+      {
+        "id": "3x182x",
+        "label": "3×RK1828 协卡",
+        "ep_cards": 3,
+        "local_npu": 0,
+        "required_files": [
+          "vae_qwenimage21-512.seg0.1828.rknn",
+          "vae_qwenimage21-512.seg1.1828.rknn",
+          "vae_qwenimage21-512.seg2.1828.rknn",
+          "vae_qwenimage21-512.seg3.1828.rknn"
+        ]
+      }
+    ]
+  },
   "memory_estimate_mb": 10200,
   "estimated_init_seconds": 110,
   "infer_timeout_s": 300,

@@ -2670,6 +2670,11 @@ const ComputeConfigPage = {
         submodels:            [],
         description:          s.description || "",
         requires_cards:       Number(s.requires_cards || 1),
+        // ⭐ 设备拓扑要求（EP 协卡 + 本机 NPU）。requires_cards 只数 EP
+        //    协卡；Qwen-Image-2.1 这类模型还要占住第三个 NPU 设备（本机
+        //    3588 的 NPU 或第三张 1828）—— 那个设备不在算力卡列表里。
+        requires_devices:     Number(s.requires_devices || 1),
+        card_requirements:    s.card_requirements || null,
         available_targets:    s.available_targets || ["182x"],
       };
       const isLocal = s._source !== "adopted";
@@ -2681,6 +2686,10 @@ const ComputeConfigPage = {
         s.npu_index,
         (s.npu_indices || []).join(","),
         s.requires_cards || 1,
+        s.requires_devices || 1,
+        // 设备拓扑判定结果会变（插了第三张卡 / 装了 rknn2-runtime /
+        // 模型包文件变了）⇒ 进 sig，让卡片重建并刷新阻断状态。
+        (s.card_requirements && s.card_requirements.ok) ? "devok" : "devno",
         s.pid,
         s.error || "",
         s.label,
@@ -3182,6 +3191,12 @@ const ComputeConfigPage = {
     missingDirEl.style.display = "none";
     body.appendChild(missingDirEl);
 
+    // 设备拓扑要求块（EP 协卡 + 本机 NPU）：永远占位，hidden via display:none
+    const deviceReqEl = document.createElement("div");
+    deviceReqEl.className = "cc-device-req";
+    deviceReqEl.style.display = "none";
+    body.appendChild(deviceReqEl);
+
     // radio fieldset 占位（_updateLocalCardState 第一次调用会替换成真 fieldset）
     const radioFieldsetEl = document.createElement("fieldset");
     radioFieldsetEl.className = "cc-target-pick";
@@ -3201,7 +3216,7 @@ const ComputeConfigPage = {
 
     card._h = {
       titleEl, autostartBadge, pidEl, restartBtn, toggle, toggleInput,
-      body, capsEl, missingDirEl, radioFieldsetEl,
+      body, capsEl, missingDirEl, deviceReqEl, radioFieldsetEl,
       countdownEl, errorEl,
       // radioSig：上一次 _makeTargetFieldset 的输入签名；
       // 变化时 replaceWith 替换 fieldset，未变则完全不动 —— 保证用户
@@ -3241,6 +3256,16 @@ const ComputeConfigPage = {
     const modelCardCount = this._modelCards(cards || []).length;
     const insufficientCards = requiresCards > 1
       && modelCardCount < requiresCards;
+    // ⭐ 设备拓扑闸门：后端已按 manifest 的 card_requirements 评估过
+    //    「EP 协卡 + 本机 NPU」是否凑得齐。不满足 ⇒ 不允许运行这个
+    //    模型（后端 ensure_worker_for_model 也会抛 400，这里只是提前
+    //    把开关锁掉 + 说清缺什么）。
+    const devReq = (svc && svc.card_requirements)
+                || (meta && meta.card_requirements) || null;
+    const deviceBlocked = !!(devReq && devReq.ok === false);
+    const devTotal = Number(
+      (devReq && devReq.total_devices) || (meta && meta.requires_devices) || 1
+    );
 
     // ---- card 整体 class
     card.dataset.source = svc._source || "spawned";
@@ -3288,7 +3313,7 @@ const ComputeConfigPage = {
     h.toggle.classList.toggle("is-load", isLoad);
     h.toggle.classList.toggle("is-err", isErr);
     h.toggle.classList.toggle(
-      "is-disabled", noCards || isPeer || insufficientCards);
+      "is-disabled", noCards || isPeer || insufficientCards || deviceBlocked);
 
     const targetPicked = this._hasTargetPicked(card.dataset.model, svc);
     const needsTarget = !isOn && !isErr && !isMissingDir
@@ -3297,6 +3322,7 @@ const ComputeConfigPage = {
     // 前端先锁掉能少一轮无谓请求。
     const toggleBlocked = noCards
                        || insufficientCards
+                       || deviceBlocked
                        || isLoad
                        || isErr
                        || isPeer
@@ -3308,6 +3334,9 @@ const ComputeConfigPage = {
         const peerLabel = svc._peer_name || "其他板子";
         h.toggleInput.setAttribute("aria-label",
           `${meta.label}：由远端 ${peerLabel} 提供，本机无权启停`);
+    } else if (deviceBlocked) {
+        h.toggleInput.setAttribute("aria-label",
+          `${meta.label}：需要 ${devTotal} 个 NPU 设备，本机硬件不满足`);
     } else if (insufficientCards) {
       h.toggleInput.setAttribute("aria-label",
         `${meta.label}：需要 ${requiresCards} 张算力卡，本机只有 ${modelCardCount} 张`);
@@ -3318,6 +3347,10 @@ const ComputeConfigPage = {
 
     if (trans === "stopping") {
       h.toggle.title = "正在关闭中，已锁定";
+    } else if (deviceBlocked) {
+      h.toggle.title =
+        `本机硬件不满足该模型的设备要求（需要 ${devTotal} 个 NPU 设备）：`
+        + ((devReq && devReq.reason) || "缺设备");
     } else if (insufficientCards) {
       h.toggle.title =
         `需要 ${requiresCards} 张算力卡（本机只有 ${modelCardCount} 张），无法启用`;
@@ -3379,6 +3412,50 @@ const ComputeConfigPage = {
       h.missingDirEl.style.display = "none";
     }
 
+    // ---- 设备拓扑要求：需要几个 NPU 设备 + 选中/缺失的布局。
+    //     只在模型声明了多设备要求（total_devices > 1）时显示。
+    h.deviceReqEl.innerHTML = "";
+    if (devReq && devTotal > 1) {
+      const sel = devReq.selected || null;
+      const head = document.createElement("span");
+      head.className = "cc-device-req-label";
+      head.textContent = `需要 ${devTotal} 个 NPU 设备`;
+      h.deviceReqEl.appendChild(head);
+
+      if (devReq.unverified) {
+        // 卡枚举失败（driver 争用）⇒ **不能**判「硬件不满足」，如实说
+        // 「暂时无法确认」。
+        const note = document.createElement("span");
+        note.className = "cc-device-req-layout";
+        note.textContent = devReq.note || "暂时无法确认设备拓扑是否满足";
+        h.deviceReqEl.appendChild(note);
+      } else if (devReq.ok && sel) {
+        const ok = document.createElement("span");
+        ok.className = "cc-device-req-ok";
+        ok.textContent = sel.label;
+        h.deviceReqEl.appendChild(ok);
+      } else {
+        const bad = document.createElement("span");
+        bad.className = "cc-device-req-bad";
+        bad.textContent = devReq.reason || "本机硬件不满足";
+        h.deviceReqEl.appendChild(bad);
+        // 把每个可选布局的缺项也列出来，用户能看懂「差哪张卡」。
+        const lays = Array.isArray(devReq.layouts) ? devReq.layouts : [];
+        for (const lay of lays) {
+          const li = document.createElement("span");
+          li.className = "cc-device-req-layout";
+          li.textContent = lay.ok
+            ? `✓ ${lay.label}`
+            : `✗ ${lay.label}：${lay.reason || "不满足"}`;
+          h.deviceReqEl.appendChild(li);
+        }
+      }
+      h.deviceReqEl.classList.toggle("is-blocked", !devReq.ok);
+      h.deviceReqEl.style.display = "";
+    } else {
+      h.deviceReqEl.style.display = "none";
+    }
+
     // ---- 运行在 fieldset：cards / available_targets / 本模型占用的卡 任一
     // 变化才换节点。勾选集合也进 sig —— 用户点 checkbox 后要立刻反映
     // 到 toggle 的可用状态上。
@@ -3387,6 +3464,9 @@ const ComputeConfigPage = {
       (meta.available_targets || []).join(","),
       this._modelNpus(card.dataset.model).join(","),
       this._selectedTargets(card.dataset.model).join(","),
+      // 设备拓扑布局进了 sig —— 插了第三张卡 / 装了 rknn2-runtime 之后，
+      // 「运行在」里的第三个设备（EP 卡 or 本机 NPU）要跟着变。
+      ((meta.card_requirements && meta.card_requirements.selected) || {}).id || "",
     ].join("|");
     if (h.lastRadioSig !== radioSig) {
       const newFs = this._makeTargetFieldset(
@@ -3843,6 +3923,41 @@ const ComputeConfigPage = {
       ph.textContent = "未检测到 NPU 卡 —— 等待 enumerate…";
       opts.appendChild(ph);
     }
+
+    // ---- ⭐ 第三个设备：本机 NPU（不是 EP 协卡 ⇒ 不可勾选）
+    //
+    // 有些模型（Qwen-Image-2.1）除了 EP 协卡还要占住**第三个 NPU
+    // 设备**：本机 RK3588 自带的 NPU（VAE 解码走 rknn2）。
+    //
+    // 那个设备**不在算力卡列表里**（那列表只列 EP 协卡）⇒ 光看
+    // 「RK182x #0/#1」用户会以为模型只占 2 张卡，不知道还有一个自动
+    // 占着的本机 NPU。所以这里补一个**固定条目**（不可勾选 —— 它不是
+    // 通过 npu_index 绑定的，由 worker 在 open 阶段自己挑）。
+    const devReq = (meta && meta.card_requirements) || null;
+    const sel = (devReq && devReq.selected) || null;
+    const localNpu = Number((sel && sel.local_npu) || 0);
+    for (let i = 0; i < localNpu; i++) {
+      const fixed = document.createElement("span");
+      fixed.className = "cc-target-fixed";
+      fixed.title = (sel && sel.local_label)
+        ? sel.local_label
+        : "本机 SoC 自带的 NPU（自动占用，不可选择）";
+      const icon = document.createElement("span");
+      icon.className = "cc-target-fixed-icon";
+      icon.textContent = "▣";
+      fixed.appendChild(icon);
+      const txt = document.createElement("span");
+      txt.textContent = (sel && sel.local_label)
+        ? sel.local_label
+        : "本机 NPU（自动占用）";
+      fixed.appendChild(txt);
+      const auto = document.createElement("span");
+      auto.className = "cc-target-fixed-tag";
+      auto.textContent = "自动";
+      fixed.appendChild(auto);
+      opts.appendChild(fixed);
+    }
+
     fs.appendChild(opts);
     return fs;
   },

@@ -291,6 +291,30 @@ def load_manifest(model_id: str) -> dict:
         return json.load(f)
 
 
+def allowed_card_counts(manifest: dict) -> set:
+    """这个模型允许绑几张 EP 协卡 —— **集合**。
+
+    ⚠️ 不能只认 manifest 里的静态 ``requires_cards``：EP 卡数取决于
+    **选中的硬件布局**——
+
+    * 「2×RK1828 + 本机 RK3588」⇒ 2 张（VAE 跑本机 NPU，走 rknn2）；
+    * 「3×RK1828」⇒ 3 张（VAE 独占第三张协卡，走 rknn3）。
+
+    静态 ``requires_cards`` 只能表达前者。主进程按本机硬件**选出**布局
+    再把对应数量的卡传下来，worker 这里只负责**校验**传进来的张数是
+    合法布局之一（否则拒绝 —— 绑错卡数会让 VAE 找不到独占设备）。
+
+    没声明 ``card_requirements`` ⇒ 回退静态 ``requires_cards``（旧行为）。
+    """
+    try:
+        static = int((manifest or {}).get("requires_cards", 1) or 1)
+    except (TypeError, ValueError):
+        static = 1
+    counts = cards_mod.allowed_ep_card_counts(
+        (manifest or {}).get("card_requirements"))
+    return counts or {static}
+
+
 def worker_comm_name(model_id: str) -> str:
     """Process comm name (``worker:<alias>``) for this worker.
 
@@ -456,17 +480,15 @@ def _build_session(model_id: str, npu_index, device_id: Optional[str] = None):
     mod = _load_wdnai()
     manifest = load_manifest(model_id)
     factory_name = (manifest.get("spec_factory") or "").strip()
-    try:
-        requires = int(manifest.get("requires_cards", 1) or 1)
-    except (TypeError, ValueError):
-        requires = 1
+    allowed = allowed_card_counts(manifest)
     if isinstance(npu_index, (list, tuple)):
         cards = [int(x) for x in npu_index]
     else:
         cards = [int(npu_index)]
-    if len(cards) != requires:
+    if len(cards) not in allowed:
         raise RuntimeError(
-            f"{model_id} 需要 {requires} 张算力卡，实际传入 {cards}"
+            f"{model_id} 需要 {'/'.join(str(c) for c in sorted(allowed))} 张算力卡"
+            f"（按硬件布局而定），实际传入 {cards}"
         )
     # Lazy import: the package __init__ owns the manifest scanner, and
     # importing it at module level would close a cycle.
@@ -612,15 +634,12 @@ def load_handler(state: dict, model_id: str,
     # 那样「主进程说的卡」与「本进程加载的卡」不可能不一致。
     device_id = payload_device_id or state.get("device_id")
     manifest = load_manifest(model_id)
-    try:
-        requires = int(manifest.get("requires_cards", 1) or 1)
-    except (TypeError, ValueError):
-        requires = 1
-    if len(cards) != requires:
+    allowed = allowed_card_counts(manifest)
+    if len(cards) not in allowed:
         return {
             "status": "error",
-            "error": (f"{model_id} 需要 {requires} 张算力卡，"
-                      f"实际传入 {cards}"),
+            "error": (f"{model_id} 需要 {'/'.join(str(c) for c in sorted(allowed))}"
+                      f" 张算力卡（按硬件布局而定），实际传入 {cards}"),
             "npu_index": cards[0],
             "npu_indices": cards,
         }

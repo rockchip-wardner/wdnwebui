@@ -756,11 +756,17 @@ def _validate_autostart_entry(entry, idx: int) -> tuple[str, list[int]]:
         raise ValueError(
             f"compute.autostart[{idx}].npu_index 含重复卡号: {cards}")
     if model in MODEL_PRESETS:
-        requires = int(MODEL_PRESETS[model].get("requires_cards", 1) or 1)
-        if len(cards) != requires:
+        preset = MODEL_PRESETS[model]
+        static = int(preset.get("requires_cards", 1) or 1)
+        # EP 卡数按**硬件布局**而定（「2×1828+3588」2 张 /「3×1828」3 张）
+        # ⇒ 接受集合而不是单一数字。
+        allowed = (cards_mod.allowed_ep_card_counts(preset.get("card_requirements"))
+                   or {static})
+        if len(cards) not in allowed:
             raise ValueError(
-                f"compute.autostart[{idx}] model={model!r} 需要 {requires} 张卡，"
-                f"npu_index 给了 {cards}")
+                f"compute.autostart[{idx}] model={model!r} 需要 "
+                f"{'/'.join(str(c) for c in sorted(allowed))} 张卡"
+                f"（按硬件布局而定），npu_index 给了 {cards}")
     return model, cards
 
 
@@ -1246,6 +1252,9 @@ class ComputeRegistry:
         # per-model 启停操作锁 —— 排队等待结束后可能有多个请求同时醒来,
         # 一起对同一个实例 bind 就是又一轮「两个 init 线程抢 NPU 内存」。
         self._model_locks: dict[str, threading.Lock] = {}
+        # 设备拓扑评估缓存: model_id -> (单调时刻, 评估结果)。算力页每秒
+        # 拉一次 snapshot, 每次都重新评估会重复探卡 + stat 模型包文件。
+        self._dev_req_cache: dict[str, tuple[float, dict]] = {}
         # 本机最近停掉过哪些 (model, npu) —— DELETE 的幂等凭据。
         # 单进程 uvicorn 下并发 DELETE 只能在事件循环里排队,轮到第二个
         # 时实例已不在(npu_index 也被乐观写重置成 -1) → 误报 404。
@@ -1922,6 +1931,25 @@ class ComputeRegistry:
                                    if i["status"] == "error" and i.get("_source") == "adopted")
         capabilities = self.list_active_capabilities()
         services = self.list_with_source()
+        # ⭐ 设备拓扑要求（EP 协卡 + 本机 NPU）—— ``requires_cards`` 只数
+        #    EP 协卡，而有些模型还要占住**第三个 NPU 设备**（Qwen-Image-2.1
+        #    的 VAE 独占第三张卡，或本机 RK3588 的 NPU）⇒ 算力页要按
+        #    **总设备数**展示，并且不满足时**不允许运行**。
+        _ep_cards = self.model_cards()
+        for _svc in services:
+            _ev = self.evaluate_device_requirements(
+                _svc.get("model_id") or "", ep_card_count=len(_ep_cards))
+            _svc["requires_cards"] = self.effective_requires_cards(
+                _svc.get("model_id") or "", ev=_ev)
+            _svc["requires_devices"] = int(_ev.get("total_devices") or 1)
+            _svc["card_requirements"] = _ev
+        for _inst in instances:
+            _ev = self.evaluate_device_requirements(
+                _inst.get("model_id") or "", ep_card_count=len(_ep_cards))
+            _inst["requires_cards"] = self.effective_requires_cards(
+                _inst.get("model_id") or "", ev=_ev)
+            _inst["requires_devices"] = int(_ev.get("total_devices") or 1)
+            _inst["card_requirements"] = _ev
         # v0.15: 不再产出 queued 计数 —— not_loaded 是默认态,顶部再报是
         # 重复 + "排队"在中文里易误读。
 
@@ -2783,6 +2811,100 @@ class ComputeRegistry:
                 f"{model_id} 是 peer 提供的 service，本机无权 spawn")
         return self.bind_instance(inst, npu_index)
 
+    def evaluate_device_requirements(self, model_id: str,
+                                     ep_card_count: int | None = None) -> dict:
+        """评估某模型声明的**设备拓扑要求**在本机是否满足（带缓存）。
+
+        返回 :func:`cards.evaluate_card_requirements` 的结果 ——
+        ``{total_devices, ok, reason, selected, layouts}``。
+
+        缓存 3 秒：算力页每秒拉一次 snapshot，每次都重新评估会重复
+        探卡（``model_cards()`` 要等 rknn 探测超时）+ stat 模型包文件。
+        3 秒足够短 —— 用户插卡 / 装 rknn2-runtime 后不用等太久。
+        """
+        now = time.monotonic()
+        cached = self._dev_req_cache.get(model_id)
+        if cached is not None and now - cached[0] < 3.0:
+            return cached[1]
+        preset = MODEL_PRESETS.get(model_id, {})
+        if ep_card_count is None:
+            ep_card_count = len(self.model_cards())
+        ev = cards_mod.evaluate_card_requirements(
+            preset.get("card_requirements"),
+            ep_card_count,
+            preset.get("model_dir") or "",
+        )
+        if self._cards_failed:
+            # ⚠️ **卡枚举失败 ≠ 硬件不满足**。``list_cards()`` 在
+            # ``/dev/rknn3`` 被 worker 占住时会 5 s 超时并返回空列表 ——
+            # 此时「本机 0 张 EP 卡」是**探测失败**的假象，不是「这板子
+            # 没卡」。
+            #
+            # ⇒ 这种情况**不硬拦**（否则一次 driver 争用就让模型再也起不来），
+            # 只把「未验证」如实标出来；worker 的 open 阶段还有自己的
+            # fail-fast，真不满足时照样会报清楚。
+            ev = dict(ev)
+            ev["ok"] = True
+            ev["reason"] = ""
+            ev["unverified"] = True
+            ev["note"] = (f"NPU 卡枚举失败（{self._cards_failed}），"
+                          "暂时无法确认设备拓扑是否满足")
+        self._dev_req_cache[model_id] = (now, ev)
+        return ev
+
+    def effective_requires_cards(self, model_id: str, ev: dict | None = None) -> int:
+        """这个模型**实际要绑几张 EP 协卡**。
+
+        ⚠️ 不能用 manifest 里的静态 ``requires_cards``：EP 卡数**取决于
+        选中的硬件布局**——
+
+        * 「2×1828 + 3588」⇒ 绑 **2** 张（VAE 跑本机 NPU）；
+        * 「3×1828」⇒ 绑 **3** 张（VAE 独占第三张协卡）。
+
+        静态值只能表达前者。返回选中布局的 ``ep_cards``；没有布局声明
+        ⇒ 回退静态 ``requires_cards``（保持旧行为）。
+        """
+        preset = MODEL_PRESETS.get(model_id, {})
+        static = int(preset.get("requires_cards", 1) or 1)
+        if ev is None:
+            ev = self.evaluate_device_requirements(model_id)
+        sel = ev.get("selected") or {}
+        try:
+            n = int(sel.get("ep_cards") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        return n if n > 0 else static
+
+    def allowed_ep_card_counts(self, model_id: str) -> set:
+        """该模型允许的 EP 协卡数量**集合**（来自布局声明）。
+
+        没有布局声明 ⇒ 空集合（调用方回退静态 ``requires_cards``）。
+        """
+        preset = MODEL_PRESETS.get(model_id, {})
+        return cards_mod.allowed_ep_card_counts(preset.get("card_requirements"))
+
+    def check_device_requirements(self, model_id: str) -> dict:
+        """检查本机是否满足该模型声明的**设备拓扑要求**。
+
+        不满足 ⇒ 抛 :class:`ValueError`（调用方转成 400）。
+        满足 ⇒ 返回评估结果（含选中的布局）。
+
+        ⚠️ 这是「**不许运行**」的唯一闸门：
+        ``requires_cards`` 只数 EP 协卡，而 Qwen-Image-2.1 这类模型还要
+        第三个 NPU 设备（本机 3588 的 NPU 或第三张 1828）—— 那个设备不在
+        算力卡列表里，光看卡数会漏判，直到 worker 的 open 阶段才炸。
+        """
+        ev = self.evaluate_device_requirements(model_id)
+        if not ev.get("ok"):
+            raise ValueError(
+                "{model} 需要 {n} 个 NPU 设备，本机不满足：{reason}".format(
+                    model=model_id,
+                    n=int(ev.get("total_devices") or 1),
+                    reason=ev.get("reason") or "硬件不满足该模型的设备拓扑要求",
+                )
+            )
+        return ev
+
     def ensure_worker_for_model(self, model_id: str,
                                allow_adopt: bool = True,
                                npu_index: int | None = None,
@@ -2818,6 +2940,10 @@ class ComputeRegistry:
         the user has not yet bound an NPU (call ``bind_instance`` for
         that).
         """
+        # ⭐ 设备拓扑闸门：本机不满足模型声明的设备要求 ⇒ **不允许运行**。
+        #    （Qwen-Image-2.1 要 3 个 NPU 设备：2 张 1828 协卡 + 第三张
+        #    1828 协卡**或**本机 RK3588 的 NPU；两者都没有就别起 worker。）
+        self.check_device_requirements(model_id)
         with self._lock:
             for inst in self._instances.values():
                 if inst.model_id != model_id:
