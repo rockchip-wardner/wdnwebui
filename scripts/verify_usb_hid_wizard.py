@@ -98,6 +98,16 @@ def run(exe: str) -> None:
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
         print("=== step 1: open homepage ===")
+        # ⚠️ 先清掉后端记的 active_app —— 开机时 ActivateManager.bootRestore()
+        # 会把它还原成 location.hash ⇒ **上一张卡**（比如别人刚用过的
+        # image-editor）的向导会先挂上，再在切到 #usb-hid 时被卸载 ⇒
+        # 本脚本断言的「第一个向导事件 = wizard:mounted」看到的是
+        # `wizard:unmounted(别的卡)` ⇒ **假失败**（2026-11-06 实测）。
+        # 测试不该依赖「上一个用过哪张卡」这种全局状态。
+        try:
+            ctx.request.delete("http://localhost:8000/api/compute/active-app")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [warn] 清 active_app 失败（忽略）: {e}")
         page.goto("http://localhost:8000", wait_until="networkidle", timeout=15000)
 
         # Wait for boot to finish
