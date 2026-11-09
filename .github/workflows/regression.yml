@@ -132,7 +132,14 @@ jobs:
     name: integration (WS broadcast end-to-end)
     runs-on: [self-hosted, wdnwebui, rk3588]  # label required for integration runners
     needs: lint
-    if: ${{ vars.RUN_INTEGRATION == 'true' || env.RUN_INTEGRATION == 'true' }}
+    # `env` is NOT an allowed context in a job-level `if` — GitHub rejects the
+    # ENTIRE workflow file ("Unrecognized named-value: 'env'") and then runs
+    # NO job at all, not even lint. Job-level `if` may only reference
+    # github / needs / vars / inputs, so the gate has to use `vars`.
+    #
+    # Enable with:  Settings → Secrets and variables → Actions → Variables
+    #               → RUN_INTEGRATION = true
+    if: ${{ vars.RUN_INTEGRATION == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
