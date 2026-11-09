@@ -57,7 +57,7 @@ pyarrow==25.0.1
 # wdndds（私有包，配套 wdnav/wdnai 一起放在 .venv/src/，需要
 # `pip install -e .venv/src/wdndds` editable 安装）— 仅 DDS/RPC，
 # 不再含 Wechat 模块。wechatbot-sdk 由 wdnwebui 直接依赖。
-# wdnav / wdnai are internal SDKs (behind SSH on git@10.10.10.10) and are
+# wdnav / wdnai are internal SDKs (behind SSH on git@github.com) and are
 # installed separately — see README §4. wdnai talks to librknn3 via
 # its vendored ctypes shim (``wdnai._librknn``); wdnwebui only needs
 # the wdnai package, NOT ``rknn3-toolkit-lite`` (removed in v0.4+).

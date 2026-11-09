@@ -4739,18 +4739,20 @@ behaviour never runs under systemd.
 
 ## One-time setup that an agent will get wrong
 
-Both internal SDKs live behind SSH on `git@10.10.10.10`. They are **not** in
-`requirements.txt` (intentional — the host SSH key + network decide whether
-the install succeeds). Run them by hand after cloning:
+Both internal SDKs live behind SSH on `git@github.com:rockchip-wardner/`.
+They are **not** in `requirements.txt` (intentional — the host SSH key +
+network decide whether the install succeeds). Run them by hand after
+cloning:
 
 ```bash
-.venv/bin/pip install -e "git+ssh://git@10.10.10.10/wardner/wdnav.git#egg=wdnav"
-.venv/bin/pip install -e "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
+.venv/bin/pip install -e "git+ssh://git@github.com/rockchip-wardner/wdnav.git#egg=wdnav"
+.venv/bin/pip install -e "git+ssh://git@github.com/rockchip-wardner/wdnai.git#egg=wdnai"
 ```
 
-If `git clone` fails, the host either lacks SSH access to `10.10.10.10` or
-the deploy key isn't loaded. Do **not** fall back to a public mirror — these
-SDKs aren't published.
+If `git clone` fails, the host either lacks SSH access to `github.com` or
+the deploy key isn't loaded. On an isolated board with no internet, use
+the internal mirror instead (`git+ssh://git@10.10.10.10/wardner/<pkg>.git`)
+— that's the path `update_rkwhl.sh` takes for field deployments.
 
 **wdnai 的依赖不会自己进 venv —— `transformers` / `tokenizers` 必须由
 wdnwebui 的 `requirements.txt` 提供。** `update_rkwhl.sh`（以及上面那条
@@ -4891,7 +4893,7 @@ bootstrap dance.
 ## SDK native-`.so` rebuild policy — all three `.venv/src/` repos (since v0.3.1)
 
 All three internal SDKs live behind SSH at
-`git@10.10.10.10:wardner/{wdnav,wdnai,wdndds}.git`. Two of them
+`git@github.com:rockchip-wardner/{wdnav,wdnai,wdndds}.git`. Two of them
 ship in-tree C/C++ that's linked into a `.so` and **dynamically
 bound at import time** via ctypes (`_lib.<sym>.argtypes = […]` at
 module top). The previous build hooks checked only C-source mtime,
@@ -6235,7 +6237,7 @@ Frontend (`app/static/core/framework.js (前端核心) + app/static/apps/<id>/ap
 ## RTSP 卡顿根因（2026-09 海康 NVR 实测，结论已落定）
 
 **用户报告**：「视频目标定位」页打开 RTSP
-`rtsp://admin:admin123@172.16.9.79/cam/realmonitor?channel=1&subtype=1`，
+`rtsp://admin:<password>@172.16.9.79/cam/realmonitor?channel=1&subtype=1`，
 前 20-40 秒 fps=1-4，之后稳定 25 fps。VLC 同一源流畅。
 
 ### 四组对照实验（决定性证据）

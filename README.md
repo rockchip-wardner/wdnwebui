@@ -1,8 +1,8 @@
 # wdnwebui
 
 A Python web service that exposes the Rockchip platform SDKs
-([`wdnav`](https://10.10.10.10/wardner/wdnav) — MPP / RGA2 / V4L2 video,
-[`wdnai`](https://10.10.10.10/wardner/wdnai) — RKNN LLM / VLM) over
+([`wdnav`](https://github.com/rockchip-wardner/wdnav) — MPP / RGA2 / V4L2 video,
+[`wdnai`](https://github.com/rockchip-wardner/wdnai) — RKNN LLM / VLM) over
 HTTP via FastAPI. Single-page UI at `http://<host>:8000/` with four
 sections: system monitor, video detection, system logs, and power
 control (shutdown / reboot).
@@ -11,7 +11,7 @@ control (shutdown / reboot).
 
 - **Python 3.11+** (3.11.2 confirmed working)
 - **Debian / Ubuntu** host (Debian PEP 668 blocks system pip — we use a venv)
-- **Git + SSH** access to `git@10.10.10.10` for the internal SDKs
+- **Git + SSH** access to `git@github.com` for the SDKs
   (ask ops for the deploy key if `git clone` fails)
 - For **power control** (关机 / 重启 buttons) the service needs to run as
   root, otherwise those buttons will error out with EPERM
@@ -99,20 +99,23 @@ python-multipart, **`gguf`**, **`transformers`**, **`tokenizers`** and
 > fine without them, but the NPU section of the system monitor and
 > the VLM detector will report "offline" / fail to load.
 
-## 4. Install the internal SDKs
+## 4. Install the SDKs
 
-These are **not** in `requirements.txt` because they're behind SSH and
-not on PyPI. Install them by hand after the SSH key is set up:
+These are **not** in `requirements.txt` because they aren't on PyPI.
+Install them by hand after the SSH key is set up:
 
 ```bash
-pip install -e "git+ssh://git@10.10.10.10/wardner/wdnav.git#egg=wdnav"
-pip install -e "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
-pip install -e "git+ssh://git@10.10.10.10/wardner/wdndds.git#egg=wdndds"
+pip install -e "git+ssh://git@github.com/rockchip-wardner/wdnav.git#egg=wdnav"
+pip install -e "git+ssh://git@github.com/rockchip-wardner/wdnai.git#egg=wdnai"
+pip install -e "git+ssh://git@github.com/rockchip-wardner/wdndds.git#egg=wdndds"
 ```
 
-If either command fails with `Permission denied (publickey)`, the host
-either can't reach `10.10.10.10` or the SSH key isn't loaded. There
-is no public fallback — these SDKs aren't published.
+If a command fails with `Permission denied (publickey)`, the host either
+can't reach `github.com` or the SSH key isn't loaded.
+
+> ℹ️  On an isolated board with no internet access, point these at the
+> internal mirror instead (`git+ssh://git@10.10.10.10/wardner/<pkg>.git`) —
+> that's what `update_rkwhl.sh` (§4b) uses for field deployments.
 
 After install you'll find them at `.venv/src/wdnav/` and `.venv/src/wdnai/`.
 
