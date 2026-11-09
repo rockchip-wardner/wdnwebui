@@ -5398,6 +5398,17 @@ def get_registry() -> ComputeRegistry:
         return _registry
 
 
+def peek_registry() -> Optional[ComputeRegistry]:
+    """已初始化的 registry（没有就 ``None``）—— **不**触发初始化。
+
+    给「只想看一眼状态」的调用方用（如 ASR 卡片每 5 秒轮询一次快照）：
+    不能因为轮询就把整个 registry 拉起来（那会触发对端发现 / 硬件探测）。
+
+    与 :func:`get_registry` 的区别就是**不创建**。
+    """
+    return _registry
+
+
 # --------------------------------------------------------------------------- #
 # Backward-compat: legacy ``get_session_call_lock()`` API.                       #
 # In the v0.4 per-subprocess RPC refactor the call lock is no longer needed     #

@@ -107,16 +107,17 @@ class _FakeRegistry:
 
 # --------------------------------------------------------------------------- #
 print("=== 1. 能力词表（wdnai 唯一权威定义）===")
-# 9 个成员。``swcap_vision_depth``（Depth Anything V3）与
-# ``swcap_text_to_image``（Qwen-Image）是 SDK 后续加入的，之前的断言还写
-# 着 7 个 —— 词表以 SDK 为准，这里同步过来。
+# 10 个成员。``swcap_vision_depth``（Depth Anything V3）、
+# ``swcap_text_to_image``（Qwen-Image）、``swcap_audio_asr``（Qwen3-ASR）
+# 是 SDK 后续加入的，之前的断言还写着 7 个 —— 词表以 SDK 为准，这里同步过来。
 EXPECTED = {
     "swcap_text_chat", "swcap_vision_chat", "swcap_vision_grounding",
     "swcap_audio_chat", "swcap_vision_embedding", "swcap_text_to_speech",
     "swcap_tool_call", "swcap_vision_depth", "swcap_text_to_image",
+    "swcap_audio_asr",
 }
 check(set(SoftwareCapability.values()) == EXPECTED,
-      "枚举恰为 9 个成员", str(SoftwareCapability.values()))
+      "枚举恰为 10 个成员", str(SoftwareCapability.values()))
 
 print("\n=== 2. worker manifest 校验必须拒绝非枚举能力 ===")
 from app.core.compute.workers import _validate                  # noqa: E402

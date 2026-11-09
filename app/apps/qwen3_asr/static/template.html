@@ -1,0 +1,200 @@
+      <section id="page-qwen3-asr" class="page hidden" data-page="qwen3-asr">
+        <header class="page-header">
+          <h2>流式语音识别</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="asr-status-line">空闲</span>
+            <button class="wizard-mode-btn" data-wizard-mode data-page-id="qwen3-asr">向导模式</button>
+          </div>
+        </header>
+
+        <div id="asr-unavailable" class="tts-banner tts-banner-error hidden">
+          <span class="tts-banner-icon" aria-hidden="true">⚠</span>
+          <span class="tts-banner-text">
+            模型未启用：请到「算力配置」页启动 [ASR]流式语音识别。
+          </span>
+        </div>
+
+        <div class="imb-card">
+          <div class="imb-card-head">
+            <div class="imb-card-head-title">
+              <h3>识别</h3>
+              <span class="imb-status" id="asr-state-badge" data-state="idle">空闲</span>
+            </div>
+            <span class="vd-spacer"></span>
+            <span class="imb-meta-inline" id="asr-language"></span>
+            <button class="vd-btn vd-btn-mini" id="asr-reset-btn">清空</button>
+          </div>
+
+          <div class="imb-card-body">
+            <!--
+              输入来源：四种（音频文件 / 含音轨的视频 / 板载麦克风 / 浏览器麦克风）。
+              「音频文件」与「含音轨的视频」共用同一套控件 —— 区别只在
+              接受的文件类型（视频取它的音轨）。
+            -->
+            <section class="asr-block">
+              <header class="asr-block-head">
+                <h4>输入来源</h4>
+                <span class="asr-block-hint">音频文件、含音轨的视频、板载麦克风、浏览器麦克风，四选一</span>
+              </header>
+
+              <div class="asr-source-tabs" id="asr-source-tabs" role="tablist">
+                <button type="button" class="asr-source-tab is-active" data-source="file"
+                        role="tab" aria-selected="true">音频文件</button>
+                <button type="button" class="asr-source-tab" data-source="video"
+                        role="tab" aria-selected="false">含音轨的视频</button>
+                <button type="button" class="asr-source-tab" data-source="board"
+                        role="tab" aria-selected="false">板载麦克风</button>
+                <button type="button" class="asr-source-tab" data-source="browser"
+                        role="tab" aria-selected="false">浏览器麦克风</button>
+              </div>
+
+              <!-- ① 音频文件 / ② 含音轨的视频 -->
+              <div class="asr-source-panel" id="asr-panel-file">
+                <div class="asr-source-row">
+                  <label class="asr-file-label" for="asr-file">本机上传</label>
+                  <input type="file" id="asr-file"
+                         accept="audio/*,.wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.wma,.amr,.aiff" />
+                  <span class="asr-file-name" id="asr-file-name"></span>
+                </div>
+
+                <div class="asr-source-row">
+                  <label class="asr-file-label" for="asr-path">设备端路径</label>
+                  <input type="text" id="asr-path" class="surv-input asr-path-input" spellcheck="false"
+                         placeholder="/userdata/assets/uploads/asr_en.wav" />
+                  <button type="button" class="vd-btn vd-btn-primary" id="asr-browse">浏览…</button>
+                </div>
+
+                <div class="asr-hint" id="asr-source-hint">选择音频文件，或填写 / 浏览设备端的文件路径。</div>
+              </div>
+
+              <!--
+                ② 含音轨的视频 → **在浏览器里播**。
+
+                识别走的是视频的**音轨**，画面在播放器里同步推进；字幕按
+                「播放头时间」对齐（音轨在容器里的起点由后端给出，见
+                ``service.py`` 的 ``audio_origin_sec`` —— 音轨晚于画面
+                起点的文件很常见）。
+
+                两种来源：
+                * 本机上传 → ``blob:`` URL（不走服务端）；
+                * 设备端路径 → ``/api/qwen3-asr/media``（Range 支持，
+                  可拖进度条；该端点**没有鉴权**，所以后端把路径限制在
+                  资源目录 + 音视频扩展名白名单内）。
+              -->
+              <div class="asr-video-wrap hidden" id="asr-video-wrap">
+                <div class="asr-video-box">
+                  <video id="asr-video" controls preload="metadata" playsinline></video>
+                  <div class="asr-video-sub" id="asr-video-sub"></div>
+                </div>
+                <div class="asr-hint" id="asr-video-hint"></div>
+              </div>
+
+              <!--
+                ③ 板载麦克风 + ④ 浏览器麦克风。
+                这一整块由 feature flag ``asr.live.enabled`` 门控 ——
+                关掉时整块隐藏，文件 / 视频路径不受影响。
+              -->
+              <section class="asr-block asr-live-block hidden" id="asr-live-block">
+                <header class="asr-block-head">
+                  <h4>实时识别</h4>
+                  <span class="asr-block-hint">对着麦克风说话，识别结果实时刷新；停一段后会自动分成一句一句。</span>
+                </header>
+
+                <!-- ③ 板载麦克风（设备端 ALSA，独立进程采集） -->
+                <div class="asr-source-panel hidden" id="asr-panel-board">
+                  <div class="asr-source-row">
+                    <label class="asr-file-label" for="asr-board-device">采集设备</label>
+                    <select id="asr-board-device" class="tts-select"></select>
+                    <button type="button" class="vd-btn vd-btn-primary" id="asr-board-start">开始采集</button>
+                    <button type="button" class="vd-btn" id="asr-board-stop" disabled>停止</button>
+                    <span class="asr-live-status" id="asr-board-status">未开始</span>
+                  </div>
+                  <div class="asr-hint" id="asr-board-hint">
+                    板载麦克风由设备端独立进程采集（占用声卡，别的程序不能再用）。
+                  </div>
+                </div>
+
+                <!-- ④ 浏览器麦克风 -->
+                <div class="asr-source-panel hidden" id="asr-panel-browser">
+                  <div class="asr-source-row">
+                    <button type="button" class="vd-btn vd-btn-primary" id="asr-mic-btn">开始实时识别</button>
+                    <button type="button" class="vd-btn" id="asr-mic-stop-btn" disabled>中止</button>
+                    <div class="asr-meter" title="麦克风音量">
+                      <div class="asr-meter-fill" id="asr-meter-fill"></div>
+                    </div>
+                    <span class="asr-live-status" id="asr-live-status">未开始</span>
+                  </div>
+                  <!--
+                    非安全上下文（http:// + 局域网 IP）时浏览器**根本不提供**
+                    navigator.mediaDevices —— 点「开始实时识别」会静默失败。
+                    所以这里提前把原因和出路说清楚（前端按
+                    window.isSecureContext 动态填）。
+                  -->
+                  <div class="asr-hint hidden" id="asr-mic-hint"></div>
+                </div>
+
+                <div class="asr-live" id="asr-rt-text">
+                  <span class="asr-live-committed" id="asr-rt-committed"></span><span
+                        class="asr-live-unfixed" id="asr-rt-unfixed"></span>
+                </div>
+                <div class="asr-live-gap hidden" id="asr-live-gap">⚠ 有音频丢失，识别结果可能有缺口</div>
+              </section>
+            </section>
+
+            <!-- 运行控制 -->
+            <div class="asr-controls">
+              <label class="asr-file-label" for="asr-mode">显示模式</label>
+              <select id="asr-mode" class="tts-select">
+                <option value="single">实时结果</option>
+                <option value="rounds">识别过程</option>
+              </select>
+
+              <span class="vd-spacer"></span>
+              <button class="vd-btn" id="asr-stop-btn" disabled>停止</button>
+              <button class="vd-btn vd-btn-primary" id="asr-start-btn" disabled>开始识别</button>
+            </div>
+
+            <div class="asr-hint" id="asr-hint">
+              选择音频来源后点「开始识别」。模型按 1 秒一块增量解码，输出实时刷新。
+            </div>
+
+            <!--
+              模式一：实时单行（对应 C demo 的 -s）
+
+              「含音轨的视频」来源下，这个框换一种输出方式：不再是
+              「已确认文本 + 未确认尾巴」的单行，而是**字幕同款转写框**
+              —— 同样的分行、同样的逐词点亮、同样的当前词高亮，
+              而且**整条时间轴都留着**，可以上拉回看（见 app.js 的
+              ``_renderTranscript``）。
+
+              那两个 span 在视频来源下只是**镜像**（回归脚本要从
+              ``#asr-live-committed`` 读最终文本），由 CSS 隐藏。
+            -->
+            <div class="asr-live" id="asr-live">
+              <span class="asr-live-committed" id="asr-live-committed"></span><span
+                    class="asr-live-unfixed" id="asr-live-unfixed"></span>
+              <div class="asr-transcript hidden" id="asr-transcript">
+                <div class="asr-transcript-cap">字幕文本 · 与画面字幕同步，可上拉回看</div>
+                <div class="asr-transcript-body" id="asr-transcript-body"></div>
+              </div>
+            </div>
+
+            <!-- 模式二：逐轮明细（对应 C demo 的默认输出） -->
+            <div class="asr-rounds hidden" id="asr-rounds"></div>
+
+            <div class="page-placeholder imb-empty" id="asr-empty">
+              <div class="page-placeholder-icon" aria-hidden="true">🎙️</div>
+              <div class="page-placeholder-title">还没有识别结果</div>
+              <div class="page-placeholder-text">
+                选一种输入来源开始识别：音频文件、含音轨的视频、板载麦克风或浏览器麦克风。
+                已确认的文本会实时出现，未确认的尾巴用蓝色标出。
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-qwen3-asr"></pre>
+        </details>
+      </section>

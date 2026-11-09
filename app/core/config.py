@@ -20,9 +20,10 @@ import json
 import os
 import secrets
 import tempfile
+import time
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Optional
 
 from app.core.compute.jsonc import dump_jsonc, parse_jsonc
 
@@ -349,6 +350,13 @@ class ConfigStore:
                         },
                     },
                 },
+                # 实时麦克风 ASR —— **默认关**。这是实时链路的回滚闸门：
+                # 关掉时 live 端点返回 404，文件 / 视频路径不受影响。
+                "asr": {
+                    "live": {
+                        "enabled": False,
+                    },
+                },
             }
             self._persist()
 
@@ -389,11 +397,47 @@ class ConfigStore:
         sections. Persists atomically and returns the new full snapshot.
 
         ``value`` is JSON round-tripped so ``set_section("base", {})``
-        wipes just the ``base`` block, not the rest of the config."""
+        wipes just the ``base`` block, not the rest of the config.
+
+        ⚠️ **落盘前会先重读磁盘**（见 :meth:`_merge_disk`）—— 否则会
+        **把外部对配置的改动悄悄吃掉**：
+
+        * 运维直接编辑 ``config.jsonc``（比如热切 feature flag
+          ``asr.live.enabled``）→ 内存副本还是旧的；
+        * 之后任何一次 ``set_section``（算力配置的自动归一化跑在**模型
+          重扫循环**里，每 ~2 秒一次）→ ``_persist()`` 把内存副本**整个**
+          写回磁盘 → 外部改动被覆盖，feature flag 悄悄弹回去。
+
+        实测踩过：回归里「flag 关掉 → live 端点 404」这条**间歇性失败**
+        （st=200），根因就是这里。
+        """
         with self._lock:
+            self._data = self._merge_disk()
             self._data[name] = json.loads(json.dumps(value))
             self._persist()
             return self.snapshot()
+
+    def _merge_disk(self) -> dict:
+        """重读磁盘上的配置，作为本次写入的**基底**。
+
+        读不到 / 文件坏了 → 退回内存副本（不能因为磁盘读不了就把配置写丢）。
+
+        只做「顶层 section 级的合并」：磁盘上有的 section 用磁盘的，磁盘上
+        没有的 section 保留内存里的（避免服务启动时刚写进去、还没落盘的
+        东西被抹掉）。
+        """
+        try:
+            if self._path.exists():
+                with self._path.open("r", encoding="utf-8") as f:
+                    parsed = parse_jsonc(f.read())
+                if isinstance(parsed, dict):
+                    merged = dict(parsed)
+                    for k, v in self._data.items():
+                        merged.setdefault(k, v)
+                    return merged
+        except Exception:  # noqa: BLE001 — 读不到就用内存副本
+            pass
+        return self._data
 
     def _persist(self) -> None:
         """Atomic write: serialize to a sibling temp file, then ``os.replace``.
@@ -436,6 +480,12 @@ class ConfigStore:
 
 _store: ConfigStore | None = None
 
+#: feature flag 的读缓存 TTL（秒）。flag 必须能**热切换**（改完
+#: config.jsonc 不用重启服务），所以每次都重新读文件 —— 用 1 秒 TTL
+#: 限住磁盘读次数。
+_FLAG_CACHE_TTL_SEC = 1.0
+_flag_cache: dict[tuple[str, str, bool], tuple[float, bool]] = {}
+
 
 def get_config() -> ConfigStore:
     """Lazy singleton accessor. First call resolves the config path from
@@ -445,3 +495,74 @@ def get_config() -> ConfigStore:
     if _store is None:
         _store = ConfigStore()
     return _store
+
+
+def feature_enabled(section: str, key: str, default: bool = False) -> bool:
+    """读一个布尔 feature flag。
+
+    配置形状是 ``config.jsonc[<section>][<key>]``，例如::
+
+        {"asr": {"live": {"enabled": true}}}
+
+    ``key`` 可以带点号表示**多级路径**（``"live.enabled"`` → 读
+    ``config["asr"]["live"]["enabled"]``）。只有路径末端的值是布尔
+    才算数。
+
+    **每次都重新读文件**（带 1 秒 TTL 缓存）—— feature flag 要能**热切换**：
+    运维改完 ``config.jsonc`` 不用重启服务就能生效。直接读文件而不是读
+    :class:`ConfigStore` 的内存缓存，是因为内存缓存只在
+    :meth:`ConfigStore.reload` 时刷新，而外部改文件不会触发它。
+
+    ``ConfigStore._persist`` 用的是「临时文件 + 原子 replace」，所以并发
+    读到的永远是**完整**的 JSONC，不会读到写了一半的文件。
+
+    读不到 / 值不是布尔 → 返回 ``default``。**不抛异常** —— feature
+    flag 读不出来时不能让整个服务起不来。
+    """
+    now = time.monotonic()
+    ck = (section, key, default)
+    hit = _flag_cache.get(ck)
+    if hit is not None and (now - hit[0]) < _FLAG_CACHE_TTL_SEC:
+        return hit[1]
+    val = _read_flag_from_disk(section, key, default)
+    _flag_cache[ck] = (now, val)
+    return val
+
+
+def _read_flag_from_disk(section: str, key: str, default: bool) -> bool:
+    """从磁盘上的配置文件读一个 flag；读不到就退回内存快照。"""
+    raw: Optional[dict[str, Any]] = None
+    try:
+        path = _resolve_config_path()
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                parsed = parse_jsonc(f.read())
+            if isinstance(parsed, dict):
+                raw = parsed
+    except Exception:  # noqa: BLE001 — 文件坏了不该让调用方崩
+        raw = None
+    if raw is None:
+        try:
+            raw = get_config().get_section(section, {})
+        except Exception:  # noqa: BLE001
+            return default
+    if not isinstance(raw, dict):
+        return default
+    val: Any = raw.get(section)
+    for part in key.split("."):
+        if not isinstance(val, dict):
+            val = None
+            break
+        val = val.get(part)
+    if isinstance(val, bool):
+        return val
+    return default
+
+
+def asr_live_enabled(default: bool = False) -> bool:
+    """实时麦克风 ASR 的 feature flag（``asr.live.enabled``）。
+
+    这是实时链路的**第一道回滚闸门**：关掉之后 ``/api/qwen3-asr/live/*``
+    一律 404，前端隐藏实时区块，**文件 / 视频路径完全不受影响**。
+    """
+    return feature_enabled("asr", "live.enabled", default)

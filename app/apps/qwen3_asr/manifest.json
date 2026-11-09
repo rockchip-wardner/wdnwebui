@@ -1,0 +1,72 @@
+{
+  "id": "qwen3-asr",
+  "title": "流式语音识别",
+  "category": "audio",
+  "description": "对音频流进行语音识别：上传文件/视频，或用麦克风做实时识别",
+  "version": "0.1.0",
+  "preview_video": "/static/apps/qwen3-asr/preview.mp4",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_audio_asr"
+  ],
+  "hardware_capabilities": [],
+  "backend": {
+    "module": "app.apps.qwen3_asr",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/qwen3-asr/template.html",
+    "js": [
+      "/static/apps/qwen3-asr/app.js"
+    ],
+    "css": [
+      "/static/apps/qwen3-asr/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "session.busy",
+      "session.state"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/qwen3-asr/stop"
+      },
+      {
+        "method": "DELETE",
+        "path": "/api/qwen3-asr/live/stop"
+      },
+      {
+        "method": "POST",
+        "path": "/api/qwen3-asr/live/board/stop"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/qwen3-asr/stop"
+      },
+      {
+        "method": "DELETE",
+        "path": "/api/qwen3-asr/live/stop"
+      },
+      {
+        "method": "POST",
+        "path": "/api/qwen3-asr/live/board/stop"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "",
+    "editable_fields": [],
+    "prompt_template": ""
+  },
+  "requires_core": [
+    "compute.registry"
+  ],
+  "uploads_dir": "uploads/qwen3_asr",
+  "display_order": 45,
+  "wizard_config": "wizard.json"
+}

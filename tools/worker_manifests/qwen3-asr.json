@@ -1,0 +1,20 @@
+{
+  "label": "[ASR]流式语音识别",
+  "capability_types": [
+    "swcap_audio_asr"
+  ],
+  "spec_factory": "qwen3_asr",
+  "worker_name": "qwen3-asr",
+  "model_dir_name": "Qwen3-ASR",
+  "model_dir_env": "WDNAI_QWEN3_ASR_DIR",
+  "instance_name": "qwen3-asr",
+  "memory_estimate_mb": 1600,
+  "estimated_init_seconds": 25,
+  "infer_timeout_s": 120,
+  "description": "Qwen3-ASR 流式语音识别：音频 → 语种 + 文本。1 秒一块增量解码，输出实时刷新",
+  "notes": "【当前部署】流式 encoder（encoder_online.1828.rknn）+ Qwen3-ASR-0.6B LLM（llm.1828.rknn）。模型目录里是 encoder_online.*（不是 encoder.*），因此本卡的 spec 走的是流式通路 —— encoder 的选择是**装载期**决定（哪份 RKNN 上 NPU），所以它写在 SDK 的 spec 里（SystemLanguageModel.qwen3_asr 的 use_online_encoder=True），manifest 只声明「这是 qwen3_asr 这个模型」。流式策略与 C++ demo（examples/Qwen3_ASR/cpp/online_main.cc）逐条对齐：1 秒一块（ONLINE_CHUNK_MS=1000）、每块 LLM 只生成 50 token（ONLINE_MAX_NEW_TOKENS=50）、前 4 轮回退不提交（ONLINE_ROLLBACK_ROUNDS=4）、之后每轮回退末尾 5 个 token（ONLINE_ROLLBACK_TOKENS=5）。最后一块提交全部 token。语种头（token 151704 分隔）由模型自己产出，SDK 额外把 'language <lang>' 单独返回给前端。文件清单：encoder_online.1828.rknn + encoder_online.weight + llm.1828.rknn + llm.weight + llm.embed.bin + llm.tokenizer.gguf + mel_128_filters.txt（mel 滤波器必须与模型同目录，128 mel × 201 频点）。infer_timeout_s=120：单次推理是 N 轮串行 LLM（15 秒音频 = 16 轮），60 秒默认预算不够。memory_estimate_mb=1600：encoder 375MB + LLM 435MB + embed 表 297MB。",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 45
+}

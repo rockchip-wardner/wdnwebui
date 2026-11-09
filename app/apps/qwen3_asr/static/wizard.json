@@ -1,0 +1,25 @@
+{
+  "enabled": true,
+  "wizard_title": "流式语音识别快速配置",
+  "swcap_to_model": {
+    "swcap_audio_asr": { "npu_index": [0], "model_id": "qwen3-asr" }
+  },
+  "upload_endpoint": "/api/qwen3-asr/upload",
+  "start_buttons": ["asr-start-btn"],
+  "steps": [
+    { "id": "env",    "title": "运行环境检查", "kind": "env_check" },
+    { "id": "source", "title": "音频源",       "kind": "form",
+      "fields": [
+        { "id": "asr-audio", "ui_key": "source",
+          "label": "音频文件（设备端路径；也可在本机上传。支持 wav / mp3 / m4a / flac / ogg 与含音轨的视频）",
+          "type": "text", "browse": true, "upload": true, "required": true,
+          "placeholder": "例：/userdata/assets/uploads/asr_en.wav" },
+        { "id": "asr-mode", "ui_key": "mode", "label": "显示模式", "type": "select",
+          "options": [
+            { "value": "single", "label": "实时结果（文字实时刷新，蓝色是还可能改动的部分）", "selected": true },
+            { "value": "rounds", "label": "识别过程（每识别一小段就记一行，能看到文字是怎么一步步成句的）" }
+          ] }
+      ] },
+    { "id": "finish", "title": "完成配置",     "kind": "finish" }
+  ]
+}

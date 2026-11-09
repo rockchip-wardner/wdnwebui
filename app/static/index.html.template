@@ -618,6 +618,7 @@
       {% card_slot "video-target-localization" %}
       {% card_slot "video-depth" %}
       {% card_slot "video-retrieval" %}
+      {% card_slot "qwen3-asr" %}
       {% card_slot "tts" %}
       {% card_slot "text-chat" %}
       {% card_slot "media-generator" %}
