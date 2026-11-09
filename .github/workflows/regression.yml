@@ -88,9 +88,19 @@ jobs:
           python-version: "3.11"
 
       - name: Install runtime deps
+        # The unit test imports app.core.video.session, whose module-level
+        # deps are exactly numpy + cv2 (wdnav is a try/except-wrapped lazy
+        # import, so it stays None on a runner without the SDK). Verified:
+        # the suite passes 9/9 with only these two installed.
+        #
+        # We deliberately do NOT `pip install -r requirements.txt` here:
+        # that pulls the whole field-runtime dep set, including packages
+        # that ship no wheel for some platforms and would have to build
+        # from source (v4l2 is a 2014 py2-era sdist) — slow, and entirely
+        # unrelated to what this test covers.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install "numpy>=1.23" "opencv-python-headless>=4.8.0"
 
       - name: Run broadcast unit tests
         # VideoSession imports wdnav lazily inside the module, but the
