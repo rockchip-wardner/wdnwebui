@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 from pathlib import Path
+from urllib.parse import parse_qs
 
 # uvicorn's default LOGGING_CONFIG does not configure the root logger, so
 # every ``LOG.info(...)`` from app.core.* / app.apps.* / app.system.* is
@@ -20,6 +21,8 @@ logging.basicConfig(
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
+from starlette.middleware.gzip import GZipMiddleware
 
 from app import __version__
 from app.core.config import get_config
@@ -64,19 +67,70 @@ def _raise_nofile_limit() -> None:
 _raise_nofile_limit()
 
 
-class _NoCacheStaticFiles(StaticFiles):
-    """StaticFiles that forces ``Cache-Control: no-cache`` on every response.
+def _prewarm_preview_posters() -> None:
+    """后台预热卡片预览海报（失败只记日志，不影响启动）。"""
+    try:
+        from app.core.preview_poster import prewarm
+        prewarm()
+    except Exception as exc:           # noqa: BLE001
+        LOG.warning("预热预览海报失败（忽略）: %s", exc)
 
-    卡片 JS/CSS 没有 URL 版本串，默认的启发式缓存会让前端改动"不生效"
-    （用户看到的是上次缓存的老逻辑）。no-cache **不是** no-store —— 浏览器
-    仍会缓存，但每次请求都带 ETag 回校验，未变 304、变了立即更新，兼顾
-    性能与新鲜度。
+
+class _NoCacheStaticFiles(StaticFiles):
+    """StaticFiles with a **stamp-aware** ``Cache-Control`` policy.
+
+    两种策略，按 URL 是否带版本戳（``?v=<mtime>``）区分：
+
+    * **带 ``?v=``** → ``public, max-age=31536000, immutable``
+      —— URL 本身已经包含了文件内容的"版本"，内容变 → mtime 变 → URL 变，
+      所以可以放心让浏览器**长期缓存**，再也不回校验。
+    * **不带 ``?v=``** → ``no-cache``
+      —— 浏览器每次都带 ETag 回校验：未变 304、变了立即更新。
+      卡片资源早先没有版本串，只能走这条。
+
+    为什么值得分成两种
+    ------------------
+    早先这里一律 ``no-cache``，于是**每次刷新都要重下 42 个文件**（HTML +
+    core JS/CSS + 每张卡的 app.js/app.css）。在 RTT 高 / 走隧道的客户端上，
+    这一项就是"网页打不开"的放大器 —— 实测某个客户端加载同一页花 76 秒，
+    每个资源批次之间隔 16~22 秒。
+    带上版本戳之后，第二次打开只剩 1 个请求（HTML）+ 若干 API。
+
+    ``no-cache`` **不是** ``no-store`` —— 浏览器仍会缓存，只是每次请求都
+    回校验，所以既保性能又不陈旧。
     """
 
     def file_response(self, *args, **kwargs):  # type: ignore[override]
         resp = super().file_response(*args, **kwargs)
-        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["Cache-Control"] = _cache_control(_scope_of(args, kwargs))
         return resp
+
+
+def _scope_of(args: tuple, kwargs: dict):
+    """从 ``file_response`` 的实参里把 ASGI ``scope`` 挖出来。
+
+    Starlette 调的是 ``self.file_response(full_path, stat_result, scope)``
+    —— 位置传参，所以不能只看 ``kwargs``；两个位置都兜住，免得 Starlette
+    哪天改成关键字传参就静默退化成"永远 no-cache"。
+    """
+    scope = kwargs.get("scope")
+    if scope is None and len(args) >= 3:
+        scope = args[2]
+    return scope
+
+
+def _cache_control(scope) -> str:
+    """按 URL 有没有版本戳决定 ``Cache-Control``。"""
+    if not scope:
+        return "no-cache"
+    qs = scope.get("query_string") or b""
+    try:
+        params = parse_qs(qs.decode("latin-1"))
+    except Exception:               # noqa: BLE001
+        return "no-cache"
+    if params.get("v"):
+        return "public, max-age=31536000, immutable"
+    return "no-cache"
 
 
 # --------------------------------------------------------------------------- #
@@ -133,6 +187,22 @@ def create_app() -> FastAPI:
     #    详见 app/core/forwarded.py 的说明。
     app.add_middleware(XForwardedProtoMiddleware)
 
+    # 0b. gzip 压缩 —— 首屏字节数的主要杠杆。
+    #
+    #     压缩前：index.html 116 KB、framework.css 140 KB、framework.js
+    #     64 KB …… 首屏要传几百 KB 明文。压缩后同样的内容约 1/5~1/8。
+    #     在 RTT 高 / 走隧道的客户端上，这是"网页一直转圈"最直接的解药。
+    #
+    #     为什么用 Starlette 自带的而不是自己写：
+    #     * 它**显式跳过 206 Partial Content**（``partial_response`` 判断）
+    #       —— 视频 preview.mp4 的 Range 请求绝不能被压坏；
+    #     * 默认排除 ``video/*`` / ``audio/*`` / ``image/*`` /
+    #       ``text/event-stream``；
+    #     * ``scope["type"] != "http"`` 时原样放行 —— **WebSocket 不受影响**。
+    #     compresslevel 用 6 而不是默认的 9：RK3588 上 level 9 编 116 KB
+    #     HTML 的 CPU 代价明显更大，而 6 的体积差距只有百分之几。
+    app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=6)
+
     # 1. Discover cards (manifest scan + validation)
     manifests = discover_cards()
     LOG.info(
@@ -170,6 +240,17 @@ def create_app() -> FastAPI:
     threading.Thread(
         target=get_registry().boot_compute_services,
         name="compute-boot",
+        daemon=True,
+    ).start()
+
+    # 4b. 预热卡片预览海报（后台线程）。
+    #
+    #     首屏改成只显示 ~16 KB 的静态首帧（海报），不再整段下载
+    #     preview.mp4（实测 9 张卡 3.2 MB）。预热是为了让第一次进网格的
+    #     用户不用等现解码（每张 ~80 ms）。
+    threading.Thread(
+        target=_prewarm_preview_posters,
+        name="preview-prewarm",
         daemon=True,
     ).start()
 
@@ -250,6 +331,33 @@ def create_app() -> FastAPI:
             return Response(status_code=404)
         return FileResponse(ico, media_type="image/x-icon",
                             headers={"Cache-Control": "no-cache"})
+
+    @app.api_route("/preview/{card_id}.jpg", methods=["GET", "HEAD"],
+                   include_in_schema=False)
+    async def preview_poster(card_id: str) -> Response:
+        """卡片预览视频的**首帧海报**（JPEG）。
+
+        为什么要有这个端点：应用网格原本给每张卡挂 ``<video autoplay>``，
+        浏览器会**整段下载**每个预览视频 —— 实测 9 张卡 3.2 MB，占首屏字节
+        的 67%，在慢链路客户端上就是「网页一直转圈」。
+
+        首屏改用这张 ~16 KB 的静态海报占位，鼠标悬停才去加载视频。
+
+        ``?v=<preview.mp4 的 mtime>`` 让海报可以吃 immutable 长期缓存：
+        视频换了内容 → mtime 变 → URL 变 → 浏览器必然重取。
+        """
+        from app.core.preview_poster import poster_bytes
+
+        data = await run_in_threadpool(poster_bytes, card_id)
+        if not data:
+            return Response(status_code=404)
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            # URL 里带 ``?v=<preview.mp4 的 mtime>`` → 内容变了 URL 就变，
+            # 所以可以跟其它带戳的静态资源一样吃 immutable 长期缓存。
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
 
     @app.get("/health")
     async def health() -> dict:

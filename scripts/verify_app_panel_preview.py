@@ -134,6 +134,15 @@ def _browser_check(base: str, want_ids: list[str], shot: str) -> None:
                 if r.status >= 400 else None)
 
         page.goto(base + "/", wait_until="domcontentloaded", timeout=60000)
+        # ⚠️ **必须显式切到应用面板**。boot-restore 会读服务端的
+        # ``/api/compute/active-app``（"上次进入的卡片"）并把 hash 改回去
+        # —— 那个值是**跨浏览器、跨会话**持久化的（用户在 ASR 卡里跑过
+        # 识别就会落盘），于是新开的浏览器直接落在 ASR 卡上，而 ASR 卡的
+        # 向导模式会把卡片页藏起来 → 等不到可见的网格。
+        # 与 ``verify_asr_wizard.py::goto_home`` 同一套做法。
+        page.wait_for_timeout(3000)
+        page.evaluate("() => { window.location.hash = '#apps'; }")
+        page.wait_for_timeout(1500)
         page.wait_for_selector("#page-apps .apps-grid .app-card", timeout=30000)
 
         for card_id in want_ids:
@@ -144,6 +153,13 @@ def _browser_check(base: str, want_ids: list[str], shot: str) -> None:
                     if (!card) return {ok: false, why: 'card element missing'};
                     const v = card.querySelector('video.app-card-video');
                     if (!v) return {ok: false, why: 'no <video> in card'};
+                    // 首屏**不加载**视频（只有 poster）—— 悬停才补 src。
+                    // 这里手动补上，等价于用户把鼠标放到那张卡上。
+                    if (!v.getAttribute('src')) {
+                        const ds = v.getAttribute('data-preview-src');
+                        if (!ds) return {ok: false, why: 'no data-preview-src'};
+                        v.src = ds;
+                    }
                     // 显式 play()：autoplay 在无用户手势的 headless 下可能被拒
                     try { await v.play(); } catch (e) { /* 下面用 currentTime 判断 */ }
                     const t0 = v.currentTime;
@@ -260,7 +276,7 @@ def main() -> int:
         pv = m["preview_video"]
         check(pv.startswith(f"/static/apps/{card_id}/"),
               f"{card_id}: preview_video 指向本卡静态目录", pv)
-        rel = pv[len(f"/static/apps/{card_id}/"):]
+        rel = pv[len(f"/static/apps/{card_id}/"):].split("?")[0]
         sdir = static_dirs.get(card_id)
         check(sdir is not None, f"{card_id}: 卡片静态目录已发现", str(sdir))
         if not sdir:

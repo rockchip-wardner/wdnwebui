@@ -705,9 +705,21 @@
         return String(a.id).localeCompare(String(b.id));
       });
     const html = cards.map((m) => {
+      // 预览视频：**首屏不加载**。
+      //
+      // 原来这里是 `autoplay ... src="preview.mp4"` —— autoplay 会让浏览器
+      // **整段下载**每个预览视频（实测 9 张卡共 3.2 MB，占首屏字节的 67%）。
+      // 浏览器侧绕不开：只要 src 在，Chrome 就发开区间 Range（bytes 0-），
+      // 服务端照直把整个文件发过去（实测 autoplay / metadata / none 三种
+      // 组合过线 3.2 / 3.4 / 2.5 MB，只有完全不设 src 才是 0）。
+      //
+      // 改成：先只给 `poster`（服务端从视频抽的第一帧 JPEG，~16 KB/张），
+      // 鼠标悬停到那张卡时才补上 src 并播放 —— 首屏零视频字节，画面不变。
+      const poster = m.preview_poster
+        ? ` poster="${escapeHtml(m.preview_poster)}"` : "";
       const preview = m.preview_video
-        ? `<video class="app-card-video" autoplay muted playsinline preload="metadata" loop
-                src="${m.preview_video}" aria-hidden="true"></video>`
+        ? `<video class="app-card-video" muted playsinline loop preload="none"${poster}
+                data-preview-src="${escapeHtml(m.preview_video)}" aria-hidden="true"></video>`
         : "";
       // description 是一句话功能说明,缺失则不渲染标签
       const desc = m.description
@@ -720,6 +732,21 @@
       </a>`;
     }).join("");
     grid.innerHTML = html + _addAppTileHtml();
+    // 悬停才加载 / 播放预览视频。
+    //
+    // 监听器挂在**卡片**（a.app-card）上而不是 video 上 —— CSS 里
+    // `.app-card-video` 是 `pointer-events: none`，鼠标事件根本落不到它。
+    // 网格每次重绘都是 innerHTML 重建，元素是新的，所以监听器不会累积。
+    for (const card of grid.querySelectorAll("a.app-card")) {
+      const v = card.querySelector("video.app-card-video");
+      if (!v) continue;
+      card.addEventListener("mouseenter", () => {
+        if (!v.getAttribute("src")) v.src = v.dataset.previewSrc;
+        const p = v.play();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      });
+      card.addEventListener("mouseleave", () => { v.pause(); });
+    }
     // grid 自身的 click 委托**只绑一次**。原来这里是每次 render 都
     // addEventListener，而 grid 元素跨重绘不变 —— 于是每重绘一次就多一个
     // 监听器，点一次卡片触发 N 次 navigate。装完应用会重绘网格，把这个

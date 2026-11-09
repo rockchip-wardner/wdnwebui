@@ -92,9 +92,10 @@ def assemble_index_html(manifests: list[CardManifest]) -> str:
     # 2. CSS link tags (8-A: all card CSS loaded eagerly at boot)
     css_links: list[str] = []
     for m in manifests:
+        stamp = _card_asset_stamp(m)
         for url in m.frontend_css:
             css_links.append(
-                f'  <link rel="stylesheet" href="{html.escape(url)}" />'
+                f'  <link rel="stylesheet" href="{html.escape(stamp(url))}" />'
             )
     template = template.replace(
         "{{ card_css_links }}",
@@ -102,8 +103,12 @@ def assemble_index_html(manifests: list[CardManifest]) -> str:
     )
 
     # 3. Manifests JSON for window.__APP_MANIFESTS__
+    #
+    #    卡片资源 URL 在这里就带上 ?v=<mtime>：framework.js 是直接拿
+    #    ``m.frontend.js`` 当 ``script.src`` 用的，所以**前端一行都不用改**
+    #    就拿到了版本戳（也因此能吃 immutable 长期缓存）。
     manifests_data = {
-        "cards": [_manifest_to_dict(m) for m in manifests],
+        "cards": [_manifest_to_dict(m, _card_asset_stamp(m)) for m in manifests],
     }
     manifests_json = json.dumps(manifests_data, ensure_ascii=False)
     template = template.replace("{{ app_manifests }}", manifests_json)
@@ -171,12 +176,80 @@ _STAMP_DIRS = {
 }
 
 
-def _manifest_to_dict(m: CardManifest) -> dict:
-    """Build the per-card dict that gets serialized to the front-end."""
+def _card_asset_stamp(m: CardManifest):
+    """返回一个函数：给这张卡的 frontend 资源 URL 追加 ``?v=<mtime>``。
+
+    为什么卡片资源也要版本戳
+    ------------------------
+    ``/static/apps/<id>/`` 早先只吃 ``no-cache``：每次刷新都要把每张卡的
+    ``app.js`` / ``app.css`` 重下一遍（实测一个客户端刷新一次要 76 秒，
+    资源批次之间隔 16~22 秒）。带上版本戳之后：
+
+    * 内容变 → mtime 变 → URL 变 → 浏览器必然拉新（不会拿到旧副本）；
+    * 内容没变 → URL 没变 → 浏览器吃 ``immutable`` 长期缓存，**一次都不重下**。
+
+    与 core/system 的 ``_ASSET_RE`` 那套是同一个思路，只是卡片资源不在
+    ``index.html.template`` 里（它们由 manifest 声明），所以在这里按
+    manifest 逐张卡处理。
+
+    注意：``preview_video`` **也**走这条路（加上 ``?v=``）—— 它是
+    ``/static/apps/<id>/preview.mp4``，同样吃 immutable 长期缓存：第二次打开
+    就不用再拉那 3.2 MB 的预览视频了。它是 ``video/mp4``，**不会被 gzip**
+    （Starlette 的 GZipMiddleware 默认排除 ``video/*``）。
+
+    但**海报 URL 不用**这套 —— 海报是服务端从视频抽出来的，由
+    :func:`_preview_poster_url` 单独给（版本戳用视频的 mtime）。
+    """
+    static_dir = m.static_dir
+    if not static_dir:
+        return lambda url: url
+    prefix = "/static/apps/%s/" % m.id
+
+    def stamp(url: str) -> str:
+        if not url.startswith(prefix) or "?" in url:
+            return url
+        rel = url[len(prefix):]
+        try:
+            ver = int((static_dir / rel).stat().st_mtime)
+        except OSError:
+            return url
+        return "%s?v=%d" % (url, ver)
+
+    return stamp
+
+
+def _preview_poster_url(m: CardManifest) -> str:
+    """预览视频首帧海报的 URL（带 ``?v=<mtime>``）。
+
+    海报是**从视频派生的**，所以版本戳用**视频的 mtime**（不是海报自己的）：
+    视频换了内容 → mtime 变 → 海报 URL 变 → 浏览器必然重取。
+
+    没有预览视频的卡返回空串（前端就不渲染 poster 属性）。
+    """
+    if not m.preview_video or not m.static_dir:
+        return ""
+    try:
+        ver = int((m.static_dir / "preview.mp4").stat().st_mtime)
+    except OSError:
+        return ""
+    return "/preview/%s.jpg?v=%d" % (m.id, ver)
+
+
+def _manifest_to_dict(m: CardManifest, stamp=None) -> dict:
+    """Build the per-card dict that gets serialized to the front-end.
+
+    ``stamp`` 可选：把 frontend 资源 URL 加上版本戳（见
+    :func:`_card_asset_stamp`）。不传就是原样输出。
+    """
+    stamp = stamp or (lambda url: url)
     return {
         "id": m.id,
         "title": m.title,
-        "preview_video": m.preview_video,
+        "preview_video": stamp(m.preview_video) if m.preview_video else "",
+        # 首帧海报（服务端从 preview.mp4 抽的第一帧 JPEG）。首屏只显示它，
+        # 鼠标悬停才去加载真正的视频 —— 否则浏览器会整段下载所有预览视频
+        # （实测 9 张卡 3.2 MB）。详见 app/core/preview_poster.py。
+        "preview_poster": _preview_poster_url(m),
         "software_capabilities": m.software_capabilities,
         "hardware_capabilities": m.hardware_capabilities,
         # 能力组：同一组内的能力必须由**同一个**模型同时满足（派生自
@@ -185,8 +258,8 @@ def _manifest_to_dict(m: CardManifest) -> dict:
         "capability_groups": m.capability_groups,
         "frontend": {
             "template": m.raw["frontend"]["template"],
-            "js": m.frontend_js,
-            "css": m.frontend_css,
+            "js": [stamp(u) for u in m.frontend_js],
+            "css": [stamp(u) for u in m.frontend_css],
         },
         "demo_guard": {
             "active_state_keys": m.demo_guard_active_state_keys,
