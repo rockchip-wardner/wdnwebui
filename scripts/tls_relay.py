@@ -42,6 +42,7 @@ keep-alive 连接，只注入第一个的话后面的又变回 http://（实测�
     /home/rockchip/work/wdnwebui/.venv/bin/python -u scripts/tls_relay.py
 """
 import asyncio
+import os
 import ssl
 import sys
 from pathlib import Path
@@ -54,6 +55,18 @@ TARGET_PORT = 8000
 CERT_DIR = Path("/home/rockchip/.config/wdnwebui/tls")
 CERT = CERT_DIR / "cert.pem"
 KEY = CERT_DIR / "key.pem"
+
+#: 监听地址 / 端口 / 证书路径可以用环境变量覆盖 —— systemd 单元里改端口
+#: 不必改代码（改代码的话重装软件包就把端口改回去了）。
+#:
+#: 默认值保持原样（0.0.0.0:8443 + ~/.config/wdnwebui/tls），所以不设这些
+#: 环境变量时行为跟以前**完全一致**。
+LISTEN_HOST = os.environ.get("WDNAI_TLS_LISTEN_HOST", LISTEN_HOST)
+LISTEN_PORT = int(os.environ.get("WDNAI_TLS_LISTEN_PORT", LISTEN_PORT))
+TARGET_HOST = os.environ.get("WDNAI_TLS_TARGET_HOST", TARGET_HOST)
+TARGET_PORT = int(os.environ.get("WDNAI_TLS_TARGET_PORT", TARGET_PORT))
+CERT = Path(os.environ.get("WDNAI_TLS_CERT", str(CERT)))
+KEY = Path(os.environ.get("WDNAI_TLS_KEY", str(KEY)))
 
 #: 请求头最大字节数。超过就放弃注入（头都不完整，猜不出帧边界）。
 MAX_HEAD_BYTES = 64 * 1024
