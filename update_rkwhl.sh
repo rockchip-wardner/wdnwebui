@@ -349,12 +349,16 @@ update_pkg() {
     # 是两回事 —— 前者重试一次就好，后者重试多少次都一样。`--ff-only`
     # 保证失败时**不改动工作区**，所以重试是安全的。
     local _pull_ok=0 _try=1
-    while [ "$_try" -le "${UPDATE_RKWHL_PULL_RETRY:-3}" ]; do
-        if git -C "$dir" pull --ff-only; then
+    while [ "$_try" -le "${UPDATE_RKWHL_PULL_RETRY:-5}" ]; do
+        # lowSpeedLimit/lowSpeedTime：git 默认**没有**连接超时，TCP 层的
+        # 失败要等 135s 才报（实测 "Failed to connect ... after 135137 ms"）。
+        # 8 个包逐个 pull 的话，一次网络抖动就能拖掉十几分钟。压到 30s。
+        if git -C "$dir" -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30 \
+            pull --ff-only; then
             _pull_ok=1
             break
         fi
-        if [ "$_try" -lt "${UPDATE_RKWHL_PULL_RETRY:-3}" ]; then
+        if [ "$_try" -lt "${UPDATE_RKWHL_PULL_RETRY:-5}" ]; then
             echo "WARN: [$pkg] git pull 失败（第 $_try 次），5s 后重试" >&2
             sleep 5
         fi
