@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 更新 .venv/src 下以 editable 模式安装的 wdnav / wdnai / wdndds / wdnhid
-# 以及三个应用插件包 wdnapps_video_analyzer / wdnapps_hdmi_processor /
-# wdnapps_audio_chat
+# 以及四个应用插件包 wdnapps_video_analyzer / wdnapps_hdmi_processor /
+# wdnapps_audio_chat / wdnapps_media_generator
 # 用法：./update_rkwhl.sh
 #
 # 每个包的流程（v1.3 起）：
@@ -83,7 +83,7 @@ fi
 # ---------------------------------------------------------------------------
 # 插件包（wdnapps_*）的产物校验
 #
-# 这两个包是 pure-Python，没有 .so 可断言；但它们有一个更致命的失败模式：
+# 这些包是 pure-Python，没有 .so 可断言；但它们有一个更致命的失败模式：
 # **pip 装成功了，卡片却一个都不出现**，而且全程不报错。最常见的原因是
 # entry point 名与 manifest.json 的 "id" 不一致——包目录用下划线
 # (cards/video_detection/)，卡 id 一贯用连字符 ("video-detection")，照着
@@ -166,7 +166,7 @@ verify_outputs() {
             # wdnwebui 卡片侧 import wdnhid，必须保证本包可用即可。
             return 0
             ;;
-        wdnapps_video_analyzer|wdnapps_hdmi_processor|wdnapps_audio_chat)
+        wdnapps_video_analyzer|wdnapps_hdmi_processor|wdnapps_audio_chat|wdnapps_media_generator)
             # 应用插件包也是 pure-Python，同样没有 .so；但要验的东西更重要
             # ——卡片是不是真的注册上了（见 verify_plugin_cards 的说明）。
             verify_plugin_cards "$pkg"
@@ -438,6 +438,9 @@ run_pkg wdnhid "git+ssh://git@10.10.10.10/wardner/wdnhid.git#egg=wdnhid"
 run_pkg wdnapps_video_analyzer "git+ssh://git@10.10.10.10/wardner/wdnapps_video_analyzer.git#egg=wdnapps_video_analyzer"
 run_pkg wdnapps_hdmi_processor "git+ssh://git@10.10.10.10/wardner/wdnapps_hdmi_processor.git#egg=wdnapps_hdmi_processor"
 run_pkg wdnapps_audio_chat "git+ssh://git@10.10.10.10/wardner/wdnapps_audio_chat.git#egg=wdnapps_audio_chat"
+# 媒体生成插件包（文生图 / 图生图，Qwen-Image-2.1）。卡片跑在 wdnai 的
+# image 能力上，所以同样排在 wdnai 之后。
+run_pkg wdnapps_media_generator "git+ssh://git@10.10.10.10/wardner/wdnapps_media_generator.git#egg=wdnapps_media_generator"
 
 # 依赖审计放在**所有包都处理完之后**：这时 venv 的状态才是最终状态
 # （前面的包可能刚被重装，依赖也可能刚被 pip 换掉）。审计失败不改 .venv，
@@ -446,7 +449,7 @@ DEPS_AUDIT_OK=1
 audit_sdk_deps || DEPS_AUDIT_OK=0
 
 if [ ${#FAILED_PKGS[@]} -eq 0 ] && [ "$DEPS_AUDIT_OK" = "1" ]; then
-    echo "更新完成（wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor / wdnapps_audio_chat 全部成功）。"
+    echo "更新完成（wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor / wdnapps_audio_chat / wdnapps_media_generator 全部成功）。"
     exit 0
 fi
 

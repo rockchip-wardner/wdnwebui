@@ -5,9 +5,11 @@
 
 * 内置目录 ``app/apps/<id>/``
 * entry point 插件包（``wdnwebui.cards`` 组）—— 音视频描述 / 视频目标监控 /
-  监控反查 / 视频任意目标定位 / 音视频分析 / 智能电脑控制 / 语音生成 这 7 张卡
-  已迁到 ``wdnapps_video_analyzer`` / ``wdnapps_hdmi_processor`` /
-  ``wdnapps_audio_chat`` 三个插件包里，**源码不在本仓库**，在 ``.venv/src/`` 下。
+  监控反查 / 视频任意目标定位 / 音视频分析 / 智能电脑控制 / 语音生成 /
+  文生图 / 图生图 这 9 张卡已迁到 ``wdnapps_video_analyzer`` /
+  ``wdnapps_hdmi_processor`` / ``wdnapps_audio_chat`` /
+  ``wdnapps_media_generator`` 四个插件包里，**源码不在本仓库**，在
+  ``.venv/src/`` 下。
 
 verify 脚本不能再硬编码 ``app/apps/<id>/`` —— 那样插件卡一律读不到文件。
 统一走这里，脚本就不用关心卡在仓库里还是在插件包里。
