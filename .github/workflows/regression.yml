@@ -49,12 +49,15 @@ jobs:
         # AGENTS.md "改动只触及目标功能及其直接依赖" — only the files
         # touched by the broadcast fix + the regression scripts need to
         # parse. py_compile is fast (~10ms) and catches SyntaxErrors.
+        #
+        # The video cards moved out to the wdnapps_video_analyzer plugin
+        # in v0.4, so app/apps/video_*/ no longer exists in this repo —
+        # and .venv/src/ is gitignored, so a CI checkout doesn't have
+        # them either. The cards still living in-tree are text_chat / tts.
         run: |
           python -m py_compile \
             app/core/video/session.py \
-            app/apps/video_detection/api.py \
-            app/apps/video_target_detection/api.py \
-            app/apps/video_target_localization/api.py \
+            app/apps/text_chat/api.py \
             && echo "✅ changed files parse OK"
 
       - name: Syntax check on regression scripts
