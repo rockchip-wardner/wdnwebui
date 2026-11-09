@@ -64,11 +64,19 @@ TERMINAL_STATES = (STATE_DONE, STATE_FAILED, STATE_CANCELLED)
 # 路径与目录校验
 # --------------------------------------------------------------------------- #
 def default_dest() -> str:
-    """默认下载目录 = 模型根目录（``/userdata/models``）。"""
+    """默认下载目录 = 模型根目录（候选清单的第一项）。
+
+    兜底**不写死路径字面量**：候选清单来自
+    :func:`app.core.config.model_root_candidates`（中央真值源），第一条
+    就是「当前配置的模型根」，取不到时退到 ``/userdata/models``。
+    """
     try:
         return str(models_root())
     except Exception:  # noqa: BLE001
-        return "/userdata/models"
+        # 中央真值源兜底（不写死路径字面量）。这里若再抛，就让它冒泡 ——
+        # 静默返回一个假路径只会让调用方拿到「目录不在候选清单里」的
+        # 误导性报错。
+        return str(model_root_candidates()[0])
 
 
 def _nearest_existing(path: Path) -> Path:

@@ -15,6 +15,11 @@ model_path 解析走 ``default_models_root()`` 三段优先级:
 
     /userdata/models  →  /mnt/oem/models  →  <HOME>/models
 
+⚠️ ``<HOME>`` 指**操作员家目录** (``app.core.config._user_home()``,
+即 ``/home/<用户名>``),**不是** ``$HOME`` / ``Path.home()``:服务以 root
+跑时 ``$HOME=/root``,而根分区只有 14G —— 模型该放 ``/home`` 那边。
+``_user_home()`` 自己的解析链由 #10 单独覆盖。
+
 resource_dir 走 ``default_resource_root()``,总是 ``<resolved_root>/assets``,
 且会自动 ``mkdir -p``。命名历史:曾用 ``test``,改为 ``assets`` 后用 ``uploads/`` 当 wizard 上传第二级
 "wizard 上传落地" 的实际用途。
@@ -25,8 +30,8 @@ resource_dir 走 ``default_resource_root()``,总是 ``<resolved_root>/assets``,
     ``{model_path: <models_root>/, resource_dir: <resolved_root>/assets}``
     —— 注意 model_path 和 resource_dir 各自独立(资源根固定是
     ``/userdata/assets``,跟模型根走不走 /userdata 没关系)。
- 2. off-device (``/userdata`` + ``/mnt/oem/models`` 都不存在): 落到
-    ``<HOME>/models`` 和 ``<HOME>/assets``。
+ 2. off-device (``/userdata`` + ``/userdata/models`` + ``/mnt/oem/models``
+    都不存在): 落到 ``<HOME>/models`` 和 ``<HOME>/assets``。
  3. off-device 时 ``ConfigStore._seed_defaults`` 落盘的 ``base.model_path`` /
     ``base.resource_dir`` 与 #2 一致。
  4. off-device 时 ``app/system/api/config._BASE_DEFAULTS`` 也与 #2 一致。
@@ -37,15 +42,19 @@ resource_dir 走 ``default_resource_root()``,总是 ``<resolved_root>/assets``,
      - 仅 /mnt/oem/models 存在  → 选 /mnt/oem/models
      - 都不存在                  → 选 <HOME>/models
  7. ``default_resource_root()`` 会自动 mkdir 出一个 ``<resolved>/assets``
-    目录(用临时 HOME 隔离,避免污染真文件系统)。
+    目录(用临时 ``_user_home()`` 隔离,避免污染真文件系统)。
  8. **静态源码审计**: ``app/**/*.py`` 里除了 ``app/core/config.py``(中央
     真值源)之外,不得再出现任何硬编码的 ``/userdata`` 运行时字面量;
-    注释 / docstring 里的描述性提及不算。
+    注释 / docstring 里的描述性提及不算。docstring 用 ``ast`` 精确识别
+    (只豁免 module/class/function 的第一条语句),普通字符串常量照旧被审计。
 """
 from __future__ import annotations
 
+import ast
 import importlib
 import json
+import os
+import pwd
 import shutil
 import sys
 import tempfile
@@ -83,23 +92,37 @@ def _is_comment_line(line: str) -> bool:
     return line.lstrip().startswith("#")
 
 
-def _is_docstring_line(idx: int, file_lines: list[str]) -> bool:
-    """Heuristic: is the line at index ``idx`` inside a triple-quoted
-    docstring?
+def _docstring_line_indexes(source: str) -> set[int]:
+    """返回所有 **docstring** 覆盖的行号（0-based）。
 
-    Tracks open/close state across lines by counting the number of
-    triple-double-quote tokens per line. Good enough for the audit:
-    false negatives just become "flagged but actually in a docstring",
-    which the human reviewer can dismiss.
+    用 ``ast`` 定位，而不是数引号 —— 数引号认不出**单行** docstring：
+    一行里出现两次三引号，奇偶相消 → 整行永远不算在 docstring
+    里。早先的启发式就是这么把 ``model_download.py`` 的一行单行 docstring
+    误报成「硬编码 ``/userdata`` 运行时字面量」的。
+
+    只豁免**真正的 docstring**（module / class / function 的第一条语句）；
+    普通字符串常量仍然是运行时字面量，照样被审计。
     """
-    in_doc = False
-    for i, ln in enumerate(file_lines):
-        if i == idx:
-            return in_doc
-        # Odd-count toggles state (treats each line as flipping once).
-        if ln.count('"""') % 2 == 1:
-            in_doc = not in_doc
-    return False
+    out: set[int] = set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return out
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef,
+                                 ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if not (isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            continue
+        end = first.end_lineno or first.lineno
+        out.update(range(first.lineno - 1, end))
+    return out
 
 
 def _audit_source_for_hardcoded_userdata(repo_root: Path) -> list[tuple[Path, int, str]]:
@@ -123,12 +146,13 @@ def _audit_source_for_hardcoded_userdata(repo_root: Path) -> list[tuple[Path, in
         except UnicodeDecodeError:
             continue
         file_lines = text.splitlines()
+        doc_lines = _docstring_line_indexes(text)
         for i, ln in enumerate(file_lines):
             if "/userdata" not in ln:
                 continue
             if _is_comment_line(ln):
                 continue
-            if _is_docstring_line(i, file_lines):
+            if i in doc_lines:
                 continue
             violations.append((py_path, i + 1, ln.rstrip()))
     return violations
@@ -187,15 +211,23 @@ def main() -> int:
         # 设为不存在,才能逼出 <HOME>/models fallback。
         with mock.patch.object(Path, "is_dir", autospec=True) as mocked_is_dir:
             def fake_is_dir(self, *args, **kwargs):
-                # 强制 /userdata、/mnt/oem/models 为不存在,其它路径真实
-                if str(self) in ("/userdata", "/mnt/oem/models"):
+                # 强制 off-device：/userdata 没挂载、两个模型根候选都不存在。
+                # 注意候选是「/userdata/models」而不是「/userdata」——
+                # 早先只挡了 "/userdata"，于是 /userdata/models 仍按真实
+                # 存在处理，off-device 场景压根没被触发（#2/#3/#4 的
+                # model_path 期望永远对不上）。
+                if str(self) in ("/userdata", "/userdata/models",
+                                 "/mnt/oem/models"):
                     return False
                 return original_is_dir(self, *args, **kwargs)
             mocked_is_dir.side_effect = fake_is_dir
 
             importlib.reload(cfg_module)
             offdevice_paths = cfg_module.default_base_paths()
-            home = Path.home()
+            # <HOME> = 操作员家目录（``_user_home()``），**不是** ``Path.home()``：
+            # 服务以 root 跑时 $HOME=/root，但那是小分区，模型该放
+            # /home/<user>。``_user_home()`` 的解析链由 #10 单独覆盖。
+            home = cfg_module._user_home()
             expected_model_path = f"{home}/models/"
             expected_resource_dir = f"{home}/assets"
 
@@ -310,7 +342,8 @@ def main() -> int:
                 importlib.reload(cfg_module)
                 importlib.reload(importlib.import_module("app.system.api.config"))
                 if expected is None:
-                    expected_path = Path.home() / "models"
+                    # 兜底是「操作员家目录」下的 models/，不是 $HOME。
+                    expected_path = cfg_module._user_home() / "models"
                 else:
                     expected_path = Path(expected)
                 ok = cfg_module.default_models_root() == expected_path
@@ -334,9 +367,15 @@ def main() -> int:
             test_dir = fake_home / "assets"
             if test_dir.exists():
                 shutil.rmtree(test_dir)
-            # mock Path.home -> fake_home + /userdata 视为不存在
+            # mock _user_home -> fake_home + /userdata 视为不存在
+            #
+            # ⚠️ mock 的是 ``_user_home()`` 而不是 ``Path.home()``：
+            # 资源根走的是 ``_user_home()``（操作员家目录），不是 ``$HOME``。
+            # 早先 mock 的是 ``Path.home()`` —— 对当前实现完全无效，于是
+            # 这一条会去 mkdir **真实的** /home/rockchip/assets（污染真文件系统），
+            # 而且断言拿临时目录去比对真实路径，恒失败。
             with mock.patch.object(Path, "is_dir", autospec=True) as mocked_is_dir, \
-                 mock.patch.object(Path, "home", return_value=fake_home):
+                 mock.patch.object(cfg_module, "_user_home", return_value=fake_home):
                 def is_dir_fake(self, *args, **kwargs):
                     if str(self) == "/userdata":
                         return False
@@ -346,7 +385,7 @@ def main() -> int:
                 root = cfg_module.default_resource_root()
                 ok = root == fake_home / "assets"
                 results.append(_check(
-                    "off-device + mock HOME: root = <HOME>/assets",
+                    "off-device + mock <HOME>: root = <HOME>/assets",
                     ok,
                     detail=str(root),
                 ))
@@ -471,15 +510,31 @@ def main() -> int:
                     ok, detail=str(rr),
                 ))
 
-        # [10c] SUDO_USER 不在 /etc/passwd(罕见): 降级到 Path.home()
+        # [10c] SUDO_USER 不在 /etc/passwd(罕见): 链条**继续往下走**，
+        # 而不是立刻掉回 Path.home()。下一站是「服务进程 cwd 的属主」——
+        # systemd 场景下 cwd 归操作员所有，那才是模型该落的地方。
         with mock.patch.dict("os.environ",
                              {"SUDO_USER": "ghost_user_no_such_account",
                               "HOME": "/root"},
                              clear=False):
             home = cfg_mod._user_home()
-            ok = str(home) == "/root"  # 降级到 Path.home()
+            # 期望值独立推导：按 cwd 属主查 pwd，**不调用被测函数**。
+            cwd_uid = os.stat(os.getcwd()).st_uid
+            if cwd_uid != 0:
+                expected_home = Path(pwd.getpwuid(cwd_uid).pw_dir)
+            else:
+                expected_home = Path.home()
+            ok = str(home) == str(expected_home)
             results.append(_check(
-                "SUDO_USER 在 NSS 查不到 -> 降级到 Path.home() (= /root)",
+                "SUDO_USER 在 NSS 查不到 -> 继续走链条: 落 cwd 属主的家目录",
+                ok, detail=f"{home} (期望 {expected_home})",
+            ))
+            # 关键性质：链条没有停在 Path.home()(=/root)。
+            # 只有在 cwd 也归 root、且系统里定位不到唯一操作员时，
+            # 才允许退到 Path.home()。
+            ok = str(home) != "/root" or cwd_uid == 0
+            results.append(_check(
+                "SUDO_USER 查不到时也不会掉回 /root",
                 ok, detail=str(home),
             ))
 

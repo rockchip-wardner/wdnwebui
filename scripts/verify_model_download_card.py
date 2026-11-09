@@ -53,6 +53,35 @@ def check(ok: bool, label: str, detail: str = "") -> bool:
     return ok
 
 
+def _find_chrome() -> str | None:
+    """找一个能用的 chromium。
+
+    venv 里的 playwright 版本不一定和 ``~/.cache/ms-playwright`` 里下载的
+    浏览器版本对得上 —— playwright 按自己的 revision 找
+    ``chromium_headless_shell-<rev>``，对不上就报 "Executable doesn't
+    exist"。本板装的是完整 chromium（``chromium-1243``），headless_shell
+    那个 revision 不存在，于是整个回归起不来浏览器。
+
+    与 :func:`verify_asr_wizard._find_chrome` 同源（各自独立一份，
+    免得两个脚本互相 import）。
+    """
+    env = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+    cands: list[str] = []
+    if env:
+        cands.append(env)
+    cache = Path.home() / ".cache" / "ms-playwright"
+    if cache.is_dir():
+        for d in sorted(cache.glob("chromium-*"), reverse=True):
+            cands.append(str(d / "chrome-linux-arm64" / "chrome"))
+            cands.append(str(d / "chrome-linux" / "chrome"))
+    cands += ["/usr/bin/chromium", "/usr/bin/chromium-browser",
+              "/usr/bin/google-chrome"]
+    for c in cands:
+        if c and Path(c).is_file():
+            return c
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 1) 纯逻辑：_staged_bytes + 续传预算
 # ---------------------------------------------------------------------------
@@ -162,7 +191,14 @@ def _job(state: str, name: str = "Probe-Model", error: str = "") -> dict:
 
 
 with sync_playwright() as pw:
-    browser = pw.chromium.launch(args=["--no-sandbox", "--mute-audio"])
+    # 上游的 ``--mute-audio``（回归别出声）+ 本地的 ``_find_chrome()`` 回退
+    # （板上 playwright 自带的 chromium_headless_shell 对不上 revision，
+    #   不指定 executable_path 根本起不来浏览器）—— 两边都要。
+    _chrome = _find_chrome()
+    launch_kw = {"args": ["--no-sandbox", "--mute-audio"]}
+    if _chrome:
+        launch_kw["executable_path"] = _chrome
+    browser = pw.chromium.launch(**launch_kw)
     page = browser.new_page(viewport={"width": 1600, "height": 1200})
     errs: list[str] = []
     page.on("pageerror", lambda e: errs.append(str(e)))
