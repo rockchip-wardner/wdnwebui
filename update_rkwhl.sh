@@ -36,6 +36,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_SRC="$SCRIPT_DIR/.venv/src"
 
+# ---------------------------------------------------------------------------
+# 包来源（可被外部覆盖）
+#
+# 默认是公司内网镜像 —— 现场板子常常没有外网，只能走内网。
+# 公网的一键安装器（https://github.com/rockchip-wardner/wardner）把
+# WARDNER_PKG_BASE 设成 https://github.com/rockchip-wardner 即可换成公网源。
+#
+# 这个变量只在「目录不存在、走 URL 兜底安装」那条路径上真正被用到：
+# 已克隆过的包走的是 `git pull`（用各自 clone 时的 remote），跟这里无关。
+#
+#   内网镜像：git+ssh://git@10.10.10.10/wardner
+#   公网 GitHub：git+https://github.com/rockchip-wardner
+# ---------------------------------------------------------------------------
+WARDNER_PKG_BASE="${WARDNER_PKG_BASE:-git+ssh://git@10.10.10.10/wardner}"
+
 # 必须先 activate venv：wdndds._build.py / wdnav._build_wdnav.py 在
 # 重建 .so 过程中可能 spawn 子进程调用 `python` / `pip`；未 activate
 # 时这些子进程会回退到系统 python（尤其 sudo / 非交互 shell 场景），
@@ -420,10 +435,10 @@ audit_sdk_deps() {
     ( cd "$SCRIPT_DIR" && python "$checker" )
 }
 
-run_pkg wdnav  "git+ssh://git@10.10.10.10/wardner/wdnav.git#egg=wdnav"
-run_pkg wdnai  "git+ssh://git@10.10.10.10/wardner/wdnai.git#egg=wdnai"
-run_pkg wdndds "git+ssh://git@10.10.10.10/wardner/wdndds.git#egg=wdndds"
-run_pkg wdnhid "git+ssh://git@10.10.10.10/wardner/wdnhid.git#egg=wdnhid"
+run_pkg wdnav  "$WARDNER_PKG_BASE/wdnav.git#egg=wdnav"
+run_pkg wdnai  "$WARDNER_PKG_BASE/wdnai.git#egg=wdnai"
+run_pkg wdndds "$WARDNER_PKG_BASE/wdndds.git#egg=wdndds"
+run_pkg wdnhid "$WARDNER_PKG_BASE/wdnhid.git#egg=wdnhid"
 
 # 应用插件包（wdnwebui 的卡片）。放在 SDK 之后：wdnapps_hdmi_processor 的
 # usb_hid 卡 import wdnhid / wdnav，先有它们再装插件，日志里的报错才不会
@@ -435,12 +450,12 @@ run_pkg wdnhid "git+ssh://git@10.10.10.10/wardner/wdnhid.git#egg=wdnhid"
 # __editable__.wdnapps_video_analyzer-0.1.0.pth。purge_install_traces 全靠
 # $pkg 拼这些 glob —— 传连字符名会让清理静默落空，旧 .pth 越攒越多，
 # 而那正是文件头 v1.3 要根治的"实体目录遮挡 editable 安装"问题。
-run_pkg wdnapps_video_analyzer "git+ssh://git@10.10.10.10/wardner/wdnapps_video_analyzer.git#egg=wdnapps_video_analyzer"
-run_pkg wdnapps_hdmi_processor "git+ssh://git@10.10.10.10/wardner/wdnapps_hdmi_processor.git#egg=wdnapps_hdmi_processor"
-run_pkg wdnapps_audio_chat "git+ssh://git@10.10.10.10/wardner/wdnapps_audio_chat.git#egg=wdnapps_audio_chat"
+run_pkg wdnapps_video_analyzer "$WARDNER_PKG_BASE/wdnapps_video_analyzer.git#egg=wdnapps_video_analyzer"
+run_pkg wdnapps_hdmi_processor "$WARDNER_PKG_BASE/wdnapps_hdmi_processor.git#egg=wdnapps_hdmi_processor"
+run_pkg wdnapps_audio_chat "$WARDNER_PKG_BASE/wdnapps_audio_chat.git#egg=wdnapps_audio_chat"
 # 媒体生成插件包（文生图 / 图生图，Qwen-Image-2.1）。卡片跑在 wdnai 的
 # image 能力上，所以同样排在 wdnai 之后。
-run_pkg wdnapps_media_generator "git+ssh://git@10.10.10.10/wardner/wdnapps_media_generator.git#egg=wdnapps_media_generator"
+run_pkg wdnapps_media_generator "$WARDNER_PKG_BASE/wdnapps_media_generator.git#egg=wdnapps_media_generator"
 
 # 依赖审计放在**所有包都处理完之后**：这时 venv 的状态才是最终状态
 # （前面的包可能刚被重装，依赖也可能刚被 pip 换掉）。审计失败不改 .venv，
