@@ -72,7 +72,7 @@ from app.apps.qwen3_asr.service import (_LIVE_ENDPOINT_CONFIG,
 from app.core.audio.capture import (CAPTURE_N_CHANNELS, CAPTURE_SAMPLE_RATE,
                                     CAPTURE_SAMPLE_WIDTH, DEFAULT_CHUNK_MS,
                                     validate_capture_format)
-from app.core.audio.decode import MEDIA_EXTS, iter_media_pcm
+from app.core.audio.decode import MEDIA_EXTS, VIDEO_EXTS, iter_media_pcm
 from app.core.config import asr_live_enabled
 
 _LOG = logging.getLogger("qwen3_asr_api")
@@ -211,6 +211,22 @@ def _media_type(path: Path) -> str:
     return guessed or "application/octet-stream"
 
 
+def _source_kind(name: str) -> str:
+    """按**文件名后缀**判定来源类型：``video``（含音轨的视频）/ ``audio``。
+
+    ⚠️ 只认后缀，**不做内容嗅探** —— 后缀是用户给的（上传的文件名 /
+    设备端路径），填错了用户自己一眼看得见；而嗅探要解容器，慢，
+    而且对「无音轨的视频」会判错（视频容器没音轨时按视频处理才对，
+    因为它本来就不该出现在音频路径上）。
+
+    这个值会**跟着轮次一起存到服务端**（见
+    :meth:`service.AsrService.transcribe_stream` 的 ``source_info``）——
+    页面刷新后前端靠它把轮次还原到**正确的来源页签**下。
+    """
+    ext = Path(name or "").suffix.lower()
+    return "video" if ext in VIDEO_EXTS else "audio"
+
+
 @router.get("/media")
 async def get_media(path: str = Query(..., description="设备端媒体文件绝对路径")):
     """把设备端的音视频文件交给浏览器播放。
@@ -238,8 +254,17 @@ async def get_asr_snapshot() -> dict:
 
 @router.get("/rounds")
 async def get_asr_rounds() -> dict:
-    """本次识别的逐轮明细（页面刷新后恢复）。"""
-    return {"rounds": get_asr_service().rounds()}
+    """本次识别的逐轮明细（页面刷新后恢复）。
+
+    响应形状：``{"rounds": [...], "source": {...}}``。
+
+    ``source`` —— 这批轮次**归属的来源**（``{"kind", "name", "path"}``）。
+    ⚠️ 必须由**服务端**给，不能让前端自己猜：前端只知道「当前停在
+    哪个页签」，刷新后那个页签是**默认值**（音频文件）→ 猜出来的
+    归属会把**视频**的轮次画到音频页签下（或反之）= 串台。
+    """
+    svc = get_asr_service()
+    return {"rounds": svc.rounds(), "source": svc.rounds_source()}
 
 
 @router.post("/upload")
@@ -345,6 +370,17 @@ async def post_asr_transcribe(
     svc = get_asr_service()
     start_at = max(0.0, float(start_sec or 0.0))
 
+    # 这批轮次**归属的来源** —— 服务端记着，页面刷新后前端靠它把轮次
+    # 还原到正确的来源页签（见 ``GET /rounds`` 的 ``source``）。
+    #
+    # ⚠️ ``path`` 只有「设备端路径」时才有值：浏览器上传的 ``File``
+    # 对象刷新后**拿不回来** → 路径留空，但轮次 / 文本照常恢复。
+    source_info = {
+        "kind": _source_kind(name),
+        "name": name,
+        "path": (source.strip() if isinstance(source, str) else ""),
+    }
+
     def _factory():
         """惰性解码器 —— 真正的解码在 worker 线程里做（阻塞 I/O）。"""
         return iter_media_pcm(source, filename=name, chunk_seconds=1.0,
@@ -352,7 +388,8 @@ async def post_asr_transcribe(
 
     try:
         rid = svc.transcribe_stream(_factory, options=options,
-                                     append=bool(append), start_sec=start_at)
+                                     append=bool(append), start_sec=start_at,
+                                     source_info=source_info)
     except ValueError as e:
         msg = str(e)
         if "上一条" in msg:

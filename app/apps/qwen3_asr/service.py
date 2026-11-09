@@ -244,6 +244,17 @@ class _AsrManager:
         self._last_result: Optional[Dict[str, Any]] = None
         self._language: str = ""
         self._rounds: List[Dict[str, Any]] = []
+        #: **这批轮次归属哪个来源**（页面刷新后要靠它把历史恢复回来）。
+        #:
+        #: ``{"kind": "video"|"audio", "name": str, "path": str}`` ——
+        #: * ``kind`` —— 媒体是**含音轨的视频**还是**纯音频**。前端按它决定
+        #:   把轮次算作「视频来源」还是「音频文件来源」。
+        #: * ``path`` —— 设备端路径（浏览器上传的没有路径 → 空串）。
+        #:
+        #: ⚠️ **归属必须由后端记，不能由前端猜**：页面刷新后前端不知道这批
+        #: 轮次是哪一路来的，靠当前页签猜就会把「音频文件」的轮次画到视频
+        #: 画面上（U15 那个「切来源串台」的坑）。后端是唯一知道真相的地方。
+        self._rounds_source: Dict[str, Any] = {}
         self._last_started: float = 0.0
         self._id_seq = 0
         #: 本次识别用的流式参数（透传给 SDK 的 respond）。
@@ -352,6 +363,7 @@ class _AsrManager:
                 "model_id": self._model_id or self._resolve_model_id(),
                 "current_request_id": self._current_request_id,
                 "round_count": len(self._rounds),
+                "rounds_source": dict(self._rounds_source),
                 "last_result": self._last_result,
                 "last_started": self._last_started,
                 "options": dict(self._options),
@@ -373,6 +385,11 @@ class _AsrManager:
     def rounds(self) -> List[Dict[str, Any]]:
         with self._lock:
             return list(self._rounds)
+
+    def rounds_source(self) -> Dict[str, Any]:
+        """这批轮次归属的来源（见 :attr:`_rounds_source`）。"""
+        with self._lock:
+            return dict(self._rounds_source)
 
     def _set_state(self, state: str, *, error: str = "") -> None:
         with self._lock:
@@ -438,6 +455,7 @@ class _AsrManager:
         """清空本轮结果，回到 idle。"""
         with self._lock:
             self._rounds = []
+            self._rounds_source = {}
             self._language = ""
             self._last_result = None
             self._current_request_id = None
@@ -467,6 +485,7 @@ class _AsrManager:
         options: Optional[Dict[str, Any]] = None,
         append: bool = False,
         start_sec: float = 0.0,
+        source_info: Optional[Dict[str, Any]] = None,
     ) -> int:
         """发起一次**流式**识别（文件 / 视频）。返回 request_id。
 
@@ -497,6 +516,12 @@ class _AsrManager:
 
         ``append`` —— **保留**已有的轮次（而不是清空）。拖动后重开识别
         时用它：前面已经识别过的部分要留在字幕时间轴上。
+
+        ``source_info`` —— 这批轮次归属的来源（见 :attr:`_rounds_source`）：
+        ``{"kind": "video"|"audio", "name": ..., "path": ...}``。
+        * **不是 append**（新的一批）→ 记下来（覆盖旧的）；
+        * **append**（拖动后重开，还是同一段媒体）→ **保持原来的** ——
+          拖动重开的是同一个视频，来源当然不变。
         """
         with self._lock:
             if self._state == self.STATE_RUNNING:
@@ -507,6 +532,10 @@ class _AsrManager:
             self._last_started = time.time()
             if not append:
                 self._rounds = []
+                self._rounds_source = dict(source_info or {})
+            elif source_info and not self._rounds_source:
+                # append 但还没有归属（例如服务重启后第一次就是拖动重开）
+                self._rounds_source = dict(source_info)
             self._language = ""
             self._last_result = None
             self._options = dict(options or {})

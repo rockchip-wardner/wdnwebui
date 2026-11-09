@@ -309,6 +309,19 @@
   display: none;
 }
 
+/* ⚠️ **实时来源的归属守卫**（串线防护）。
+ *
+ * 单行文字框显示的是「**最近一批**」的文本。切到**实时来源**（麦克风）
+ * 时，那行字是**文件批次**的历史 —— 而麦克风的文字在它自己的框里
+ * （`#asr-rt-committed`）→ 藏起来，别让两段文字并排出现。
+ *
+ * ⚠️ **文件 ↔ 视频之间不藏**：那两栏是同一批结果的两种视图，藏了的话
+ * 视频的识别结果在切回文件页签后就彻底看不见（U18 的契约）。 */
+.asr-live.asr-live-notfile .asr-live-committed,
+.asr-live.asr-live-notfile .asr-live-unfixed {
+  display: none;
+}
+
 .asr-transcript {
   padding: 10px 14px 12px;
   /* 同上：模板里的换行 + 缩进在 pre-wrap 下会变成空行 */

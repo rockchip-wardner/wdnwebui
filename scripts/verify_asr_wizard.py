@@ -2044,6 +2044,234 @@ def verify_sources(page, shot_dir: Path) -> None:
                     pass
 
 
+def verify_restore(page, shot_dir: Path) -> None:
+    """U19: 刷新页面后恢复 + 不同来源的历史不串线。
+
+    用户反馈：「刷新页面后转写框内容丢失」。
+
+    根因：轮次只存在**服务端的内存**里（``service.py::_rounds``），浏览器
+    一刷新 ``this.rounds`` 就空了 → 视频来源的「字幕同款转写框」被清空。
+
+    这里钉死两件事：
+
+    1. **刷新后还在** —— 轮次 / 转写框 / 来源页签 / 设备端路径都要恢复，
+       而且**归属由服务端说了算**（``GET /rounds`` 一起返回 ``source``）：
+       前端自己猜会把「音频文件」的轮次画到视频画面上。
+    2. **不同来源的历史不串线** —— 音频文件的那句话不能出现在视频页签下，
+       视频的轮次也不能被画到麦克风页签下。
+    """
+    print("\n--- U19 刷新恢复 + 来源不串线 ---")
+
+    mp4_src = Path("/tmp/asr_ref/asr_real_audio.mp4")
+    tmp_mp4 = "/userdata/assets/uploads/_asr_restore_test.mp4"
+    have_mp4 = False
+    if mp4_src.is_file():
+        try:
+            shutil.copyfile(str(mp4_src), tmp_mp4)
+            have_mp4 = True
+        except OSError:
+            have_mp4 = False
+
+    def _mark_wizard_done():
+        """把向导标成「已完成」→ 刷新后**不会**重挂向导（卡片页直接可见）。
+
+        ⚠️ 不能像 ``open_wizard`` 那样把痕迹**清空** —— 清空了等于「没走过
+        向导」，刷新后框架的 ``tryMount`` 会把向导重新挂上，向导会把卡片页
+        藏起来 → 后面点页签都点不到（元素 not visible）。
+
+        键名 = ``wdnwebui.wizard.<appId>.completed``（``state.js::_lsKey``，
+        没有 ``localStorage_key`` 时就是这个前缀）。
+        """
+        page.evaluate("""(id) => {
+            const base = 'wdnwebui.wizard.' + id;
+            localStorage.setItem(base + '.completed', '1');
+            for (const k of Object.keys(localStorage))
+                if (k.startsWith(base) && k.endsWith('.completed'))
+                    localStorage.setItem(k, '1');
+        }""", APP)
+
+    def _reload_and_wait(n_rounds: int):
+        """刷新页面 → 等恢复完成（轮次数够 + 归属落定）。"""
+        _mark_wizard_done()
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_function("() => !!window.Qwen3Asr", timeout=20000)
+        try:
+            page.wait_for_function(
+                """(n) => {
+                    const A = window.Qwen3Asr;
+                    return !!A && (A.rounds || []).length >= n && !!A._roundsSource;
+                }""", arg=n_rounds, timeout=25000)
+        except Exception:
+            pass
+        page.wait_for_timeout(600)
+
+    def _state():
+        return page.evaluate("""() => {
+            const A = window.Qwen3Asr || {};
+            const c = document.getElementById('asr-live-committed');
+            const box = document.getElementById('asr-transcript');
+            const body = document.getElementById('asr-transcript-body');
+            const rt = document.getElementById('asr-rt-committed');
+            const tab = document.querySelector(
+                '#asr-source-tabs .asr-source-tab.is-active');
+            // 「看得见吗」要一路往上算 —— 父元素 display:none 时，
+            // 子元素的 computed display 仍然是它自己的值。
+            const vis = (e) => {
+                if (!e) return null;
+                let n = e;
+                while (n && n !== document.body) {
+                    if (getComputedStyle(n).display === 'none') return false;
+                    n = n.parentElement;
+                }
+                return true;
+            };
+            return {
+                n: (A.rounds || []).length,
+                src: A._roundsSource || '',
+                source: A._source || '',
+                text: c ? (c.textContent || '').trim() : '',
+                singleShown: vis(c),
+                trHidden: box ? box.classList.contains('hidden') : null,
+                trRows: body ? body.querySelectorAll('.asr-sub-line').length : 0,
+                trText: body ? (body.textContent || '').trim() : '',
+                rtText: rt ? (rt.textContent || '').trim() : '',
+                tab: tab ? tab.dataset.source : '',
+                path: (document.getElementById('asr-path') || {}).value || '',
+            };
+        }""")
+
+    try:
+        # ---------------- 1) 音频文件批次 → 刷新 → 还在 ----------------
+        page.select_option("#asr-mode", "single")
+        page.click('#asr-source-tabs .asr-source-tab[data-source=file]')
+        page.wait_for_timeout(400)
+        page.fill("#asr-path", WAV)
+        page.dispatch_event("#asr-path", "input")
+        page.wait_for_timeout(600)
+        page.click("#asr-start-btn")
+        try:
+            page.wait_for_function(
+                """() => {
+                    const b = document.getElementById('asr-state-badge');
+                    return b && b.getAttribute('data-state') === 'done';
+                }""", timeout=180000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1200)
+        a_before = _state()
+        print(f"  刷新前：轮次={a_before['n']} 文本={a_before['text'][:50]!r} "
+              f"页签={a_before['tab']!r}")
+        check("U19 音频文件识别出了轮次和文本",
+              a_before["n"] > 0 and bool(a_before["text"]),
+              f"n={a_before['n']} text={a_before['text'][:50]!r}")
+
+        _reload_and_wait(a_before["n"])
+        a_after = _state()
+        print(f"  刷新后：轮次={a_after['n']} 文本={a_after['text'][:50]!r} "
+              f"页签={a_after['tab']!r} 路径={a_after['path']!r}")
+        check("U19 刷新后轮次恢复（数量与刷新前一致）",
+              a_after["n"] == a_before["n"] and a_after["n"] > 0,
+              f"{a_before['n']} → {a_after['n']}")
+        check("U19 刷新后文本恢复（与刷新前逐字一致）",
+              a_after["text"] == a_before["text"] and bool(a_after["text"]),
+              f"{a_before['text'][:50]!r} → {a_after['text'][:50]!r}")
+        check("U19 刷新后来源页签仍是「音频文件」",
+              a_after["tab"] == "file", f"tab={a_after['tab']!r}")
+        check("U19 刷新后设备端路径填回输入框",
+              a_after["path"] == WAV, f"path={a_after['path']!r}")
+        check("U19 刷新后批次归属是 file（服务端说了算）",
+              a_after["src"] == "file", f"src={a_after['src']!r}")
+
+        # ---------------- 2) 切到视频页签 → 音频文件的话不串线 ----------------
+        #
+        # ⚠️ **单行文字框不藏**（U18 的契约：切回文件页签要还能看到结果）
+        # —— 真正要挡住的是「画到画面上」的那两处：视频字幕 + 转写框。
+        page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
+        page.wait_for_timeout(900)
+        v_state = _state()
+        check("U19 切到视频页签后，音频文件的轮次没被画进转写框（不串线）",
+              v_state["trHidden"] is True and v_state["trRows"] == 0,
+              f"hidden={v_state['trHidden']} rows={v_state['trRows']}")
+        sub_after = page.evaluate(
+            """() => (document.getElementById('asr-video-sub')
+                    .textContent || '').trim()""")
+        check("U19 切到视频页签后画面字幕是空的（没画上一来源的轮次）",
+              sub_after == "", f"字幕={sub_after[:60]!r}")
+        check("U19 切到视频页签后音频文件的文本还在（没被删，切回去能看）",
+              v_state["text"] == a_before["text"],
+              f"{v_state['text'][:50]!r}")
+
+        # ---------------- 3) 视频批次 → 刷新 → 转写框还在 ----------------
+        if not have_mp4:
+            print("  [SKIP] 缺 /tmp/asr_ref/asr_real_audio.mp4"
+                  "（U19 视频段跳过）")
+            return
+        page.fill("#asr-path", tmp_mp4)
+        page.dispatch_event("#asr-path", "input")
+        page.wait_for_timeout(800)
+        page.click("#asr-start-btn")
+        try:
+            page.wait_for_function(
+                """() => {
+                    const b = document.getElementById('asr-state-badge');
+                    return b && b.getAttribute('data-state') === 'done';
+                }""", timeout=180000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+        v_before = _state()
+        print(f"  视频刷新前：轮次={v_before['n']} 转写行={v_before['trRows']}")
+        check("U19 视频识别后转写框有内容",
+              v_before["trRows"] > 0 and v_before["trHidden"] is False,
+              f"rows={v_before['trRows']} hidden={v_before['trHidden']}")
+
+        _reload_and_wait(v_before["n"])
+        v_after = _state()
+        print(f"  视频刷新后：轮次={v_after['n']} 转写行={v_after['trRows']} "
+              f"页签={v_after['tab']!r} 路径={v_after['path']!r}")
+        check("U19 刷新后转写框的行数与刷新前一致",
+              v_after["trRows"] == v_before["trRows"] and v_after["trRows"] > 0,
+              f"{v_before['trRows']} → {v_after['trRows']}")
+        check("U19 刷新后转写框的文本与刷新前一致",
+              v_after["trText"] == v_before["trText"] and bool(v_after["trText"]),
+              f"{v_before['trText'][:40]!r} → {v_after['trText'][:40]!r}")
+        check("U19 刷新后来源页签回到「含音轨的视频」",
+              v_after["tab"] == "video", f"tab={v_after['tab']!r}")
+        check("U19 刷新后批次归属是 video（不是上一次的 file）",
+              v_after["src"] == "video", f"src={v_after['src']!r}")
+        check("U19 刷新后设备端路径填回输入框（播放器能重载）",
+              v_after["path"] == tmp_mp4, f"path={v_after['path']!r}")
+
+        # ---------------- 4) 麦克风页签 → 文件的结果不串线 ----------------
+        page.click('#asr-source-tabs .asr-source-tab[data-source=browser]')
+        page.wait_for_timeout(900)
+        m_state = _state()
+        check("U19 麦克风页签下，文件那批的单行文本被藏起来",
+              m_state["singleShown"] is False,
+              f"shown={m_state['singleShown']}")
+        check("U19 麦克风区没有文件的历史文本",
+              m_state["rtText"] == "", f"rt={m_state['rtText'][:50]!r}")
+
+        # ---------------- 5) API 层：归属跟着轮次一起下发 ----------------
+        st, data = api("GET", "/api/qwen3-asr/rounds")
+        src = (data or {}).get("source") or {}
+        check("U19 /rounds 一起返回轮次的归属（kind=video）",
+              src.get("kind") == "video", f"source={src}")
+        check("U19 /rounds 的归属带上了设备端路径（播放器能重载）",
+              src.get("path") == tmp_mp4, f"source={src}")
+        check("U19 新批次替换了旧批次（音频文件的轮次没留下）",
+              (data or {}).get("rounds") is not None
+              and len(data["rounds"]) == v_after["n"],
+              f"server={len((data or {}).get('rounds') or [])} "
+              f"page={v_after['n']}")
+        page.screenshot(path=str(shot_dir / "7_u19_mic.png"))
+    finally:
+        try:
+            os.remove(tmp_mp4)
+        except OSError:
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--headful", action="store_true")
@@ -2349,6 +2577,9 @@ def main() -> int:
 
         # ---------------- 四种输入源 + 不再 60 s 截断 ----------------
         verify_sources(page, shot_dir)
+
+        # ---------------- 刷新恢复 + 来源不串线 ----------------
+        verify_restore(page, shot_dir)
 
         check("页面没有 JS 报错", not errors, f"errors={errors[:3]}")
         browser.close()

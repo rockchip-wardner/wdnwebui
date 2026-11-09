@@ -195,6 +195,11 @@ const Qwen3Asr = {
   //
   // 有了这个标记，字幕只在「轮次确实来自视频这次识别」时才渲染。
   _roundsSource: "",
+  // 轮次「代」计数器 —— 每次发起新识别 / 清空就 +1。
+  // 用途：刷新恢复（``_restoreFromServer``）拉轮次的过程中，用户要是
+  // 又点了「开始识别」→ 代数变了 → **丢弃这次恢复**（旧轮次不能盖掉
+  // 新识别刚起的轮次 = 串台）。
+  _roundGen: 0,
   _file: null,
   _path: "",
   _starting: false,
@@ -344,6 +349,9 @@ const Qwen3Asr = {
     this._applyMode();
     this._switchSource(this._source || "file");
     this.ensureWs();
+    // 刷新恢复：把服务端的轮次 + 归属拉回来（转写框 / 逐轮明细 /
+    // 来源页签）。**异步** —— 不阻塞首屏，WS 照常先连上。
+    this._restoreFromServer();
     this._probeCap().catch(() => {});
     if (!this._capTimer) {
       this._capTimer = setInterval(() => {
@@ -1162,7 +1170,20 @@ const Qwen3Asr = {
     if (!box) return;
     const live = document.getElementById("asr-live");
     const isVideo = this._source === "video" && this._roundsSource === "video";
-    if (live) live.classList.toggle("asr-live-video", isVideo);
+    if (live) {
+      live.classList.toggle("asr-live-video", isVideo);
+      // ⚠️ **实时来源的归属守卫** —— 单行文字框显示的是「**最近一批**」
+      // 的文本。切到**实时来源**（麦克风）时，那一行是**文件批次**的历史，
+      // 而麦克风的文字在它自己的框里（``#asr-rt-committed``）→ 藏起来，
+      // 别让两段文字并排出现。
+      //
+      // ⚠️ **文件 ↔ 视频之间不藏**：那两栏是同一批结果的两种视图
+      // （视频来源多一个「字幕同款转写框」）—— 藏了的话，视频的识别
+      // 结果在切回文件页签后就**彻底看不见**了（U18 的契约）。
+      // 真正要挡住的是「画到画面上」的那几处：视频字幕 / 转写框靠
+      // ``_roundsSource`` 把关（见 ``_renderVideoSubtitle``）。
+      live.classList.toggle("asr-live-notfile", !this._isFileSource());
+    }
     box.classList.toggle("hidden", !isVideo);
     if (!isVideo) { this._transcriptClear(); return; }
 
@@ -2202,6 +2223,111 @@ const Qwen3Asr = {
     this._syncLiveUi();
   },
 
+  /* ------------------------------------------------------------------ *
+   * 刷新页面后恢复
+   *
+   * 为什么必须有：轮次只存在**服务端的内存**里（``service.py::_rounds``），
+   * 浏览器一刷新 ``this.rounds`` 就空了 → 视频来源的「字幕同款转写框」
+   * 被清空 → 用户看到「刚才识别出来的内容全没了」。
+   *
+   * 归属由**服务端**说了算（``GET /rounds`` 一起返回 ``source``）：
+   * 前端自己猜会把「音频文件」的轮次画到视频画面上（U15 那个串台坑）。
+   * ------------------------------------------------------------------ */
+  async _restoreFromServer() {
+    // 拉取期间用户又发起了识别 → 丢弃这次恢复（否则旧轮次会盖掉新轮次）。
+    const gen0 = this._roundGen;
+    let data = null;
+    try {
+      const r = await fetch(API_PREFIX + "/qwen3-asr/rounds");
+      if (!r.ok) return;
+      data = await r.json();
+    } catch (e) { return; }
+    if (!data || this._roundGen !== gen0) return;
+
+    const server = Array.isArray(data.rounds) ? data.rounds : [];
+    const src = data.source || {};
+    // 服务端什么都没有 → 不动界面（首次进入页面就是这个分支）。
+    if (!server.length && !src.kind) return;
+
+    // 服务端那份是**同一批轮次的前缀**（服务端先把轮次记进 ``_rounds``
+    // 再广播给 WS → 浏览器收到的每一条服务端都已经有了）；本地多出来
+    // 的是「拉取窗口内」新到的 → 合并，别覆盖也别重复。
+    const merged = this._mergeRounds(server, this.rounds);
+
+    const kind = (src.kind === "video") ? "video" : "file";
+    const path = (typeof src.path === "string") ? src.path.trim() : "";
+    if (path) {
+      // 设备端路径 → 播放器能重新加载。浏览器上传的 File 对象**刷新后
+      // 拿不回来** → path 为空，轮次 / 文本照常恢复，只是放不了片子。
+      this._path = path;
+      this._file = null;
+      const el = document.getElementById("asr-path");
+      if (el) el.value = path;
+    }
+
+    // 先切页签（会清字幕 / 作废时间轴），再摆轮次 —— 顺序反了会被
+    // ``_switchSource`` 里的 ``_renderTranscript`` 覆盖掉。
+    if (this._source !== kind) this._switchSource(kind);
+
+    // 浏览器上传的文件**恢复不了**（File 对象刷新后就没了）→ 轮次和
+    // 文本恢复了，但来源框是空的。把原因说清楚，别让用户对着一个空
+    // 来源框发愣（来源框空了 → 「开始识别」也是灰的）。
+    if (!path && src.name) {
+      const hint = document.getElementById("asr-source-hint");
+      if (hint) {
+        hint.textContent = "已恢复上次识别的结果（" + src.name
+          + "）—— 浏览器上传的文件刷新后无法恢复，要重跑请重新选择文件。";
+      }
+    }
+
+    this.rounds = merged;
+    // 归属：**只认服务端说的那份**（file / video）。前端猜不得。
+    this._roundsSource = kind;
+    this._subInvalidate();
+    this._roundsDirty = true;      // 轮次表整体换过 → 重建面板
+    this._renderRounds();
+    this._renderTranscript();
+
+    // 单行「实时结果」（音频文件来源用；视频来源下它是隐藏的镜像 ——
+    // 回归脚本要从 ``#asr-live-committed`` 读最终文本）。
+    const res = this.snapshot && this.snapshot.last_result;
+    const last = merged.length ? merged[merged.length - 1] : null;
+    if (res && res.text) this._renderLive(res.text, "");
+    else if (last) this._renderLive(last.committed || "", last.unfixed || "");
+
+    if (this.snapshot) this._applySnapshot(this.snapshot);
+  },
+
+  /**
+   * 合并「服务端恢复的轮次」与「本地已收到的轮次」。
+   *
+   * 去重靠 ``chunk_start_sec``（**绝对音频时间**，跨 append 也单调）：
+   * ⚠️ 不能靠 ``round`` 序号 —— 拖动重开（append）会开新会话，序号
+   * 从 0 重来，拿序号去重会把新的一段认成旧的。
+   */
+  _mergeRounds(serverRounds, localRounds) {
+    const out = Array.isArray(serverRounds) ? serverRounds.slice() : [];
+    const seen = new Set();
+    let maxStart = -Infinity;
+    for (const r of out) {
+      const s = Number(r && r.chunk_start_sec);
+      if (Number.isFinite(s)) {
+        seen.add(s);
+        if (s > maxStart) maxStart = s;
+      }
+    }
+    for (const r of (localRounds || [])) {
+      const s = Number(r && r.chunk_start_sec);
+      if (!Number.isFinite(s)) { out.push(r); continue; }
+      if (seen.has(s)) continue;    // 服务端已经有了 → 丢弃本地这份
+      if (s < maxStart) continue;   // 服务端更新 → 本地这份是旧的
+      out.push(r);
+      seen.add(s);
+      maxStart = s;
+    }
+    return out;
+  },
+
   // ------------------------------------------------------------------ REST
   async start() {
     // 只有「文件 / 视频」来源走这条路径（实时两种来源各有各的按钮）。
@@ -2214,6 +2340,7 @@ const Qwen3Asr = {
     if (!this._hasSource() || this._starting || this._busy()) return false;
     this._starting = true;
     this.rounds = [];
+    this._roundGen++;            // 新的一批轮次 → 作废在途的「刷新恢复」
     // 记下这批轮次来自**哪个来源** —— 视频字幕靠它判断「该不该渲染」
     // （否则会拿上一来源的轮次画到当前视频上，见 _onSourceChanged）。
     this._roundsSource = this._source;
@@ -2280,6 +2407,7 @@ const Qwen3Asr = {
       const r = await fetch(API_PREFIX + "/qwen3-asr/reset", { method: "POST" });
       const data = await r.json().catch(() => ({}));
       this.rounds = [];
+      this._roundGen++;          // 清空 → 作废在途的「刷新恢复」
       this._roundsSource = "";
       this._renderRounds();
       this._renderLive("", "");
