@@ -8988,7 +8988,7 @@ Python 实现：搬 box（`ftyp` → `moov` → `mdat`）+ 修偏移表。
 .venv/bin/python scripts/mp4_faststart.py --fix  <mp4>...    # 就地改写
 ```
 
-> 本机曾有两张卡的素材是 `moov` 在尾：`tts`（`wdnapps-audio-chat` 仓）
+> 本机曾有两张卡的素材是 `moov` 在尾：`tts`（`wdnapps_audio_chat` 仓）
 > 与 `video-target-localization`。已用该脚本改成 faststart —— 改写后
 > 视频轨 73 个样本、音频轨 97 个样本**逐字节哈希不变**。
 
