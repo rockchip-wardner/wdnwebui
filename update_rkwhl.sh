@@ -344,9 +344,25 @@ update_pkg() {
     # `--ff-only` 只在两种情况下拒绝，且都不改动工作区：本地有未提交
     # 修改会被覆盖、或本地与远程已分叉。这属于「本地有人在工作」，
     # 强推/merge 都不是脚本该做的决定（FATAL 留给 pip / .so 这类真故障）。
-    if ! git -C "$dir" pull --ff-only; then
+    #
+    # 加重试：网络抖动（RPC failed / curl 28 连接超时）跟「本地有改动」
+    # 是两回事 —— 前者重试一次就好，后者重试多少次都一样。`--ff-only`
+    # 保证失败时**不改动工作区**，所以重试是安全的。
+    local _pull_ok=0 _try=1
+    while [ "$_try" -le "${UPDATE_RKWHL_PULL_RETRY:-3}" ]; do
+        if git -C "$dir" pull --ff-only; then
+            _pull_ok=1
+            break
+        fi
+        if [ "$_try" -lt "${UPDATE_RKWHL_PULL_RETRY:-3}" ]; then
+            echo "WARN: [$pkg] git pull 失败（第 $_try 次），5s 后重试" >&2
+            sleep 5
+        fi
+        _try=$((_try + 1))
+    done
+    if [ "$_pull_ok" != "1" ]; then
         echo "WARN: [$pkg] git pull --ff-only 失败，跳过本包（.venv 未改动）" >&2
-        echo "      常见原因：本地有未提交修改 / 本地与远程已分叉。" >&2
+        echo "      常见原因：本地有未提交修改 / 本地与远程已分叉 / 网络抖动" >&2
         echo "      git 不会因此丢失你的修改——请自行处理后重跑：" >&2
         echo "        git -C $dir status" >&2
         echo "        git -C $dir stash   # 或 commit / branch" >&2
