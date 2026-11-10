@@ -26,6 +26,7 @@ BASE = "http://localhost:8000"
 # 内置是 app.apps，插件是 <包>.cards。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from card_dirs import resolve_cards  # noqa: E402
+from active_app_guard import install_on_page as install_active_app_guard  # noqa: E402
 
 
 def _card_list() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -101,6 +102,11 @@ def check_card(page, cid: str, title: str, kind: str) -> None:
 with sync_playwright() as pw:
     browser = pw.chromium.launch(args=["--no-sandbox"])
     page = browser.new_page(viewport={"width": 1600, "height": 950})
+    # ⚠️ 本脚本**遍历所有卡** ⇒ 前端必然在卡之间切换 ⇒ 可能触发
+    # ``DELETE /api/compute/active-app``（产品语义：「退出应用」）
+    # ⇒ **连带清空 compute.autostart**（设备级开机自启配置）。
+    # 拦住写方法：前端拿到 200（不报 pageerror），生产配置原样不动。
+    install_active_app_guard(page)
     page.on("pageerror", lambda e: page_errors.append(str(e)))
     page.on("console", lambda m: page_errors.append(f"console.{m.type}: {m.text}")
             if m.type == "error" else None)

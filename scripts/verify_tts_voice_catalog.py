@@ -28,6 +28,14 @@ import re
 import sys
 from pathlib import Path
 
+# 让 ``active_app_guard`` 可导入（拦下改生产配置的 active-app 写操作）
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from active_app_guard import (  # noqa: E402
+    install_on_page as install_active_app_guard)
+
 API_BASE = "http://127.0.0.1:8000"
 
 # 官方 Qwen3-TTS 的 10 种语言 + auto
@@ -305,6 +313,9 @@ def test_frontend_browser() -> None:
     with sync_playwright() as p:
         b = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
         pg = b.new_page()
+        # ⚠️ 拦下 active-app 的写操作（DELETE 会连带清空 compute.autostart
+        # ⇒ 回归脚本不该改设备级生产配置）。详见 active_app_guard.py。
+        install_active_app_guard(pg)
         errs: list = []
         bad_res: list = []
         # 资源加载失败在 console 里也会冒一条 "Failed to load resource" ——

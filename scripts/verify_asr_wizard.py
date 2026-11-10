@@ -41,6 +41,13 @@ _ROOT = Path(__file__).resolve().parent.parent
 # 让 ``app.core.audio.capture`` 可导入（V6a 要用板载那套重采样做基准）
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+# 让 ``active_app_guard`` 可导入（拦下改生产配置的 active-app 写操作）
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from active_app_guard import (  # noqa: E402
+    install_on_page as install_active_app_guard)
 
 try:
     from playwright.sync_api import sync_playwright
@@ -754,6 +761,9 @@ def verify_live(p, shot_dir: Path) -> None:
         ],
         executable_path=exe)
     page = browser.new_page(viewport={"width": 1440, "height": 960})
+    # ⚠️ 拦下 active-app 的写操作：DELETE 会连带清空 compute.autostart
+    # （设备级配置）⇒ 回归脚本不该改生产配置。详见 active_app_guard.py。
+    install_active_app_guard(page)
     errors: list[str] = []
     page.on("pageerror", lambda e: errors.append(str(e)))
     browser_text = ""
@@ -3084,6 +3094,8 @@ def main() -> int:
             headless=not args.headful, args=["--no-sandbox"],
             executable_path=exe)
         page = browser.new_page(viewport={"width": 1440, "height": 960})
+        # ⚠️ 同上：拦住 active-app 写操作，别改生产 autostart 配置
+        install_active_app_guard(page)
         errors: list[str] = []
         page.on("pageerror", lambda e: errors.append(str(e)))
 

@@ -11103,3 +11103,74 @@ for parent in Path(core_file).resolve().parents:
 | `scripts/verify_asr_live.py` | 49 通过 / 0 失败 |
 | `/health` | 12 张卡全 `status=ok` |
 | 静态资源 | `app.js` / `app.css` / `template.html` / `wizard.json` / `capture-worklet.js` / `preview.mp4` 全 200 |
+
+## 清理 `app/apps/tts/` 残留：插件化后的「假源码点」（v0.44 附则）
+
+TTS 卡拆到插件包后，宿主 `app/apps/tts/` 只剩一个 `static/app.js` ——
+**它一行都不会被用到**，但看起来完全像源码。
+
+### 为什么它不生效（三条独立原因，每条都足以让它失效）
+
+1. **没有 `manifest.json`** ⇒ 内置卡扫描直接 `[skip] tts: no manifest.json`
+   ⇒ 不生成 `CardManifest` ⇒ 压根不进 `manifests` 列表。
+2. **`/static/apps/tts` 挂的是插件那份** —— `app/main.py` 用 `m.static_dir`
+   挂载，而 `app/core/manifest.py` 里 `static_dir = card_dir / "static"`，
+   插件卡的 `card_dir` 是 **entry point 模块所在目录**（插件包的
+   `cards/tts/`）。实测：`/static/apps/tts/app.js` 返回 3268 行（插件版），
+   树内那份 2574 行**从未被发出去过**。
+3. **宿主没有「树内覆盖插件」机制** —— 宿主的 `/static` 挂的是
+   `app/static/`（框架级），`app/apps/` 从未被挂载。两边同时有
+   `manifest.json` 反而会撞 `[FATAL] duplicate card id`。
+
+### 它是怎么回来的（**别再让它回来**）
+
+```
+10-29 01:56  95fce52  wade.weng  refactor(tts): 语音生成卡拆到 wdnapps_audio_chat 插件包
+10-29 03:26  7844dfd  LiYuekai   feat(text-chat): 完善文本对话功能与 9B 模型的对接…
+```
+
+迁移提交把整张卡删干净了（父提交里已无此文件）。**1.5 小时后，一个
+text-chat 提交把 `app/apps/tts/static/app.js` 又加了回来**（2574 行全新
+文件，内容是迁移前的老版本）。
+
+树内那份**缺**的正是后来加的功能：音色试听（`_updatePreviewButton` /
+`previewVoice`）、用户音色克隆（`_droppedFile` / `uploadVoice`）、向导内选
+音色（`_wizardVoice` / `_catalogPromise`）、新音色表（`news_female` /
+`baby_girl` / `cool_lady` / `male_announcer` / `uncle_bass`）。
+
+⇒ **风险不是「残留」，是「假源码点」**：按目录名直觉去改它，改动会被
+**静默丢弃** —— 没有报错、没有告警，页面照旧跑插件那份。
+
+⇒ 已删除。`app/apps/` 现在只剩 `text_chat` 一张内置卡。
+
+> 同批清掉的还有 5 个只剩 `__pycache__/*.pyc` 的空壳目录
+> （`audio_analysis` / `video_analysis_search` / `video_detection` /
+> `video_target_detection` / `video_target_localization`）—— 它们在
+> 内置卡扫描里各刷一条 `[skip] …: no manifest.json`，删掉后启动日志干净了。
+
+### ⚠️ 回归脚本会改**生产**配置：`active-app` 必须 mock
+
+`DELETE /api/compute/active-app` 会**连带清空** `compute.autostart`
+（`app/core/compute/registry.py::clear_active_app`）—— 产品语义是
+「退出应用 = 不想让这些算力开机自启」。
+
+`PUT /api/compute/active-app` 则把承载该卡 caps 的 `(model, npu_index)`
+**增量追加**进 autostart。
+
+⇒ **任何用浏览器驱动前端、并在卡之间切换的回归脚本，都会改到设备级的
+`config.jsonc`。** 2026-11-10 实测：跑完浏览器回归后 `compute.autostart`
+变成 `[]` ⇒ 下次重启板子**没有任何算力自启**。
+
+⇒ 已加 **`scripts/active_app_guard.py`**：在 Playwright 层拦下
+`/api/compute/active-app` 的**写方法**（PUT/POST/PATCH/DELETE），
+直接回 200 —— 前端不报 pageerror，请求根本没到服务端，生产配置原样不动。
+**`GET` 必须放行**（`bootRestore()` 靠它读 `active_app` 决定开机跳哪张卡）。
+
+已接入：`verify_plugin_cards.py` / `verify_asr_wizard.py` /
+`verify_tts_voice_catalog.py`。其余 ~50 个浏览器脚本仍待接入 —— 新写
+浏览器脚本时**一律**先 `install_on_page(page)`。
+
+> ⚠️ Playwright 1.49 的 **`Browser` 没有 `route()` 方法**（只有
+> `BrowserContext.route` 和 `Page.route`）。`browser.new_page()` 隐式建
+> context、拿不到它 ⇒ 这种脚本只能**给 page 装**（`install_on_page`），
+> 且**每个 page 都要单独装**。
