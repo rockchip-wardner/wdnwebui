@@ -9,7 +9,11 @@
   "software_capabilities": [
     "swcap_audio_asr"
   ],
-  "hardware_capabilities": [],
+  "hardware_capabilities": [
+    "hwcap_video_input",
+    "hwcap_audio_input",
+    "hwcap_audio_output"
+  ],
   "backend": {
     "module": "app.apps.qwen3_asr",
     "register_api": "register_api",

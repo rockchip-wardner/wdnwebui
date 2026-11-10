@@ -6,13 +6,20 @@
   },
   "upload_endpoint": "/api/qwen3-asr/upload",
   "start_buttons": ["asr-start-btn"],
+
+  "open_source_button": "asr-open",
+  "canvas_id": "asr-preview-wrap",
+  "open_source_label": "预览播放",
+  "drop_hint": "或点击「浏览」选择音频或视频",
+  "drop_icon": "<svg viewBox=\"0 0 24 24\" width=\"48\" height=\"48\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"><path d=\"M4 10v4\"/><path d=\"M8 7v10\"/><path d=\"M12 4v16\"/><path d=\"M16 7v10\"/><path d=\"M20 10v4\"/></svg>",
+
   "steps": [
     { "id": "env",    "title": "运行环境检查", "kind": "env_check" },
     { "id": "source", "title": "音频源",       "kind": "form",
       "fields": [
-        { "id": "asr-audio", "ui_key": "source",
-          "label": "音频文件（设备端路径；也可在本机上传。支持 wav / mp3 / m4a / flac / ogg 与含音轨的视频）",
-          "type": "text", "browse": true, "upload": true, "required": true,
+        { "id": "asr-source", "ui_key": "source",
+          "label": "音频文件或含音轨的视频（设备端路径；也可在本机上传。支持 wav / mp3 / m4a / flac / ogg 与含音轨的视频）",
+          "type": "text", "required": true,
           "placeholder": "例：/userdata/assets/uploads/asr_en.wav" },
         { "id": "asr-mode", "ui_key": "mode", "label": "显示模式", "type": "select",
           "options": [

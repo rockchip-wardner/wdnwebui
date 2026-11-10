@@ -1460,9 +1460,15 @@
           // 必须同色（蓝底白字），否则同一个「播放视频」在应用页是蓝的、在
           // 向导里是白底 —— 同名不同色 = 视觉语言自相矛盾。关闭按钮仍走
           // source-action-btn 的白底次要样式。
+          //
+          // ⚠️ 按钮文案**可配**（``cfg.open_source_label``）：源字段不一定
+          // 是「视频」—— 音频卡（qwen3-asr）的源是**音频或视频**，写死
+          // 「播放视频」会让音频用户点一个视频按钮。默认仍是「播放视频」，
+          // 既有卡片行为零变化。
+          const openLabel = cfg.open_source_label || "播放视频";
           const openBtn = _ce("button",
             WIZARD_NS + "source-action-btn " + WIZARD_NS + "source-open-btn",
-            "播放视频");
+            openLabel);
           openBtn.type = "button";
           openBtn.id = WIZARD_NS + "source-open-" + field.id;
           // 点击"打开"后,wizard 容器内需要展示视频。应用页面的 canvas 元素
@@ -1488,9 +1494,22 @@
           // 拖动视频文件到此处 → POST 上传 → 把 server 路径写到 source
           //        input + 自动调 vd-open(VDOpen 把 canvas 搬进 wrap 替换)
           const dropZone = _ce("div", WIZARD_NS + "drop-zone");
-          const dropIcon = _ce("div", WIZARD_NS + "drop-icon", "📥");
+          // 拖放区文案**可配**（``cfg.drop_hint`` / ``cfg.drop_icon``）：
+          // * 文案写死「本地视频」→ 音频卡（qwen3-asr）的源是**音频或视频**，
+          //   让音频用户去选「本地视频」不对；
+          // * 图标写死 emoji「📥」→ **板端没有 emoji 字体**，实测渲染成
+          //   豆腐块 □（AGENTS.md 有记）。``drop_icon`` 传空串 = 不要图标；
+          //   传 HTML 片段 = 自带内联 SVG（板端唯一可靠的图标方案）。
+          const dropIcon = _ce("div", WIZARD_NS + "drop-icon");
+          const iconHtml = (cfg.drop_icon != null) ? String(cfg.drop_icon) : "📥";
+          if (iconHtml) {
+            dropIcon.innerHTML = iconHtml;
+          } else {
+            dropIcon.style.display = "none";
+          }
           const dropText = _ce("div", WIZARD_NS + "drop-text", "拖动文件放到此处");
-          const dropHint = _ce("div", WIZARD_NS + "drop-hint", "或点击「浏览」选择本地视频");
+          const dropHint = _ce("div", WIZARD_NS + "drop-hint",
+            cfg.drop_hint || "或点击「浏览」选择本地视频");
           dropZone.appendChild(dropIcon);
           dropZone.appendChild(dropText);
           dropZone.appendChild(dropHint);
@@ -1583,7 +1602,7 @@
             });
           } else {
             // 没声明 upload_endpoint,给一个静态 placeholder
-            noUp = _ce("div", WIZARD_NS + "drop-text", "点击「播放视频」开始");
+            noUp = _ce("div", WIZARD_NS + "drop-text", `点击「${openLabel}」开始`);
             canvasWrap.appendChild(noUp);
           }
 

@@ -109,6 +109,61 @@
   display: none;
 }
 
+/* ---- 向导「预览播放」的播放器 ----
+   这个 wrap 会被向导框架**搬进向导面板**（wizard.json 的 canvas_id），
+   搬走时外面那层 holder 的 hidden 就失效了 ⇒ 向导里照常显示；向导卸载
+   时按原位搬回 holder ⇒ 卡片页上依旧不占位。 */
+.asr-preview-holder.hidden {
+  display: none;
+}
+
+.asr-preview-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+/* 播放器**居中**（用户要求）。
+   之前只有 ``display:block`` + ``max-width:720px`` ⇒ 宽度到上限后
+   块级元素默认贴**左边**，向导面板右侧留一大片空白。
+   ⇒ ``margin: 0 auto`` 把它在 ``.asr-preview-wrap``（width:100%）里
+   水平居中（flex 列容器里 auto 外边距同样成立）。 */
+.asr-preview {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  max-height: 46vh;
+  margin: 0 auto;
+  background: #000;
+  border-radius: 8px;
+}
+
+/* 音频没有画面 —— 纯控件条，不给黑底、不给大高度 */
+.asr-preview.asr-preview-audio {
+  background: transparent;
+  height: 42px;
+  max-height: none;
+}
+
+/* 向导面板里的预览播放器：向导容器是 page section 的**兄弟**节点，
+   不能用 #page-qwen3-asr 作用域 ⇒ 用向导容器自己的 id。 */
+#wd-wizard-root-qwen3-asr .wd-wizard-canvas-wrap .asr-preview {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  max-height: 46vh;
+  margin: 0 auto;
+  background: #000;
+  border-radius: 8px;
+}
+
+#wd-wizard-root-qwen3-asr .wd-wizard-canvas-wrap .asr-preview.asr-preview-audio {
+  background: transparent;
+  height: 42px;
+  max-height: none;
+}
+
 /* 画面 + 字幕层：字幕绝对压在画面底部 */
 .asr-video-box {
   position: relative;

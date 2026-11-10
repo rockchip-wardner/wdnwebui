@@ -4,6 +4,19 @@
   const STATIC_PREFIX = "/static";
 
   /* ------------------------------------------------------------------ *
+   * 含音轨的视频容器（后缀，不含点）
+   *
+   * 与后端 ``app/core/audio/decode.py::VIDEO_EXTS`` 对齐 —— 前端判
+   * 「这个文件该用 <video> 播还是 <audio> 播」，后端判「这个文件能不能
+   * 当媒体取流」。两边口径不一致的话，会出现「前端当视频播、后端当
+   * 音频收」这种错位。
+   * ------------------------------------------------------------------ */
+  const ASR_VIDEO_EXTS = new Set([
+    "mp4", "mov", "mkv", "avi", "flv", "webm", "ts", "m4v",
+    "wmv", "mpg", "mpeg", "3gp",
+  ]);
+
+  /* ------------------------------------------------------------------ *
    * 实时识别（麦克风）的常量
    *
    * CHUNK_MS —— 采集端攒块粒度。500 ms 兼顾「首字延迟」与「上行开销」：
@@ -294,17 +307,19 @@ const Qwen3Asr = {
       this._syncVideoPlayer();
     });
 
-    $("asr-path")?.addEventListener("input", (e) => {
+    $("asr-source")?.addEventListener("input", (e) => {
       this._path = (e.target.value || "").trim();
       if (this._path) this._file = null;   // 反向：填了路径就不再用本机文件
       this._setFileBlob(null);              // 改成设备端路径 → 释放 blob
-      this._syncSourceUi();
-      this._syncVideoPlayer();
+      // ⚠️ 路径**后缀**决定来源类型（视频 / 音频）⇒ 页签跟着走。
+      //   不跟着走的话：用户填了 .mp4、页签还停在「音频文件」⇒ 前端按
+      //   音频播、后端按视频记 ⇒ 播放器不出现，两边口径也对不上。
+      this._applyKindFromPath(this._path);
     });
 
     // 设备端文件浏览（与 vtl / vd 共用 FSModal）
     $("asr-browse")?.addEventListener("click", () => {
-      const target = $("asr-path");
+      const target = $("asr-source");
       try {
         window.VdFsModal._sourceTarget = target;
         window.VdFsModal.open("");
@@ -316,11 +331,19 @@ const Qwen3Asr = {
     $("asr-start-btn")?.addEventListener("click", () => this.start());
     $("asr-stop-btn")?.addEventListener("click", () => this.stop());
     $("asr-reset-btn")?.addEventListener("click", () => this.reset());
+
+    // 向导框架的应用页契约（wizard.json 的 open_source_button + "-open"
+    // → "-close" 约定）—— 卡片页上这两个按钮是隐藏的，点了的是向导里的
+    // 「预览播放 / 关闭」。
+    $("asr-open")?.addEventListener("click", () => this._previewOpen());
+    $("asr-close")?.addEventListener("click", () => this._previewClose());
     $("asr-mode")?.addEventListener("change", () => this._applyMode());
     $("asr-mic-btn")?.addEventListener("click", () => this._liveToggle());
     $("asr-mic-stop-btn")?.addEventListener("click", () => this._liveAbort());
     $("asr-board-start")?.addEventListener("click", () => this._boardStart());
     $("asr-board-stop")?.addEventListener("click", () => this._boardStop());
+    // 预览播放器的收尾守卫（向导卸载 / 离开卡片时停掉播放）
+    this._bindPreviewGuards();
 
     // 输入来源切换（音频文件 / 含音轨的视频 / 板载麦克风 / 浏览器麦克风）
     document.querySelectorAll("#asr-source-tabs .asr-source-tab")
@@ -437,7 +460,7 @@ const Qwen3Asr = {
         ? "选择含音轨的视频（只取它的声音）；或填写 / 浏览设备端的文件路径。"
         : "选择音频文件，或填写 / 浏览设备端的文件路径。";
     }
-    const pathInput = $("asr-path");
+    const pathInput = $("asr-source");
     if (pathInput) {
       pathInput.placeholder = kind_ === "video"
         ? "/userdata/assets/uploads/movie.mp4"
@@ -537,6 +560,111 @@ const Qwen3Asr = {
         : "正在播设备端的视频（识别走它的音轨）。";
     }
     this._renderVideoSubtitle();
+  },
+
+  /* ------------------------------------------------------------------ *
+   * 向导「预览播放」：音频文件 / 含音轨的视频 都能在**向导面板里**放
+   *
+   * 向导框架（core/wizard/state.js）点「预览播放」时：
+   *   ① 把 wizard.json 的 ``canvas_id`` 元素搬进向导面板；
+   *   ② 点应用页的 ``#asr-open``（= ``open_source_button``）。
+   * ⇒ 这里是 ② 的实现：按**文件后缀**选 <audio> 还是 <video>，用
+   *   与页面同一个媒体端点（``/api/qwen3-asr/media``）取流。
+   *
+   * ⚠️ 用**独立**的播放器，不复用页面的 ``#asr-video``：页面上那个
+   * 绑着字幕渲染循环（字幕条是它的兄弟节点），把它搬进向导会留下
+   * 一个没有字幕条的孤儿视频，而页面自己也会因此看不到画面。
+   * ------------------------------------------------------------------ */
+  _previewOpen() {
+    const path = (document.getElementById("asr-source")?.value || "").trim();
+    if (!path) return;
+    // ⚠️ 框架点「预览播放」时把向导里的值**直接写进**页面的输入框，
+    // 但**不派发 input 事件** ⇒ 卡片的内部状态（``_path``）还是旧的。
+    // 不同步的话：向导里选了 A、预览了 A、然后跳过向导 → 页面输入框
+    // 显示 A，内部却是旧值 B ⇒ 点「开始识别」识别的是 B。
+    // ⇒ 这里补一次同步（与输入框的 input 处理器同口径）。
+    if (path !== this._path) {
+      this._path = path;
+      this._file = null;
+      this._setFileBlob(null);
+      // ⚠️ 页签跟着路径的后缀走（.mp4 → 「含音轨的视频」）。
+      //   不然「跳过向导」那条路会留下错位：向导把路径写进了页面的
+      //   #asr-source（框架在点「预览播放」时写的），但 skip() **不调**
+      //   applyWizardSnapshot ⇒ 页签停在「音频文件」、播放器不出现。
+      this._applyKindFromPath(path);
+    }
+    const ext = (/\.([a-z0-9]+)$/i.exec(path) || [])[1] || "";
+    const isVideo = ASR_VIDEO_EXTS.has(ext.toLowerCase());
+    const video = document.getElementById("asr-preview-video");
+    const audio = document.getElementById("asr-preview-audio");
+    const el = isVideo ? video : audio;
+    const other = isVideo ? audio : video;
+    if (!el) return;
+    // ⚠️⚠️ 切换预览源时，**上一个**播放器必须**停掉**，不能只藏起来。
+    //
+    // 症状（用户实测）：先预览**视频**、再预览**音频** ⇒ 上一次的视频
+    // **还在放声音**，两个声音叠在一起。
+    //
+    // 根因：``display:none`` **不会**让浏览器暂停媒体 —— 播放与元素可见性
+    // 无关。原来这里只做了 ``other.classList.add("hidden")``（藏起来），
+    // 播放头照走（实测 1.5s → 3.1s → 4.3s）、``paused`` 恒为 false。
+    // ⇒ 藏 **+** 停，两件事都要做。
+    this._stopPreviewEl(other);
+    el.classList.remove("hidden");
+    const url = API_PREFIX + "/qwen3-asr/media?path=" + encodeURIComponent(path);
+    try {
+      // 同一个源重复点「预览播放」**不要**重头再来（会打断正在播的）；
+      // 只有换了源才重新 load。播完了（ended）再点 ⇒ 从头播。
+      if (el.getAttribute("src") !== url) {
+        el.src = url;
+        el.load();
+      } else if (el.ended) {
+        try { el.currentTime = 0; } catch (e) { /* noop */ }
+      }
+      const p = el.play();
+      if (p && typeof p.catch === "function") p.catch(() => { /* 自动播放被拦 */ });
+    } catch (e) { /* noop */ }
+  },
+
+  /**
+   * 停掉一个预览播放器，并清掉它的源。
+   *
+   * 「藏起来」≠「停了」—— ``display:none`` 的媒体元素照样播。
+   */
+  _stopPreviewEl(el) {
+    if (!el) return;
+    try { el.pause(); } catch (e) { /* noop */ }
+    try { el.removeAttribute("src"); el.load(); } catch (e) { /* noop */ }
+    el.classList.add("hidden");
+  },
+
+  _previewClose() {
+    ["asr-preview-video", "asr-preview-audio"].forEach((id) => {
+      this._stopPreviewEl(document.getElementById(id));
+    });
+  },
+
+  /**
+   * 预览播放器的收尾守卫。
+   *
+   * ⚠️ 预览元素被向导框架**搬进向导面板**、向导关闭时按原位搬回卡片页 ——
+   * **搬回去了不等于停了**：``<video>`` / ``<audio>`` 还在播，声音会在
+   * 后台继续放（卡片页上那个 holder 是 hidden 的，用户只看到页面、听
+   * 到声音 ⇒ 典型的「幽灵声音」）。
+   * ⇒ 两个收尾点都要停：
+   *   * 向导卸载（框架 dispatch ``wizard:unmounted``）；
+   *   * 离开这张卡（hashchange）。
+   */
+  _bindPreviewGuards() {
+    if (this._previewGuardsBound) return;
+    this._previewGuardsBound = true;
+    window.addEventListener("wizard:unmounted", (e) => {
+      if (e && e.detail && e.detail.appId === "qwen3-asr") this._previewClose();
+    });
+    window.addEventListener("hashchange", () => {
+      const cur = (location.hash || "").replace(/^#/, "");
+      if (cur !== "qwen3-asr") this._previewClose();
+    });
   },
 
   /**
@@ -1544,6 +1672,40 @@ const Qwen3Asr = {
   },
 
   /**
+   * 按**路径后缀**判定来源类型（"video" / "file"）。
+   *
+   * 与后端 ``api.py::_source_kind`` **同口径**（同一份扩展名表）——
+   * 前端判「要不要放视频播放器」，后端判「这批轮次属于哪种来源」；
+   * 两边不一致 ⇒ 字幕 / 转写框的来源守卫和实际媒体对不上（U15 串台坑
+   * 的同源版本）。
+   *
+   * 只认后缀、**不做内容嗅探**（与后端一致）：嗅探要解容器，慢，而且对
+   * 「无音轨的视频」会判错。
+   */
+  _kindFromPath(path) {
+    const ext = (/\.([a-z0-9]+)$/i.exec(String(path || "").trim()) || [])[1] || "";
+    return ASR_VIDEO_EXTS.has(ext.toLowerCase()) ? "video" : "file";
+  },
+
+  /**
+   * 按路径推断出的类型**切来源页签**。
+   *
+   * ⚠️ 只在**推断结果与当前页签不同**时才切 —— 同类型重复切会触发
+   * ``_onSourceChanged()``（清字幕 / 作废时间轴），在打字过程中反复
+   * 触发会把正在看的字幕清掉。
+   */
+  _applyKindFromPath(path) {
+    const kind = this._kindFromPath(path);
+    if (kind !== this._source) {
+      this._switchSource(kind);
+    } else {
+      this._syncSourceUi();
+      this._syncVideoPlayer();
+    }
+    return kind;
+  },
+
+  /**
    * 流式参数**不再由前端传**。
    *
    * 分块长度 / 每块 token 上限 / 回退 token / 前几轮不提交这四个值
@@ -2285,7 +2447,7 @@ const Qwen3Asr = {
       // 拿不回来** → path 为空，轮次 / 文本照常恢复，只是放不了片子。
       this._path = path;
       this._file = null;
-      const el = document.getElementById("asr-path");
+      const el = document.getElementById("asr-source");
       if (el) el.value = path;
     }
 
@@ -2760,13 +2922,18 @@ window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
     if (path) {
       Qwen3Asr._path = path;
       Qwen3Asr._file = null;
-      const el = document.getElementById("asr-path");
+      const el = document.getElementById("asr-source");
       if (el) el.value = path;
       const fileInput = document.getElementById("asr-file");
       if (fileInput) fileInput.value = "";
       const nameEl = document.getElementById("asr-file-name");
       if (nameEl) nameEl.textContent = "";
-      Qwen3Asr._syncSourceUi();
+      // ⚠️ **必须按路径推断来源类型并切页签** —— 向导里**没有**「输入来源」
+      //   页签（那是功能页的东西），用户在向导里选了个含音轨的视频，
+      //   完成配置回到功能页时页签还停在默认的「音频文件」⇒ 视频播放器
+      //   不出现、视频也不播（用户实测）。
+      //   后端 ``api.py::_source_kind`` 同样按后缀判定 ⇒ 前后端口径一致。
+      Qwen3Asr._applyKindFromPath(path);
     }
   }
 
