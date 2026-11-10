@@ -1700,6 +1700,7 @@ app/apps/<card_id>/
 |---|---|---|---|
 | `text-chat` | `swcap_text_chat` | `app.apps.text_chat` | 内置 |
 | `tts` | `swcap_text_to_speech` | `wdnapps_audio_chat.cards.tts` | `wdnapps_audio_chat` |
+| `qwen3-asr` | `swcap_audio_asr` | `wdnapps_audio_chat.cards.qwen3_asr` | `wdnapps_audio_chat` |
 | `audio-analysis` | `swcap_audio_chat` | `wdnapps_video_analyzer.cards.audio_analysis` | `wdnapps_video_analyzer` |
 | `video-retrieval` | `swcap_vision_embedding` | `wdnapps_video_analyzer.cards.video_retrieval`（检索） | `wdnapps_video_analyzer` |
 | `video-detection` | `swcap_vision_chat` + `swcap_audio_chat`（两个模型） | `wdnapps_video_analyzer.cards.video_detection` | `wdnapps_video_analyzer` |
@@ -5001,7 +5002,7 @@ deps + native lib vendoring.
 |---|---|---|---|
 | wdnwebui | `.` | `origin` | 本仓（.venv/ 已被 .gitignore 排除） |
 | wdnai | `.venv/src/wdnai` | `origin` | editable 安装，VLM/LLM SDK |
-| wdnapps_audio_chat | `.venv/src/wdnapps_audio_chat` | `origin` | editable 安装，语音生成卡片插件 |
+| wdnapps_audio_chat | `.venv/src/wdnapps_audio_chat` | `origin` | editable 安装，音频卡片插件（语音生成 + 流式语音识别） |
 | wdnapps_hdmi_processor | `.venv/src/wdnapps_hdmi_processor` | `origin` | editable 安装，HDMI 卡片插件 |
 | wdnapps_video_analyzer | `.venv/src/wdnapps_video_analyzer` | `origin` | editable 安装，视频卡片插件 |
 | wdnav | `.venv/src/wdnav` | `origin` | editable 安装，MPP/RGA/V4L2 |
@@ -11009,3 +11010,96 @@ git）再重启：
 > bug** —— 只是回归脚本会踩到它的副作用：板子恰好停在「用户已离开所有卡」
 > 的状态 ⇒ 没有模型自启 ⇒ 回归失败。⇒ 回归前把 `autostart` 恢复好即可
 > （设备级配置，不进 git）。
+
+## Qwen3-ASR 卡迁到 `wdnapps_audio_chat` 插件包（v0.44）
+
+「流式语音识别」卡（`qwen3-asr`）从宿主 `app/apps/qwen3_asr/` 迁到插件包
+`.venv/src/wdnapps-audio-chat/src/wdnapps_audio_chat/cards/qwen3_asr/` ——
+与 `tts` 卡同仓。宿主 `app/apps/` 现在只剩 `text_chat` 一张内置卡。
+
+> 迁移动机与 `tts`（commit `95fce52`）完全一致：**卡片是可独立分发的
+> 功能单元**，音频类两张卡（生成 + 识别）同仓 ⇒ 装一个包得两张卡。
+
+### 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `cards/qwen3_asr/manifest.json` | `backend.module`：`app.apps.qwen3_asr` → `wdnapps_audio_chat.cards.qwen3_asr` |
+| `cards/qwen3_asr/__init__.py` | `from app.apps.qwen3_asr.api` → `from wdnapps_audio_chat.cards.qwen3_asr.api` |
+| `cards/qwen3_asr/api.py` | `board_mic` / `service` 两个 import 换成插件路径 |
+| `cards/qwen3_asr/service.py` | **零改动** —— 它只 import `app.core.audio.*` / `app.core.config` |
+| `cards/qwen3_asr/static/*` | **零改动** —— 逐字拷贝（URL / wizard 字段 id 一个没动） |
+| `pyproject.toml` | 新增 entry point `qwen3-asr` + `package-data` 一条 |
+| `scripts/verify_asr_live.py` | import 路径跟着改（4 处） |
+| `app/core/audio/capture.py`、`scripts/verify_asr_long_audio.py` | 仅 docstring 里的路径引用 |
+
+> **`backend.module` 是唯一需要改的「身份」字段** —— 路由前缀
+> `/api/qwen3-asr`、静态挂载 `/static/apps/qwen3-asr`、wizard 字段 id
+> 全都跟着 **卡 id** 走，与卡住在哪个仓库无关。
+
+### ⚠️ 坑一：插件化后「向上寻址找宿主文件」会失效
+
+`board_mic.py` 要 spawn 板载采集进程 `tools/asr_mic_agent.py`。原实现是
+「从本文件所在目录逐级向上找 `tools/asr_mic_agent.py`」。
+
+搬进插件后，向上寻址的**命中结果取决于插件装在哪儿**：
+
+* editable 装在 `.venv/src/wdnapps-audio-chat/`（本机现状）⇒ 向上走
+  恰好能摸到 `/userdata/wdnwebui/tools/asr_mic_agent.py` ⇒ **碰巧能用**；
+* 真 wheel 装进 site-packages ⇒ 向上走摸不到宿主 ⇒ **板载麦克风静默失效**。
+
+⇒ 改成**从 `app.core.__file__` 反推宿主仓库根**（插件本来就依赖
+`app.core`，这条依赖是允许的方向）：
+
+```python
+for parent in Path(core_file).resolve().parents:
+    if parent.name == "app":
+        return parent.parent          # ← 宿主仓库根
+```
+
+> ⚠️ **别写死 `parents[1]`** —— `app/core/__init__.py` 的
+> `parents[1]` 是 `<host>/app`（**少一层**），`parents[2]` 才是根。
+> 本次就是先写成了 `parents[1]`，靠「向上寻址」兜底才没暴露。
+> ⇒ **按目录名（`app`）找，不按索引找。**
+
+> `tools/asr_mic_agent.py` **本身不搬**：它 import `app.core.audio.alsa`
+> ⇒ 是**宿主**的工具，留在宿主 `tools/` 下。插件只是**用**它。
+
+### ⚠️ 坑二：加了 entry point 必须重装，宿主才认
+
+`pyproject.toml` 里加了 `[project.entry-points."wdnwebui.cards"]` 的新条目
+**不会**自动生效 —— editable 装法的 entry point 存在
+`site-packages/wdnapps_audio_chat-0.1.0.dist-info/entry_points.txt` 里，
+是**装的时候**生成的。
+
+```bash
+.venv/bin/pip install -e .venv/src/wdnapps-audio-chat --no-deps --no-build-isolation
+```
+
+不重装 ⇒ 宿主扫不到这张卡 ⇒ **`/health` 里没有 `qwen3-asr`，应用网格里也没有**，
+而且**没有报错**（只是「卡不存在」）。⇒ 改完 `pyproject.toml` 一定要重装再验证。
+
+### ⚠️ 坑三：删掉 `app/apps/qwen3_asr/` 后，跑着的服务是「半坏」的
+
+宿主服务是**常驻进程**：`manifest.json` / 路由 / 静态挂载都在**启动时**读一次。
+删掉目录后，**不重启**的话：
+
+* 路由还在（模块已 import 进内存）⇒ `POST /api/qwen3-asr/transcribe` 还通；
+* 静态挂载指向**已不存在的目录** ⇒ `/static/apps/qwen3-asr/app.js` **404**
+  ⇒ 前端白屏，且**后端毫无异常**。
+
+⇒ **迁移完成后必须重启服务**（`sudo systemctl restart wdnwebui`）。
+⚠️ 重启会连坐杀掉 `compute_worker`（`KillMode=control-group`）⇒ 确认
+`config.jsonc` 的 `compute.autostart` 里有条目，否则重启后板子没有算力。
+
+### 验证结果（本机 RK3588）
+
+| 脚本 | 结果 |
+|---|---|
+| `scripts/check_plugin_entrypoints.py` | 11 张插件卡全 OK（含 `qwen3-asr`） |
+| `scripts/verify_card_slots.py` | 12 张卡全有卡位占位符，渲染出 page section |
+| `scripts/verify_apps_isolation.py` | A/B/C 全 PASS（静态扫描 + 可达性 + 故障隔离） |
+| `scripts/verify_plugin_cards.py` | VERDICT: OK —— `qwen3-asr` 归类为 **plugin**（原 builtin），pageerror 空 |
+| `scripts/verify_asr_live.py` | 49 通过 / 0 失败 |
+| `/health` | 12 张卡全 `status=ok` |
+| 静态资源 | `app.js` / `app.css` / `template.html` / `wizard.json` / `capture-worklet.js` / `preview.mp4` 全 200 |

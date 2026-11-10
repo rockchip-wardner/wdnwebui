@@ -2,7 +2,7 @@
 """Qwen3-ASR 实时链路的**契约级**回归。
 
 **不需要 NPU、不需要服务在跑** —— 它用一只**假 SDK session** 直接驱动
-:class:`app.apps.qwen3_asr.service._LiveAsrSession`，把「协议契约」钉死。
+:class:`wdnapps_audio_chat.cards.qwen3_asr.service._LiveAsrSession`，把「协议契约」钉死。
 
 假 session 模仿 SDK 的在线路径（:meth:`wdnai.backends.asr.ASRBackend.
 _run_online_stream`）的切块规则：
@@ -53,9 +53,9 @@ if str(_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 
-from app.apps.qwen3_asr import service as svc_mod  # noqa: E402
-from app.apps.qwen3_asr.service import (_LiveAsrManager,  # noqa: E402
-                                        _LiveAsrSession, get_asr_service)
+from wdnapps_audio_chat.cards.qwen3_asr import service as svc_mod  # noqa: E402
+from wdnapps_audio_chat.cards.qwen3_asr.service import (  # noqa: E402
+    _LiveAsrManager, _LiveAsrSession, get_asr_service)
 
 PASSED = 0
 FAILED: list[str] = []
@@ -440,7 +440,7 @@ async def t_l11_language_header_shapes() -> None:
     形状 3 会让正文以 ``language`` 开头（实测在 97 分钟视频里出现过）。
     """
     print("\n=== L11: 语言头三种形状的拆解 ===")
-    from app.apps.qwen3_asr.service import _split_language, _valid_language
+    from wdnapps_audio_chat.cards.qwen3_asr.service import _split_language, _valid_language
 
     def split(raw: str) -> tuple:
         lang, body = _split_language(raw)
@@ -485,7 +485,7 @@ async def t_l12_stall_detector() -> None:
     """
 
     print("\n=== L12: 停滞检测状态机 ===")
-    from app.apps.qwen3_asr.service import (_STALL_ROUNDS_LIMIT, _AsrManager)
+    from wdnapps_audio_chat.cards.qwen3_asr.service import (_STALL_ROUNDS_LIMIT, _AsrManager)
 
     mgr = _AsrManager()
 
@@ -538,7 +538,7 @@ async def t_l13_model_pause_detector() -> None:
     20 次都是模型在改写 → 在句子中间误切一刀。
     """
     print("\n=== L13: 模型侧停顿检测状态机 ===")
-    from app.apps.qwen3_asr.service import _PAUSE_ROUNDS_LIMIT, _AsrManager
+    from wdnapps_audio_chat.cards.qwen3_asr.service import _PAUSE_ROUNDS_LIMIT, _AsrManager
 
     mgr = _AsrManager()
 

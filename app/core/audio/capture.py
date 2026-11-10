@@ -29,7 +29,7 @@ Qwen3-ASR 的输入就是 16 kHz（SDK 侧的 ``TARGET_SAMPLE_RATE``）。契约
 2. **两个采集端用同一套重采样算法** —— 板载端用
    :class:`StreamResampler`（带 carry 的流式线性插值），浏览器端用
    前端那份**逐样本等价**的 JS 实现
-   （``app/apps/qwen3_asr/static/app.js`` 的 ``_resampleTo16k``）。
+   （``wdnapps_audio_chat/cards/qwen3_asr/static/app.js`` 的 ``_resampleTo16k``）。
    ⚠️ **不要**让浏览器自己做（``new AudioContext({sampleRate:16000})``）：
    那是 WebAudio 自己的重采样器，与我们的算法不同 → 同一段录音从两端
    进来会得到不同的 16 kHz PCM → 文本分叉（清单 B3）。
@@ -400,7 +400,7 @@ def resample_s16_linear(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     用 :class:`StreamResampler`。
 
     ⚠️ **量化是「向零截断」**（``astype("<i2")`` 的语义），**不是**
-    四舍五入。浏览器那边（``app/apps/qwen3_asr/static/app.js`` 的
+    四舍五入。浏览器那边（``wdnapps_audio_chat/cards/qwen3_asr/static/app.js`` 的
     ``_resampleTo16k``）必须用同样的规则 —— 差 1 LSB 就会让「跨端
     逐字节一致」（清单 B3）不成立。回归见
     ``scripts/verify_asr_wizard.py`` 的 **V6a**。
@@ -441,7 +441,7 @@ class StreamResampler:
     加载它会让整个测试套件间歇性段错误（已在 SDK 侧踩过）。
 
     ⚠️ **浏览器那边有一份逐行同构的 JS 实现**
-    （``app/apps/qwen3_asr/static/app.js`` 的 ``_resampleTo16k``）——
+    （``wdnapps_audio_chat/cards/qwen3_asr/static/app.js`` 的 ``_resampleTo16k``）——
     两边的输出必须**逐字节相同**（清单 B3「跨端一致」）。改了任何一边
     都要重跑 ``scripts/verify_asr_wizard.py`` 的 **V6a**。
     """

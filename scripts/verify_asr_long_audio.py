@@ -22,7 +22,7 @@ SDK ``asr.py::_run_online_block``）是::
 （每轮 +700 字，远超语速），文本与音频彻底脱节，最后退化成
 ``<小红帽>《小红帽》`` 式的无限重复。
 
-修复（``app/apps/qwen3_asr/service.py``）：
+修复（``wdnapps_audio_chat/cards/qwen3_asr/service.py``）：
 
 1. **会话分段**：``_FILE_SESSION_MAX_SEC`` 900 → 60（对齐 C demo 的
    ``ONLINE_MAX_AUDIO_SECONDS``）—— 长音频靠**分段会话**而不是单个
