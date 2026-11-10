@@ -10885,3 +10885,32 @@ v0.43 修「重启卡死 90 秒」时挖出一条**跨卡通用**的坑：WebSoc
   有泄漏**（客户端断开没让服务端收尾）；
 * 想直接看某个 WS 有没有泄漏：连上 → 断开 → 看服务端的
   `journalctl -f` / 队列 / 线程有没有跟着消失。
+
+### ⚠️ 本板子进程会**继承 uvicorn 的 fd**（SDK 没设 FD_CLOEXEC）
+
+实测：`journalctl -f` 子进程的 fd 里有 `/dev/rga`、`/tmp/rknnsmi.lock`、
+`/dev/shm/fastdds_*` ⇒ **FastDDS / RGA / RKNNS 打开的 fd 都没设
+`FD_CLOEXEC`** ⇒ fork 时被子进程继承。
+
+⇒ 一个**没退出的**日志跟随进程，会一直占着 RGA 设备 fd 和 DDS 的共享内存
+（它卡在 `sock_alloc_send_pskb` 时尤其明显：stdout 管道写缓冲排不空，
+进程既不读也不退）。
+
+> ⚠️ **别用 `preexec_fn` 解决** —— 本服务跑在 **uvloop** 上，`preexec_fn`
+> 会让 uvloop 的 `UVProcess._after_fork` 抛
+> `OSError: [Errno 9] Bad file descriptor` ⇒ **子进程根本起不来**
+> （journalctl 立刻死、WS 连接被异常关闭、`ConnectionClosedError`）。
+> 实测踩过，别再试。
+>
+> ⇒ 正确的解法在 **SDK 侧**（打开 fd 时设 `FD_CLOEXEC`），或**接受现状但
+> 确保日志进程及时死**（见下）。
+
+### `journalctl -f` 可能卡在写缓冲 ⇒ 收尾要 `kill` 兜底
+
+stdout 管道没人读时它会阻塞在写上 ⇒ **收到 SIGTERM 后还要好几秒才退出**
+⇒ 收尾时 **terminate 后只给 0.5s 宽限，超时直接 `kill()`**（日志跟随进程
+不需要优雅退出）。宽限给到 2s 时，实测能看到「客户端已断开、journalctl
+还挂着」的窗口。
+
+⇒ 收尾再打一行 `system-logs ws closed` 日志 —— 之前日志跟随进程的收尾
+**完全静默**，泄漏了也看不出来（两个插件仓的 WS 也各加了一行同款日志）。

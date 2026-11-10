@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -390,6 +391,10 @@ async def ws_logs(
     except WebSocketDisconnect:
         pass
     finally:
+        # Observable end of a tail connection. Without it a follower that
+        # never gets cleaned up is completely silent.
+        logging.getLogger("wdnwebui.api.system_logs").info(
+            "system-logs ws closed")
         # The disconnect watcher lives outside the ``asyncio.wait`` set, so
         # it has to be stopped explicitly — otherwise it lingers as a
         # pending task after the tail ends.
@@ -415,7 +420,11 @@ async def ws_logs(
             except Exception:
                 pass
             try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
+                # Only 0.5s of grace: ``journalctl -f`` can get stuck in
+                # ``sock_alloc_send_pskb`` (its stdout pipe is full and
+                # nobody drains it any more) and then linger for minutes
+                # while still holding the inherited RGA / FastDDS fds.
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
             except asyncio.CancelledError:
                 # Shutting down — kill immediately, don't await.
                 try:
