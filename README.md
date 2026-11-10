@@ -1,3 +1,4 @@
+[English](README.md) | [简体中文](README_CN.md)
 # wdnwebui
 
 A Python web service that exposes the Rockchip platform SDKs
@@ -46,7 +47,7 @@ That pulls FastAPI, Uvicorn, Pydantic, psutil, opencv-python-headless,
 python-multipart, **`gguf`**, **`transformers`**, **`tokenizers`** and
 **`v4l2`**.
 
-> ℹ️  These three (`gguf` / `transformers` / `tokenizers`) are listed here
+> **Note**: These three (`gguf` / `transformers` / `tokenizers`) are listed here
 >  because the SDKs are installed with `--no-deps` (§4) and therefore never
 >  pull their own dependencies in. `scripts/check_sdk_deps.py` (§4c) audits
 >  exactly this — run it after any SDK install or update.
@@ -70,7 +71,7 @@ python-multipart, **`gguf`**, **`transformers`**, **`tokenizers`** and
   its own. Without it every HDMI-IN snapshot request fails with
   `ModuleNotFoundError: No module named 'v4l2'` → 503.
 
-  > ⚠️ Upstream `v4l2` 0.2 (2014) still contains the Python-2 idiom
+  > **Warning**: Upstream `v4l2` 0.2 (2014) still contains the Python-2 idiom
   > `range(...) + [...]`, which raises **at import time** on Python 3:
   > `TypeError: unsupported operand type(s) for +: 'range' and 'list'`.
   > That is *not* an `ImportError`, so a plain `pip install v4l2`
@@ -87,7 +88,7 @@ python-multipart, **`gguf`**, **`transformers`**, **`tokenizers`** and
   wrapper that drives the im-bridge page lives in
   `app/services/wechat_bot.py` (inlined from `wdndds.Wechat` in 0.5+).
 
-> ℹ️  As of `wdnai ≥ 0.4.0`, the `rknn3-toolkit-lite` wheel is **no
+> **Note**: As of `wdnai ≥ 0.4.0`, the `rknn3-toolkit-lite` wheel is **no
 > longer** a wdnwebui dependency. `wdnai` ships its own vendored
 > ctypes shim (`wdnai._librknn`) that drives
 > `/usr/lib/librknn3_api.so` directly. The kernel-mode driver
@@ -113,7 +114,7 @@ pip install -e "git+ssh://git@github.com/rockchip-wardner/wdndds.git#egg=wdndds"
 If a command fails with `Permission denied (publickey)`, the host either
 can't reach `github.com` or the SSH key isn't loaded.
 
-> ℹ️  On an isolated board with no internet access, point these at the
+> **Note**: On an isolated board with no internet access, point these at the
 > internal mirror instead (`git+ssh://git@10.10.10.10/wardner/<pkg>.git`) —
 > that's what `update_rkwhl.sh` (§4b) uses for field deployments.
 
@@ -290,3 +291,7 @@ wdnwebui/
 - **`create_app()` / router 404** — make sure `app/api/__init__.py`
   imports every submodule (`from . import power, ...`); without it
   the package object is empty and the routes are silently missing.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

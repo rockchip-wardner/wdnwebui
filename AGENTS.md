@@ -10,6 +10,45 @@ Python web service (`wdnwebui`) exposing RK-platform hardware / model SDKs
 后端 `api.py` + 前端 `static/`(template.html / app.js / app.css /
 wizard.json);`app/core/manifest.py` 启动时扫描全部 manifest 装载。
 
+## 仓库地址与同步策略（2026-11-10）
+
+同一批仓库在三个平台上**同名对应**（`wdnwebui` / `wdnav` / `wdnai` /
+`wdndds`，另有 `wdnapps_*` 等应用仓库）：
+
+| 角色 | 地址 | 允许的操作 |
+|---|---|---|
+| **局域网主仓库** | http://10.10.10.10:8080/wardner | **pull + push** —— 唯一权威源，所有更新的第一站 |
+| **GitHub** | https://github.com/rockchip-wardner | **只允许 push** —— 发布镜像，不从它 pull |
+| **Gitee 国内镜像** | https://gitee.com/rockchip-wardner | **不允许任何 git 操作** —— 公开只读镜像，内容由上游自动同步 |
+
+各仓的远端命名统一成：
+
+```
+origin = git@10.10.10.10:wardner/<repo>.git           ← 局域网主仓库（pull + push）
+github = git@github.com:rockchip-wardner/<repo>.git    ← 只 push
+```
+
+**每次提交更新的顺序（不可颠倒）：**
+
+1. **先推局域网主仓库**（`git push origin master`）—— 它是权威源；
+2. **再推 GitHub**（`git push github master`）—— 只出不进；
+3. **Gitee 一概不碰** —— 不 clone、不 pull、不 push。
+
+⚠️ **Gitee 不做任何操作。** 它是上游自动同步出来的**公开只读镜像**：推上去的内容
+会被下一次同步覆盖，且没有任何提示；连 `git pull` 也不该从它走 —— 它的内容滞后于
+局域网主仓库，拉下来只会制造分叉。
+
+⚠️ **GitHub 只出不进。** 它是**发布镜像**，不是开发源。`git pull` 拉的是「已经
+发布出去的历史」，不是最新的开发状态 —— 拉它会让本地与局域网主仓库分叉。要同步
+最新代码，只从局域网主仓库拉（`git pull origin master`）。
+
+> **拉取代码只走局域网主仓库。** 各仓 `master` 的跟踪分支都指向 `origin`
+> （局域网），所以裸 `git pull` / `git push` 操作的就是主仓库；推 GitHub 必须
+> 显式写 `git push github master`。
+>
+> 本仓库当前**没有**配 gitee 远端（`git remote -v` 只有 `origin` / `github`）
+> —— 保持这样。
+
 ## Stack at a glance
 
 - **Web framework**: FastAPI + Uvicorn (`run.py` boots `app.main:app` on
@@ -4753,6 +4792,9 @@ If `git clone` fails, the host either lacks SSH access to `github.com` or
 the deploy key isn't loaded. On an isolated board with no internet, use
 the internal mirror instead (`git+ssh://git@10.10.10.10/wardner/<pkg>.git`)
 — that's the path `update_rkwhl.sh` takes for field deployments.
+国内网络拉 GitHub 慢时，还可以从 Gitee 镜像拉
+(`git+https://gitee.com/rockchip-wardner/<pkg>.git`) —— **只拉不推**，
+三个平台的完整地址见上文「仓库地址」。
 
 **wdnai 的依赖不会自己进 venv —— `transformers` / `tokenizers` 必须由
 wdnwebui 的 `requirements.txt` 提供。** `update_rkwhl.sh`（以及上面那条
