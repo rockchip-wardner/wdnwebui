@@ -1211,16 +1211,33 @@
   // ─────────────────────────────────────────────────────────────────────
 
   function wireWizardModeButtons() {
-    document.addEventListener("click", (ev) => {
+    document.addEventListener("click", async (ev) => {
       const btn = ev.target.closest("[data-wizard-mode]");
       if (!btn) return;
       const appId = btn.getAttribute("data-page-id");
       if (!appId) return;
       ev.preventDefault();
+      // ⚠️ 「切到向导模式」= **离开功能页** ⇒ 顺手把在跑的识别停掉。
+      //
+      // 两条理由（缺一不可）：
+      //
+      //   1. **算力**：识别是长任务（整文件快转，几十秒起步），不停就一直
+      //      占着 NPU —— 而用户已经离开这张卡了，没人看结果。
+      //   2. **功能**：向导走完会 ``applyWizardSnapshot`` → **直接发起新的
+      //      识别**；而后端「一次只能跑一个识别」（RPC 只有一条 delta
+      //      通道）⇒ 上一条还在跑的话，新请求直接 409「上一条识别还在
+      //      进行中」⇒ 向导显示完成、识别却没跑起来。
+      //
+      // 只在**真的在跑**时才停（``DemoGuard.isActive``）⇒ 空闲的卡点这个
+      // 按钮行为零变化。``stopAndClear`` 走 card manifest 声明的
+      // ``stop_endpoints``（ASR = ``POST /api/qwen3-asr/stop``）。
+      if (DemoGuard.isActive(appId)) {
+        try { await DemoGuard.stopAndClear(appId); } catch (_) { /* ignore */ }
+      }
       if (typeof window.enterWizardMode === "function") {
         window.enterWizardMode(appId);
       } else {
-        // 理论不可能:wizard/registry.js 比 framework 早 boot,
+        // 理论不可能：wizard/registry.js 比 framework 早 boot,
         // WizardState 加载顺位也在 enterWizardMode 之前。但留个
         // 兜底,避免真出现时静默失败。
         console.warn("[framework] enterWizardMode not loaded yet");
