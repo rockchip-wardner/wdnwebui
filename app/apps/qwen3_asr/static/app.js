@@ -200,6 +200,15 @@ const Qwen3Asr = {
   // 又点了「开始识别」→ 代数变了 → **丢弃这次恢复**（旧轮次不能盖掉
   // 新识别刚起的轮次 = 串台）。
   _roundGen: 0,
+  // 「停止」是**本页面**发起的吗？—— 用来区分两种「stopped」帧：
+  //   * 自己点的停止 → 画面在 click 的那一刻就冻住了（见 ``stop()``），
+  //     1 秒后到达的 stopped 帧**不该**再冻一次（那时用户可能已经
+  //     自己按了播放）；
+  //   * 别的页面 / 别的标签页发的停止 → 本页面没冻过 → 要冻。
+  _stopInitiated: false,
+  // 「清空」之后忽略迟到的轮次帧（清空前广播出去的那几帧）。
+  // 新一轮识别开始时归零。
+  _ignoreRounds: false,
   _file: null,
   _path: "",
   _starting: false,
@@ -677,8 +686,17 @@ const Qwen3Asr = {
       const hint = document.getElementById("asr-video-hint");
       if (hint) hint.textContent = "正在识别拖到的位置…";
       // ① 停掉正在跑的那一轮（一次只能跑一个识别）
+      //
+      // ⚠️ **reason=internal** —— 这次停**不是**用户喊停，是前端为了
+      // 「重开识别」而停的 ⇒ **画面不能停**（用户正在拖进度条看视频，
+      // 停了就没法看了，字幕也得继续跟着播放头走）。后端把 reason
+      // 带在 stopped 帧里回来，前端据此**不冻画面**。
+      //
+      // 踩过的坑：没带 reason 时，stopped 帧一律冻画面 → 拖一下进度条
+      // 视频就停了（用户报「拖动进度条后视频和字幕都暂停了」）。
       if (this.snapshot && this.snapshot.busy) {
-        await fetch(API_PREFIX + "/qwen3-asr/stop", { method: "POST" })
+        await fetch(API_PREFIX + "/qwen3-asr/stop?reason=internal",
+                    { method: "POST" })
           .catch(() => {});
         await this._waitIdle(20000);
       }
@@ -1690,10 +1708,16 @@ const Qwen3Asr = {
   _updateHint() {
     const hint = document.getElementById("asr-hint");
     if (!hint) return;
+    const st = (this.snapshot && this.snapshot.state) || "";
     if (!this._hasSource()) {
       hint.textContent = "选择一个音频来源后点「开始识别」。模型按 1 秒一块增量解码，输出实时刷新。";
     } else if (this._busy()) {
       hint.textContent = "识别中…… 已确认的文本会实时出现，蓝色是尚未确认的部分。";
+    } else if (st === "stopped" && !this._seekBusy) {
+      // ⚠️ 「已停止」和「完成」要说清楚区别 —— 用户点「停止」是**提前
+      // 收尾**：已识别的那部分留下了，画面也停住了（字幕不再滚）。
+      hint.textContent = "已停止 —— 已识别的内容保留在下方转写框里；"
+        + "要重跑点「开始识别」。";
     } else {
       hint.textContent = "点击「开始识别」重新跑一遍。";
     }
@@ -2341,6 +2365,8 @@ const Qwen3Asr = {
     this._starting = true;
     this.rounds = [];
     this._roundGen++;            // 新的一批轮次 → 作废在途的「刷新恢复」
+    this._stopInitiated = false;  // 新的一批 → 「谁停的」重新算
+    this._ignoreRounds = false;  // 新的一批 → 轮次帧照收
     // 记下这批轮次来自**哪个来源** —— 视频字幕靠它判断「该不该渲染」
     // （否则会拿上一来源的轮次画到当前视频上，见 _onSourceChanged）。
     this._roundsSource = this._source;
@@ -2397,27 +2423,66 @@ const Qwen3Asr = {
       const r = await fetch(API_PREFIX + "/qwen3-asr/stop", { method: "POST" });
       const data = await r.json().catch(() => ({}));
       if (data.snapshot) this._applySnapshot(data.snapshot);
+      // ⚠️ **画面也要停住** —— 字幕是**播放头**的渲染（YouTube 式：字幕
+      // 跟着画面走，**跟识别进度无关**）。只停后端识别的话，视频还在播
+      // → 字幕的 rAF 循环继续跑 → **字幕继续按播放头滚动** → 用户以为
+      // 「识别还在跑」（这正是用户报的 bug）。
+      //
+      // 「停止」的语义 = 停下来（识别 + 同步播放）。想继续看视频可以自己
+      // 按播放键 —— 那时字幕会跟着**已识别**的那部分继续走（正常）。
+      this._stopInitiated = true;
+      this._freezePlayback();
     } catch (e) {
       this._showError("停止失败: " + e);
     }
   },
 
+  /**
+   * 冻结画面：暂停视频 + 停掉字幕 rAF 循环。
+   *
+   * 字幕的驱动源是**播放头**（``_renderVideoSubtitle`` 按
+   * ``video.currentTime`` 取当前行）→ 播放头不动，字幕自然停住。
+   *
+   * ``video.pause()`` 会派发 'pause' 事件 → ``_stopSubLoop``；这里再
+   * 显式调一次是**兜底**（元素不在 / 事件没派发时也保证循环停了）。
+   */
+  _freezePlayback() {
+    const video = document.getElementById("asr-video");
+    if (video && !video.paused) {
+      try { video.pause(); } catch (e) { /* noop */ }
+    }
+    this._stopSubLoop();
+  },
+
   async reset() {
+    // 识别**进行中**点「清空」= 停止 + 清空（后端 /reset 会把正在跑的那
+    // 一轮打断，见 service.py::reset）⇒ **画面也要停**：不然视频还在
+    // 播、字幕还在滚，而识别已经被清空了 —— 那就是「点停止后字幕还在
+    // 滚」那个 bug 的翻版。
+    if (this.snapshot && this.snapshot.busy) this._freezePlayback();
+
+    // ⚠️ **本地先清，不等服务器** —— 点了就该立刻看到「清空了」。
+    // ``POST /reset`` 要等在飞的那次 RPC 被打断才返回（实测 ~1 s），
+    // 等它才清 → 用户会觉得「点了没反应」。
+    this.rounds = [];
+    this._roundGen++;          // 清空 → 作废在途的「刷新恢复」
+    this._roundsSource = "";
+    // 清空之后**忽略迟到的轮次帧**：服务端已经在清空时断了那一轮，
+    // 但清空前广播出去的几帧还会到 —— 收到就又长回来。
+    this._ignoreRounds = true;
+    this._renderRounds();
+    this._renderLive("", "");
+    this._audioOriginSec = 0;
+    this._subInvalidate();
+    const sub = document.getElementById("asr-video-sub");
+    if (sub) this._subClear(sub);
+    this._transcriptClear();
+    const empty = document.getElementById("asr-empty");
+    if (empty) empty.classList.remove("hidden");
+
     try {
       const r = await fetch(API_PREFIX + "/qwen3-asr/reset", { method: "POST" });
       const data = await r.json().catch(() => ({}));
-      this.rounds = [];
-      this._roundGen++;          // 清空 → 作废在途的「刷新恢复」
-      this._roundsSource = "";
-      this._renderRounds();
-      this._renderLive("", "");
-      this._audioOriginSec = 0;
-      this._subInvalidate();
-      const sub = document.getElementById("asr-video-sub");
-      if (sub) this._subClear(sub);
-      this._transcriptClear();
-      const empty = document.getElementById("asr-empty");
-      if (empty) empty.classList.remove("hidden");
       if (data.snapshot) this._applySnapshot(data.snapshot);
     } catch (e) {
       this._showError("清空失败: " + e);
@@ -2563,6 +2628,8 @@ const Qwen3Asr = {
           this._liveRender();
           break;
         }
+        // ⚠️ 「清空」之后迟到的轮次帧 → 忽略（否则清完又长回来）。
+        if (this._ignoreRounds) break;
         this.rounds.push({
           round: msg.round,
           committed: msg.committed || "",
@@ -2634,6 +2701,29 @@ const Qwen3Asr = {
           const audio = msg.audio_sec ? ` · 音频 ${msg.audio_sec.toFixed(1)} s` : "";
           hint.textContent = `识别完成（${(msg.elapsed_sec || 0).toFixed(2)} s${audio}）`
             + `· 语种 ${msg.language || "未知"}`;
+        }
+        break;
+      }
+      case "stopped": {
+        // 停止 → **正常收尾**，不是失败：把已识别的文本交回界面。
+        // （后端在取消时不再广播 error 帧。）
+        this._renderLive(msg.text || "", "");
+        this._renderRounds();
+        // ⚠️ **要不要把画面也停住，取决于「谁喊的停」**：
+        //   * ``internal`` —— 前端为了「拖动进度条 → 重开识别」而停的
+        //     ⇒ **画面继续**（用户在拖进度条看视频，冻了就看不了）。
+        //   * ``user`` —— 用户点了「停止」⇒ 画面停（字幕别再滚）。
+        //     本页面点的 → click 那一刻就冻过了 → 这里**别再冻**
+        //     （用户可能已经自己按了播放）；别的标签页点的 → 本页面
+        //     没冻过 → 要冻（否则那边停了这边字幕还在滚）。
+        const internal = (msg.reason === "internal");
+        if (!internal && !this._stopInitiated) this._freezePlayback();
+        const hint = document.getElementById("asr-hint");
+        if (hint && !internal) {
+          const audio = msg.audio_sec
+            ? ` · 已识别 ${msg.audio_sec.toFixed(1)} s` : "";
+          hint.textContent = `已停止${audio} —— 已识别的内容保留在下方，`
+            + "要重跑点「开始识别」。";
         }
         break;
       }

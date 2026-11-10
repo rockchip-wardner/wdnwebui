@@ -283,6 +283,22 @@ def live_chunk(stream_id: str, seq: int, pcm: bytes) -> tuple:
                 "X-Asr-Seq": str(seq)})
 
 
+def release_npu() -> None:
+    """把 NPU 让出来 —— 后端**一次只能跑一个识别**。
+
+    后面的用例（live 的「文件路径参考」）要自己跑一遍识别；前面的用例若
+    还占着识别，它就会拿到 409「上一条识别还在进行中」，而且它取的
+    「参考文本」是**上一条识别的残留** → 一串假失败。
+
+    实测：U21（拖动进度条）跑完没收尾 → live 的 V3/V4/V5c 全挂，
+    根因就是这个（V3 报 409，V4/V5c 是被 V3 的参考文本带偏的）。
+    """
+    try:
+        api("POST", "/api/qwen3-asr/stop")
+    except Exception:  # noqa: BLE001 — 收尾失败无所谓
+        pass
+
+
 def read_wav_pcm(path: str, expect_rate: int | None = None) -> bytes:
     """读 WAV 的裸 PCM（只支持单声道 / s16）。"""
     import wave
@@ -2044,6 +2060,351 @@ def verify_sources(page, shot_dir: Path) -> None:
                     pass
 
 
+def verify_reset(page, shot_dir: Path) -> None:
+    """U22: 「清空」= 真清干净（识别中点也不长回来）+ 画面停住。
+
+    用户把「清空」挪到了「停止」左边（运行控制区）—— 位置显眼了，
+    **误点概率也高了**：识别进行中点「清空」是很自然的手滑。
+
+    而原来的后端 ``reset()`` 只清结果、**不停正在跑的识别** → 那个
+    线程继续推轮次 → 结果**又长回来**（实测：32 轮 → 清成 3 →
+    4.5 s 后涨回 26，「清空」等于没点）。
+    """
+    print("\n--- U22 「清空」：真清干净 + 画面停住 ---")
+    long_mp4 = Path("/tmp/asr_ref/asr_long_90s.mp4")
+    tmp_mp4 = "/userdata/assets/uploads/_asr_reset_test.mp4"
+    have_mp4 = False
+    if long_mp4.is_file():
+        try:
+            shutil.copyfile(str(long_mp4), tmp_mp4)
+            have_mp4 = True
+        except OSError:
+            have_mp4 = False
+    if not have_mp4:
+        print("  [SKIP] 缺 /tmp/asr_ref/asr_long_90s.mp4（U22 跳过）")
+        return
+
+    def _probe():
+        return page.evaluate("""() => {
+            const A = window.Qwen3Asr || {};
+            const v = document.getElementById('asr-video');
+            const body = document.getElementById('asr-transcript-body');
+            const live = document.getElementById('asr-live-committed');
+            return {
+                rounds: (A.rounds || []).length,
+                state: (A.snapshot && A.snapshot.state) || '',
+                busy: !!(A.snapshot && A.snapshot.busy),
+                paused: v ? !!v.paused : null,
+                rows: body ? body.querySelectorAll('.asr-sub-line').length : 0,
+                live: live ? (live.textContent || '').trim().length : 0,
+            };
+        }""")
+
+    try:
+        page.select_option("#asr-mode", "single")
+        page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
+        page.wait_for_timeout(500)
+        page.fill("#asr-path", tmp_mp4)
+        page.dispatch_event("#asr-path", "input")
+        page.wait_for_timeout(900)
+        page.click("#asr-start-btn")
+
+        # 等识别跑起来（有轮次了）
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if _probe()["rounds"] > 5:
+                break
+            page.wait_for_timeout(300)
+        before = _probe()
+        print(f"  清空前：{before}")
+        check("U22 清空前识别在跑（有轮次）",
+              before["rounds"] > 5 and before["busy"], f"{before}")
+
+        page.click("#asr-reset-btn")
+        page.wait_for_timeout(600)
+        mid = _probe()
+        print(f"  清空 +0.6s：{mid}")
+        check("U22 点清空后本地轮次立刻清零",
+              mid["rounds"] == 0, f"rounds={mid['rounds']}")
+
+        # ⚠️ **关键**：等一会儿，看结果会不会**长回来**
+        page.wait_for_timeout(5000)
+        after = _probe()
+        print(f"  清空 +5.6s：{after}")
+        check("U22 清空 5 秒后轮次**没有长回来**（真清干净）",
+              after["rounds"] == 0, f"rounds={after['rounds']}")
+        check("U22 清空后转写框也空了",
+              after["rows"] == 0, f"rows={after['rows']}")
+        check("U22 清空后单行结果也空了",
+              after["live"] == 0, f"live={after['live']}")
+
+        snap = api_state()
+        check("U22 后端状态回到 idle、轮次为 0",
+              snap.get("state") == "idle" and (snap.get("round_count") or 0) == 0,
+              f"state={snap.get('state')!r} rounds={snap.get('round_count')}")
+        check("U22 识别中点清空 → 画面也停住（视频暂停）",
+              after["paused"] is True, f"paused={after['paused']}")
+        page.screenshot(path=str(shot_dir / "10_u22_reset.png"))
+    finally:
+        release_npu()
+        try:
+            os.remove(tmp_mp4)
+        except OSError:
+            pass
+
+
+def verify_seek(page, shot_dir: Path) -> None:
+    """U21: 拖动进度条 → 视频**继续播**，字幕继续跟着走。
+
+    用户报的 bug：「拖动进度条到目标位置后，视频播放和字幕都暂停了」。
+
+    根因：拖动进度条会触发「重开识别」（``_maybeFollowSeek`` → 先
+    ``POST /stop`` 停掉正在跑的那一轮，再从拖动点往前 8 秒重开）——
+    这个 stop 是**前端内部**的，不是用户喊停。而 stopped 帧一律冻
+    画面 → 视频被暂停 → 字幕也跟着停。
+
+    修法：stop 带 ``reason``（``user`` / ``internal``）⇒ 只有用户喊停
+    才冻画面。
+    """
+    print("\n--- U21 拖动进度条 → 视频继续播 ---")
+    long_mp4 = Path("/tmp/asr_ref/asr_long_90s.mp4")
+    tmp_mp4 = "/userdata/assets/uploads/_asr_seek_test.mp4"
+    have_mp4 = False
+    if long_mp4.is_file():
+        try:
+            shutil.copyfile(str(long_mp4), tmp_mp4)
+            have_mp4 = True
+        except OSError:
+            have_mp4 = False
+    if not have_mp4:
+        print("  [SKIP] 缺 /tmp/asr_ref/asr_long_90s.mp4（U21 跳过）")
+        return
+
+    def _probe():
+        return page.evaluate("""() => {
+            const A = window.Qwen3Asr || {};
+            const v = document.getElementById('asr-video');
+            const sub = document.getElementById('asr-video-sub');
+            const body = document.getElementById('asr-transcript-body');
+            return {
+                sub: sub ? (sub.textContent || '').trim() : '',
+                paused: v ? !!v.paused : null,
+                t: v ? (v.currentTime || 0) : 0,
+                raf: A._subRaf || 0,
+                rows: body ? body.querySelectorAll('.asr-sub-line').length : 0,
+                seekBusy: !!A._seekBusy,
+                state: (A.snapshot && A.snapshot.state) || '',
+                rounds: (A.snapshot && A.snapshot.round_count) || 0,
+            };
+        }""")
+
+    try:
+        page.select_option("#asr-mode", "single")
+        page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
+        page.wait_for_timeout(500)
+        page.fill("#asr-path", tmp_mp4)
+        page.dispatch_event("#asr-path", "input")
+        page.wait_for_timeout(900)
+        page.click("#asr-start-btn")
+
+        # 等识别真的跑起来 + 字幕出来了
+        got = False
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            st = _probe()
+            if st["sub"] and st["rows"] > 0 and st["paused"] is False:
+                got = True
+                break
+            page.wait_for_timeout(400)
+        before = _probe()
+        print(f"  拖动前：字幕={before['sub'][:30]!r} 播放头={before['t']:.2f}s "
+              f"暂停={before['paused']} 轮次={before['rounds']}")
+        check("U21 拖动前视频在播、字幕在画面上", got,
+              f"sub={before['sub'][:30]!r} paused={before['paused']}")
+
+        # 拖到**还没识别过**的位置 → 触发「重开识别」
+        page.evaluate("""() => {
+            const v = document.getElementById('asr-video');
+            v.currentTime = 30;
+        }""")
+        page.wait_for_timeout(400)
+        # 等重开识别走完（内部 stop → 重开）
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            st = _probe()
+            if not st["seekBusy"]:
+                break
+            page.wait_for_timeout(300)
+        page.wait_for_timeout(1200)
+        after = _probe()
+        print(f"  拖动后：字幕={after['sub'][:30]!r} 播放头={after['t']:.2f}s "
+              f"暂停={after['paused']} rAF={after['raf']} 状态={after['state']!r}")
+
+        # ① **视频没有被暂停**（这条就是用户报的 bug）
+        check("U21 拖动进度条后视频**没有**被暂停",
+              after["paused"] is False, f"paused={after['paused']}")
+        # ② 播放头继续前进（真的还在播）
+        t1 = after["t"]
+        page.wait_for_timeout(2000)
+        later = _probe()
+        check("U21 拖动后播放头继续前进（视频还在播）",
+              later["t"] > t1 + 0.2, f"{t1:.2f} → {later['t']:.2f}")
+        # ③ 字幕的 rAF 循环还活着
+        check("U21 拖动后字幕 rAF 循环仍在跑",
+              later["raf"] != 0, f"raf={later['raf']}")
+        # ④ 字幕有内容（跟着新位置）
+        check("U21 拖动后字幕跟着新位置（不是空的）",
+              bool(later["sub"]), f"sub={later['sub'][:40]!r}")
+        # ⑤ 识别确实重开了（状态回到 running，轮次在长）
+        check("U21 拖动后识别重开了（状态 running）",
+              later["state"] == "running", f"state={later['state']!r}")
+        check("U21 拖动后轮次继续增长", later["rounds"] > 0,
+              f"rounds={later['rounds']}")
+        page.screenshot(path=str(shot_dir / "9_u21_seek.png"))
+    finally:
+        # ⚠️ **必须让出 NPU** —— 这个用例结束时识别还在跑（拖动后重开
+        # 的那一轮），后面的 live 用例要自己跑识别 → 会撞 409。
+        release_npu()
+        try:
+            os.remove(tmp_mp4)
+        except OSError:
+            pass
+
+
+def verify_stop(page, shot_dir: Path) -> None:
+    """U20: 点「停止」→ 画面（含字幕）必须**立刻停住**，状态是「已停止」。
+
+    用户报的 bug：「流式语音识别」里点了「停止」，**字幕还在滚动**。
+
+    根因有两层（都修了）：
+
+    1. **字幕的驱动源是「播放头」**（YouTube 式：字幕跟着画面走，跟识别
+       进度无关）—— 原来「停止」只停后端识别，**视频还在播** → 字幕的
+       rAF 循环继续跑 → 字幕继续按播放头滚动 → 用户以为识别还在跑。
+    2. **后端把「用户取消」当成了「识别失败」** —— 取消会让在飞的那次
+       RPC 抛 ``generation stopped``，那条异常走 ``_fail`` → 状态落成
+       ``error``（徽标显示「出错」）→ 用户以为识别崩了。
+    """
+    print("\n--- U20 点「停止」→ 字幕停住 + 状态「已停止」---")
+    long_mp4 = Path("/tmp/asr_ref/asr_long_90s.mp4")
+    tmp_mp4 = "/userdata/assets/uploads/_asr_stop_test.mp4"
+    have_mp4 = False
+    if long_mp4.is_file():
+        try:
+            shutil.copyfile(str(long_mp4), tmp_mp4)
+            have_mp4 = True
+        except OSError:
+            have_mp4 = False
+    if not have_mp4:
+        print("  [SKIP] 缺 /tmp/asr_ref/asr_long_90s.mp4（U20 跳过）")
+        return
+
+    def _probe():
+        return page.evaluate("""() => {
+            const A = window.Qwen3Asr || {};
+            const v = document.getElementById('asr-video');
+            const sub = document.getElementById('asr-video-sub');
+            const body = document.getElementById('asr-transcript-body');
+            const badge = document.getElementById('asr-state-badge');
+            const live = document.getElementById('asr-live-committed');
+            return {
+                sub: sub ? (sub.textContent || '').trim() : '',
+                paused: v ? !!v.paused : null,
+                t: v ? (v.currentTime || 0) : 0,
+                raf: A._subRaf || 0,
+                rows: body ? body.querySelectorAll('.asr-sub-line').length : 0,
+                badge: badge ? badge.textContent.trim() : '',
+                live: live ? (live.textContent || '').trim() : '',
+                hint: (document.getElementById('asr-hint') || {}).textContent || '',
+            };
+        }""")
+
+    try:
+        page.select_option("#asr-mode", "single")
+        page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
+        page.wait_for_timeout(500)
+        page.fill("#asr-path", tmp_mp4)
+        page.dispatch_event("#asr-path", "input")
+        page.wait_for_timeout(900)
+        page.click("#asr-start-btn")
+
+        # 等字幕真的出来（视频在播 + 时间轴已有行 + 播放头落在已识别区间）
+        got = False
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            st = _probe()
+            if st["sub"] and st["rows"] > 0 and st["paused"] is False:
+                got = True
+                break
+            page.wait_for_timeout(400)
+        before = _probe()
+        print(f"  停止前：字幕={before['sub'][:40]!r} 行数={before['rows']} "
+              f"播放头={before['t']:.2f}s 暂停={before['paused']} "
+              f"rAF={before['raf']}")
+        check("U20 停止前字幕确实在画面上（能复现用户的场景）", got,
+              f"sub={before['sub'][:40]!r} rows={before['rows']}")
+        check("U20 停止前字幕 rAF 循环在跑", before["raf"] != 0,
+              f"raf={before['raf']}")
+
+        page.click("#asr-stop-btn")
+        # 等后端把状态落成 stopped（「停止」的语义）
+        try:
+            page.wait_for_function(
+                """() => {
+                    const b = document.getElementById('asr-state-badge');
+                    return b && b.getAttribute('data-state') === 'stopped';
+                }""", timeout=30000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1200)
+        after = _probe()
+        print(f"  停止后：字幕={after['sub'][:40]!r} 播放头={after['t']:.2f}s "
+              f"暂停={after['paused']} rAF={after['raf']} 徽标={after['badge']!r}")
+
+        # ① 后端状态：必须是「已停止」，不是「出错」也不是「完成」
+        snap = api_state()
+        check("U20 后端状态是 stopped（不是 error / done）",
+              snap.get("state") == "stopped",
+              f"state={snap.get('state')!r} error={snap.get('error')!r}")
+        check("U20 停止后没有把 RPC 的异常当成识别失败",
+              not (snap.get("error") or ""), f"error={snap.get('error')!r}")
+        check("U20 徽标显示「已停止」", after["badge"] == "已停止",
+              f"badge={after['badge']!r}")
+
+        # ② 画面停住：视频暂停 + 字幕 rAF 循环停
+        check("U20 停止后视频已暂停", after["paused"] is True,
+              f"paused={after['paused']}")
+        check("U20 停止后字幕 rAF 循环已停", after["raf"] == 0,
+              f"raf={after['raf']}")
+
+        # ③ **字幕不再滚动** —— 这是用户报的 bug 本身。
+        #    判据：字幕文本 + 播放头在 2 秒内都不变。
+        t1 = after["t"]
+        sub1 = after["sub"]
+        page.wait_for_timeout(2000)
+        later = _probe()
+        check("U20 停止后字幕内容不再变化（不滚了）",
+              later["sub"] == sub1, f"{sub1[:30]!r} → {later['sub'][:30]!r}")
+        check("U20 停止后播放头不再前进",
+              abs(later["t"] - t1) < 0.05, f"{t1:.3f} → {later['t']:.3f}")
+
+        # ④ 已识别的内容**保留**（点停止不是白识别）
+        check("U20 停止后已识别的内容保留（转写框有行）",
+              after["rows"] > 0, f"rows={after['rows']}")
+        check("U20 停止后单行结果保留",
+              bool(after["live"]) or bool((snap.get("last_result") or {}).get("text")),
+              f"live={after['live'][:40]!r}")
+        check("U20 提示语说明是「已停止」", "已停止" in after["hint"],
+              f"hint={after['hint'][:60]!r}")
+        page.screenshot(path=str(shot_dir / "8_u20_stopped.png"))
+    finally:
+        release_npu()
+        try:
+            os.remove(tmp_mp4)
+        except OSError:
+            pass
+
+
 def verify_restore(page, shot_dir: Path) -> None:
     """U19: 刷新页面后恢复 + 不同来源的历史不串线。
 
@@ -2580,6 +2941,15 @@ def main() -> int:
 
         # ---------------- 刷新恢复 + 来源不串线 ----------------
         verify_restore(page, shot_dir)
+
+        # ---------------- 点「停止」→ 字幕停住 ----------------
+        verify_stop(page, shot_dir)
+
+        # ---------------- 拖动进度条 → 视频继续播 ----------------
+        verify_seek(page, shot_dir)
+
+        # ---------------- 「清空」→ 真清干净 ----------------
+        verify_reset(page, shot_dir)
 
         check("页面没有 JS 报错", not errors, f"errors={errors[:3]}")
         browser.close()

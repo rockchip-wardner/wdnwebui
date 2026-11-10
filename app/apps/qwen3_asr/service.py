@@ -255,6 +255,17 @@ class _AsrManager:
         #: 轮次是哪一路来的，靠当前页签猜就会把「音频文件」的轮次画到视频
         #: 画面上（U15 那个「切来源串台」的坑）。后端是唯一知道真相的地方。
         self._rounds_source: Dict[str, Any] = {}
+        #: 上一次停止的**发起方**（``user`` / ``internal``）—— 见
+        #: :meth:`stop`。前端据此决定「画面要不要跟着停」。
+        self._stop_reason: str = ""
+        #: 「清空」之后要不要**丢掉迟到的轮次帧**。
+        #:
+        #: ⚠️ 不能拿「当前没有请求」当条件（``_current_request_id is
+        #: None``）—— 那个条件在**从来没有请求过**的实例上也成立，而
+        #: 停滞 / 停顿检测的单元测试正是直接调 ``_on_delta()``（没有请求
+        #: 上下文）→ 帧会被全丢掉，计数永远不涨（L12/L13 直接挂）。
+        #: ⇒ 用一个**只在 reset 时置位**的专用标志。
+        self._drop_frames: bool = False
         self._last_started: float = 0.0
         self._id_seq = 0
         #: 本次识别用的流式参数（透传给 SDK 的 respond）。
@@ -438,29 +449,133 @@ class _AsrManager:
         ).start()
         return rid
 
-    def stop(self) -> None:
-        """停止正在跑的识别（当前轮丢弃）。"""
+    def stop(self, reason: str = "user") -> None:
+        """停止正在跑的识别（当前轮丢弃）。
+
+        ⚠️ **「停止」是正常收尾，不是失败** —— 状态必须落成
+        ``stopped``（徽标显示「已停止」），**不能**落成 ``error``：
+        取消会让在飞的那次 RPC 抛 ``generation stopped``，那条异常会被
+        当成「识别失败」→ 徽标变「出错」，还把 RPC 原文抛给用户
+        （实测：点一次「停止」就看到「出错：识别失败:
+        LLMRPCSession[...]: generation stopped」）。
+
+        这里**立刻**把状态置成 stopped 并广播 —— 不等后台线程收尾
+        （那个线程随后还会再广播一次，带上已识别到的文本）。
+
+        ``reason`` —— **谁喊的停**：
+        * ``user`` —— 用户点了「停止」⇒ 画面也要停（字幕别再滚）；
+        * ``internal`` —— **前端内部**为了「拖动进度条 → 重开识别」
+          而停的那一次 ⇒ **画面不能停**（用户正在看视频，停了就没法
+          看了；字幕还要继续跟着播放头走）。
+
+        这个区别**必须由调用方说**，后端猜不出来 —— 两个动作在后端看
+        起来一模一样（都是「停掉正在跑的识别」）。
+        """
         with self._lock:
             if self._state != self.STATE_RUNNING:
                 return
             self._cancel = True
             session = self._session
+            self._stop_reason = reason or "user"
+            self._set_state(self.STATE_STOPPED)
         if session is not None:
             try:
                 session.stop()
             except Exception as e:  # noqa: BLE001 — cancel is best-effort
                 _LOG.debug("session.stop() failed (best-effort): %s", e)
+        self._broadcast({"type": "state", "state": self.snapshot()})
+
+    def _stopped(self, rid: int, *, text: str = "", language: str = "",
+                 model_id: str = "", audio_sec: float = 0.0,
+                 segments: int = 0, epochs: int = 1, epoch_errors: int = 0,
+                 elapsed_sec: float = 0.0) -> None:
+        """用户喊停 → 状态 ``stopped``，**已识别的内容保留**。
+
+        ⚠️ 不能复用 :meth:`_fail` —— 那是「识别崩了」的语义（徽标
+        「出错」+ 把 RPC 原文抛给用户）。用户点「停止」是**提前收尾**：
+        已识别的那部分必须留下（转写框 / 单行结果都要能看到）。
+        """
+        with self._lock:
+            self._language = language or self._language
+            self._last_result = {
+                "request_id": rid,
+                "model_id": model_id or self._model_id or "",
+                "language": language or self._language,
+                "text": text,
+                "raw": text,
+                "elapsed_sec": round(elapsed_sec, 3),
+                "audio_sec": audio_sec,
+                "segments": segments,
+                "epochs": epochs,
+                "epoch_errors": epoch_errors,
+                "stopped": True,
+            }
+            self._set_state(self.STATE_STOPPED)
+        self._broadcast({
+            "type": "stopped",
+            "request_id": rid,
+            "language": language or self._language,
+            "text": text,
+            "elapsed_sec": round(elapsed_sec, 3),
+            "audio_sec": audio_sec,
+            # 「谁喊的停」—— 前端据此决定要不要把画面也停住。
+            "reason": self._stop_reason or "user",
+        })
+        self._broadcast({"type": "state", "state": self.snapshot()})
+
+    def _partial_text(self) -> str:
+        """已识别到哪算哪 —— 取消时兜底用。
+
+        ⚠️ 单轮的 ``committed`` 是**段内累计**的（跨 epoch 会归零），
+        所以它只是**兜底**；正常路径用 ``_stream_main`` 返回的
+        segments 拼接（那是跨段的完整文本）。
+        """
+        with self._lock:
+            if not self._rounds:
+                return ""
+            return (self._rounds[-1].get("committed") or "").strip()
 
     def reset(self) -> None:
-        """清空本轮结果，回到 idle。"""
+        """清空本轮结果，回到 idle。
+
+        ⚠️ **必须把正在跑的那一轮也停掉** —— 只清结果不停识别的话，
+        那个线程会继续推轮次 → 结果**又长回来**（实测：识别中点「清空」，
+        0.5 s 后轮次 32 → 3，4.5 s 后又涨回 26 —— 「清空」等于没点）。
+
+        ⇒ ``_cancel`` + ``session.stop()`` 把那一轮打断；线程收尾时靠
+        :meth:`_superseded` 认出「自己已经被清空作废了」→ **不写回**
+        ``last_result``、**不改**状态、**不广播**（否则会把「清空」撤销）。
+        """
         with self._lock:
+            self._cancel = True
+            self._drop_frames = True   # 之后迟到的轮次帧一律丢掉
+            session = self._session
             self._rounds = []
             self._rounds_source = {}
             self._language = ""
             self._last_result = None
             self._current_request_id = None
             self._set_state(self.STATE_IDLE)
+        if session is not None:
+            try:
+                session.stop()
+            except Exception as e:  # noqa: BLE001 — cancel is best-effort
+                _LOG.debug("session.stop() failed (best-effort): %s", e)
         self._broadcast({"type": "state", "state": self.snapshot()})
+
+    def _superseded(self, rid: int) -> bool:
+        """这次识别是不是**已经被作废**了（被「清空」或被新的一批顶替）。
+
+        作废的判据是 ``_current_request_id``：
+        * 「清空」把它置成 ``None``；
+        * 新的识别把它换成新的 rid。
+
+        ⇒ 作废的那一轮在收尾时**什么都不做**（不写 ``last_result``、
+        不改状态、不广播 done/stopped）—— 否则「清空」会被它撤销
+        （文本又冒出来、状态又变「已停止」）。
+        """
+        with self._lock:
+            return self._current_request_id != rid
 
     # -------------------------------------------------------------- 推理
     def _select_session(self):
@@ -540,6 +655,8 @@ class _AsrManager:
             self._last_result = None
             self._options = dict(options or {})
             self._cancel = False
+            self._stop_reason = ""
+            self._drop_frames = False  # 新的一批 → 轮次帧照收
             self._audio_origin_sec = 0.0
             self._set_state(self.STATE_RUNNING)
 
@@ -591,9 +708,38 @@ class _AsrManager:
                     self._stream_main(rid, session, chunk_factory,
                                       start_sec))
         except Exception as e:  # noqa: BLE001
+            if self._superseded(rid):
+                # 已被「清空」作废 → 什么都不做（别把「清空」撤销）。
+                return
+            if self._cancel:
+                # 用户喊停 → 不是失败（取消会把在飞的 RPC 打断成
+                # 「generation stopped」）。走 stopped 路径，保留已识别的。
+                self._stopped(rid, text=self._partial_text(),
+                              model_id=model_id,
+                              elapsed_sec=time.perf_counter() - t0)
+                return
             self._fail(rid, "识别失败: {}".format(e))
             return
         elapsed = time.perf_counter() - t0
+
+        if self._superseded(rid):
+            # 已被「清空」作废 → 什么都不做。
+            return
+
+        if result.get("cancelled"):
+            # 用户喊停 → **正常收尾**：状态 stopped，已识别的文本留下。
+            self._stopped(
+                rid,
+                text=result.get("text") or self._partial_text(),
+                language=result.get("language") or "",
+                model_id=model_id,
+                audio_sec=float(result.get("audio_sec") or 0.0),
+                segments=int(result.get("segments") or 0),
+                epochs=int(result.get("epochs") or 1),
+                epoch_errors=int(result.get("epoch_errors") or 0),
+                elapsed_sec=elapsed,
+            )
+            return
 
         language = result.get("language") or ""
         body = result.get("text") or ""
@@ -735,6 +881,9 @@ class _AsrManager:
         epoch_errors = 0
         consecutive_errors = 0
         last_error: Optional[BaseException] = None
+        #: 用户喊停了没。取消会让在飞的那次 RPC 抛 ``generation stopped``
+        #: —— 那是**预期内**的收尾，不是「识别失败」（见 ``_stopped``）。
+        cancelled = False
 
         async def _close_epoch(reason: str) -> bool:
             """收掉当前会话（带尾块）。返回 False = 收尾失败（已记日志）。
@@ -742,11 +891,19 @@ class _AsrManager:
             失败时**不抛**（除非判定 worker 整体坏了）—— 调用方继续下一段。
             """
             nonlocal epoch_count, epoch_errors, consecutive_errors, last_error
+            if self._cancel:
+                # 用户喊停 → 不再向**已停的**会话提交收尾调用（那必然抛
+                # 「generation stopped」）。不计入 epoch_errors：这不是
+                # worker 的错。
+                return False
             epoch_count += 1
             tail = feed.flush()
             try:
                 _absorb(await _submit(tail, final=True))
             except Exception as e:  # noqa: BLE001 — 单段失败不毁全场
+                if self._cancel:
+                    # 收尾正好撞上用户喊停 → 同上，不算 epoch 错误。
+                    return False
                 epoch_errors += 1
                 consecutive_errors += 1
                 last_error = e
@@ -799,6 +956,7 @@ class _AsrManager:
 
         for chunk in chunk_factory():
             if self._cancel:
+                cancelled = True
                 break
             if feed is None:
                 src_rate = int(chunk.sample_rate or CAPTURE_SAMPLE_RATE)
@@ -832,7 +990,18 @@ class _AsrManager:
             # （否则标记会一直挂着，等到后面某个跟停顿无关的位置才切）。
             chunk_paused = False
             for blk in feed.push(chunk.pcm):
-                await _submit(blk, final=False)
+                try:
+                    await _submit(blk, final=False)
+                except Exception:
+                    # ⚠️ 用户喊停 → 在飞的那次 RPC 被 session.stop() 打断
+                    # （「generation stopped」）。这是**预期内**的收尾，
+                    # 不是识别失败 → 跳出循环，把已识别的部分交回去。
+                    if not self._cancel:
+                        raise
+                    cancelled = True
+                    break
+                if cancelled:
+                    break
                 # **自适应停顿检测**（**只观察**）：这一块是不是「说话停顿」。
                 #
                 # 为什么要它：切会话的切口如果落在句子中间，新会话就是
@@ -863,6 +1032,9 @@ class _AsrManager:
             with self._lock:
                 if self._pause_hit:
                     chunk_paused = True
+            if cancelled:
+                # 用户喊停 → 这一块剩下的活（停顿检测 / 切会话）都不做了。
+                break
             epoch_sec += dur
             # 切会话的三个理由（按优先级）：
             #   silence —— 说话停顿（切在停顿处 → 新会话从句子开头开始）
@@ -900,6 +1072,8 @@ class _AsrManager:
             "language": languages[-1] if languages else "",
             "audio_sec": audio_sec,
             "segments": len(segments),
+            #: 用户喊停了没 —— 调用方据此决定是「完成」还是「已停止」。
+            "cancelled": cancelled,
             # 真实分段数（含空段）。``segments`` 只数「有正文」的段，
             # 纯静音段的收尾文本是空的 → 会被漏掉；回归脚本要判断
             # 「长音频确实被拆成了多个会话」得看这个。
@@ -948,6 +1122,9 @@ class _AsrManager:
             except (TypeError, ValueError):
                 pass
         with self._lock:
+            if self._drop_frames:
+                # 「清空」之后才到的迟到轮次 → 丢掉（否则清空不干净）。
+                return
             self._rounds.append(frame)
             lang = _valid_language(frame["language"])
             if lang:

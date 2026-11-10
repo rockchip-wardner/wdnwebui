@@ -410,10 +410,20 @@ async def post_asr_transcribe(
 
 
 @router.post("/stop")
-async def post_asr_stop() -> dict:
-    """立即停止正在跑的识别。"""
+async def post_asr_stop(
+    reason: str = Query("user", description=(
+        "谁喊的停：``user`` = 用户点了「停止」（画面也要停，字幕别再滚）；"
+        "``internal`` = 前端为了「拖动进度条 → 重开识别」而停"
+        "（画面**不能**停，用户正在看视频）。")),
+) -> dict:
+    """立即停止正在跑的识别。
+
+    ``reason`` —— 「谁喊的停」。后端看这两种动作**一模一样**（都是停掉
+    正在跑的识别），但对前端的含义相反：用户喊停 ⇒ 画面停；内部为了
+    重开识别而停 ⇒ 画面继续（字幕还要跟着播放头走）。⇒ 由调用方说。
+    """
     svc = get_asr_service()
-    svc.stop()
+    svc.stop(reason=reason)
     return {"ok": True, "snapshot": svc.snapshot()}
 
 
