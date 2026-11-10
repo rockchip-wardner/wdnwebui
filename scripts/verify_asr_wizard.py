@@ -350,6 +350,18 @@ def dom_transcript(page) -> str:
 #: 只要能**解码出画面**就行，不要求有音轨（带音轨的那些都是 100 MB+ 的
 #: 真实素材，回归里不该去拖它们）。
 def _pick_sample_mp4() -> str:
+    """uploads 目录里挑一个**小**的 mp4 当视频播放用例的样本。
+
+    ⚠️ **必须排除测试自己的临时文件**（``_asr_*``）—— 它们是各个用例
+    复制进去、用完删掉的**草稿**。板子重启 / 用例崩了就会留下残骸，
+    而本函数取的是「最小的 mp4」⇒ 残骸会**插队**成为样本。
+
+    实测踩过：重启后残留的 ``_asr_switch_test.mp4``（142 KB）比
+    ``rk-0.mp4``（1.07 MB）小 ⇒ 被挑中 ⇒ U12「视频能真正解码出画面」
+    红了（``videoWidth=0``），而样本其实换了另一个视频轨。
+
+    ⇒ 只认「用户自己的」素材（不以 ``_`` 开头）。
+    """
     try:
         from app.core.config import default_resource_root
         d = default_resource_root() / "uploads"
@@ -357,7 +369,9 @@ def _pick_sample_mp4() -> str:
         return ""
     try:
         cands = [p for p in d.glob("*.mp4")
-                 if p.is_file() and p.stat().st_size < 20 * 1024 * 1024]
+                 if p.is_file()
+                 and not p.name.startswith(("_", "."))
+                 and p.stat().st_size < 20 * 1024 * 1024]
     except OSError:
         return ""
     if not cands:
@@ -1121,8 +1135,20 @@ def verify_sources(page, shot_dir: Path) -> None:
     ======  ====================================================
     """
     print("\n=== 四种输入源（文件 / 视频 / 板载麦 / 浏览器麦）===")
+    # ⚠️ 「默认选中『音频文件』」必须在**干净状态**下验。
+    #
+    # 页面会**恢复**上一批次的来源（``_restoreFromServer`` → 按服务端的
+    # ``rounds_source.kind`` 切页签）—— 这是有意的行为（U19 有断言：
+    # 刷新后页签回到「含音轨的视频」）。而上一段（W7 视频向导）刚好留
+    # 下了 video 归属的轮次 ⇒ 不清干净的话，U1 量到的是「恢复」而不是
+    # 「默认」。
+    try:
+        api("POST", "/api/qwen3-asr/reset")
+    except Exception:  # noqa: BLE001 — 收尾失败不致命
+        pass
+    page.reload(wait_until="domcontentloaded")
     goto_card(page, APP)
-    page.wait_for_timeout(900)
+    page.wait_for_timeout(1200)
 
     # ---------------- U1 四个页签 ----------------
     tabs = page.eval_on_selector_all(
@@ -1358,8 +1384,8 @@ def verify_sources(page, shot_dir: Path) -> None:
         # U12：设备端路径 → 走媒体端点，且**真的能解码出画面**
         page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
         page.wait_for_timeout(400)
-        page.fill("#asr-path", sample)
-        page.dispatch_event("#asr-path", "input")
+        page.fill("#asr-source", sample)
+        page.dispatch_event("#asr-source", "input")
         try:
             page.wait_for_function(
                 """() => {
@@ -1419,8 +1445,8 @@ def verify_sources(page, shot_dir: Path) -> None:
             print("  [SKIP] 缺 /tmp/asr_ref/asr_real_audio.mp4（字幕同步用例跳过）")
         else:
             try:
-                page.fill("#asr-path", tmp)
-                page.dispatch_event("#asr-path", "input")
+                page.fill("#asr-source", tmp)
+                page.dispatch_event("#asr-source", "input")
                 page.wait_for_timeout(1500)
                 page.click("#asr-start-btn")
                 page.wait_for_timeout(7000)
@@ -1715,8 +1741,8 @@ def verify_sources(page, shot_dir: Path) -> None:
             try:
                 page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
                 page.wait_for_timeout(500)
-                page.fill("#asr-path", tmp_long)
-                page.dispatch_event("#asr-path", "input")
+                page.fill("#asr-source", tmp_long)
+                page.dispatch_event("#asr-source", "input")
                 page.wait_for_timeout(900)
                 page.click("#asr-start-btn")
                 try:
@@ -1990,8 +2016,8 @@ def verify_sources(page, shot_dir: Path) -> None:
                 # 1) 先用「音频文件」跑一遍
                 page.click('#asr-source-tabs .asr-source-tab[data-source=file]')
                 page.wait_for_timeout(400)
-                page.fill("#asr-path", wav)
-                page.dispatch_event("#asr-path", "input")
+                page.fill("#asr-source", wav)
+                page.dispatch_event("#asr-source", "input")
                 page.wait_for_timeout(600)
                 page.click("#asr-start-btn")
                 try:
@@ -2025,8 +2051,8 @@ def verify_sources(page, shot_dir: Path) -> None:
                 # ⚠️ 语义跟着字幕实现一起改了：现在是「YouTube 式节奏字幕」
                 # —— 画面上是**当前那几行**，不是「最终文本的前缀」。
                 # 所以要验的是「字幕里的每个词都出现在最终文本里」。
-                page.fill("#asr-path", tmp_mp4)
-                page.dispatch_event("#asr-path", "input")
+                page.fill("#asr-source", tmp_mp4)
+                page.dispatch_event("#asr-source", "input")
                 page.wait_for_timeout(800)
                 page.click("#asr-start-btn")
                 try:
@@ -2104,8 +2130,8 @@ def verify_reset(page, shot_dir: Path) -> None:
         page.select_option("#asr-mode", "single")
         page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
         page.wait_for_timeout(500)
-        page.fill("#asr-path", tmp_mp4)
-        page.dispatch_event("#asr-path", "input")
+        page.fill("#asr-source", tmp_mp4)
+        page.dispatch_event("#asr-source", "input")
         page.wait_for_timeout(900)
         page.click("#asr-start-btn")
 
@@ -2202,8 +2228,8 @@ def verify_seek(page, shot_dir: Path) -> None:
         page.select_option("#asr-mode", "single")
         page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
         page.wait_for_timeout(500)
-        page.fill("#asr-path", tmp_mp4)
-        page.dispatch_event("#asr-path", "input")
+        page.fill("#asr-source", tmp_mp4)
+        page.dispatch_event("#asr-source", "input")
         page.wait_for_timeout(900)
         page.click("#asr-start-btn")
 
@@ -2323,8 +2349,8 @@ def verify_stop(page, shot_dir: Path) -> None:
         page.select_option("#asr-mode", "single")
         page.click('#asr-source-tabs .asr-source-tab[data-source=video]')
         page.wait_for_timeout(500)
-        page.fill("#asr-path", tmp_mp4)
-        page.dispatch_event("#asr-path", "input")
+        page.fill("#asr-source", tmp_mp4)
+        page.dispatch_event("#asr-source", "input")
         page.wait_for_timeout(900)
         page.click("#asr-start-btn")
 
@@ -2497,7 +2523,7 @@ def verify_restore(page, shot_dir: Path) -> None:
                 trText: body ? (body.textContent || '').trim() : '',
                 rtText: rt ? (rt.textContent || '').trim() : '',
                 tab: tab ? tab.dataset.source : '',
-                path: (document.getElementById('asr-path') || {}).value || '',
+                path: (document.getElementById('asr-source') || {}).value || '',
             };
         }""")
 
@@ -2506,8 +2532,8 @@ def verify_restore(page, shot_dir: Path) -> None:
         page.select_option("#asr-mode", "single")
         page.click('#asr-source-tabs .asr-source-tab[data-source=file]')
         page.wait_for_timeout(400)
-        page.fill("#asr-path", WAV)
-        page.dispatch_event("#asr-path", "input")
+        page.fill("#asr-source", WAV)
+        page.dispatch_event("#asr-source", "input")
         page.wait_for_timeout(600)
         page.click("#asr-start-btn")
         try:
@@ -2567,8 +2593,8 @@ def verify_restore(page, shot_dir: Path) -> None:
             print("  [SKIP] 缺 /tmp/asr_ref/asr_real_audio.mp4"
                   "（U19 视频段跳过）")
             return
-        page.fill("#asr-path", tmp_mp4)
-        page.dispatch_event("#asr-path", "input")
+        page.fill("#asr-source", tmp_mp4)
+        page.dispatch_event("#asr-source", "input")
         page.wait_for_timeout(800)
         page.click("#asr-start-btn")
         try:
@@ -2629,6 +2655,411 @@ def verify_restore(page, shot_dir: Path) -> None:
     finally:
         try:
             os.remove(tmp_mp4)
+        except OSError:
+            pass
+
+
+def verify_wizard_preview(page, shot_dir: Path) -> None:
+    """U23：向导「音频源」步 —— 硬件能力三行 ✓ + 预览播放。
+
+    用户诉求（2026-11-10）：
+
+    1. 环境检查步的**硬件能力**要有 ``✓ hwcap_video_input`` /
+       ``✓ hwcap_audio_input`` / ``✓ hwcap_audio_output`` 三个；
+    2. 「音频源」步要有**视频源步同款**的逻辑（浏览 / 预览 / 关闭 /
+       拖放上传区），但**不要** gscore 那部分 UI 与逻辑；
+    3. 音频文件**或**含音轨的视频，都能在**向导界面**里预览播放。
+
+    ⚠️ 预览素材必须落在**媒体端点放行的目录**里（``<assets>/uploads`` /
+    ``<assets>/tts``）—— ``/api/qwen3-asr/media`` 只放行这两个根，别的
+    路径一律拒（那个端点没有鉴权）。所以这里把本地的参考素材**复制**
+    一份进去用完再删。
+    """
+    print("\n--- U23 向导「音频源」步：硬件能力 + 预览播放 ---")
+    uploads = Path("/userdata/assets/uploads")
+    wav_in = uploads / "u23_preview.wav"
+    mp4_in = uploads / "u23_preview.mp4"
+    try:
+        uploads.mkdir(parents=True, exist_ok=True)
+        shutil.copy(WAV, wav_in)
+        shutil.copy(MP4, mp4_in)
+    except OSError as e:
+        print(f"  （跳过 U23：素材准备失败 {e}）")
+        return
+
+    try:
+        open_wizard(page)
+
+        # ---------------- 1) 环境检查步：硬件能力 ----------------
+        hw = page.eval_on_selector_all(
+            f"#{NS}root-{APP} .{NS}env-row",
+            """els => els.map(e => ({
+                text: e.textContent.trim(),
+                ok: e.classList.contains('env-ok'),
+            }))""")
+        print("  env 行: " + " | ".join(r["text"] for r in hw))
+        for cap in ("hwcap_video_input", "hwcap_audio_input", "hwcap_audio_output"):
+            row = next((r for r in hw if cap in r["text"]), None)
+            check(f"U23 硬件能力列出 {cap}", row is not None,
+                  f"rows={[r['text'] for r in hw]}")
+            check(f"U23 {cap} 带 ✓", bool(row) and row["text"].startswith("✓"),
+                  f"text={row['text'] if row else None}")
+
+        # ---------------- 2) 音频源步：源字段那套控件 ----------------
+        click_next(page)
+        check("U23 步骤标题是「音频源」", step_title(page) == "音频源",
+              step_title(page))
+        src_btns = page.eval_on_selector_all(
+            f"#{NS}root-{APP} .{NS}source-action-btn",
+            "els => els.map(e => e.textContent.trim())")
+        labels = " ".join(field_labels(page))
+        print("  源按钮: " + ", ".join(src_btns))
+        check("U23 有「预览播放」按钮", any("预览" in b for b in src_btns),
+              f"src_btns={src_btns}")
+        check("U23 有「关闭」按钮", any("关闭" in b for b in src_btns),
+              f"src_btns={src_btns}")
+        check("U23 有拖放上传区",
+              page.locator(f"#{NS}root-{APP} .{NS}drop-zone").count() > 0)
+        # gscore 那部分**不要**（判帧算法 / 阈值 / 帧间隔）
+        check("U23 没有 gscore / 判帧 / 阈值 / 帧间隔字段",
+              not any(k in labels for k in ("gscore", "判帧", "阈值", "帧间隔")),
+              f"labels={labels}")
+        page.screenshot(path=str(shot_dir / "u23_source.png"))
+
+        # ---------------- 3) 预览播放 ----------------
+        def _preview(path: str, tag: str, want_tag: str) -> None:
+            set_field(page, "asr-source", path)
+            page.click(f"#{NS}root-{APP} #{NS}source-open-asr-source")
+            page.wait_for_timeout(2200)
+            info = page.evaluate(f"""() => {{
+                const root = document.getElementById('{NS}root-{APP}');
+                const wrap = document.getElementById('asr-preview-wrap');
+                const v = document.getElementById('asr-preview-video');
+                const a = document.getElementById('asr-preview-audio');
+                let el = null;
+                if (v && !v.classList.contains('hidden')) el = v;
+                else if (a && !a.classList.contains('hidden')) el = a;
+                // 居中判定：播放器的几何中心 vs 所在容器（.asr-preview-wrap）
+                const rect = (n) => n ? (() => {{
+                    const b = n.getBoundingClientRect();
+                    return {{l: b.left, r: b.right, w: b.width,
+                             cx: (b.left + b.right) / 2}};
+                }})() : null;
+                const elRect = rect(el);
+                const wrapRect = rect(wrap);
+                return {{
+                    inWizard: !!(wrap && root.contains(wrap)),
+                    tag: el ? el.tagName : null,
+                    src: el ? (el.getAttribute('src') || '') : '',
+                    t: el ? el.currentTime : null,
+                    paused: el ? el.paused : null,
+                    ready: el ? el.readyState : null,
+                    err: el && el.error ? el.error.code : null,
+                    elRect: elRect,
+                    wrapRect: wrapRect,
+                    centerDev: (elRect && wrapRect)
+                        ? Math.abs(elRect.cx - wrapRect.cx) : null,
+                }};
+            }}""")
+            print(f"  [{tag}] {info}")
+            check(f"U23 {tag} 预览器被搬进向导面板", info["inWizard"],
+                  f"info={info}")
+            check(f"U23 {tag} 用 {want_tag} 元素播", info["tag"] == want_tag,
+                  f"info={info}")
+            check(f"U23 {tag} 媒体走 /media 端点",
+                  "/api/qwen3-asr/media?path=" in (info["src"] or ""),
+                  f"src={info['src']}")
+            check(f"U23 {tag} 真的在播（播放头在走、没暂停）",
+                  bool(info["t"]) and info["t"] > 0 and info["paused"] is False,
+                  f"info={info}")
+            check(f"U23 {tag} 媒体没有解码错误", info["err"] is None,
+                  f"err={info['err']}")
+            # 居中（用户要求：之前是左对齐）。
+            # 播放器 ``max-width:720px`` 到顶后，块级元素默认贴左边 ⇒
+            # 必须 ``margin: 0 auto``。判据：几何中心偏差 ≤ 2px。
+            check(f"U23 {tag} 预览播放器在向导画布里**居中**",
+                  info["centerDev"] is not None
+                  and info["centerDev"] <= 2.0,
+                  f"dev={info['centerDev']} el={info['elRect']} "
+                  f"wrap={info['wrapRect']}")
+            page.screenshot(path=str(shot_dir / f"u23_preview_{tag}.png"))
+
+        _preview(str(wav_in), "音频", "AUDIO")
+        _preview(str(mp4_in), "视频", "VIDEO")
+
+        # ---------------- 3b) 换源预览 ⇒ 上一个必须**停掉** ----------------
+        # 症状（用户实测）：先预览视频、再预览音频 ⇒ **上一次的视频还在
+        # 放声音**，两个叠着放。
+        # 根因：``display:none`` **不会**让浏览器暂停媒体（播放与可见性
+        # 无关）⇒ 只藏不停，播放头照走。
+        print("--- 换源预览：上一个必须停 ---")
+        set_field(page, "asr-source", str(mp4_in))
+        page.click(f"#{NS}root-{APP} #{NS}source-open-asr-source")
+        page.wait_for_timeout(1500)
+        set_field(page, "asr-source", str(wav_in))
+        page.click(f"#{NS}root-{APP} #{NS}source-open-asr-source")
+        page.wait_for_timeout(1800)
+        sw = page.evaluate("""() => {
+            const v = document.getElementById('asr-preview-video');
+            const a = document.getElementById('asr-preview-audio');
+            return {
+                vPaused: v ? v.paused : null,
+                vT: v ? v.currentTime : null,
+                vSrc: v ? (v.getAttribute('src') || '') : null,
+                aPaused: a ? a.paused : null,
+                aT: a ? a.currentTime : null,
+            };
+        }""")
+        print("  换源后:", sw)
+        check("U23 换源后上一个播放器停住了（不叠音）",
+              sw["vPaused"] is True, f"sw={sw}")
+        check("U23 换源后上一个播放器的源被清掉",
+              not (sw["vSrc"] or ""), f"sw={sw}")
+        check("U23 换源后播放头归零", (sw["vT"] or 0) == 0, f"sw={sw}")
+        check("U23 换源后新播放器在播",
+              sw["aPaused"] is False and (sw["aT"] or 0) > 0, f"sw={sw}")
+        page.screenshot(path=str(shot_dir / "u23_switch.png"))
+
+        # ---------------- 4) 「关闭」→ 停播 + 搬回卡片页 ----------------
+        page.click(f"#{NS}root-{APP} .{NS}source-action-btn:not(.{NS}source-open-btn)")
+        page.wait_for_timeout(800)
+        closed = page.evaluate(f"""() => {{
+            const root = document.getElementById('{NS}root-{APP}');
+            const wrap = document.getElementById('asr-preview-wrap');
+            const v = document.getElementById('asr-preview-video');
+            const a = document.getElementById('asr-preview-audio');
+            return {{
+                inWizard: !!(wrap && root.contains(wrap)),
+                videoPaused: v ? v.paused : null,
+                audioPaused: a ? a.paused : null,
+                audioSrc: a ? (a.getAttribute('src') || '') : null,
+            }};
+        }}""")
+        print("  关闭后:", closed)
+        check("U23 关闭后预览器被搬回卡片页", not closed["inWizard"],
+              f"closed={closed}")
+        check("U23 关闭后预览停住了（不会在后台继续放声音）",
+              closed["videoPaused"] is not False and closed["audioPaused"] is not False,
+              f"closed={closed}")
+        check("U23 关闭后预览源被清掉", not (closed["audioSrc"] or ""),
+              f"closed={closed}")
+    finally:
+        for pth in (wav_in, mp4_in):
+            try:
+                os.remove(pth)
+            except OSError:
+                pass
+
+
+def verify_wizard_video_source(page, shot_dir: Path) -> None:
+    """U24：向导里选**含音轨的视频** → 完成配置 → 功能页必须切成视频来源。
+
+    用户实测 bug（2026-11-10）：
+
+    * 向导「音频源」步选了一个 .mp4（带音轨）；
+    * 点「完成配置」进功能页 ⇒ **页签还停在「音频文件」**，视频**也不播**。
+
+    根因：向导里**没有**「输入来源」页签（那是功能页的东西）⇒
+    ``applyWizardSnapshot`` 回填路径后从没设置过 ``_source`` ⇒
+    ``_syncVideoPlayer()`` / ``_playVideoIfAny()`` 都以
+    ``_source === "video"`` 为前提 ⇒ 播放器不出现、视频不播；
+    同时后端 ``_source_kind`` 按后缀判成 "video" ⇒ **前后端口径不一致**。
+
+    修法：``applyWizardSnapshot`` 按路径后缀推断来源类型并切页签
+    （``_applyKindFromPath``），与后端 ``_source_kind`` 同口径。
+    """
+    print("\n--- U24 向导选视频 → 完成配置 → 功能页是视频来源 ---")
+    uploads = Path("/userdata/assets/uploads")
+    mp4_in = uploads / "u24_source.mp4"
+    try:
+        uploads.mkdir(parents=True, exist_ok=True)
+        shutil.copy(MP4, mp4_in)
+    except OSError as e:
+        print(f"  （跳过 U24：素材准备失败 {e}）")
+        return
+
+    try:
+        open_wizard(page)
+        click_next(page)               # env → source
+        print("  步骤:", step_title(page))
+        set_field(page, "asr-source", str(mp4_in))
+        click_next(page)               # source → finish
+        page.wait_for_selector(f"#{NS}root-{APP} #{NS}finish-btn", timeout=10000)
+        print("  步骤:", step_title(page))
+
+        page.click(f"#{NS}root-{APP} #{NS}finish-btn")
+        # 等这一次识别真的跑完（后端一次只能跑一个识别）。
+        wait_run_done(0, timeout=180)
+        page.wait_for_timeout(2500)
+
+        st = page.evaluate("""() => {
+            const tab = document.querySelector(
+                '#asr-source-tabs .asr-source-tab.is-active');
+            const wrap = document.getElementById('asr-video-wrap');
+            const vid = document.getElementById('asr-video');
+            const b = vid ? vid.getBoundingClientRect() : null;
+            const A = window.Qwen3Asr || {};
+            return {
+                tab: tab ? tab.dataset.source : null,
+                wrapHidden: wrap ? wrap.classList.contains('hidden') : null,
+                src: vid ? (vid.getAttribute('src') || '') : null,
+                paused: vid ? vid.paused : null,
+                t: vid ? vid.currentTime : null,
+                err: vid && vid.error ? vid.error.code : null,
+                w: b ? b.width : null,
+                h: b ? b.height : null,
+                source: A._source || null,
+                roundsSource: A._roundsSource || null,
+            };
+        }""")
+        print("  完成配置后:", st)
+        page.screenshot(path=str(shot_dir / "u24_after_finish.png"))
+
+        check("U24 来源页签是「含音轨的视频」", st["tab"] == "video",
+              f"tab={st['tab']!r}")
+        check("U24 卡片内部来源状态是 video", st["source"] == "video",
+              f"source={st['source']!r}")
+        check("U24 批次归属是 video（与后端同口径）",
+              st["roundsSource"] == "video",
+              f"roundsSource={st['roundsSource']!r}")
+        check("U24 视频播放器容器可见（没被藏）",
+              st["wrapHidden"] is False, f"hidden={st['wrapHidden']}")
+        check("U24 播放器 src 指向 /media 端点",
+              "/api/qwen3-asr/media?path=" in (st["src"] or ""),
+              f"src={st['src']}")
+        check("U24 视频真的在播（播放头在走、没暂停）",
+              st["paused"] is False and (st["t"] or 0) > 0,
+              f"paused={st['paused']} t={st['t']}")
+        check("U24 视频没有解码错误", st["err"] is None, f"err={st['err']}")
+        check("U24 视频有实际尺寸",
+              (st["w"] or 0) > 0 and (st["h"] or 0) > 0,
+              f"w={st['w']} h={st['h']}")
+    finally:
+        release_npu()
+        try:
+            os.remove(mp4_in)
+        except OSError:
+            pass
+
+
+def verify_leave_stops(page, shot_dir: Path) -> None:
+    """U25：识别在跑时**离开这张卡** ⇒ 识别必须停（否则 NPU 一直被占）。
+
+    用户诉求（2026-11-10）：
+
+    「流式语音识别」从功能界面正在识别的时候，切到向导模式，或者返回首页，
+    或者切到其它界面，识别应该停止才合理，要不推理一直会占用。
+
+    三个场景（都从**功能界面**出发）：
+
+    ======  ======================================================
+    U25-A   点「向导模式」⇒ 识别停
+    U25-B   点「返回首页」⇒ 识别停
+    U25-C   切到另一张卡（hash 变化）⇒ 识别停
+    ======  ======================================================
+
+    ⚠️ **A 之前是坏的**：「向导模式」按钮只调 ``enterWizardMode()``，
+    没有任何停止逻辑 ⇒ 识别继续跑 ⇒ ① NPU 一直被占；② 向导走完要
+    ``applyWizardSnapshot`` → **发起新的识别**，而后端「一次只能跑一个
+    识别」⇒ 新请求直接 409「上一条识别还在进行中」。
+
+    B / C 走框架的 DemoGuard（hashchange → ``stopSync`` → sendBeacon；
+    「返回首页」→ ``stopAndClear``），本来就工作 —— 一并守住，防止回归。
+    """
+    print("\n--- U25 识别在跑时离开这张卡 ⇒ 必须停 ---")
+    uploads = Path("/userdata/assets/uploads")
+    mp4_in = uploads / "u25_leave.mp4"
+    long_mp4 = Path("/tmp/asr_ref/asr_long_90s.mp4")
+    try:
+        uploads.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(str(long_mp4), mp4_in)
+    except OSError as e:
+        print(f"  （跳过 U25：素材准备失败 {e}）")
+        return
+
+    try:
+        # 把向导标成「已完成」+ 卸载 ⇒ 卡片功能页直接可见（能点按钮）
+        page.evaluate("""(id) => {
+            localStorage.setItem('wdnwebui.wizard.' + id + '.completed', '1');
+            if (window.WizardState) window.WizardState.unmount();
+        }""", APP)
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_function("() => !!window.Qwen3Asr", timeout=20000)
+        goto_card(page, APP)
+        page.wait_for_timeout(1200)
+
+        stops: list = []
+        page.on("request", lambda r: stops.append(r.url)
+                if "/qwen3-asr/stop" in r.url else None)
+
+        def _start() -> bool:
+            """点「开始识别」并等它真的跑起来（后端 busy=true）。"""
+            stops.clear()
+            page.fill("#asr-source", str(mp4_in))
+            page.dispatch_event("#asr-source", "input")
+            page.wait_for_timeout(600)
+            page.click("#asr-start-btn")
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if (api_state().get("busy")):
+                    return True
+                time.sleep(0.4)
+            return False
+
+        def _stopped() -> tuple:
+            """动作之后等 3.5 s，看后端还跑不跑。"""
+            time.sleep(3.5)
+            s = api_state()
+            return bool(s.get("busy")), (s.get("state") or "")
+
+        def _back_to_card() -> None:
+            """回卡片功能页（向导若挂着要先卸）。"""
+            page.evaluate("""(id) => {
+                localStorage.setItem('wdnwebui.wizard.' + id + '.completed', '1');
+                if (window.WizardState) window.WizardState.unmount();
+            }""", APP)
+            page.wait_for_timeout(500)
+            goto_card(page, APP)
+            page.wait_for_timeout(900)
+
+        # ---------------- A) 点「向导模式」 ----------------
+        started = _start()
+        print(f"  A 已启动: {started}")
+        page.click("[data-wizard-mode][data-page-id='%s']" % APP)
+        page.wait_for_timeout(1200)
+        busy, state = _stopped()
+        print(f"  A 后端 busy={busy} state={state!r} stop={stops}")
+        check("U25-A 点「向导模式」⇒ 识别停了（释放算力）",
+              started and not busy, f"busy={busy} state={state!r}")
+        check("U25-A 页面确实发了停止请求",
+              any("/qwen3-asr/stop" in u for u in stops), f"stops={stops}")
+        page.screenshot(path=str(shot_dir / "u25_a_wizard_mode.png"))
+
+        # ---------------- B) 点「返回首页」 ----------------
+        _back_to_card()
+        started = _start()
+        print(f"  B 已启动: {started}")
+        page.click("#page-%s .back-home-btn" % APP)
+        page.wait_for_timeout(1200)
+        busy, state = _stopped()
+        print(f"  B 后端 busy={busy} state={state!r} stop={stops}")
+        check("U25-B 点「返回首页」⇒ 识别停了（释放算力）",
+              started and not busy, f"busy={busy} state={state!r}")
+
+        # ---------------- C) 切到另一张卡 ----------------
+        _back_to_card()
+        started = _start()
+        print(f"  C 已启动: {started}")
+        page.evaluate("() => { window.location.hash = '#text-chat'; }")
+        page.wait_for_timeout(1200)
+        busy, state = _stopped()
+        print(f"  C 后端 busy={busy} state={state!r} stop={stops}")
+        check("U25-C 切到其它卡 ⇒ 识别停了（释放算力）",
+              started and not busy, f"busy={busy} state={state!r}")
+    finally:
+        release_npu()
+        try:
+            os.remove(mp4_in)
         except OSError:
             pass
 
@@ -2746,6 +3177,22 @@ def main() -> int:
         check("W1 env 步渲染出能力行", len(rows) > 0, f"rows={rows}")
         check("W1 列出 swcap_audio_asr 能力",
               any("swcap_audio_asr" in r for r in rows), f"rows={rows}")
+        # W1b：**硬件能力**三行（用户点名要的）—— manifest 声明的
+        # hwcap_* 在 env 步逐行列出，各带一个 ✓。
+        hw_rows = page.eval_on_selector_all(
+            f"#{NS}root-{APP} .{NS}env-row",
+            """els => els.map(e => ({
+                text: e.textContent.trim(),
+                ok: e.classList.contains('env-ok') ||
+                    e.classList.contains('wd-wizard-env-ok'),
+            }))""")
+        for cap in ("hwcap_video_input", "hwcap_audio_input", "hwcap_audio_output"):
+            row = next((r for r in hw_rows if cap in r["text"]), None)
+            check(f"W1b 硬件能力列出 {cap}", row is not None,
+                  f"rows={[r['text'] for r in hw_rows]}")
+            check(f"W1b {cap} 是 ✓（不是 ✗）",
+                  bool(row) and row["text"].startswith("✓"),
+                  f"text={row['text'] if row else None}")
         page.screenshot(path=str(shot_dir / "1_env.png"))
 
         # ---------------- 第 2 步：音频源 ----------------
@@ -2755,18 +3202,40 @@ def main() -> int:
               step_title(page))
         ids = field_ids(page)
         print("  字段: " + ", ".join(ids))
-        check("W2 有音频源字段", "asr-audio" in ids, f"ids={ids}")
+        check("W2 有音频源字段", "asr-source" in ids, f"ids={ids}")
         check("W2 有显示模式字段", "asr-mode" in ids, f"ids={ids}")
-        # 三个控件：文本框 + 浏览… + 上传…
+        # 控件：文本框 + 浏览… + （上传走**拖放区**，见下面 W2b）
         has_text = page.locator(
-            f'#{NS}root-{APP} [data-field-id="asr-audio"]').count() > 0
+            f'#{NS}root-{APP} [data-field-id="asr-source"]').count() > 0
         btns = page.eval_on_selector_all(
             f"#{NS}root-{APP} .{NS}browse-btn",
             "els => els.map(e => e.textContent.trim())")
         print("  按钮: " + ", ".join(btns))
         check("W2 音频源是文本框（设备端路径）", has_text, f"ids={ids}")
         check("W2 有「浏览…」按钮", any("浏览" in b for b in btns), f"btns={btns}")
-        check("W2 有「上传…」按钮", any("上传" in b for b in btns), f"btns={btns}")
+        # W2b：**源字段**那一套（浏览 / 预览播放 / 关闭 / 拖放上传区）——
+        # 音频源步现在走的是视频卡同款的「源字段」路径。
+        src_btns = page.eval_on_selector_all(
+            f"#{NS}root-{APP} .{NS}source-action-btn",
+            "els => els.map(e => e.textContent.trim())")
+        drop_zone = page.locator(
+            f"#{NS}root-{APP} .{NS}drop-zone").count() > 0
+        drop_hint = page.eval_on_selector(
+            f"#{NS}root-{APP} .{NS}drop-hint", "e => e.textContent.trim()")
+        print("  源按钮: " + ", ".join(src_btns) + f" | 拖放区={drop_zone}")
+        check("W2b 有「预览播放」按钮（源字段路径生效）",
+              any("预览" in b for b in src_btns), f"src_btns={src_btns}")
+        check("W2b 有「关闭」按钮", any("关闭" in b for b in src_btns),
+              f"src_btns={src_btns}")
+        check("W2b 有拖放上传区（上传入口从「上传…」按钮换成拖放区）",
+              drop_zone, f"drop_zone={drop_zone}")
+        check("W2b 拖放区文案说的是音频/视频（不是「本地视频」）",
+              "音频" in drop_hint and "视频" in drop_hint, f"hint={drop_hint!r}")
+        # 板端**没有 emoji 字体** ⇒ 拖放区图标不能是 emoji（会渲染成豆腐块）
+        drop_icon = page.eval_on_selector(
+            f"#{NS}root-{APP} .{NS}drop-icon", "e => e.innerHTML.trim()")
+        check("W2b 拖放区图标不是 emoji（板端会渲染成豆腐块）",
+              "<svg" in drop_icon.lower(), f"icon={drop_icon[:60]!r}")
         # 显示模式的下拉选项
         opts = page.eval_on_selector_all(
             f'#{NS}root-{APP} [data-field-id="asr-mode"] option',
@@ -2795,7 +3264,7 @@ def main() -> int:
         # **没有「识别参数」步** —— 分块长度 / token 上限 / 回退策略
         # 等于 C++ demo 的 ONLINE_* 常量，属于内部契约，不暴露给用户。
         print("\n=== 第 3 步：完成配置 → 发起识别 ===")
-        set_field(page, "asr-audio", WAV)
+        set_field(page, "asr-source", WAV)
         click_next(page)
         check("W5 步骤标题是「完成配置」", step_title(page) == "完成配置",
               step_title(page))
@@ -2883,7 +3352,7 @@ def main() -> int:
             page.wait_for_timeout(500)
             open_wizard(page)
             click_next(page)          # env → source
-            set_field(page, "asr-audio", MP4)
+            set_field(page, "asr-source", MP4)
             click_next(page)          # source → finish（3 步流程，没有识别参数步）
             page.wait_for_selector(f"#{NS}root-{APP} #{NS}finish-btn", timeout=10000)
             vreq = api_state().get("current_request_id") or 0
@@ -2950,6 +3419,15 @@ def main() -> int:
 
         # ---------------- 「清空」→ 真清干净 ----------------
         verify_reset(page, shot_dir)
+
+        # ---------------- 向导「音频源」步：硬件能力 + 预览播放 ----------------
+        verify_wizard_preview(page, shot_dir)
+
+        # ---------------- 向导选视频 → 完成配置 → 功能页是视频来源 ----------------
+        verify_wizard_video_source(page, shot_dir)
+
+        # ---------------- 识别在跑时离开这张卡 ⇒ 必须停 ----------------
+        verify_leave_stops(page, shot_dir)
 
         check("页面没有 JS 报错", not errors, f"errors={errors[:3]}")
         browser.close()

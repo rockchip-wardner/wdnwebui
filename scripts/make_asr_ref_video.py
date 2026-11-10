@@ -32,6 +32,19 @@
     .venv/bin/python scripts/make_asr_ref_video.py     # 视频素材
 
 跑法：``.venv/bin/python scripts/make_asr_ref_video.py``
+
+⚠️ **视频轨必须用 H.264（libx264），不能用 MPEG-4 Part 2**
+------------------------------------------------------
+早期版本用 ``out.add_stream("mpeg4", ...)`` —— 那是 **MPEG-4 Part 2**，
+**Chromium 早就不支持了**（Chrome 只解 H.264 / VP8 / VP9 / AV1）。
+
+症状很隐蔽：音频轨正常（AAC 解得出来、时长也对、识别没问题），但**视频轨
+解不出来** ⇒ 浏览器里 ``videoWidth === 0``（``readyState`` 却是 4）⇒
+「设备端视频能真正解码出画面」那条断言红，而识别/字幕全都正常 ⇒ 看起来
+像产品 bug，其实是**素材编码格式不对**。
+
+⇒ 板端 Chromium 能解 H.264（用户素材 ``rk-0.mp4`` 就是 H.264，实测
+704×576 解得好好的）⇒ 这里改用 ``libx264``。
 """
 from __future__ import annotations
 
@@ -91,10 +104,15 @@ def build(src: Path, dst: Path) -> int:
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     out = av.open(str(dst), mode="w")
-    vstream = out.add_stream("mpeg4", rate=FPS)
+    # ⚠️ **libx264（H.264）**，不是 ``mpeg4``（MPEG-4 Part 2）——
+    # Chromium 不解后者（见文件头的说明）。
+    vstream = out.add_stream("libx264", rate=FPS)
     vstream.width = WIDTH
     vstream.height = HEIGHT
     vstream.pix_fmt = "yuv420p"
+    vstream.options = {"crf": "28", "preset": "veryfast", "tune": "zerolatency"}
+    # 帧率 1 fps（1 秒音频配 1 帧黑画面）⇒ 帧的 pts 就是「第几秒」。
+    vstream.time_base = Fraction(1, 1)
     astream = out.add_stream("aac", rate=rate)
     astream.layout = "mono"
 
@@ -112,7 +130,7 @@ def build(src: Path, dst: Path) -> int:
         for pkt in astream.encode(af):
             out.mux(pkt)
         frame.pts = i // step
-        frame.time_base = Fraction(1, FPS)
+        frame.time_base = Fraction(1, 1)
         for pkt in vstream.encode(frame):
             out.mux(pkt)
     for pkt in astream.encode(None):
