@@ -15,16 +15,16 @@
         </div>
 
         <div class="imb-card">
-          <div class="imb-card-head">
-            <div class="imb-card-head-title">
-              <h3>识别</h3>
-              <span class="imb-status" id="asr-state-badge" data-state="idle">空闲</span>
-            </div>
-            <span class="vd-spacer"></span>
-            <span class="imb-meta-inline" id="asr-language"></span>
-            <button class="vd-btn vd-btn-mini" id="asr-reset-btn">清空</button>
-          </div>
+          <!--
+            这里原来有一条「识别」卡头（灰底、只有两个字）。
 
+            删掉它 —— 单独一条只有标题的栏**突兀**：页面头部已经有「流式
+            语音识别」这个卡名了，卡内再挂一条同名标题是重复；而且它夹
+            在「输入来源」上方，把用户第一眼该看的东西（选来源）往下挤。
+
+            状态徽标 + 语种已经挪到**结果文本栏正上方**（「清空」左边），
+            运行状态也没地方丢。
+          -->
           <div class="imb-card-body">
             <!--
               输入来源：四种（音频文件 / 含音轨的视频 / 板载麦克风 / 浏览器麦克风）。
@@ -141,6 +141,15 @@
               </section>
             </section>
 
+            <!--
+              提示语（动态：空闲 / 识别中 / 已停止…）挪到操作行**上方**
+              —— 读法是「提示 → 操作 → 结果」。这样下面的状态/按钮行就
+              **紧贴**识别结果文本栏，中间不再夹一行字。
+            -->
+            <div class="asr-hint" id="asr-hint">
+              选择音频来源后点「开始识别」。模型按 1 秒一块增量解码，输出实时刷新。
+            </div>
+
             <!-- 运行控制 -->
             <div class="asr-controls">
               <label class="asr-file-label" for="asr-mode">显示模式</label>
@@ -150,12 +159,26 @@
               </select>
 
               <span class="vd-spacer"></span>
+
+              <!--
+                状态组：徽标 + 语种。
+
+                它原来在**卡片头右上角** —— 离结果文本框隔着大半个卡片，
+                用户盯着下面那段文字时看不到 ⇒ 挪到**结果文本栏正上方**、
+                且排在「清空」按钮**左边**：状态描述的就是下面这块内容，
+                挨着才直观。
+
+                三个动作仍然**一组**、顺序不变（清空 → 停止 → 开始识别），
+                「清空」依然紧挨着「停止」。
+              -->
+              <span class="asr-status-group">
+                <span class="imb-status" id="asr-state-badge" data-state="idle">空闲</span>
+                <span class="imb-meta-inline" id="asr-language"></span>
+              </span>
+
+              <button class="vd-btn" id="asr-reset-btn">清空</button>
               <button class="vd-btn" id="asr-stop-btn" disabled>停止</button>
               <button class="vd-btn vd-btn-primary" id="asr-start-btn" disabled>开始识别</button>
-            </div>
-
-            <div class="asr-hint" id="asr-hint">
-              选择音频来源后点「开始识别」。模型按 1 秒一块增量解码，输出实时刷新。
             </div>
 
             <!--

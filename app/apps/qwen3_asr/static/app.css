@@ -14,6 +14,19 @@
   padding: 4px 0 10px;
 }
 
+/* ---- 状态组（徽标 + 语种）----
+   它描述的是**下面**那块识别结果文本栏，所以被放在结果栏正上方、
+   「清空」按钮左边。组内两条元素挨在一起，跟右边的按钮组之间用
+   一条竖线分开 —— 免得「识别中」看着像是在给「清空」按钮做说明。 */
+.asr-status-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 4px;
+  border-right: 1px solid var(--border, #e5e7eb);
+  white-space: nowrap;
+}
+
 /* ---- 来源区（本机上传 / 设备端路径）---- */
 .asr-block {
   border: 1px solid var(--border, #e5e7eb);
@@ -403,6 +416,20 @@
 #page-qwen3-asr .imb-card {
   height: auto;
   min-height: calc(100vh - 220px);
+
+  /* 「识别」那条卡头删掉后，外层这圈边框 + 白底就只剩「包住」输入来源
+     那个框 ⇒ **框套框**，比原来那栏还突兀。
+     ⇒ 这张卡的外层容器**不画框**：框由里面的块（输入来源 / 结果框 /
+     逐轮明细）自己带。 */
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+/* 外层不画框了 ⇒ body 也不该再缩 16px，否则里面的块会比页面标题
+   （「流式语音识别」）往里缩一截，看着没对齐。 */
+#page-qwen3-asr .imb-card-body {
+  padding: 0;
 }
 
 /* 允许 body 收缩（配合上面的 height: auto），否则 min-content 仍会顶破 */
