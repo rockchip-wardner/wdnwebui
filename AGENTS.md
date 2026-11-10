@@ -10394,3 +10394,314 @@ v0.38 之后，卡头只剩「识别」两个字（状态徽标和语种已经�
   「逐轮明细压住完整 JSON」（W8）的，跟卡头无关。
 * 只影响 `#page-qwen3-asr` 作用域，**framework.css 一行没动**
   （`.imb-card` / `.imb-card-head` 是其它卡共用的）。
+
+## Qwen3-ASR 卡：向导「音频源」步 —— 硬件能力 + 视频源式预览（v0.40）
+
+### 用户诉求（三条）
+
+1. 「流式语音识别快速配置」里，**硬件能力**要有 `✓ hwcap_video_input`、
+   `✓ hwcap_audio_input`、`✓ hwcap_audio_output` 这三个；
+2. 「音频源」步增加**类似「视频实时深度估计」卡「视频源」步**的逻辑，
+   但**不要** gscore 那部分 UI 与逻辑；
+3. **音频文件**或**含音轨的视频文件**都要能在**向导界面**里预览播放。
+
+### 1. 硬件能力：只改 manifest
+
+`manifest.json` 的 `hardware_capabilities` 加三个 → 框架 env 步的
+「硬件能力」卡按 `app.hardware_capabilities` **逐行列出**
+（`state.js::_renderEnvStep`）。`hwMissing` 恒为空 ⇒ 每行都带 `✓`。
+
+> ⚠️ 这是**声明式**的：框架不强求板子真有这些硬件（`state.js` 注释：
+> 「严格 HW 探测留给具体应用在 applyWizardSnapshot 内 assert」）。
+> 与 `video_detection` 卡声明的是同一组。
+
+### 2. 「音频源」改走**源字段**路径
+
+框架判定源字段：`state.js::_isSourceFieldId(id)` = `/-sources?$/`
+⇒ **字段 id 必须以 `-source` / `-sources` 结尾**。
+⇒ wizard.json 的字段 id 从 `asr-audio` 改成 `asr-source`。
+
+两条路径**互斥**（`state.js::_renderFormStep`）：
+
+| 路径 | 触发条件 | 控件 |
+|---|---|---|
+| 通用文件字段 | `field.browse \|\| field.upload` | 浏览… + 上传… |
+| **源字段** | id 匹配 `-source(s)` | 浏览… + **预览播放 / 关闭** + **拖放上传区** + **画面搬进向导** |
+
+⇒ 音频源步现在跟视频源步同款。
+
+#### ⚠️ 源字段 id 必须与**应用页元素同名**
+
+框架点「预览播放」时执行：
+
+```js
+const srcEl = document.getElementById(field.id);   // ← field.id
+if (srcEl) srcEl.value = el.value || "";
+```
+
+向导自己的 input **没有 `id`**（只有 `data-field-id`）⇒ 这个 id 命中的是
+**应用页**的元素。⇒ 应用页的 `#asr-path` 改名成 `#asr-source`
+（app.js 5 处 + 回归脚本 21 处）。
+
+> 同一条链路还藏着第二个坑：框架写值**不派发 `input` 事件** ⇒ 卡片的
+> 内部状态（`_path`）还是旧的。向导里选了 A、预览了 A、跳过向导 ⇒
+> 页面输入框显示 A、内部却是旧值 B ⇒ 点「开始识别」识别的是 B。
+> ⇒ `_previewOpen()` 里补一次状态同步。
+
+### 3. 预览播放：独立播放器 + 收尾守卫
+
+wizard.json 声明 `open_source_button: "asr-open"`、
+`canvas_id: "asr-preview-wrap"` ⇒ 框架把该元素**搬进向导面板**
+（点「预览播放」时搬、`unmount()` 时按原位搬回）。
+
+应用页给一个**独立的**预览播放器（`<audio>` + `<video>`，按后缀切换）：
+
+> ⚠️ **不复用页面的 `#asr-video`** —— 那个绑着字幕渲染循环（字幕条
+> `#asr-video-sub` 是它的**兄弟节点**），把它搬进向导会留下一个没有
+> 字幕条的孤儿视频，而页面自己也没画面了。
+
+> ⚠️ **搬回页面 ≠ 停了** —— `<video>` / `<audio>` 还在播，声音会在后台
+> 继续放（卡片页那层 holder 是 hidden 的 ⇒ 用户只看到页面、听到声音）。
+> ⇒ 两个收尾点都停：**向导卸载**（框架 dispatch `wizard:unmounted`）
+> + **离开这张卡**（hashchange）。
+
+媒体源用**同一个端点** `/api/qwen3-asr/media?path=`（Range 支持），
+只放行 `<assets>/uploads` / `<assets>/tts` 两个根 ⇒ 预览的文件必须在
+这两个目录里（回归脚本会先复制一份进去）。
+
+### 4. 框架侧新增三个可配项（向后兼容，默认行为不变）
+
+| 配置项 | 默认值 | 用途 |
+|---|---|---|
+| `cfg.open_source_label` | 「播放视频」 | 源字段的预览按钮文案 |
+| `cfg.drop_hint` | 「或点击「浏览」选择本地视频」 | 拖放区提示 |
+| `cfg.drop_icon` | 「📥」 | 拖放区图标（**HTML 片段**） |
+
+> ⚠️ **`drop_icon` 传空串 = 不要图标** —— 板端**没有 emoji 字体**，
+> 「📥」实测渲染成**豆腐块 □**（AGENTS.md 有记）。ASR 传的是**内联
+> SVG**（波形图标），不是 emoji。
+
+### 回归
+
+`scripts/verify_asr_wizard.py` 新增 **U23**（约 30 条断言）：
+
+* env 步三条硬件能力**逐条列出且带 ✓**；
+* 音频源步有「预览播放 / 关闭 / 拖放上传区」、拖放区文案说音频或视频、
+  图标是 SVG 不是 emoji、**没有** gscore / 判帧 / 阈值 / 帧间隔字段；
+* 预览**音频**：`<audio>` 被搬进向导面板、走 `/media` 端点、**播放头
+  在走**、无解码错误；
+* 预览**视频**：`<video>` 同上；
+* 「关闭」后预览器**搬回卡片页**、**停住了**、源被清掉。
+
+⚠️ **预览素材必须在媒体端点放行的目录里** —— 回归脚本把参考素材复制到
+`<assets>/uploads/` 再用（那个端点没有鉴权，只放行 `uploads` / `tts`
+两个根），用完删掉。
+
+### ⚠️ 踩坑：「藏起来」≠「停了」—— `display:none` 的媒体照样播
+
+用户实测报的 bug：**先预览视频、再预览音频 ⇒ 上一次的视频还在放声音**，
+两个叠着放。
+
+```
+预览视频后   video{hidden:false, paused:false, t:1.49}
+再预览音频后 video{hidden:true,  paused:false, t:3.11}   ← 藏了，但还在播！
+再预览音频后 video{hidden:true,  paused:false, t:4.33}   ← 播放头照走
+```
+
+**根因**：``<video>`` / ``<audio>`` 的**播放与元素可见性无关** ——
+``display:none`` 只是不渲染，浏览器**不会**因此暂停它。原来切换预览源时
+只做了 ``other.classList.add("hidden")``（藏起来），没停。
+
+⇒ 换源预览必须**藏 + 停**两件事都做（`_stopPreviewEl()`：
+``pause()`` + ``removeAttribute("src")`` + ``load()`` + 加 hidden）。
+
+> 同一类坑还有：向导关闭时元素被**搬回**卡片页 —— **搬回去也不等于停了**
+> （卡片页那层 holder 是 hidden 的 ⇒ 用户只看到页面、听到声音）。
+> ⇒ 向导卸载（`wizard:unmounted`）+ 离开卡片（hashchange）两个收尾点
+> 都要停。
+
+> 顺带：同一个源重复点「预览播放」**不要**重头再来（会打断正在播的）
+> ⇒ 只有换了 src 才 `load()`；`ended` 了才归零重播。
+
+> ⚠️ **实测发现（设备级）**：ASR 模型在 **npu 0** 上 `init_runtime` 会失败
+> （`wdnai/backends/asr.py` 的 `audio init_runtime failed`，RKNN 里等约
+> **3 分钟**才报），而同样的模型在 npu 1 / npu 2 上正常。
+> 本卡向导的 `swcap_to_model.swcap_audio_asr.npu_index` 写的是 **[0]** ⇒
+> 环境步会显示 ⚠（能力可用但配置没配齐）而不是 ✓。
+> ⇒ **别把这个 ⚠ 当成 bug**：它是「模型实际跑在别的卡上」的真实反映。
+> （同日早些时候 ASR 在 npu 0 上是能跑的 ⇒ 更像是 NPU 核心被反复
+> 杀 worker 搞脏了，**重启板子**能恢复。）
+
+## Qwen3-ASR 卡：向导选视频 ⇒ 功能页必须切成视频来源（v0.41）
+
+### 用户诉求
+
+「流式语音识别快速配置」向导里，**音频源**选的是含音轨的视频；点「完成
+配置」进功能页 ⇒ **页签还是「音频文件」**，**视频也不播**。
+
+### 根因：向导里**没有**「输入来源」页签
+
+「输入来源」页签（音频文件 / 含音轨的视频 / 板载麦 / 浏览器麦）是**功能页**
+的东西。向导只有「音频源」一个文本字段 ⇒ **没有任何 UI 能表达「这是个视频」**。
+
+`applyWizardSnapshot` 回填路径后只调了 `_syncSourceUi()`（刷新按钮可用性），
+**从没设置过 `_source`** ⇒ 三个后果：
+
+| 位置 | 判据 | 结果 |
+|---|---|---|
+| 页签 | `_switchSource()` 从没被调 | 停在默认的「音频文件」 |
+| 视频播放器 | `_syncVideoPlayer()`：`this._source === "video"` 才显示 | 不显示 |
+| 视频播放 | `_playVideoIfAny()`：同上 | 不播 |
+
+而后端 `api.py::_source_kind`（按**后缀**判）返回的是 `"video"` ⇒
+**前后端口径不一致**（前端按音频、后端按视频记轮次归属）。
+
+### 修法：按路径后缀推断来源类型
+
+新增两个 helper（`app.js`）：
+
+* `_kindFromPath(path)` —— 按**后缀**判 `"video"` / `"file"`，与后端
+  `_source_kind` **同口径**（同一份 `VIDEO_EXTS` 扩展名表）；
+* `_applyKindFromPath(path)` —— 推断结果与当前页签**不同**时才
+  `_switchSource(kind)`（同类型重复切会触发 `_onSourceChanged()` 清字幕，
+  打字过程中反复触发会把正在看的字幕清掉）。
+
+调用点三处：
+
+1. `applyWizardSnapshot`（**向导完成** —— 本次 bug 的正主）；
+2. `#asr-source` 的 `input` 处理器（手填路径 / 「浏览…」弹窗写回 ——
+   `FSModal._commit` 会补发标准 `input` 事件，所以这条覆盖手填 + 浏览）；
+3. `_previewOpen()`（向导内「预览播放」）—— 因为向导的 `skip()`
+   **不调** `applyWizardSnapshot` ⇒ 走「跳过向导」那条路时只有这里能
+   把页签纠正过来。
+
+### 回归
+
+`scripts/verify_asr_wizard.py` 新增 **U24**（9 条断言）：向导选 mp4 →
+「完成配置」⇒ 页签是 `video`、卡片内部 `_source` 是 `video`、批次归属
+`roundsSource` 是 `video`、播放器容器**可见**、src 指向 `/media` 端点、
+**视频真的在播**（播放头在走）、无解码错误、有实际尺寸、无 JS 报错。
+
+### ⚠️ 踩坑：页签会**恢复**，所以「默认」那条断言必须验在干净状态上
+
+页面会按服务端的 `rounds_source.kind` **恢复**上一批次的来源
+（`_restoreFromServer` → `_switchSource(kind)`，这是有意的，U19 有断言）。
+⇒ 上一段（W7 视频向导）留下的 video 轮次，会让后面「默认选中『音频文件』」
+的断言量到的是「恢复」而不是「默认」。
+
+⇒ `verify_sources` 现在**先 `POST /api/qwen3-asr/reset` + 刷新页面**再验
+U1。
+
+### ⚠️ 环境级：NPU 驱动超时会让长音频识别**提前结束**（不是代码 bug）
+
+实测偶发：`verify_asr_wizard.py` 的 U7（长音频不被 60 s 截断）红，
+`audio_sec=48.0`（应该是 90）。
+
+服务日志里同一时刻有：
+
+```
+[ERROR] [nsmi_pcie.c:644] Receive timeout, command: 4
+[ERROR] [rk_nsmi.c:727] rknnsmi receive failed, ret=-7
+[INFO] qwen3_asr: asr stream epoch rotated: rid=52 epoch=1 reason=silence audio_sec=48.0
+```
+
+⇒ NPU 通信超时 → 模型输出不再变化 → **模型侧停顿检测**命中 →
+在 48 s 处切会话（`reason=silence`）→ 新会话建不起来 → 这一轮只交回
+前 48 s 的结果。
+
+**这不是前端/后端逻辑问题**：同一个请求单独调 API 能跑满 90 s
+（`audio_sec=90.0`、90 轮、996 字）。⇒ 遇到 U7 偶发红，先看服务日志里
+有没有 `rknnsmi receive failed`，有就是**板子的 NPU 状态**问题
+（重启板子 / 重启服务能清），不要去改代码。
+
+### ⚠️ 回归素材：**视频轨必须用 H.264**，不能用 MPEG-4 Part 2
+
+`scripts/make_asr_ref_video.py` 早期用 `out.add_stream("mpeg4", ...)` ——
+那是 **MPEG-4 Part 2**，**Chromium 早就不支持了**（Chrome 只解
+H.264 / VP8 / VP9 / AV1）。
+
+症状**极其隐蔽**：音频轨正常（AAC 解得出来、时长也对、识别和字幕全都
+正常），但**视频轨解不出来** ⇒ 浏览器里 `videoWidth === 0`
+（而 `readyState` 却是 4）⇒ 「设备端视频能真正解码出画面」那条断言红。
+
+⇒ 看起来像产品 bug（用户会以为「视频播不了」），其实是**素材编码格式
+不对**。已改成 `libx264`（板端 Chromium 能解 H.264 —— 用户素材
+`rk-0.mp4` 就是 H.264，实测 704×576 解得好好的）。
+
+自检（浏览器里量 `videoWidth`）：
+
+```
+asr_real_audio.mp4（自造·旧）: FAIL {'w': 0, 'h': 0, 'dur': 15.051, 'ready': 4}
+asr_long_90s.mp4（自造·旧）  : FAIL {'w': 0, 'h': 0, 'dur': 90,   'ready': 4}
+rk-0.mp4（用户素材）          : OK   {'w': 704, 'h': 576, 'dur': 19, 'ready': 4}
+```
+
+### ⚠️ 回归素材：uploads 里的**测试草稿**会插队当样本
+
+`_pick_sample_mp4()` 取的是「uploads 里最小的 mp4」。而各个用例会往
+uploads 复制 `_asr_*.mp4` 草稿、用完删 —— **板子重启 / 用例崩了就留下
+残骸**，残骸往往更小 ⇒ **插队成为样本** ⇒ U12 测的其实是另一个文件。
+
+⇒ `_pick_sample_mp4()` 现在**排除 `_` / `.` 开头的文件**（只认用户素材）。
+
+## 「切到向导模式」必须先停掉在跑的识别（v0.42）
+
+### 用户诉求
+
+「流式语音识别」**从功能界面正在识别**的时候，切到向导模式，或者返回首页，
+或者切到其它界面，识别应该停止才合理 —— 要不推理一直会占着 NPU。
+
+### 三个「离开」的路径，各走各的机制
+
+| 场景 | 机制 | 改之前 |
+|---|---|---|
+| 点「返回首页」 | 框架 `injectBackHomeButtons` → `DemoGuard.stopAndClear` | ✓ 本来就行 |
+| 切到其它卡 / 浏览器前进后退 | `onHashChange` → `DemoGuard.stopSync`（sendBeacon） | ✓ 本来就行 |
+| **点「向导模式」** | `wireWizardModeButtons` → `enterWizardMode()` | ❌ **完全没停** |
+
+「向导模式」按钮（`<button class="wizard-mode-btn" data-wizard-mode
+data-page-id="<id>">`）的处理函数只调 `window.enterWizardMode(appId)` ——
+**一行停止逻辑都没有** ⇒ 识别继续跑。
+
+实测（`/tmp/asr_ref/guard_probe.py`）：点「向导模式」后后端仍
+`busy=True state='running'`，且页面**根本没发 stop 请求**。
+
+### 两条理由（缺一不可）
+
+1. **算力**：识别是长任务（整文件快转，几十秒起步），不停就一直占着 NPU
+   —— 而用户已经离开这张卡了，没人看结果。
+2. **功能**：向导走完会 `applyWizardSnapshot` → **直接发起新的识别**；而后端
+   「一次只能跑一个识别」（RPC 只有一条 delta 通道，`service.py::
+   _ASR_RPC_LOCK`）⇒ 上一条还在跑的话，新请求直接 **409「上一条识别还在
+   进行中」** ⇒ 向导显示完成、识别却没跑起来。
+
+### 改法（框架级，只动「向导模式」按钮这一处）
+
+`app/static/core/framework.js` 的 `wireWizardModeButtons`：
+
+```js
+      // 只在**真的在跑**时才停（DemoGuard.isActive）⇒ 空闲的卡点这个
+      // 按钮行为零变化。stopAndClear 走 card manifest 声明的
+      // stop_endpoints（ASR = POST /api/qwen3-asr/stop）。
+      if (DemoGuard.isActive(appId)) {
+        try { await DemoGuard.stopAndClear(appId); } catch (_) {}
+      }
+      if (typeof window.enterWizardMode === "function") {
+        window.enterWizardMode(appId);
+      }
+```
+
+* **只在 `isActive` 时才停** ⇒ 空闲卡行为零变化；
+* 走 card manifest 的 `stop_endpoints` ⇒ **不给 ASR 硬编码端点**，其它卡
+  自动生效（text-chat / tts / video-* 都有各自的 stop 端点）；
+* `service.stop()` 是**非阻塞**的（立刻置 `stopped` + 广播，不等后台线程
+  收尾）⇒ `await` 不会卡住界面。
+
+后端 stop 会广播 `stopped` 帧（带 `reason`）⇒ 前端据此 `_freezePlayback()`
+⇒ 画面也停（`reason=user`），不会「后台继续放声音」。
+
+### 回归
+
+`scripts/verify_asr_wizard.py` 新增 **U25**（4 条断言）：A 点「向导模式」/
+B 点「返回首页」/ C 切到其它卡 ⇒ 三种离开方式识别都停；外加「页面确实
+发了 stop 请求」。
