@@ -3132,11 +3132,6 @@ body.dg-modal-open .back-home-btn {
 .cc-device-req.is-blocked .cc-device-req-label {
   color: #991b1b;
 }
-.cc-device-req-ok {
-  font-size: 11px;
-  color: #047857;
-  font-weight: 600;
-}
 .cc-device-req-bad {
   font-size: 11px;
   color: #b91c1c;

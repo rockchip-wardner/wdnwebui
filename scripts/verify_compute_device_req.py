@@ -13,8 +13,9 @@ Qwen-Image-2.1 就是这种模型: TE/DiT 占 2 张 RK1828，**VAE 必须独占*
 
 本脚本 mock ``/api/compute``，断言卡片上：
 
-* 设备要求块**显示**「需要 N 个 NPU 设备」+ 选中的布局；
-* 满足 ⇒ 块不带 ``is-blocked``，toggle **可用**；
+* **满足** ⇒ 设备要求块**不显示**（信息已经在「运行在」那一行的固定条目里
+  说过一遍，再重复一遍只会把卡片撑得很奇怪），toggle **可用**，「运行在」
+  仍有第三个设备；
 * 不满足 ⇒ 块带 ``is-blocked`` + 显示缺什么，toggle **禁用**；
 * 单卡模型（``total_devices == 1``）⇒ 块**隐藏**（不打扰普通模型）。
 
@@ -210,11 +211,10 @@ def run_scenario(page, services):
 
 
 SCENARIOS = [
-    ("1. 满足：显示「需要 3 个 NPU 设备」+ 选中布局，toggle 可用",
+    ("1. 满足：不显示设备要求块（信息已在「运行在」那行），toggle 可用",
      [svc(req=_req_ok())],
-     {"visible": True, "blocked": False, "toggle_disabled": False,
-      "must_have": ["需要 3 个 NPU 设备", "2×RK1828 协卡 + 本机 RK3588 NPU"],
-      "must_not_have": ["本机 NPU 不可用"],
+     {"visible": False, "blocked": False, "toggle_disabled": False,
+      "must_have": [], "must_not_have": ["需要", "NPU 设备"],
       "fixed_count": 1, "fixed_must_have": ["本机 RK3588 NPU（VAE 解码）"]}),
 
     ("2. 不满足：显示缺什么 + toggle 被禁用",
