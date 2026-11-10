@@ -10914,3 +10914,30 @@ stdout 管道没人读时它会阻塞在写上 ⇒ **收到 SIGTERM 后还要好
 
 ⇒ 收尾再打一行 `system-logs ws closed` 日志 —— 之前日志跟随进程的收尾
 **完全静默**，泄漏了也看不出来（两个插件仓的 WS 也各加了一行同款日志）。
+
+### 已知限制：偶发的「日志跟随进程残留」
+
+实测中见过**一次** `journalctl -f` 残留（客户端断开后存活 1 分 35 秒、服务端
+**没有** `system-logs ws closed` 日志 ⇒ handler 根本没走到 `finally`）。
+**成因未复现**（此后所有可复现的断开路径都正常收尾）。
+
+已验证能正常收尾的路径（`b0d70e9` 之后的代码）：
+
+| 断开方式 | 结果 |
+|---|---|
+| 客户端正常关闭 | journalctl **≤1s** 归零 |
+| 客户端进程被 **SIGKILL**（模拟浏览器被杀） | **≤2s** 归零 |
+| 服务端停机（`--timeout-graceful-shutdown` 到点 cancel） | task 被 cancel ⇒ `finally` 里 kill 兜底 |
+
+⇒ 推测是「客户端已消失、但内核没把 FIN/RST 送到服务端」这种 TCP 半死
+场景：此时 `send` 仍会成功（内核照收），心跳察觉不到，服务端**在应用层
+无从得知**对端已走。
+
+⇒ 若要根治，方向是**在应用层之外查 TCP 状态**（如按
+`scope["server"]` 的端口去读 `/proc/net/tcp` 看 socket 还在不在
+ESTABLISHED），或**依赖内核 keepalive**（默认 2 小时，太慢）。
+本轮**未实现** —— 收益有限、风险（/proc 解析、IPv6、netns）不低。
+
+⇒ 危害有限：残留的只是一个 `journalctl`（它**持有** `/dev/rga`、
+`/tmp/rknnsmi.lock`、FastDDS 共享内存的 **fd**，但**不持有文件锁** ——
+锁随进程退出释放），不影响服务正确性，只是让那些 fd 多活一会儿。
