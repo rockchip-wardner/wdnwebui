@@ -41,6 +41,13 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:-]{1,128}$")
 MAX_LINES = 2000
 MAX_MSG_CHARS = 4 * 1024  # truncate huge entries so the WS/REST payload stays bounded
 MAX_FOLLOW_SECONDS = 30 * 60  # 30 min cap per WS connection
+# How often the tail pings the client. Short on purpose: when the server
+# shuts down, uvicorn closes the transport *without* delivering a
+# ``websocket.disconnect`` to the app, so a failing send is the only way
+# the handler learns the socket is gone. See ``_ping`` below.
+PING_INTERVAL_SEC = 3
+# Upper bound for a single send to the client. See ``_ping`` below.
+_WS_SEND_TIMEOUT = 5.0
 
 # systemd-numeric → name. systemd priority 0=emerg ... 7=debug.
 _PRIORITY_NAME = {
@@ -260,10 +267,40 @@ async def ws_logs(
         "pid": proc.pid,
     })
 
+    # A dedicated watcher for the client going away. The drain loops below
+    # block on ``stream.readline()`` — waiting for ``journalctl`` to say
+    # something — so they never call ``receive()`` and never notice that the
+    # socket is gone. On a server shutdown uvicorn closes the transport and
+    # then waits for this handler's task to finish; without this watcher the
+    # handler waits forever, the task never leaves ``server_state.tasks``,
+    # and the unit has to be SIGKILLed once systemd's stop timeout expires
+    # (which takes the compute workers down with it).
+    async def _watch_disconnect() -> None:
+        # Block until the client goes away. Messages sent by the client are
+        # ignored on purpose — this endpoint is a one-way tail.
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                return
+
+    disconnect = asyncio.create_task(_watch_disconnect(), name="logs-disconnect")
+
     async def _drain(stream, label):
         sent_error = False
         while True:
-            line = await stream.readline()
+            read = asyncio.create_task(stream.readline())
+            done, _pending = await asyncio.wait(
+                {read, disconnect}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if disconnect in done:
+                # Client gone (or the server is shutting the socket down).
+                read.cancel()
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return
+            line = read.result()
             if not line:
                 # EOF — journalctl exited
                 return
@@ -291,14 +328,32 @@ async def ws_logs(
     async def _ping():
         # Periodic liveness ping — keeps proxies from reaping an idle WS
         # during quiet periods, and lets us notice a hang early.
+        #
+        # The interval is deliberately short: when the *server* shuts down,
+        # uvicorn closes the transport without delivering a
+        # ``websocket.disconnect`` to the app, so the only way this handler
+        # learns the socket is gone is by **failing to send**. A ping every
+        # few seconds turns "wait for the graceful-shutdown timeout" into
+        # "notice it right away" — the difference between a service that
+        # stops in a second and one that has to be SIGKILLed.
         try:
             while True:
-                await asyncio.sleep(15)
+                await asyncio.sleep(PING_INTERVAL_SEC)
                 if proc.returncode is not None:
                     return
                 try:
-                    await ws.send_json({"type": "ping"})
-                except (WebSocketDisconnect, RuntimeError):
+                    # ⚠️ **send 必须加超时**: a peer that vanished without
+                    # closing cleanly leaves the socket in CLOSE-WAIT with
+                    # unflushed data — ``send`` then waits forever for the
+                    # write buffer to drain and never returns, so this
+                    # coroutine never ends and the unit's stop times out.
+                    await asyncio.wait_for(
+                        ws.send_json({"type": "ping"}),
+                        timeout=_WS_SEND_TIMEOUT,
+                    )
+                except Exception:
+                    # ClientDisconnected / WebSocketDisconnect / RuntimeError
+                    # — the socket is gone, stop the follower.
                     try:
                         proc.terminate()
                     except Exception:
@@ -335,14 +390,41 @@ async def ws_logs(
     except WebSocketDisconnect:
         pass
     finally:
+        # The disconnect watcher lives outside the ``asyncio.wait`` set, so
+        # it has to be stopped explicitly — otherwise it lingers as a
+        # pending task after the tail ends.
+        if not disconnect.done():
+            disconnect.cancel()
+        else:
+            # Consume a possible exception (e.g. WebSocketDisconnect) so
+            # asyncio doesn't log "Task exception was never retrieved".
+            try:
+                disconnect.exception()
+            except BaseException:
+                pass
         if proc.returncode is None:
+            # Kill the follower **even when this coroutine is cancelled**.
+            # ``asyncio.CancelledError`` derives from ``BaseException``, so a
+            # plain ``except Exception`` never sees it — and cancellation is
+            # exactly what happens during a uvicorn graceful shutdown.
+            # Skipping the kill there left an orphaned ``journalctl -f``
+            # behind, which then kept the systemd cgroup busy and made the
+            # unit stop time out.
             try:
                 proc.terminate()
             except Exception:
                 pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except (asyncio.TimeoutError, Exception):
+            except asyncio.CancelledError:
+                # Shutting down — kill immediately, don't await.
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise
+            except Exception:
+                # TimeoutError (and anything else) — escalate to SIGKILL.
                 try:
                     proc.kill()
                 except Exception:

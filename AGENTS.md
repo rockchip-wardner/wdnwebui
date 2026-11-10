@@ -10705,3 +10705,179 @@ data-page-id="<id>">`）的处理函数只调 `window.enterWizardMode(appId)` �
 `scripts/verify_asr_wizard.py` 新增 **U25**（4 条断言）：A 点「向导模式」/
 B 点「返回首页」/ C 切到其它卡 ⇒ 三种离开方式识别都停；外加「页面确实
 发了 stop 请求」。
+
+## 服务重启卡死 90 秒 → SIGKILL 整组（v0.43）
+
+### 症状
+
+`sudo systemctl restart wdnwebui` 要等**整整 90 秒**，日志：
+
+```
+State 'stop-sigterm' timed out. Killing.
+Main process exited, code=killed, status=9/KILL
+Failed with result 'timeout'.
+```
+
+⇒ systemd **强杀整个 cgroup** ⇒ `compute_worker` **连坐**被杀（AGENTS.md
+开头就警告过这条）。worker 不是自己退的，是被 SIGKILL 拖走的。
+
+### 根因链（三层，一层一层剥）
+
+**① 谁卡住了 uvicorn**
+
+uvicorn 停机顺序：先 `connection.shutdown()` 关掉 WS transport → 再等
+`server_state.tasks` 清空 → 最后才发 lifespan shutdown。日志里那行
+`Waiting for background tasks to complete.` 就是它 —— **挂住的是卡在
+`await` 上的 WS handler**。
+
+**② WS handler 为什么卡**
+
+`app/system/api/system_logs.py` 的 `_drain()` 阻塞在
+`await stream.readline()`（等 `journalctl -f` 出声）。**服务端主动关闭
+transport 时，ASGI 层收不到 `websocket.disconnect`** —— 那个事件只在
+**客户端**断开时才有 ⇒ handler 根本不知道 socket 没了 ⇒ 永远不退出。
+
+> 同类问题在插件卡 `audio_analysis`
+> （`.venv/src/wdnapps-video-analyzer/.../audio_analysis/api.py:123`，
+> 卡在 `await queue.get()`）—— **外部仓库**，本仓改不了，只能靠 uvicorn
+> 的优雅超时兜底。
+
+**③ uvicorn 的超时上限没生效**
+
+`--timeout-graceful-shutdown` 会给 `_wait_tasks_to_complete()` 加上限，
+超时后 cancel 所有 task（日志 `Cancel N running task(s), timeout graceful
+shutdown exceeded`）。**原 ExecStart 裸跑 uvicorn ⇒ 没有这个上限 ⇒
+无限等 ⇒ 只能等 systemd 的 `TimeoutStopSec=90s` 把整组 SIGKILL 掉。**
+
+### 修法
+
+**单元（`install_autostart.sh` 是单元文件的仓库源头 —— 改它，别只改板子上的 `/etc`）**
+
+```
+ExecStart=... uvicorn app.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 8
+TimeoutStopSec=25
+```
+
+> ⚠️ `TimeoutStopSec` 必须 **>** graceful timeout，否则 systemd 会在
+> uvicorn 还没收尾完时就 SIGKILL —— 又回到老问题。
+
+**代码（`app/system/api/system_logs.py`）**
+
+1. `_drain()` 改成「读一行」与「等客户端断开」**竞速**
+   （`asyncio.wait({read, disconnect}, FIRST_COMPLETED)`）⇒ 客户端一断
+   就收尾；
+2. `finally` 里 **`except asyncio.CancelledError` 也要 kill journalctl**
+   —— CancelledError 继承自 **BaseException**，`except Exception` 捕不到；
+   而 shutdown 恰恰是 cancel 触发的 ⇒ 漏这一句就留下**孤儿
+   `journalctl -f`**（它会继续占着 cgroup，下次 stop 又超时）；
+3. `_ping` 间隔 **15s → 3s**：服务端主动关闭时 ASGI 层收不到 disconnect，
+   **「发不出去」是唯一的信号** ⇒ 心跳短一点，发现得早一点。
+
+### 效果（实测，板子）
+
+| | 改之前 | 改之后 |
+|---|---|---|
+| `systemctl stop` | 90s（超时） | **8.4s** |
+| 主进程退出方式 | `status=9/KILL`（被强杀） | 正常退出 |
+| `compute_worker` 退出码 | 连坐被杀 | **rc=0**（自己优雅退） |
+| 孤儿 `journalctl -f` | 有（能挂 6 个月） | 无 |
+
+### ⚠️ 排查这类问题的通用手法
+
+* `Waiting for background tasks to complete.` ⇒ 就是它；
+* 有 `Cancel N running task(s), timeout graceful shutdown exceeded` ⇒
+  优雅超时**生效了**（没这行 = 参数没传到进程）；
+* 紧跟着的 `Exception in ASGI application` + traceback ⇒ 那是**被 cancel
+  的 handler 的收尾**抛出来的，不是新 bug（但会刷屏）；
+* **`systemctl restart` 比 `stop` + `start` 慢**：restart 的停止阶段还要
+  等 cgroup 里 worker 排空（worker 卸载 RKNN 模型要 ~6s）⇒ 别拿
+  restart 的耗时当停止耗时，**分开测**（`stop` 8.4s / `start` 0.2s，
+  restart 却 15.4s）。
+
+### 附带：流式 ASR 冒烟脚本
+
+`scripts/verify_asr_live_smoke.py`（新）—— 活体链路几十秒冒烟：
+`live/start` → 37×500ms `live/chunk` → `live/finish`，8 条断言。
+全量回归仍是 `scripts/verify_asr_live.py`（49 条）。
+
+> ⚠️ 两个判据容易写错：
+> * `round` 是**本段内**已凑满 1 秒的推理轮次。500ms 一块 ⇒ 同一轮的
+>   两块共享同一个 round 号（`0,0,1,1,2,2…`）⇒ 判据是「**段内**单调
+>   不减」，不是严格递增；
+> * VAD 静音断句（`silence_ms=1200`）后**开新的一段**，round 归零重数
+>   —— 设计行为，不是异常。
+>
+> ⚠️ 素材在 `/tmp`（tmpfs），板子重启就没了 ⇒ 缺素材时脚本**报错退出**，
+> 不静默 SKIP。
+
+## WebSocket handler **必须能感知断开**（v0.43 附则，跨卡通用）
+
+### 为什么单独立一节
+
+v0.43 修「重启卡死 90 秒」时挖出一条**跨卡通用**的坑：WebSocket handler
+只要「只写不读」或「读不到断开」，就会**永久占住一个 ASGI task**。
+
+后果有两条，都很隐蔽：
+
+1. **泄漏** —— 客户端每次断开都漏一个 handler（连同它持有的队列 / 线程）；
+2. **关停卡死** —— `uvicorn` 的 `Server.shutdown()` 等
+   `server_state.tasks` 清空 ⇒ 永远等不到 ⇒ systemd 只能 SIGKILL 整个
+   cgroup ⇒ **compute_worker 连坐被杀**。
+
+### 根因：uvicorn **关停时不会**给「只写」的协程投递 disconnect
+
+`websocket.disconnect` 这个 ASGI 事件只在**客户端断开**时才有。
+**服务端主动关闭**（`connection.shutdown()` → `transport.close()`）时，
+只写不读的协程**永远看不到任何信号** ⇒ 它会一直等下去。
+
+⇒ 于是有两种死法：
+
+* **只写不读**（`while True: await queue.get()`）：客户端断开也不报错 ⇒
+  纯泄漏；
+* **写了但状态不变就不写**（`if changed: await ws.send_json(...)`）：
+  客户端断开后没有新事件 ⇒ `send` 永远不被调用 ⇒ 也发现不了死连接。
+
+### 四条规则
+
+1. **必须有「只读」协程**：`await ws.receive_text()` / `receive_json()`
+   循环 —— 客户端断开时它抛 `WebSocketDisconnect`。
+2. **推送协程与只读协程赛跑**：
+   `await asyncio.wait({push, watch}, return_when=asyncio.FIRST_COMPLETED)`
+   —— 谁先结束都收尾，**finally 里 cancel 掉另一个**。
+3. **`send` 必须加超时**：`await asyncio.wait_for(ws.send_json(p),
+   timeout=5.0)` —— 对端「消失但不干净关闭」时 socket 停在 CLOSE-WAIT
+   且写缓冲排不空 ⇒ `send` **永远不返回** ⇒ 协程卡死。
+4. **要有心跳**：即使状态没变也定期推一次 —— 否则「死连接但没关闭」
+   永远等不到一次 `send` ⇒ 也永远发现不了它死了。
+
+> ⚠️ `except WebSocketDisconnect:` 写在 `await queue.get()` 外面是
+> **死代码** —— `queue.get()` 永远不会抛它。这种 handler 看起来「有断开
+> 处理」，实则一次都没触发过。
+
+### 本仓 6 个 + 插件仓 6 个 WS 端点的现状
+
+| 端点 | 写法 | 断开感知 |
+|---|---|---|
+| `system-logs/ws`（本仓） | `readline` × `ws.receive()` 竞速 + 3s 心跳 + send 超时 | ✅ v0.43 修 |
+| `qwen3-asr/ws`（本仓） | reader task（`receive_text`）→ finally 取消 relay | ✅ |
+| `text_chat/ws` / `im_bridge/ws`（本仓） | 同上，同构 | ✅ |
+| `core/video/multi_api.py`（本仓） | 50ms 轮询，天然能感知 | ✅ |
+| `coprocessor/ws`（本仓） | 一次性任务，跑完即止 | ✅ |
+| `image_editor/ws`（media-generator） | FIRST_COMPLETED 竞速 + 10s 心跳 + send 超时 | ✅ 2026-11-04 已修 |
+| `media_generator/ws`（media-generator） | 同上 | ✅ |
+| `video_retrieval/ws`（video-analyzer） | `wait_for(queue.get(), timeout=1.0)` 轮询 | ✅ |
+| `video_retrieval/play`（video-analyzer） | 双向 + `receive_json` 超时 | ✅ |
+| `audio_analysis/ws`（video-analyzer） | 纯 `queue.get()` + 死代码 except | ❌ **v0.43 已修** |
+| `tts/ws`（audio-chat） | `audio_q.get()` + 主循环空转 | ❌ **v0.43 已修** |
+
+> **同仓的 `image_editor` 早就踩过这个坑并留下了模板**（2026-11-04，
+> 注释里写得很清楚）—— 加新卡时**直接抄它**，别自己发明写法。
+
+### 排查手法
+
+* 停机日志 `Cancel N running task(s)` 的 **N 越大 ⇒ 泄漏越多**（N 里也含
+  正在进行的 HTTP 请求 task，所以不是纯 WS 数，但趋势有意义）；
+* 对照实验：挂一个 WS → 停机记 N₁；断开后再停机记 N₂。**N₂ < N₁ ⇒
+  有泄漏**（客户端断开没让服务端收尾）；
+* 想直接看某个 WS 有没有泄漏：连上 → 断开 → 看服务端的
+  `journalctl -f` / 队列 / 线程有没有跟着消失。

@@ -65,9 +65,19 @@ Type=simple
 User=root
 WorkingDirectory=$SCRIPT_DIR
 Environment=WDNWEBUI_CONFIG=$SCRIPT_DIR/config.jsonc
-ExecStart=$SCRIPT_DIR/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+# --timeout-graceful-shutdown caps how long uvicorn waits for in-flight
+# connections (WebSockets included) before closing them. Without a cap,
+# uvicorn waits forever on a half-open socket, systemd hits its own stop
+# timeout and SIGKILLs the whole cgroup — which takes the compute workers
+# down with it. 5s keeps restarts snappy and still lets an in-flight
+# request finish writing its response.
+ExecStart=$SCRIPT_DIR/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 5
 Restart=on-failure
 RestartSec=5
+# Backstop for the graceful shutdown above: it must be larger than
+# --timeout-graceful-shutdown, otherwise systemd kills the process while
+# uvicorn is still shutting down cleanly.
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

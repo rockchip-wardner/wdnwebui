@@ -7,6 +7,8 @@ on its own:
 
     .venv/bin/python scripts/check_plugin_entrypoints.py wdnapps_video_analyzer
 
+Run it without arguments to check every installed plugin package at once.
+
 Why this exists
 ---------------
 These plugin packages are pure Python, so there is no ``.so`` to assert. But
@@ -108,12 +110,30 @@ def check_pkg(pkg: str) -> int:
     return bad
 
 
+def plugin_packages() -> list[str]:
+    """Top level packages that provide a ``wdnwebui.cards`` entry point.
+
+    The ownership of a card is decided by its top level package name (see
+    ``check_pkg``), so the top level module is what has to be checked.
+    """
+    try:
+        eps = entry_points(group=GROUP)
+    except Exception:  # noqa: BLE001
+        return []
+    return sorted({e.value.split(".")[0] for e in eps if e.value})
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        print("usage: check_plugin_entrypoints.py <package name> [<package name> ...]", file=sys.stderr)
-        print("       without arguments every wdnwebui.cards plugin package is checked", file=sys.stderr)
-        return 2
-    total = sum(check_pkg(p) for p in argv[1:])
+        # No package given — check every plugin package that actually
+        # registered a card entry point.
+        pkgs = plugin_packages()
+        if not pkgs:
+            print(f"no package provides a {GROUP} entry point", file=sys.stderr)
+            return 0
+    else:
+        pkgs = argv[1:]
+    total = sum(check_pkg(p) for p in pkgs)
     return 1 if total else 0
 
 
