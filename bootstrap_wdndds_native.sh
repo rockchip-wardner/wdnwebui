@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap wdndds native libraries (one-time, per host).
+# Bootstrap the wdndds native libraries (one-time, per host).
 #
 # The wdndds 0.4 wheel does NOT ship libwdndds_cshim.so /
 # libwdndds_idl.so — they are source-compiled at pip install time by
@@ -27,12 +27,15 @@
 #   7. Audit the SDK-declared dependencies (scripts/check_sdk_deps.py).
 #   8. Verify the .so artefacts are in place.
 #
-# v1.4 (2026-10-10) — Step 3 改用 **editable**（`-e`）。此前刻意用非
-# editable，理由有二：①「editable 不 copy 文件所以编不出 .so」→ 实测错误
-# （钩子写死源码树输出，与 install 形式无关）；②「setuptools≥64 对 -e 静默
-# 吞掉 hook 失败」→ 仍成立，但已由 Step 6 的产物断言 + update_rkwhl.sh 的
-# verify_outputs 覆盖。非 editable 的代价（site-packages 实体目录永久遮挡
-# editable 安装 → worker ImportError）详见 Step 4。
+# v1.4 (2026-10-10) — Step 3 now uses an **editable** install (`-e`). It
+# deliberately used a non-editable one before, for two reasons: ① "an
+# editable install does not copy the files, so it cannot build the .so" →
+# measured wrong (the hook writes its output to the source tree, no matter
+# which install form is used); ② "setuptools≥64 silently swallows the hook
+# failure for -e" → still true, but it is now covered by the artefact
+# assertion of Step 6 + verify_outputs of update_rkwhl.sh. The price of a
+# non-editable install (the physical directory in site-packages permanently
+# shadows the editable install → worker ImportError) is described in Step 4.
 #
 # Idempotent: skips any step that's already done. Fast path when
 # everything is in place takes <1s.
@@ -66,7 +69,7 @@ die() { printf '\033[1;31m[bootstrap]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ -d "${WDNDDS_SRC}" ]] || die \
     "wdndds source not found at ${WDNDDS_SRC}.
-Run the editable install first:
+→Run the editable install first:
     .venv/bin/pip install -e .venv/src/wdndds"
 
 # -- Step 1: apt build deps -----------------------------------------------
@@ -123,8 +126,8 @@ fi
 # v0.6.1: the previous "if both .so exist, exit 0" fast path was a
 # silent correctness trap — after a `git pull` of wdndds source that
 # added new bindings to _cshim.py (e.g. commit 871d00f
-# feat(wdndds): 新增 create_topic_writer/reader 流式分片助手), the
-# pre-existing .so would still satisfy the existence check, bootstrap
+# feat(wdndds): add the create_topic_writer/reader streaming helpers),
+# the pre-existing .so would still satisfy the existence check, bootstrap
 # would exit 0, and the user would later hit
 # `AttributeError: undefined symbol: wdndds_topic_writer_create` from
 # the wrapper. The fix lives in two places:
@@ -141,26 +144,34 @@ fi
 # the bootstrap itself with `WDNWEBUI_SKIP_WDNDDS_BOOTSTRAP=1`
 # (see run.py). Don't bypass bootstrap from inside this script.
 
-# -- Step 4: trigger _build.py via **editable** install ---------------------
+# -- Step 4: trigger _build.py via an **editable** install -----------------
 #
-# v1.4：这里**必须**用 `-e`。此前是非 editable，理由是「editable 不 copy
-# 文件所以编不出 .so」——实测该前提**错误**：_build.py 的 build_py 钩子
-# 把输出写死在源码树 `src/wdndds/dds/_native/`（其 `_THIS_DIR`），与
-# install 形式无关。删掉 .so 后实测 `-e` 装照常重建，且不产生
-# site-packages 实体目录。
+# v1.4: `-e` **must** be used here. It was a non-editable install before,
+# for the reason "an editable install does not copy the files, so it
+# cannot build the .so" — that premise is **wrong**: the build_py hook of
+# _build.py writes its output to the source tree
+# `src/wdndds/dds/_native/` (its `_THIS_DIR`), no matter which install
+# form is used. Measured after deleting the .so: an `-e` install rebuilds
+# them just fine and creates no physical directory in site-packages.
 #
-# 而非 editable 的代价很实在：它会在 site-packages 留一个实体目录，而
-# site-packages 在 sys.path 上排在 editable 的 .pth **之前**，于是该目录
-# 永久遮挡 editable 安装；后续 git pull + `pip install -e` 也不会回收它
-# （pip 只认自己元数据里记的文件）。实测踩过：源码树已是 0.9.0，
-# site-packages 里却仍是 0.6.0 → 算力页启用本地模型时 worker
-# `ImportError: cannot import name 'serve_local_session'` →
-# `compute_worker exited rc=1`，且 UI 错误框为空（worker stderr 落
-# /tmp/wdnwebui-worker/<model>.log，不进 PIPE）。根治即改用 `-e`。
+# The price of a non-editable install is very real: it leaves a physical
+# directory in site-packages, and site-packages comes **before** the
+# editable .pth on sys.path, so that directory permanently shadows the
+# editable install; a later git pull + `pip install -e` does not reclaim
+# it either (pip only knows the files recorded in its own metadata).
+# Observed in practice: the source tree was already 0.9.0 while
+# site-packages still held 0.6.0 → enabling the local model on the
+# compute page failed with `ImportError: cannot import name
+# 'serve_local_session'` in the worker → `compute_worker exited rc=1`,
+# and the UI error box was empty (the worker stderr goes to
+# /tmp/wdnwebui-worker/<model>.log, not into the PIPE). The root fix is
+# to switch to `-e`.
 #
-# `--force-reinstall` 保留：否则 pip 可能判定「已安装」而跳过构建。
-# pip >= 24 拒绝 `--force-reinstall` + `-e` 组合（PEP 660）；届时去掉
-# 该 flag 即可，钩子本身无条件 unlink + 重建，不依赖它。
+# `--force-reinstall` is kept: otherwise pip may decide "already
+# installed" and skip the build. pip >= 24 rejects the
+# `--force-reinstall` + `-e` combination (PEP 660); drop the flag at that
+# point, the hook itself unconditionally unlinks and rebuilds and does not
+# depend on it.
 log "running \`pip install --force-reinstall --no-deps -e ${WDNDDS_SRC}\` as ${ORIG_USER} to compile the .so"
 PIP_CMD=()
 if [[ "$(id -u)" -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
@@ -169,18 +180,20 @@ fi
 PIP_CMD+=("${REPO_ROOT}/.venv/bin/pip" install --force-reinstall --no-deps -e "${WDNDDS_SRC}")
 if ! "${PIP_CMD[@]}"; then
     die "pip install failed. Inspect the error above — common causes:
-  - foonathan_memory apt packages not installed (see Step 1)
-  - FastDDS 3.6 not vendored at ${NATIVE_LIB} (see Step 2)
-  - cmake / g++ missing (apt install cmake g++ make)
-  - pip >= 24 拒绝 '--force-reinstall -e' 组合 → 去掉 --force-reinstall 重试"
+  - the foonathan_memory apt packages are not installed (see Step 1)
+  - FastDDS 3.6 is not vendored at ${NATIVE_LIB} (see Step 2)
+  - cmake / g++ are missing (apt install cmake g++ make)
+  - pip >= 24 rejects the '--force-reinstall -e' combination → drop --force-reinstall and retry"
 fi
 
-# 清掉**更早**的非 editable 安装残留实体目录。本次改成 -e 之后不会再
-# 产生新的，但历史上跑过旧版 bootstrap 的机器上可能还留着——它会遮挡
-# 刚装好的 editable 安装，必须删。只删这一个确定路径，不动其它包。
+# Remove the physical directory left behind by an **earlier** non-editable
+# install. No new ones are produced after the switch to -e, but machines
+# that ran the old bootstrap may still have one — it shadows the freshly
+# installed editable one and has to go. Only this one known path is
+# deleted, no other package is touched.
 STALE_SP="${REPO_ROOT}/.venv/lib/python3.11/site-packages/wdndds"
 if [[ -d "${STALE_SP}" ]]; then
-    warn "发现非 editable 安装残留 ${STALE_SP}（会遮挡 editable 安装），已删除"
+    warn "found the leftover of a non-editable install ${STALE_SP} (it shadows the editable install), removed it"
     rm -rf "${STALE_SP}"
 fi
 
@@ -189,10 +202,12 @@ fi
 # the resulting .so files would be root-owned and any later
 # unprivileged rebuild would fail to overwrite them.)
 #
-# v1.4：改用 editable 后产物只在**源码树**里，site-packages 侧只剩 pip 以
-# ORIG_USER 身份写下的 `.pth` + `dist-info`，无需额外 chown。原先还 chown
-# 了 `site-packages/wdndds` 实体目录——editable 下该目录不存在，chown 会
-# 被 `|| true` 静默吞掉，留着只会误导。
+# v1.4: with the editable install the artefacts only live in the **source
+# tree**, on the site-packages side pip only writes the `.pth` +
+# `dist-info` as ORIG_USER, so no extra chown is needed. The old version
+# also chowned the physical `site-packages/wdndds` directory — that
+# directory does not exist with an editable install, the chown was
+# swallowed by `|| true` and only left a misleading trace.
 if [[ "$(id -u)" -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]] \
    && id -u "${ORIG_USER}" >/dev/null 2>&1; then
     chown -R "${ORIG_UID}:${ORIG_UID}" \
@@ -200,17 +215,20 @@ if [[ "$(id -u)" -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]] \
         2>/dev/null || true
 fi
 
-# -- Step 6: v4l2 (PyPI) 的 py3 兼容补丁 -------------------------------------
+# -- Step 6: the py3 compatibility patch for v4l2 (PyPI) -------------------
 #
-# wdnav/src/wdnav/v4l2.py 在模块级 `import v4l2`（第三方 PyPI 包）。SDK 用
-# `--no-deps` 装，所以它不会自己进 venv —— requirements.txt 里已显式列出
-# `v4l2>=0.2`。但上游 0.2（2014）留着 Python 2 惯用法 `range(...) + [...]`，
-# py3 下 import 阶段就抛 TypeError（**不是** ImportError），装了照样用不了：
-# HDMI-IN 快照端点会从 503 退化成 500。
+# wdnav/src/wdnav/v4l2.py does a module level `import v4l2` (the third
+# party PyPI package). The SDK is installed with `--no-deps`, so it does
+# not come into the venv on its own — requirements.txt lists
+# `v4l2>=0.2` explicitly. But upstream 0.2 (2014) still has the Python 2
+# idiom `range(...) + [...]`, which raises a TypeError at **import** time
+# under py3 (**not** an ImportError), so it is installed and still
+# unusable: the HDMI-IN snapshot endpoint degrades from 503 to 500.
 #
-# 这里做一次幂等修补（同一个脚本也挂在 update_rkwhl.sh 上）。
-# v4l2 没装（requirements 还没同步）时只提示、不失败 —— 它只影响 HDMI-IN
-# 一条链路，不该把整个 bootstrap 拖死。
+# An idempotent patch is applied here (the same script is also wired into
+# update_rkwhl.sh). When v4l2 is not installed (the requirements have not
+# been synced yet) it only warns and does not fail — v4l2 only affects
+# the HDMI-IN chain and must not drag the whole bootstrap down.
 if [[ -f "${REPO_ROOT}/scripts/fix_v4l2_py3.py" ]]; then
     if [[ -f "${REPO_ROOT}/.venv/bin/python" ]]; then
         log "patching v4l2 for py3 compatibility (scripts/fix_v4l2_py3.py)"
@@ -225,22 +243,27 @@ fi
 
 # -- Step 7: audit the SDK-declared dependencies ---------------------------
 #
-# SDK 是用 `--no-deps` 装的，所以它们**自己声明的依赖不会进 venv**。
-# 故障现场离原因很远：v4l2 缺失 → HDMI-IN 端点一直 503；tokenizers 缺失
-# → 算力页「模型启动失败」。
+# The SDKs are installed with `--no-deps`, so the dependencies **they
+# declare** do not come into the venv. The symptom is far away from the
+# cause: v4l2 missing → the HDMI-IN endpoint returns 503 forever;
+# tokenizers missing → the compute page reports "the model failed to
+# start".
 #
-# check_sdk_deps.py 读 .venv/src/*/pyproject.toml 的 [project].dependencies，
-# 逐条查**已装**发行版（importlib.metadata，不查索引 → 离线可用），并**真的
-# import 一次** —— 「装了但 import 失败」正是 v4l2 那类故障，find_spec 查不出来。
+# check_sdk_deps.py reads the [project].dependencies of the
+# .venv/src/*/pyproject.toml, looks up every **installed** distribution
+# (importlib.metadata, never the index → works offline) and **really
+# imports it once** — "installed but the import fails" is exactly the
+# class of failure that v4l2 represents, and find_spec does not catch it.
 #
-# 这里不 die：bootstrap 自己的活（wdndds 的 .so）已经干完了，依赖缺失是另一
-# 条链路的事。但必须**大声 warn** 并给出修复命令 —— 否则这条链路的坑又要等
-# 到用户点页面才发现。
+# This does not die here: the job of bootstrap (the .so of wdndds) is
+# already done, a missing dependency is another chain's business. But it
+# **has to warn loudly** and give the fix command — otherwise the pit of
+# that chain is only noticed when the user clicks on the page.
 if [[ -f "${REPO_ROOT}/scripts/check_sdk_deps.py" ]] \
    && [[ -f "${REPO_ROOT}/.venv/bin/python" ]]; then
     log "auditing SDK-declared dependencies (scripts/check_sdk_deps.py)"
     if ! "${REPO_ROOT}/.venv/bin/python" "${REPO_ROOT}/scripts/check_sdk_deps.py"; then
-        warn "SDK dependency audit did not pass — declared dependencies are missing / broken."
+        warn "the SDK dependency audit did not pass — the declared dependencies are missing / broken."
         warn "  fix:    ${REPO_ROOT}/.venv/bin/pip install -r ${REPO_ROOT}/requirements.txt"
         warn "  recheck: ${REPO_ROOT}/.venv/bin/python ${REPO_ROOT}/scripts/check_sdk_deps.py"
     fi
@@ -250,7 +273,7 @@ fi
 
 # -- Step 8: verify --------------------------------------------------------
 for so in "${CSHIM}" "${IDL}"; do
-    [[ -f "${so}" ]] || die "build hook ran but ${so} is still missing"
+    [[ -f "${so}" ]] || die "the build hook ran but ${so} is still missing"
 done
 
 log "OK — libwdndds_cshim.so + libwdndds_idl.so built and in place"

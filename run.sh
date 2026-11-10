@@ -5,14 +5,16 @@
 # already configured and bound to fc000000.usb, this is a near-no-op
 # (a few stat() calls + a status check, ~10 ms). Re-running on every
 # wdnwebui boot avoids the "reboot and forget to run setup again"
-# class of failure that has bitten the 智能电脑控制 card before.
+# class of failure that has bitten the 智能电脑控制 (smart computer
+# control) card before.
 #
 # `sudo -n` is the non-interactive mode: if the NOPASSWD rule in
 # /etc/sudoers.d/wdnwebui-usb-hid is in place it runs without a
 # password prompt; if it isn't, we print a warning and let the web UI
-# still come up. The card will surface "Gadget 未就绪" in the page
-# header instead of silently disappearing — see the banner reason
-# list in app/apps/usb_hid/static/app.js's applySnapshot().
+# still come up. The card will surface the "Gadget 未就绪" (gadget not
+# ready) state in the page header instead of silently disappearing — see
+# the banner reason list in app/apps/usb_hid/static/app.js's
+# applySnapshot().
 #
 # Why not just chmod 0660 the whole /sys/kernel/config/usb_gadget?
 #   configfs write access is enforced by the kernel, not the

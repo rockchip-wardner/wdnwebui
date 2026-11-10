@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# 端到端出图回归（Qwen-Image-2.1 / media-generator 卡）
+# The end-to-end image generation regression (Qwen-Image-2.1 / media-generator
+# card)
 #
-# 用法： e2e_topo.sh [steps] [prompt]
-#   默认 8 步 + "a cute cat sitting on a wooden chair"
+# Usage: e2e_topo.sh [steps] [prompt]
+#   default: 8 steps + "a cute cat sitting on a wooden chair"
 #
-# ⭐ 状态快照在 `GET /api/media-generator/`（**带斜杠**）——
-#   `GET /api/media-generator/status` 不存在，会返回 `{"detail":"Not Found"}`。
-#   ⚠️ 返回的 JSON 是 `json.dumps` 的紧凑格式（**冒号后没有空格**），
-#   所以 grep 要写 '"capability_ready":true'（写成带空格就永远匹配不上）。
+# ⭐ The state snapshot is at `GET /api/media-generator/` (**with the
+#   trailing slash**) — `GET /api/media-generator/status` does not exist and
+#   returns `{"detail":"Not Found"}`.
+#   ⚠️ The JSON that comes back is the compact form of `json.dumps`
+#   (**no space after the colon**), so the grep has to be written as
+#   '"capability_ready":true' (with a space it never matches).
 #
-# ⚠️ 等模型加载完再发请求 —— worker 起来后要 ~140 s 才 ready
-#    （TE + DiT 4 段 + VAE 全部常驻），没 ready 就发会被 service 拒掉。
+# ⚠️ Wait for the model to finish loading before sending the request — the
+#    worker needs ~140 s to become ready (TE + the 4 DiT stages + the VAE
+#    all stay resident); a request sent before that is rejected by the
+#    service.
 set -u
 
 STEPS="${1:-8}"
@@ -19,7 +24,7 @@ OUT=${OUT:-/tmp/e2e_topo.png}
 BASE=${BASE:-http://127.0.0.1:8000}
 PY=/home/rockchip/wdnwebui/.venv/bin/python
 
-echo "== 等 capability_ready =="
+echo "== waiting for capability_ready =="
 for i in $(seq 1 90); do
   R=$(curl -s "$BASE/api/media-generator/" 2>/dev/null)
   case "$R" in
@@ -34,7 +39,7 @@ GEN=$(curl -s -X POST "$BASE/api/media-generator/generate" \
       -d "{\"prompt\":\"$PROMPT\",\"steps\":$STEPS,\"fixed_noise\":true}")
 echo "   $GEN"
 RUN=$(printf '%s' "$GEN" | sed -n 's/.*"run_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-if [ -z "$RUN" ]; then echo "!! 没拿到 run_id"; exit 1; fi
+if [ -z "$RUN" ]; then echo "!! no run_id received"; exit 1; fi
 echo "   run_id=$RUN"
 
 for i in $(seq 1 120); do
@@ -47,11 +52,11 @@ for i in $(seq 1 120); do
   sleep 3
 done
 
-echo "== 取图 =="
+echo "== fetching the image =="
 curl -s "$BASE/api/media-generator/image/$RUN" -o "$OUT"
 SZ=$(stat -c %s "$OUT")
 echo "   size=$SZ  md5=$(md5sum "$OUT" | cut -d' ' -f1)"
-if [ "$SZ" -lt 1000 ]; then echo "!! 返回的不是 PNG："; cat "$OUT"; echo; exit 1; fi
+if [ "$SZ" -lt 1000 ]; then echo "!! the response is not a PNG:"; cat "$OUT"; echo; exit 1; fi
 "$PY" - "$OUT" <<'PY'
 import sys
 import numpy as np

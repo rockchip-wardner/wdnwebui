@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 安装 wdnwebui 的 systemd 开机自启单元
-# 用法：sudo ./install_autostart.sh [--uninstall]
+# Install the systemd autostart unit of wdnwebui
+# Usage: sudo ./install_autostart.sh [--uninstall]
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ for arg in "$@"; do
             exit 0
             ;;
         *)
-            echo "未知参数: $arg" >&2
+            echo "unknown argument: $arg" >&2
             sed -n '2,3p' "$0" >&2
             exit 2
             ;;
@@ -27,14 +27,14 @@ for arg in "$@"; do
 done
 
 if [ "$EUID" -ne 0 ]; then
-    echo "需要 root 权限：请用 sudo 运行，例：sudo $0" >&2
+    echo "root privileges are required: please run it with sudo, e.g. sudo $0" >&2
     exit 1
 fi
 
 SERVICE_USER="${SUDO_USER:-$(whoami)}"
 
 if [ ! -x "$PY" ]; then
-    echo "找不到 $PY，请先激活 venv 或完成依赖安装" >&2
+    echo "$PY not found, please activate the venv or finish the dependency installation first" >&2
     exit 1
 fi
 
@@ -44,13 +44,13 @@ uninstall() {
         unit_name="$(basename "$WEB_UNIT")"
         systemctl disable --now "$unit_name" 2>/dev/null || true
         rm -f "$WEB_UNIT"
-        echo "已移除 $WEB_UNIT"
+        echo "removed $WEB_UNIT"
         changed=1
     fi
     if [ "$changed" -eq 1 ]; then
         systemctl daemon-reload
     fi
-    echo "卸载完成"
+    echo "uninstall complete"
 }
 
 write_web_unit() {
@@ -74,7 +74,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable wdnwebui.service
-    echo "已写入 $WEB_UNIT（已 enable，未启动）"
+    echo "wrote $WEB_UNIT (enabled, not started)"
 }
 
 if [ "$UNINSTALL" = true ]; then
@@ -84,6 +84,6 @@ fi
 
 write_web_unit
 
-echo "完成。可手动 systemctl start wdnwebui.service 立即拉起。"
-echo "v0.6+：发现走 FastDDS SIMPLE multicast (239.255.0.1:7400)，无独立 daemon。"
-echo "若 LAN 组播被阻断，在 systemd unit 里加 Environment=WDNDDS_INITIAL_PEERS=ip1,ip2,..."
+echo "done. Start it immediately with: systemctl start wdnwebui.service"
+echo "v0.6+: discovery uses FastDDS SIMPLE multicast (239.255.0.1:7400), there is no separate daemon."
+echo "If LAN multicast is blocked, add Environment=WDNDDS_INITIAL_PEERS=ip1,ip2,... to the systemd unit"

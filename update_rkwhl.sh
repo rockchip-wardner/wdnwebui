@@ -1,35 +1,48 @@
 #!/usr/bin/env bash
-# 更新 .venv/src 下以 editable 模式安装的 wdnav / wdnai / wdndds / wdnhid
-# 以及四个应用插件包 wdnapps_video_analyzer / wdnapps_hdmi_processor /
-# wdnapps_audio_chat / wdnapps_media_generator
-# 用法：./update_rkwhl.sh
+# Update the wdnav / wdnai / wdndds / wdnhid SDKs and the four application
+# plugin packages wdnapps_video_analyzer / wdnapps_hdmi_processor /
+# wdnapps_audio_chat / wdnapps_media_generator, all installed in editable
+# mode under .venv/src
+# Usage: ./update_rkwhl.sh
 #
-# 每个包的流程（v1.3 起）：
-#   1. `git pull --ff-only` 拉最新代码
-#   2. 比对 pull 前后的 git HEAD
-#   3. HEAD 没变 → **什么都不做**（不碰 .venv，不跑 pip）
-#   4. HEAD 变了 → 先彻底卸载旧版本（purge_install_traces），再
-#      `pip install -e` 装新的；编译 / 断言 .so 落地的逻辑沿用原样
+# The flow per package (since v1.3):
+#   1. `git pull --ff-only` to fetch the latest code
+#   2. Compare the git HEAD before and after the pull
+#   3. HEAD unchanged → **do nothing at all** (the .venv is untouched, pip
+#      does not run)
+#   4. HEAD changed → first completely uninstall the old version
+#      (purge_install_traces), then reinstall it with `pip install -e`; the
+#      compile / .so landing assertion logic stays as it was
 #
-# 设计要点：
-#   * 以 **git HEAD** 为唯一更新信号，不用 pyproject 版本号 —— 实测三包
-#     的 repo 版本号与已装版本长期一致，大量「改 cshim_src / 改 _build.py」
-#     的提交不 bump 版本号，只比版本号会把最该重建 .so 的升级静默跳过。
-#     代价：纯文档提交也会重装一次，换来不漏。
-#   * 升级前先卸载（purge_install_traces）。pip 不会因为后来装了 editable
-#     就回收更早非 editable 安装留下的实体目录，而实体目录在 sys.path 上
-#     排在 .pth 之前、会永久遮挡 editable 安装。根治见
-#     bootstrap_wdndds_native.sh v1.4（改用 -e），purge 只做兜底自愈。
-#   * pip >= 24 拒绝 `--force-reinstall` + `-e` 组合（PEP 660）；且非
-#     editable 标志必须放在 `-e` 之前，否则 pip 26.x 会当成 editable
-#     requirement 报错。
-#   * 每次 install 后**断言 .so 落地**——setuptools ≥64 会静默吞掉
-#     build_py 钩子的 RuntimeError，pip 返回 0、日志全绿但产物没生成。
-#   * 插件包（wdnapps_*）没有 .so，改为断言 **entry point → manifest id →
-#     static/ 三段链路**。这组断言挡的是另一个静默失败：entry point 名写了
-#     下划线而 manifest "id" 是连字符时，pip 全程报成功，但宿主启动时把这
-#     几张卡 FATAL 跳过，页面上就是"卡片不见了"且日志里只有一行 ERROR。
-#   * 强制重建：`UPDATE_RKWHL_FORCE_REBUILD=1 ./update_rkwhl.sh`。
+# Design notes:
+#   * The **git HEAD** is the only update signal, not the pyproject version
+#     number — in practice the repo version of the three packages stays
+#     equal to the installed version for a long time, and a lot of commits
+#     that change cshim_src / _build.py do not bump the version number, so
+#     comparing versions would silently skip exactly the upgrades that
+#     should rebuild the .so. The price: a documentation-only commit also
+#     triggers a reinstall — in exchange, nothing is missed.
+#   * Uninstall before upgrading (purge_install_traces). pip does not reclaim
+#     the physical directory left behind by an earlier non-editable install
+#     just because an editable one was installed later, and that physical
+#     directory comes before the .pth on sys.path and therefore shadows the
+#     editable install permanently. The root fix lives in
+#     bootstrap_wdndds_native.sh v1.4 (switched to -e); purge is only the
+#     self-healing fallback.
+#   * pip >= 24 rejects the `--force-reinstall` + `-e` combination (PEP
+#     660); and the non-editable flag must come before `-e`, otherwise pip
+#     26.x treats it as an editable requirement and errors out.
+#   * After every install we **assert that the .so landed** — setuptools
+#     >=64 silently swallows the RuntimeError of the build_py hook: pip
+#     returns 0, the log is all green, and the artifact was never built.
+#   * The plugin packages (wdnapps_*) have no .so, so they assert the
+#     **entry point → manifest id → static/ chain** instead. That assertion
+#     blocks another silent failure: when the entry point name uses
+#     underscores while the manifest "id" uses hyphens, pip reports success
+#     all the way through, but the host skips those cards as FATAL at
+#     startup — the page simply has no cards and the log holds a single
+#     ERROR line.
+#   * Force a rebuild: `UPDATE_RKWHL_FORCE_REBUILD=1 ./update_rkwhl.sh`.
 
 set -euo pipefail
 
@@ -37,28 +50,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_SRC="$SCRIPT_DIR/.venv/src"
 
 # ---------------------------------------------------------------------------
-# 包来源（可被外部覆盖）
+# Package source (can be overridden from the outside)
 #
-# 默认是公司内网镜像 —— 现场板子常常没有外网，只能走内网。
-# 公网的一键安装器（https://github.com/rockchip-wardner/wardner）把
-# WARDNER_PKG_BASE 设成 https://github.com/rockchip-wardner 即可换成公网源。
+# The default is the company intranet mirror — boards in the field often
+# have no internet access and can only use the intranet.
+# The public one-shot installer (https://github.com/rockchip-wardner/wardner)
+# sets WARDNER_PKG_BASE to https://github.com/rockchip-wardner to switch to
+# the public source.
 #
-# 这个变量只在「目录不存在、走 URL 兜底安装」那条路径上真正被用到：
-# 已克隆过的包走的是 `git pull`（用各自 clone 时的 remote），跟这里无关。
+# This variable is only really used on the "directory does not exist, fall
+# back to installing from the URL" path: packages that were cloned before
+# use `git pull` (with the remote they were cloned with), which has nothing
+# to do with this.
 #
-#   内网镜像：git+ssh://git@10.10.10.10/wardner
-#   公网 GitHub：git+https://github.com/rockchip-wardner
+#   intranet mirror: git+ssh://git@10.10.10.10/wardner
+#   public GitHub:   git+https://github.com/rockchip-wardner
 # ---------------------------------------------------------------------------
 WARDNER_PKG_BASE="${WARDNER_PKG_BASE:-git+ssh://git@10.10.10.10/wardner}"
 
-# 必须先 activate venv：wdndds._build.py / wdnav._build_wdnav.py 在
-# 重建 .so 过程中可能 spawn 子进程调用 `python` / `pip`；未 activate
-# 时这些子进程会回退到系统 python（尤其 sudo / 非交互 shell 场景），
-# 导致 whl 装到系统 site-packages 而非 .venv，并触发 Debian PEP 668
-# "externally-managed-environment" 报错。activate 后 `python` 锁定到
-# venv，`python -m pip` 走 venv site-packages，路径可预测。
+# The venv has to be activated first: wdndds._build.py / wdnav._build_wdnav.py
+# may spawn child processes that call `python` / `pip` while rebuilding the
+# .so; without activation those child processes fall back to the system
+# python (especially under sudo / in a non-interactive shell), so the wheel
+# lands in the system site-packages instead of the .venv and Debian's PEP
+# 668 "externally-managed-environment" error triggers. After activation
+# `python` is locked to the venv, `python -m pip` uses the venv
+# site-packages and the paths are predictable.
 if [ ! -f "$SCRIPT_DIR/.venv/bin/activate" ]; then
-    echo "ERROR: 未找到 $SCRIPT_DIR/.venv/bin/activate，请先创建虚拟环境" >&2
+    echo "ERROR: $SCRIPT_DIR/.venv/bin/activate not found, please create the virtual environment first" >&2
     exit 1
 fi
 # shellcheck disable=SC1091
@@ -66,55 +85,69 @@ source "$SCRIPT_DIR/.venv/bin/activate"
 
 PIP_TARGET="python -m pip"
 
-# 先把 wdnwebui 自己的运行时依赖（fastapi / uvicorn / opencv-python-headless /
-# python-multipart / av / gguf / lancedb / pyarrow / psutil 等）按
-# requirements.txt 装好——开发机经常是新克隆的 .venv，requirements.txt
-# 还没执行过；或者上游 bump 了 web 依赖版本。装完再 update SDK，避免 SDK 重装
-# 链上拉不到 web 侧依赖。
+# Install wdnwebui's own runtime dependencies (fastapi / uvicorn /
+# opencv-python-headless / python-multipart / av / gguf / lancedb /
+# pyarrow / psutil and friends) from requirements.txt first — a dev machine
+# often has a freshly cloned .venv where requirements.txt was never
+# installed, or upstream bumped a web dependency version. Installing them
+# before updating the SDKs avoids the SDK reinstall chain failing to pull
+# the web side dependencies.
 if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
-    echo "==> 同步 requirements.txt (wdnwebui 自身依赖)"
+    echo "==> syncing requirements.txt (wdnwebui's own dependencies)"
     ( cd "$SCRIPT_DIR" && $PIP_TARGET install -r requirements.txt )
     # ------------------------------------------------------------------------
-    # v4l2 (PyPI) 的 py3 兼容补丁
+    # The py3 compatibility patch for v4l2 (from PyPI)
     #
-    # requirements.txt 里的 `v4l2>=0.2` 是 wdnav.v4l2 的硬依赖（SDK 用
-    # --no-deps 装，依赖不会自己进来）。但上游 0.2（2014）源码里留着
-    # Python 2 惯用法 `range(...) + [...]`，py3 下 import 阶段就抛
-    # TypeError（不是 ImportError！）—— 装上了照样用不了，且 HDMI-IN
-    # 端点会从 503 退化成 500。补丁一行搞定，脚本幂等。
+    # `v4l2>=0.2` in requirements.txt is a hard dependency of wdnav.v4l2 (the
+    # SDK is installed with --no-deps, so the dependency does not come in
+    # by itself). But upstream 0.2 (2014) still has the Python 2 idiom
+    # `range(...) + [...]` in its source, which raises a TypeError at
+    # **import** time under py3 (not an ImportError!) — so it is installed
+    # and still unusable, and the HDMI-IN endpoint degrades from 503 to 500.
+    # The patch is one line, the script is idempotent.
     #
-    # 失败不终止本脚本：v4l2 只影响 HDMI-IN 一条链路，其余 SDK 更新
-    # 不该被它拖住。日志里会明确给出补救命令。
+    # A failure does not abort this script: v4l2 only affects the HDMI-IN
+    # chain, the other SDK updates should not be held up by it. The log
+    # states the exact remediation command.
     # ------------------------------------------------------------------------
-    echo "==> 修补 v4l2 的 py3 兼容问题 (scripts/fix_v4l2_py3.py)"
+    echo "==> patching the py3 compatibility issue of v4l2 (scripts/fix_v4l2_py3.py)"
     if ! ( cd "$SCRIPT_DIR" && python scripts/fix_v4l2_py3.py ); then
-        echo "WARN: v4l2 py3 兼容补丁未成功 —— HDMI-IN 采集将不可用。" >&2
-        echo "      手动执行: python scripts/fix_v4l2_py3.py" >&2
+        echo "WARN: the v4l2 py3 compatibility patch did not succeed — HDMI-IN capture will be unavailable." >&2
+        echo "      run it manually: python scripts/fix_v4l2_py3.py" >&2
     fi
 else
-    echo "==> 未找到 requirements.txt，跳过 web 依赖同步"
+    echo "==> requirements.txt not found, skipping the web dependency sync"
 fi
 
 # ---------------------------------------------------------------------------
-# 插件包（wdnapps_*）的产物校验
+# Artifact verification for the plugin packages (wdnapps_*)
 #
-# 这些包是 pure-Python，没有 .so 可断言；但它们有一个更致命的失败模式：
-# **pip 装成功了，卡片却一个都不出现**，而且全程不报错。最常见的原因是
-# entry point 名与 manifest.json 的 "id" 不一致——包目录用下划线
-# (cards/video_detection/)，卡 id 一贯用连字符 ("video-detection")，照着
-# 模块名写就全错。宿主 discover() 判 FATAL 后**静默跳过**该卡，所以
-# "装上了" 与 "卡片能用" 是两件事，必须在这里断言。
+# These packages are pure Python, so there is no .so to assert; but they
+# have an even more fatal failure mode: **pip reports success and not a
+# single card shows up**, without any error along the way. The most common
+# cause is that the entry point name and the "id" in manifest.json do not
+# match — the package directory uses underscores (cards/video_detection/)
+# while the card id consistently uses hyphens ("video-detection"), so
+# copying the module name gets every one of them wrong. After discover()
+# marks it FATAL the host **silently skips** that card, so "it is
+# installed" and "the card works" are two different things and have to be
+# asserted here.
 #
-# 用 importlib.util.find_spec 而不是 import_module：前者只 import 父包
-# (cards/__init__.py 是空的，正好)，**不执行叶子模块**；后者会顺着 api.py
-# 拉起整个 app.core.*（compute registry、解码器初始化），在更新脚本里既慢
-# 又带副作用。
+# importlib.util.find_spec is used instead of import_module: the former
+# only imports the parent package (cards/__init__.py is empty, conveniently)
+# and **does not execute the leaf module**; the latter would pull the whole
+# app.core.* chain up through api.py (compute registry, decoder
+# initialisation), which is both slow and has side effects in an update
+# script.
 #
-# 输出约定：一行一卡，`OK <id> (<dir>)` 或 `BAD: <原因>`。判定逻辑在
-# scripts/check_plugin_entrypoints.py（也可独立跑），这里只负责调用 + 呈现。
-# 最初这段是 `$(python - <<'PYEOF' ... )` 的内联 heredoc，在本机 bash
-# 5.2 上**解析期**就报 `command substitution: syntax error near unexpected
-# token '||'`——最小用例能过、函数里不能过，不值得继续纠缠这种脆写法。
+# Output convention: one line per card, `OK <id> (<dir>)` or `BAD: <reason>`.
+# The decision logic lives in scripts/check_plugin_entrypoints.py (which can
+# also be run on its own); this script only calls it and renders the
+# result. This block was originally an inline heredoc
+# (`$(python - <<'PYEOF' ... )`), which failed with a **parse time**
+# `command substitution: syntax error near unexpected token '||'` on bash
+# 5.2 — the minimal case passes, the version inside a function does not,
+# and that fragile style is not worth fighting any further.
 # ---------------------------------------------------------------------------
 verify_plugin_cards() {
     local pkg="$1"
@@ -122,40 +155,45 @@ verify_plugin_cards() {
     local out bad
 
     if [ ! -f "$checker" ]; then
-        echo "FATAL: [$pkg] 找不到校验脚本 $checker" >&2
+        echo "FATAL: [$pkg] the checker script not found: $checker" >&2
         return 1
     fi
 
-    # 判定交给 grep，不用 python 的退出码 —— python 侧恒定 exit 0，
-    # 输出里 `BAD:` 开头即为失败。`cd "$SCRIPT_DIR"` 是必须的：
-    # 卡片模块 import 的是宿主仓库根的 `app.core.*`。
+    # The decision is made with grep, not with the exit code of python — the
+    # python side always exits 0, a line starting with `BAD:` means
+    # failure. `cd "$SCRIPT_DIR"` is mandatory: the card modules import
+    # `app.core.*` from the root of the host repo.
     out="$(cd "$SCRIPT_DIR" && python "$checker" "$pkg" 2>&1)" || true
 
     if [ -z "$out" ]; then
-        echo "FATAL: [$pkg] 插件校验无输出（python 可能没跑起来）" >&2
+        echo "FATAL: [$pkg] the plugin check produced no output (python may not have run)" >&2
         return 1
     fi
 
     bad="$(printf '%s\n' "$out" | grep -c '^BAD' || true)"
-    printf '%s\n' "$out" | sed 's/^OK /    ✅ /'
+    printf '%s\n' "$out" | sed 's/^OK /    ● /'
     if [ "$bad" != "0" ]; then
-        printf '%s\n' "$out" | grep '^BAD' | sed 's/^BAD: /    ❌ /' >&2
-        echo "FATAL: [$pkg] 插件卡片校验未通过（$bad 项）。宿主启动时会静默丢卡，" >&2
-        echo "       不是启动时报错，所以必须在这里拦住。" >&2
+        printf '%s\n' "$out" | grep '^BAD' | sed 's/^BAD: /    × /' >&2
+        echo "FATAL: [$pkg] the card verification failed ($bad items). The host drops cards silently" >&2
+        echo "       at startup, so it has to be stopped here." >&2
         return 1
     fi
     return 0
 }
 
-# 校验某个 SDK 安装后必须落地的 .so 产物。pip install -e 在 setuptools ≥64
-# 上会**静默吞掉** ``build_py`` 钩子的 RuntimeError（参见 bootstrap_wdndds_native.sh
-# 注释 / AGENTS.md「SDK native-`.so` rebuild policy」段）——pip exit code 仍为 0，
-# 但 .so 根本不会生成。所以脚本必须在 install 之后**亲自**检查产物，否则
-# 编译失败会一路滑过去、前端 import 时才报 FileNotFoundError，很难溯源。
+# Verify the .so artifacts an SDK has to produce after the install.
+# `pip install -e` **silently swallows** the RuntimeError of the
+# ``build_py`` hook on setuptools >=64 (see the bootstrap_wdndds_native.sh
+# comments / the "SDK native-.so rebuild policy" section of AGENTS.md) — the
+# pip exit code is still 0, but the .so is never generated. So the script
+# has to check the artifacts **itself** after the install, otherwise a
+# failed build slides through and only shows up as a FileNotFoundError when
+# the frontend imports it, which is very hard to trace.
 #
-# 用法：verify_outputs <pkg> <pip_stderr_log>
-#   缺失任一 .so → 打印 "build hook 失败提示 + 关键 .so 路径 + pip stderr 末尾"，
-#                 然后 exit 1，让 set -e 在外层立即终止脚本。
+# Usage: verify_outputs <pkg> <pip_stderr_log>
+#   A missing .so → prints "build hook failure hint + the key .so paths +
+#   the tail of the pip stderr", then exits 1, so set -e aborts the script
+#   immediately.
 verify_outputs() {
     local pkg="$1"
     local log="$2"
@@ -173,17 +211,21 @@ verify_outputs() {
             )
             ;;
         wdnai)
-            # wdnai 是 pure-Python，无 .so 产物；HEAD 推进就当 OK。
+            # wdnai is pure Python, it has no .so artifact; an advanced HEAD
+            # is good enough.
             return 0
             ;;
         wdnhid)
-            # wdnhid 是 pure-Python（USB Gadget HID bindings），无 .so 产物。
-            # wdnwebui 卡片侧 import wdnhid，必须保证本包可用即可。
+            # wdnhid is pure Python (USB Gadget HID bindings), it has no .so
+            # artifact. The card side of wdnwebui imports wdnhid, so it is
+            # enough to guarantee that this package works.
             return 0
             ;;
         wdnapps_video_analyzer|wdnapps_hdmi_processor|wdnapps_audio_chat|wdnapps_media_generator)
-            # 应用插件包也是 pure-Python，同样没有 .so；但要验的东西更重要
-            # ——卡片是不是真的注册上了（见 verify_plugin_cards 的说明）。
+            # The application plugin packages are pure Python as well, so
+            # they have no .so either; but what they need verified matters
+            # more — whether the cards really registered (see the notes of
+            # verify_plugin_cards).
             verify_plugin_cards "$pkg"
             return $?
             ;;
@@ -199,24 +241,27 @@ verify_outputs() {
         return 0
     fi
 
-    echo "FATAL: [$pkg] build hook 未生成以下 .so（setuptools ≥64 静默吞了 RuntimeError）:" >&2
+    echo "FATAL: [$pkg] the build hook did not generate the following .so (setuptools >=64 silently swallowed a RuntimeError):" >&2
     for f in "${missing[@]}"; do
         echo "    - $f" >&2
     done
 
-    # 试着从 captured stderr 抽出真正的根因，比笼统的「缺 apt 依赖」更直接
-    # 命中。subprocess 抛的 FileNotFoundError 通常是 cmd 二进制找不到
-    # （cmake / patchelf / make）；cmake 自身的报错通常以 "CMake Error" 开头；
-    # gcc/clang 链接/编译失败通常带 "fatal error" 或 "undefined reference"。
+    # Try to extract the real root cause from the captured stderr — that
+    # hits the problem more directly than a generic "missing apt
+    # dependency". The FileNotFoundError raised by subprocess usually means
+    # the binary was not found (cmake / patchelf / make); the error of
+    # cmake itself usually starts with "CMake Error"; a gcc/clang
+    # link/compile failure usually carries "fatal error" or "undefined
+    # reference".
     local cause=""
     if [ -f "$log" ] && [ -s "$log" ]; then
         if grep -qE "No such file or directory: 'cmake'" "$log"; then
-            cause="cmake 二进制缺失（apt install cmake）"
+            cause="the cmake binary is missing (apt install cmake)"
         elif grep -qE "No such file or directory: '(make|patchelf|cc|g\\+\\+)'" "$log"; then
             cause=$(grep -oE "No such file or directory: '[^']+'" "$log" | head -1)
-            cause="$cause （apt install build-essential patchelf cmake）"
+            cause="$cause (apt install build-essential patchelf cmake)"
         elif grep -qE "Could NOT find (FastDDS|foonathan)" "$log"; then
-            cause="FastDDS 3.6 dev 头文件未找到（跑 .venv/src/wdndds/build_native.sh 或设 WDNDDS_FASTDDS_PREFIX）"
+            cause="the FastDDS 3.6 dev headers were not found (run .venv/src/wdndds/build_native.sh or set WDNDDS_FASTDDS_PREFIX)"
         elif grep -qE "fatal error:.*No such file" "$log"; then
             cause=$(grep -oE "fatal error: [^\\n]+" "$log" | head -1)
         elif grep -qE "undefined reference to" "$log"; then
@@ -225,89 +270,101 @@ verify_outputs() {
     fi
     if [ -n "$cause" ]; then
         echo "" >&2
-        echo "  实测到的根因：$cause" >&2
+        echo "  the root cause observed: $cause" >&2
     fi
 
     echo "" >&2
-    echo "  通常原因：" >&2
+    echo "  common causes:" >&2
     case "$pkg" in
         wdndds)
-            echo "    - 缺 build 工具链：sudo apt install cmake patchelf build-essential" >&2
-            echo "    - 缺 C++ 内存分配库：sudo apt install libfoonathan-memory-dev libfoonathan-memory0.7.3" >&2
-            echo "    - 缺 FastDDS 3.6 dev 头文件：跑 bash .venv/src/wdndds/build_native.sh" >&2
-            echo "      （vendor 路径 .venv/src/wdndds/native/ 已存在时不用重跑）" >&2
-            echo "    - 一键 bootstrap：sudo ./bootstrap_wdndds_native.sh（apt + stub + non-editable pip install）" >&2
+            echo "    - missing the build toolchain: sudo apt install cmake patchelf build-essential" >&2
+            echo "    - missing the C++ memory allocator library: sudo apt install libfoonathan-memory-dev libfoonathan-memory0.7.3" >&2
+            echo "    - missing the FastDDS 3.6 dev headers: run bash .venv/src/wdndds/build_native.sh" >&2
+            echo "      (no need to run it again when the vendor path .venv/src/wdndds/native/ already exists)" >&2
+            echo "    - one-shot bootstrap: sudo ./bootstrap_wdndds_native.sh (apt + stub + non-editable pip install)" >&2
             ;;
         wdnav)
-            echo "    - 缺 apt 依赖：sudo apt install librockchip-mpp-dev（提供 /usr/include/rockchip 头文件）" >&2
-            echo "    - 头文件目录有但 .so 链接失败：检查 cc 错误（多半缺 librockchip-mpp1 / librockchip-vpu0 运行时库）" >&2
+            echo "    - missing apt dependency: sudo apt install librockchip-mpp-dev (provides the /usr/include/rockchip headers)" >&2
+            echo "    - the header directory exists but linking the .so fails: check the cc errors (usually a missing librockchip-mpp1 / librockchip-vpu0 runtime library)" >&2
             ;;
     esac
     echo "" >&2
     if [ -f "$log" ] && [ -s "$log" ]; then
-        echo "  --- pip install stderr 末尾（捕获 setuptools 吞掉的 hook traceback）---" >&2
+        echo "  --- tail of the pip install stderr (captures the hook traceback swallowed by setuptools) ---" >&2
         tail -n 60 "$log" >&2 || true
         echo "  --- end ---" >&2
     else
-        echo "  （无 captured stderr；重跑时加 UPDATE_RKWHL_VERBOSE=1 看详细日志）" >&2
+        echo "  (no captured stderr; re-run with UPDATE_RKWHL_VERBOSE=1 for the detailed log)" >&2
     fi
     return 1
 }
 
-# 卸载一个 SDK 包的所有安装痕迹，为紧接着的 `pip install -e` 扫场地。
-# 三个动作缺一不可（pip uninstall 只做得到第 1 个）：
-#   1. `pip uninstall -y` —— 按 pip 自己的元数据摘除（含 editable 的 .pth）
-#   2. 删实体目录 `site-packages/<pkg>/` —— pip uninstall 不做（它只认元
-#      数据里记的文件）。更早某次**非** editable 安装留下的目录属于这类，
-#      且会因 sys.path 顺序永久遮挡 editable 安装。
-#   3. 删累积的 `__editable__.<pkg>-*.pth` —— 每次装 editable 都会新写一个
-#      带版本号的且从不回收（实测攒到过 0.7.0/0.8.0/0.9.0 三个）。
-# 只删 pip 生成的确定性路径；site-packages 用 sysconfig 动态取，不硬编码版本。
+# Uninstall every installation trace of an SDK package, clearing the ground
+# for the `pip install -e` that follows. All three actions are needed
+# (pip uninstall only does the first one):
+#   1. `pip uninstall -y` — removes it using pip's own metadata (including
+#      the editable .pth)
+#   2. Delete the physical directory `site-packages/<pkg>/` — pip uninstall
+#      does not do this (it only knows the files recorded in its metadata).
+#      A directory left behind by an earlier **non**-editable install
+#      belongs to this category, and it shadows the editable install
+#      permanently because of the sys.path order.
+#   3. Delete the accumulated `__editable__.<pkg>-*.pth` — every editable
+#      install writes a new versioned one and never reclaims it (observed
+#      up to three of them: 0.7.0/0.8.0/0.9.0).
+# Only the deterministic paths pip generates are deleted; the site-packages
+# path is obtained dynamically via sysconfig, no version is hardcoded.
 purge_install_traces() {
     local pkg="$1"
     local sp
     sp="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
     if [ -z "$sp" ] || [ ! -d "$sp" ]; then
-        echo "WARN: [$pkg] 无法定位 site-packages（$sp），跳过清理" >&2
+        echo "WARN: [$pkg] cannot locate site-packages ($sp), skipping the cleanup" >&2
         return 0
     fi
 
     echo "    [$pkg] pip uninstall -y $pkg"
-    # pip uninstall 对「当前没装」返回非 0，不算失败。
+    # pip uninstall returns non-zero when the package is not installed, which
+    # is not a failure.
     $PIP_TARGET uninstall -y "$pkg" >/dev/null 2>&1 || true
 
     local removed=0 f
     if [ -d "$sp/$pkg" ]; then
-        echo "    [$pkg] 删除非 editable 残留实体目录 $sp/$pkg"
+        echo "    [$pkg] deleting the leftover physical directory of a non-editable install: $sp/$pkg"
         rm -rf "$sp/$pkg"
         removed=1
     fi
-    # pip 升级/卸载时会把旧目录/旧 dist-info 改名成 ``~`` 前缀再删；
-    # 进程被打断就留下 ``~dndds`` / ``~-ndds`` / ``~dndds-*.dist-info`` 这类
-    # 垃圾。它们的命名**不固定**（pip 各版本改名策略不同，实测同一个
-    # wdndds 能留下三种），所以按包名去 glob 是抓不全的。
+    # On upgrade/uninstall pip renames the old directory / dist-info with a
+    # ``~`` prefix before deleting it; when the process is interrupted that
+    # leaves junk such as ``~dndds`` / ``~-ndds`` /
+    # ``~dndds-*.dist-info``. Their naming is **not fixed** (pip versions
+    # differ in their renaming strategy; observed: the same wdndds left
+    # three different ones), so globbing by package name does not catch
+    # them all.
     #
-    # 但 ``~`` 不是合法的 Python 标识符首字符 —— 合法包名不可能以它开头，
-    # 所以 site-packages 里的 ``~*`` **一律是 pip 垃圾**，整个扫掉即可。
-    # 不这么做的后果：importlib.metadata 会把 ``~xxx.dist-info`` 当成一个
-    # 非法发行版，pip 每条命令都刷 "Ignoring invalid distribution"，
-    # 还可能让对应的包从 pip list 里整个消失（实测 wdndds 就这样没了）。
+    # But ``~`` is not a valid first character of a Python identifier — a
+    # legal package name can never start with it, so every ``~*`` in
+    # site-packages is **pip junk** and the whole set can be swept away.
+    # Not doing this leads to importlib.metadata treating
+    # ``~xxx.dist-info`` as an illegal distribution, pip printing
+    # "Ignoring invalid distribution" on every command, and the package
+    # possibly disappearing from pip list entirely (observed with wdndds).
     for f in "$sp"/'~'*; do
         [ -e "$f" ] || continue
-        echo "    [$pkg] 删除 pip 中断残留 $f"
+        echo "    [$pkg] deleting the leftover of an interrupted pip run: $f"
         rm -rf "$f"
         removed=1
     done
     for f in "$sp/$pkg"-*.dist-info "$sp/$pkg".dist-info \
              "$sp/__editable__.$pkg"-*.pth "$sp/__editable__.$pkg.pth"; do
         [ -e "$f" ] || continue
-        echo "    [$pkg] 删除 $f"
+        echo "    [$pkg] deleting $f"
         rm -rf "$f"
         removed=1
     done
 
     if [ "$removed" = "0" ]; then
-        echo "    [$pkg] 无残留（干净的可编辑安装）"
+        echo "    [$pkg] nothing left behind (a clean editable install)"
     fi
 }
 
@@ -317,18 +374,19 @@ update_pkg() {
     local repo_url="$2"
     local dir="$VENV_SRC/$pkg"
 
-    # pip stderr 存临时文件，install 后由 verify_outputs 在 .so 缺失时
-    # 回打（-v 让 setuptools 把钩子内部的输出转发进来）。
+    # The pip stderr goes to a temporary file, which verify_outputs prints
+    # back when a .so is missing after the install (-v makes setuptools
+    # forward the output of the hook internals).
     local pip_log
     pip_log="$(mktemp -t update_rkwhl.XXXXXX.log)"
     [ -n "$pip_log" ] || pip_log="/tmp/update_rkwhl.$$.log"
     trap "rm -f '$pip_log'" RETURN
 
-    # 步骤 1：拉取最新代码
+    # Step 1: fetch the latest code
     if [ ! -d "$dir" ]; then
-        echo "==> [$pkg] 未找到 $dir，执行 pip install -e 安装"
+        echo "==> [$pkg] $dir not found, running a pip install -e"
         if ! ( cd "$SCRIPT_DIR" && $PIP_TARGET install -v --no-deps -e "$repo_url" ) 2> "$pip_log"; then
-            echo "FATAL: [$pkg] pip install 自身失败（exit≠0）" >&2
+            echo "FATAL: [$pkg] pip install itself failed (exit != 0)" >&2
             tail -n 60 "$pip_log" >&2 || true
             return 1
         fi
@@ -340,46 +398,55 @@ update_pkg() {
     local before after
     before=$(git -C "$dir" rev-parse HEAD)
 
-    # pull 失败不中止整个脚本，记 warn 跳过本包继续下一个。
-    # `--ff-only` 只在两种情况下拒绝，且都不改动工作区：本地有未提交
-    # 修改会被覆盖、或本地与远程已分叉。这属于「本地有人在工作」，
-    # 强推/merge 都不是脚本该做的决定（FATAL 留给 pip / .so 这类真故障）。
+    # A failed pull does not abort the whole script: it logs a warning,
+    # skips this package and continues with the next one.
+    # `--ff-only` refuses in exactly two cases, and neither touches the
+    # working tree: local uncommitted changes would be overwritten, or the
+    # local branch has diverged from the remote. That means "somebody is
+    # working locally" — force pushing or merging is not a decision this
+    # script should make (FATAL is reserved for real failures such as pip
+    # or a missing .so).
     #
-    # 加重试：网络抖动（RPC failed / curl 28 连接超时）跟「本地有改动」
-    # 是两回事 —— 前者重试一次就好，后者重试多少次都一样。`--ff-only`
-    # 保证失败时**不改动工作区**，所以重试是安全的。
+    # With retries: network flapping (RPC failed / curl 28 connection
+    # timeout) is a different thing from "local changes" — the former
+    # usually succeeds on a retry, the latter never does. `--ff-only`
+    # guarantees that a failed attempt leaves the **working tree
+    # untouched**, so retrying is safe.
     local _pull_ok=0 _try=1
     while [ "$_try" -le "${UPDATE_RKWHL_PULL_RETRY:-5}" ]; do
-        # lowSpeedLimit/lowSpeedTime：git 默认**没有**连接超时，TCP 层的
-        # 失败要等 135s 才报（实测 "Failed to connect ... after 135137 ms"）。
-        # 8 个包逐个 pull 的话，一次网络抖动就能拖掉十几分钟。压到 30s。
+        # lowSpeedLimit/lowSpeedTime: git has **no** connect timeout by
+        # default, so a TCP-level failure takes 135s to surface (observed:
+        # "Failed to connect ... after 135137 ms"). Pulling 8 packages one
+        # by one, a single hiccup can cost a quarter of an hour. Cap it at
+        # 30s.
         if git -C "$dir" -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30 \
             pull --ff-only; then
             _pull_ok=1
             break
         fi
         if [ "$_try" -lt "${UPDATE_RKWHL_PULL_RETRY:-5}" ]; then
-            echo "WARN: [$pkg] git pull 失败（第 $_try 次），5s 后重试" >&2
+            echo "WARN: [$pkg] git pull failed (attempt $_try), retrying in 5s" >&2
             sleep 5
         fi
         _try=$((_try + 1))
     done
     if [ "$_pull_ok" != "1" ]; then
-        echo "WARN: [$pkg] git pull --ff-only 失败，跳过本包（.venv 未改动）" >&2
-        echo "      常见原因：本地有未提交修改 / 本地与远程已分叉 / 网络抖动" >&2
-        echo "      git 不会因此丢失你的修改——请自行处理后重跑：" >&2
+        echo "WARN: [$pkg] git pull --ff-only failed, skipping this package (the .venv is unchanged)" >&2
+        echo "      common causes: uncommitted local changes / the local branch has diverged from the remote / network flapping" >&2
+        echo "      git does not lose your changes because of this — handle it yourself and re-run:" >&2
         echo "        git -C $dir status" >&2
-        echo "        git -C $dir stash   # 或 commit / branch" >&2
-        echo "      其余 SDK 继续处理。" >&2
+        echo "        git -C $dir stash   # or commit / branch" >&2
+        echo "      the remaining SDKs keep being processed." >&2
         return 1
     fi
     after=$(git -C "$dir" rev-parse HEAD)
 
-    # 步骤 2/3：HEAD 没变就不动 .venv（信号选择理由见文件头）
+    # Step 2/3: when the HEAD did not change the .venv stays untouched (see
+    # the file header for why this signal was chosen)
     local force="${UPDATE_RKWHL_FORCE_REBUILD:-0}"
     if [ "$before" = "$after" ] && [ "$force" != "1" ]; then
-        echo "==> [$pkg] HEAD 未变（${after:0:7}），跳过安装（.venv 未改动）"
-        echo "    需要强制重建时：UPDATE_RKWHL_FORCE_REBUILD=1 $0"
+        echo "==> [$pkg] HEAD unchanged (${after:0:7}), skipping the install (the .venv is unchanged)"
+        echo "    to force a rebuild: UPDATE_RKWHL_FORCE_REBUILD=1 $0"
         return 0
     fi
 
@@ -387,28 +454,33 @@ update_pkg() {
     if [ "$before" != "$after" ]; then
         reason="HEAD ${before:0:7}→${after:0:7}"
     else
-        reason="HEAD 未变（${after:0:7}），但 FORCE_REBUILD=1"
+        reason="HEAD unchanged (${after:0:7}), but FORCE_REBUILD=1"
     fi
-    echo "==> [$pkg] ${reason}，卸载旧版本后重装"
+    echo "==> [$pkg] $reason, uninstalling the old version and reinstalling"
 
-    # 步骤 4a：彻底卸载
+    # Step 4a: uninstall completely
     purge_install_traces "$pkg"
 
-    # 步骤 4b：安装新版本。传本地路径而非 $repo_url 以免 SSH 重新 clone；
-    # .so 编译走 build_py 钩子（内部无条件 unlink + 重建），失败时旧 .so
-    # 已被删，运行时 import 抛 FileNotFoundError，比 silent undefined
-    # symbol 容易诊断。
+    # Step 4b: install the new version. The local path is passed instead of
+    # $repo_url to avoid a fresh SSH clone; the .so is compiled by the
+    # build_py hook (which unconditionally unlinks and rebuilds), and when
+    # it fails the old .so is already gone, so the runtime import raises
+    # FileNotFoundError, which is easier to diagnose than a silent
+    # undefined symbol.
     if ! ( cd "$SCRIPT_DIR" && $PIP_TARGET install -v --no-deps -e "$dir" ) 2> "$pip_log"; then
-        echo "FATAL: [$pkg] pip install 自身失败（exit≠0）" >&2
+        echo "FATAL: [$pkg] pip install itself failed (exit != 0)" >&2
         tail -n 60 "$pip_log" >&2 || true
         return 1
     fi
     verify_outputs "$pkg" "$pip_log" || return 1
 }
 
-# 逐包驱动：某个包失败只记 warn 并继续下一个，跑完全部再汇总。
-# 早期用裸调用 + `set -e`，一个包出错就打断整个脚本，后面的 SDK 静默
-# 停留在旧版——三包只要有一个处于「本地有改动」，另外两个就永远升不了。
+# Drive the packages one by one: a failing package only logs a warning and
+# the next one is processed; the summary comes at the end.
+# Early on this was a bare call + `set -e`, so a single failing package
+# aborted the whole script and the SDKs behind it silently stayed on the
+# old version — with three packages, if one of them has local changes the
+# other two can never be upgraded.
 FAILED_PKGS=()
 run_pkg() {
     local pkg="$1"
@@ -416,42 +488,50 @@ run_pkg() {
     if update_pkg "$pkg" "$repo_url"; then
         return 0
     fi
-    echo "WARN: [$pkg] 本次未更新（详见上方错误）" >&2
+    echo "WARN: [$pkg] not updated this time (see the error above)" >&2
     FAILED_PKGS+=("$pkg")
-    return 0   # 吞掉失败，保证后续包继续
+    return 0   # swallow the failure so the following packages continue
 }
 
 # ---------------------------------------------------------------------------
-# 依赖审计（--no-deps 的对冲）
+# Dependency audit (the hedge against --no-deps)
 #
-# SDK 一律用 `pip install --no-deps -e` 装 —— 这是**有意为之**，不是历史遗留：
-#   * 私有包不在 PyPI（wdndds → wdnai、插件包 → wdnhid / wdnav），让 pip 去
-#     解析必挂；
-#   * 解析会把 opencv-python（GUI 版）一起拉进来，和已装的
-#     opencv-python-headless 抢同一个 cv2 包；
-#   * av 需要手挑版本；
-#   * 目标机常常根本连不上 PyPI。
-# 详见 README §4b。
+# The SDKs are always installed with `pip install --no-deps -e` — this is
+# **deliberate**, not legacy:
+#   * the private packages are not on PyPI (wdndds → wdnai, the plugin
+#     packages → wdnhid / wdnav), so letting pip resolve them fails
+#     outright;
+#   * the resolution would pull in opencv-python (the GUI build) next to
+#     the installed opencv-python-headless, and the two fight over the same
+#     cv2 package;
+#   * av needs a hand-picked version;
+#   * the target machine often cannot reach PyPI at all.
+# See README §4b.
 #
-# 代价是 **SDK 自己声明的依赖永远不会自己进 venv**，而故障现场离原因很远：
-#   * v4l2 缺失 → HDMI-IN 快照端点一直 503；
-#   * tokenizers 缺失 → 算力页「模型启动失败」。
+# The price is that **the dependencies the SDKs declare never land in the
+# venv on their own**, and the symptom is far away from the cause:
+#   * v4l2 missing → the HDMI-IN snapshot endpoint returns 503 forever;
+#   * tokenizers missing → the compute page reports "model failed to
+#     start".
 #
-# 所以装完必须**当场核一遍**：读 .venv/src/*/pyproject.toml 的
-# [project].dependencies，逐条查**已装**发行版（不查索引 → 离线可用），
-# 并**真的 import 一次** —— 「装了但 import 失败」正是 v4l2 那类故障，
-# find_spec 查不出来。
+# So after the install they have to be **checked on the spot**: read the
+# [project].dependencies of .venv/src/*/pyproject.toml, look up every
+# **installed** distribution (not the index → works offline), and **really
+# import it once** — "installed but fails to import" is exactly the class
+# of failure that v4l2 represents, and find_spec does not catch it.
 #
-# 判定在 scripts/check_sdk_deps.py（可独立跑）。注意审计读的是**源码树**的
-# pyproject：它可能比已装版本新 —— 这正是我们要的（提前把新依赖报出来）。
+# The decision lives in scripts/check_sdk_deps.py (which can be run on its
+# own). Note that the audit reads the pyproject of the **source tree**: it
+# may be newer than the installed version — which is exactly what we want
+# (new dependencies are reported early).
 # ---------------------------------------------------------------------------
 audit_sdk_deps() {
     local checker="$SCRIPT_DIR/scripts/check_sdk_deps.py"
     if [ ! -f "$checker" ]; then
-        echo "WARN: 找不到 $checker，跳过依赖审计" >&2
+        echo "WARN: $checker not found, skipping the dependency audit" >&2
         return 0
     fi
-    echo "==> 审计 SDK 声明的依赖是否真的可用 (scripts/check_sdk_deps.py)"
+    echo "==> auditing whether the SDK-declared dependencies are really usable (scripts/check_sdk_deps.py)"
     ( cd "$SCRIPT_DIR" && python "$checker" )
 }
 
@@ -460,42 +540,51 @@ run_pkg wdnai  "$WARDNER_PKG_BASE/wdnai.git#egg=wdnai"
 run_pkg wdndds "$WARDNER_PKG_BASE/wdndds.git#egg=wdndds"
 run_pkg wdnhid "$WARDNER_PKG_BASE/wdnhid.git#egg=wdnhid"
 
-# 应用插件包（wdnwebui 的卡片）。放在 SDK 之后：wdnapps_hdmi_processor 的
-# usb_hid 卡 import wdnhid / wdnav，先有它们再装插件，日志里的报错才不会
-# 指向"还没装的 SDK"这种假线索。
+# The application plugin packages (the cards of wdnwebui). They come after
+# the SDKs: the usb_hid card of wdnapps_hdmi_processor imports wdnhid /
+# wdnav, and installing the plugins only after those exist keeps the errors
+# in the log from pointing at "an SDK that is not installed yet" — a false
+# lead.
 #
-# **包名必须用下划线**（= 目录名 = pip 落盘的 dist-info / .pth 名）。
-# pip 的规范名是连字符的 wdnapps-video-analyzer，但 site-packages 上实际
-# 生成的是 wdnapps_video_analyzer-0.1.0.dist-info 和
-# __editable__.wdnapps_video_analyzer-0.1.0.pth。purge_install_traces 全靠
-# $pkg 拼这些 glob —— 传连字符名会让清理静默落空，旧 .pth 越攒越多，
-# 而那正是文件头 v1.3 要根治的"实体目录遮挡 editable 安装"问题。
+# **The package name must use underscores** (= the directory name = the
+# dist-info / .pth name pip writes to disk). The canonical name of pip is
+# the hyphenated wdnapps-video-analyzer, but what actually lands in
+# site-packages is wdnapps_video_analyzer-0.1.0.dist-info and
+# __editable__.wdnapps_video_analyzer-0.1.0.pth. purge_install_traces globs
+# all of these with $pkg — passing the hyphenated name makes the cleanup
+# silently miss, old .pth files pile up, and that is exactly the "physical
+# directory shadows the editable install" problem the v1.3 file header set
+# out to eliminate.
 run_pkg wdnapps_video_analyzer "$WARDNER_PKG_BASE/wdnapps_video_analyzer.git#egg=wdnapps_video_analyzer"
 run_pkg wdnapps_hdmi_processor "$WARDNER_PKG_BASE/wdnapps_hdmi_processor.git#egg=wdnapps_hdmi_processor"
 run_pkg wdnapps_audio_chat "$WARDNER_PKG_BASE/wdnapps_audio_chat.git#egg=wdnapps_audio_chat"
-# 媒体生成插件包（文生图 / 图生图，Qwen-Image-2.1）。卡片跑在 wdnai 的
-# image 能力上，所以同样排在 wdnai 之后。
+# The media generation plugin package (text-to-image / image-to-image,
+# Qwen-Image-2.1). Its cards run on the image capability of wdnai, so it
+# comes after wdnai as well.
 run_pkg wdnapps_media_generator "$WARDNER_PKG_BASE/wdnapps_media_generator.git#egg=wdnapps_media_generator"
 
-# 依赖审计放在**所有包都处理完之后**：这时 venv 的状态才是最终状态
-# （前面的包可能刚被重装，依赖也可能刚被 pip 换掉）。审计失败不改 .venv，
-# 所以不打断已经跑完的更新，只影响本脚本的退出码。
+# The dependency audit runs **after every package has been processed**:
+# only then is the state of the venv the final state (the packages before
+# it may just have been reinstalled, and pip may just have swapped a
+# dependency). A failed audit does not modify the .venv, so it does not
+# interrupt the update that already ran; it only affects the exit code of
+# this script.
 DEPS_AUDIT_OK=1
 audit_sdk_deps || DEPS_AUDIT_OK=0
 
 if [ ${#FAILED_PKGS[@]} -eq 0 ] && [ "$DEPS_AUDIT_OK" = "1" ]; then
-    echo "更新完成（wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor / wdnapps_audio_chat / wdnapps_media_generator 全部成功）。"
+    echo "Update complete (wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor / wdnapps_audio_chat / wdnapps_media_generator all succeeded)."
     exit 0
 fi
 
 echo "" >&2
 if [ ${#FAILED_PKGS[@]} -ne 0 ]; then
-    echo "更新部分完成，以下包未更新：${FAILED_PKGS[*]}" >&2
-    echo "其余包已按各自状态处理完毕；上述包解决后重跑 $0 即可。" >&2
+    echo "The update partly completed, these packages were not updated: ${FAILED_PKGS[*]}" >&2
+    echo "The remaining packages have been processed according to their own state; re-run $0 once the packages above are sorted out." >&2
 fi
 if [ "$DEPS_AUDIT_OK" != "1" ]; then
-    echo "依赖审计未通过：SDK 声明的依赖有缺失 / 版本不符 / import 失败。" >&2
-    echo "  补齐： .venv/bin/pip install -r requirements.txt" >&2
-    echo "  再查： .venv/bin/python scripts/check_sdk_deps.py" >&2
+    echo "The dependency audit did not pass: the SDK-declared dependencies are missing, have the wrong version or fail to import." >&2
+    echo "  to fill the gap: .venv/bin/pip install -r requirements.txt" >&2
+    echo "  to check again: .venv/bin/python scripts/check_sdk_deps.py" >&2
 fi
 exit 1

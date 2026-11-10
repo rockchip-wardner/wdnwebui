@@ -1,18 +1,21 @@
 #!/bin/bash
-# 混合量化第 ② 步的并行 runner：同一份 step1 产物 (.model/.data)，不同的 cfg。
+# The parallel runner for step ② of the hybrid quantization: the same step1
+# artefacts (.model/.data), a different cfg.
 #
-# step1 贵（逐层标定 + 自动填 custom_quantize_layers），step2 便宜（编译 + 出模型）。
-# 所以 step1 只跑一次，之后每换一份 cfg 就跑一次 step2。
+# step1 is expensive (per-layer calibration + filling custom_quantize_layers
+# automatically), step2 is cheap (compile + produce the model). So step1 is
+# run once, and after that every new cfg runs step2.
 #
-# 三档对照：
-#   theirs —— 只用工具链自己自动填的 custom_quantize_layers
-#   ours   —— 只用逐层精度分析挑出来的层留 fp16
-#   union  —— 两者合并
+# The three variants to compare:
+#   theirs —— only the custom_quantize_layers the toolchain filled in itself
+#   ours   —— only the layers picked by the per-layer accuracy analysis are
+#             kept in fp16
+#   union  --- both of them combined
 #
-# 用法: hyb_run.sh <workdir> <tag> <mode> [fp16_layers_file]
+# Usage: hyb_run.sh <workdir> <tag> <mode> [fp16_layers_file]
 set -eu
 
-WORK="${1:?用法: hyb_run.sh <workdir> <tag> <mode> [fp16_file]}"
+WORK="${1:?usage: hyb_run.sh <workdir> <tag> <mode> [fp16_file]}"
 TAG="${2:?}"
 MODE="${3:?}"
 FP16="${4:-}"
@@ -23,7 +26,8 @@ CWD="$ROOT/hybrun/$TAG"
 mkdir -p "$CWD" "$ROOT/logs"
 cd "$CWD"
 
-# 每个 run 独立 TMPDIR，避免并发时互相覆盖工具链的临时文件
+# Every run gets its own TMPDIR, so that concurrent runs do not overwrite
+# each other's temporary files of the toolchain
 export TMPDIR=/datasets/tmp/rknnbuild_$TAG
 mkdir -p "$TMPDIR"
 
@@ -36,7 +40,7 @@ echo "[$TAG] model=$MODEL"
 echo "[$TAG] data =$DATA"
 echo "[$TAG] cfg  =$SRC_CFG"
 
-# 改写 cfg
+# rewrite the cfg
 if [ "$MODE" = "theirs" ]; then
   "$PY" "$ROOT/hyb_cfg.py" --cfg "$SRC_CFG" --out "$CFG" --mode theirs
 else
@@ -44,7 +48,7 @@ else
         --fp16-file "$FP16"
 fi
 
-# step2 + 出模型 + 模拟器对拍
+# step2 + produce the model + compare against the simulator
 "$PY" -u "$ROOT/hyb_step2.py" \
     --tag "$TAG" \
     --model "$MODEL" --data "$DATA" --cfg "$CFG" \

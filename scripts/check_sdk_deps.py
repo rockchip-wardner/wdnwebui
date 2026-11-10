@@ -22,7 +22,7 @@ the cause —
 
 * ``v4l2`` missing → the HDMI-IN endpoints return 503 forever
   (``No module named 'v4l2'``);
-* ``tokenizers`` missing → the compute page says 「模型启动失败」.
+* ``tokenizers`` missing → the compute page reports a model startup failure.
 
 This script turns that class of failure into an install-time error:
 
@@ -74,9 +74,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SRC_DIR = REPO_ROOT / ".venv" / "src"
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
 
-#: 私有发行版 —— 由兄弟 SDK 的 editable 安装提供，**不在 PyPI 上**。
-#: 缺了只能靠 ``update_rkwhl.sh`` 装 SDK 解决，``pip install <name>``
-#: 是错的修法，所以提示语要分开写。
+#: Private distributions — provided by the editable install of a sibling SDK,
+#: **not on PyPI**. When one of them is missing it can only be fixed by
+#: installing the SDKs through ``update_rkwhl.sh``; ``pip install <name>``
+#: is the wrong remedy, so the hint has to be worded differently.
 PRIVATE_DISTS = {
     "wdnav",
     "wdnai",
@@ -88,7 +89,8 @@ PRIVATE_DISTS = {
     "wdnapps_video_analyzer",
 }
 
-#: 发行版名 → import 名（默认同名 + 下划线化）。
+#: Distribution name → import name (the same name by default, with
+#: underscores).
 _IMPORT_NAME = {
     "opencv-python": "cv2",
     "opencv-python-headless": "cv2",
@@ -100,9 +102,10 @@ _IMPORT_NAME = {
     "sentencepiece": "sentencepiece",
 }
 
-#: 提供同一个 import 的等价发行版。headless 版即满足 ``opencv-python``
-#: 声明 —— 强制解析会把 **GUI 版 opencv-python 一起装进来**，两份
-#: ``cv2`` 互相覆盖（见 README §3）。
+#: Equivalent distributions that provide the same import. The headless build
+#: already satisfies a declared ``opencv-python`` — the forced resolution
+#: would install the **GUI build of opencv-python** as well, and the two
+#: overwrite each other's ``cv2`` (see README §3).
 _EQUIVALENT = {
     "opencv-python": ("opencv-python-headless",),
     "opencv-python-headless": ("opencv-python",),
@@ -115,7 +118,7 @@ _REQ_RE = re.compile(
     r"(?:;\s*(?P<marker>.*))?$"
 )
 
-#: 状态
+#: Status
 OK = "OK"
 MISSING = "MISSING"
 BAD_VERSION = "BAD_VERSION"
@@ -203,12 +206,14 @@ def _installed_version(dist: str) -> str | None:
 
 
 def _expand_equivalents(names: set[str]) -> set[str]:
-    """把提供同一个 import 的等价发行版名互相算作「已 pin」。
+    """Treat distribution names that provide the same import as each other
+    as "pinned".
 
-    requirements.txt 里 pin 的是 ``opencv-python-headless``，而 SDK 声明的
-    是 ``opencv-python`` —— 两者提供同一个 ``cv2`` 包。不做这层展开的话，
-    提示语会错误地说「requirements.txt 里也没有」，把人引去装 GUI 版
-    opencv（那会跟 headless 版抢同一个 ``cv2``）。
+    requirements.txt pins ``opencv-python-headless`` while the SDKs declare
+    ``opencv-python`` — both provide the same ``cv2`` package. Without this
+    expansion the hint would wrongly say "requirements.txt does not have it
+    either" and send people to install the GUI build of opencv (which
+    fights the headless build over the same ``cv2``).
     """
     out = set(names)
     for name in list(out):
@@ -285,20 +290,24 @@ def _read_captured(tmp) -> str:
 
 
 def _mute_stdout_at_teardown() -> None:
-    """把 fd 1 指向 /dev/null，让解释器拆卸时那行 native banner 落进黑洞。
+    """Point fd 1 at /dev/null so the native banner that the interpreter
+    prints while shutting down falls into the void.
 
-    ``librga`` 在**进程收尾**时（ctypes 释放 CDLL → dlclose）用 ``write(2)``
-    直接往 fd 1 吐一行 ``rga_api version 1.10.5_[9]``。
+    ``librga`` writes a line ``rga_api version 1.10.5_[9]`` straight to fd 1
+    via ``write(2)`` during **process teardown** (ctypes releases the CDLL →
+    dlclose).
 
-    实测（strace）：那是一次**独立的 write(1, ...) 系统调用**，发生在脚本
-    主体跑完、解释器开始收尾时 —— **比 Python 的 atexit 处理器还早**，
-    所以「在 atexit 里静音」是来不及的（试过，banner 照样出现）。
+    Observed with strace: that is one **independent write(1, ...) system
+    call** that happens after the body of the script has run and the
+    interpreter starts tearing down — **earlier even than Python's atexit
+    handlers** — so "silencing it in atexit" is too late (tried, the banner
+    shows up anyway).
 
-    因此只能在 main() 返回前直接换掉 fd 1。stderr 不动：真正的报错
-    还是要看得见。
+    Therefore fd 1 has to be swapped right before main() returns. stderr is
+    left alone: real errors still have to be visible.
 
-    只在 ``__main__`` 下调用 —— 这个脚本被当模块 import 时不该抢走
-    调用方的 stdout。
+    Only called under ``__main__`` — this script must not steal the stdout
+    of its caller when it is imported as a module.
     """
     try:
         devnull = os.open(os.devnull, os.O_WRONLY)
@@ -311,41 +320,41 @@ def _mute_stdout_at_teardown() -> None:
 def _check_one(sdk: str, raw: str, pins: set[str]) -> Check:
     parsed = _parse_requirement(raw)
     if parsed is None:
-        return Check(sdk, raw, "", "", "", SKIPPED, "无法解析的依赖声明")
+        return Check(sdk, raw, "", "", "", SKIPPED, "the dependency declaration cannot be parsed")
     name, spec, marker = parsed
     norm = _norm(name)
 
     if not _marker_applies(marker):
         return Check(sdk, raw, name, spec, marker, SKIPPED,
-                     f"marker 不适用于当前环境（{marker}）")
+                     f"the marker does not apply to this environment ({marker})")
 
     version = _installed_version(name)
     if version is None:
         if norm in PRIVATE_DISTS:
-            detail = ("私有包不在 PyPI —— 用 ./update_rkwhl.sh 装 SDK，"
-                      "不要 pip install")
+            detail = ("a private package that is not on PyPI — install the SDKs"
+                      " with ./update_rkwhl.sh, do not pip install")
         elif norm in pins:
-            detail = ("requirements.txt 里已 pin —— 跑 "
+            detail = ("already pinned in requirements.txt — run "
                       ".venv/bin/pip install -r requirements.txt")
         else:
-            detail = (f"requirements.txt 里也没有 —— 补进 requirements.txt "
-                      f"（.venv/bin/pip install '{name}{spec}'）")
+            detail = (f"requirements.txt does not have it either — add it to "
+                      f"requirements.txt (.venv/bin/pip install '{name}{spec}')")
         return Check(sdk, raw, name, spec, marker, MISSING, detail)
 
     if not _version_ok(version, spec):
         return Check(sdk, raw, name, spec, marker, BAD_VERSION,
-                     f"装的是 {version}，不满足 {spec}")
+                     f"the installed version is {version}, which does not satisfy {spec}")
 
     module = _import_name(name)
     with _captured_stdio() as tmp:
         try:
             importlib.import_module(module)
-        except Exception as e:  # noqa: BLE001 — 任何 import 失败都要报出来
+        except Exception as e:  # noqa: BLE001 — every import failure has to be reported
             noise = _read_captured(tmp)
-            detail = (f"装了（{version}）但 import 失败："
+            detail = (f"installed ({version}) but the import fails: "
                       f"{type(e).__name__}: {e}")
             if noise:
-                detail += f" | import 期间的输出：{noise[:300]}"
+                detail += f" | output during the import: {noise[:300]}"
             return Check(sdk, raw, name, spec, marker, BROKEN, detail)
     return Check(sdk, raw, name, spec, marker, OK, version)
 
@@ -368,11 +377,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--src-dir", default=str(DEFAULT_SRC_DIR),
-        help="SDK 源码树目录（默认 .venv/src）",
+        help="the SDK source tree directory (default: .venv/src)",
     )
     ap.add_argument(
         "--quiet", action="store_true",
-        help="只输出有问题的依赖",
+        help="only print the dependencies that have problems",
     )
     args = ap.parse_args(argv)
 
@@ -380,14 +389,15 @@ def main(argv: list[str] | None = None) -> int:
     sdks = _discover_sdks(src_dir)
     if not sdks:
         print(
-            f"[deps] FATAL: {src_dir} 下没找到任何带 pyproject.toml 的 SDK",
+            f"[deps] FATAL: no SDK with a pyproject.toml found under {src_dir}",
             file=sys.stderr,
         )
         return 2
 
     pins = _requirements_pins()
-    # transformers 在 import 时会打一条 "None of PyTorch..." 的 warning，
-    # 与审计无关 —— 压掉，别污染输出。**必须在 import 之前设。**
+    # transformers prints a "None of PyTorch..." warning while it is
+    # imported, which has nothing to do with the audit — silence it so it
+    # does not pollute the output. **Must be set before the import.**
     logging.getLogger("transformers").setLevel(logging.ERROR)
 
     checks: list[Check] = []
@@ -395,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             deps = _read_dependencies(pyproject)
         except Exception as e:  # noqa: BLE001
-            print(f"[deps] FATAL: 读 {pyproject} 失败: {e}", file=sys.stderr)
+            print(f"[deps] FATAL: cannot read {pyproject}: {e}", file=sys.stderr)
             return 2
         for raw in deps:
             checks.append(_check_one(sdk_name, raw, pins))
@@ -404,8 +414,8 @@ def main(argv: list[str] | None = None) -> int:
 
     name_w = max(len(n) for n, _ in sdks) + 1
     if not args.quiet:
-        print(f"[deps] 扫描 {src_dir} 下 {len(sdks)} 个 SDK 的 "
-              f"[project].dependencies（{len(checks)} 条）")
+        print(f"[deps] scanning the [project].dependencies of {len(sdks)} SDKs "
+              f"under {src_dir} ({len(checks)} entries)")
     for sdk_name, _ in sdks:
         mine = [c for c in checks if c.sdk == sdk_name]
         if not mine:
@@ -417,49 +427,54 @@ def main(argv: list[str] | None = None) -> int:
         head = f"[deps] {sdk_name:<{name_w}}"
         if not bad:
             applied = [c.name for c in mine if c.status == OK]
-            extra = (f"（跳过 {len(skipped)} 条 marker 不适用）"
+            extra = (f"({len(skipped)} entries skipped, their marker does not apply)"
                      if skipped else "")
             print(f"{head}OK       {', '.join(applied)}{extra}")
             continue
         for c in bad:
             print(f"{head}{c.status:<11} {c.raw}  —— {c.detail}")
         if skipped:
-            # 有问题时也要说清"另外还跳过了什么" —— 否则明细行数对不上
-            # 依赖条数，读的人会以为审计漏了几条。
+            # When there are problems, say clearly "and this is what was
+            # skipped as well" — otherwise the number of detail lines does
+            # not match the number of dependencies and the reader thinks the
+            # audit missed a few.
             print(f"{head}{'SKIPPED':<11} " +
-                  "、".join(f"{c.raw}（{c.detail}）" for c in skipped))
+                  ", ".join(f"{c.raw} ({c.detail})" for c in skipped))
 
     if not problems:
         if not args.quiet:
-            print(f"[deps] 全部就绪（{len(checks)} 条依赖）")
+            print(f"[deps] everything is ready ({len(checks)} dependencies)")
         return 0
 
-    # stdout 走管道时是块缓冲，stderr 是无缓冲的 —— 不显式 flush 的话
-    # 汇总会跑到明细前面，读起来像"先报结论后给证据"。
+    # stdout is block buffered when it goes into a pipe, stderr is not — without
+    # an explicit flush the summary ends up **before** the details, which
+    # reads like "the conclusion first, the evidence later".
     sys.stdout.flush()
     print("", file=sys.stderr)
-    print(f"[deps] FATAL: {len(problems)} 条依赖不可用", file=sys.stderr)
+    print(f"[deps] FATAL: {len(problems)} dependencies are unusable", file=sys.stderr)
     missing_pins = sorted({
         _norm(c.name) for c in problems
         if c.status == MISSING and _norm(c.name) not in pins
         and _norm(c.name) not in PRIVATE_DISTS
     })
     if missing_pins:
-        print(f"       这些连 requirements.txt 里都没有，先补进去："
+        print(f"       requirements.txt does not have these either, add them first: "
               f"{', '.join(missing_pins)}", file=sys.stderr)
-    print("       修复： .venv/bin/pip install -r requirements.txt",
+    print("       fix: .venv/bin/pip install -r requirements.txt",
           file=sys.stderr)
     if any(c.status == BROKEN for c in problems):
-        print("       import 失败的多半是「装了但版本不对/有 bug」，"
-              "装完记得跑 scripts/fix_v4l2_py3.py 之类的补丁脚本",
+        print("       an import failure is usually \"installed but the version is wrong"
+              "/ there is a bug\" — after installing, remember to run a patch script"
+              " such as scripts/fix_v4l2_py3.py",
               file=sys.stderr)
     return 1
 
 
 if __name__ == "__main__":
     _code = main()
-    # 报告已经落到 stdout 了 —— 现在把 fd 1 换成 /dev/null，好让解释器
-    # 收尾时那行 native banner（librga 打的）落进黑洞。放在 raise 之前，
-    # 也放在模块级 import 之后。
+    # The report has already gone to stdout — now swap fd 1 for /dev/null so
+    # the native banner that the interpreter prints while shutting down
+    # (librga writes it) falls into the void. Placed before the raise, and
+    # after the module level import.
     _mute_stdout_at_teardown()
     raise SystemExit(_code)
