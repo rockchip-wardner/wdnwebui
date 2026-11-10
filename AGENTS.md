@@ -10917,9 +10917,13 @@ stdout 管道没人读时它会阻塞在写上 ⇒ **收到 SIGTERM 后还要好
 
 ### 已知限制：偶发的「日志跟随进程残留」
 
-实测中见过 `journalctl -f` **残留**：客户端断开后它还活了 **1~2 分钟**
-才自己退出（服务端 TCP 连接早已消失，`established` 为 0）。**成因未复现**
-（此后所有可复现的断开路径都正常收尾）。
+修复**之前**实测中见过 `journalctl -f` **残留**：客户端断开后它还活了
+**1~2 分钟**才自己退出（服务端 TCP 连接早已消失，`established` 为 0）。
+**成因未复现**。
+
+修复**之后**用 `scripts/verify_ws_disconnect.py` 回归过 **4 端点 × 3 种
+断开方式 = 12 种组合，全部通过**（含上面那次没复现的场景）⇒ 结论：
+残留来自**修复前的代码**（旧进程），现已消失。
 
 > ⚠️ 别把它和「在线客户端」混淆：`journalctl` 存活 ⇏ 有活跃 WS 连接 ——
 > 它的 stdout 是**管道**不是 TCP。判据要看**服务端的关闭日志**
@@ -10948,3 +10952,60 @@ ESTABLISHED），或**依赖内核 keepalive**（默认 2 小时，太慢）。
 ⇒ 危害有限：残留的只是一个 `journalctl`（它**持有** `/dev/rga`、
 `/tmp/rknnsmi.lock`、FastDDS 共享内存的 **fd**，但**不持有文件锁** ——
 锁随进程退出释放），不影响服务正确性，只是让那些 fd 多活一会儿。
+
+### 回归：`scripts/verify_ws_disconnect.py`（12 条）
+
+对 **4 个端点**（`system-logs` / `audio_analysis` / `tts` / `qwen3-asr`）
+× **3 种断开方式**（正常关闭 / 客户端进程被 **SIGKILL** / 经 **TLS
+relay(8443)**）断言「服务端的关闭标志出现了」。
+
+⇒ 关停链路的修复**跨三个仓**（wdnwebui / wdnapps-video-analyzer /
+wdnapps-audio-chat）⇒ 光靠单仓回归测不出来 ⇒ 这个脚本是唯一的
+「一处跑、三个仓一起验」的守门人。
+
+⇒ 每个端点都要有一行**关闭日志**（`system-logs ws closed` /
+`audio_analysis ws closed` / `ws[..] closed` / `qwen3_asr ws closed`）——
+没有它就没法判定 handler 有没有走到 `finally`。⇒ **加 WS 端点时顺手加
+这行日志**，否则回归脚本覆盖不到。
+
+### ⚠️ 向导类回归失败的第一嫌疑：`compute.autostart` 被清空了
+
+症状（看着像脚本 bug，其实是环境没准备好）：
+
+```
+playwright._impl._errors.TimeoutError: Page.click: Timeout 30000ms exceeded.
+  - waiting for locator("#wd-wizard-root-qwen3-asr #wd-wizard-next-btn")
+  -     - locator resolved to <button disabled ...>下一步</button>
+```
+
+⇒ **「下一步」按钮 disabled** ⇒ 向导的**环境步**没满足 ⇒ 软件能力没就绪
+⇒ **ASR 实例没在跑**。
+
+根因链：`DELETE /api/compute/active-app`（**前端离开卡片时就会发**）会
+**连带清空** `compute.autostart`（`clear_active_app`）⇒ 板子重启后
+**没有任何模型自启** ⇒ 跑回归时实例不在。
+
+> ✅ **这是产品语义，不是 bug**：「离开那张卡 = 取消那张卡的开机自启」。
+> 回归脚本踩到的只是它的**副作用** —— 板子恰好处于「用户已离开所有卡」
+> 的状态，于是没有模型可跑。
+
+⇒ 跑回归**前**先确认实例在跑：
+
+```bash
+curl -s http://127.0.0.1:8000/api/compute | grep -o '"status": "[a-z]*"'
+```
+
+没有实例就恢复 `config.jsonc` 的 `compute.autostart`（设备级配置，不进
+git）再重启：
+
+```jsonc
+"compute": {
+  "autostart": [ { "model": "qwen3-asr", "npu_index": 0 } ],
+  "card_count": null,
+}
+```
+
+> ⚠️ 这是**产品语义**（「离开那张卡 = 取消那张卡的开机自启」），**不是
+> bug** —— 只是回归脚本会踩到它的副作用：板子恰好停在「用户已离开所有卡」
+> 的状态 ⇒ 没有模型自启 ⇒ 回归失败。⇒ 回归前把 `autostart` 恢复好即可
+> （设备级配置，不进 git）。

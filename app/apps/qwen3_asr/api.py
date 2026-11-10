@@ -714,3 +714,6 @@ async def asr_ws(ws: WebSocket) -> None:
             await relay_task
         except (asyncio.CancelledError, Exception):
             pass
+        # Observable end of a subscriber connection — without it a WS that
+        # never gets cleaned up is completely silent.
+        _LOG.info("qwen3_asr ws closed")
