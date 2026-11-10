@@ -3412,11 +3412,16 @@ const ComputeConfigPage = {
       h.missingDirEl.style.display = "none";
     }
 
-    // ---- 设备拓扑要求：需要几个 NPU 设备 + 选中/缺失的布局。
-    //     只在模型声明了多设备要求（total_devices > 1）时显示。
+    // ---- 设备拓扑要求：**只在硬件不满足（或没法确认）时显示**。
+    //     满足时那行「需要 N 个 NPU 设备 + 选中布局」是**冗余**的 —— 同一
+    //     个信息「运行在」那一行已经用固定条目（▣ 本机 RK3588 NPU（VAE
+    //     解码）[自动]）说清楚了，重复一遍只是把卡片撑得很奇怪。
+    //     不满足时**必须**显示：那是 toggle 被锁住的理由；没法确认时
+    //     也要说清楚 —— 「暂时无法确认」和「不满足」不是一回事。
     h.deviceReqEl.innerHTML = "";
-    if (devReq && devTotal > 1) {
-      const sel = devReq.selected || null;
+    const devShow = !!(devReq && devTotal > 1
+                       && (!devReq.ok || devReq.unverified));
+    if (devShow) {
       const head = document.createElement("span");
       head.className = "cc-device-req-label";
       head.textContent = `需要 ${devTotal} 个 NPU 设备`;
@@ -3429,11 +3434,6 @@ const ComputeConfigPage = {
         note.className = "cc-device-req-layout";
         note.textContent = devReq.note || "暂时无法确认设备拓扑是否满足";
         h.deviceReqEl.appendChild(note);
-      } else if (devReq.ok && sel) {
-        const ok = document.createElement("span");
-        ok.className = "cc-device-req-ok";
-        ok.textContent = sel.label;
-        h.deviceReqEl.appendChild(ok);
       } else {
         const bad = document.createElement("span");
         bad.className = "cc-device-req-bad";

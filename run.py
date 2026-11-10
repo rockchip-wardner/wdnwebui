@@ -3,6 +3,7 @@
 Usage:
     python run.py
     python run.py --config /etc/wdnwebui/config.jsonc
+    python run.py --port 8080
     # or
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
@@ -78,6 +79,41 @@ def _pid_listening_on_port(port: int) -> int | None:
     return None
 
 
+def _instance_port(pid: int, argv: list[bytes]) -> int:
+    """The TCP port a ``run.py`` instance is configured to serve.
+
+    Resolution order: ``--port N`` on the command line, then
+    ``WDNWEBUI_PORT`` in the process environment, then the default
+    8000. Used by the stale-process sweep to tell "the leftover of the
+    instance I am about to replace" from "a healthy webui serving a
+    different port" — the latter must never be killed.
+    """
+    decoded = [a.decode("utf-8", "replace") for a in argv]
+    for i, a in enumerate(decoded):
+        if a == "--port" and i + 1 < len(decoded):
+            try:
+                return int(decoded[i + 1])
+            except ValueError:
+                break
+        if a.startswith("--port="):
+            try:
+                return int(a.split("=", 1)[1])
+            except ValueError:
+                break
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            raw = f.read()
+    except OSError:
+        raw = b""
+    for item in raw.split(b"\0"):
+        if item.startswith(b"WDNWEBUI_PORT="):
+            try:
+                return int(item.split(b"=", 1)[1])
+            except ValueError:
+                break
+    return 8000
+
+
 def _ancestor_pids() -> set[int]:
     """Walk ``/proc/*/status`` PPid chain back to PID 1. Returns the
     set of PIDs that are ancestors of (or equal to) ourselves —
@@ -105,15 +141,16 @@ def _ancestor_pids() -> set[int]:
     return out
 
 
-def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
+def _kill_stale_wdnwebui_processes(enabled: bool, port: int = 8000) -> None:
     """Best-effort cleanup of stale wdnwebui MAIN process resources
     from a previous unclean shutdown.
 
     Cleans up:
-      * the uvicorn process holding port 8000 (this is the actual
+      * the uvicorn process holding ``port`` (this is the actual
         ``[Errno 98] Address already in use`` blocker)
-      * the previous ``run.py`` (uvicorn reloader parent; otherwise
-        the reloader-spawned zombie holds port 8000 indefinitely)
+      * the previous ``run.py`` for the **same** port (uvicorn reloader
+        parent; otherwise the reloader-spawned zombie holds the port
+        indefinitely)
       * uvicorn-reloader's ``multiprocessing.spawn`` /
         ``resource_tracker`` children (defunct zombies that inherited
         the LISTEN socket)
@@ -152,8 +189,10 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
 
         Detection rules (all scoped to this repo's repo_root / CWD /
         .venv python to avoid touching foreign processes):
-          (a) ``uvicorn`` holding port 8000 — the actual blocker
-          (b) ``python run.py`` ancestor (the reloader's parent)
+          (a) ``uvicorn`` holding ``port`` — the actual blocker
+          (b) ``python run.py`` ancestor (the reloader's parent) **for
+              the same port** — an instance serving a different port is
+              left alone (two webuis on two ports must coexist)
           (c) uvicorn-reloader's ``multiprocessing.spawn`` /
               ``resource_tracker`` children
           (d) any ``compute_worker.py`` subprocess (orphan or not)
@@ -162,10 +201,10 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
         """
         candidates: list[tuple[str, int]] = []
 
-        # (a) uvicorn holding port 8000 — the actual blocker.
-        holder = _pid_listening_on_port(8000)
+        # (a) uvicorn holding the target port — the actual blocker.
+        holder = _pid_listening_on_port(port)
         if holder and holder != my_pid and holder not in ancestors:
-            candidates.append(("uvicorn(port 8000)", holder))
+            candidates.append((f"uvicorn(port {port})", holder))
 
         worker_path = repo_root / "app" / "services" / "compute_worker.py"
         try:
@@ -202,12 +241,14 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
             )
 
             # (b) stale ``python run.py`` — the actual uvicorn parent.
+            # Only the instance serving **the same port** counts: a
+            # second webui on another port must survive the sweep.
             if len(argv) >= 2 and has_run_py and has_repo_python:
                 try:
                     cwd_target = os.readlink(f"/proc/{pid}/cwd")
                 except OSError:
                     continue
-                if cwd_target == str(repo_root):
+                if cwd_target == str(repo_root) and _instance_port(pid, argv) == port:
                     candidates.append(("run.py", pid))
                     continue
 
@@ -307,27 +348,27 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
         # Give the kernel a moment to release sockets.
         time.sleep(0.5)
 
-    # Post-kill verification: kill whoever still holds 8000 (covers
-    # orphan uvicorn workers whose PPid chain has been reaped by
+    # Post-kill verification: kill whoever still holds the target port
+    # (covers orphan uvicorn workers whose PPid chain has been reaped by
     # init — _find_wdnwebui_ancestor returns None for those). Fall
     # back to ancestor-walk + group kill if a foreign process rebinds
     # the socket after the direct kill. If even that can't release
     # the port, leave a loud hint and let uvicorn raise [Errno 98].
-    new_holder = _pid_listening_on_port(8000)
+    new_holder = _pid_listening_on_port(port)
     if new_holder and new_holder != my_pid and new_holder not in ancestors:
         print(
-            f"[run.py] kill-stale: port 8000 still held by pid={new_holder}; "
+            f"[run.py] kill-stale: port {port} still held by pid={new_holder}; "
             f"killing holder directly",
             file=sys.stderr,
         )
         _signal_pid(new_holder, signal.SIGKILL)
         time.sleep(0.5)
-        leftover = _pid_listening_on_port(8000)
+        leftover = _pid_listening_on_port(port)
         if leftover and leftover != my_pid and leftover not in ancestors:
             ancestor = _find_wdnwebui_ancestor(leftover, repo_root, ancestors)
             if ancestor and ancestor not in {p for _, p in expanded}:
                 print(
-                    f"[run.py] kill-stale: port 8000 still held by pid={leftover}; "
+                    f"[run.py] kill-stale: port {port} still held by pid={leftover}; "
                     f"killing wdnwebui ancestor pid={ancestor} (+ descendants)",
                     file=sys.stderr,
                 )
@@ -335,7 +376,7 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
                     _signal_pid(child, signal.SIGKILL)
                 _signal_pid(ancestor, signal.SIGKILL)
                 time.sleep(0.5)
-                leftover = _pid_listening_on_port(8000)
+                leftover = _pid_listening_on_port(port)
             if leftover and leftover != my_pid and leftover not in ancestors:
                 try:
                     with open(f"/proc/{leftover}/cmdline", "rb") as f:
@@ -343,7 +384,7 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
                 except OSError:
                     cmd = "(unreadable)"
                 print(
-                    f"[run.py] kill-stale: WARNING port 8000 STILL held by "
+                    f"[run.py] kill-stale: WARNING port {port} STILL held by "
                     f"pid={leftover} cmd='{cmd}' — kill -9 manually",
                     file=sys.stderr,
                 )
@@ -355,7 +396,7 @@ def _kill_stale_wdnwebui_processes(enabled: bool) -> None:
     if killed:
         print(
             f"[run.py] kill-stale: {len(killed)} process(es) reaped "
-            f"before binding port 8000",
+            f"before binding port {port}",
             file=sys.stderr,
         )
 
@@ -369,7 +410,7 @@ def _find_wdnwebui_ancestor(
     such ancestor, or ``None`` if the chain breaks / no match.
 
     Used by the post-kill verification path: when the original
-    ``_kill_stale_wdnwebui_processes`` sweep missed the port 8000
+    ``_kill_stale_wdnwebui_processes`` sweep missed the target port
     holder (e.g. it was launched under ``nohup`` and the wrapper
     proc owns the LISTEN socket), we walk up from the holder to find
     a wdnwebui process we can safely kill the whole group of.
@@ -415,30 +456,47 @@ def _find_wdnwebui_ancestor(
 
 
 def _descendant_pids(pid: int) -> list[int]:
-    """Return all descendant PIDs of ``pid`` (children, grand-children, …)
-    in post-order (deepest first). Reads
-    ``/proc/<pid>/task/<pid>/children`` which the kernel maintains
-    automatically — no need to walk /proc on each candidate. Excludes
-    ``pid`` itself; caller signals the root separately.
+    """Return all descendant PIDs of ``pid`` (children, grand-children, …).
+
+    ⚠️ **NOT** via ``/proc/<pid>/task/<pid>/children``: that file needs
+    ``CONFIG_PROC_CHILDREN``, and the kernel of this board does **not**
+    set it (verified in /boot/config: ``# CONFIG_PROC_CHILDREN is not
+    set``) — the file simply does not exist, so the walk returned
+    nothing here and every "signal the descendants too" step was a
+    silent no-op. The parent relation is read from
+    ``/proc/<pid>/status`` (PPid) instead: one scan of /proc, then the
+    tree is built in memory.
+
+    Excludes ``pid`` itself; caller signals the root separately.
     """
+    children: dict[int, list[int]] = {}
+    try:
+        pids = sorted(int(p) for p in os.listdir("/proc") if p.isdigit())
+    except OSError:
+        return []
+    for p in pids:
+        ppid = None
+        try:
+            with open(f"/proc/{p}/status") as f:
+                for line in f:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+        except (OSError, ValueError):
+            continue
+        if ppid:
+            children.setdefault(ppid, []).append(p)
+
     out: list[int] = []
-    stack = [pid]
+    stack = list(children.get(pid, []))
+    seen = {pid}
     while stack:
         cur = stack.pop()
-        try:
-            with open(f"/proc/{cur}/task/{cur}/children") as f:
-                raw = f.read().strip()
-        except OSError:
+        if cur in seen:
             continue
-        if not raw:
-            continue
-        for tok in raw.split():
-            try:
-                child = int(tok)
-            except ValueError:
-                continue
-            stack.append(child)
-            out.append(child)
+        seen.add(cur)
+        out.append(cur)
+        stack.extend(children.get(cur, []))
     return out
 
 
@@ -529,11 +587,20 @@ def main() -> None:
              "the WDNWEBUI_CONFIG env var.",
     )
     parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="TCP port to listen on (default: 8000, or the WDNWEBUI_PORT "
+             "env var when it is set). The stale-process sweep only "
+             "reaps the leftovers of the instance on **this** port — a "
+             "webui serving another port is left alone.",
+    )
+    parser.add_argument(
         "--kill-stale",
         action="store_true", default=None,
-        help="Reap stale wdnwebui MAIN processes (port 8000 uvicorn + "
-             "uvicorn-reloader fork + prior run.py) from a previous "
-             "unclean shutdown before binding. Orphan compute_worker "
+        help="Reap stale wdnwebui MAIN processes (the uvicorn on the "
+             "target port + uvicorn-reloader fork + prior run.py) from a "
+             "previous unclean shutdown before binding. Orphan compute_worker "
              "processes are intentionally NOT killed — they're "
              "independently managed and adopted by "
              "ComputeRegistry.boot_compute_services() on the new boot. "
@@ -567,6 +634,15 @@ def main() -> None:
         # both / neither — default behaviour is ON.
         kill_stale = True
 
+    # Resolve the listen port: CLI --port > WDNWEBUI_PORT env > 8000.
+    port = args.port
+    if port is None:
+        env_port = os.environ.get("WDNWEBUI_PORT", "").strip()
+        port = int(env_port) if env_port.isdigit() else 8000
+    if not (1 <= port <= 65535):
+        print(f"[run.py] invalid port: {port} (must be 1..65535)", file=sys.stderr)
+        raise SystemExit(2)
+
     config_path = args.config.expanduser()
     if not config_path.is_absolute():
         config_path = (Path(__file__).resolve().parent / config_path).resolve()
@@ -576,10 +652,12 @@ def main() -> None:
     # Propagate to the app via env so app.core.config picks it up
     # before any FastAPI route is hit.
     os.environ["WDNWEBUI_CONFIG"] = str(config_path)
+    os.environ["WDNWEBUI_PORT"] = str(port)
 
-    # Reap stale uvicorn (port 8000) + compute_workers from any
-    # previous unclean shutdown BEFORE we try to bind.
-    _kill_stale_wdnwebui_processes(kill_stale)
+    # Reap the stale uvicorn on **this** port + compute_workers from any
+    # previous unclean shutdown BEFORE we try to bind. An instance on
+    # another port is left running.
+    _kill_stale_wdnwebui_processes(kill_stale, port)
 
     # v0.6: no daemon bootstrap — ComputeRegistry's Hub uses FastDDS
     # SIMPLE discovery (multicast 239.255.0.1:7400).
@@ -595,7 +673,7 @@ def main() -> None:
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=True,
         # **只监听源码目录**，这是白名单而不是排除。
         #
