@@ -49,6 +49,17 @@ github = git@github.com:rockchip-wardner/<repo>.git    ← 只 push
 > 本仓库当前**没有**配 gitee 远端（`git remote -v` 只有 `origin` / `github`）
 > —— 保持这样。
 
+## 提交信息规范（2026-11-11）
+
+**commit message 必须用英文。**
+
+- 格式：Conventional Commits —— `type(scope): subject`，正文（若有）也用英文。
+  例：`fix(video-detection): keep the event badge above the canvas`
+- 原因：本仓发布到公开的 GitHub 镜像（发布镜像 = 国际可见），提交历史是给国际读者
+  看的 —— 中文提交信息让公开历史没法读。
+- **只约束提交信息**：代码注释、docstring、仓内文档（AGENTS.md / README）仍按各仓
+  现有的写法（中文没问题）。README 是中英双语，AGENTS.md 允许中文。
+
 ## Stack at a glance
 
 - **Web framework**: FastAPI + Uvicorn (`run.py` boots `app.main:app` on
