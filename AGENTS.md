@@ -869,6 +869,16 @@ vd 除了 `image_size` / `model_id`，还有两处 vtd 没有的东西：
   stage 里面。`.vd-stage` 的 16:9 是给单 canvas 的尺寸基准；宫格要靠它给出确定
   高度，再用 `grid-auto-rows:1fr` 撑满行。提示层（`.vd-overlay`）要放在宫格
   **内部** —— absolute 不参与网格布局，`inset:0` 正好罩住画面。
+* **浮层必须显式给 `z-index`，否则会被画面盖死。** 宫格那一版把画面从「非定位的
+  `<canvas>`」换成了「`position: relative` 的 `.vd-tile`」，而 `.vd-tile` 是
+  `MultiGrid.paint()` **追加**到宫格 div 上的 —— 排在提示层之后。CSS 2.1 附录 E
+  第 8 步：定位元素且 `z-index: auto` 的按 **DOM 顺序**绘制 → `.vd-tile` /
+  `.vd-overlay` / `.vd-event-badge` 三者同一层叠组 → 后来的 tile 赢，而 tile 有不透明
+  的 `background:#000` → **浮框整个被盖住**（用户现象：音视频描述页右上角那个显示
+  检测内容的浮框不见了；EOF / 帧渲染失败 / WS 错误 的提示层同样看不见）。
+  层级：`tile(0) < .vd-overlay(5) < .vd-event-badge(6)`，`.vtd-crop-popup` 的 6 同理。
+  改 DOM 没用 —— tile 是运行期 append 的，静态 DOM 里排不到它后面。
+  自检：`scripts/check_canvas_overlay_stacking.py`（不依赖浏览器，直接解析 CSS 算层叠）。
 
 ### vtl 的「命中定格」：定格**算框那一帧**，不是定格「事件到达时」的画布
 

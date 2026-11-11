@@ -841,6 +841,14 @@ html, body {
 .vd-overlay {
   position: absolute;
   inset: 0;
+  /* 必须压过 .vd-tile —— 宫格那一版把画面从「非定位的 <canvas>」换成了
+     「position:relative 的 .vd-tile」，而 .vd-tile 是 MultiGrid.paint()
+     **追加**到宫格 div 上的，排在提示层之后。两边都是定位元素且
+     z-index:auto → 同一层叠组里按 DOM 顺序绘制 → 画面把提示层盖住了
+     （EOF / 帧渲染失败 / WS 错误 这些提示就看不见了）。
+     z-index 非 auto 才会把它们抬到画面之上。层级：tile(0) < overlay(5)
+     < event-badge(6)。 */
+  z-index: 5;
   pointer-events: none;
   display: flex;
   align-items: center;
@@ -1271,6 +1279,12 @@ html, body {
   position: absolute;
   top: 0.6rem;
   right: 0.6rem;
+  /* 同 .vd-overlay：必须压过 .vd-tile，否则检测结果的浮框会被画面盖住
+     （浮框是 DOM 里先于 tile 的，两边又都是 z-index:auto 的定位元素，
+     同层叠组按 DOM 顺序绘制 → 后来的 tile 赢）。
+     6 比 overlay 的 5 高一层：两个框可能重叠（提示语长了会压到右上角），
+     浮框要压住提示层。参考 .vtd-crop-popup 的 6。 */
+  z-index: 6;
   max-width: 60%;
   background: rgba(17, 24, 39, 0.78);
   color: #fff;
