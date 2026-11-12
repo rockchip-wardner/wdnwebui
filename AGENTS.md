@@ -5113,7 +5113,7 @@ wdnwebui/
 │   │   ├── llm/
 │   │   │   └── detector_base.py        # WdnaiDetector 基类 + VLMDoc/TargetDoc/LocatorDoc
 │   │   ├── translate/                   # 界面翻译(板端代理,浏览器不直连翻译站点)
-│   │   │   ├── providers.py             # provider(默认 MyMemory)+ 重试/错误分类
+│   │   │   ├── providers.py             # provider 链(有道/金山词霸/MyMemory)+ 重试/错误分类/冷却
 │   │   │   └── service.py               # 去重 → 分批(编号列表) → 缓存 → 对齐拼回
 │   │   ├── video/                      # 视频通用
 │   │   │   ├── session.py              # 单源 VideoSession (VideoCapture + decode 线程)
@@ -5989,9 +5989,9 @@ holds it in memory. The file is seeded with a `base` section at
 
 ## 界面翻译（右上角语言切换）
 
-右上角有个「界面语言」按钮：26 种语言（英 / 日 / 韩 / 法 / 德 / 西 / 葡 / 意 /
+右上角有个「界面语言」按钮：28 种语言（英 / 日 / 韩 / 法 / 德 / 西 / 葡 / 意 /
 俄 / 阿 / 印 / 泰 / 越 / 印尼 / 马来 / 土 / 波 / 荷 / 瑞 / 丹 / 挪 / 芬 / 捷 /
-希 / 希伯来 / 乌 / 匈），外加「中文（原文）」一项（还原）。
+希 / 希伯来 / 乌 / 匈 + 繁体中文），外加「中文（原文）」一项（还原）。
 
 ### 为什么不是挂现成的 translate.js 挂件
 
@@ -6016,7 +6016,7 @@ Google 后端取译文」——两头都断在这套网络里。所以改成：*
 | 控件 | `app/static/core/translate.{js,css}` | 右上角下拉 + 遍历文本节点 + 替换 / 还原 |
 | 路由 | `app/system/api/translate.py` | `POST /api/translate`、`GET /api/translate/status` |
 | 服务 | `app/core/translate/service.py` | 去重 → 分批 → 缓存 → 编号对齐拼回 |
-| provider | `app/core/translate/providers.py` | MyMemory（默认）；换一家只改配置 |
+| provider | `app/core/translate/providers.py` | 有道 → 金山词霸 → MyMemory 轮流上；换一家只改配置 |
 
 ### 分批与编号对齐（核心算法）
 
@@ -6059,7 +6059,85 @@ JSON 落盘）。
 ⚠️ **限流冷却期只拦「要往外发请求」的那部分**：全命中缓存时根本不需要 provider，
 不该被限流拦住。所以冷却检查放在缓存查询**之后**。
 
+### provider 链：429 了自动换下一个
+
+`translate.providers` 是**故障转移顺序**（前面的主力，后面的备选）：
+
+```jsonc
+"translate": {
+  "providers": ["youdao", "iciba", "mymemory", "baidu"],
+  "email": "",                                       // MyMemory:填邮箱 5k → 50k 词/天
+  "baidu": {"appid": "", "key": ""},                 // 百度官方 API(要 key)
+  "iciba": {"relay": "https://simplytranslate.org"},  // 金山词霸中转站
+}
+```
+
+* 主力返回 429 / 配额用尽 → 该 provider 进入 **30 分钟冷却**，**自动切下一个**；
+* 网络类失败（超时 / SSL）→ **60 秒冷却**，也切下一个；
+* 冷却期内**不再打**这个接口（`GET /api/translate/status` 的 `cooldown` 字段能看到）；
+* 全都在冷却 → 直接报「所有翻译服务都在冷却中」，7ms 返回，不去撞墙；
+* 没配 appid/key 的 provider 会被**跳过**（并打一条警告），不会运行时报错。
+
+链上**三家都是免 key 的**，默认顺序 `youdao → iciba → mymemory`（百度要 key，
+配了才进链）。按钮的 title 会显示这条链（中文名：`有道 → 金山词霸 → MyMemory`）。
+
+### 三条免 key 的通道（2026-11-12 逐一实测）
+
+| provider | 走的是谁 | 实测 |
+|---|---|---|
+| `youdao` | 有道/金山词霸**直连** `dict-trans.youdao.com` | 0.1~0.9s/次，28 语种实测全对，编号列表原样保留 |
+| `iciba` | 金山词霸经 SimplyTranslate 公共实例的 `iciba` 引擎 | 1.3~2.2s/次，12 语种实测全对；**中转站上只有 iciba 引擎是通的** |
+| `mymemory` | `api.mymemory.translated.net` | 1~3s/次，匿名**每天只有 5000 词**（填 email 到 5 万） |
+
+有道和金山词霸是**同一家翻译站的两条路**（直连 / 经中转站）——配额与网络路径
+不同，一条被限流时另一条大概率还活着；MyMemory 兜底。
+
+### 有道接口的坑（逆向结论，别再重蹈）
+
+**旧接口 `dict.youdao.com/webtranslate` 是个诱饵。** 它的响应确实是加密的
+（AES-128-CBC，key = `MD5(aesKey)`、iv = `MD5(aesIv)`，响应是 URL-safe base64），
+解密能成功 —— 但**解出来的译文是服务端随机生成的诱饵**，跟原文毫无关系
+（同一句话连发 4 次得到 4 句毫不相干的英文）。这是有意的反爬。**别用。**
+
+**真正干活的是新版 SSE 接口** `POST https://dict-trans.youdao.com/webtranslate/sse`：
+
+1. `POST https://dict-trans.youdao.com/translate/key?...` 匿名取
+   `secretKey` + `token`（**必须是 POST**，GET 会 500）；
+   签名密钥 `kSy5gtKA4yRUxAVPJPrdYKZ0jBKyd3t1` 是前端 JS 里的固定常量，
+   **不需要用户配任何 key**；
+2. 签名 `genParamV3`：参数按 key 排序、末尾追加 `key=<secret>`、整体 MD5，
+   `pointParam` = 排序后的 key 列表；
+3. `multipart/form-data` 发到 `/webtranslate/sse`，响应是 SSE：把
+   `message` 事件里的 `transIncre` 拼起来就是译文（`begin` / `end` 忽略）。
+
+行为细节：
+
+* **源语言是服务端自动识别的**，`from` 只是建议值，**`to` 决定目标语言**；
+* `secretKey`/`token` 可以**缓存复用**（30 分钟），复用后单次只要 0.12s；
+* **空文本会 500**（服务端直接报错），所以空串要提前挡掉；
+* 长文本明显变慢（2100 字 → 15s），所以还是按 480 字分批；
+* 中文语言码要写 `zh-CHS` / `zh-CHT`（不是 `zh-CN` / `zh-TW`）。
+
+### 其余免 key 方案的实测结论（2026-11-12，别再重蹈）
+
+| 候选 | 结果 |
+|---|---|
+| Google 系（element.js / googleapis / googleusercontent） | 全部连接超时 |
+| `translate.google.cn` | 通的，但 `/translate_a/*` 全 404（那边没有翻译服务） |
+| 百度**网页版** `fanyi.baidu.com/v2transapi` | 端点活着，但 token 藏在混淆后的 SPA bundle 里、还带反爬 → `errno 1022` |
+| 有道**旧**网页版 `translate_o` | 各种 sign 变体全返回 `errorCode 30`（要 secretKey） |
+| DeepL 网页版 `www.deepl.com/jsonrpc` | 页面能打开，但接口已迁到 Next.js 新路由（404），authKey 算法不明 |
+| Papago `papago.naver.net/apis/n2trans` | 页面通、接口域名 SSL 握手超时（不通） |
+| LibreTranslate 公共镜像（20+ 个） | 全部 403 / 连接重置 / DNS 失败；`libretranslate.com` 被 Cloudflare 挡 |
+| Edge 免 key 令牌 `edge.microsoft.com/translate/auth` | 404（端点已变） |
+| Bing 网页版 `ttranslatev3` | token 拿到了（`params_AbusePreventionHelper = [ts, token, ttl]`），但 POST 返回**空响应体 / `statusCode 400`**（反爬） |
+| 各类第三方免费翻译中转（`api.vvhan.com` / `api.codelife.cc` / `api.uomg.com` …） | 大多 DNS 不通或返回 `data: null` |
+| 公共 CORS 代理（allorigins / corsproxy.io / codetabs …） | 全超时或 401 |
+| 百度 / 微软 / DeepL **官方** API | 都要 key（百度的已支持，配 `translate.baidu` 即可） |
+
 ### provider 的脾气（实测，别改）
+
+下面这些主要是 **MyMemory** 的脾气（有道/金山词霸见上面的「有道接口的坑」）：
 
 * 单次 query 上限 **500 字符**；超了 403 `QUERY LENGTH LIMIT EXCEEDED`。
 * `auto` **不是**合法源语言（403 `'AUTO' IS AN INVALID SOURCE LANGUAGE`）
@@ -6074,7 +6152,8 @@ JSON 落盘）。
   退化成逐条翻：宁可慢，也不能把 A 的译文贴到 B 上。
 * 匿名配额 5000 词/天 → `config.jsonc` 里填 `translate.email` 提到 50000。
 * **HTTP 429 = 被限流**：**不重试**（重试只会让限流更严重，等下来还是 429），
-  直接判成配额问题 → 上层进入 120s 冷却 → API 回 429 + 「翻译服务限流了」。
+  直接判成配额问题 → 该 provider 在链里进入 **30 分钟冷却** → API 回 429 +
+  「翻译服务限流了」。
   （早期版本把它当成普通网络错误重试 3 次再报 502，既慢又掩盖了真实原因。）
 * 语言码用 ISO 639-1 / RFC3066（`zh-CN` / `en` / `ja` …）。
 
@@ -6084,10 +6163,23 @@ JSON 落盘）。
 
 ```jsonc
 "translate": {
-  "provider": "mymemory",   // 换一家 = 改这里 + 在 providers.py 里注册
-  "email": ""               // 可选：填邮箱把每日配额从 5k 词提到 50k
+  // 故障转移顺序:第一个是主力,后面的被限流(429)时自动接上
+  "providers": ["youdao", "iciba", "mymemory", "baidu"],
+  "email": "",                                       // MyMemory:填邮箱把每日配额 5k → 50k 词
+  "baidu": {"appid": "", "key": ""},                 // 百度官方 API(要 key;没配会被跳过)
+  "iciba": {"relay": "https://simplytranslate.org"},  // 金山词霸中转站
 }
 ```
+
+### 自检脚本
+
+```bash
+.venv/bin/python scripts/test_translate_chain.py          # 离线:假 provider 钉死链的行为
+.venv/bin/python scripts/test_translate_chain.py --live   # 再跑一遍真机链路
+```
+
+离线部分把「配额超限 → 自动换站 → 冷却 → 全冷却快速失败 → 失败不写缓存 →
+编号对齐」逐条断言（23 项）；`--live` 会真翻一句中文并报告实际是谁在干活。
 
 ### 前端行为
 

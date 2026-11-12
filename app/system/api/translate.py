@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from app.core.translate import (
+    PROVIDER_LABELS,
     QuotaExceeded,
     TranslationError,
     get_translate_service,
@@ -94,10 +95,18 @@ def translate(req: TranslateRequest) -> dict:
 
 @router.get("/translate/status")
 def translate_status() -> dict:
-    """当前 provider 与缓存状态。"""
+    """当前 provider 链与缓存状态。"""
     service = get_translate_service()
+    names = service.provider_names
     return {
         "provider": service.provider_name,
+        "providers": names,
+        # 每家的中文显示名 —— 前端直接用,不用自己维护一张表
+        "provider_labels": {
+            name: PROVIDER_LABELS.get(name, name) for name in names
+        },
+        # 还在冷却的 provider 及剩余秒数(429 之后会看到它在里面)
+        "cooldown": service.cooldown_state(),
         "cache_size": service.cache_size(),
         "source": "zh-CN",
     }

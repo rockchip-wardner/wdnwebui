@@ -87,7 +87,9 @@
     target: SOURCE,   // 当前界面语言(SOURCE = 中文原文)
     source: SOURCE,   // 原文语言(后端可改,默认 zh-CN)
     busy: false,
-    provider: "",
+    provider: "",     // 最后干活的 provider
+    providers: [],    // 故障转移顺序
+    labels: {},       // provider 名 → 中文显示名(后端给的)
     applied: 0,       // 本次已经翻出去的条数(失败回滚时用)
   };
 
@@ -211,7 +213,13 @@
     els.btn.setAttribute("aria-busy", state.busy ? "true" : "false");
     els.caret.hidden = state.busy;      // 忙的时候位置让给百分比
     let title = "界面语言";
-    if (state.provider) title += "（译文由板端 " + state.provider + " 提供）";
+    // provider 名字显示成中文(后端给一张对照表),没有就显示原名
+    const labelOf = (name) => state.labels[name] || name;
+    if (state.providers && state.providers.length > 1) {
+      title += "（译文由板端 " + state.providers.map(labelOf).join(" → ") + " 提供）";
+    } else if (state.provider) {
+      title += "（译文由板端 " + labelOf(state.provider) + " 提供）";
+    }
     els.btn.title = title;
     els.list.querySelectorAll(".wdn-lang-item").forEach((item) => {
       item.classList.toggle("active", item.dataset.code === state.target);
@@ -482,6 +490,8 @@
       const data = await res.json();
       if (data && data.source) state.source = data.source;
       if (data && data.provider) state.provider = data.provider;
+      if (data && data.providers) state.providers = data.providers;
+      if (data && data.provider_labels) state.labels = data.provider_labels;
       updateButton();
     } catch (_) { /* 拿不到就按默认值走 */ }
   }

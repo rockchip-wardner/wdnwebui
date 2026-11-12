@@ -23,6 +23,7 @@ import time
 from typing import Sequence
 
 from app.core.translate.providers import (
+    ProviderChain,
     QuotaExceeded,
     TranslationError,
     TranslationProvider,
@@ -42,8 +43,6 @@ _MAX_BATCH_SEGMENTS = 60
 _BATCH_GAP = 1.2
 # 内存缓存条目上限
 _MAX_CACHE = 5000
-# 配额用尽后的冷却(秒):这段时间内直接快速失败,不去打接口
-_QUOTA_COOLDOWN = 120.0
 
 _WS = re.compile(r"\s+")
 # 行首的 "12. " / "12) " / "12、" —— 解析 MT 回传的编号列表
@@ -62,21 +61,32 @@ def normalize(text: str) -> str:
 class TranslateService:
     """带缓存与分批的翻译服务。线程安全。"""
 
-    def __init__(self, provider: TranslationProvider):
-        self._provider = provider
+    def __init__(self, provider: TranslationProvider | ProviderChain):
+        # 传单个 provider 也行 —— 包成一条只有一节的链,调用方不用改。
+        self._chain = (
+            provider if isinstance(provider, ProviderChain)
+            else ProviderChain([provider])
+        )
         self._cache: dict[tuple[str, str, str], str] = {}
         # RLock 而不是 Lock:这把锁会被「查缓存」「写缓存」「看缓存大小」三处
         # 拿,万一哪天又出现嵌套,RLock 最多是重复计数,Lock 就是死锁 —— 而
         # 死锁的表现是**整个翻译服务(连同所有读缓存的请求)永久挂住**。
         self._lock = threading.RLock()
-        self._quota_until = 0.0
 
     # ------------------------------------------------------------------ #
     # 对外
     # ------------------------------------------------------------------ #
     @property
     def provider_name(self) -> str:
-        return self._provider.name
+        """最后一次真正干活的 provider(链里可能换过)。"""
+        return self._chain.last_used or (self._chain.names[0] if self._chain.names else "")
+
+    @property
+    def provider_names(self) -> list[str]:
+        return self._chain.names
+
+    def cooldown_state(self) -> dict[str, int]:
+        return self._chain.cooldown_state()
 
     def cache_size(self) -> int:
         with self._lock:
@@ -113,11 +123,8 @@ class TranslateService:
         #    **串行**,不加并发:免费接口(MyMemory)会掐并发 —— 实测同一 IP
         #    同时打 4 路就会成片 SSL 握手超时(单发 1~3s 正常)。一次界面翻译
         #    也就 5~8 批,串行 10~25s 可以接受,换来的是**不超时**。
-        if pending:
-            # 冷却检查放在**缓存查询之后**:全都命中缓存时根本不需要 provider,
-            # 不该被限流拦住(限流的是外网,不是缓存)。只有确实要往外发请求了,
-            # 才看冷却期。
-            self._check_quota_cooldown()
+        # 冷却检查交给 provider 链(每家各管各的冷却):全都命中缓存时根本
+        # 不需要 provider,不该被限流拦住(限流的是外网,不是缓存)。
         requests = 0
         failed = 0
         for batch in self._pack(pending):
@@ -142,7 +149,8 @@ class TranslateService:
             time.sleep(_BATCH_GAP * (2 if misses else 1))
 
         stats = {
-            "provider": self._provider.name,
+            "provider": self.provider_name,
+            "providers": self.provider_names,
             "segments": len(norm),
             "unique": len(groups),
             "cached": len(groups) - len(pending),
@@ -205,10 +213,9 @@ class TranslateService:
         joined = self._pack_numbered(texts)
         raw: str | None = None
         try:
-            raw = self._provider.translate(joined, source, target)
+            raw = self._chain.translate(joined, source, target)
         except QuotaExceeded:
-            with self._lock:
-                self._quota_until = time.time() + _QUOTA_COOLDOWN
+            # 链里已经把出问题的 provider 记进冷却了,这里直接往上抛
             raise
         except TranslationError as exc:
             LOG.warning(
@@ -228,7 +235,7 @@ class TranslateService:
         misses: set[int] = set()
         for i, text in enumerate(texts):
             try:
-                out.append(self._provider.translate(text, source, target))
+                out.append(self._chain.translate(text, source, target))
             except QuotaExceeded:
                 raise
             except TranslationError as exc:
@@ -273,7 +280,3 @@ class TranslateService:
                     self._cache.pop(key, None)
             self._cache[(source, target, text)] = out
 
-    def _check_quota_cooldown(self) -> None:
-        with self._lock:
-            if self._quota_until > time.time():
-                raise QuotaExceeded("翻译服务免费额度已用尽,稍后再试")
