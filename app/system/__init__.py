@@ -31,6 +31,7 @@ def register_all(app: FastAPI) -> None:
         power,
         system_logs,
         system_monitor,
+        translate,
         versions,
     )
     app.include_router(system_monitor.router, prefix="/api")
@@ -41,6 +42,10 @@ def register_all(app: FastAPI) -> None:
     app.include_router(power.router,          prefix="/api")
     app.include_router(coprocessor.router,    prefix="/api")
     app.include_router(versions.router,       prefix="/api")
+    # 界面翻译代理（右上角语言切换）。前端不直连任何翻译站点 —— 浏览器在
+    # 局域网里访问不了 Google 系域名，翻译请求统一转发到板子，由板子去够
+    # 真正干活的 provider（默认 MyMemory，见 app/core/translate/）。
+    app.include_router(translate.router,      prefix="/api")
     # 应用包安装（首页应用网格末尾那个"添加应用"磁位拖 wheel 到这里）。
     # ⚠️ 装包 = 在本机执行任意代码，本端点无鉴权、信任局域网。
     app.include_router(apps.router,           prefix="/api")

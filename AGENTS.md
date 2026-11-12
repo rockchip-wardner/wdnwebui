@@ -5098,6 +5098,9 @@ wdnwebui/
 │   │   │   └── serial.py               # 进程级 RLock: 串行化所有 chat
 │   │   ├── llm/
 │   │   │   └── detector_base.py        # WdnaiDetector 基类 + VLMDoc/TargetDoc/LocatorDoc
+│   │   ├── translate/                   # 界面翻译(板端代理,浏览器不直连翻译站点)
+│   │   │   ├── providers.py             # provider(默认 MyMemory)+ 重试/错误分类
+│   │   │   └── service.py               # 去重 → 分批(编号列表) → 缓存 → 对齐拼回
 │   │   ├── video/                      # 视频通用
 │   │   │   ├── session.py              # 单源 VideoSession (VideoCapture + decode 线程)
 │   │   │   ├── utils.py                # PyAV 探测 / 取帧 / 切片
@@ -5135,6 +5138,7 @@ wdnwebui/
 │   │   │   ├── power.py                # 重启 / 关机
 │   │   │   ├── system_logs.py          # journalctl → WS
 │   │   │   ├── system_monitor.py       # CPU / 内存 / NPU / thermal zones
+│   │   │   ├── translate.py            # 界面翻译代理 POST /api/translate
 │   │   │   └── versions.py             # 组件版本探测
 │   │   ├── im_bridge/                  # 微信桥接实现
 │   │   │   ├── bot.py                  # Wechat 类(同步门面 + daemon thread)
@@ -5156,6 +5160,7 @@ wdnwebui/
 │       │   ├── qrcode.js               # (vendored) 二维码渲染
 │       │   ├── vtl-palette.js          # 视频目标定位调色板
 │       │   ├── format-utils.js         # 时间/字节 格式化
+│       │   ├── translate.{js,css}       # 右上角界面语言切换(板端代理翻译)
 │       │   └── wizard/                 # 向导框架
 │       │       ├── state.js            # WizardState IIFE:mount/unmount/step/env_check/form/finish
 │       │       ├── registry.js         # WizardRegistry.tryMount(manifest) / unmount()
@@ -5967,6 +5972,99 @@ holds it in memory. The file is seeded with a `base` section at
   `"swcap_text_to_speech"`）；capability 路由仅走同进程 `ComputeRegistry`，
   跨机器发现走 FastDDS SIMPLE multicast（v0.6+），`ComputeRegistry`
   的 `Hub` 服务名 `wdndds/rpc/<model_id>` 自动暴露给 peer。
+
+## 界面翻译（右上角语言切换）
+
+右上角有个「界面语言」按钮：26 种语言（英 / 日 / 韩 / 法 / 德 / 西 / 葡 / 意 /
+俄 / 阿 / 印 / 泰 / 越 / 印尼 / 马来 / 土 / 波 / 荷 / 瑞 / 丹 / 挪 / 芬 / 捷 /
+希 / 希伯来 / 乌 / 匈），外加「中文（原文）」一项（还原）。
+
+### 为什么不是挂现成的 translate.js 挂件
+
+**浏览器在这套网络里够不到 Google 系域名。** 实测（2026-11，本板）：
+
+| 域名 | 结果 |
+|---|---|
+| `translate.google.com` | 连接超时 |
+| `translate.googleapis.com` | 连接超时 |
+| `translate.googleusercontent.com` | 连接超时 |
+| `translate.google.cn` | 通的，但 `/translate_a/*` 全 404（没有翻译服务） |
+| `mirrors.aliyun.com` / `fanyi.baidu.com` / `fanyi.youdao.com` / `github.com` | 200 |
+
+translate.js 官方挂件是「从 `translate.google.com` 加载脚本 + **浏览器**去
+Google 后端取译文」——两头都断在这套网络里。所以改成：**前端只跟本机说话，
+板子去够真正干活的 provider**（浏览器全程不碰任何境外站点）。
+
+### 分层
+
+| 层 | 位置 | 职责 |
+|---|---|---|
+| 控件 | `app/static/core/translate.{js,css}` | 右上角下拉 + 遍历文本节点 + 替换 / 还原 |
+| 路由 | `app/system/api/translate.py` | `POST /api/translate`、`GET /api/translate/status` |
+| 服务 | `app/core/translate/service.py` | 去重 → 分批 → 缓存 → 编号对齐拼回 |
+| provider | `app/core/translate/providers.py` | MyMemory（默认）；换一家只改配置 |
+
+### 分批与编号对齐（核心算法）
+
+一次「把整页翻成英文」是 **300+ 条**中文文案。逐条发请求 = 几百次往返（慢、
+吃配额、必被限流），所以：
+
+1. **去重** —— 同一句中文在界面里出现几十次是常态（「应用面板」「刷新」…），
+   只翻一份；
+2. **拼成编号列表** —— `"1. xxx\n2. yyy"`，实测 MT 会**原样保留行首编号和换行
+   结构**，回传后按编号一一对齐；
+3. **切批** —— provider 单次 query 上限 **500 字符**（超了 403
+   `QUERY LENGTH LIMIT EXCEEDED`）。批次大小要**按拼出来的实际长度算**：
+   编号本身也占字符（`"100. xxx"`），71 条 246 字的文案光编号就撑到 530 字符。
+   现状：一批 ≤ 480 字符 / ≤ 60 条；
+4. **对齐失败就退化** —— 编号对不上（MT 把两条并成一条）时退化成**逐条翻译**，
+   慢一点，但绝不会把 A 的译文贴到 B 上（贴错了用户根本看不出来）。
+
+### provider 的脾气（实测，别改）
+
+* 单次 query 上限 **500 字符**；超了 403 `QUERY LENGTH LIMIT EXCEEDED`。
+* `auto` **不是**合法源语言（403 `'AUTO' IS AN INVALID SOURCE LANGUAGE`）
+  → 源语言写死 `zh-CN`。
+* **会掐并发**：同一 IP 同时打 4 路就成片 SSL 握手超时（单发 1~3s 正常）→ 批次必须**串行**。
+* **也掐连接建立速率**：每 0.4s 发一个请求，十次里撞两次 SSL 握手超时（一次请求
+  拖成 15s）；改成 **1.2s 间隔**连打 10 次零失败 → 批间隔就定在 1.2s。
+* 单批失败**不拖垮整页**：批次请求挂了就退化成逐条翻，单条再失败保留原文，
+  统计里的 `failed` 会带回给前端（页面上少数几条仍是中文，比整页报错强）。
+* 匿名配额 5000 词/天 → `config.jsonc` 里填 `translate.email` 提到 50000。
+* 语言码用 ISO 639-1 / RFC3066（`zh-CN` / `en` / `ja` …）。
+
+### 配置
+
+`config.jsonc`（设备级，不入库）：
+
+```jsonc
+"translate": {
+  "provider": "mymemory",   // 换一家 = 改这里 + 在 providers.py 里注册
+  "email": ""               // 可选：填邮箱把每日配额从 5k 词提到 50k
+}
+```
+
+### 前端行为
+
+* **只翻含中日韩字符的文本节点** —— 纯英文 / 数字 / 标识符一律不动（翻一遍只会
+  把 `wdnai v0.9.3` 变成看不懂的东西）。
+* 跳过 `script/style/pre/code/表单控件`、`translate="no"` 的元素，以及**日志正文
+  与 JSON 原文**（那些是数据，不是界面文案）。
+* 每个被翻过的节点记住**原文**（`node.__wdnOrig`）：「中文（原文）」能原样还原；
+  **切语言时从原文重翻**，不是拿当前译文再翻一遍（否则会出现中→英→日的二次
+  翻译损耗）。
+* 懒加载进来的内容（卡片 `app.js` 注入的 DOM）由 `MutationObserver` 兜住：有新
+  文本节点就补翻一次。判定「这次改动是我们自己写的」靠**值比对**
+  （`node.nodeValue === node.__wdnTrans`），不靠标志位 —— 观察者回调是微任务，
+  标志位在回调触发时早就复位了。
+* 选择存 `localStorage["wdnwebui.translate.lang"]`，下次进页面自动翻。
+* 控件是 `position: fixed` 钉在视口右上角，所以 `translate.css` 给 `.content`
+  加了上内边距 —— 否则各页 `page-header` 右侧的按钮（刷新 / 向导模式…）会被压住。
+
+### 生效方式
+
+`translate.{js,css}` 挂在 `/static/core`（`_NoCacheStaticFiles`）→ **改完刷新页面
+即生效**，不用重启服务；后端 `app/core/translate/` 改动需要重启服务。
 
 ## App 提示词模板 (app.prompts)
 

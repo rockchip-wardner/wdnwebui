@@ -17,6 +17,7 @@
   <link rel="stylesheet" href="/static/core/model-pick.css" />
   <link rel="stylesheet" href="/static/core/boot-restore.css" />
   <link rel="stylesheet" href="/static/core/query-groups.css" />
+  <link rel="stylesheet" href="/static/core/translate.css" />
   
   
   
@@ -726,5 +727,8 @@
        必须早于各卡片的 app.js 被执行：卡片的 applyWizardSnapshot 会用它，
        而不是 btn.click()（disabled 按钮的 click 会被浏览器静默丢弃）。 -->
   <script src="/static/core/wizard-start.js" defer></script>
+  <!-- 右上角「界面语言」切换。译文不走浏览器 —— 浏览器在这套网络里够不到
+       Google 系域名,统一转发到板子的 /api/translate(见 app/core/translate/)。 -->
+  <script src="/static/core/translate.js" defer></script>
 </body>
 </html>

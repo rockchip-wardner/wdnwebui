@@ -1,0 +1,105 @@
+/* translate.css —— 右上角「界面语言」控件。
+ *
+ * 控件是 fixed 定位的(永远钉在视口右上角,不随内容滚动跑掉),所以给
+ * .content 补了一点上内边距 —— 否则各页 page-header 右侧的按钮(刷新 /
+ * 向导模式 / 协处理器…)会被它压住。
+ *
+ * z-index 取 40:各弹窗(.vd-modal 50 / .dg-modal 60 等)都在它之上,
+ * 弹窗打开时语言控件被盖住是应该的。
+ */
+
+.wdn-lang {
+  position: fixed;
+  top: 0.75rem;
+  right: 1.25rem;
+  z-index: 40;
+  font-family: inherit;
+  font-size: 0.85rem;
+  color: #111827;
+}
+
+.wdn-lang-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 4px;
+  cursor: pointer;
+  color: #111827;
+  box-shadow: 0 1px 2px rgba(17, 24, 39, 0.06);
+  line-height: 1.4;
+}
+.wdn-lang-btn:hover { border-color: var(--accent); color: var(--accent); }
+.wdn-lang-btn[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+.wdn-lang-btn[disabled] { opacity: 0.6; cursor: progress; }
+
+.wdn-lang-icon { width: 15px; height: 15px; flex: 0 0 auto; }
+.wdn-lang-name { font-weight: 500; white-space: nowrap; }
+.wdn-lang-caret { font-size: 0.65rem; opacity: 0.55; }
+
+.wdn-lang-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 16rem;
+  max-height: 70vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 28px rgba(17, 24, 39, 0.16);
+  padding: 0.3rem 0;
+}
+.wdn-lang-panel[hidden] { display: none; }
+
+.wdn-lang-title {
+  padding: 0.45rem 0.85rem 0.3rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  letter-spacing: 0.08em;
+}
+
+.wdn-lang-list { list-style: none; margin: 0; padding: 0; }
+
+.wdn-lang-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.38rem 0.85rem;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  color: #111827;
+  font-size: 0.88rem;
+  font-family: inherit;
+}
+.wdn-lang-item:hover { background: #f3f4f6; }
+.wdn-lang-item.active { background: #eff6ff; color: #1d4ed8; font-weight: 600; }
+.wdn-lang-item-native { color: var(--muted); font-size: 0.8rem; }
+.wdn-lang-item.active .wdn-lang-item-native { color: #3b82f6; }
+
+.wdn-lang-status {
+  margin: 0.4rem 0.5rem 0.15rem;
+  padding: 0.4rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+.wdn-lang-status[data-kind="error"] { background: #fef2f2; color: #b91c1c; }
+.wdn-lang-status[data-kind="busy"] { background: #f8fafc; color: var(--muted); }
+.wdn-lang-status[hidden] { display: none; }
+
+/* 让出右上角控件的位置 */
+.content { padding-top: 3.75rem; }
+
+@media (max-width: 760px) {
+  .wdn-lang { right: 0.75rem; }
+  .wdn-lang-panel { width: 13rem; }
+}
