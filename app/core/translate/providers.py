@@ -24,6 +24,7 @@ import json
 import logging
 import random
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -130,16 +131,24 @@ class MyMemoryProvider(TranslationProvider):
                 )
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return resp.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as exc:
+                # 429 = 被限流(配额/频率)。**不重试**:重试只会让限流更严重,
+                # 而且等下来还是 429。直接判成配额问题,让上层走冷却逻辑。
+                if exc.code == 429:
+                    raise QuotaExceeded(
+                        "翻译服务限流了(HTTP 429),请稍后再试"
+                    ) from exc
+                last = exc
             except Exception as exc:  # 网络层什么都可能抛(超时 / SSL / DNS)
                 last = exc
-                LOG.warning(
-                    "translate: provider=%s 第 %d/%d 次请求失败: %s",
-                    self.name, attempt, self.retries, exc,
-                )
-                if attempt < self.retries:
-                    # 退避别太长:一次界面翻译通常只有几批,每批都等 30s 的话
-                    # 用户看到的就是"转圈转到超时"。
-                    time.sleep(0.8 * attempt + random.random() * 0.4)
+            LOG.warning(
+                "translate: provider=%s 第 %d/%d 次请求失败: %s",
+                self.name, attempt, self.retries, last,
+            )
+            if attempt < self.retries:
+                # 退避别太长:一次界面翻译通常只有几批,每批都等 30s 的话
+                # 用户看到的就是"转圈转到超时"。
+                time.sleep(0.8 * attempt + random.random() * 0.4)
         raise TranslationError(f"翻译服务不可达: {last}")
 
 

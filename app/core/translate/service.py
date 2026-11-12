@@ -89,8 +89,6 @@ class TranslateService:
 
         返回 ``(译文列表, 统计信息)``;译文列表与入参**一一对应、同序**。
         """
-        self._check_quota_cooldown()
-
         norm = [normalize(s) for s in segments]
         results: list[str] = [""] * len(norm)
 
@@ -115,13 +113,25 @@ class TranslateService:
         #    **串行**,不加并发:免费接口(MyMemory)会掐并发 —— 实测同一 IP
         #    同时打 4 路就会成片 SSL 握手超时(单发 1~3s 正常)。一次界面翻译
         #    也就 5~8 批,串行 10~25s 可以接受,换来的是**不超时**。
+        if pending:
+            # 冷却检查放在**缓存查询之后**:全都命中缓存时根本不需要 provider,
+            # 不该被限流拦住(限流的是外网,不是缓存)。只有确实要往外发请求了,
+            # 才看冷却期。
+            self._check_quota_cooldown()
         requests = 0
         failed = 0
         for batch in self._pack(pending):
             translated, calls, misses = self._translate_batch(batch, source, target)
             requests += calls
-            failed += misses
-            for text, out in zip(batch, translated):
+            failed += len(misses)
+            for j, (text, out) in enumerate(zip(batch, translated)):
+                if j in misses:
+                    # 翻失败的**绝对不能写缓存**。写了就是把「原文 = 译文」记
+                    # 进缓存 —— 下次直接命中,返回的还是中文,而且**再也不会
+                    # 重试**(实测踩过:接口 429 限流时,整批文案被永久毒化)。
+                    for idx in groups[text]:
+                        results[idx] = text      # 保留原文
+                    continue
                 # ⚠️ 不要在外面再套一层 ``with self._lock`` —— _remember 内部
                 # 自己会拿锁,非重入锁这么套一层就是**自死锁**(实测:请求永远
                 # 不返回,连带所有碰这把锁的请求一起挂死)。
@@ -176,10 +186,10 @@ class TranslateService:
 
     def _translate_batch(
         self, texts: Sequence[str], source: str, target: str
-    ) -> tuple[list[str], int, int]:
+    ) -> tuple[list[str], int, set[int]]:
         """翻一批。
 
-        返回 ``(译文列表, 本次实际发出的请求数, 失败条数)``。
+        返回 ``(译文列表, 本次实际发出的请求数, 失败条在批内的下标集合)``。
 
         失败分两种,处理方式**不一样**:
 
@@ -188,6 +198,9 @@ class TranslateService:
           已经翻成功的那几批在缓存里,用户再点一次只补没翻出来的那几批。
         * **编号对不上**(MT 把两条并成一条):这是**正确性**问题不是网络问题,
           退化成逐条翻 —— 宁可慢,也不能把 A 的译文贴到 B 上。
+
+        失败的那些**不写缓存**(见 :meth:`translate_segments`):把「原文=译文」
+        记进缓存 = 永久毒化,下次命中缓存就再也不会重试了。
         """
         joined = self._pack_numbered(texts)
         raw: str | None = None
@@ -201,19 +214,19 @@ class TranslateService:
             LOG.warning(
                 "translate: 批次请求失败(%d 条),本批保留原文: %s", len(texts), exc
             )
-            return list(texts), 0, len(texts)
+            return list(texts), 0, set(range(len(texts)))
 
         parsed = self._parse_numbered(raw, len(texts))
         if parsed is not None:
-            return parsed, 1, 0
+            return parsed, 1, set()
 
         # 编号没对上(MT 把两条并成一条、或把编号改写了)→ 逐条翻
         LOG.warning(
             "translate: 批次编号解析失败(%d 条),退化为逐条翻译", len(texts)
         )
         out: list[str] = []
-        failed = 0
-        for text in texts:
+        misses: set[int] = set()
+        for i, text in enumerate(texts):
             try:
                 out.append(self._provider.translate(text, source, target))
             except QuotaExceeded:
@@ -221,8 +234,8 @@ class TranslateService:
             except TranslationError as exc:
                 LOG.warning("translate: 单条翻译失败,保留原文: %s", exc)
                 out.append(text)
-                failed += 1
-        return out, len(texts) + 1, failed
+                misses.add(i)
+        return out, len(texts) + 1, misses
 
     @staticmethod
     def _pack_numbered(texts: Sequence[str]) -> str:
