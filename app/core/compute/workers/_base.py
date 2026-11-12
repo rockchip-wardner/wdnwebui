@@ -1685,6 +1685,24 @@ def run_worker(argv=None) -> int:
 
             overrides["enable_thinking"] = effective_thinking(
                 overrides.get("enable_thinking", False))
+            # ⚠️ **每个请求都自带上下文** —— 这是本应用的约定，所以
+            # C 会话里残留的 KV cache 只会有害无益。
+            #
+            # 应用层的每个提示都是自包含的：电脑控制是「任务 + 已执行动作
+            # + 当前截图」，文本对话/微信桥接是完整 ChatML 记录
+            # （``respond(history=…)`` 内部拼好），检测/音视频描述是
+            # 「当前帧 + 当前问题」。**没有一条依赖 worker 侧的会话历史。**
+            #
+            # 9B 的会话级 ``keep_history`` 是 1（vendor 写死，分段 pipeline
+            # 内部需要），所以它会**跨请求**累积上下文 —— 实测（2026-11-12）：
+            # 让它「点击任务栏最左边的 Windows 开始按钮」，它 thought 里写的
+            # 却是**上一轮**「打开记事本」的目标，坐标也照着上一轮给
+            # （误差 60 px 起，落在隔壁图标上）。清掉 KV 之后同一个提示立刻
+            # 答对任务。
+            #
+            # 4B 的会话级 keep_history 是 0，本来就没有这个问题；统一在这里
+            # 声明这条约定，两边行为一致，也不必每个调用点各写一遍。
+            overrides["keep_history"] = False
             extra = _tts_channel_options(overrides)
             sock = extra.pop("_tts_pcm_sock", None)
             overrides.update(extra)

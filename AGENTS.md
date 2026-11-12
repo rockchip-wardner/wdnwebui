@@ -7009,6 +7009,9 @@ qwen3.5-vl-4b 提供），
        9B 的 `split_9b_thinking(text, enabled=True)` 在模型**没有**产出
        `\n\n\n` 分界时会把**整段回答吞进 thinking**、让 answer 变空 ——
        不能拿调用方要的标志去切分模型实际没产出的东西。
+  - ⚠️ **同一个地方还管另一件事：每个请求都自带上下文**
+    （`overrides["keep_history"] = False`）。详见下面「C 会话不能跨请求
+    累积上下文」那条。
   - 页面上的「深度思考」复选框**保留在 DOM 但置 `disabled`**（JS 用
     `getElementById` 取它，删了会要改 JS）；向导里的同名字段已移除
     （`app/apps/text_chat/static/wizard.json`）——留一个能勾但不生效的
@@ -7111,6 +7114,29 @@ qwen3.5-vl-4b 提供），
     thinking 段为空；电脑控制任务 12 步全过（action / 坐标 / thought 都
     正常解析出来）、零 `inference exceeded`；故意传 `enable_thinking=true`
     也照样被压成非思考（总闸生效）。
+
+* **C 会话不能跨请求累积上下文（2026-11-12 踩的坑，症状极具误导性）**：
+  - **约定**：本应用的每个请求都**自带上下文** —— 电脑控制是「任务 + 已
+    执行动作 + 当前截图」，文本对话/微信桥接是完整 ChatML 记录
+    （`respond(history=…)` 内部拼好），检测/音视频描述是「当前帧 + 当前
+    问题」。**没有一条依赖 worker 侧的会话历史。**
+  - ⇒ worker 在 `_LazySession.run_prompt` 里给每个请求带上
+    `keep_history=False`；9B 多卡后端据此在每轮生成前清掉残留的 KV
+    cache（`wdnai/backends/vlm_multicard.py::_generate`）。
+  - **为什么必须管**：9B 的会话级 `llm_args["keep_history"] = 1`（vendor
+    写死的，分段 pipeline 内部需要它），所以它会**跨请求**累积；4B 的
+    会话级是 0，本来就没这个问题。⇒ 以前只有 9B 会中招。
+  - **症状**：模型**照着上一个请求回答**。实测：让它「点击任务栏最左边
+    的 Windows 开始按钮」，它 thought 里写的却是上一轮「打开记事本」的
+    目标，坐标也照着上一轮给（误差 60 px 起，直接落在隔壁图标上）；
+    输出还会从正常 JSON 退化成「复读 JSON Schema 外壳」。
+    ⇒ 「点击坐标偏移」这个症状，**根因不一定是坐标换算**，也可能是模型
+    在回答上一轮的问题。换算本身是对的：实测模型答的坐标在
+    **0-1000 归一化空间**（不是原始帧像素 —— 裁图验证过：按 0-1000
+    解释落在任务栏上，按原始像素解释落在空白处）。
+  - **顺带修掉一个连带症状**：「复读 JSON Schema 外壳」其实也是污染
+    的产物 —— KV 干净之后，模型自己就吐正常 JSON 了，agent 那边的
+    原文兜底只是保险。
 
 * **跨进程后立刻失效的东西 —— v0.16 实测踩过的坑，别再踩**：
   - **`sess._backend` 恒为 None**。会话在 worker 进程，任何
