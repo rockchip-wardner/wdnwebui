@@ -28,6 +28,30 @@ gguf>=0.10.0
 # wdnai 目前只在 tokenizer 这条窄路径上用到它们。
 transformers>=4.40,<5
 tokenizers>=0.15,<1
+# jinja2 —— wdnai **多卡 VLM 后端**（Qwen3.5-VL-9B 两段式）的硬依赖，
+# 同属「SDK 用到但没兜住、由 wdnwebui 兜」的一类，而且比 transformers/tokenizers
+# 更隐蔽：**jinja2 在 wdnai 的 pyproject 里根本没声明**。
+#
+# 故障链：wdnai/backends/vlm_multicard.py 在**模块级**写死
+#   from jinja2 import Environment
+# 随后用 tokenizer.chat_template（GGUF tokenizer 自带的 Jinja2 模板）渲染多模态
+# 对话的 prompt。缺包时 worker 侧 LLMSession 初始化即炸：
+#   ModuleNotFoundError: No module named 'jinja2'
+# 算力页表现为「qwen3.5-vl-9b 启动失败」。
+#
+# 为什么两道防线都没拦住：
+#   * update_rkwhl.sh / README §4 都是 `pip install --no-deps -e` 装 SDK
+#     —— --no-deps 直接跳过依赖安装，jinja2 **永远**不会自己进 venv；
+#   * scripts/check_sdk_deps.py 只审计 SDK **声明过**的依赖（读
+#     .venv/src/*/pyproject.toml 的 [project].dependencies），而 jinja2 没被
+#     声明 → 审计看不见它。
+# 另外 transformers 4.57 只在 `chat-template` / `all` / `dev` extra 里要 jinja2
+# （不是硬依赖），靠 transformers 的传递依赖满足同样是侥幸。
+#
+# 只影响多卡 VLM：单卡 VLMs（qwen3-vl-4b / qwen3.5-vl-4b）走别的后端，不 import
+# 这条路径 —— 所以板子上其它模型一直正常，直到第一次启用 9B 才暴露。
+# MarkupSafe 是 jinja2 自己的硬依赖，pip 会一并装上。
+jinja2>=3.1.0,<4
 # v4l2（PyPI，纯 ctypes 的 Video4L2 绑定，GPLv2）—— wdnav.v4l2 的硬依赖，
 # 同属「SDK 声明了、但 --no-deps 装不进来、只能由 wdnwebui 兜」的一类。
 #
