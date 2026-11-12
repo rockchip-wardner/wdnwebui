@@ -6075,6 +6075,20 @@ Google 后端取译文」——两头都断在这套网络里。所以改成：*
 `translate.{js,css}` 挂在 `/static/core`（`_NoCacheStaticFiles`）→ **改完刷新页面
 即生效**，不用重启服务；后端 `app/core/translate/` 改动需要重启服务。
 
+### 怎么验证（板上没有浏览器时）
+
+拉个 Node + jsdom 就能在板上把前端真跑一遍（Node 二进制在 npmmirror 上有
+arm64 版：`https://registry.npmmirror.com/-/binary/node/v22.20.0/`）：
+
+1. `npm install --registry=https://registry.npmmirror.com jsdom`；
+2. `new JSDOM(真实首页 HTML, {runScripts:"dangerously", url:"http://127.0.0.1:8000/"})`，
+   把 `window.fetch` 转发到板子（`fetch` 是**浏览器**在用，板子代理后浏览器
+   完全不碰境外站点），再把 `translate.js` 注入进去；
+3. 触发 `.wdn-lang-item` 的 click，等按钮文案变成 English / 日本語，再断言
+   侧栏、页头、品牌名的文本节点都换了 —— 顺便测还原、失败降级、增量翻译。
+
+这样测的是**真前端 + 真后端 + 真 provider**，不是 mock。
+
 ## App 提示词模板 (app.prompts)
 
 `config.jsonc["app"]["prompts"]` 是一个 3 层 schema 驱动的提示词模板
