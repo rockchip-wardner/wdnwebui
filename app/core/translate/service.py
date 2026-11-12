@@ -128,7 +128,8 @@ class TranslateService:
                 self._remember(source, target, text, out)
                 for idx in groups[text]:
                     results[idx] = out
-            time.sleep(_BATCH_GAP)
+            # 自适应间隔:刚失败过就多歇一会儿,别再把接口往限流里推
+            time.sleep(_BATCH_GAP * (2 if misses else 1))
 
         stats = {
             "provider": self._provider.name,
@@ -180,9 +181,13 @@ class TranslateService:
 
         返回 ``(译文列表, 本次实际发出的请求数, 失败条数)``。
 
-        批次请求失败(免费接口会随机 SSL 握手超时)时**不整批放弃**:退化成
-        逐条翻;单条再失败就保留原文。页面上少数几条没翻好,比整页失败强得多
-        —— 用户看得见的就是"这一行还是中文",而不是"翻译服务不可用"。
+        失败分两种,处理方式**不一样**:
+
+        * **网络类**(批次请求挂了):整批**保留原文**并记账 —— 绝不能退化成
+          逐条翻:被限流的接口上,60 次单发只会更糟(限流是按连接建立速率算的)。
+          已经翻成功的那几批在缓存里,用户再点一次只补没翻出来的那几批。
+        * **编号对不上**(MT 把两条并成一条):这是**正确性**问题不是网络问题,
+          退化成逐条翻 —— 宁可慢,也不能把 A 的译文贴到 B 上。
         """
         joined = self._pack_numbered(texts)
         raw: str | None = None
@@ -194,17 +199,18 @@ class TranslateService:
             raise
         except TranslationError as exc:
             LOG.warning(
-                "translate: 批次请求失败(%d 条),退化为逐条翻译: %s", len(texts), exc
+                "translate: 批次请求失败(%d 条),本批保留原文: %s", len(texts), exc
             )
-        if raw is not None:
-            parsed = self._parse_numbered(raw, len(texts))
-            if parsed is not None:
-                return parsed, 1, 0
-            # 编号没对上(MT 把两条并成一条、或把编号改写了)
-            LOG.warning(
-                "translate: 批次编号解析失败(%d 条),退化为逐条翻译", len(texts)
-            )
+            return list(texts), 0, len(texts)
 
+        parsed = self._parse_numbered(raw, len(texts))
+        if parsed is not None:
+            return parsed, 1, 0
+
+        # 编号没对上(MT 把两条并成一条、或把编号改写了)→ 逐条翻
+        LOG.warning(
+            "translate: 批次编号解析失败(%d 条),退化为逐条翻译", len(texts)
+        )
         out: list[str] = []
         failed = 0
         for text in texts:

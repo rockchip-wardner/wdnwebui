@@ -78,7 +78,7 @@ class MyMemoryProvider(TranslationProvider):
     name = "mymemory"
     endpoint = "https://api.mymemory.translated.net/get"
 
-    def __init__(self, email: str = "", timeout: float = 12.0, retries: int = 3):
+    def __init__(self, email: str = "", timeout: float = 10.0, retries: int = 3):
         self.email = (email or "").strip()
         self.timeout = timeout
         self.retries = max(1, int(retries))

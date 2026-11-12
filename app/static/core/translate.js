@@ -194,7 +194,9 @@
   function updateButton() {
     const lang = langByCode(state.target);
     els.name.textContent = lang ? lang.native : "中文";
-    els.btn.disabled = state.busy;
+    // 翻译期间**不**禁用按钮:禁用了用户就点不开面板,看不到进度 —— 而一次
+    // 整页翻译要几十秒,期间必须让人看得见「在翻第几片」。
+    els.btn.setAttribute("aria-busy", state.busy ? "true" : "false");
     let title = "界面语言";
     if (state.provider) title += "（译文由板端 " + state.provider + " 提供）";
     els.btn.title = title;
@@ -227,7 +229,12 @@
 
   /** 收集要翻的文本节点。``onlyNew`` = 只收还没翻成当前目标语言的。 */
   function collect(onlyNew, target) {
-    const out = [];
+    // 当前可见的页先收 —— 分片是按收集顺序发的,这样第一片就是「眼前这一页」,
+    // 用户几秒内就看到它变了;剩下的页面在后面慢慢跟上。整页 300+ 条一起等
+    // (冷缓存时可能好几分钟)是不能接受的体验。
+    const active = document.querySelector(".page:not(.hidden)");
+    const visible = [];
+    const rest = [];
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
@@ -238,9 +245,9 @@
       if (!CJK_RE.test(text)) continue;
       if (onlyNew && node.__wdnTarget === target) continue;
       if (!isTranslatable(node)) continue;
-      out.push({ node, text });
+      (active && active.contains(node) ? visible : rest).push({ node, text });
     }
-    return out;
+    return visible.concat(rest);
   }
 
   async function requestTranslations(segments, target) {
@@ -318,12 +325,14 @@
     state.busy = true;
     updateButton();
     setStatus(code === SOURCE ? "正在还原中文原文…" : "正在翻译…", "busy");
+    showPanel();   // 把面板弹出来,进度要看得见
     try {
       if (code === SOURCE) {
         state.target = SOURCE;
         restoreOriginal();
         persist(code);
         setStatus("", null);
+        closePanel();
       } else {
         const failed = await translateTo(code, false);
         state.target = code;
@@ -332,6 +341,7 @@
           failed > 0 ? "已翻译,但有 " + failed + " 条没翻出来(仍是中文)" : "",
           failed > 0 ? "busy" : null
         );
+        if (failed === 0) closePanel();   // 一切正常就把面板收起来
       }
     } catch (err) {
       // 半途失败(比如配额在第 3 片用完)会留下"翻了一半"的界面 —— 还原回
