@@ -85,6 +85,83 @@ _THINKING_LOCKS: dict[str, threading.RLock] = {}
 _THINKING_LOCKS_GUARD = threading.Lock()
 _THINKING_SUPPORTED: dict[str, bool] = {}
 
+# --------------------------------------------------------------------------- #
+# Inference-timeout recovery
+# --------------------------------------------------------------------------- #
+# A worker that blows its inference budget does **not** interrupt the
+# inference: the inference thread is a daemon and is simply abandoned, so
+# the NPU slot stays busy until the driver returns on its own. The worker
+# says so itself — see the trade-off note in
+# ``app/core/compute/workers/_base.py`` (``_serve_one``): "a timeout
+# therefore means 'this worker needs restarting', not 'retry this call'".
+#
+# That sentence described the intended recovery, but nothing implemented
+# it, so one runaway generation wedged the card **for good**: every later
+# request queued behind the abandoned thread and died with the same
+# timeout, and the user saw "推理错误" over and over until they restarted
+# the instance by hand. This is the missing half — restart the worker so
+# the feature heals by itself.
+#
+# The restart runs in a background thread: unloading and reloading a model
+# takes ~50 s on this board, and the caller that just got the timeout has
+# to return *now*.
+_RECOVERY_LOCKS: dict[str, threading.Lock] = {}
+_RECOVERY_LOCKS_GUARD = threading.Lock()
+
+
+def _recovery_lock(model_id: str) -> threading.Lock:
+    with _RECOVERY_LOCKS_GUARD:
+        lock = _RECOVERY_LOCKS.get(model_id)
+        if lock is None:
+            lock = threading.Lock()
+            _RECOVERY_LOCKS[model_id] = lock
+        return lock
+
+
+def _is_infer_timeout(exc: BaseException) -> bool:
+    """Is this the worker's own "inference exceeded Ns" reply?
+
+    The worker replies with a *reason* (``TimeoutError: inference exceeded
+    60.0s``) instead of letting the client time out blind, so the string
+    is the only marker available on this side of the RPC boundary.
+    """
+    return "inference exceeded" in str(exc)
+
+
+def _schedule_recovery(model_id: str) -> None:
+    """Restart the wedged worker — once per model, in the background.
+
+    Several callers can hit the same wedged worker at once (the UI polls,
+    the agent retries); without the lock every one of them would start a
+    restart, and the NPU would be fought over by several spawns.
+    """
+    lock = _recovery_lock(model_id)
+    if not lock.acquire(blocking=False):
+        return          # a recovery for this model is already on its way
+    try:
+        def _run() -> None:
+            try:
+                from app.core.compute.registry import get_registry
+                LOG.warning(
+                    "compute: inference timeout on %s — restarting the worker",
+                    model_id)
+                get_registry().recover_wedged_instance(model_id)
+                LOG.warning(
+                    "compute: worker %s restarted after an inference timeout",
+                    model_id)
+            except Exception:  # noqa: BLE001 — a failed recovery must not
+                # kill the caller's thread; the next request tries again.
+                LOG.exception(
+                    "compute: worker restart after an inference timeout failed")
+            finally:
+                lock.release()
+
+        threading.Thread(target=_run, name=f"wdn-recover-{model_id}",
+                         daemon=True).start()
+    except Exception:  # noqa: BLE001
+        lock.release()
+        raise
+
 
 def _thinking_lock(service_name: str) -> threading.RLock:
     with _THINKING_LOCKS_GUARD:
@@ -127,6 +204,27 @@ def _wrap_thinking_mode(sess: Any, service_name: str) -> None:
                         _THINKING_SUPPORTED[service_name] = False
                     LOG.debug("set_thinking_mode failed (%s) — continuing", e)
             return await orig_respond(prompt, *args, **kwargs)
+
+    sess.respond = respond
+
+
+def _wrap_infer_timeout_recovery(sess: Any, model_id: str) -> None:
+    """Restart the worker when an inference blows its budget.
+
+    Wrapped **around** the thinking-mode wrapper, so it also sees the
+    failures that the mode switch itself produces. The error is re-raised
+    unchanged — the caller still gets the worker's explanation ("inference
+    exceeded 60.0s"), the restart is a side effect, not a replacement.
+    """
+    orig_respond = sess.respond
+
+    async def respond(prompt: Any = None, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await orig_respond(prompt, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — re-raised below
+            if _is_infer_timeout(exc):
+                _schedule_recovery(model_id)
+            raise
 
     sess.respond = respond
 
@@ -197,6 +295,10 @@ def make_rpc_session(
     # Make ``enable_thinking`` behave as a per-call toggle even though the C
     # session latches it on. See the block above.
     _wrap_thinking_mode(sess, service_name)
+    # A worker that blows its inference budget keeps the NPU busy (the
+    # inference thread is abandoned, not interrupted) — restart it so one
+    # runaway generation cannot wedge the card for good.
+    _wrap_infer_timeout_recovery(sess, model_id)
     return sess
 
 

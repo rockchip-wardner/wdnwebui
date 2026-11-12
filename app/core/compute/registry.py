@@ -3586,6 +3586,75 @@ class ComputeRegistry:
             LOG.warning("restart: stop %s raised: %s", model_id, e)
         self.ensure_worker_for_model(model_id, allow_adopt=False)
 
+    def recover_wedged_instance(self, model_id: str) -> bool:
+        """Restart a worker whose inference timed out **and reload the model**.
+
+        Why this exists
+        ---------------
+        A worker that blows its inference budget does not interrupt the
+        inference: the inference thread is a daemon and is simply
+        abandoned, so the NPU slot stays busy until the driver returns on
+        its own. The worker says so itself — see the trade-off note in
+        ``app/core/compute/workers/_base.py`` (``_serve_one``): *"a
+        timeout therefore means 'this worker needs restarting', not 'retry
+        this call'"*.
+
+        That sentence described the intended recovery but nothing
+        implemented it, so one runaway generation wedged the card **for
+        good**: every later request queued behind the abandoned thread
+        and died with the same timeout, and the user saw "推理错误" over
+        and over until they restarted the instance by hand.
+
+        So do it here: stop the wedged worker, spawn a fresh one and bind
+        it to the **same cards** — which is what the "启用" button does
+        (``ensure_worker_for_model`` → ``bind_instance``). Plain
+        :meth:`restart_instance_local` is not enough: it deliberately
+        leaves the model in ``not_loaded`` and waits for the user to
+        re-pick a card, which is right for a button press and wrong for a
+        self-heal.
+
+        Returns True when a recovery was carried out, False when there was
+        nothing local to recover (a peer-owned model is not ours to
+        restart).
+        """
+        cards: list[int] = []
+        for inst in self._instances_of(model_id):
+            if inst._source != "spawned":
+                continue
+            got = [int(c) for c in (inst.npu_indices or ()) if int(c) >= 0]
+            if got:
+                cards = got
+                break
+        if not cards:
+            # Nothing spawned locally (peer-owned model, or the worker is
+            # already gone) — there is no wedged local worker to restart.
+            LOG.warning("recover: no local instance of %s to recover", model_id)
+            return False
+
+        LOG.warning("recover: restarting the wedged worker of %s on card(s) %s",
+                    model_id, cards)
+        try:
+            self.stop_instance_local(model_id)
+        except Exception as e:  # noqa: BLE001 — a wedged worker may refuse
+            # the graceful unload; the spawn below is what actually frees
+            # the NPU (the driver releases the contexts when the process
+            # dies).
+            LOG.warning("recover: stop %s raised: %s", model_id, e)
+        try:
+            inst = self.ensure_worker_for_model(
+                model_id,
+                allow_adopt=False,
+                npu_index=(cards if len(cards) > 1 else cards[0]),
+                eager_load=False,
+            )
+            self.bind_instance(inst, cards)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("recover: respawn %s failed: %s", model_id, e)
+            return False
+        LOG.warning("recover: worker of %s respawned, loading on card(s) %s",
+                    model_id, cards)
+        return True
+
     def stop_all_local(self) -> None:
         """Stop every spawned worker (proc != None). Adopted peers
         untouched."""
