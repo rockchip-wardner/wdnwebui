@@ -33,8 +33,9 @@
   const SOURCE = "zh-CN";
   const API = "/api/translate";
   const STORAGE_KEY = "wdnwebui.translate.lang";
-  // 一次请求多少条文案(服务端按 480 字符 / 60 条切批,这里跟它对齐)
-  const CHUNK_SIZE = 60;
+  // 一次请求多少条文案。服务端一批 ≤480 字符 / ≤60 条,这里取 24 —— 一片
+  // 基本就是服务端的**一批**,第一片回来就能把当前这一页换掉(不用等整页)。
+  const CHUNK_SIZE = 24;
 
   // 常用语言清单(26 种)。语言码给 provider 用(MyMemory 收 ISO 639-1 /
   // RFC3066,比如 zh-CN / en / ja)。
@@ -87,6 +88,7 @@
     source: SOURCE,   // 原文语言(后端可改,默认 zh-CN)
     busy: false,
     provider: "",
+    applied: 0,       // 本次已经翻出去的条数(失败回滚时用)
   };
 
   let els = null;
@@ -128,7 +130,17 @@
       "</svg>";
     const name = h("span", "wdn-lang-name", "中文");
     const caret = h("span", "wdn-lang-caret", "▾");
-    btn.append(name, caret);
+    // 翻译期间显示的百分比(平时隐藏)
+    const pct = h("span", "wdn-lang-pct");
+    pct.hidden = true;
+    btn.append(name, caret, pct);
+
+    // 常驻在按钮下方的进度条 —— 进度不能只写在「要点开才看得到」的下拉里,
+    // 用户点完语言就该看见「在翻了、到百分之几」。
+    const progress = h("div", "wdn-lang-progress");
+    progress.hidden = true;
+    const fill = h("div", "wdn-lang-progress-fill");
+    progress.appendChild(fill);
 
     const panel = h("div", "wdn-lang-panel");
     panel.hidden = true;
@@ -142,10 +154,10 @@
     LANGUAGES.forEach((lang) => list.appendChild(languageItem(lang)));
 
     panel.append(title, list, status);
-    root.append(btn, panel);
+    root.append(btn, progress, panel);
     document.body.appendChild(root);
 
-    els = { root, btn, name, panel, list, status };
+    els = { root, btn, name, caret, pct, progress, fill, panel, list, status };
 
     btn.addEventListener("click", () => togglePanel());
     panel.addEventListener("click", (ev) => {
@@ -197,12 +209,31 @@
     // 翻译期间**不**禁用按钮:禁用了用户就点不开面板,看不到进度 —— 而一次
     // 整页翻译要几十秒,期间必须让人看得见「在翻第几片」。
     els.btn.setAttribute("aria-busy", state.busy ? "true" : "false");
+    els.caret.hidden = state.busy;      // 忙的时候位置让给百分比
     let title = "界面语言";
     if (state.provider) title += "（译文由板端 " + state.provider + " 提供）";
     els.btn.title = title;
     els.list.querySelectorAll(".wdn-lang-item").forEach((item) => {
       item.classList.toggle("active", item.dataset.code === state.target);
     });
+  }
+
+  /** 进度条 + 百分比。``total`` 为 0 时只显示条、不显示数字。 */
+  function setProgress(done, total) {
+    const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+    els.progress.hidden = false;
+    els.fill.style.width = pct + "%";
+    if (total > 0) {
+      els.pct.hidden = false;
+      els.pct.textContent = pct + "%";
+    }
+  }
+
+  function clearProgress() {
+    els.progress.hidden = true;
+    els.fill.style.width = "0%";
+    els.pct.hidden = true;
+    els.pct.textContent = "";
   }
 
   function setStatus(text, kind) {
@@ -272,10 +303,11 @@
   /** 把整页(或新增部分)翻成 ``target``。 */
   async function translateTo(target, onlyNew) {
     const items = collect(!!onlyNew, target);
-    if (!items.length) return;
+    if (!items.length) return 0;
+    setProgress(0, items.length);
     // 分片请求:一次 300+ 条会变成一次几十秒的长请求,浏览器那边只能干等。
-    // 拆成 60 条一片,每片回来就更新进度 —— 服务端按 (源,目标,原文) 缓存,
-    // 拆开不影响总耗时(缓存是跨请求的)。
+    // 拆成 24 条一片 —— 服务端一批 ≤480 字符 ≈ 24 条,所以基本一片一批,
+    // 第一片回来就能把**当前这一页**换掉,不用等整页。
     let done = 0;
     let failed = 0;
     for (let i = 0; i < items.length; i += CHUNK_SIZE) {
@@ -298,6 +330,8 @@
         if (node.nodeValue !== out) node.nodeValue = out;
       });
       done += chunk.length;
+      state.applied += chunk.length;
+      setProgress(done, items.length);
       setStatus("正在翻译… " + done + "/" + items.length, "busy");
     }
     // 少数几条翻不出来(免费接口抽风)不算失败,但得让用户知道
@@ -322,37 +356,44 @@
 
   async function applyTarget(code) {
     if (state.busy) return;
+    const prev = state.target;
     state.busy = true;
+    state.applied = 0;
+    // **先改状态再翻**:按钮标题、列表高亮立刻变成新语言,不用等整页翻完。
+    // 翻失败了再回滚(下面 catch 里)。
+    state.target = code;
     updateButton();
+    showPanel();
     setStatus(code === SOURCE ? "正在还原中文原文…" : "正在翻译…", "busy");
-    showPanel();   // 把面板弹出来,进度要看得见
     try {
       if (code === SOURCE) {
-        state.target = SOURCE;
         restoreOriginal();
         persist(code);
         setStatus("", null);
         closePanel();
       } else {
         const failed = await translateTo(code, false);
-        state.target = code;
         persist(code);
         setStatus(
           failed > 0 ? "已翻译,但有 " + failed + " 条没翻出来(仍是中文)" : "",
           failed > 0 ? "busy" : null
         );
-        if (failed === 0) closePanel();   // 一切正常就把面板收起来
+        if (failed === 0) closePanel();
       }
     } catch (err) {
-      // 半途失败(比如配额在第 3 片用完)会留下"翻了一半"的界面 —— 还原回
-      // 中文,别让用户对着中英混杂的页面猜哪儿出了问题。
-      if (code !== SOURCE) {
-        try { restoreOriginal(); } catch (_) { /* 还原失败就算了,原样报错 */ }
+      if (state.applied === 0) {
+        // 一个字都没翻出去 → 页面内容还是上一个语言的样子,状态跟着回去
+        state.target = prev;
+      } else {
+        // 翻了一半 → 还原成中文,别让用户对着中英混杂的页面猜哪儿出了问题
+        restoreOriginal();
+        state.target = SOURCE;
       }
       setStatus("翻译失败:" + (err && err.message ? err.message : err), "error");
       throw err;
     } finally {
       state.busy = false;
+      clearProgress();
       updateButton();
     }
   }

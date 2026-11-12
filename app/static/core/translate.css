@@ -39,6 +39,40 @@
 .wdn-lang-name { font-weight: 500; white-space: nowrap; }
 .wdn-lang-caret { font-size: 0.65rem; opacity: 0.55; }
 
+/* 翻译期间的百分比(按钮里,替换掉那个小三角) */
+.wdn-lang-pct {
+  font-size: 0.68rem;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  min-width: 2.2em;
+  text-align: right;
+}
+.wdn-lang-pct[hidden] { display: none; }
+
+/* 常驻在按钮下方的进度条 —— 进度必须一直看得见,不能只写在要点开的下拉里 */
+.wdn-lang-progress {
+  margin-top: 3px;
+  height: 3px;
+  border-radius: 2px;
+  background: #e5e7eb;
+  overflow: hidden;
+}
+.wdn-lang-progress[hidden] { display: none; }
+.wdn-lang-progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.25s ease;
+}
+
+/* 翻译中的按钮:描边变蓝,配合进度条表示"在动" */
+.wdn-lang-btn[aria-busy="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: #eff6ff;
+}
+
 .wdn-lang-panel {
   position: absolute;
   top: calc(100% + 6px);
