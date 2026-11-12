@@ -40,6 +40,8 @@ from typing import Any, List, Optional
 
 from wdndds import LLMRPCSession
 
+from app.core.thinking import effective_thinking
+
 LOG = logging.getLogger("compute_proxy")
 
 # Generation budget for one respond(). Generous on purpose: a VLM looking
@@ -185,7 +187,39 @@ def _wrap_thinking_mode(sess: Any, service_name: str) -> None:
     lock = _thinking_lock(service_name)
 
     async def respond(prompt: Any = None, *args: Any, **kwargs: Any) -> Any:
-        desired = bool(kwargs.get("enable_thinking", False))
+        # ⚠️ **思考模式在这块板子上全局关闭**（2026-11-12 的决定）。
+        #
+        # Qwen3.5（4B 和 9B 都一样）开思考有概率陷入**死循环**：贪心解码
+        # 一路复读、不吐 EOS，把 worker 的推理预算烧光；更糟的是 C 侧
+        # thinking 是「开了就锁住」的（见本文件上面那段说明），掉进去
+        # 很难自己出来。一次这样的跑飞会把 NPU 占住，后面每个请求都跟着
+        # 超时 —— 现场表现就是「电脑控制老是推理错误」。
+        #
+        # 所以这里**忽略调用方要什么**，一律按非思考模式跑。这是应用里
+        # 所有推理请求的**唯一咽喉**（文本对话、电脑控制、音视频描述、
+        # 微信桥接都要从这里过），总闸放在这里，才不会有漏网的调用方。
+        #
+        # 保留 ``set_thinking_mode`` 这套机制本身：它是「C 会话一旦开启
+        # 就锁死」的唯一解药 —— worker 起来时 9B 的 C 会话**默认就是
+        # thinking 模式**，总闸的第一次调用会把它切回非思考（reset +
+        # 重设模板）。以后要重新开放思考，把 ``app/core/thinking.py`` 的
+        # ``THINKING_ENABLED`` 改回 True 即可，别的文件都不用动。
+        desired = effective_thinking(kwargs.get("enable_thinking", False))
+        # ⚠️ **per-call 覆盖值也必须一起压掉** —— 它是总闸的**旁路**。
+        #
+        # ``enable_thinking`` 随 RPC payload 的 ``options`` 一路透传到后端
+        # （options → run_prompt(**options) → backend.run_images(…,
+        # **overrides) → _build_prompt(enable_thinking=…)），后果有两处：
+        #
+        #   1. prompt 尾巴会挂上 ``<think>\n``（非思考模式应该是
+        #      ``<think>\n\n</think>\n\n``）—— 模型被重新拉回思考模式；
+        #   2. C 层 session_run 的输入标志也被置上。
+        #
+        # 只挡 ``set_thinking_mode`` 这个**控制调用**是不够的：调用方只要
+        # 传了 ``enable_thinking=True``，总闸就被从后门打开了。这正是
+        # 「worker 日志显示 thinking mode -> False、但回答里仍然有思考
+        # 内容」的原因 —— 两处标志不是一回事，必须一起压。
+        kwargs["enable_thinking"] = desired
         with lock:
             # A worker that predates the op answers "unknown op". Remember
             # that (unless the caller needs ON, where a retry may succeed
@@ -202,7 +236,15 @@ def _wrap_thinking_mode(sess: Any, service_name: str) -> None:
                 except Exception as e:  # noqa: BLE001
                     if "unknown op" in str(e).lower():
                         _THINKING_SUPPORTED[service_name] = False
-                    LOG.debug("set_thinking_mode failed (%s) — continuing", e)
+                    else:
+                        # ⚠️ **不能静默**。思考模式的切换失败 = C 会话保持
+                        # 原模式（9B 起来时就是 thinking 模式），而 thinking
+                        # 正是会死循环的那个模式 —— 现场表现是「模型随机卡住」，
+                        # 没有任何线索指向这里。这条曾经是 DEBUG 级、什么痕
+                        # 迹都不留，排查了很久。
+                        LOG.warning(
+                            "set_thinking_mode failed (%s) — the worker keeps "
+                            "its current C-side mode", e)
             return await orig_respond(prompt, *args, **kwargs)
 
     sess.respond = respond

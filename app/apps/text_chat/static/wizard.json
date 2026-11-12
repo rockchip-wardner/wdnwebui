@@ -10,8 +10,7 @@
     { "id": "env",    "title": "运行环境检查",   "kind": "env_check" },
     { "id": "prompt", "title": "首次提问",       "kind": "form",
       "fields": [
-        { "id": "tc-prompt", "ui_key": "prompt", "label": "例:请用一段话介绍你自己", "summary_label": "首次提问", "type": "textarea" },
-        { "id": "tc-enable-thinking", "ui_key": "enableThinking", "label": "开启深度思考（模型会先输出思考过程，响应更慢）", "type": "checkbox", "default": false, "summary_show_false": true }
+        { "id": "tc-prompt", "ui_key": "prompt", "label": "例:请用一段话介绍你自己", "summary_label": "首次提问", "type": "textarea" }
       ]
     },
     { "id": "finish", "title": "完成配置",        "kind": "finish" }

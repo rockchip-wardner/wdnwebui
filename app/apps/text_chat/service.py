@@ -70,6 +70,7 @@ from dataclasses import dataclass
 from typing import Callable, Deque, List, Optional
 
 from app.core.chat.runner import MAX_NEW_TOKENS, split_thinking
+from app.core.thinking import effective_thinking
 from app.apps.text_chat.thinking_9b import Thinking9BParser, split_9b_thinking
 
 
@@ -374,11 +375,18 @@ class _TextChatManager:
         with self._lock:
             history_snapshot = list(self._history)
 
+        # ⚠️ **客户端标志必须和实际模式对齐**（思考模式在应用层全局关闭，
+        # 见 ``app/core/thinking.py``）。9B 的 ``split_9b_thinking(text,
+        # enabled=True)`` 在模型**没有**产出 ``\n\n\n`` 分界时，会把**整段
+        # 回答吞进 thinking**、让 answer 变空 —— 所以不能拿调用方要的
+        # 标志去切分模型实际没产出的东西。
+        thinking_on = effective_thinking(req.enable_thinking)
+
         if model_id == "qwen3.5-vl-9b":
             router = Thinking9BParser(
                 emit_fn=lambda payload: self._broadcast(payload),
                 request_id=req.id,
-                enabled=req.enable_thinking,
+                enabled=thinking_on,
             )
         else:
             router = _ThinkingRouter(
@@ -406,7 +414,7 @@ class _TextChatManager:
                     req.text,
                     context_limit=context_limit,
                     max_new_tokens=max_new_tokens,
-                    enable_thinking=req.enable_thinking,
+                    enable_thinking=thinking_on,
                     tool_names=self._resolve_tool_names(),
                     on_delta=lambda d: router.push(d),
                     retry_empty_answer=True,
@@ -440,7 +448,7 @@ class _TextChatManager:
         thinking = agent.get("thinking") or ""
         answer = agent.get("answer") or ""
         if self._active_model_id == "qwen3.5-vl-9b":
-            thinking, answer = split_9b_thinking(answer, req.enable_thinking)
+            thinking, answer = split_9b_thinking(answer, thinking_on)
         if not thinking and not answer:
             full_text = ""
             thinking, answer = split_thinking(full_text)

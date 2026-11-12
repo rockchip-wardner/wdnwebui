@@ -6872,9 +6872,9 @@ RIFF header by hand.
 
 `#page-text-chat` 暴露纯文本对话（`swcap_text_chat` capability，由
 qwen3.5-vl-4b 提供），
-流式逐字渲染 ` thinking...</think>` 与正式回答（思考过程由页面「深度
-思考」开关控制，**默认关闭**；关闭时思考块整块隐藏，见下文「深度思考
-开关」），单页实例串行推理，
+流式逐字渲染正式回答（**思考过程已全局禁用**，见下文「深度思考开关」——
+本机 Qwen3.5 开思考有概率死循环，总闸在
+`app/core/compute/proxy.py::_wrap_thinking_mode`），单页实例串行推理，
 多轮上下文由主进程裁剪、wdnai 拼 ChatML。
 
 **推理走 compute_worker 子进程（RPC）**。`get_session("swcap_text_chat")`
@@ -6974,15 +6974,97 @@ qwen3.5-vl-4b 提供），
     私有符号，SDK 一重构就断（f61dddd 改名事故：算力配置页所有模型加载
     报 `AttributeError`，worker 静默退化成无流式）。
 
-* **深度思考开关（`enable_thinking`）—— 动态切换要「reset + 重设模板」，
-  状态必须放 worker 侧**：
+* **深度思考开关（`enable_thinking`）—— ⚠️ 2026-11-12 起本机**全局禁用**：
+  - **为什么禁**：Qwen3.5（4B 和 9B 都一样）开思考有概率陷入**死循环**
+    —— 贪心解码一路复读、不吐 EOS，把 worker 的推理预算烧光；而 C 侧
+    thinking 是「开了就锁住」的，掉进去很难自己出来。一次这样的跑飞会把
+    NPU 占住（worker 超时只弃用推理线程、不打断它），后面每个请求都跟着
+    超时，现场表现就是「电脑控制老是推理错误」。
+  - **总闸在哪**：`app/core/thinking.py` —— 一个模块、一个常量：
+    `THINKING_ENABLED = False` + `effective_thinking(requested)`（返回
+    **实际生效**的模式，不是调用方想要的那个）。**要重新开放思考，改这一个
+    常量即可，别的文件都不用动。**
+  - **一个开关，四个执行点**（少一个就有漏网的调用方）：
+    1. `app/core/compute/proxy.py::_wrap_thinking_mode` —— 主进程侧所有
+       推理请求的咽喉（文本对话 / 电脑控制 / 音视频描述 / 微信桥接都从
+       这里过）。它压住**两处**标志，缺一不可：
+       - **C 侧模式**（`set_thinking_mode` 控制调用）；
+       - **per-call 覆盖值**（`kwargs["enable_thinking"]`）。
+       ⚠️ **只压控制调用是不够的** —— `enable_thinking` 随 RPC payload 的
+       `options` 一路透传到后端（`options` → `run_prompt(**options)` →
+       `backend.run_images(…, **overrides)` → `_build_prompt(enable_thinking=…)`
+       → `session_run(enable_thinking=…)`），后果是 prompt 尾巴会挂上
+       `<think>\n`、C 层输入标志也被置上。**只挡控制调用时，调用方传
+       `enable_thinking=True` 就能从后门把总闸重新打开** —— 这正是实测
+       「worker 日志显示 `thinking mode -> False`、但回答里仍然有思考
+       内容」的原因。
+    2. `app/core/compute/workers/_base.py::set_thinking_mode_handler` ——
+       worker 侧控制面**拒绝**把模式切到 ON（`effective_thinking` 在
+       worker 里也生效），直接对 `wdndds/rpc/<model>` 发包的局域网 peer
+       同样开不了。
+    3. `app/core/compute/workers/_base.py::_LazySession.run_prompt` ——
+       worker 侧**运行时兜底**：在最后一刻把 `overrides["enable_thinking"]`
+       压成 False。这是最后一道防线（LAN peer 的请求也走这里）。
+    4. `app/apps/text_chat/service.py` —— 客户端标志必须和实际模式对齐。
+       9B 的 `split_9b_thinking(text, enabled=True)` 在模型**没有**产出
+       `\n\n\n` 分界时会把**整段回答吞进 thinking**、让 answer 变空 ——
+       不能拿调用方要的标志去切分模型实际没产出的东西。
+  - 页面上的「深度思考」复选框**保留在 DOM 但置 `disabled`**（JS 用
+    `getElementById` 取它，删了会要改 JS）；向导里的同名字段已移除
+    （`app/apps/text_chat/static/wizard.json`）——留一个能勾但不生效的
+    开关比没有更糟。
+  - ⚠️ **9B 的模式切换是后端自己的事，不能给 9B 套 ChatML 模板**。
+    `set_thinking_mode_handler` 先问后端有没有 `set_thinking_mode` 钩子，
+    有就用它（9B 多卡后端有），没有才走旧的 `apply_chat_template(rknn)`
+    （4B 单卡后端走这条）。
+    - **4B 单卡**：模式**锁存在 C 会话里**。`clear_kvcache` 单独无效，
+      必须 `reset()` **再 `set_chat_template(CHATML_SYSTEM/USER/ASSISTANT)`**
+      才能切回非思考。实测同一 session：开启 2.2 s / 输出完整思考；
+      关闭 0.39 s / 输出空的 `<think>\n\n</think>` 块；只 reset 不重设模板
+      → 仍是完整思考。重建 session 也能回到 OFF，但要 45 s 模型加载。
+    - **9B 多卡**：自己拼完整 ChatML prompt
+      （`<|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n`），
+      C 侧模板**必须保持为空**（vendor 在 init 时
+      `set_chat_template("", "", "")` 清空，`reset()` 又清一次）。
+      **给 9B 套上模板 = 把已经完整的 prompt 再套一遍**，模型看到错位的
+      对话 —— 后果是普通问答还凑合、**结构化输出直接崩**（电脑控制的
+      agent 要 JSON，对话里套着对话时模型只吐出一个裸词 `click`）。
+      9B 的模式是**每次调用带**的（prompt 里的 think 块 + `session_run`
+      的 `enable_thinking` 标志），所以它的 `set_thinking_mode` 只做
+      「清 KV cache」，不碰模板。
+    - 因此 `wdnai` 的 `_StageHandle` **故意没有** `set_chat_template`：
+      留成 AttributeError，任何还走 `apply_chat_template(rknn)` 的老路径
+      都会**大声失败**，而不是悄悄给 9B 套上模板。
+  - ⚠️ **C 侧 thinking「开了就锁住」对 9B 同样成立，而且很隐蔽**：
+    一旦跑过一轮 `enable_thinking=True`，之后的 `enable_thinking=False`
+    会被**忽略** —— 这就是「9B 一直跑在 thinking 模式」的真正原因
+    （`set_thinking_mode` 早先一直失败，per-call 的 False 也不起作用）。
+    真机实测（同一 session，先 True 后 False）：False 那次**仍然**是
+    思考模式。**所以 per-call 的 False 本身不是「关思考」，必须靠
+    `reset()` + 重新设模板（4B）/ 后端钩子（9B）真的切一次。**
+  - ⚠️ **9B 真·非思考模式下会复读 JSON Schema 外壳**（2026-11-12 实测）。
+    模型把提示里的 schema **原样抄回来**，只是把值填进去：
+    ```` ```json
+    {"properties": {"action": "key", "x": null, …, "text": "notepad",
+                    "thought": "…"}}
+    ``` ````
+    这不是合法的 schema 实例 → pydantic 校验失败 → wdnai 的
+    `_safe_validate` 把它降级成「只带 `text` 字段的实例」→
+    `model_dump()` 里**根本没有 `action` 键** → agent 报
+    「不支持的动作: ''」。
+    **修法在调用方**：`wdnapps_hdmi_processor` 的 usb_hid agent 用
+    `self._last_raw`（`on_delta` 收回的原始文本）再解析一次 ——
+    `_parse_action_json` / `_normalize_action` 本来就认识
+    `{"properties": {...}}` 这层外壳（只是原来走不到，因为 wdnai 把原文
+    吞了）。
+  - 下面这些机制**全部保留**（只是不再被打开）：
   - 页面级开关「深度思考」（默认关，`localStorage["text_chat_thinking"]`），
     随 `POST /api/text-chat/send {enable_thinking}` 下发；
     `ChatRequest` → `run_chat_with_tools(enable_thinking=…)` →
-    `respond(enable_thinking=…)`。**只有文本对话传 True**；微信桥接、
-    音视频描述、电脑控制都不传（默认 False）。
-  - **C 侧 thinking 是「开了就锁住」的**（真机 Qwen3.5-4B 实测）：一旦
-    `enable_thinking=True` 跑过一轮，之后所有 `enable_thinking=False` 都
+    `respond(enable_thinking=…)`。
+  - **C 侧 thinking 是「开了就锁住」的**（真机 Qwen3.5-4B 实测；9B 同样成立，
+    见上面那条 ⚠️）：一旦 `enable_thinking=True` 跑过一轮，之后所有
+    `enable_thinking=False` 都
     被忽略 —— **`sess.reset()`（`clear_kvcache`）单独无效**，必须
     `reset()` **再 `set_chat_template(CHATML_SYSTEM/USER/ASSISTANT)`**
     才能切回非思考。实测同一 session：开启 2.2s / 输出完整思考；
@@ -6990,7 +7072,12 @@ qwen3.5-vl-4b 提供），
     完整思考。重建 session 也能回到 OFF，但要 45s 模型加载，不可用。
   - 因此 **worker 提供 `set_thinking_mode` extra op**
     （`workers/_base.py`）：**幂等**（模式相同直接返回 `changed=False`），
-    只在变化时做 reset + 重设模板，状态存在 `state["thinking_mode"]`。
+    状态存在 `state["thinking_mode"]`。它先问后端有没有
+    `set_thinking_mode` 钩子（有就用，9B 多卡后端有），没有才走
+    `apply_chat_template(rknn)`（4B 单卡后端）。**模式切换失败要从
+    WARNING 级别冒出来**（2026-11-12 改）—— 切换失败 = C 会话保持原模式
+    （9B 起来时就是 thinking 模式），现场表现是「模型随机卡住」，没有任何
+    线索指向这里；这条曾经是 DEBUG 级、什么痕迹都不留，排查了很久。
     状态放 worker 而不是主进程，是因为 **C 会话才是唯一真源**：LAN peer
     adopt 同一 worker 时，两个主进程各自缓存会不一致。
   - **`proxy.make_rpc_session` 包装所有 session 的 `respond`**
@@ -7004,7 +7091,9 @@ qwen3.5-vl-4b 提供），
   - **已知边界（多板）**：LAN peer 借同一 worker 时，两边主进程在各自的
     锁外 → `set_thinking_mode` 与 `respond` 之间有极小窗口（对端刚切走
     模式）。**单板部署不受影响**；多板共用 worker 且同时混用
-    thinking / 非 thinking 才会遇到。
+    thinking / 非 thinking 才会遇到。（worker 侧的运行时兜底已经让
+    「打开思考」这条路彻底封死，所以这个窗口只剩「模式被谁切成什么」的
+    语义问题，不再是安全阀。）
   - **输出形态两种，`_ThinkingRouter` 必须都覆盖**（勿回退成
     `delta.find("</think>")` 的单 delta 写法）：
     * 开启：流里**没有** ` thinking` 开标签（C 侧把它注入 assistant
@@ -7018,6 +7107,10 @@ qwen3.5-vl-4b 提供），
     `hidden`，**只有非空 thinking 才显示**（关闭思考时整块消失，不再出现
     用户看到的「只有一个 ` thinking`」）。
   - 回归：`scripts/verify_thinking_router.py`（6 用例，纯逻辑，无需 NPU）。
+  - **实测（2026-11-12，关闭思考之后）**：文本对话 0.34 s 答出 `2`、
+    thinking 段为空；电脑控制任务 12 步全过（action / 坐标 / thought 都
+    正常解析出来）、零 `inference exceeded`；故意传 `enable_thinking=true`
+    也照样被压成非思考（总闸生效）。
 
 * **跨进程后立刻失效的东西 —— v0.16 实测踩过的坑，别再踩**：
   - **`sess._backend` 恒为 None**。会话在 worker 进程，任何
@@ -7071,7 +7164,17 @@ qwen3.5-vl-4b 提供），
     per-worker 锁内先调 worker 的 `set_thinking_mode` 再推理 —— 让
     `enable_thinking` 在「C 会话一旦开启就锁死」的前提下表现得像
     per-call 开关，且同一 worker 的其它调用方（vd / usb_hid / 微信）
-    请求前会被自动切回它们期望的模式。详见「深度思考开关」小节。
+    请求前会被自动切回它们期望的模式。⚠️ **2026-11-12 起这里是思考模式的
+    总闸之一**：`desired = effective_thinking(kwargs.get("enable_thinking"))`
+    —— `effective_thinking` 来自 `app/core/thinking.py`，总闸关着时恒为
+    False，**调用方传什么都无所谓**（Qwen3.5 开思考有概率死循环）。
+    ⚠️ **而且它必须同时改掉 per-call 覆盖值**（`kwargs["enable_thinking"]`
+    = desired）：那个值会随 RPC payload 的 `options` 透传到后端（改 prompt
+    的 think 块 + 改 C 层输入标志），只挡控制调用的话调用方能从后门把
+    总闸重新打开。详见「深度思考开关」小节。
+  - `_wrap_infer_timeout_recovery(sess, model_id)`：推理超时后调度
+    `registry.recover_wedged_instance()` 重启那个 worker（worker 超时只
+    弃用推理线程、不打断它，NPU 会一直被占，不重启就会一路超时）。
   - **不再有** `_ProxyResult` / `_AttachmentProxy` / `_decode_reply_shm` /
     `_encode_attachments`：schema 在调用方解析，附件与长文本的
     `/dev/shm` 路由由 wdndds 两端统一负责。**没有 LAN peer 降级**了 ——

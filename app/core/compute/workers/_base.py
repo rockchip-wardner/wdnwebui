@@ -1161,8 +1161,18 @@ def set_thinking_mode_handler(state: dict, payload: dict) -> dict:
     ``changed=False`` for the common case (mode already matches), so the
     caller pays one cheap control-plane round trip and no reset unless the
     mode really changes.
+
+    ⚠️ **请求打开思考会被拒绝**（2026-11-12 起）：Qwen3.5 开思考有概率
+    死循环，应用层把总闸拉下来了（``app/core/thinking.py``）。即便有人
+    直接对 ``wdndds/rpc/<model>`` 发包（局域网 peer），C 会话也进不了
+    thinking 模式。
     """
-    desired = bool(payload.get("enable_thinking", False))
+    from app.core.thinking import effective_thinking
+
+    requested = bool(payload.get("enable_thinking", False))
+    desired = effective_thinking(requested)
+    if requested and not desired:
+        LOG.info("thinking mode request refused (app-level switch is off)")
     sess = state.get("session")
     if sess is None:
         return {"status": "noop (not loaded)", "changed": False}
@@ -1176,13 +1186,31 @@ def set_thinking_mode_handler(state: dict, payload: dict) -> dict:
     try:
         sess.reset()
         backend = getattr(sess, "_backend", None)
-        rknn = getattr(backend, "rknn_llm", None) or getattr(backend, "rknn", None)
-        if rknn is None:
-            return {"status": "error", "error": "no rknn handle"}
-        from wdnai.backends._common import apply_chat_template
-        apply_chat_template(rknn)
+        # ⚠️ **后端自己知道怎么切模式**，优先问它。
+        #
+        # 单卡后端（4B）的模式**锁存在 C 会话里**：必须 reset + 重设
+        # chat template 才回得来，所以走 ``apply_chat_template``。
+        #
+        # 9B 多卡后端**不能**走这条路：它自己拼完整的 ChatML prompt，
+        # C 侧模板必须保持为空（vendor 在 init 时清空、reset() 又清一次）。
+        # 给它套上模板 = 把已经完整的 prompt 再套一遍，模型看到错位的
+        # 对话 —— 后果是普通问答还凑合、结构化输出直接崩（电脑控制的
+        # agent 要 JSON，模型只吐一个裸词 ``click``）。
+        #
+        # 9B 的模式是**每次调用带**的（prompt 里的 think 块 + session_run
+        # 的 ``enable_thinking`` 标志），所以它的 ``set_thinking_mode`` 只做
+        # 「清 KV cache」，不碰模板。
+        switch = getattr(backend, "set_thinking_mode", None)
+        if callable(switch):
+            switch(desired)
+        else:
+            rknn = getattr(backend, "rknn_llm", None) or getattr(backend, "rknn", None)
+            if rknn is None:
+                return {"status": "error", "error": "no rknn handle"}
+            from wdnai.backends._common import apply_chat_template
+            apply_chat_template(rknn)
         state["thinking_mode"] = desired
-        LOG.info("thinking mode -> %s (reset + chat template reapplied)", desired)
+        LOG.info("thinking mode -> %s (reset + mode applied)", desired)
         return {"status": "ok", "changed": True}
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "error": f"set_thinking_mode failed: {e}"}
@@ -1646,6 +1674,17 @@ def run_worker(argv=None) -> int:
 
         async def run_prompt(self, prompt, attachment=None, *,
                              on_delta=None, **overrides):
+            # ⚠️ **运行时兜底**：思考模式在应用层被全局关掉了
+            # （``app/core/thinking.py``）。per-call 的
+            # ``enable_thinking`` 覆盖值会一路透传到后端，既改 prompt
+            # （挂上 ``<think>\n``）又改 C 层输入标志 —— 那是总闸的
+            # 旁路。这里在**最后一道**把它压掉，所以任何调用方（包括
+            # 直接对 ``wdndds/rpc/<model>`` 发包的局域网 peer）都开不了
+            # 思考模式。
+            from app.core.thinking import effective_thinking
+
+            overrides["enable_thinking"] = effective_thinking(
+                overrides.get("enable_thinking", False))
             extra = _tts_channel_options(overrides)
             sock = extra.pop("_tts_pcm_sock", None)
             overrides.update(extra)

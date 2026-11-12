@@ -20,10 +20,14 @@
               <h3>对话</h3>
               <span class="imb-status" id="text-chat-state-badge" data-state="idle">空闲</span>
             </div>
+            <!-- 深度思考：应用层已全局禁用（Qwen3.5 开思考有概率死循环，
+                 见 app/core/compute/proxy.py 的总闸）。控件保留在 DOM 里
+                 只是为了让 JS 的 getElementById 不必判空，置 disabled
+                 并把话说清楚 —— 留一个能勾但不生效的开关比没有更糟。 -->
             <label class="text-chat-thinking-toggle"
-                   title="开启后模型先输出思考过程（更慢，消耗更多 token）">
-              <input type="checkbox" id="text-chat-thinking" />
-              <span>深度思考</span>
+                   title="本机已禁用深度思考：Qwen3.5（4B/9B）开思考有概率陷入死循环">
+              <input type="checkbox" id="text-chat-thinking" disabled />
+              <span>深度思考（已禁用）</span>
             </label>
             <span class="vd-spacer"></span>
             <span class="imb-meta-inline" id="text-chat-tokens">0 / 16384 tokens</span>
