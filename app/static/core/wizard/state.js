@@ -336,6 +336,137 @@
   }
 
   // ------------------------------------------------------------------ //
+  // 「这个能力本板还有谁顶上」—— 按 capability 列出**已安装**的 provider
+  // ------------------------------------------------------------------ //
+  //
+  // 数据来自后端 /api/compute 的 supported_models（每项带
+  // capability_types 与 requires_cards）。这是「模型能做什么」的权威清单。
+  //
+  // 为什么要这一层：``swcap_to_model`` 里钉的 model_id 只是**偏好**，
+  // 不是**唯一解** —— 卡片是按 capability 取 session 的（见 _capStates
+  // 的注释：「卡片按 capability 取 session，不认 model_id」）。
+  // 所以钉的模型没装时（本板只有 4B、偏好写的是 9B），旧逻辑会判成
+  // 「本板未安装所需模型」并**禁用**「一键开启」—— 用户走进死胡同，
+  // 其实 4B 也能提供这个能力。
+  function _installedProviders(supportedModels) {
+    const out = {};
+    if (!Array.isArray(supportedModels)) return out;
+    for (const m of supportedModels) {
+      if (!m || !m.id) continue;
+      if (m.exists === false) continue;   // 目录不在 = 没装
+      for (const cap of (m.capability_types || [])) {
+        (out[cap] || (out[cap] = [])).push(m);
+      }
+    }
+    return out;
+  }
+
+  // 候选顺序 = 配置声明的 models[] → model_id → 其余已安装 provider。
+  //
+  // ``models`` 是**候选列表**（有序，首选在前）—— 卡片可以声明「这个能力
+  // 我接受这些模型，按这个顺序挑」。它让「新增模型不必改代码」成立：
+  // 新模型只要被列进来（或本身带这个 capability），向导与运行期都能用上。
+  // 没写 models[] 的老卡片行为不变（只认 model_id）。
+  function _candidateModels(cap, pin, providers) {
+    const declared = Array.isArray(pin && pin.models)
+      ? pin.models.filter((x) => typeof x === "string" && x)
+      : [];
+    if (pin && pin.model_id && declared.indexOf(pin.model_id) === -1) {
+      declared.unshift(pin.model_id);   // model_id 是首选 → 排最前
+    }
+    const rest = (providers[cap] || []).map((m) => m.id)
+      .filter((id) => declared.indexOf(id) === -1);
+    return declared.concat(rest);
+  }
+
+  // 解析「这个能力实际用哪个模型 + 占哪几张卡」。
+  //
+  // 返回 null = 本板**没有任何**已安装模型提供这个能力（真缺）。
+  // 返回 {model_id, npu_index, swapped, preferred, requires_cards} = 可用；
+  // ``swapped`` = 用的不是配置钉的那个（首选没装 → 退到能用的）。
+  function _resolvePin(cap, pin, providers, modelCards) {
+    const byId = {};
+    for (const caps of Object.keys(providers)) {
+      for (const m of providers[caps]) byId[m.id] = m;
+    }
+    for (const id of _candidateModels(cap, pin, providers)) {
+      const meta = byId[id];
+      if (!meta) continue;                  // 没装 → 下一个候选
+      // 卡位按**这个模型**要的卡数算：钉 9B（2 张）退到 4B（1 张）时不能
+      // 还占 2 张 —— 后端 POST 会对 npu_index 里的每一张各起一个实例。
+      const want = Math.max(1, Number(meta.requires_cards) || 1);
+      const pinned = (pin && pin.npu_index != null)
+        ? (Array.isArray(pin.npu_index) ? pin.npu_index : [pin.npu_index])
+        : null;
+      let cards = (pinned && pinned.length >= want)
+        ? pinned.slice(0, want)
+        : (modelCards || []).slice(0, want);
+      if (cards.length < want) continue;     // 本机卡不够 → 换下一个候选
+      const preferred = (pin && pin.model_id) || null;
+      return {
+        model_id: id,
+        npu_index: cards,
+        swapped: !!(preferred && preferred !== id),
+        preferred: preferred,
+        requires_cards: want,
+      };
+    }
+    return null;
+  }
+
+  // 把 cfg.swcap_to_model 里钉死的模型换成「本板真正能用的那个」。
+  //
+  // 返回 {cfg, swaps, missing}：
+  //   cfg     —— 解析后的 cfg（swcap_to_model 的 model_id/npu_index 已替换）
+  //   swaps   —— [{cap, preferred, actual, running}] 用了替代模型的能力
+  //   missing —— [{cap, model_id}] 本板**没有任何** provider 的能力
+  //
+  // 解析后的 cfg 交给既有代码（_modelSlots / _missingModels /
+  // _wizardBringUpModels）用 → 它们一行都不用改。
+  function _resolveEffectiveCfg(cfg, ctx) {
+    const map = (cfg && cfg.swcap_to_model) || {};
+    const out = {};
+    const swaps = [];
+    const missing = [];
+    // 替代模型**是不是已经在跑** —— 决定提示怎么说：
+    // 「已在运行，可直接用」 vs 「点一键开启就能用」。
+    const runningIds = new Set();
+    for (const inst of ((ctx && ctx.instances) || [])) {
+      if (!inst || !inst.model_id) continue;
+      if (inst.status === "running" || inst.status === "loading") {
+        runningIds.add(inst.model_id);
+      }
+    }
+    for (const cap of Object.keys(map)) {
+      const pin = map[cap];
+      const r = _resolvePin(cap, pin, (ctx && ctx.providers) || {},
+                            (ctx && ctx.modelCards) || []);
+      if (!r) {
+        missing.push({cap: cap, model_id: (pin && pin.model_id) || null});
+        out[cap] = pin;               // 原样保留 → 渲染层照旧报「未安装」
+        continue;
+      }
+      out[cap] = Object.assign({}, pin, {
+        model_id: r.model_id,
+        npu_index: r.npu_index,
+      });
+      if (r.swapped) {
+        swaps.push({
+          cap: cap,
+          preferred: r.preferred,
+          actual: r.model_id,
+          running: runningIds.has(r.model_id),
+        });
+      }
+    }
+    return {
+      cfg: Object.assign({}, cfg, {swcap_to_model: out}),
+      swaps: swaps,
+      missing: missing,
+    };
+  }
+
+  // ------------------------------------------------------------------ //
   // 就绪判据：capability 级 + **(模型, 卡位) 对**级                          //
   // ------------------------------------------------------------------ //
   //
@@ -434,23 +565,39 @@
     const swMissing = singleOn
       ? swRequired.filter((c) => allMissing.includes(c))
       : allMissing;
-    const slots = _modelSlots(cfg || state.cfg, env.instances || []);
     // 组没被同一个实例满足 → 组内每项都判缺。groupsUnsatisfied 的元素
     // 是 "a + b"（拼给人看的），拆回能力名。
     const groupFail = new Set();
     (env.groupsUnsatisfied || []).forEach((label) => {
       String(label).split(" + ").forEach((c) => groupFail.add(c.trim()));
     });
-    const capStates = _capStates(swRequired, swMissing, slots, groupFail);
+    // 解析「配置钉的模型」→「本板真正能用的那个」。钉的没装但有别的
+    // provider 顶上时（swaps 非空），后续一律用解析后的 cfg 判定与启用
+    // —— 既有代码一行都不用改。
+    const resolved = _resolveEffectiveCfg(cfg || state.cfg, {
+      providers: _installedProviders((state.envCheck || {}).supportedModels),
+      modelCards: (state.envCheck || {}).modelCards || [],
+      instances: env.instances || [],
+    });
+    // 判定用**解析后**的槽位：钉 9B@npu0+npu1、实际只有 4B 在跑时，
+    // 槽位应按 4B 的卡位算，否则会被判成「配置没配齐」。
+    const capStates = _capStates(swRequired, swMissing,
+      _modelSlots(resolved.cfg, env.instances || []), groupFail);
     // 本板没装的模型（worker 随模型文件夹分发 → 装没装是板子状态）。
     // 进 view 是为了让 _envSig 把它算进指纹：用户 clone 完模型 → 算力页
     // 刷新 → 已安装集合变了 → 提示要消失，得重绘。
+    //
+    // 用**解析后**的 cfg：钉的模型没装但有替代时，解析结果指向替代模型
+    // （已装）→ 不算「缺」；只有**一个 provider 都没有**才算真缺。
     const missingModels = _missingModels(
-      cfg || state.cfg, (state.envCheck || {}).installedModels);
+      resolved.cfg, (state.envCheck || {}).installedModels);
     return {
       swRequired,
-      capStates,
+      capStates: capStates,
       missingModels,
+      // 用了替代模型的能力（首选没装 → 退到本板装着的那个）。
+      // 渲染层据此说明「为什么不是配置里那个」而不是笼统报「未安装」。
+      modelSwaps: resolved.swaps,
       // 能不能继续 = 每条要求的能力都可用（只有 fail 挡路）。
       swOK: swRequired.every((c) => capStates[c] !== "fail"),
       // 「一键开启所需模型」按钮要不要出：能力没配齐就出（alt/warn/fail）——
@@ -591,6 +738,10 @@
     // 是两回事 —— 后者有占位卡、可以一键起。
     // alt 态的 cap 排除在外 —— 那个能力已经有人顶上，配置里指定的
     // 模型装没装都不影响使用，提示「未安装」只会让人以为不能继续。
+    //
+    // ⚠️ 这里的 missingModels 已经过 _resolveEffectiveCfg 过滤：钉的模型
+    // 没装但**有别的 provider 顶上**时不算缺（走下面的 modelSwaps 分支），
+    // 只有**一个 provider 都没有**才是真缺。
     const altCaps = swRequired.filter((c) => view.capStates[c] === "alt");
     const missingModels = (view.missingModels || [])
       .filter((x) => altCaps.indexOf(x.cap) === -1);
@@ -603,6 +754,25 @@
             "worker 配置随模型文件夹一起分发：把模型文件夹放到模型根目录后，" +
             "在「算力配置」页点「刷新模型」即可出现该卡片。",
           ])));
+    }
+    // 配置钉的（首选）模型没装，但本板**有别的模型带这个能力** ——
+    // 说清楚「换成了谁」，而不是笼统报「未安装」。旧逻辑在这里报
+    // 「未安装所需模型」并禁用「一键开启」⇒ 用户走进死胡同（其实能用的
+    // 模型就在本板上）。现在按钮照常可用，启的是替代模型。
+    //
+    // 两种说法（说人话）：替代模型**已经在跑** → 告诉用户可以直接用，
+    // 不用去点那个会重载模型的按钮；**没在跑** → 告诉他点哪就能用。
+    const modelSwaps = view.modelSwaps || [];
+    if (modelSwaps.length) {
+      card2.appendChild(_singleCardNotice(
+        "warn",
+        "⚠ 已改用本板可用的模型",
+        modelSwaps.map((x) => x.running
+          ? `「${x.cap}」的首选模型 ${x.preferred} 未安装，`
+            + `已改用 ${x.actual}（正在运行，可直接使用）。`
+          : `「${x.cap}」的首选模型 ${x.preferred} 未安装，`
+            + `已改用 ${x.actual}（点击下方「一键开启所需模型」即可启用）。`)
+      ));
     }
     if (view.needBring && !blocked) {
       const bringBtn = _ce("button", WIZARD_NS + "primary-btn", "一键开启所需模型");
@@ -680,7 +850,7 @@
   // 结论变了 → 重绘当前步（按钮 / 明细行 / 「下一步」跟着变）；
   // 结论没变 → 什么都不动（保住「一键开启」刚写的状态文案）。
   async function _refreshEnv(state, sig) {
-    let instances, judged, installedModels;
+    let instances, judged, installedModels, supportedModels;
     try {
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (!r.ok) return;
@@ -691,6 +861,9 @@
       if (Array.isArray(data.preset_order)) {
         installedModels = data.preset_order.slice();
       }
+      if (Array.isArray(data.supported_models)) {
+        supportedModels = data.supported_models.slice();
+      }
       // 用**探针那份** cfg 复判(srcCfg),别用裁剪后的 —— 两处口径必须一致
       judged = _capJudgement(state.app, state.envCheck.srcCfg || state.cfg, instances);
     } catch (_) { return; }
@@ -699,6 +872,7 @@
     if (!stepDef || stepDef.kind !== "env_check") return;
     state.envCheck.instances = instances;
     if (installedModels) state.envCheck.installedModels = installedModels;
+    if (supportedModels) state.envCheck.supportedModels = supportedModels;
     state.envCheck.swMissing = judged.swMissing;
     state.envCheck.groupsUnsatisfied = judged.groupsUnsatisfied;
     if (_envSig(_envView(state, state.cfg)) === sig) return;  // 结论没变
@@ -771,6 +945,9 @@
     // 注意不能用 instances 判「装没装」：instances 只有真正跑起来的，
     // 「装了但没启用」的模型压根不在里面，会被误判成没装。
     let installedModels = null;
+    // 本板**已安装**的模型清单（每项带 capability_types / requires_cards）
+    // —— 「这个能力还有谁顶上」的数据源。解析在 _resolveEffectiveCfg。
+    let supportedModels = null;
     try {
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (r.ok) {
@@ -782,6 +959,9 @@
         modelCards = Array.isArray(data.model_cards) ? data.model_cards : [];
         if (Array.isArray(data.preset_order)) {
           installedModels = data.preset_order.slice();
+        }
+        if (Array.isArray(data.supported_models)) {
+          supportedModels = data.supported_models.slice();
         }
       }
     } catch (_) { /* keep all missing */ }
@@ -795,6 +975,7 @@
       groupsUnsatisfied: judged.groupsUnsatisfied,
       instances,
       installedModels,
+      supportedModels,
       // 后台刷新要用**同一份** cfg 复判（单卡裁剪后的 cfg 组集合会变小）
       srcCfg: cfg,
       cardCount,
@@ -2399,9 +2580,23 @@
     // 展开成 (model_id, npu_index) 对：只按 model_id 判的话，多卡场景下
     // "任意一张卡起来了"就算齐，用户要两张卡却只等到一张，推理退化成单卡
     // 还不报错。
+    //
+    // 目标也用**解析后**的模型：钉的首选没装、启用的是替代模型时，进度行
+    // 得显示真正在加载的那个（否则用户看到 "9b@0 加载中"，实际在起 4B）。
+    let effCfg = cfg;
+    try {
+      const rr = await fetch("/api/compute", { cache: "no-store" });
+      if (rr.ok) {
+        const dd = await rr.json();
+        effCfg = _resolveEffectiveCfg(cfg, {
+          providers: _installedProviders(dd.supported_models),
+          modelCards: Array.isArray(dd.model_cards) ? dd.model_cards : [],
+        }).cfg;
+      }
+    } catch (_) { /* 拿不到就按原 cfg 等 */ }
     const targets = [];
     const seen = new Set();
-    for (const [cap, m] of Object.entries(cfg.swcap_to_model || {})) {
+    for (const [cap, m] of Object.entries(effCfg.swcap_to_model || {})) {
       const cards = Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index];
       for (const n of cards) {
         // 同组能力指向同一个模型时会展开出重复对 —— 进度行会多出几行
@@ -2767,6 +2962,13 @@
     // 优先」口径，不用来回启停真机上的模型。
     __capStates: _capStates,
     __modelSlots: _modelSlots,
+    // 「首选模型没装 → 回退到本板装着的那个」的解析链：纯函数，
+    // 给 scripts/verify_wizard_model_fallback.py 断言候选顺序、
+    // 卡位按 requires_cards 重算、swap 判定。
+    __installedProviders: _installedProviders,
+    __candidateModels: _candidateModels,
+    __resolvePin: _resolvePin,
+    __resolveEffectiveCfg: _resolveEffectiveCfg,
   };
 
   // ------------------------------------------------------------------ #
@@ -2827,6 +3029,21 @@
       const r = await fetch("/api/compute", { cache: "no-store" });
       if (!r.ok) return false;
       const data = await r.json();
+      // 解析「配置钉的模型」→「本板真正能用的那个」。
+      //
+      // 钉的模型没装、但本板有别的 provider 带这个能力时（例：偏好 9B，
+      // 本板只装了 4B）→ 启用**替代模型**，卡位按替代模型的
+      // requires_cards 重算（9B 占 2 张、4B 占 1 张）。
+      // 这条路径是「一键开启」唯一的入口 —— 不解析的话用户点了会拿到
+      // 后端 422「未知 model」。
+      const eff = _resolveEffectiveCfg(cfg, {
+        providers: _installedProviders(data.supported_models),
+        modelCards: Array.isArray(data.model_cards) ? data.model_cards : [],
+      });
+      const effMap = eff.cfg.swcap_to_model || {};
+      for (const sw of eff.swaps) {
+        say(`本板未安装 ${sw.preferred}，改用 ${sw.actual}`);
+      }
       // 1. 停非必需(后端契约 DELETE + JSON {model, npu_index})
       //
       // 判据必须是 **(模型, 卡位) 对**,不是模型级。同一个模型跑两张卡
@@ -2839,7 +3056,7 @@
       // 没声明卡号的模型 → 任意卡都算需要;声明了 → 只有那几张卡算。
       const wantedModels = new Set();
       const wantedPairs = new Set();
-      for (const m of Object.values(cfg.swcap_to_model || {})) {
+      for (const m of Object.values(effMap)) {
         if (m.npu_index == null) { wantedModels.add(m.model_id); continue; }
         const npus = Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index];
         for (const n of npus) wantedPairs.add(m.model_id + "@" + n);
@@ -2895,7 +3112,7 @@
       //    **按 (model_id, npu_index) 去重** —— 同组能力指向同一个模型时
       //    （usb_hid 的视觉 + 工具调用）逐条目 POST 会把同一个模型启两次。
       const started = new Set();
-      for (const m of Object.values(cfg.swcap_to_model)) {
+      for (const m of Object.values(effMap)) {
         const key = m.model_id + "@" + m.npu_index;
         if (started.has(key)) continue;
         started.add(key);

@@ -1853,6 +1853,12 @@ class ComputeRegistry:
                 "memory_estimate_mb": preset["memory_estimate_mb"],
                 "capability_types":   list(preset["capability_types"]),
                 "available_targets":  list(preset.get("available_targets", ["182x"])),
+                # 这个模型要占几张协处理器卡 —— 前端算力页与向导据此决定
+                # 「模型 + 卡位」的绑定（9B 两段式占 2 张，单卡模型占 1 张）。
+                # 向导的「一键开启所需模型」在**回退到别的 provider** 时必须
+                # 按替代模型的实际卡数选卡位：钉 9B（2 张）退到 4B（1 张）
+                # 还占 2 张的话，后端会对 npu_index 里的每张卡各起一个实例。
+                "requires_cards":     int(preset.get("requires_cards", 1) or 1),
             })
         return out
 

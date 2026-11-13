@@ -416,3 +416,59 @@ manifest 的 `model_dir_name` 正好是 `Qwen3.5-4B`，与目录名逐字相同�
 - 微信桥接（L4-24）未手测 —— 桥接开关需要 `swcap_text_chat` 实例 running，
   本板有条件但未实际发微信消息。
 
+---
+
+## 5.6 模型解析改造（①+②+③）与复跑（2026-11-13，迁移之后追加）
+
+### 5.6.1 起因
+
+用户实测发现向导 env 步报「⚠ 本板未安装所需模型 ·「swcap_text_chat」需要模型
+qwen3.5-vl-9b —— 本板未安装」，且「一键开启所需模型」按钮 **disabled** ⇒ 死路。
+根因是**两处逻辑打架**：
+
+| 位置 | 当时的逻辑 |
+|---|---|
+| 向导 `wizard.json` | 硬钉 `model_id: qwen3.5-vl-9b`（占 2 张卡） |
+| 运行期 `service.py` | `PREFERRED_MODELS = ("qwen3.5-vl-9b", "qwen3.5-vl-4b")` —— 4B 是**明确的回退** |
+
+卡片是**按 capability 取 session、不认 model_id** 的 ⇒ 钉的模型没装时，
+向导却判成「没装 → 不能继续」，而运行期其实能用 4B 干活。
+
+### 5.6.2 三条改动
+
+| # | 改动 | 落点 |
+|---|---|---|
+| ① | env 步的「未安装」提示只在**真缺**（一个 provider 都没有）时出现；首选没装但有替代 → 弹「⚠ 已改用本板可用的模型」并**保持按钮可用** | `app/static/core/wizard/state.js`（`_installedProviders` / `_candidateModels` / `_resolvePin` / `_resolveEffectiveCfg`） |
+| ② | 运行期 `PREFERRED_MODELS` 常量 → **动态 provider 解析**：候选 = 声明的偏好 + 本板已装 provider（后端 `list_supported_models()`）+ 正在跑的 provider | 插件 `cards/text_chat/service.py` |
+| ③ | `swcap_to_model` 支持**候选列表** `models[]`（可选、有序，首选在前）；`model_id` 保持兼容（= 首选） | 卡片 `static/wizard.json` + 前端 + 运行期**读同一份文件** |
+
+配套：`registry.list_supported_models()` 增加 `requires_cards`（前端要按
+**替代模型**的实际卡数算卡位 —— 钉 9B 占 2 张、退到 4B 只占 1 张）。
+
+### 5.6.3 复跑结果（改动后全量重跑）
+
+| 层 | 项 | 结果 |
+|---|---|---|
+| **L1** | `verify_card_slots` / `check_plugin_entrypoints` / `card_dirs` | ✅ 12 卡 / 3 行 OK / 插件路径 |
+| L1 | `verify_apps_isolation` / `verify_thinking_router` / `verify_tool_channel_filter` | ✅ PASS / 9-9 / 11-11 |
+| L1 | `verify_model_packaging` | ✅ 全部通过（21 条；`requires_cards` 未破坏打包契约） |
+| **L2** | 4 个静态资源 / 2 个 API / `POST /send` 空 text | ✅ 全 200；`app.css` 4328B；空 text = **422**；首页含 `page-text-chat` |
+| **L3** | `verify_plugin_cards` / `smoke_wizard_all` / `verify_text_chat_plugin_card` | ✅ VERDICT OK / 8-8 / **19-19** |
+| L3 | `verify_wizard_cap_states`（**被本次改动影响**） | ✅ 全部通过（alt 态判定口径未变） |
+| L3 | **`verify_wizard_model_fallback.py`（新增）** | ✅ **33/33** —— 运行期解析 + 前端解析 + env 步提示与按钮 |
+| **L4** | `verify_stage3_smoke.py --group chat`（sudo） | ✅ **5/5**（agent 循环 / 256 delta / 工具轮） |
+| L4 | 卡片真实推理（走服务） | ✅ `model_id=qwen3.5-vl-4b`（**动态解析得到**），answer 正常 |
+| L4 | 「停止」真中断 | ✅ `state=stopped`，被停轮**未写历史** |
+
+### 5.6.4 新增回归脚本
+
+`scripts/verify_wizard_model_fallback.py`（33 条断言，mock `/api/compute`，
+不启停模型、不占 NPU）：
+
+* **第 1 段（纯 Python）** —— 运行期解析：声明的偏好、已装 provider、候选顺序；
+  **模拟装上一个新模型 → 它自动进候选池**（这就是「新增模型不必改代码」的真身，
+  比静态正则强）。
+* **第 2 段（纯函数）** —— 前端解析：候选顺序、首选没装 → 退到 4B、卡位按
+  `requires_cards` 重算、首选装了 → 保持 2 张卡、一个 provider 都没有 → 真缺。
+* **第 3 段（端到端）** —— env 步：A 场景（有替代）不报「未安装」、出现「已改用」
+  提示、按钮**可用**、「下一步」可点；B 场景（真缺）仍报「未安装」且按钮禁用。

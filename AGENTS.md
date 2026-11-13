@@ -3260,6 +3260,69 @@ capability 取 session,`get_session`,不认 model_id):
 **找实例统一走 `_pickInst(cands)`**:优先 running/loading,其次 error 终态 ——
 同模型可能有多个卡位的实例,取首个未必是活的那个。
 
+### `swcap_to_model` 的**候选列表** + 「首选没装 ⇒ 回退」
+
+**`model_id` 是偏好,不是唯一解** —— 卡片按 **capability** 取 session
+(`get_session_for_model(cap, model_id)` 只是「按模型取」,能力不匹配就失败)。
+所以「用哪个模型」只能表达成**顺序**。
+
+`wizard.json` 的 `swcap_to_model.<cap>` 新增**可选**字段 `models`(有序,首选在前):
+
+```jsonc
+"swcap_to_model": {
+  "swcap_text_chat": {
+    "model_id": "qwen3.5-vl-9b",                    // = 首选(兼容旧字段)
+    "models": ["qwen3.5-vl-9b", "qwen3.5-vl-4b"],    // 候选列表(可选)
+    "npu_index": [0, 1]                             // 首选的卡位
+  }
+}
+```
+
+**候选顺序**(前端 `state.js` 与运行期 `service.py` **同一份口径**):
+
+1. **声明的偏好**(`models[]`,`model_id` 补在首位)—— 权威顺序;
+2. **本板已安装的 provider**(后端 `/api/compute` 的 `supported_models`,按
+   `capability_types` 过滤)—— **新增模型不必改代码**;
+3. **正在跑的 provider**(`list_sessions`)—— 兜住**远端 peer**:peer 上的
+   模型本板没装,第 2 段里没有,但它确实能提供这个能力。
+
+**前端解析链**(`app/static/core/wizard/state.js`):
+
+| 位置 | 作用 |
+|---|---|
+| `_installedProviders(supportedModels)` | `supported_models` → `{cap: [模型元数据]}`;跳过 `exists === false` |
+| `_candidateModels(cap, pin, providers)` | 候选顺序(声明 → 其余已装 provider) |
+| `_resolvePin(cap, pin, providers, modelCards)` | 解析成 `{model_id, npu_index, swapped, preferred, requires_cards}`;**null = 真缺** |
+| `_resolveEffectiveCfg(cfg, ctx)` | 产出 `{cfg, swaps, missing}`;**解析后的 cfg 交给既有代码用** |
+
+三条不变量:
+
+1. **卡位按替代模型自己的 `requires_cards` 重算** —— 钉 9B(占 2 张)退到 4B
+   (占 1 张)时**不能**还占 2 张:后端 `POST /api/compute/instances` 会对
+   `npu_index` 里的每一张卡**各起一个实例**。`requires_cards` 由后端
+   `list_supported_models()` 给出(worker manifest 的字段)。
+2. **只有「一个 provider 都没有」才是真缺** —— 首选没装但有别的 provider
+   顶上时:不报「本板未安装所需模型」、**不禁用**「一键开启所需模型」
+   (旧逻辑在这里禁用 ⇒ 用户走进死胡同),而是弹黄色说明块
+   「⚠ 已改用本板可用的模型:首选 X 未安装,已改用 Y(正在运行,可直接使用)/
+   (点击下方「一键开启所需模型」即可启用)」—— 替代模型**已经在跑**时说
+   「可直接使用」,别骗用户去点一个会重载模型的按钮。
+3. **解析后的 cfg 才是判定依据** —— `_envView` / `_wizardBringUpModels` /
+   `_waitForModelsRunning` 全部用 `_resolveEffectiveCfg` 的产物:
+   进度行显示的是**真正在加载**的模型,不是配置里那个。
+
+**运行期**(卡片自己的 `service.py`)同一条链:候选 = 声明的偏好(wizard.json)
++ 已装 provider(`registry.list_supported_models()`)+ 正在跑的 provider。
+⇒ 卡片源码里**不写模型偏好**(旧形态是 `PREFERRED_MODELS = (...)` 常量)。
+⚠️ 例外:模型**特有的输出格式**仍可能写死(9B 的专用 thinking 解析器)——
+那是另一回事,别跟「偏好写死」混为一谈。
+
+回归:`scripts/verify_wizard_model_fallback.py`(运行期解析 + 前端解析 +
+env 步提示与按钮,共 33 条断言;mock `/api/compute`,不启停模型、不占 NPU)。
+
+> 偏好顺序写在卡片自己的 `wizard.json`（`swcap_to_model.swcap_text_chat.models`），
+> 运行期动态解析 —— 卡片源码里**不写模型偏好**。
+
 ### `wizard:unmounted` 事件 + 重新挂载
 
 `state.js:unmount()` 末尾 dispatch `window` 上的 `wizard:unmounted` 事件
