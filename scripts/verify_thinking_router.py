@@ -10,6 +10,11 @@
 标签可能被 token 流切开（``<th`` + ``ink>``），所以这里全部按多段 delta
 喂入。空思考段不得产生 thinking 事件；关闭思考时页面上不应出现任何
 ``<think>`` 字样。
+
+卡片位置：``_ThinkingRouter`` 是 **text-chat 卡的内部类**。该卡已于
+v0.26 从宿主仓 ``app/apps/text_chat/`` 迁到 ``wdnapps_audio_chat`` 插件包，
+所以类的新路径是 ``wdnapps_audio_chat.cards.text_chat.service``。
+本脚本同时接受旧路径（宿主仓还没删干净、或插件没装上的过渡期）。
 """
 from __future__ import annotations
 
@@ -21,8 +26,26 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 
+def _import_router():
+    """取 ``_ThinkingRouter`` —— 插件路径优先，旧的内置路径兜底。"""
+    last_err: Exception | None = None
+    for mod in (
+        "wdnapps_audio_chat.cards.text_chat.service",   # 插件卡（现行）
+        "app.apps.text_chat.service",                   # 宿主内置卡（过渡期）
+    ):
+        try:
+            return getattr(__import__(mod, fromlist=["_ThinkingRouter"]),
+                           "_ThinkingRouter")
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise RuntimeError(
+        "找不到 _ThinkingRouter —— text-chat 卡既不在插件包"
+        "（wdnapps_audio_chat 未安装？）也不在宿主内置路径下：%r" % (last_err,)
+    )
+
+
 def run(deltas):
-    from app.apps.text_chat.service import _ThinkingRouter
+    _ThinkingRouter = _import_router()
 
     events = []
     router = _ThinkingRouter(events.append, 1)

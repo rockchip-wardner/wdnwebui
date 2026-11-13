@@ -1724,8 +1724,8 @@ app/apps/<card_id>/
 依赖方向是单向的：插件 → `app.core.*`。core 不得依赖插件，否则插件没装
 时 core 会静默降级。
 
-> **脚本别再硬编码 `app/apps/<id>/`** —— 7 张卡的源码在插件包里，不在仓库
-> 里。verify 脚本要取卡片的 wizard.json / manifest.json / app.js，走
+> **脚本别再硬编码 `app/apps/<id>/`** —— 8 张卡的源码在插件包里，不在仓库
+> 里（v0.26 起 `text_chat` 也迁走了，内置通道已无卡）。verify 脚本要取卡片的 wizard.json / manifest.json / app.js，走
 > `scripts/card_dirs.py`（内置 + 插件双通道解析，返回 id / 目录名 / 路径 /
 > import 命名空间）。否则轻则 ENOENT 崩掉，重则**扫不到任何东西却照样报
 > 绿** —— `verify_apps_isolation` 的跨卡 import 检查只剩 2 张内置卡时就是
@@ -1733,7 +1733,7 @@ app/apps/<card_id>/
 
 | `id` | capability（能力组） | 后端入口 | 来源 |
 |---|---|---|---|
-| `text-chat` | `swcap_text_chat` | `app.apps.text_chat` | 内置 |
+| `text-chat` | `swcap_text_chat` | `wdnapps_audio_chat.cards.text_chat` | `wdnapps_audio_chat`（**暂存** —— 计划拆到独立的 `wdnapps_chat` 包） |
 | `tts` | `swcap_text_to_speech` | `wdnapps_audio_chat.cards.tts` | `wdnapps_audio_chat` |
 | `qwen3-asr` | `swcap_audio_asr` | `wdnapps_audio_chat.cards.qwen3_asr` | `wdnapps_audio_chat` |
 | `audio-analysis` | `swcap_audio_chat` | `wdnapps_video_analyzer.cards.audio_analysis` | `wdnapps_video_analyzer` |
@@ -7146,7 +7146,7 @@ qwen3.5-vl-4b 提供），
 独立 RELIABLE 旁路 topic 直达 `on_delta`，`respond()` 的返回值不因流式
 而变，**没有轮询、没有 chat state 机**。
 
-* **Backend** (`app/apps/text_chat/api.py`):
+* **Backend** (`wdnapps_audio_chat/cards/text_chat/api.py`):
   - `GET /api/text-chat` — snapshot：state / busy / error / history_count /
     history_tokens / context_limit / max_new_tokens / current_request_id /
     last_result。
@@ -7161,7 +7161,7 @@ qwen3.5-vl-4b 提供），
   - `WS /api/text-chat/ws` — server-push 流式 token + 状态变更；连接后立即
     推 `{type:"snapshot", snapshot:...}` hydrate。
 
-* **Service** (`app/apps/text_chat/service.py`):
+* **Service** (`wdnapps_audio_chat/cards/text_chat/service.py`):
   - `_TextChatManager` 单例（`get_chat_service()`，lazy）；状态机
     `idle → loading → running → done/error/stopped`，与 wdnwebui
     其它服务风格一致。
@@ -7265,7 +7265,7 @@ qwen3.5-vl-4b 提供），
     3. `app/core/compute/workers/_base.py::_LazySession.run_prompt` ——
        worker 侧**运行时兜底**：在最后一刻把 `overrides["enable_thinking"]`
        压成 False。这是最后一道防线（LAN peer 的请求也走这里）。
-    4. `app/apps/text_chat/service.py` —— 客户端标志必须和实际模式对齐。
+    4. `wdnapps_audio_chat/cards/text_chat/service.py` —— 客户端标志必须和实际模式对齐。
        9B 的 `split_9b_thinking(text, enabled=True)` 在模型**没有**产出
        `\n\n\n` 分界时会把**整段回答吞进 thinking**、让 answer 变空 ——
        不能拿调用方要的标志去切分模型实际没产出的东西。
@@ -7274,7 +7274,7 @@ qwen3.5-vl-4b 提供），
     累积上下文」那条。
   - 页面上的「深度思考」复选框**保留在 DOM 但置 `disabled`**（JS 用
     `getElementById` 取它，删了会要改 JS）；向导里的同名字段已移除
-    （`app/apps/text_chat/static/wizard.json`）——留一个能勾但不生效的
+    （`wdnapps_audio_chat/cards/text_chat/static/wizard.json`）——留一个能勾但不生效的
     开关比没有更糟。
   - ⚠️ **9B 的模式切换是后端自己的事，不能给 9B 套 ChatML 模板**。
     `set_thinking_mode_handler` 先问后端有没有 `set_thinking_mode` 钩子，
@@ -7509,14 +7509,19 @@ qwen3.5-vl-4b 提供），
       assistant 气泡"三段渲染状态；`_finalizeBubble` 优先用 done 帧的完整
       thinking/answer 覆盖流式 buffer（一次性结果也能完整渲染）；
     - `_scrollToBottom()` 仅在用户靠近底部时自动滚动（避免抢焦点）。
-  - `loadPageData("text-chat")` 调 `TextChat.init() + refresh() + ensureWs()`；
-    `showPage()` 离开时调 `TextChat.closeWs()`。
+  - 初始化由**卡片自己的 `app.js`** 负责（IIFE 末尾直接 `TextChat.init()`，
+    插件卡 `wdnapps_audio_chat/cards/text_chat/static/app.js`）。
+    ⚠️ `app/system/static/system.js` 里那段 `loadPageData("text-chat")`
+    调 `TextChat.init() + refresh() + ensureWs()` 的代码**从来不会执行** ——
+    `system.js` 的 `showPage()` 没有任何调用者（框架走的是 `framework.js`
+    的 `ROUTER.showPage()`），且 `TextChat` 从来不是全局变量（它定义在
+    卡片 app.js 的 IIFE 作用域内）。该死代码已于 v0.26 删除。
 
 * **资源预算** —— 由所选模型的 ``manifest.json`` 声明
   （``memory_estimate_mb``）。多用户并发首版不支持 —— worker 串行。
-  注意 `swcap_text_chat` 现在**只有 qwen3.5-vl-4b 一个 provider**（原
-  qwen3-4b 专用文本 worker 已删除，权重不在目标板上，且与 qwen3.5-vl-4b
-  争同一个 capability）。因此对话与视频描述会落在同一个进程 —— 两者
+  注意 `swcap_text_chat` 现在有**两个 provider**：`qwen3.5-vl-4b` 与
+  `qwen3.5-vl-9b`（9B 占两张卡，是本卡声明的**首选**；原
+  qwen3-4b 专用文本 worker 已删除，权重不在目标板上）。因此对话与视频描述会落在同一个进程 —— 两者
   都要用时注意显存叠加，不能再像以前那样分开加载。
 
 * **限制 / 已知问题**：

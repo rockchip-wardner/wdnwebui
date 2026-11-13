@@ -25,7 +25,7 @@ Qwen3.5 —— **4B 和 9B 都一样** —— 开思考有概率陷入**死循�
    （``enable_thinking``）。
 2. ``app/core/compute/workers/_base.py`` —— worker 侧兜底。直接对
    ``wdndds/rpc/<model>`` 发包的局域网 peer 同样开不了思考。
-3. ``app/apps/text_chat/service.py`` —— 客户端切分。9B 的
+3. ``wdnapps_audio_chat.cards.text_chat.service`` —— 客户端切分。9B 的
    ``split_9b_thinking(…, enabled=True)`` 在模型**没有**产出 ``\\n\\n\\n``
    分界时会把**整段回答吞进 thinking**、让 answer 变空；客户端标志必须
    和实际模式对齐。

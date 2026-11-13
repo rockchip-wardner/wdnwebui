@@ -53,11 +53,13 @@ jobs:
         # The video cards moved out to the wdnapps_video_analyzer plugin
         # in v0.4, so app/apps/video_*/ no longer exists in this repo —
         # and .venv/src/ is gitignored, so a CI checkout doesn't have
-        # them either. The cards still living in-tree are text_chat / tts.
+        # them either. text_chat moved out to the wdnapps_audio_chat
+        # plugin in v0.26, so **no card lives in-tree any more** — the
+        # built-in scan channel of app/core/manifest.py currently has
+        # zero cards.
         run: |
           python -m py_compile \
             app/core/video/session.py \
-            app/apps/text_chat/api.py \
             && echo "✅ changed files parse OK"
 
       - name: Syntax check on regression scripts

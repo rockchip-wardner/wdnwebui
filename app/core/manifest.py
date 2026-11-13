@@ -9,8 +9,12 @@ routes + static mounts + frontend asset references.
 Two discovery channels feed the same validation pipeline:
 
 1. **Built-in** — ``app/apps/<card_id>/manifest.json`` scanned from disk.
-   After the v0.25 split this holds only ``text_chat`` (``tts`` moved out
-   to the ``wdnapps_audio_chat`` plugin package).
+   **As of v0.26 this channel carries no cards**: ``text_chat`` was the last
+   one and it moved out to the ``wdnapps_audio_chat`` plugin package (as a
+   *staging* step — a dedicated ``wdnapps-chat`` package is planned). The
+   directory is kept (with just ``__init__.py``) so that removing it does not
+   trip the "apps/ directory not found" warning below; the channel stays in
+   place for the next built-in card.
 2. **Installed plugins** — any distribution advertising an entry point in
    the ``wdnwebui.cards`` group. The entry point *name* is the card id and
    its *value* is the importable card module; the card directory is that

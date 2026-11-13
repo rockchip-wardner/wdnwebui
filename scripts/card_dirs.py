@@ -3,13 +3,12 @@
 
 卡片发现有两条通道（见 ``app/core/manifest.py``）：
 
-* 内置目录 ``app/apps/<id>/``
+* 内置目录 ``app/apps/<id>/`` —— **v0.26 起为空**（text_chat 是最后一张内置卡，
+  它已迁到 ``wdnapps_audio_chat`` 插件包）。目录保留着，下一张内置卡直接放进去。
 * entry point 插件包（``wdnwebui.cards`` 组）—— 音视频描述 / 视频目标监控 /
   监控反查 / 视频任意目标定位 / 音视频分析 / 智能电脑控制 / 语音生成 /
-  文生图 / 图生图 这 9 张卡已迁到 ``wdnapps_video_analyzer`` /
-  ``wdnapps_hdmi_processor`` / ``wdnapps_audio_chat`` /
-  ``wdnapps_media_generator`` 四个插件包里，**源码不在本仓库**，在
-  ``.venv/src/`` 下。
+  流式语音识别 / **文本对话** / 文生图 / 图生图 这 11 张卡都在插件包里，
+  **源码不在本仓库**，在 ``.venv/src/`` 下。
 
 verify 脚本不能再硬编码 ``app/apps/<id>/`` —— 那样插件卡一律读不到文件。
 统一走这里，脚本就不用关心卡在仓库里还是在插件包里。
@@ -17,6 +16,7 @@ verify 脚本不能再硬编码 ``app/apps/<id>/`` —— 那样插件卡一律�
 命令行用法（给 node 脚本用）::
 
     .venv/bin/python scripts/card_dirs.py          # 打印 JSON 映射
+    .venv/bin/python scripts/card_dirs.py text-chat  # 打印某张卡的目录
 
 刻意用 ``importlib.util.find_spec`` 而不是 ``import_module``：前者只 import
 父包（``cards/__init__.py`` 是空的），**不执行叶子模块** —— 后者会顺着

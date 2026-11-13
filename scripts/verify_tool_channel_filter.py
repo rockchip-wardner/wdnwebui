@@ -51,12 +51,15 @@ from typing import Any, Dict, Optional
 
 # 让脚本能 import ``app.*``
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# 让脚本能 import 同目录的 ``card_dirs``（卡片源码目录的双通道解析器）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.core.tools.registry import (  # noqa: E402
     ToolRegistry,
     ToolSpec,
     resolve_available_tool_names,
 )
+from card_dirs import card_dir  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -443,16 +446,14 @@ def test_builtins_tts_alert_registers_with_both_chat_channels():
 
 
 def test_text_chat_resolver_calls_with_channel_chat_web():
-    """``app/apps/text_chat/service.py`` 的 ``_resolve_tool_names``
-    必须显式传 ``channel="chat_web"`` —— 这是修复 web 端不再注入
-    VideoSearch 的契约。
+    """text-chat 卡的 ``_resolve_tool_names`` 必须显式传
+    ``channel="chat_web"`` —— 这是修复 web 端不再注入 VideoSearch 的契约。
+
+    卡片源码目录走 ``card_dirs.card_dir("text-chat")`` 双通道解析：它现在在
+    ``wdnapps_audio_chat`` 插件包里（不在宿主仓 ``app/apps/`` 下），硬编码
+    路径会 FileNotFoundError。
     """
-    src = open(
-        os.path.join(
-            os.path.dirname(__file__),
-            "..", "app", "apps", "text_chat", "service.py",
-        ),
-    ).read()
+    src = open(os.path.join(str(card_dir("text-chat")), "service.py")).read()
     tree = ast.parse(src)
     fn = next(
         (n for n in ast.walk(tree)

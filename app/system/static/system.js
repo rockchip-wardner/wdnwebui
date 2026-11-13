@@ -1255,12 +1255,11 @@ async function loadPageData(name) {
     return;
   }
 
-  if (name === "text-chat") {
-    TextChat.init();
-    await TextChat.refresh();
-    TextChat.ensureWs();
-    return;
-  }
+  // 注：**没有** text-chat 分支 —— 那段代码引用的是一个从来不是全局变量的
+  // ``TextChat``（真实定义在插件卡自己的 app.js 的 IIFE 作用域内），
+  // 而本函数（system.js 的 showPage）压根没有调用者：框架走的是
+  // framework.js 的 ``ROUTER.showPage()``。text-chat 卡的初始化由插件卡的
+  // app.js 自己完成。
 
   const target = document.getElementById("data-" + name);
   if (!target) return;
@@ -1286,9 +1285,9 @@ function showPage(name) {
   if (prev === "im-bridge" && name !== "im-bridge") {
     ImBridge.closeWs();
   }
-  if (prev === "text-chat" && name !== "text-chat") {
-    TextChat.closeWs();
-  }
+  // 注：**没有** text-chat 分支 —— 卡片已迁到 wdnapps_audio_chat 插件包，
+  // 它的 WS 生命周期由插件卡自己的 app.js 管（system.js 的 showPage
+  // 本就没有调用者，见上面 loadPageData 处的注释）。
   // 离开音视频描述页：关掉 AudioAnalysis WS（DemoGuard 才是 stop 入口）
   if (prev === "video-detection" && name !== "video-detection") {
     if (AudioAnalysis.ws) {
