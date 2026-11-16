@@ -37,10 +37,14 @@
   // 基本就是服务端的**一批**,第一片回来就能把当前这一页换掉(不用等整页)。
   const CHUNK_SIZE = 24;
 
-  // 常用语言清单(26 种)。语言码给 provider 用(MyMemory 收 ISO 639-1 /
+  // 界面语言清单(21 种)。语言码给 provider 用(MyMemory 收 ISO 639-1 /
   // RFC3066,比如 zh-CN / en / ja)。
+  //
+  // ⚠️ **这份清单 = 本板 NPU(HY-MT1.5)能翻的语言集合**,不多不少。
+  //   去掉的那 7 种(中文繁体 / 瑞典 / 丹麦 / 挪威 / 芬兰 / 希腊 / 匈牙利)
+  //   模型词表里**没有**(或简繁共用一个码分不出来)—— 选它们只能整批走
+  //   外网翻译站:慢好几倍、还把文案发到公网。既然板上不能翻,就别摆出来。
   const LANGUAGES = [
-    { code: "zh-TW", zh: "中文（繁体）", native: "繁體中文" },
     { code: "en",  zh: "英语",       native: "English" },
     { code: "ja",  zh: "日语",       native: "日本語" },
     { code: "ko",  zh: "韩语",       native: "한국어" },
@@ -59,15 +63,9 @@
     { code: "tr",  zh: "土耳其语",   native: "Türkçe" },
     { code: "pl",  zh: "波兰语",     native: "Polski" },
     { code: "nl",  zh: "荷兰语",     native: "Nederlands" },
-    { code: "sv",  zh: "瑞典语",     native: "Svenska" },
-    { code: "da",  zh: "丹麦语",     native: "Dansk" },
-    { code: "no",  zh: "挪威语",     native: "Norsk" },
-    { code: "fi",  zh: "芬兰语",     native: "Suomi" },
     { code: "cs",  zh: "捷克语",     native: "Čeština" },
-    { code: "el",  zh: "希腊语",     native: "Ελληνικά" },
     { code: "he",  zh: "希伯来语",   native: "עברית" },
     { code: "uk",  zh: "乌克兰语",   native: "Українська" },
-    { code: "hu",  zh: "匈牙利语",   native: "Magyar" },
   ];
 
   // 这些标签 / 容器里的文本不翻
@@ -83,6 +81,43 @@
   // 只翻含中日韩字符的文本
   const CJK_RE = /[㐀-䶿一-鿿豈-﫿]/;
 
+  // 客户端译文缓存:``目标语言 \0 原文`` → 译文。
+  //
+  // ⚠️ 为什么必须有它(2026-11-16 实测踩出来的):
+  //
+  // 页面里会**持续重建 DOM** ——「网页翻译」卡 3s 轮询一次、算力页 1s 轮询
+  // 一次,每次都把内容重写一遍 ⇒ 每轮都产生一批**全新的**文本节点。它们
+  // 的内容跟之前翻过的**一模一样**,但对 translate.js 来说就是新节点 ⇒
+  // 每轮都触发一次增量翻译 ⇒ 每轮几百条、十几个请求(虽然服务端命中缓存、
+  // 秒回),而且**全局进度条被一轮轮打回 0%** —— 用户看着就是「进度条不停
+  // 回退」。
+  //
+  // 缓存命中就直接把译文套上去,不发请求 ⇒ 增量翻译几乎零成本,
+  // 也不会再去动进度条。
+  const localCache = new Map();
+  const LOCAL_CACHE_MAX = 4000;
+
+  function cacheKey(target, text) {
+    return target + "\u0000" + text;
+  }
+
+  function rememberLocal(target, text, out) {
+    // ⚠️ **译文等于原文的不缓存** —— 那是「没翻出来」(服务端也是这么处理
+    // 的:失败条目不写缓存,否则会被永久毒化)。缓存了就等于把「这条翻不
+    // 出来」记死,以后再也不重试。
+    if (!out || out === text) return;
+    if (localCache.size >= LOCAL_CACHE_MAX) {
+      // FIFO 粗暴淘汰(Map 保持插入序)
+      const it = localCache.keys();
+      for (let i = 0; i < LOCAL_CACHE_MAX / 4; i++) {
+        const k = it.next().value;
+        if (k === undefined) break;
+        localCache.delete(k);
+      }
+    }
+    localCache.set(cacheKey(target, text), out);
+  }
+
   const state = {
     target: SOURCE,   // 当前界面语言(SOURCE = 中文原文)
     source: SOURCE,   // 原文语言(后端可改,默认 zh-CN)
@@ -91,6 +126,10 @@
     providers: [],    // 故障转移顺序
     labels: {},       // provider 名 → 中文显示名(后端给的)
     applied: 0,       // 本次已经翻出去的条数(失败回滚时用)
+    // NPU 这一路是否在链里(=「网页翻译」卡片的服务已启用)。
+    // 在链里 = 译文优先走本板 RK1828 翻译,界面必须把这件事**说出来** ——
+    // 用户有权知道译文是本机算出来的,还是走了外网翻译站。
+    npuActive: false,
   };
 
   let els = null;
@@ -135,7 +174,13 @@
     // 翻译期间显示的百分比(平时隐藏)
     const pct = h("span", "wdn-lang-pct");
     pct.hidden = true;
-    btn.append(name, caret, pct);
+    // 「NPU」徽标 —— 译文走本板 RK1828 时常驻在按钮上。
+    // 为什么常驻而不是只在翻译时闪一下:用户是**先**看到这个徽标才会去点
+    // 语言切换的;点完就消失的话,「刚才那一下是本板算的」没人记得住。
+    const npu = h("span", "wdn-lang-npu", "NPU");
+    npu.hidden = true;
+    npu.title = "译文由本板 NPU（RK1828）翻译";
+    btn.append(name, caret, pct, npu);
 
     // 常驻在按钮下方的进度条 —— 进度不能只写在「要点开才看得到」的下拉里,
     // 用户点完语言就该看见「在翻了、到百分之几」。
@@ -151,15 +196,18 @@
     const list = h("ul", "wdn-lang-list");
     const status = h("div", "wdn-lang-status");
     status.hidden = true;
+    // 面板顶部的「谁来翻」说明 —— NPU 在链里时明说是本板 RK1828。
+    const engine = h("div", "wdn-lang-engine");
+    engine.hidden = true;
 
     list.appendChild(languageItem({ code: SOURCE, zh: "中文(原文)", native: "简体中文" }));
     LANGUAGES.forEach((lang) => list.appendChild(languageItem(lang)));
 
-    panel.append(title, list, status);
+    panel.append(title, engine, list, status);
     root.append(btn, progress, panel);
     document.body.appendChild(root);
 
-    els = { root, btn, name, caret, pct, progress, fill, panel, list, status };
+    els = { root, btn, name, caret, pct, npu, progress, fill, panel, list, status, engine };
 
     btn.addEventListener("click", () => togglePanel());
     panel.addEventListener("click", (ev) => {
@@ -212,22 +260,47 @@
     // 整页翻译要几十秒,期间必须让人看得见「在翻第几片」。
     els.btn.setAttribute("aria-busy", state.busy ? "true" : "false");
     els.caret.hidden = state.busy;      // 忙的时候位置让给百分比
+    // NPU 徽标:译文走本板 RK1828 时亮出来。
+    els.npu.hidden = !state.npuActive;
+    els.btn.classList.toggle("is-npu", !!state.npuActive);
     let title = "界面语言";
     // provider 名字显示成中文(后端给一张对照表),没有就显示原名
     const labelOf = (name) => state.labels[name] || name;
-    if (state.providers && state.providers.length > 1) {
+    if (state.npuActive) {
+      // NPU 在链里 = 它是**主力** provider —— 话要说死,别让用户以为
+      // 还是外网在翻。
+      title += "（译文由板端 NPU RK1828 翻译）";
+    } else if (state.providers && state.providers.length > 1) {
       title += "（译文由板端 " + state.providers.map(labelOf).join(" → ") + " 提供）";
     } else if (state.provider) {
       title += "（译文由板端 " + labelOf(state.provider) + " 提供）";
     }
     els.btn.title = title;
+    // 面板里的「谁来翻」说明
+    if (state.npuActive) {
+      els.engine.hidden = false;
+      els.engine.dataset.kind = "npu";
+      els.engine.textContent = "译文由本板 NPU（RK1828）翻译 · 不消耗外网额度";
+    } else {
+      els.engine.hidden = false;
+      els.engine.dataset.kind = "remote";
+      els.engine.textContent = "译文由外网翻译站提供 · 可在「网页翻译」卡启用本板 NPU";
+    }
     els.list.querySelectorAll(".wdn-lang-item").forEach((item) => {
       item.classList.toggle("active", item.dataset.code === state.target);
     });
   }
 
+  // 进度条已经显示到的值 —— **只增不减**。
+  //
+  // ⚠️ 进度条**绝不能往回走**。用户看到进度条后退,第一反应是「卡住了」/
+  // 「出错了」,比慢还糟。任何一次重绘都要比上次大,小了就沿用上次。
+  let progressShown = 0;
+
   /** 进度条 + 百分比。``total`` 为 0 时只显示条、不显示数字。 */
   function setProgress(done, total) {
+    if (done < progressShown) done = progressShown;   // ← 不许后退
+    if (done > progressShown) progressShown = done;
     const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
     els.progress.hidden = false;
     els.fill.style.width = pct + "%";
@@ -238,6 +311,8 @@
   }
 
   function clearProgress() {
+    // 一整轮结束 —— 这里才允许复位(下一轮从 0 重新开始)。
+    progressShown = 0;
     els.progress.hidden = true;
     els.fill.style.width = "0%";
     els.pct.hidden = true;
@@ -308,18 +383,59 @@
     return await res.json();
   }
 
+  /** 把译文写进节点,并记下原文/译文(还原、重翻、认出「这是我们自己写的」都要用)。 */
+  function applyTranslation(node, out, origText, target) {
+    node.__wdnOrig = origText;     // 原文(还原 / 重翻都靠它)
+    node.__wdnTrans = out;          // 当前译文(用来认出"这是我们自己写的")
+    node.__wdnTarget = target;
+    if (node.nodeValue !== out) node.nodeValue = out;
+  }
+
   /** 把整页(或新增部分)翻成 ``target``。 */
   async function translateTo(target, onlyNew) {
-    const items = collect(!!onlyNew, target);
-    if (!items.length) return 0;
-    setProgress(0, items.length);
+    const collected = collect(!!onlyNew, target);
+    if (!collected.length) return 0;
+    const total = collected.length;
+
+    // ⚠️ **增量翻译不碰全局进度条** ——
+    //
+    // 进度条是给「整页翻译」这个**用户主动发起**的操作用的。增量翻译是
+    // 后台杂活(页面自己长出新内容),它去画进度条的话,用户看到的是
+    // 「进度条被一轮轮打回 0%」—— 每轮都是「重新开始」的感觉。
+    // 实测(2026-11-16):页面每 24~65s 就有一轮增量翻译,进度条于是
+    // 0% → 100% → 0% → 100% 地来回跳。
+    const showProgress = !onlyNew;
+    if (showProgress) setProgress(0, total);
+
+    // ---- 先用本地缓存消化 ----
+    // 页面轮询会不断重建同一批文案 ⇒ 它们的译文本地就有 ⇒ 直接套上,
+    // 不发请求。这一步同时把「一轮几百条」压到「零请求」。
+    let done = 0;
+    let failed = 0;
+    const pending = [];
+    collected.forEach((it) => {
+      const hit = localCache.get(cacheKey(target, it.text));
+      if (hit !== undefined) {
+        applyTranslation(it.node, hit, it.text, target);
+        done += 1;
+        // 也算「翻出去了」—— 失败回滚时靠它判断「一个字都没翻出去」。
+        state.applied += 1;
+      } else {
+        pending.push(it);
+      }
+    });
+    if (showProgress && done) setProgress(done, total);
+    if (!pending.length) {
+      // 全是本地缓存命中 —— 什么都没在翻,别去动状态行(否则会留下一句
+      // 「正在翻译…」永远不消失)。
+      return failed;
+    }
+
     // 分片请求:一次 300+ 条会变成一次几十秒的长请求,浏览器那边只能干等。
     // 拆成 24 条一片 —— 服务端一批 ≤480 字符 ≈ 24 条,所以基本一片一批,
     // 第一片回来就能把**当前这一页**换掉,不用等整页。
-    let done = 0;
-    let failed = 0;
-    for (let i = 0; i < items.length; i += CHUNK_SIZE) {
-      const chunk = items.slice(i, i + CHUNK_SIZE);
+    for (let i = 0; i < pending.length; i += CHUNK_SIZE) {
+      const chunk = pending.slice(i, i + CHUNK_SIZE);
       const data = await requestTranslations(chunk.map((it) => it.text), target);
       const translations = data.translations || [];
       if (!translations || translations.length !== chunk.length) {
@@ -331,17 +447,22 @@
       chunk.forEach((item, j) => {
         const out = translations[j];
         if (!out) return;
-        const node = item.node;
-        node.__wdnOrig = item.text;     // 原文(还原 / 重翻都靠它)
-        node.__wdnTrans = out;          // 当前译文(用来认出"这是我们自己写的")
-        node.__wdnTarget = target;
-        if (node.nodeValue !== out) node.nodeValue = out;
+        applyTranslation(item.node, out, item.text, target);
+        rememberLocal(target, item.text, out);
       });
       done += chunk.length;
       state.applied += chunk.length;
-      setProgress(done, items.length);
-      setStatus("正在翻译… " + done + "/" + items.length, "busy");
+      if (showProgress) setProgress(done, total);
+      // 翻译中要**明说**是谁在翻:NPU 在链里就说 NPU,否则说外网。
+      setStatus(
+        (state.npuActive ? "正在使用 NPU（RK1828）翻译… " : "正在翻译… ")
+        + done + "/" + total,
+        state.npuActive ? "npu" : "busy"
+      );
     }
+    // 增量翻译是后台杂活 —— 做完就把状态行收掉,别留一句「正在翻译…」
+    // 挂在面板上(主翻译那轮已经给过结论了)。
+    if (!showProgress) setStatus("", null);
     // 少数几条翻不出来(免费接口抽风)不算失败,但得让用户知道
     return failed;
   }
@@ -372,7 +493,14 @@
     state.target = code;
     updateButton();
     showPanel();
-    setStatus(code === SOURCE ? "正在还原中文原文…" : "正在翻译…", "busy");
+    if (code === SOURCE) {
+      setStatus("正在还原中文原文…", "busy");
+    } else {
+      setStatus(
+        state.npuActive ? "正在使用 NPU（RK1828）翻译…" : "正在翻译…",
+        state.npuActive ? "npu" : "busy"
+      );
+    }
     try {
       if (code === SOURCE) {
         restoreOriginal();
@@ -492,6 +620,13 @@
       if (data && data.provider) state.provider = data.provider;
       if (data && data.providers) state.providers = data.providers;
       if (data && data.provider_labels) state.labels = data.provider_labels;
+      // NPU 在不在链里 —— 后端给的是权威口径（``npu`` 在 provider 链上）。
+      // 老后端没有 ``npu_active`` 字段时退回看链里有没有 "npu"。
+      if (data && typeof data.npu_active === "boolean") {
+        state.npuActive = data.npu_active;
+      } else {
+        state.npuActive = !!(data && (data.providers || []).indexOf("npu") >= 0);
+      }
       updateButton();
     } catch (_) { /* 拿不到就按默认值走 */ }
   }
@@ -508,6 +643,15 @@
       } catch (_) { /* 失败状态已在面板里 */ }
     }
     startObserver();
+    // 后台复查 provider 链 —— 用户在「网页翻译」卡里启用了 NPU 之后,
+    // 回到这个页面右上角的 NPU 徽标要跟着亮,不能非得刷新整页。
+    // 10s 一次:够快(用户切完卡回来看一眼就对了),也够省(不跟
+    // 算力页的 1Hz 快照抢)。
+    setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      if (state.busy) return;          // 翻译中别改状态(会改掉进度提示)
+      loadStatus();
+    }, 10000);
   }
 
   if (document.readyState === "loading") {
@@ -520,7 +664,18 @@
   window.Translate = {
     get target() { return state.target; },
     get busy() { return state.busy; },
+    get npuActive() { return state.npuActive; },
     languages: LANGUAGES,
     setLanguage: choose,
+    // 进度条的当前状态(只读)—— 排障用:控制台敲 `Translate.progress`
+    // 就能看到「现在画到几 % / 是不是亮着」。进度条只增不减,所以这里的
+    // shown 只应该往上走;要是掉了,说明有人绕过了 setProgress。
+    get progress() {
+      return {
+        shown: progressShown,
+        visible: !els.progress.hidden,
+        pct: els.pct.textContent,
+      };
+    },
   };
 })();

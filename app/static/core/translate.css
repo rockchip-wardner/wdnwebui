@@ -39,6 +39,42 @@
 .wdn-lang-name { font-weight: 500; white-space: nowrap; }
 .wdn-lang-caret { font-size: 0.65rem; opacity: 0.55; }
 
+/* 「NPU」徽标 —— 译文走本板 RK1828 时常驻在按钮上。
+   绿色 = 本板算的；不给绿色而用中性灰会让人以为是个装饰标签。 */
+.wdn-lang-npu {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.05rem 0.32rem;
+  border-radius: 3px;
+  background: #dcfce7;
+  color: #166534;
+  border: 1px solid #86efac;
+  line-height: 1.5;
+}
+.wdn-lang-npu[hidden] { display: none; }
+.wdn-lang-btn.is-npu { border-color: #86efac; }
+.wdn-lang-btn.is-npu:hover { border-color: #16a34a; color: #166534; }
+
+/* 面板顶部的「谁来翻」 */
+.wdn-lang-engine {
+  margin: 0 0.5rem 0.3rem;
+  padding: 0.35rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: var(--muted);
+  background: #f8fafc;
+  border: 1px solid var(--border);
+}
+.wdn-lang-engine[data-kind="npu"] {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+  color: #166534;
+  font-weight: 600;
+}
+.wdn-lang-engine[hidden] { display: none; }
+
 /* 翻译期间的百分比(按钮里,替换掉那个小三角) */
 .wdn-lang-pct {
   font-size: 0.68rem;
@@ -128,6 +164,8 @@
 }
 .wdn-lang-status[data-kind="error"] { background: #fef2f2; color: #b91c1c; }
 .wdn-lang-status[data-kind="busy"] { background: #f8fafc; color: var(--muted); }
+/* NPU 翻译中 —— 绿色,跟「正在用本板算」这件事对上 */
+.wdn-lang-status[data-kind="npu"] { background: #f0fdf4; color: #166534; }
 .wdn-lang-status[hidden] { display: none; }
 
 /* 让出右上角控件的位置 */

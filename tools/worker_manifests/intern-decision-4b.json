@@ -1,0 +1,20 @@
+{
+  "label": "[JEV]图像文字决策模型4B",
+  "capability_types": [
+    "swcap_decision"
+  ],
+  "spec_factory": "intern_decision_4b",
+  "worker_name": "intern-dec",
+  "model_dir_name": "Intern_Decision-4B",
+  "model_dir_env": "WDNAI_INTERN_DECISION_4B_DIR",
+  "instance_name": "decision-intern4b",
+  "memory_estimate_mb": 3200,
+  "estimated_init_seconds": 60,
+  "infer_timeout_s": 120,
+  "description": "Intern-Decision-4B 结构化决策模型（状态→分类/是非/评分，实测单次纯文本决策 ~1.1s、图文决策 ~9s）",
+  "notes": "⚠️ **它不是对话模型**：Intern-Decision 不生成文本 —— 每个决策字段输出的是 62 个候选符号（A-Z + a-z + 0-9）的 logits，由 CPU 侧换算成选项概率。调用方要传**任务配置**（task=）：字段类型 choice（选一项）/ score（选项键是数字，输出概率加权评分）/ noul（是否，输出肯定概率）。答案 JSON 形如 {\"category\": \"account\", \"urgency\": 0.7676}，完整概率 / logits 随 TextAttachment 一起回传。⚠️ **prompt 里的 ChatML 标记是「写进文本」的，不是模板**：完整形态是 <|im_start|>system\\n…<|im_end|>\\n<|im_start|>user\\n…<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n{骨架}<|im_end|>\\n；少写这 6 个标记就少 66 字节 / 6 个 token，token 位置整体错位、概率明显偏移。C 侧的 chat template 被**显式清空**（官方 demo 从不调 set_chat_template，它默认就是空的）。⚠️ **预分词正则按 GGUF 的 tokenizer.ggml.pre 选**：这个模型是 qwen35，ByteLevel 自带的 GPT-2 正则会把 e.g. 切成 4 个 token 而不是 3 个 → token id 整体错位。⚠️ **每个字段一次 prefill，且必须换 session**：模型有 linear-attention 层，递归状态跨调用残留，keep_history=0 只清 KV cache 不清递归状态 —— C++ 参考实现每个字段都 rknn3_session_init/destroy，wdnai 用 RKNN3Lite.recreate_llm_session() 复刻。⚠️ **控制 token 必须是单 token**：<decision>=248077、<think>=248068、</think>=248069，ByteLevel 预分词器会把它们拆开，所以 wdnai 在**本模型的 tokenizer 实例上**单独注册（不动 Qwen 全局 tokenizer —— Qwen 路径靠解码文本里的字面量切 thinking 通道）；追加时必须**合并**而不是替换 additional_special_tokens（add_special_tokens 是整体替换，会把 Qwen 的 <|vision_start|>/<|image_pad|> 踢掉 → C 库定位不到图片占位区 → 图文 prompt 少喂 6 个 token）。⚠️ **单卡可同驻留 LLM + vision**：实测一张 1828 协卡上 LLM（weight 2013MB + internal 44MB + kvcache 297MB）与 vision（weight 651MB + internal 65MB）**同时驻留**，每个 NPU 节点用量 296MB → 383MB（节点总量 ~640MB，余量充足）。视觉模型**按需加载**（第一次带图的请求才加载）、编码完即释放（对齐 C++ 参考实现），可用 spec.options['keep_vision_resident']=True 改成常驻。视觉预处理是**整幅拉伸 resize** 到 384×384（不是 letterbox），归一化已烙进模型，只送原始 RGB 字节；缩放走 **RGA 硬件**（wdnai._rga，ctypes 直调 librga），与官方 image_utils.c 的 convert_image 一致（RGA 插值 ≠ OpenCV INTER_LINEAR，像素最大差 136）。⚠️ 概率校准温度按 embedding 宽度查表（4B = 1.99241824，float32 实际值 1.9924182891845703），运行时从 RKNN 内嵌的 LLM_CONFIG 自动读 embedding_dim 选取；校准全程 float32（参考实现用 C float）。✅ **与官方 C++ demo 逐位一致**（2026-11-13 真机对拍，官方 demo 在本板 aarch64 编译）：prompt 字节（1063 / 2861）、token id 序列（251 / 374）、原始 logits、校准概率、评分、温度全部一致；图文在喂官方自己解码的像素时同样逐位一致（SDK 自带解码只剩 JPEG 解码器差异，概率差 ≤0.03pp）。词表参数：vocab_size=248320、eos=248046、max_context_len=4096（导出时的值）。",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 91
+}

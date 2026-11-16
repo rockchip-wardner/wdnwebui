@@ -1,0 +1,20 @@
+{
+  "label": "[MT]翻译模型v1.5",
+  "capability_types": [
+    "swcap_translate"
+  ],
+  "spec_factory": "hy_mt_1_5",
+  "worker_name": "hy-mt",
+  "model_dir_name": "HY_MT_1_5",
+  "model_dir_env": "WDNAI_HY_MT_1_5_DIR",
+  "instance_name": "mt-hy15",
+  "memory_estimate_mb": 2200,
+  "estimated_init_seconds": 30,
+  "max_replicas_per_card": 2,
+  "description": "混元 HY-MT1.5-1.8B 翻译模型（文本→文本，中英互译，实测单句 ~0.15s）",
+  "notes": "⚠️ **提示词模板不是 ChatML**：HY-MT 说混元方言（<｜hy_begin▁of▁sentence｜> / <｜hy_User｜> / <｜hy_Assistant｜>），模板由 wdnai 的 HY_MT_CHAT_TEMPLATE 通过 spec.chat_template 装到 C 侧 session 上。真机实测：套 ChatML 模板 → **输出为空字符串**；套混元模板 → 中英互译正常。⚠️ **提示词必须自带翻译指令**：只把原文丢进去（不写「翻译成什么语言」）模型会当成普通对话回答（实测 \"The weather is very nice today.\" → \"Yes, that's true. It seems like we are in a pleasant weather today.\"），加上指令前缀后才是译文（\"Translate the following text from English to Chinese:\\n…\" → \"今天天气非常好。\"）。指令措辞不敏感，模型对「Translate the following text from A to B:」「翻译成中文：」「English -> Chinese:」等写法都认。⚠️ 三个控制 token 在词表里是**单 token**（120000 / 120006 / 120007），ByteLevel 预分词器会把它们拆成 ~5 个普通 token —— wdnai 的 gguf_tokenizer 已把它们注册为 additional_special_tokens（照 Qwen 多模态占位符的老办法），否则解码输出里会漏出字面量。词表参数：vocab_size=120818、eos=120020（<｜hy_place▁holder▁no▁2｜>）、max_context_len=8192（**导出时**的值，RKNN 内嵌 hf_config_json 写的 8192，不是上游 checkpoint 的 262144）。采样走贪心（top_k=1、temperature=1e-6）：翻译要忠实原文，带采样噪声会漏译或重译。同目录的 HY-MT1.5-1.8B.config.pkl 是转换工具的回执（chat template + HF config），**运行期不读** —— 同样的数字 RKNN 自己内嵌了一份，SDK 也从 GGUF tokenizer 读，没必要反序列化第三方 pickle。",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 90
+}

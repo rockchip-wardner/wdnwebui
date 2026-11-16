@@ -1208,7 +1208,23 @@ def set_thinking_mode_handler(state: dict, payload: dict) -> dict:
             if rknn is None:
                 return {"status": "error", "error": "no rknn handle"}
             from wdnai.backends._common import apply_chat_template
-            apply_chat_template(rknn)
+            # ⚠️ **必须套「这个模型自己的」模板** —— 不能用默认的 ChatML。
+            #
+            # ``apply_chat_template(rknn)`` 不带参数时套的是 ChatML（Qwen
+            # 系靠它工作），但 HY-MT1.5 说的是**混元方言**。C 侧模板被换成
+            # ChatML 之后模型看到的是错位的对话 —— 实测输出是整片空格 /
+            # "ashiashiashi" 复读，**全程不报错**，只是译文全废。
+            #
+            # 这条分支是「单卡后端 + reset 后重设模板」的通用路径（4B 走
+            # 这里；9B 有自己的 ``set_thinking_mode``，不走）。对 4B 来说
+            # spec 里本来就是 ChatML，取出来再套 = 行为不变；只有 HY-MT
+            # 这种**自带模板**的模型才会被这一行改对。
+            #
+            # 取模板的来源是 ``sess.spec.chat_template`` —— 与后端构造时
+            # （``backends/text.py``: ``apply_chat_template(self.rknn,
+            # spec.chat_template)``）**同一个源**，两处不会漂移。
+            spec = getattr(sess, "spec", None)
+            apply_chat_template(rknn, getattr(spec, "chat_template", None))
         state["thinking_mode"] = desired
         LOG.info("thinking mode -> %s (reset + mode applied)", desired)
         return {"status": "ok", "changed": True}

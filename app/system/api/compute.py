@@ -84,6 +84,39 @@ router = APIRouter(tags=["compute"])
 # --------------------------------------------------------------------------- #
 # Pydantic 模型
 # --------------------------------------------------------------------------- #
+class InstanceSlot(BaseModel):
+    """一个「槽位」= 卡号 + 本卡第几份。
+
+    同一张卡上可以并行跑几份同一个模型（小模型同卡多开能提高吞吐），
+    所以「卡号」单独已经不足以定位一个实例 —— 还要知道它是本卡的第几份。
+
+    * ``npu_index`` —— 卡号（0 起）
+    * ``replica``   —— 本卡第几份（0 起，默认 0）
+    """
+
+    model_config = {"extra": "ignore"}
+
+    npu_index: int
+    replica: int = 0
+
+    @field_validator("npu_index")
+    @classmethod
+    def _card_id(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"npu_index 必须是非负整数: {v!r}")
+        return v
+
+    @field_validator("replica")
+    @classmethod
+    def _replica_id(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"replica 必须是非负整数: {v!r}")
+        return v
+
+    def as_tuple(self) -> tuple:
+        return (self.npu_index, self.replica)
+
+
 class InstanceRequest(BaseModel):
     """``POST /compute/instances`` 入参：用户选好 (model, npu) 后启用。
 
@@ -102,6 +135,12 @@ class InstanceRequest(BaseModel):
     #: handler 里查 —— 见 ``start_instance`` 里的 ``reg.npu_card_error()``。
     npu_index: int | list[int]
     model: str
+    #: **槽位**（卡号 + 本卡第几份）。给了它就按槽位启停，``npu_index``
+    #: 被忽略 —— 算力页勾「1828#0 的第 2 份」时发的是这个。
+    #:
+    #: ⚠️ ``npu_index`` 仍然必填（老调用方 / 向导 / 卡片都在用），但语义
+    #: 退化成「卡号列表」；``slots`` 存在时以 ``slots`` 为准。
+    slots: Optional[List["InstanceSlot"]] = None
 
     @field_validator("npu_index")
     @classmethod
@@ -138,6 +177,9 @@ class StopInstanceRequest(BaseModel):
     """
     model: str
     npu_index: Optional[int] = None
+    #: 本卡第几份（0 起）。给了就只停**那一份**，同卡的其它副本留着。
+    #: 不给 = 该卡上这一模型的**所有**副本都停。
+    replica: Optional[int] = None
 
     @field_validator("model")
     @classmethod
@@ -153,6 +195,13 @@ class StopInstanceRequest(BaseModel):
     def _card_id(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v < 0:
             raise ValueError(f"npu_index 必须是非负整数: {v!r}")
+        return v
+
+    @field_validator("replica")
+    @classmethod
+    def _replica_id(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError(f"replica 必须是非负整数: {v!r}")
         return v
 
 
@@ -467,6 +516,11 @@ async def start_instance(req: InstanceRequest) -> dict:
     reg = get_registry()
     npu_indices = (req.npu_index if isinstance(req.npu_index, list)
                    else [req.npu_index])
+    # **槽位** = (卡号, 本卡第几份)。``slots`` 给了就以它为准（算力页勾
+    # 「1828#0 的第 2 份」时发的是它）；没给就退化成「每张卡第 0 份」——
+    # 老调用方（向导 / 卡片 / config autostart）的语义完全不变。
+    slots: List[tuple] = ([s.as_tuple() for s in req.slots] if req.slots
+                          else [(n, 0) for n in npu_indices])
     # ⚠️ 动态卡数：EP 卡数**取决于选中的硬件布局**（「2×1828+3588」绑 2 张，
     #    「3×1828」绑 3 张），静态 requires_cards 只能表达前者。
     requires_cards = reg.effective_requires_cards(req.model)
@@ -490,13 +544,25 @@ async def start_instance(req: InstanceRequest) -> dict:
     # 起不来（worker 会 IndexError 秒退），先排队只会让用户白等 120s
     # 再收到一个语焉不详的 409。docstring 早就承诺了「npu_index 越界 → 400」，
     # 以前只有 `>= 0` 的校验，单卡板上传 npu=1 会造出僵尸实例。
-    for n in npu_indices:
+    for n in sorted({n for (n, _r) in slots}):
         bad = reg.npu_card_error(n)
         if bad:
             raise HTTPException(status_code=400, detail=bad)
+    # 副本位不能超过该模型声明的「每卡几份」
+    max_rep = int((MODEL_PRESETS.get(req.model) or {}).get(
+        "max_replicas_per_card", 1) or 1)
+    for (_n, r) in slots:
+        if r >= max_rep:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"{req.model} 每张卡最多 {max_rep} 份"
+                        f"（请求了第 {r + 1} 份）"),
+            )
     # 过渡态前置判定：目标卡还在启动/关闭 → 排队等它结束，而不是直接
     # 再 load 一次（见文件头的「过渡态排队」注释：那是 rc=-6 的来源）。
-    want = set(npu_indices)
+    # 等的是**这些槽位所在卡**上的过渡态（副本不参与判定 —— 同一张卡上
+    # 第 1 份在 loading 时，第 2 份也该等）。
+    want = {n for (n, _r) in slots}
     if not await _await_quiet(reg, req.model, want, _QUEUE_WAIT_LOADING_S):
         raise HTTPException(
             status_code=409,
@@ -529,7 +595,7 @@ async def start_instance(req: InstanceRequest) -> dict:
                     errors.append({"npu_index": npu_indices, "detail": str(e)})
         return {"ok": not errors, "instances": created,
                 "errors": errors, "snapshot": reg.snapshot()}
-    for n in npu_indices:
+    for (n, replica) in slots:
         # 同一模型的启停串行化 —— 排队的多个请求可能同时醒来。
         with reg.model_op_lock(req.model):
             try:
@@ -537,9 +603,13 @@ async def start_instance(req: InstanceRequest) -> dict:
                 # 「spawn（不带 --npu）→ RPC action=load」。若同时传 --npu
                 # 让 worker 自己 eager-load，两条 load 会争同一个 session
                 # slot，worker 直接 rc=-6（真机实测）。
+                #
+                # replica>0 ⇒ **不复用**这张卡上已有的实例，强制起**新的
+                # worker 进程**（新的 rknn3 context + 新的 per-PID DDS
+                # service）—— 否则「勾 4 个槽位」只会起 2 份。
                 inst = reg.ensure_worker_for_model(
                     req.model, allow_adopt=False,
-                    npu_index=n, eager_load=False)
+                    npu_index=n, eager_load=False, replica=replica)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
             if inst._source == "adopted":
@@ -553,16 +623,20 @@ async def start_instance(req: InstanceRequest) -> dict:
                         "本机启动一个新实例（unavailable → spawned）。"
                     ),
                 )
-            # 幂等：已经在这张卡上 loading / running → 不用再 load。
+            # 幂等：这张卡的**这一份**已经 loading / running → 不用再 load。
             # worker 侧只在 running 时幂等，loading 时会再起一个 init 线程
             # 抢同一份 NPU 内存（rc=-6），所以这里必须挡住。
-            if inst.npu_index == n and inst.status in ("loading", "running"):
+            # ⚠️ 判据**必须带上 replica** —— 同卡的第 1 份在跑，不代表
+            # 第 2 份也起来了。
+            if (inst.npu_index == n and inst.replica == replica
+                    and inst.status in ("loading", "running")):
                 created.append(inst.to_dict())
                 continue
             try:
                 inst = reg.bind_instance(inst, n)
             except RuntimeError as e:
-                errors.append({"npu_index": n, "detail": str(e)})
+                errors.append({"npu_index": n, "replica": replica,
+                               "detail": str(e)})
                 continue
             created.append(inst.to_dict())
     return {"ok": not errors, "instances": created,
@@ -683,7 +757,7 @@ async def stop_instance(req: StopInstanceRequest) -> dict:
                     status_code=409,
                     detail=(f"{req.model} 正在启动中，请稍后重试"),
                 )
-            reg.stop_instance_local(req.model, npu)
+            reg.stop_instance_local(req.model, npu, req.replica)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "snapshot": reg.snapshot()}

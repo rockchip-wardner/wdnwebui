@@ -171,6 +171,60 @@ def test_single_provider_compat() -> None:
     check("provider 名对", stats["provider"] == "solo", str(stats))
 
 
+def test_local_provider_skips_batch_gap() -> None:
+    """本地 provider（板载 NPU）**不**吃批间 1.2s 间隔，外网照旧。
+
+    为什么这条要钉死：那个间隔（``_BATCH_GAP``）是**给免费外网接口防限流**
+    的 —— 免费站点按连接建立速率掐人。本板 NPU 没有外网连接，让它白等
+    1.2s 就是纯亏：实测它占 4 实例端到端耗时的 **30%**（3.99s 里 1.2s），
+    把加速比从 1.99× 压到 1.69×。
+
+    判据是 provider 自己的属性 ``local``（``TranslationProvider.local``），
+    不是 service 里硬编码 provider 名 —— 以后再加本地 provider 不用改
+    service。
+    """
+    print("\n[11] 本地 provider 不吃批间间隔(外网照旧)")
+
+    class Local(FakeProvider):
+        local = True
+
+    slept: list[float] = []
+    real_sleep = time.sleep
+
+    def fake_sleep(sec):
+        slept.append(sec)
+
+    # ---- 本地 provider → 一秒都不该睡 ----
+    svc = TranslateService(ProviderChain([Local("npu")]))
+    import app.core.translate.service as svc_mod
+    svc_mod.time.sleep = fake_sleep
+    try:
+        out, stats = svc.translate_segments(["系统运行正常"], "zh-CN", "en")
+    finally:
+        svc_mod.time.sleep = real_sleep
+    check("本地 provider 翻出来了", out == ["[npu] 系统运行正常"], str(out))
+    check("本地 provider 一秒都没睡", slept == [], f"睡了 {slept}")
+
+    # ---- 外网 provider → 照旧睡 1.2s ----
+    slept.clear()
+    svc = TranslateService(ProviderChain([FakeProvider("youdao")]))
+    svc_mod.time.sleep = fake_sleep
+    try:
+        svc.translate_segments(["系统运行正常"], "zh-CN", "en")
+    finally:
+        svc_mod.time.sleep = real_sleep
+    check("外网 provider 照旧睡 _BATCH_GAP",
+          slept == [svc_mod._BATCH_GAP], f"睡了 {slept}")
+
+    # ---- 判据本身 ----
+    chain = ProviderChain([Local("npu"), FakeProvider("youdao")])
+    check("provider_is_local(npu)", chain.provider_is_local("npu") is True)
+    check("provider_is_local(youdao)", chain.provider_is_local("youdao") is False)
+    check("provider_is_local(空/未知) 保守返回 False",
+          chain.provider_is_local("") is False
+          and chain.provider_is_local("nope") is False)
+
+
 def test_build_chain_order() -> None:
     print("\n[10] 配置顺序 = 故障转移顺序")
     chain = build_chain(["youdao", "iciba", "mymemory"])
@@ -179,6 +233,200 @@ def test_build_chain_order() -> None:
     check("没配 key 的百度被跳过", "baidu" not in chain.names, str(chain.names))
     chain = build_chain(["baidu"], baidu={"appid": "1", "key": "2"})
     check("配了 key 的百度进链", "baidu" in chain.names, str(chain.names))
+
+
+# --------------------------------------------------------------------------- #
+# 「一条不合格拖垮 24 条」那个 bug 的回归
+# --------------------------------------------------------------------------- #
+class PartialProvider(TranslationProvider):
+    """只翻成功一部分的 provider(模拟 NPU:23 条成了,第 24 条翻不出来)。"""
+
+    def __init__(self, name: str, bad_index: int = -1, total: int = 1):
+        self.name = name
+        self.bad_index = bad_index
+        self.total = total
+        self.calls = 0
+        self.saw: list[str] = []
+
+    def translate(self, text, source, target):
+        from app.core.translate.base import TranslationResult
+        self.calls += 1
+        self.saw.append(text)
+        lines = [ln for ln in (text or "").split("\n") if ln.strip()]
+        bodies = []
+        for ln in lines:
+            m = __import__("re").match(r"^\s*(\d{1,3})\s*[.)、]?\s*(.*)$", ln)
+            bodies.append(m.group(2).strip() if m else ln.strip())
+        misses = set()
+        outs = []
+        for i, body in enumerate(bodies):
+            if i == self.bad_index:
+                misses.add(i)
+                outs.append(body)
+            else:
+                outs.append("[%s] %s" % (self.name, body))
+        joined = "\n".join("%d. %s" % (i, o) for i, o in enumerate(outs, 1))
+        return TranslationResult(joined, provider=self.name,
+                                 misses=frozenset(misses),
+                                 failed_provider=self.name if misses else "")
+
+
+def test_partial_failure_not_fatal() -> None:
+    print("\n[12] 一条翻不出来**不牵连整批**(核心修复)")
+    a = PartialProvider("a", bad_index=1, total=3)
+    b = FakeProvider("b")
+    svc = TranslateService(ProviderChain([a, b]))
+    out, stats = svc.translate_segments(
+        ["系统运行正常", "算力配置", "已安装"], "zh-CN", "en")
+    check("三条都有译文", all(o for o in out), str(out))
+    check("翻出来的那两条用的是 a", out[0].startswith("[a]"), str(out))
+    check("翻不出来的那条被 b 补上了", out[1].startswith("[b]"), str(out))
+    check("没有条目保留原文", stats["failed"] == 0, str(stats))
+    check("上报的是翻了多数条的那家", stats["provider"] == "a", str(stats))
+
+
+def test_repair_skips_failed_provider() -> None:
+    print("\n[13] 补翻时**跳过**刚刚翻不出来的那家")
+    a = PartialProvider("a", bad_index=0, total=2)
+    b = FakeProvider("b")
+    svc = TranslateService(ProviderChain([a, b]))
+    out, stats = svc.translate_segments(["算力配置", "已安装"], "zh-CN", "en")
+    check("补翻那条由 b 翻", out[0].startswith("[b]"), str(out))
+    check("a 只被调用过一次(整批那次)", a.calls == 1, "a.calls=%d" % a.calls)
+    check("a 没有再收到那条补翻请求",
+          not any("算力配置" in t and "1." not in t for t in a.saw),
+          str(a.saw))
+
+
+def test_skip_argument() -> None:
+    print("\n[14] chain.translate 的 skip 参数")
+    a = FakeProvider("a")
+    b = FakeProvider("b")
+    chain = ProviderChain([a, b])
+    out = chain.translate("系统运行正常", "zh-CN", "en", skip=("a",))
+    check("跳过的 provider 没被调用", a.calls == 0, "a.calls=%d" % a.calls)
+    check("用的是下一个", out == "[b] 系统运行正常", out)
+
+
+def test_unsupported_language_no_cooldown() -> None:
+    print("\n[15] 语言不支持 -> **不记 provider 冷却**(不能连累别的语言)")
+    from app.core.translate.base import UnsupportedLanguageError
+
+    class NoLang(FakeProvider):
+        def translate(self, text, source, target):
+            self.calls += 1
+            raise UnsupportedLanguageError("不支持的语言对")
+
+    a = NoLang("a")
+    b = FakeProvider("b")
+    chain = ProviderChain([a, b])
+    out = chain.translate("系统运行正常", "zh-CN", "sv")
+    check("换到了下一家", out == "[b] 系统运行正常", out)
+    check("没有进冷却", chain.cooldown_state() == {}, str(chain.cooldown_state()))
+    out2 = chain.translate("系统运行正常", "zh-CN", "en")
+    check("下一条请求仍然先试 a", a.calls == 2, "a.calls=%d" % a.calls)
+    check("照样翻出来了", out2 == "[b] 系统运行正常", out2)
+
+
+def test_partial_no_cooldown() -> None:
+    print("\n[16] provider 只翻出一部分 -> 也不记冷却")
+    a = PartialProvider("a", bad_index=0, total=1)
+    b = FakeProvider("b")
+    chain = ProviderChain([a, b])
+    chain.translate("1. 算力配置", "zh-CN", "en")
+    check("没有进冷却", chain.cooldown_state() == {}, str(chain.cooldown_state()))
+
+
+def test_npu_negative_cache() -> None:
+    print("\n[17] NPU: 翻不出来的那条短期内不再重试(负缓存)")
+    from app.core.translate.npu_provider import NpuTranslateProvider
+
+    prov = NpuTranslateProvider()
+    prov._infer = lambda session, prompt: "算力配置"   # 复读原文 -> 翻不出来
+    calls = {"n": 0}
+
+    def counting(session, prompt):
+        calls["n"] += 1
+        return "算力配置"
+
+    prov._infer = counting
+    try:
+        prov._translate_one("算力配置", "zh-CN", "en", session=object())
+    except Exception as exc:
+        check("第一次报质量错", type(exc).__name__ == "NpuQualityError",
+              type(exc).__name__)
+    check("试了 5 个措辞", calls["n"] == 5, "calls=%d" % calls["n"])
+    before = calls["n"]
+    try:
+        prov._translate_one("算力配置", "zh-CN", "en", session=object())
+    except Exception as exc:
+        check("第二次还是质量错", type(exc).__name__ == "NpuQualityError",
+              type(exc).__name__)
+    check("第二次**一次都没试**(命中负缓存)", calls["n"] == before,
+          "calls=%d" % calls["n"])
+
+
+def test_npu_unsupported_language() -> None:
+    print("\n[18] NPU: 语言对不支持 -> UnsupportedLanguageError(不记冷却)")
+    from app.core.translate.base import UnsupportedLanguageError
+    from app.core.translate.npu_provider import NpuTranslateProvider
+
+    prov = NpuTranslateProvider()
+    try:
+        prov.translate("1. 算力配置", "zh-CN", "sv")
+        check("抛了 UnsupportedLanguageError", False, "没抛")
+    except UnsupportedLanguageError:
+        check("抛了 UnsupportedLanguageError", True)
+    except Exception as exc:
+        check("抛了 UnsupportedLanguageError", False, type(exc).__name__)
+
+
+def test_npu_check_pair() -> None:
+    print("\n[19] NPU: 语言对准入判定(同码不同语言 = 不支持)")
+    from app.core.translate.base import UnsupportedLanguageError
+    from app.core.translate.npu_provider import NpuTranslateProvider
+
+    prov = NpuTranslateProvider()
+    try:
+        prov._check_pair("zh-CN", "en")
+        check("支持的语言对不抛异常", True)
+    except Exception as exc:
+        check("支持的语言对不抛异常", False, repr(exc))
+    try:
+        prov._check_pair("zh-CN", "zh-TW")
+        check("简→繁(同码)抛 UnsupportedLanguageError", False, "没抛")
+    except UnsupportedLanguageError:
+        check("简→繁(同码)抛 UnsupportedLanguageError", True)
+    except Exception as exc:
+        check("简→繁(同码)抛 UnsupportedLanguageError", False, repr(exc))
+    try:
+        prov._check_pair("zh-CN", "sv")
+        check("词表外抛 UnsupportedLanguageError", False, "没抛")
+    except UnsupportedLanguageError:
+        check("词表外抛 UnsupportedLanguageError", True)
+    except Exception as exc:
+        check("词表外抛 UnsupportedLanguageError", False, repr(exc))
+
+
+def test_npu_prompt_order() -> None:
+    print("\n[20] NPU: 每种语言有自己的措辞顺序(实测表)")
+    from app.core.translate.npu_provider import (NpuTranslateProvider,
+                                                  PROMPT_ORDER,
+                                                  DEFAULT_PROMPT_ORDER,
+                                                  _ALL_PROMPTS)
+    prov = NpuTranslateProvider()
+    check("表里有 30 种以上语言", len(PROMPT_ORDER) >= 30, str(len(PROMPT_ORDER)))
+    check("默认顺序是 5 条全用", DEFAULT_PROMPT_ORDER == (0, 1, 2, 3, 4),
+          str(DEFAULT_PROMPT_ORDER))
+    ok = all(len(v) == 5 and sorted(v) == [0, 1, 2, 3, 4]
+             for v in PROMPT_ORDER.values())
+    check("每种语言都是 5 条的排列(不丢兜底)", ok)
+    check("非拉丁字母的语言把「按名写」排前面",
+          PROMPT_ORDER["hi"][0] >= 3 and PROMPT_ORDER["uk"][0] >= 3,
+          "hi=%s uk=%s" % (PROMPT_ORDER["hi"], PROMPT_ORDER["uk"]))
+    check("拉丁字母的语言把「按码写」排前面",
+          PROMPT_ORDER["en"][0] < 3 and PROMPT_ORDER["fr"][0] < 3,
+          "en=%s fr=%s" % (PROMPT_ORDER["en"], PROMPT_ORDER["fr"]))
 
 
 def live_check() -> None:
@@ -214,7 +462,17 @@ if __name__ == "__main__":
     test_failure_not_cached()
     test_numbered_alignment()
     test_single_provider_compat()
+    test_local_provider_skips_batch_gap()
     test_build_chain_order()
+    test_partial_failure_not_fatal()
+    test_repair_skips_failed_provider()
+    test_skip_argument()
+    test_unsupported_language_no_cooldown()
+    test_partial_no_cooldown()
+    test_npu_negative_cache()
+    test_npu_unsupported_language()
+    test_npu_check_pair()
+    test_npu_prompt_order()
     if "--live" in sys.argv:
         live_check()
     print("\n" + "=" * 72)

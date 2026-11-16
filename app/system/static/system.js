@@ -2699,7 +2699,7 @@ const ComputeConfigPage = {
         // 后 _selectedTarget 更新了，但 sig 没变 → 节点复用 → toggle.disabled
         // 还是旧值（needsTarget && !targetPicked）。sig 包含 _selectedTarget
         // 后切勾选会触发重建，toggle 立即变可用。
-        this._selectedTargets(s.model_id).join(",") || "_",
+        this._selectedSlots(s.model_id).join(",") || "_",
         // 同模型可能同时占多张卡，一并进 sig（禁用全部 / 启一张都会变）。
         this._modelNpus(s.model_id).join(","),
       ].join("|");
@@ -3147,18 +3147,28 @@ const ComputeConfigPage = {
       // 用当前 snapshot 里的 svc，避免 update 后闭包 svc 过时。
       const curSvc = this._findSvcInSnapshot(modelId);
       const curCards = (this._snapshot && this._snapshot.cards) || [];
-      // 「运行在」是多选：用户可能勾了两张卡，启用时两张都起 worker。
-      const targets = this._selectedTargets(modelId);
+      // 「运行在」是多选：用户可能勾了多张卡 / 同一张卡的多个副本，
+      // 启用时**每个槽位各起一个 worker**。
+      const targets = this._selectedSlots(modelId);
       const finalTargets = (targets && targets.length)
         ? targets
-        : [ (curSvc && curSvc.npu_index >= 0)
-              ? curSvc.npu_index
-              : this._defaultTargetNpu(curCards) ];
+        : [ this._slotKey((curSvc && curSvc.npu_index >= 0)
+                            ? curSvc.npu_index
+                            : this._defaultTargetNpu(curCards),
+                          (curSvc && curSvc.replica) || 0) ];
       if (toggleInput.checked) {
         this._enableInstance(finalTargets, modelId);
       } else {
-        if (confirm(`确认禁用 ${meta.label}？将卸载模型并关闭 worker 进程。`)) {
-          this._disableInstance(modelId);
+        // 只停**这张卡上这一份** —— 同一模型还跑在别的卡 / 别的副本上时，
+        // 不该被一起停掉。
+        const ownNpu = (svc && svc.npu_index >= 0) ? svc.npu_index : null;
+        const ownRep = (svc && svc.replica) || 0;
+        const onlyOne = this._modelSlots(modelId).length <= 1;
+        if (confirm(`确认禁用 ${meta.label}`
+                    + (ownNpu != null && !onlyOne
+                       ? `（卡 #${ownNpu} 的第 ${ownRep + 1} 份）` : "")
+                    + `？将卸载模型并关闭 worker 进程。`)) {
+          this._disableInstance(modelId, ownNpu, ownRep);
         } else {
           // 用户取消：回滚 toggle 视觉（后端 API 调用还没真正发起）
           toggleInput.checked = true;
@@ -3462,7 +3472,7 @@ const ComputeConfigPage = {
       (cards || []).map(c => `${c.npu_index}:${c.device_id || ""}`).join(","),
       (meta.available_targets || []).join(","),
       this._modelNpus(card.dataset.model).join(","),
-      this._selectedTargets(card.dataset.model).join(","),
+      this._selectedSlots(card.dataset.model).join(","),
       // 设备拓扑布局进了 sig —— 插了第三张卡 / 装了 rknn2-runtime 之后，
       // 「运行在」里的第三个设备（EP 卡 or 本机 NPU）要跟着变。
       ((meta.card_requirements && meta.card_requirements.selected) || {}).id || "",
@@ -3517,11 +3527,51 @@ const ComputeConfigPage = {
 
   // 「运行在」的勾选集合。v0.19 起是**数组**（同模型可多卡），早期版本
   // 是单个数字 —— 这里做一次兼容读取，免得热更新后老状态把 toggle 卡死。
-  _selectedTargets(modelId) {
+  // 「槽位」= 卡号 + 本卡第几份，编码成 "卡:份"（例 "0:1" = 1828#0 的第 2 份）。
+  //
+  // 为什么要有「份」：同一张卡上可以并行跑几份同一个模型（小模型同卡多开
+  // 能提高吞吐 —— 实测 RK1828：1 份 → 2 份，24 条界面文案 3.30s → 2.74s；
+  // 2 卡各 2 份 → 1.45s / 2.31×）。光有卡号定位不了一份实例。
+  //
+  // ⚠️ 一份实例 = 一个独立的 worker 进程（自己的 rknn3 context + 自己的
+  // per-PID DDS service），所以它们能**同时**各跑一个推理。
+  _slotKey(npu, replica) {
+    return String(npu) + ":" + String(replica || 0);
+  },
+
+  _parseSlot(key) {
+    const parts = String(key).split(":");
+    const n = Number(parts[0]);
+    const r = Number(parts[1]);
+    return [Number.isInteger(n) ? n : -1, Number.isInteger(r) ? r : 0];
+  },
+
+  // 用户勾选的槽位（"卡:份" 数组）
+  _selectedSlots(modelId) {
     const raw = this._selectedTarget[modelId];
-    if (Array.isArray(raw)) return raw.filter(n => Number.isInteger(n) && n >= 0);
-    if (typeof raw === "number" && raw >= 0) return [raw];
-    return [];
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(k => typeof k === "string" && k.indexOf(":") >= 0);
+  },
+
+  // 用户勾选的**卡号**（从槽位派生，去重升序）—— 老调用方要的仍是卡号。
+  _selectedTargets(modelId) {
+    const cards = [];
+    for (const key of this._selectedSlots(modelId)) {
+      const [n] = this._parseSlot(key);
+      if (n >= 0 && !cards.includes(n)) cards.push(n);
+    }
+    return cards;
+  },
+
+  // 本模型**正在跑**的槽位（"卡:份"）
+  _modelSlots(modelId) {
+    const out = [];
+    for (const s of (this._snapshot && this._snapshot.services) || []) {
+      if (s.model_id !== modelId) continue;
+      if (!(s.npu_index >= 0)) continue;
+      out.push(this._slotKey(s.npu_index, s.replica || 0));
+    }
+    return [...new Set(out)].sort();
   },
 
   // adopted peer —— 只读
@@ -3624,16 +3674,32 @@ const ComputeConfigPage = {
     await this.load();
   },
 
-  // npu_index 可以是单卡或卡数组 —— 「运行在」是多选，一个模型可以
-  // 同时跑在多张卡上（后端为每张卡各 spawn 一个 worker）。
-  _enableInstance(npu_index, model) {
-    const cards = Array.isArray(npu_index) ? npu_index : [npu_index];
+  // 「运行在」是多选：一个模型可以同时跑在多张卡上**、同一张卡上跑多份**
+  // （后端为每个**槽位**各 spawn 一个 worker）。
+  //
+  // ``slots`` 是槽位数组（"卡:份" 或 {npu_index, replica}）；``npu_index``
+  // 仍然带上（老后端 / 排障时看快照用），但后端以 ``slots`` 为准。
+  _enableInstance(slots, model) {
+    const list = (Array.isArray(slots) ? slots : [slots]).map((s) => {
+      if (typeof s === "string") {
+        const [n, r] = this._parseSlot(s);
+        return {npu_index: n, replica: r};
+      }
+      return {npu_index: s.npu_index, replica: s.replica || 0};
+    });
+    const cards = [...new Set(list.map(s => s.npu_index))];
     return this._computeAction("/compute/instances", "POST",
-                               {npu_index: cards, model}, "启用");
+                               {npu_index: cards, slots: list, model}, "启用");
   },
 
-  _disableInstance(model) {
-    return this._computeAction("/compute/instances", "DELETE", {model}, "卸载");
+  // 禁用：给了 npu_index / replica 就只停**那一份**，否则停该模型全部实例。
+  _disableInstance(model, npu_index, replica) {
+    const body = {model};
+    if (Number.isInteger(npu_index) && npu_index >= 0) {
+      body.npu_index = npu_index;
+      if (Number.isInteger(replica) && replica > 0) body.replica = replica;
+    }
+    return this._computeAction("/compute/instances", "DELETE", body, "卸载");
   },
 
   _restartInstance(model) {
@@ -3846,53 +3912,68 @@ const ComputeConfigPage = {
     // npu_index；最后兜底第一个 supported target。
     let defaults;
     if (requiresCards > 1) {
+      // 多卡模型（要占 N 张卡的那种）：仍是「按卡」，一份一个实例
       defaults = new Set(sortedIndices.slice(0, requiresCards));
     } else {
-      defaults = new Set(this._selectedTargets(modelId));
+      defaults = new Set(this._selectedSlots(modelId));
       if (defaults.size === 0) {
-        const running = this._modelNpus(modelId);
+        const running = this._modelSlots(modelId);
         if (running.length) defaults = new Set(running);
       }
       if (defaults.size === 0 && inst && inst.npu_index >= 0) {
-        defaults.add(inst.npu_index);
+        defaults.add(this._slotKey(inst.npu_index, inst.replica || 0));
       }
       if (defaults.size === 0 && inst
           && Number.isInteger(inst._default_npu_index)
           && inst._default_npu_index >= 0) {
-        defaults.add(inst._default_npu_index);
+        defaults.add(this._slotKey(inst._default_npu_index, 0));
       }
       if (defaults.size === 0) {
         for (const idx of sortedIndices) {
-          if (supported.has("182x")) { defaults.add(idx); break; }
+          if (supported.has("182x")) {
+            defaults.add(this._slotKey(idx, 0));
+            break;
+          }
         }
       }
     }
     // 只保留真实枚举出来的卡，避免 snapshot 里的陈旧卡号留下幽灵勾选。
-    for (const n of Array.from(defaults)) {
-      if (!sortedIndices.includes(n)) defaults.delete(n);
+    // ⚠️ defaults 现在装的是**槽位**（"卡:份"），要拆出卡号再比。
+    for (const key of Array.from(defaults)) {
+      const [n] = this._parseSlot(key);
+      if (!sortedIndices.includes(n)) defaults.delete(key);
     }
     this._selectedTarget[modelId] = Array.from(defaults);
 
     let rendered = 0;
-    const renderOpt = (npuIndex, title, sub, targetFamily, supportedFlag) => {
+    // 同一张卡上可以跑几份 —— 模型 manifest 的 ``max_replicas_per_card``。
+    // 2 ⇒ 每张卡两个复选框（"1828#0" 的第 1 份 / 第 2 份）。
+    const maxReplicas = Math.max(1, Number(
+      (meta && meta.max_replicas_per_card)
+      || (inst && inst.max_replicas_per_card) || 1
+    ));
+
+    const renderOpt = (npuIndex, title, sub, targetFamily, supportedFlag,
+                       replica) => {
       // 不支持的 target 不渲染（直接跳过）—— 用户只看到能用的 NPU 卡。
       const isSup = supportedFlag !== false;
       if (!isSup) return;
+      const slot = this._slotKey(npuIndex, replica);
       const label = document.createElement("label");
       label.className = "cc-target-opt";
       label.title = sub || "";
       const input = document.createElement("input");
-      // checkbox 而非 radio：同一个模型可以同时跑在多张卡上（每个勾选的
-      // 卡各起一个 worker，各占一张卡）。
+      // checkbox 而非 radio：同一个模型可以同时跑在多张卡上、同一张卡上
+      // 跑多份（每个勾选的**槽位**各起一个 worker，各占一份 NPU 内存）。
       input.type = "checkbox";
-      input.value = String(npuIndex);
+      input.value = slot;
       input.className = "cc-target-radio";
-      if (defaults.has(npuIndex)) input.checked = true;
+      if (defaults.has(slot)) input.checked = true;
       if (requiresCards > 1) input.disabled = true;
       input.addEventListener("change", () => {
         if (requiresCards > 1) return;
-        const cur = new Set(this._selectedTargets(modelId));
-        if (input.checked) cur.add(npuIndex); else cur.delete(npuIndex);
+        const cur = new Set(this._selectedSlots(modelId));
+        if (input.checked) cur.add(slot); else cur.delete(slot);
         this._selectedTarget[modelId] = Array.from(cur);
       });
       label.appendChild(input);
@@ -3908,12 +3989,20 @@ const ComputeConfigPage = {
     // "RK182x #0"，input value 也是 0（直接给 worker 用）。
     // 排序按 npu_index 升序，与顶部 182x 内存条位置完全对齐。
     for (const card of sorted) {
-      if (rendered >= MAX_RK182X_OPTIONS) break;
+      if (rendered >= MAX_RK182X_OPTIONS * maxReplicas) break;
       if (requiresCards > 1 && rendered >= requiresCards) break;
       const idx = card.npu_index;
-      renderOpt(idx, `RK182x #${idx}`,
-                card.device_id || `npu #${idx}`,
-                "182x", supported.has("182x"));
+      // 一张卡上几份 → 几个复选框：「RK182x #0」/「RK182x #0 (2)」。
+      // 第 1 份的标题保持原样（老截图/文案不变），第 2 份起加后缀。
+      for (let rep = 0; rep < maxReplicas; rep++) {
+        if (requiresCards > 1 && rep > 0) break;   // 多卡模型：一份一个实例
+        const title = rep === 0
+          ? `RK182x #${idx}`
+          : `RK182x #${idx} (${rep + 1})`;
+        renderOpt(idx, title,
+                  card.device_id || `npu #${idx}`,
+                  "182x", supported.has("182x"), rep);
+      }
     }
     if (rendered === 0) {
       const ph = document.createElement("span");
