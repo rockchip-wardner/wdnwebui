@@ -139,6 +139,21 @@ def _cache_control(scope) -> str:
 def create_app() -> FastAPI:
     cfg = get_config()
 
+    # TLS 握手失败 ⇒ 明文 ERROR 日志。
+    #
+    # 8000 只提供 HTTPS 之后，「客户端用 http:// 撞上来」这个故障在服务端
+    # **完全静默**（asyncio 的 OSError 分支只在 loop debug 模式下记 DEBUG，
+    # 而 asyncio logger 默认 WARNING ⇒ 记了也被丢掉）。客户端只看到
+    # "Empty reply from server"，现场没有任何线索。
+    #
+    # 这里装一个守卫式钩子补上这条链路。**装不上也不影响服务启动**
+    # （install() 内部只 WARNING）—— 日志钩子不该成为启动的硬依赖。
+    try:
+        from app.core.tls_logging import install as install_tls_logging
+        install_tls_logging()
+    except Exception as exc:               # noqa: BLE001
+        LOG.warning("[TLS] 握手失败日志钩子安装异常（已忽略）: %s", exc)
+
     # Propagate WDNAI_MODELS_DIR from config so downstream SDKs pick up
     # the configured model root before any LLMSession is built.
     base = cfg.get_section("base", {})

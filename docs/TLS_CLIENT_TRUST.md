@@ -50,7 +50,9 @@
 | `scripts/gen_tls_ca.sh` | **私有 CA** + 签发服务端证书（本文档用的就是它） |
 | `scripts/gen_tls_cert.sh` | 另一条路：直接自签一张叶子证书（要点「继续前往」） |
 | `scripts/verify_tls_scheme.py` | 回归：转发头 scheme 处理 + 请求体不被搞坏 |
+| `scripts/verify_tls_handshake_log.py` | 回归：握手失败落明文 ERROR 日志（asyncio + uvloop） |
 | `scripts/verify_run_py_tls_guard.py` | 回归：`run.py` 不许在 8000 上以明文启动 |
+| `app/core/tls_logging.py` | 握手失败的明文日志钩子（与 event loop 无关） |
 | `/etc/systemd/system/wdnwebui-cert-check.{service,timer}` | 证书存在性 / 有效期每日巡检 |
 
 ## 证书在哪
@@ -175,9 +177,43 @@ sudo systemctl restart wdnwebui.service
 | `ERR_CERT_AUTHORITY_INVALID` | 同上；或证书过期（`openssl x509 -enddate` 看） |
 | `ERR_CERT_COMMON_NAME_INVALID` | 访问地址不在 SAN 里 → 用 `https://172.16.9.65:8000`（SAN 含 IP + `debian` + `localhost` + `127.0.0.1`） |
 | **服务整个起不来**（8000 连不上） | 证书缺失 / 私钥不可读 → `ConditionPathExists` 挡住了启动。查 `journalctl -u wdnwebui` 与 `ls -l /home/rockchip/.config/wdnwebui/tls/` |
-| `curl` 报 exit=52（Empty reply） | 用明文 http 访问了 8000 —— 8000 **只说 HTTPS** |
+| `curl` 报 exit=52（Empty reply） | 用明文 http 访问了 8000 —— 8000 **只说 HTTPS**。服务端会留一行明文日志：`journalctl -u wdnwebui.service \| grep '\[TLS\]'`（见下） |
 | 页面能开但 `Failed to fetch` | 查 `curl -sSI https://127.0.0.1:8000/api/tts \| grep -i location` 是否为 `https://` |
 | 麦克风还是打不开 | 看浏览器控制台；**必须**是 `https://`（`http://localhost` 在非回环地址上不算） |
+
+### 「Empty reply from server」怎么定位
+
+8000 只说 HTTPS ⇒ 客户端用 `http://` 撞上来时，服务端会**掐掉连接**，
+客户端只看到 `curl: (52) Empty reply from server`，**看不出原因**。
+
+服务端现在会留**明文**日志（`app/core/tls_logging.py`）：
+
+```bash
+journalctl -u wdnwebui.service | grep '\[TLS\]'
+```
+
+```
+[ERROR] [TLS] 握手失败  SSLError: [SSL: HTTP_REQUEST] http request (_ssl.c:992)
+[ERROR] [TLS] 排查提示: 疑似「明文客户端撞上 HTTPS 端口」：客户端用了 http:// 而不是 https://。
+                   服务端 8000 只提供 HTTPS —— 客户端请改用 https://<host>:8000
+```
+
+`[SSL: HTTP_REQUEST] http request` 是 OpenSSL 直接认出来的「对面发的是
+一个 HTTP 请求」⇒ 结论就是**客户端把地址写成了 `http://`**。
+
+其它可能的原文：
+
+| 原文 | 含义 |
+|---|---|
+| `[SSL: HTTP_REQUEST] http request` | 明文客户端撞 HTTPS 端口 |
+| `[SSL: WRONG_VERSION_NUMBER] wrong version number` | 同上（老一点 OpenSSL 的措辞） |
+| `CERTIFICATE_VERIFY_FAILED` | 客户端**不信任**本板 CA ⇒ 走上面的「装 CA」流程 |
+| `The operation did not complete (read)` | 握手超时（网络不通 / 中间设备拦截） |
+
+> ⚠️ 纯 asyncio 下这行还会带 `peer=<ip>:<port>`（对端地址）。
+> **生产跑的是 uvloop** ⇒ uvloop 的 SSL 类型不可打补丁 ⇒ **拿不到 peer**。
+> 钩子本体走 `ssl.SSLObject.do_handshake`，与 event loop 无关 ⇒
+> uvloop 下照样能记，只是没有对端地址。
 
 ```bash
 systemctl status wdnwebui.service

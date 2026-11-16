@@ -102,6 +102,30 @@ github = git@github.com:rockchip-wardner/<repo>.git    ← 只 push
       cgroup 里的 `compute_worker` 一起 SIGTERM 掉 → 重启前确认
       `compute.autostart` 有值，否则重启后板子没有任何算力，得手工
       `POST /api/compute/instances` 把模型拉回来。
+    - **明文撞 HTTPS 端口现在会留明文日志**（`app/core/tls_logging.py`）：
+      ```
+      journalctl -u wdnwebui.service | grep '\[TLS\]'
+      # [ERROR] [TLS] 握手失败  SSLError: [SSL: HTTP_REQUEST] http request
+      # [ERROR] [TLS] 排查提示: 疑似「明文客户端撞上 HTTPS 端口」：客户端用了 http:// 而不是 https://。…
+      ```
+      ⇒ 客户端报「Empty reply from server」时，先看这一行。
+      - ⚠️ **生产跑的是 uvloop，不是 asyncio**（`uvicorn --loop auto` 优先
+        选 uvloop，板上装了 uvloop 0.22.1）⇒ **打在
+        `asyncio.sslproto.SSLProtocol` 上的补丁在生产上完全无效**
+        （2026-11-16 实测：钩子装了、明文撞 8000、日志 0 行）。
+        uvloop 的类型（`uvloop.loop.SSLProtocol` / `Loop` / `TCPTransport`）
+        **全是不可变的**（Cython `cdef class`）⇒ 打不了补丁。
+        真正与 event loop 无关的钩子是 **`ssl.SSLObject.do_handshake`**
+        （`ssl.py` 里的**纯 Python 类**；asyncio 与 uvloop 都走
+        `self._sslobj.do_handshake()`）。
+      - ⚠️ 必须**排除 `SSLWantReadError` / `SSLWantWriteError` /
+        `SSLSyscallError`**（asyncio 叫它们 `SSLAgainErrors`）—— 那是
+        「还要更多数据」的**正常中间态**，每次正常握手都会抛好几次；
+        它们是 `ssl.SSLError` 的子类 ⇒ 不排除的话每次正常握手都刷一条
+        「握手失败」。
+      - 只记 `server_side=True` 的对象（客户端侧握手失败跟本故障无关）。
+      - 回归：`python -m scripts.verify_tls_handshake_log`（asyncio +
+        uvloop 两套都测）。
   - **别和 systemd 单元 `wdnwebui.service` 同时跑**：该单元
     `Restart=on-failure` + `RestartSec=5`，抢不到 8000 端口就每 5 秒
     重启一轮，而**每轮重启都会把 cgroup 里的 `compute_worker` 一起
