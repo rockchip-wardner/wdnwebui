@@ -105,6 +105,10 @@ def translate_status() -> dict:
         "provider_labels": {
             name: PROVIDER_LABELS.get(name, name) for name in names
         },
+        # ⚠️ ``npu`` 在链里 = 「网页翻译」卡片的服务已启用,译文优先走
+        # 本板 RK1828。前端靠它显示「正在使用 NPU 翻译」—— 这个口径必须
+        # **由后端给**:浏览器看不见 provider 链,让它自己猜就一定会猜错。
+        "npu_active": "npu" in names,
         # 还在冷却的 provider 及剩余秒数(429 之后会看到它在里面)
         "cooldown": service.cooldown_state(),
         "cache_size": service.cache_size(),

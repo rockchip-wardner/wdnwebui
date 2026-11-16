@@ -708,6 +708,551 @@ if (lastDone) { badge.textContent = "✓ 已安装"; ... }   // ← 只看任务
 > 数字必须来自**被计数对象的当前状态**，不能来自**操作流水**。
 > 凡是文案会被读成库存陈述的（「已安装」「已就绪」），就别拿任务事件驱动。
 
+## HY-MT1.5 翻译模型（`swcap_translate`，2026-11-13）
+
+混元 **HY-MT1.5-1.8B**：Hunyuan-Dense 架构的**机器翻译**专用模型（文本→文本）。
+装在 `~/models/HY_MT_1_5/`（= 本板 `base.model_path` 指向的模型根）。
+
+### 交付物
+
+| 位置 | 内容 |
+|---|---|
+| `wdnai/src/wdnai/model.py` | `SystemLanguageModel.hy_mt_1_5()` + `_hy_mt_1_5_spec()` + `HY_MT_CHAT_TEMPLATE` + `_hy_mt_1_5_dir()` / `_default_hy_mt_1_5_paths()` / `_verify_hy_mt_1_5_files()` |
+| `wdnai/src/wdnai/capability.py` | `SoftwareCapability.TRANSLATE = "swcap_translate"` |
+| `wdnai/src/wdnai/backends/_common.py` | `apply_chat_template(rknn_llm, template=None)` —— 模板改成**按模型族**传 |
+| `wdnai/src/wdnai/backends/text.py` | 传 `spec.chat_template`（`None` = ChatML） |
+| `wdnai/src/wdnai/gguf_tokenizer.py` | 混元控制 token 注册为 `additional_special_tokens` |
+| `tools/worker_manifests/hy-mt-1-5.json` | 出厂清单（HF 上传用） |
+| `~/models/HY_MT_1_5/hy-mt-1-5.json` | 随模型分发的 worker manifest（算力卡片就是它） |
+
+**没有新 backend kind** —— 它就是 `kind="llm"`，走现成的 `TextBackend`。
+差别只在 **spec**（词表参数 + prompt 模板）。
+
+### 模型文件
+
+```
+~/models/HY_MT_1_5/
+├── hy-mt-1-5.json              ← worker manifest（算力卡片）
+├── HY-MT1.5-1.8B.1820.rknn     ← 23 MB
+├── HY-MT1.5-1.8B.weight        ← 1.1 GB
+├── HY-MT1.5-1.8B.embed.bin     ← 472 MB (120818 × 2048 fp16)
+├── HY-MT1.5-1.8B.tokenizer.gguf
+└── HY-MT1.5-1.8B.config.pkl    ← 转换工具的回执，**运行期不读**
+```
+
+`config.pkl` 是 pickle —— SDK **不反序列化**它：同样的数字 RKNN 自己内嵌了
+一份（`hf_config_json`），tokenizer 参数也能从 GGUF 读。反序列化第三方
+pickle 等于执行任意代码，没有理由做。
+
+### 参数（从包里读出来的，不是猜的）
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| `vocab_size` | 120818 | GGUF 词表长度 / RKNN 内嵌 hf_config |
+| `special_eos_id` | 120020（`<｜hy_place▁holder▁no▁2｜>`） | GGUF `eos_token_id` |
+| `max_context_len` | 8192 | RKNN 内嵌 `max_position_embeddings` |
+| 采样 | 贪心（`top_k=1`、`temperature=1e-6`） | 翻译要忠实原文 |
+
+⚠️ `max_context_len` 是 **8192** 不是 262144 —— 262144 是上游 checkpoint 的
+训练上限，**导出时没保留**。取大的那个会按错误的长度分配 KV cache。
+
+### ⚠️ 三个坑（都实测过）
+
+1. **prompt 模板不是 ChatML**。HY-MT 说混元方言
+   （`<｜hy_begin▁of▁sentence｜>` / `<｜hy_User｜>` /
+   `<｜hy_Assistant｜>`），模板通过 `spec.chat_template` 装到 C 侧 session。
+   **实测：同一份权重套 ChatML → 输出是空字符串**；套混元模板 → 翻译正常。
+   ⇒ 这是 `ModelSpec` 加 `chat_template` 字段的原因。
+2. **提示词必须自带翻译指令**。只把原文丢进去，模型会当成普通对话回答：
+   `"The weather is very nice today."` →
+   `"Yes, that's true. It seems like we are in a pleasant weather today."`；
+   加上 `"Translate the following text from English to Chinese:"` 才是译文。
+   措辞不敏感（实测 9 种写法都能触发翻译），但**必须有**。
+3. **混元控制 token 在词表里是单 token**（120000 / 120006 / 120007），
+   但 ByteLevel 预分词器会把它们拆成 ~5 个普通 token
+   （实测 `<｜hy_User｜>` → `[36058, 9036, 62, 4610, 24945]` 而非 `[120006]`）。
+   ⇒ `gguf_tokenizer.py` 把它们注册为 `additional_special_tokens`
+   （跟 Qwen 多模态占位符一个套路）。⚠️ 混元这批**只注册已在词表里的**，
+   缺失的**不能** `add_tokens`（那会给模型一个从没见过的 id）。
+
+### 实测数据（RK1828，单卡）
+
+* 加载 **~20s**（`estimated_init_seconds=30`，含余量）
+* 单句翻译 **~0.15s**（"The weather is very nice today." → "今天天气非常好。"）
+* 长句也稳：两个 RK1828 协处理器那句 → "该主板上连接了两个RK1828 PCIe AI协处理器。"
+* 中译英正常；EOS 收尾正常（`finish_state=2`，末 token 120020）
+* 走 worker + DDS 的 `respond` op 也验证过（主进程 `POST /api/compute/instances`
+  起实例 → `wdndds/rpc/hy-mt-1-5` 应答正确）
+
+### 为什么 `swcap_translate` 要与 `swcap_text_chat` 分开
+
+翻译是「一段文本进、一段文本出」的**定向**任务。共用一个能力名的话，
+`get_session("swcap_text_chat")` 在同时装了通用对话模型的机器上取决于
+卡号排列 —— 而通用对话模型**不一定**会翻译（实测裸原文会得到一段闲聊）。
+
+### 部署注意
+
+* `model_dir_env` = `WDNAI_HY_MT_1_5_DIR` —— SDK 认这个覆盖，
+  `_assert_spec_under_model_dir` 会校验 spec 路径落在模型目录内。
+* 模型根由 `base.model_path` 决定（`WDNAI_MODELS_DIR` 在 boot 时写入）。
+  **改根目录要重启服务**（运行期改 `base.model_path` 不生效）。
+* 卡片不「已启用」是正常的 —— 装了模型但没启用时卡片**在**，
+  显示为未启用，点「启用」即可。
+
+### 「网页翻译」应用（`web-translate` 卡，2026-11-16）
+
+模型装上只是第一步 —— **要能真的被界面翻译用上**，还得把它接进
+`app/core/translate/` 的 provider 链。这条链有三个部分：
+
+| 位置 | 职责 |
+|---|---|
+| `app/core/translate/npu_provider.py` | `NpuTranslateProvider`（provider 名 `npu`）—— 按实测可靠的措辞拼提示词，**校验译文真的翻成了目标语言**，翻不出来抛 `TranslationError` 让链继续找外网 |
+| `app/core/translate/__init__.py` | `set_npu_translate_enabled()` / `npu_translate_enabled()` —— **运行期**开关 NPU 那一路（启用=排到链首当主力，禁用=从链里摘掉） |
+| `app/system/api/translate.py` | `GET /api/translate/status` 返回 `npu_active` —— 前端靠它显示「正在使用 NPU 翻译」 |
+
+卡片本体在 **插件包 `wdnapps_audio_chat`**（`cards/web_translate/`），
+与 `text-chat` 同包；宿主只留 `{% card_slot "web-translate" %}` 占位符。
+
+⚠️ **三条容易踩的**：
+
+1. **provider 链是运行期状态，不是配置**。`config.jsonc` 的
+   `translate.providers` 只是**默认值**；卡片点「禁用」之后链里就不该
+   再有 `npu`（否则每次翻译都先撞一次 NPU 的冷却才轮到外网）。
+   ⇒ 改标志位**必须重建服务**（`reset_translate_service()`），否则老链还在用。
+2. **默认走第一张 1828 协卡**（`npu_index=0`）。本机 EP 协卡按 PCI BDF
+   排序编号（见 `app/core/compute/cards.py`），0 号就是第一张 1828。
+   翻译模型只要一张卡；图像生成（`qwenimage21`）要两张 —— 同占 0 号卡
+   会抢显存起不来（实测 `MODEL_SETUP fail`），卡片会提前把这个冲突说出来。
+3. **端点必须是同步 `def`，不能是 `async def`**。启用要等模型加载完
+   （~20~30s）、禁用要等 unload + shutdown + SIGTERM 宽限（~3~5s）。
+   FastAPI 只把 `async def` 跑在事件循环里 —— 写成 `async def` 的话，
+   这 30 秒里**整个 Web UI 都没响应**。
+
+### 界面提示「正在使用 NPU 翻译」
+
+`app/static/core/translate.js`（右上角「界面语言」下拉）：
+
+* 按钮上常驻一枚 **NPU 徽标**（`state.npuActive`）—— 译文走本板时亮出来；
+* 面板顶部一行「谁来翻」：本板 NPU / 外网翻译站；
+* 翻译过程中状态文案是「**正在使用 NPU（RK1828）翻译…** n/total」
+  （`data-kind="npu"` 绿色），而不是干巴巴一句「正在翻译…」。
+
+`npuActive` 的口径**必须由后端给**（`/api/translate/status` 的
+`npu_active`）—— 浏览器看不见 provider 链，让它自己猜就一定会猜错。
+
+### ⚠️ 进度条只增不减（2026-11-16）
+
+用户报「网页翻译进度条会不停回退」。**不是进度条画错**，是**增量翻译也在
+画全局进度条**：
+
+```
+页面持续重建 DOM（「网页翻译」卡 3s 轮询、算力页 1s 轮询）
+  → 每轮都产生一批「全新」文本节点（内容跟之前翻过的一模一样）
+  → MutationObserver 触发增量翻译
+  → translateTo(target, onlyNew=true) 调了 setProgress(0, N)
+  → 全局进度条被打回 0% → 一轮轮「重新开始」
+```
+
+实测：浏览器每 24~65s 一轮增量翻译，每轮十几个请求（服务端命中缓存、秒回），
+进度条于是 0% → 100% → 0% → 100% 地跳。⚠️ 去掉 `_BATCH_GAP` 之后更显眼
+—— 以前一轮要慢慢爬 20 秒，现在是瞬间冲顶。
+
+三条修法（都在 `app/static/core/translate.js`）：
+
+1. **增量翻译不碰全局进度条** —— 进度条是给「整页翻译」这个**用户主动发起**
+   的操作用（`showProgress = !onlyNew`）；
+2. **`setProgress` 单调** —— 进度值只增不减（`progressShown` 兜底），任何
+   一次重绘都不许比上次小；
+3. **客户端译文缓存** —— 页面重建出的节点内容跟之前翻过的一样，直接套用
+   缓存里的译文，**不发请求** ⇒ 增量翻译几乎零成本（实测每轮 12~18 个
+   请求 → 0 个）。
+
+⚠️ **译文 == 原文的不能进缓存** —— 那是「没翻出来」，缓存了就等于把它记死，
+以后再也不重试。
+
+排障钩子：控制台 `Translate.progress` → `{shown, visible, pct}`。
+
+自检：`scripts/test_translate_progress.py` —— 用 dukpy + 最小 DOM stub 跑
+**真实的** `translate.js`，复现「页面重建 DOM → 增量翻译」，断言增量不碰
+进度条、不发请求、宽度单调。**负向验证**（把增量路径改回旧行为）必须
+失败 —— 证明这套断言抓得住 bug。
+
+### 并行拓扑：2 卡 × 每卡 2 份 = 4 份（2026-11-16）
+
+网页翻译默认起 **4 个实例**：卡 #0 两份 + 卡 #1 两份。
+
+⚠️ **加速的单位是「卡」不是「实例」** —— 实测（RK1828 双卡，24 条界面文案）：
+
+| 布局 | 实例数 | provider 层 | 端到端¹ |
+|---|---|---|---|
+| 1 实例 / 1 卡 | 1 | 3.30s (1.00×) | 5.52s |
+| 2 实例 / 1 卡 | 2 | 2.74s (1.21×) | — |
+| 2 实例 / 2 卡 | 2 | 1.76s (1.85×) | — |
+| **4 实例 / 2 卡×2** | **4** | **1.45s (2.31×)** | **2.78s (1.99×)** |
+
+¹ 端到端 = `POST /api/translate`（10 个有效轮次的中位；同一批文案、同一串
+目标语言、每次 disable→enable 清缓存后重跑）。
+
+同卡加第 2 份只 +21%（两个 rknn3 context 抢同一张卡的算力），加到**第 2 张卡**
+直接 +85%。⚠️ 所以**卡越多越值钱**，副本数是次要的。
+
+**架构前提**：一个 `LLMRPCSession` 的 RPC 执行器是
+`ThreadPoolExecutor(max_workers=1)`（`wdndds/ai_session.py`）⇒ **同一个
+session 同时只能有一个推理在飞**。要并发必须有多个 session（多 worker 进程）。
+实测 1 实例开 8 线程 = 1.03×（客户端线程无用）。
+
+### ⚠️ 措辞顺序**按语言定制**（实测表，不是原理）
+
+模型对「裸语言码」的反应很看语言 —— 拉丁字母系（en/fr/de/es/pt/nl/pl…）
+用码写指令它一听就懂，但**非拉丁字母系**用码写，它经常**译到别的语言去**：
+
+| 目标语言 | 用「码」写第一条就翻对 | 用「名」写第一条就翻对 |
+|---|---|---|
+| `hi`（印地语） | **0/24** | **24/24** |
+| `uk`（乌克兰语） | **0/24** | **24/24** |
+| `ko`（韩语） | 6/24 | **24/24** |
+| `ru`（俄语） | **0/24** | 22/24 |
+| `th`（泰语） | 2/24 | 23/24 |
+| `tr`（土耳其语） | 16/24 | **24/24** |
+| `fr`（法语） | 22/24 | **24/24** |
+
+（`zh→hi` 用码写，模型回**英文** —— "hi" 被当成了问候语！）
+
+⇒ `npu_provider.PROMPT_ORDER` 是**实测表**（24 条界面文案 × 5 条措辞 ×
+35 种语言，贪心求最优顺序）。「成功率」两者一样（5 条全试也就 24/24），
+差的是**推理次数** —— 而推理次数就是端到端耗时。
+
+⚠️ 这张表是**实测快照**，不是原理：模型换了权重就得重测
+（脚本：`scripts/probe_prompt_order.py`）。
+
+### ⚠️ 批间 1.2s 间隔：**只对走外网的 provider 生效**
+
+`TranslateService` 每批之间 sleep `_BATCH_GAP` = 1.2s —— 那是**给免费外网
+接口防限流**的（免费站点按连接建立速率掐人，连着打会成片 SSL 握手超时）。
+本板 NPU **没有外网连接**，这个间隔纯白等：它占 4 实例端到端时间的 **30%**
+（3.99s 里 1.2s），把加速比从 **1.99× 压到 1.69×**。
+
+⇒ 判据做成了 **provider 自己的属性**（`TranslationProvider.local`），
+不是 service.py 里硬编码字符串 —— 以后再加本地 provider 不用改 service.py：
+
+| 位置 | 改动 |
+|---|---|
+| `app/core/translate/base.py` | `TranslationProvider.local = False` ——「我是不是本地 provider」 |
+| `app/core/translate/npu_provider.py` | `NpuTranslateProvider.local = True` |
+| `app/core/translate/providers.py` | `ProviderChain.provider_is_local(name)` —— 按名字查 |
+| `app/core/translate/service.py` | 批间 sleep：本地 provider **不睡**，外网照旧；批里有条目失败（misses）时照旧多歇（那是真出错，该退避） |
+
+
+### 副本数是**模型级声明**，不是全局开关
+
+`WorkerManifest.max_replicas_per_card`（默认 1）⇒ 别的模型仍是一卡一份，
+零回归。
+
+| 位置 | 职责 |
+|---|---|
+| `app/core/compute/registry.py` | 实例键 `(npu, model_id, source)` → `(npu, model_id, source, replica)`；`ModelInstance.replica`；`ensure_worker_for_model(..., replica=)`、`stop_instance_local(model, npu, replica)` |
+| `app/core/compute/workers/__init__.py` | `WorkerManifest.max_replicas_per_card` + 解析 |
+| `app/system/api/compute.py` | `InstanceSlot`（`npu_index` + `replica`）；`POST /compute/instances` 收 `slots`；`DELETE` 收 `replica` |
+| `app/system/static/system.js` | 槽位编码 `"卡:份"`；每张卡按 `max_replicas_per_card` 渲染多个复选框（`RK182x #0` / `RK182x #0 (2)`） |
+| `app/static/core/wizard/state.js` | 向导读 `swcap_to_model[cap].instance_slots`，**逐槽位** POST |
+| `app/core/translate/npu_provider.py` | `_sessions()` 取本机全部翻译 session；`_translate_many()` **按条轮转**分发 + `ThreadPoolExecutor(max_workers=len(sessions))` |
+| `app/core/translate/base.py` | `TranslationResult`（**str 子类**，带 `misses`/`failed_provider`）、`UnsupportedLanguageError` |
+| `app/core/translate/service.py` | `_repair()` 只补翻没翻出来的那几条；`_dominant_provider()` 上报「翻了多数条」的那家 |
+| `cards/web_translate/static/wizard.json` | `instance_slots` 4 条 —— **向导和卡片读的是同一份** |
+
+⚠️ **items 必须按条轮转分给 session**（第 i 条给第 `i % N` 个）：成块分配时
+最先跑起来的 N 个任务会全落在同一个 session 上 —— 并发根本没发生。
+
+### ⚠️ 一条翻不出来，整批都回退外网（2026-11-16 已修）
+
+**老症状**：provider 逐条翻译时，**任何一条**翻不出来都让**整批**抛
+`TranslationError` → 链把整批交给外网 → NPU 已经跑完的那 23 条**全白跑**。
+界面文案里天然混着 NPU 翻不出来的条目（`简体中文` 译成日文是纯汉字没假名
+→ 文种判定不通过；`外网翻译站` 这类超短术语模型直接复读原文）。
+
+**更狠的连带效应**：整批回退抛的是普通 `TranslationError` → 链给 npu 记
+**60 秒冷却** → 冷却期 `ProviderChain._available()` 把它**静默**剔除，
+**日志里一行告警都没有** → 那一分钟内**所有**语言都走外网。
+（这就是「界面切了语言却慢得要死、而且看不出为什么」的真正成因。）
+
+**修法**（三层异常分工 + 单条隔离）：
+
+| 失败类型 | 异常 | 后果 |
+|---|---|---|
+| 推理级（worker 挂了/超时） | `TranslationError` | 整批换下一家 + 记 60s 冷却（对） |
+| 质量级（这句翻不出来） | `NpuQualityError` | **只牵连这一条** + 不记冷却 |
+| 语言不支持 | `UnsupportedLanguageError` | 整批换下一家 + **不记冷却** |
+
+* provider 把翻不出来的那几条记进 `TranslationResult.misses` 返回；
+* 服务层 `_repair()` **只补翻那几条**，并**跳过**刚失败的那家
+  （`chain.translate(..., skip=(failed_provider,))`）；
+* 已经翻好的条目**沿用 NPU 的译文**，`stats["provider"]` 上报**翻了多数条
+  的那家**（不是 `chain.last_used` —— 补翻一条之后它就变成外网那家了）。
+
+**实测（28 种界面语言 × 24 条，同一批文案）**：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 走 NPU 的语言 | 15 种 | **21 种** |
+| 走外网的语言 | 13 种 | **7 种**（全是不支持的：zh-TW sv da no fi el hu） |
+| 整批抛异常次数 | 23 次 | **0 次** |
+| 保留原文的条目 | —— | **0 条** |
+| 28 语言全跑一遍 | ~30 分钟（每次失败后等 60s 冷却） | **99 秒** |
+
+⚠️ **还剩一个坑没动**：60 秒冷却是**静默**的（`_available()` 剔除时不打
+日志）。看到「provider=youdao 又没告警」先查 `/api/translate/status` 的
+`cooldown`。
+
+### ✅ 界面语言下拉 = NPU 能翻的语言（21 种）
+
+上面那 **7 种走外网的语言已经从下拉里删掉了**（`app/static/core/translate.js`
+的 `LANGUAGES`）：中文繁体 / 瑞典 / 丹麦 / 挪威 / 芬兰 / 希腊 / 匈牙利。
+
+⇒ 不变式：**下拉里有的语言，一定是本板 NPU 翻的** —— 不会再有「选了某个
+语言，结果悄悄走了外网」的情况（慢好几倍，而且文案发到公网）。
+
+* `zh-TW` 也被删了：模型词表里简繁**共用一个码**（`zh`），它分不出来
+  （实测让它转繁体是「半繁体半简体」，比不转更糟）⇒ 判成「NPU 不支持」。
+  它**当源语言**仍然可用（繁体中文 → 其它语言，模型能翻），所以
+  `LANG_CODES["zh-TW"]` 留着。
+* 这 7 种语言**直接调 API** 仍然能翻（走外网），只是不在下拉里了 ——
+  `NpuTranslateProvider._check_pair()` 抛 `UnsupportedLanguageError`。
+
+### ⚠️ 孤儿 worker × 副本：一条进程不能占两个槽位
+
+uvicorn 的 `reload=True`（`run.py` 的 `reload_dirs` = `app/` + `.venv/src/`）
+会在改代码后重启主进程 —— **上一次留下的 worker 进程会活下来**（孤儿）。
+生产环境（systemd，无 reload）不会遇到，但开发中天天遇到。
+
+`_spawn_compute_worker` 里那条「LOCAL 启用 + /proc orphan → 注册成
+adopted_local」的路径**原本不看副本号**，于是：
+
+1. 槽位「卡#0 第 1 份」把孤儿抢过去（注册成 `replica=0`）；
+2. 槽位「卡#0 第 2 份」**又把同一个进程抢过去**（key 里的 replica 恒为 0）；
+3. 第 2 份的 `replica=1` 永远匹配不上 → 干等 **120s 超时** → 报
+   「翻译模型启动失败（卡 #0 第 2 份）」。
+
+修法是三条不变量（`registry.py`）：
+
+* **已跟踪 = 该模型的任何实例**（不只 `spawned`，`adopted_local` 也算）——
+  已被某个槽位认领的进程不能再被另一个槽位「复用」；
+* **已绑卡的本机实例不能被丢弃** —— 它正在服务那个槽位；
+* **副本 > 0 一律真 spawn** —— 「再起一份」的语义就是多一个进程，
+  复用的孤儿注册出来的 replica 恒为 0。
+
+### ⚠️ 开机清理 sweep 扫不到「后装的模型」（2026-11-16）
+
+上面那个 bug 之所以反复出现，是因为**孤儿从来没被清理过**。根因是**时序**：
+
+* `MODEL_PRESETS` 是**模块导入时**取的快照（`_model_presets()`）；
+* 而 `WDNAI_MODELS_DIR` 要到 `app/main.py:create_app()` 里才从
+  `base.model_path` 写进环境变量 —— **两者有时序差**；
+* 于是导入时的快照里**缺了本板后来装的模型**（实测 `hy-mt-1-5` /
+  `intern-decision-4b` 都不在内：它俩装在 `base.model_path` 指向的目录，
+  不在出厂默认的 `/mnt/oem/models`）；
+* 开机清理 sweep 的扫描范围是 `MODEL_PRESETS` 的键 ⇒ **那个模型的孤儿
+  worker 永远不会被清理**。
+
+同一个根因还让 `_worker_comm_name()` 算出错的名字（`worker:hy-mt-1-`
+而不是 manifest 里声明的 `worker:hy-mt`）—— comm 匹配失效，只靠 cmdline
+fallback 兜住。
+
+⇒ 修法：sweep 之前**同步调一次 `refresh_model_presets()`**（扫描很便宜：
+一次目录列举 + 读几个小 JSON）。后台重扫线程 2s 就会补上，但 sweep 是
+开机清理，它跑在线程之前，得自己先刷新。
+
+验证：修完触发一次热重载，日志里 4 个孤儿被
+`cleanup: hy-mt-1-5 pid=... no longer in config.compute.autostart; killing`
+全部回收，进程数归零。
+
+### 向导 → 功能页
+
+`cards/web_translate/static/wizard.json` 的 `swcap_to_model` 钉
+`hy-mt-1-5` 并声明 `instance_slots`（4 条：卡#0 ×2 + 卡#1 ×2）⇒ 向导 env 步的
+「一键开启所需模型」起 **4 个实例**（2 张 1828，各 2 份）。向导走完调
+`ImApp_web_translate.applyWizardSnapshot`
+→ **直接启用翻译服务**（用户不用回功能页再点一次「启用」），失败会抛
+`start_failed:` 让向导显示错误并给「重新开启模型」的重试入口。
+
+功能页顶部是**服务状态条**（未启用 / 处理中 / 已启用），带「启用翻译服务」
+「禁用翻译服务」两个按钮 —— 这就是「向导配置完成后功能页提示翻译服务的
+启用和禁用」。
+
+## Intern-Decision-4B 决策模型（`swcap_decision`，2026-11-13）
+
+Intern **Intern-Decision-4B**（internlm/Intern-Decision-4B）：**结构化决策**
+模型。装在 `~/models/Intern_Decision-4B/`（= 本板 `base.model_path` 指向的
+模型根）。
+
+### 它不是对话模型
+
+它**不生成文本**。对每个决策字段，它输出的是 **62 个候选符号**
+（`A-Z` + `a-z` + `0-9`）的 logits，由 CPU 侧换算成选项概率。三种字段类型：
+
+| type | 语义 | 输出 |
+|---|---|---|
+| `choice` | 从若干选项选一个 | 选中的选项键 + 概率 |
+| `score` | 选项键是数字字符串（"0"/"1"/"2"） | 概率加权评分 |
+| `noul` | 是否判断（yes/no） | 肯定概率 |
+
+### 交付物
+
+| 位置 | 内容 |
+|---|---|
+| `wdnai/src/wdnai/decision.py` | 决策协议（纯 CPU）：候选符号表、system prompt、任务 JSON 解析、prompt 构造、概率校准 |
+| `wdnai/src/wdnai/backends/intern_decision.py` | `InternDecisionBackend` —— 新 backend kind `"decision"` |
+| `wdnai/src/wdnai/model.py` | `SystemLanguageModel.intern_decision_4b()` + `_intern_decision_4b_spec()` + 路径解析 / 文件校验 |
+| `wdnai/src/wdnai/capability.py` | `SoftwareCapability.DECISION = "swcap_decision"` |
+| `wdnai/src/wdnai/_librknn.py` | `RKNN3Lite.recreate_llm_session()`（按字段重建 session）+ 多模态输入支持 `tokens=` |
+| `wdnai/src/wdnai/backends/_common.py` | `build_llm_callback(..., result_cb=, output_cb=, output_tensors=)` —— 决策模型不消费 token 流，但 C 库要求有 result_callback，且要读输出张量 |
+| `wdnai/src/wdnai/gguf_tokenizer.py` | `load_tokenizer_from_gguf(..., extra_special_tokens=)` —— **按实例**注册控制 token；预分词正则按 GGUF 的 `tokenizer.ggml.pre` 分发（qwen2 / qwen35） |
+| `wdnai/src/wdnai/_rga.py` | RGA 硬件缩放（ctypes 直调 `librga`）—— 对齐官方 `image_utils.c` 的 `convert_image` |
+| `wdnai/src/wdnai/session.py` | `_suppress_generating_in_prompt` 加 `"decision"`（schema hint 不进 state） |
+| `tools/worker_manifests/intern-decision-4b.json` | 出厂清单（HF 上传用） |
+| `~/models/Intern_Decision-4B/intern-decision-4b.json` | 随模型分发的 worker manifest（算力卡片就是它） |
+
+**新 backend kind**（`"decision"`）—— 它既不是 `kind="llm"`（不生成文本），
+也不是 `kind="vlm"`（视觉只是可选输入，主输出是 logits）。
+
+### 任务配置怎么传
+
+走 `respond(..., task=...)` override —— DDS wire 的 `options` 字段能带任意
+override，worker 侧 `**options` 透传给 `run_prompt`。`task` 可以是
+`DecisionTask` / 任务 JSON dict / JSON 字符串。
+
+```json
+{"questions": {"category": {"type": "choice", "instructions": "…",
+                            "criteria": {"account": "…", "payment": "…"}}}}
+```
+
+### 模型包
+
+```
+~/models/Intern_Decision-4B/
+├── intern-decision-4b.json           ← worker manifest（算力卡片）
+├── Intern-Decision-4B-llm.rknn       ← 25 MB（输出 = 62 维 logits）
+├── Intern-Decision-4B-llm.weight     ← 2.1 GB
+├── Intern-Decision-4B-llm.embed.bin  ← 1.27 GB (248320 × 2560 fp16)
+├── Intern-Decision-4B-llm.tokenizer.gguf
+├── Intern-Decision-4B-vision.rknn    ← 4.8 MB（输入 uint8 NHWC 384×384）
+└── Intern-Decision-4B-vision.weight  ← 682 MB
+```
+
+### 参数（从包里读出来的，不是猜的）
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| `vocab_size` | 248320 | GGUF 词表长度 |
+| `special_eos_id` | 248046（`<\|im_end\|>`） | GGUF `eos_token_id` |
+| `max_context_len` | 4096 | RKNN 内嵌 `max_position_embeddings` |
+| 校准温度 | 1.99241824（4B） | 按 embedding 宽度（2560）查表 |
+
+⚠️ **校准温度 ≠ 采样温度**。校准温度决定报出来的概率（CPU 侧 softmax 之后
+再校准），采样参数是另一回事（`disable_sampling=True`，logits 直接读）。
+
+### ⚠️ 八个坑（都实测过，都会让概率偏掉且**不报错**）
+
+1. **prompt 里的 ChatML 标记是「写进文本」的，不是模板**。完整形态是
+   `<|im_start|>system\n…<|im_end|>\n<|im_start|>user\n…<|im_end|>\n`
+   `<|im_start|>assistant\n<think>\n\n</think>\n\n{骨架}<|im_end|>\n`；
+   少写这 6 个标记就少 66 字节 / 6 个 token，token 位置整体错位。
+   C 侧 chat template 必须**显式清空**（`set_chat_template("", "", "")`）——
+   官方 demo 从不调 `set_chat_template`，它默认就是空的。
+2. **预分词正则要按 `tokenizer.ggml.pre` 选**。这个 GGUF 是 `qwen35`
+   （正则 `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+…`）；ByteLevel 自带的 GPT-2 正则
+   把 `e.g.` 切成 4 个 token 而不是 3 个 → token id 整体错位。
+   `wdnai.gguf_tokenizer` 现在按 `pre` 分发（`qwen2` / `qwen35`）。
+3. **noul 字段的 criteria 要「覆盖」默认说明**（参考实现是赋值覆盖、位置
+   不变），不是「首次出现优先」—— 否则 prompt 里留的是英文默认说明。
+4. **没有文本时 state 要回落**成「请根据图片回答问题。」
+   （`row["state"] = text[0] ? text : …`），否则 prompt 里是 `null`。
+5. **每个字段一次 prefill，且必须换 session**。模型有 linear-attention 层，
+   递归状态跨调用残留；`keep_history=0` 只清 KV cache，不清递归状态。
+   C++ 参考实现每个字段都 `rknn3_session_init` / `destroy` ⇒ SDK 加了
+   `RKNN3Lite.recreate_llm_session()`。
+6. **控制 token 必须是单 token**：`<decision>`=248077、`<think>`=248068、
+   `</think>`=248069。它们**只在本模型的 tokenizer 实例上**注册为 special
+   （`load_tokenizer(..., extra_special_tokens=...)`）—— Qwen 路径靠解码文本里
+   的字面量切 thinking 通道，注册成 special 会被 `skip_special_tokens=True`
+   抹掉，所以**不动**全局 tokenizer。⚠️ 追加时必须**合并**而不是替换
+   `additional_special_tokens`（`add_special_tokens` 是整体替换），否则
+   Qwen 的 `<|vision_start|>` / `<|image_pad|>` 被踢掉 → C 库定位不到图片
+   占位区 → 图文 prompt 被少喂 6 个 token。
+7. **视觉预处理是整幅拉伸 resize** 到 384×384（**不是** letterbox），归一化
+   已烙进模型 —— 只送原始 RGB 字节。缩放走 **RGA 硬件**
+   （`wdnai/src/wdnai/_rga.py`，ctypes 直调 `librga`），与官方
+   `image_utils.c` 的 `convert_image` 一致：RGA 的插值和 OpenCV 的
+   `INTER_LINEAR` 不是同一个算法（像素最大差 136）。
+8. **C 库必须有 result_callback**。决策模型不消费 token 流，但缺了 result
+   callback 会打印 `no result_callback provided!` 并让 `session_run` 返回
+   -1 ⇒ `_common.build_llm_callback` 接受 `result_cb=` / `output_cb=` /
+   `output_tensors=`。
+
+### ✅ 与官方 C++ demo 逐位对拍（2026-11-13）
+
+`rknn3_model_zoo/examples/Intern_Decision/cpp/main.cpp` 是这个模型的官方
+参考实现（吃同一份 .rknn / .weight）。官方 demo 只有 x86_64 版、参考主机
+又没有 NPU，所以是在**本板（aarch64）编译**官方源码后对拍的。
+
+| 对拍项 | 文本决策 | 图文决策（bus.jpg） |
+|---|---|---|
+| prompt 字节 | 1063 = 1063 ✅ | 2861 = 2861 ✅ |
+| token id 序列 | 251 = 251 ✅ | 374 = 374 ✅ |
+| 原始 logits | **逐位一致** ✅ | **逐位一致** ✅ |
+| 校准概率 / 评分 | **逐位一致** ✅ | **逐位一致** ✅ |
+| 校准温度 | 1.9924182891845703 ✅ | 同左 ✅ |
+
+文本决策官方 / SDK 输出完全一样：
+
+```
+category  account  p=0.9871750473976135   logits=[31.84375, 22.515625, 20.703125]
+urgency   "1"      p=0.6921776533126831   logits=[24.90625, 26.78125, 20.984375]
+          score=0.7676316499710083        temperature=1.9924182891845703
+```
+
+图文决策喂**官方自己解码的像素**时同样逐位一致；喂 SDK 自己解码的像素
+（OpenCV/libjpeg，官方用 stb_image）时只剩 **JPEG 解码器差异**（逐像素 ±3），
+概率差 ≤0.03pp、结论完全相同。
+
+⇒ 结论：**与官方精度一致**（文本逐位一致；图文在解码器差异范围内一致）。
+
+### ⚠️ 单卡能不能同驻留 LLM + vision？—— **能**（实测）
+
+用户明确要求验证的问题，结论：**一张 RK1828 协卡同时跑得起这两个模型**。
+
+| 阶段 | 每 NPU 节点占用 | 节点总量 |
+|---|---|---|
+| 仅 LLM（weight 2013MB + internal 44MB + kvcache 297MB） | 296 MB | ~620–640 MB |
+| **LLM + vision 同驻留**（vision 再加 weight 651MB + internal 65MB） | **383 MB** | ~620–640 MB |
+
+⇒ 视觉模型**按需加载**（只有带图的请求才加载）、编码完即释放（对齐 C++
+参考实现），`spec.options["keep_vision_resident"]=True` 可改成常驻（实测
+常驻也能跑完，峰值同为 383MB/节点）。
+
+### 实测数据（RK1828，单卡，4B）
+
+* 加载 **~43s**（`estimated_init_seconds=60`，含余量）
+* 纯文本决策 **~1.1s**（2 个字段）
+* 图文决策 **~9s**（首次含视觉加载 7.5s + 编码 0.17s）
+* 客服分流：「我无法登录账号，请帮我恢复访问。」→ `category=account`
+  (98.72%)、`urgency=0.7676`（官方逐位一致）
+* 街景（bus.jpg）→ `vehicle=bus` (98.50%)、`people=yes` (92.43%)
+* 走 worker + DDS 的 `respond` op 也验证过（主进程
+  `POST /api/compute/instances` 起实例 → `LLMRPCSession.respond(..., task=…)`
+  返回 `{"category": "account", "urgency": 0.7676}` / `{"vehicle": "bus",
+  "people": "yes"}`）
+
+> ⚠️ README 里的黄金值（account 95.48% / urgency 0.9078 / bus 82.46% /
+> yes 75.72%）是 **0.8B** 的实测值 —— 上游 README 明写「本用例以
+> Intern-Decision-0.8B 完成验证」。4B 的概率更集中，**标签一致**。
+
+### 部署注意
+
+* `model_dir_env` = `WDNAI_INTERN_DECISION_4B_DIR` —— SDK 认这个覆盖。
+* `memory_estimate_mb` = 3200（LLM 2013 + kvcache 297 + vision 651 + 余量）。
+* `infer_timeout_s` = 120（图文决策 ~9s，给足余量）。
+* 卡片不「已启用」是正常的 —— 装了模型但没启用时卡片**在**，显示为未启用。
+
 ## 设备拓扑：模型要占几个 NPU 设备（`requires_cards` 不够）
 
 `requires_cards` 数的是**本机 EP 协卡**（`cards.py::card_no` 口径）。
@@ -1745,22 +2290,42 @@ app/apps/<card_id>/
 
 ### 能力词表由 wdnai 定义，不许自造
 
-7 个 `swcap_*` 全部是 `wdnai.SoftwareCapability` 的成员（`wdnai/capability.py`），
-命名轴统一为 `<输入模态>_<输出形态或功能>`：
+`swcap_*` 全部是 `wdnai.SoftwareCapability` 的成员（`wdnai/capability.py`），
+命名轴统一为 `<输入模态>_<输出形态或功能>`。**词表是封闭枚举** —— 改了它
+要同步三处：① `wdnai/capability.py`（真源），② 本仓
+`scripts/verify_capability_groups.py`（它断言枚举成员**集合与数量**，
+成员数变了必须改 `EXPECTED` 和那句「枚举恰为 N 个成员」），
+③ `wdnai` 仓的 `README.md` / `README_CN.md` 能力表。
 
 | 成员 | 值 | 含义 | provider |
 |---|---|---|---|
 | `TEXT_CHAT` | `swcap_text_chat` | 文本→文本（多轮 / 流式） | qwen3.5-vl-4b |
+| `TRANSLATE` | `swcap_translate` | 文本→文本（**机器翻译**） | hy-mt-1-5 |
+| `DECISION` | `swcap_decision` | 状态→**结构化决策**（分类 / 是非 / 评分） | intern-decision-4b |
 | `VISION_CHAT` | `swcap_vision_chat` | 图像→文本 | qwen3-vl-4b、qwen3.5-vl-4b |
 | `VISION_GROUNDING` | `swcap_vision_grounding` | 图像→0–1000 归一化 bbox | LocateAnything-3b |
 | `AUDIO_CHAT` | `swcap_audio_chat` | 音频→文本 | qwen2.5-omni-3b |
+| `AUDIO_ASR` | `swcap_audio_asr` | 音频→文本（**语音识别**） | qwen3-asr |
 | `VISION_EMBEDDING` | `swcap_vision_embedding` | 图像→向量 | qwen3-vl-embedding-2b |
+| `VISION_DEPTH` | `swcap_vision_depth` | 图像→逐像素深度图 + 置信度 | DepthAnythingV3 |
 | `TEXT_TO_SPEECH` | `swcap_text_to_speech` | 文本→语音 | qwen3-tts |
+| `TEXT_TO_IMAGE` | `swcap_text_to_image` | 文本→图像 | qwenimage21 |
 | `TOOL_CALL` | `swcap_tool_call` | →**可执行动作 / 工具调用** | qwen3.5-vl-4b |
 
 **能力描述的是模型能做什么，不是哪个业务用它。** 业务归属走绑定
 （`swcap_to_model`），两者混为一谈就会长出 `swcap_tool_call` 这种
 「绑定伪装成能力」的东西（见下节）。
+
+> `swcap_translate`（2026-11-13 新增，HY-MT1.5）与 `TEXT_CHAT` **必须分开**：
+> 翻译是「一段文本进、一段文本出」的定向任务，调用方要按能力指名要翻译模型；
+> 共用一个能力名会让 `get_session("swcap_text_chat")` 在同时装了通用对话模型
+> 的机器上取决于卡号排列 —— 而通用对话模型**不一定**会翻译。
+> 详见下面「HY-MT1.5 翻译模型」一节。
+>
+> `swcap_decision`（2026-11-13 新增，Intern-Decision）同理，而且更极端：
+> 决策模型**根本不生成文本** —— 它对每个决策字段输出的是 62 个候选符号的
+> logits，由 CPU 侧换算成选项概率。通用对话模型在这个场景下只会编一段
+> 像 JSON 的散文，所以这两个能力不能共用一个名字。
 
 两个容易踩的判定：
 

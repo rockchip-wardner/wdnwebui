@@ -43,26 +43,18 @@ _BROWSER_UA = (
 )
 
 
-class TranslationError(RuntimeError):
-    """翻译失败(网络不通 / 语言对不支持 / 返回格式不对)。"""
-
-
-class QuotaExceeded(TranslationError):
-    """免费额度用尽。
-
-    与「网络不通」必须分成两个异常:前者要等,后者可以立刻重试 —— 混在一起
-    的话前端只能给出「翻译失败」这种没法指导用户下一步的提示。
-    """
-
-
-class TranslationProvider:
-    """provider 接口。子类实现 :meth:`translate`。"""
-
-    name = "base"
-
-    def translate(self, text: str, source: str, target: str) -> str:
-        """把 ``text`` 从 ``source`` 翻成 ``target``。"""
-        raise NotImplementedError
+# 基类搬到 ``base.py`` 了 —— ``npu_provider.py`` 也要用它们，而本模块要把
+# NPU 那家登记进 ``PROVIDERS``，放一起就是循环 import。三个名字在这里
+# **原样再导出**：``from app.core.translate.providers import TranslationError``
+# 这种写法（service.py / api/translate.py / scripts/ 都是）一个字都不用改。
+from app.core.translate.base import (  # noqa: E402
+    QuotaExceeded,
+    TranslationError,
+    TranslationProvider,
+    TranslationResult,
+    UnsupportedLanguageError,
+)
+from app.core.translate.npu_provider import NpuTranslateProvider  # noqa: E402
 
 
 # MyMemory 用 ``responseDetails`` 报配额 / 限流,这几个串要挑出来单独报
@@ -670,6 +662,7 @@ PROVIDERS = {
     BaiduProvider.name: BaiduProvider,
     YoudaoProvider.name: YoudaoProvider,
     IcibaProvider.name: IcibaProvider,
+    NpuTranslateProvider.name: NpuTranslateProvider,
 }
 
 
@@ -720,8 +713,35 @@ class ProviderChain:
         with self._lock:
             self._until[provider.name] = time.time() + seconds
 
-    def translate(self, text: str, source: str, target: str) -> str:
-        available = self._available()
+    def provider_is_local(self, name: str) -> bool:
+        """这个名字的 provider 是不是**本地的**（不走外网）。
+
+        给 :class:`~app.core.translate.service.TranslateService` 用 ——
+        批与批之间的间隔只对**外网** provider 有意义（免费站点按连接建立
+        速率掐人），本地推理（板载 NPU）不需要，详见
+        :attr:`TranslationProvider.local`。
+        """
+        if not name:
+            return False
+        with self._lock:
+            for p in self._providers:
+                if p.name == name:
+                    return bool(getattr(p, "local", False))
+        return False
+
+    def translate(self, text: str, source: str, target: str,
+                  skip: tuple | list = ()) -> TranslationResult:
+        """按链顺序翻一段文本。
+
+        ``skip`` 是**要跳过的 provider 名**。上层用它做「补翻」:某条是 npu
+        翻不出来的,补翻时就不必再问 npu 一遍(它刚在这条上失败过,再试
+        也是白烧推理)。
+
+        返回值是 :class:`~app.core.translate.base.TranslationResult` ——
+        它**就是 str**(老代码照旧能用),额外带着「哪几条没翻出来」。
+        """
+        skip_set = {str(s) for s in (skip or ())}
+        available = [p for p in self._available() if p.name not in skip_set]
         if not available:
             raise QuotaExceeded(
                 "所有翻译服务都在冷却中(刚被限流),请稍后再试"
@@ -730,13 +750,22 @@ class ProviderChain:
         for provider in available:
             try:
                 out = provider.translate(text, source, target)
-                self.last_used = provider.name
-                return out
             except QuotaExceeded as exc:
                 self._mark(provider, self._quota_cooldown)
                 last = exc
                 LOG.warning(
                     "translate: provider=%s 配额用尽,切下一个: %s",
+                    provider.name, exc,
+                )
+                continue
+            except UnsupportedLanguageError as exc:
+                # 语言对不支持 —— **确定性的失败,不是 provider 挂了**。
+                # 绝对不能给它记冷却:记了它就会被静默剔除 60 秒,那一分钟里
+                # 其它语言也全走外网(实测踩过:6 种语言不支持,每次都把 NPU
+                # 冷却掉,连累其它 22 种)。
+                last = exc
+                LOG.info(
+                    "translate: provider=%s 不支持该语言对,换下一家: %s",
                     provider.name, exc,
                 )
                 continue
@@ -748,6 +777,12 @@ class ProviderChain:
                     provider.name, exc,
                 )
                 continue
+            self.last_used = provider.name
+            if isinstance(out, TranslationResult):
+                if not out.provider:
+                    out.provider = provider.name
+                return out
+            return TranslationResult(out, provider=provider.name)
         # 全挂了:把**最后一个**错误抛出去(通常是最有信息量的那个)
         raise last if last else TranslationError("没有可用的翻译服务")
 
@@ -775,6 +810,7 @@ PROVIDER_LABELS = {
     "iciba": "金山词霸",
     "mymemory": "MyMemory",
     "baidu": "百度",
+    "npu": "NPU（本板）",
 }
 
 
@@ -811,8 +847,13 @@ def build_chain(
                 LOG.warning(
                     "translate: provider=baidu 没配 appid/key,已从链里跳过"
                 )
-        else:
-            LOG.warning("translate: 未知的 provider %r,已跳过", raw)
+        elif name == "npu":
+            # 本板 NPU 上的翻译模型（默认 HY-MT1.5）。
+            #
+            # ⚠️ 它**没有"没配就跳过"这回事** —— 装没装模型、启没启用实例
+            # 都不是配置问题。真跑不起来时 :class:`NpuTranslateProvider`
+            # 自己抛 ``TranslationError``，链自动切下一家（外网 provider）。
+            providers.append(NpuTranslateProvider())
     if not providers:
         # 一个都没配上 —— 至少留个 youdao,免得整个功能直接没了
         LOG.warning("translate: 没有可用的 provider,回退 youdao")

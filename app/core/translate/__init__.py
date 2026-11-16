@@ -39,6 +39,11 @@ import logging
 import threading
 
 from app.core.config import get_config
+from app.core.translate.base import (
+    TranslationResult,
+    UnsupportedLanguageError,
+)
+from app.core.translate.npu_provider import NpuTranslateProvider
 from app.core.translate.providers import (
     DEFAULT_PROVIDERS,
     PROVIDER_LABELS,
@@ -62,18 +67,28 @@ __all__ = [
     "BaiduProvider",
     "IcibaProvider",
     "MyMemoryProvider",
+    "NpuTranslateProvider",
     "ProviderChain",
     "QuotaExceeded",
     "TranslateService",
     "TranslationError",
     "TranslationProvider",
+    "TranslationResult",
+    "UnsupportedLanguageError",
     "YoudaoProvider",
     "get_translate_service",
+    "npu_translate_enabled",
     "reset_translate_service",
+    "set_npu_translate_enabled",
 ]
 
 _service: TranslateService | None = None
 _lock = threading.Lock()
+
+#: NPU 那一路是否启用。``None`` = 跟着 ``config.jsonc`` 的
+#: ``translate.providers`` 走（默认）；``True`` / ``False`` = 运行期被
+#: 「网页翻译」卡片显式开/关过。见 :func:`set_npu_translate_enabled`。
+_npu_enabled: bool | None = None
 
 
 def _build_chain() -> ProviderChain:
@@ -94,6 +109,20 @@ def _build_chain() -> ProviderChain:
         names = [section.get("provider") or DEFAULT_PROVIDERS[0]]
     if isinstance(names, str):
         names = [names]
+    names = [str(n).strip().lower() for n in names if str(n).strip()]
+
+    # ⚠️ 「网页翻译」卡片可以在**运行期**开关 NPU 那一路（启用/禁用按钮）。
+    #
+    #   * 启用 → 把 npu 放到链的**最前面**（主力），外网那几家退成备选；
+    #   * 禁用 → 把 npu 从链里**摘掉**，界面翻译继续走外网。
+    #
+    # 这里的开关是**运行期状态**，不是配置：卡片点了「禁用」之后，链里就不该
+    # 再有 npu（否则每次翻译都先撞一次 NPU 的 60s 冷却才轮到外网）。
+    if _npu_enabled is False:
+        names = [n for n in names if n != NpuTranslateProvider.name]
+    elif _npu_enabled is True and NpuTranslateProvider.name not in names:
+        names = [NpuTranslateProvider.name] + names
+
     email = str(section.get("email") or "")
     baidu = section.get("baidu") or {}
     iciba = section.get("iciba") or {}
@@ -119,3 +148,32 @@ def reset_translate_service() -> None:
     global _service
     with _lock:
         _service = None
+
+
+def set_npu_translate_enabled(enabled: bool | None) -> bool:
+    """运行期开关「NPU 翻译」这一路 provider。
+
+    ``enabled=True``  → npu 进链并排在**最前**（主力）；
+    ``enabled=False`` → npu 出链（界面翻译继续走外网那几家）；
+    ``enabled=None``  → 交回 ``config.jsonc`` 决定。
+
+    改完立刻重建服务(``reset_translate_service``) —— provider 链是在服务
+    构造时定下的,只改标志位不重建的话,老链还在用。
+
+    返回**当前实际生效**的状态(``True`` / ``False``)。
+    """
+    global _npu_enabled, _service
+    with _lock:
+        _npu_enabled = None if enabled is None else bool(enabled)
+        _service = None
+    # 重建一次,好让日志里立刻看到新的链
+    get_translate_service()
+    return _npu_enabled is not False
+
+
+def npu_translate_enabled() -> bool:
+    """NPU 那一路当前**是否在链里**（按实际构建出来的链算）。"""
+    try:
+        return NpuTranslateProvider.name in get_translate_service().provider_names
+    except Exception:  # noqa: BLE001
+        return False

@@ -40,6 +40,11 @@ _MAX_BATCH_SEGMENTS = 60
 # 免费接口按**连接建立速率**掐人:实测同一 IP 每 0.4s 发一个请求,十次里能撞
 # 两次 SSL 握手超时(要等 12s 超时 + 重试,一次请求拖成 15s);改成 1.2s 间隔
 # 连打 10 次零失败。慢几秒换不来超时,值。
+#
+# ⚠️ **只对走外网的 provider 生效** —— 本地 provider(板载 NPU)没有外网
+# 连接,这个间隔是白等的(它占 4 实例端到端耗时的 30%)。判据见
+# :meth:`TranslateService.translate_segments` 与
+# :attr:`app.core.translate.base.TranslationProvider.local`。
 _BATCH_GAP = 1.2
 # 内存缓存条目上限
 _MAX_CACHE = 5000
@@ -127,10 +132,19 @@ class TranslateService:
         # 不需要 provider,不该被限流拦住(限流的是外网,不是缓存)。
         requests = 0
         failed = 0
+        #: 各 provider 各自翻了多少条 —— 用来回答「谁来翻」。
+        #:
+        #: ⚠️ 不能只看 ``chain.last_used``:补翻那一条之后 last_used 变成了
+        #: 外网那家，但实际是 **23 条 NPU + 1 条外网**。上报「多数条」那家
+        #: 才符合实际（前端据此显示 NPU 徽标）。
+        provider_counts: dict[str, int] = {}
         for batch in self._pack(pending):
-            translated, calls, misses = self._translate_batch(batch, source, target)
+            translated, calls, misses, provs = self._translate_batch(
+                batch, source, target)
             requests += calls
             failed += len(misses)
+            for name, cnt in provs.items():
+                provider_counts[name] = provider_counts.get(name, 0) + cnt
             for j, (text, out) in enumerate(zip(batch, translated)):
                 if j in misses:
                     # 翻失败的**绝对不能写缓存**。写了就是把「原文 = 译文」记
@@ -146,10 +160,29 @@ class TranslateService:
                 for idx in groups[text]:
                     results[idx] = out
             # 自适应间隔:刚失败过就多歇一会儿,别再把接口往限流里推
-            time.sleep(_BATCH_GAP * (2 if misses else 1))
+            #
+            # ⚠️ **这个间隔只对「外网 provider」有意义**。
+            #
+            # 它的存在是因为免费接口(MyMemory / 有道)按**连接建立速率**掐人 ——
+            # 连着打会成片 SSL 握手超时。而**本地 provider**(板载 NPU 推理)
+            # 根本没有外网连接,这个间隔纯属白等:实测它占 4 实例端到端
+            # 耗时的 **30%**(3.99s 里 1.2s),去掉之后同一批文案从
+            # 3.99s 掉到 ~2.8s。
+            #
+            # 判据:这一批**有没有真的用到外网**(而不是「最后一家是谁」——
+            # 补翻一条之后 last_used 就变成外网那家了,但那是 1 条不是 24 条)。
+            # 批里有条目没翻出来(misses)时照旧多歇一会儿 —— 那是真出错了,
+            # 该退避。
+            used_external = any(
+                not self._chain.provider_is_local(name) for name in provs
+            )
+            if misses:
+                time.sleep(_BATCH_GAP * 2)
+            elif used_external:
+                time.sleep(_BATCH_GAP)
 
         stats = {
-            "provider": self.provider_name,
+            "provider": self._dominant_provider(provider_counts),
             "providers": self.provider_names,
             "segments": len(norm),
             "unique": len(groups),
@@ -194,26 +227,26 @@ class TranslateService:
 
     def _translate_batch(
         self, texts: Sequence[str], source: str, target: str
-    ) -> tuple[list[str], int, set[int]]:
+    ) -> tuple[list[str], int, set[int], dict[str, int]]:
         """翻一批。
 
-        返回 ``(译文列表, 本次实际发出的请求数, 失败条在批内的下标集合)``。
+        返回 ``(译文列表, 本次实际发出的请求数, 失败条在批内的下标集合,
+        各 provider 翻了多少条)``。
 
-        失败分两种,处理方式**不一样**:
+        失败分三种,处理方式**不一样**:
 
         * **网络类**(批次请求挂了):整批**保留原文**并记账 —— 绝不能退化成
           逐条翻:被限流的接口上,60 次单发只会更糟(限流是按连接建立速率算的)。
           已经翻成功的那几批在缓存里,用户再点一次只补没翻出来的那几批。
         * **编号对不上**(MT 把两条并成一条):这是**正确性**问题不是网络问题,
           退化成逐条翻 —— 宁可慢,也不能把 A 的译文贴到 B 上。
-
-        失败的那些**不写缓存**(见 :meth:`translate_segments`):把「原文=译文」
-        记进缓存 = 永久毒化,下次命中缓存就再也不会重试了。
+        * **provider 只翻出了一部分**(NPU 有几条翻不出来):**只补翻那几条**,
+          其余条目的译文**沿用 NPU 的** —— 这是「一条不合格拖垮 24 条」
+          那个 bug 的修复点。
         """
         joined = self._pack_numbered(texts)
-        raw: str | None = None
         try:
-            raw = self._chain.translate(joined, source, target)
+            res = self._chain.translate(joined, source, target)
         except QuotaExceeded:
             # 链里已经把出问题的 provider 记进冷却了,这里直接往上抛
             raise
@@ -221,28 +254,95 @@ class TranslateService:
             LOG.warning(
                 "translate: 批次请求失败(%d 条),本批保留原文: %s", len(texts), exc
             )
-            return list(texts), 0, set(range(len(texts)))
+            return list(texts), 0, set(range(len(texts))), {}
 
-        parsed = self._parse_numbered(raw, len(texts))
+        parsed = self._parse_numbered(res.text, len(texts))
         if parsed is not None:
-            return parsed, 1, set()
+            out = parsed
+            calls = 1
+            misses = set(res.misses or ())
+            provs: dict[str, int] = {}
+            if res.provider:
+                provs[res.provider] = max(0, len(texts) - len(misses))
+            if misses:
+                out, misses, extra, fixed = self._repair(
+                    out, misses, texts, source, target, res.failed_provider)
+                calls += extra
+                for name, cnt in fixed.items():
+                    provs[name] = provs.get(name, 0) + cnt
+            return out, calls, misses, provs
 
         # 编号没对上(MT 把两条并成一条、或把编号改写了)→ 逐条翻
         LOG.warning(
             "translate: 批次编号解析失败(%d 条),退化为逐条翻译", len(texts)
         )
-        out: list[str] = []
-        misses: set[int] = set()
+        out = []
+        misses = set()
+        provs = {}
         for i, text in enumerate(texts):
             try:
-                out.append(self._chain.translate(text, source, target))
+                r = self._chain.translate(text, source, target)
             except QuotaExceeded:
                 raise
             except TranslationError as exc:
                 LOG.warning("translate: 单条翻译失败,保留原文: %s", exc)
                 out.append(text)
                 misses.add(i)
-        return out, len(texts) + 1, misses
+                continue
+            if r.misses:
+                out.append(text)
+                misses.add(i)
+                continue
+            out.append(r.text)
+            if r.provider:
+                provs[r.provider] = provs.get(r.provider, 0) + 1
+        return out, len(texts) + 1, misses, provs
+
+    def _repair(
+        self, out: list[str], misses: set[int], texts: Sequence[str],
+        source: str, target: str, failed_provider: str,
+    ) -> tuple[list[str], set[int], int, dict[str, int]]:
+        """**只补翻没翻出来的那几条** —— 已经翻好的不牵连。
+
+        provider 侧已经把它们单独报上来了(``TranslationResult.misses``)。
+        这里把这几条交给外网补(并**跳过**刚刚翻不出来的那家,免得同一段
+        文字在同一家身上又失败一次),其余条目**沿用 NPU 的译文**。
+
+        以前是「任何一条失败 → 整批抛异常 → 整批交给外网」—— NPU 已经
+        跑完的那 23 条**全白跑**(实测 28 种界面语言里有 7 种栽在这上面)。
+        """
+        skip = (failed_provider,) if failed_provider else ()
+        left = set(misses)
+        calls = 0
+        provs: dict[str, int] = {}
+        for i in sorted(misses):
+            try:
+                r = self._chain.translate(texts[i], source, target, skip=skip)
+            except QuotaExceeded:
+                raise
+            except TranslationError as exc:
+                LOG.warning("translate: 单条补翻失败,保留原文: %s", exc)
+                continue
+            calls += 1
+            if r.misses:
+                # 补翻的那家也翻不出来 —— 保留原文
+                continue
+            out[i] = r.text
+            left.discard(i)
+            if r.provider:
+                provs[r.provider] = provs.get(r.provider, 0) + 1
+        return out, left, calls, provs
+
+    def _dominant_provider(self, counts: dict[str, int]) -> str:
+        """「谁来翻」= **翻了多数条**的那家。
+
+        不用 ``chain.last_used``:补翻一条之后 last_used 变成外网那家,
+        但实际是 23 条 NPU + 1 条外网 —— 上报 last_used 会让前端显示
+        「有道在翻」,而实际上大头是 NPU。
+        """
+        if not counts:
+            return self.provider_name
+        return max(counts.items(), key=lambda kv: kv[1])[0]
 
     @staticmethod
     def _pack_numbered(texts: Sequence[str]) -> str:
