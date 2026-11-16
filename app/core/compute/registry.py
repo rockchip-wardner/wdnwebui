@@ -1027,9 +1027,17 @@ class ModelInstance:
       4. ``stop_instance_local(model)`` is spawned-only: RPC unload →
          RPC shutdown → wait → kill. Adopted peers are not affected.
     """
-    key: Tuple[int, str, str]                    # (npu, model_id, source) — source tag 防 spawned/adopted dict key 互撞
+    # 实例键：(npu, model_id, source, replica)。
+    #   * ``source`` —— 防 spawned/adopted 的 dict key 互撞
+    #   * ``replica`` —— **同一张卡上的第几份**。默认 0；>0 时是这张卡上
+    #     额外起的**另一个 worker 进程**（自己的 rknn3 context + 自己的
+    #     per-PID DDS service）。小模型（HY-MT 翻译）同卡多开一份能提高
+    #     吞吐（实测 RK1828：1 份 → 2 份，24 条界面文案 3.30s → 2.74s）。
+    key: Tuple[int, str, str, int]              # (npu, model_id, source, replica)
     npu_index: int                             # -1 until bound
     model_id: str
+    #: 这份实例是**本卡第几份**（0 起）。与 key 的第 4 位一致。
+    replica: int = 0
     # 每个worker占用的卡位。单卡模型是空/-1；分段9B worker报(0, 1)。
     npu_indices: tuple = ()
     device_id: Optional[bytes] = None
@@ -1134,6 +1142,10 @@ class ModelInstance:
         return {
             "npu_index":          self.npu_index,
             "npu_indices":        list(self.npu_indices or ()),
+            # 这一份是**本卡第几份** —— 同一张卡上可以有多份同名实例
+            # （小模型同卡多开提高吞吐），算力页靠它区分「1828#0 的第 1 份」
+            # 和「1828#0 的第 2 份」。
+            "replica":            self.replica,
             "model_id":           self.model_id,
             "label":              self.label,
             "instance_name":      self.instance_name,
@@ -1230,7 +1242,7 @@ class ComputeRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._instances: dict[Tuple[int, str], ModelInstance] = {}
+        self._instances: dict[Tuple[int, str, str, int], ModelInstance] = {}
         self._cards: list[dict] = []            # not used by RPC path
         self._cards_failed: str = ""
         # boot 时被裁掉的 autostart 条目（用户配了但没生效的）—— 暴露到
@@ -1859,6 +1871,11 @@ class ComputeRegistry:
                 # 按替代模型的实际卡数选卡位：钉 9B（2 张）退到 4B（1 张）
                 # 还占 2 张的话，后端会对 npu_index 里的每张卡各起一个实例。
                 "requires_cards":     int(preset.get("requires_cards", 1) or 1),
+                # **同一张卡上可以并行跑几份** —— 算力页据此渲染复选框：
+                # 2 ⇒ 每张卡给两个复选框（1828#0 的第 1 份 / 第 2 份）。
+                # 默认 1 = 维持「一张卡一个实例」的旧行为。
+                "max_replicas_per_card": int(
+                    preset.get("max_replicas_per_card", 1) or 1),
             })
         return out
 
@@ -2157,7 +2174,7 @@ class ComputeRegistry:
             old_key = inst.key
             # key 带上卡号（跟 spawn 时一致）：同模型两张卡都失败时不能撞同一个占位 key。
             err_npu = inst.npu_index if isinstance(inst.npu_index, int) and inst.npu_index >= 0 else -1
-            inst.key = (err_npu, inst.model_id, "spawned")
+            inst.key = (err_npu, inst.model_id, "spawned", inst.replica)
             if old_key != inst.key:
                 self._instances.pop(old_key, None)
             self._instances[inst.key] = inst
@@ -2167,7 +2184,8 @@ class ComputeRegistry:
     def _spawn_compute_worker(self, model_id: str,
                             allow_adopt: bool = True,
                             npu_index: int | list[int] | None = None,
-                            eager_load: bool | None = None) -> ModelInstance:
+                            eager_load: bool | None = None,
+                            replica: int = 0) -> ModelInstance:
         """Spawn a fresh ``compute_worker.py --model <id>`` subprocess.
 
         ``npu_index`` has **two independent jobs** and they must not be
@@ -2222,7 +2240,15 @@ class ComputeRegistry:
             with self._lock:
                 drop_keys = [k for k, inst in self._instances.items()
                              if inst.model_id == model_id
-                             and inst._source in ("adopted", "adopted_local")]
+                             and inst._source in ("adopted", "adopted_local")
+                             # ⚠️ **已经绑到卡上的本机实例不能丢** ——
+                             # 它正在服务那个槽位。丢了它，/proc 里那个进程
+                             # 会变成「没人认领的孤儿」，下一轮 spawn 又把它
+                             # 当新实例抢走 ⇒ 同一个进程被两个槽位抢，
+                             # 而它只装得下一份模型（rc=-6）。
+                             and not (inst._source == "adopted_local"
+                                      and isinstance(inst.npu_index, int)
+                                      and inst.npu_index >= 0)]
                 for k in drop_keys:
                     old = self._instances.pop(k)
                     LOG.info(
@@ -2231,20 +2257,31 @@ class ComputeRegistry:
                         old._source, model_id, getattr(old, "_peer_pid", None))
         # 1. 进程级 dedup:扫 /proc 同 comm 名的 worker
         orphan_pids = _find_workers_by_name(model_id)
-        # **排除本 registry 已经跟踪的 spawned worker。** 这条是「同一个
-        # 模型跑多张卡」的前提：给卡 1 启第二个实例时，`/proc` 里必然还
-        # 躺着刚给卡 0 spawn 的那个 worker，needle 只认 `--model <id>`，
-        # 分不清它是我们自己的。若不排除，`orphan_pids` 会命中它 →
-        # 注册成 adopted_local → 把卡 0 的那个实例从 dict 里踢掉 →
-        # 两个 registry 条目指向同一个进程，然后 bind 会让**同一个**
-        # worker 去 load 第二份模型（同卡再叠模型会 rc=-6，跨卡则状态
-        # 全乱）。实测症状：POST [0,1] 返回两个 pid 相同的实例。
+        # **排除本 registry 已经跟踪的 worker。** 这条是「同一个模型跑多张卡」
+        # 的前提：给卡 1 启第二个实例时，`/proc` 里必然还躺着刚给卡 0 spawn
+        # 的那个 worker，needle 只认 `--model <id>`，分不清它是我们自己的。
+        # 若不排除，`orphan_pids` 会命中它 → 注册成 adopted_local → 把卡 0 的
+        # 那个实例从 dict 里踢掉 → 两个 registry 条目指向同一个进程，然后
+        # bind 会让**同一个** worker 去 load 第二份模型（同卡再叠模型会
+        # rc=-6，跨卡则状态全乱）。实测症状：POST [0,1] 返回两个 pid 相同
+        # 的实例。
+        #
+        # ⚠️ **「已跟踪」= 本 registry 里该模型的**任何**实例**（不只 spawned）**：
+        # adopted_local（本机孤儿被接管）同样算 —— 一个进程已经被某个槽位
+        # 认领了，再被另一个槽位「复用」就是**一个进程占两个槽位**。
+        # 这正是「4 份里第 2 份起不来」的成因：复用出来的实例 key 里的
+        # replica 恒为 0，请求的副本 1 永远匹配不上 → 干等 120s 超时。
         tracked_pids = set()
         with self._lock:
             for i in self._instances.values():
-                if (i.model_id == model_id and i._source == "spawned"
+                if i.model_id != model_id:
+                    continue
+                if (i._source == "spawned"
                         and i.proc is not None and i.proc.poll() is None):
                     tracked_pids.add(i.proc.pid)
+                elif (i._source == "adopted_local"
+                        and isinstance(i._peer_pid, int)):
+                    tracked_pids.add(i._peer_pid)
         reusable = [p for p in orphan_pids if p not in tracked_pids]
         if orphan_pids and not reusable:
             LOG.info(
@@ -2262,7 +2299,7 @@ class ComputeRegistry:
             if adopted is not None:
                 return adopted
             err_inst = ModelInstance(
-                key=(-1, model_id, "spawned"),
+                key=(-1, model_id, "spawned", 0),
                 npu_index=-1,
                 model_id=model_id,
                 capability_types=list(preset["capability_types"]),
@@ -2281,10 +2318,16 @@ class ComputeRegistry:
             )
             self._register_errored_instance(err_inst)
             return err_inst
-        if not allow_adopt and orphan_pids:
+        if not allow_adopt and orphan_pids and replica == 0:
             # v0.8.22: LOCAL 启用 + /proc orphan → 直接注册 adopted_local,
             # 不走 _adopt_existing_worker 的 DDS probe(避免 grab 错 peer
             # worker 把 NETWORK 卡弄回来;orphan 是我们自己的,直接用 /proc)。
+            #
+            # ⚠️ **只对第 0 份生效** —— 复用的孤儿注册出来的 replica 恒为 0
+            # (见下面那个 key),而「第 2 份」的语义是「**再**起一个」：
+            # 必须真的 spawn 一个新进程。再抢一个已有进程 = 一个进程占两个
+            # 槽位 ⇒ 请求的副本号永远匹配不上 ⇒ 表现为「启动失败」+ 干等
+            # 120s 超时。
             orphan_pid = orphan_pids[0]
             LOG.info(
                 "spawn (allow_adopt=False): reusing local /proc orphan "
@@ -2292,7 +2335,7 @@ class ComputeRegistry:
             device_name = (get_config().get_section("base", {}).get(
                 "device_name", "") or socket.gethostname())
             inst = ModelInstance(
-                key=(-1, model_id, "adopted_local"),
+                key=(-1, model_id, "adopted_local", replica),
                 npu_index=-1,
                 model_id=model_id,
                 capability_types=list(preset["capability_types"]),
@@ -2301,6 +2344,7 @@ class ComputeRegistry:
                 memory_estimate_mb=preset["memory_estimate_mb"],
                 status="not_loaded",
                 started_at=time.time(),
+                replica=replica,
                 _source="adopted_local",
             )
             inst._peer_pid = orphan_pid
@@ -2345,6 +2389,9 @@ class ComputeRegistry:
                     continue
                 if not allow_adopt and inst._source == "adopted":
                     continue
+                # 同卡第 2 份 → 不复用（见 ensure_worker_for_model 同名注释）
+                if replica > 0:
+                    continue
                 # Same card-aware rule as the outer ensure_worker_for_model
                 # (see _instance_reusable).
                 if not _instance_reusable(
@@ -2364,9 +2411,10 @@ class ComputeRegistry:
         )
         spawn_npu = _cards[0] if _cards else -1
         inst = ModelInstance(
-            key=(spawn_npu, model_id, "spawned"),
+            key=(spawn_npu, model_id, "spawned", replica),
             npu_index=spawn_npu,
             npu_indices=tuple(_cards),
+            replica=replica,
             model_id=model_id,
             capability_types=list(preset["capability_types"]),
             instance_name=preset["instance_name"],
@@ -2544,9 +2592,11 @@ class ComputeRegistry:
             existing.available_image_sizes = _coerce_image_sizes(
                 info.get("available_image_sizes"))
             if isinstance(existing.npu_index, int) and existing.npu_index >= 0:
-                existing.key = (existing.npu_index, model_id, existing._source)
+                existing.key = (existing.npu_index, model_id,
+                                existing._source, existing.replica)
             else:
-                existing.key = (-1, model_id, existing._source)
+                existing.key = (-1, model_id, existing._source,
+                                existing.replica)
             self._instances[existing.key] = existing
         LOG.info("v0.8.28: in-place updated %s for %s (pid=%d npu=%s status=%s)",
                  existing._source, model_id, getattr(existing, "_peer_pid", 0),
@@ -2623,7 +2673,7 @@ class ComputeRegistry:
             else:
                 peer_name = "远端"
         inst = ModelInstance(
-            key=(-1, model_id, source),
+            key=(-1, model_id, source, 0),
             npu_index=worker_npu if isinstance(worker_npu, int) else -1,
             model_id=model_id,
             capability_types=list(preset["capability_types"]),
@@ -2686,9 +2736,9 @@ class ComputeRegistry:
                 # probe 成功但被拦下,NETWORK 永远不显示 peer 的同 model 卡。
                 pass
             if inst.npu_index >= 0:
-                inst.key = (inst.npu_index, model_id, source)
+                inst.key = (inst.npu_index, model_id, source, inst.replica)
             else:
-                inst.key = (-1, model_id, source)
+                inst.key = (-1, model_id, source, inst.replica)
             with self._lock:
                 # v0.8.22: 必须在 lock 下插,避免 peer_listener 线程插入
                 # adopted 卡与 _spawn_compute_worker 顶部 dedup 之间的
@@ -2913,8 +2963,9 @@ class ComputeRegistry:
 
     def ensure_worker_for_model(self, model_id: str,
                                allow_adopt: bool = True,
-                               npu_index: int | None = None,
-                               eager_load: bool | None = None) -> ModelInstance:
+                               npu_index: int | list[int] | None = None,
+                               eager_load: bool | None = None,
+                               replica: int = 0) -> ModelInstance:
         """User-facing: ensure *some* worker exists for this model.
 
         Order:
@@ -2956,6 +3007,12 @@ class ComputeRegistry:
                     continue
                 if not allow_adopt and inst._source == "adopted":
                     continue
+                # ⚠️ 同卡的**第 2 份**（replica>0）**绝不复用**已有实例
+                # —— 用户明确要在这张卡上再跑一份，必须起**新的 worker
+                # 进程**（新的 rknn3 context + 新的 per-PID DDS service）。
+                # 复用会让「勾了 4 个槽位」只起 2 份。
+                if replica > 0:
+                    continue
                 # Card-aware matching: without this, a model already on
                 # card 0 would be handed back for a request naming card 1
                 # and bind_instance would then ask one worker to load a
@@ -2989,7 +3046,8 @@ class ComputeRegistry:
                 return adopted
         spawned = self._spawn_compute_worker(model_id, allow_adopt=allow_adopt,
                                              npu_index=npu_index,
-                                             eager_load=eager_load)
+                                             eager_load=eager_load,
+                                             replica=replica)
         return spawned
 
     def _call_load_with_warmup(self, rpc_client, inst: ModelInstance,
@@ -3136,7 +3194,7 @@ class ComputeRegistry:
             # 置位，否则新 probe 的第一次 info 读会把它当成本次的终态。
             # probe 拿它判「worker 报上来的 error 是上一轮的残留」。
             inst._load_pending = True
-            new_key = (npu_index, inst.model_id, inst._source)
+            new_key = (npu_index, inst.model_id, inst._source, inst.replica)
             if inst.key != new_key:
                 self._instances.pop(inst.key, None)
                 inst.key = new_key
@@ -3239,7 +3297,8 @@ class ComputeRegistry:
                     # 退场：probe 接管。
                     # v0.8.13:key 用 inst._source 不硬编码 —— bind 也能调到
                     # adopted_local (orphan dedup 返回的 inst)。
-                    new_key = (npu_index, inst.model_id, inst._source)
+                    new_key = (npu_index, inst.model_id, inst._source,
+                               inst.replica)
                     with self._lock:
                         if inst.key != new_key:
                             self._instances.pop(inst.key, None)
@@ -3391,7 +3450,7 @@ class ComputeRegistry:
         with self._lock:
             old_key = inst.key
             inst.npu_index = -1
-            inst.key = (-1, model_id, inst._source)
+            inst.key = (-1, model_id, inst._source, inst.replica)
             inst.status = "not_loaded"
             inst.load_time_sec = None
             inst.loaded_at = None
@@ -3399,9 +3458,9 @@ class ComputeRegistry:
             # Two instances unloading at once would both land on
             # key (-1, model, source) and the second would overwrite
             # the first, orphaning it. Keep them apart by suffixing.
-            if (-1, model_id, inst._source) in self._instances:
+            if (-1, model_id, inst._source, inst.replica) in self._instances:
                 inst.key = (-1 - len(self._instances), model_id,
-                            inst._source)
+                            inst._source, inst.replica)
             self._instances[inst.key] = inst
         # Tear down the local FastDDS endpoints so the cshim payload
         # pool doesn't pin in hub._services. The hub Service / Requester
@@ -3420,7 +3479,8 @@ class ComputeRegistry:
                 model_id, inst.npu_index)
 
     def stop_instance_local(self, model_id: str,
-                            npu_index: Optional[int] = None) -> None:
+                            npu_index: Optional[int] = None,
+                            replica: Optional[int] = None) -> None:
         """Unload → RPC shutdown → SIGTERM → wait 3 s → kill -9.
 
         ``npu_index`` 缺省停该模型全部实例；给了卡号只停那一张。
@@ -3458,7 +3518,7 @@ class ComputeRegistry:
         exist both locally and on a LAN peer at the same npu index, and
         stopping the local copy must not be aborted by the peer entry.
         """
-        all_targets = self._instances_of(model_id, npu_index)
+        all_targets = self._instances_of(model_id, npu_index, replica)
         if not all_targets:
             raise RuntimeError(f"{model_id} 不在 registry")
         targets = [i for i in all_targets if i._source != "adopted"]
@@ -3993,7 +4053,8 @@ class ComputeRegistry:
             return adopted
 
     def _instances_of(self, model_id: str,
-                      npu_index: Optional[int] = None) -> List[ModelInstance]:
+                      npu_index: Optional[int] = None,
+                      replica: Optional[int] = None) -> List[ModelInstance]:
         """Every registered instance of ``model_id``, optionally narrowed
         to one card.
 
@@ -4008,9 +4069,10 @@ class ComputeRegistry:
             found = [i for i in self._instances.values()
                      if i.model_id == model_id
                      and (npu_index is None
-                          or npu_index in (i.npu_indices or (i.npu_index,)))]
+                          or npu_index in (i.npu_indices or (i.npu_index,)))
+                     and (replica is None or i.replica == replica)]
         found.sort(key=lambda i: (local_first.get(i._source, 9),
-                                  i.npu_index))
+                                  i.npu_index, i.replica))
         return found
 
     def transition_cards(self, model_id: str, *,
@@ -4596,7 +4658,7 @@ class ComputeRegistry:
         else:
             peer_name = "远端"
         inst = ModelInstance(
-            key=(-1, model_id, "adopted"),
+            key=(-1, model_id, "adopted", 0),
             npu_index=worker_npu if isinstance(worker_npu, int) else -1,
             model_id=model_id,
             capability_types=list(preset["capability_types"]),
@@ -4636,6 +4698,27 @@ class ComputeRegistry:
 
         Returns the count of PIDs killed.
         """
+        # ⚠️ **先同步刷新一次 MODEL_PRESETS** ——
+        #
+        # ``MODEL_PRESETS`` 是**导入时**取的快照（``_model_presets()``），而
+        # ``WDNAI_MODELS_DIR`` 要到 ``app/main.py:create_app()`` 里才从
+        # ``base.model_path`` 写进环境变量 —— 两者**有时序差**。所以导入时
+        # 的快照里**可能缺了本板后来装的模型**（实测：hy-mt-1-5 /
+        # intern-decision-4b 都不在内，因为它俩装在 ``base.model_path``
+        # 指向的目录，不在出厂默认的 ``/mnt/oem/models``）。
+        #
+        # 后果很实在：下面的扫描范围是 ``MODEL_PRESETS`` 的键，缺一个模型
+        # ⇒ **那个模型的孤儿 worker 永远不会被清理** —— 每次热重载都留下一
+        # 批占着 NPU 显存的僵尸进程，剩下的实例起不来（显存不够）。
+        #
+        # 后台重扫线程（2s 间隔）会补上 ``MODEL_PRESETS``，但本函数是**开机
+        # 清理**：它跑在线程之前，所以必须自己先刷新一次。扫描很便宜（一次
+        # 目录列举 + 读几个小 JSON）。
+        try:
+            refresh_model_presets()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("清理孤儿前刷新模型清单失败: %s", exc)
+
         try:
             # autostart entries are objects, so take the ``model`` field;
             # a raw set() over the list would raise on unhashable dicts
@@ -4900,7 +4983,8 @@ class ComputeRegistry:
                                     and inst.npu_index != worker_npu):
                                 self._instances.pop(inst.key, None)
                                 inst.npu_index = worker_npu
-                                inst.key = (worker_npu, inst.model_id, inst._source)
+                                inst.key = (worker_npu, inst.model_id,
+                                            inst._source, inst.replica)
                                 self._instances[inst.key] = inst
                             inst.finished_at = data.get(
                                 "loaded_at", time.time())

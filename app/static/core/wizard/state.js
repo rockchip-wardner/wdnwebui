@@ -2598,7 +2598,13 @@
     const seen = new Set();
     for (const [cap, m] of Object.entries(effCfg.swcap_to_model || {})) {
       const cards = Array.isArray(m.npu_index) ? m.npu_index : [m.npu_index];
-      for (const n of cards) {
+      // 槽位声明的卡也要等 —— 只等 swcap_to_model 的卡会漏掉「额外那张卡
+      // 上的那一份」（网页翻译默认 4 个实例，跨 2 张卡）。
+      const slotCards = (Array.isArray(m.instance_slots) ? m.instance_slots : [])
+        .map((sl) => Number(sl.npu_index))
+        .filter((n) => Number.isInteger(n) && n >= 0);
+      const allCards = [...new Set([...cards, ...slotCards])];
+      for (const n of allCards) {
         // 同组能力指向同一个模型时会展开出重复对 —— 进度行会多出几行
         // 一模一样的加载条，90s 超时也按重复条数算。
         const key = m.model_id + "@" + n;
@@ -3108,19 +3114,39 @@
           return false;
         }
       }
-      // 2. 启必需(后端契约 POST + JSON {model, npu_index})
+      // 2. 启必需(后端契约 POST + JSON {model, npu_index, slots})
       //    **按 (model_id, npu_index) 去重** —— 同组能力指向同一个模型时
       //    （usb_hid 的视觉 + 工具调用）逐条目 POST 会把同一个模型启两次。
+      //
+      //    ⚠️ **槽位（instance_slots）**：同一张卡上可以并行跑几份同一个
+      //    模型（小模型同卡多开提高吞吐 —— 实测 RK1828：1 份 → 2 份，
+      //    24 条界面文案 3.30s → 2.74s；2 卡各 2 份 → 1.45s / 2.31×）。
+      //    声明了 instance_slots 就按它逐个槽位起（每个槽位一个 worker
+      //    进程），否则退回「每张卡第 0 份」的旧行为。
       const started = new Set();
       for (const m of Object.values(effMap)) {
         const key = m.model_id + "@" + m.npu_index;
         if (started.has(key)) continue;
         started.add(key);
         say("正在启动模型...");
+        // 槽位表：优先用声明的 instance_slots；否则按 npu_index 推导。
+        let slots = null;
+        if (Array.isArray(m.instance_slots) && m.instance_slots.length) {
+          slots = m.instance_slots.map((sl) => ({
+            npu_index: Number(sl.npu_index),
+            replica: Number(sl.replica || 0),
+          })).filter((sl) => Number.isInteger(sl.npu_index)
+                           && sl.npu_index >= 0);
+        }
+        const body = { model: m.model_id, npu_index: m.npu_index };
+        if (slots && slots.length) {
+          body.slots = slots;
+          body.npu_index = [...new Set(slots.map((sl) => sl.npu_index))];
+        }
         const sr = await fetch("/api/compute/instances", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model: m.model_id, npu_index: m.npu_index }),
+          body: JSON.stringify(body),
         });
         if (!sr.ok) {
           const detail = await _errDetail(sr);

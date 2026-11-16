@@ -149,6 +149,17 @@ class WorkerManifest:
     #: Number of RK182x cards one worker instance must occupy. ``1`` for
     #: every single-card model; the segmented 9B export needs two.
     requires_cards: int = 1
+    #: **同一张卡上可以并行跑几份这个模型**（默认 1）。
+    #:
+    #: 为什么需要它：算力页的「运行在」是按**卡**多选的，一个模型在一张卡
+    #: 上只能有一份实例（registry 的实例键是 ``(卡号, 模型, 来源)``）。
+    #: 但小模型（比如 HY-MT 翻译模型）**同卡多开一份**是划算的 —— 实测
+    #: RK1828 上 1 份 → 2 份，24 条界面文案的翻译耗时从 3.30s 降到 2.74s
+    #: （1.21×；卡是瓶颈，所以同卡加副本的收益远小于加卡）。
+    #:
+    #: ⚠️ 这个值**只影响 UI 给出几个复选框**，不保证显存一定够 —— 真放不
+    #: 下时 worker 会报 ``MODEL_SETUP fail``，由算力页显示错误。
+    max_replicas_per_card: int = 1
     #: **设备拓扑要求**（可选）：这个模型一共要占几个 NPU 设备、允许哪几种
     #: 硬件布局。``requires_cards`` 只数**本机 EP 协卡**，而有些模型还要
     #: 占住**第三个 NPU 设备** —— 那个设备不是 EP 协卡，算力卡列表里
@@ -259,6 +270,9 @@ class WorkerManifest:
             "instance_name": self.instance_name,
             "requires_cards": self.requires_cards,
             "card_requirements": dict(self.card_requirements),
+            # 同一张卡上可以并行跑几份 —— 算力页按它渲染复选框个数
+            # （max_replicas_per_card=2 ⇒ 每张卡两个复选框）。
+            "max_replicas_per_card": self.max_replicas_per_card,
             "memory_estimate_mb": self.memory_estimate_mb,
             "estimated_init_seconds": self.estimated_init_seconds,
             "infer_timeout_s": self.infer_timeout_s,
@@ -384,7 +398,7 @@ def _validate(raw: Any, stem: str, *, canonical: bool = False
     known = {
         "id", "label", "capability_types", "spec_factory", "worker_name",
         "model_dir_name", "model_dir", "model_dir_env", "instance_name",
-        "requires_cards", "card_requirements",
+        "requires_cards", "card_requirements", "max_replicas_per_card",
         "memory_estimate_mb", "estimated_init_seconds",
         "infer_timeout_s",
         "description", "notes", "available_targets", "hidden", "display_order",
@@ -407,6 +421,7 @@ def _validate(raw: Any, stem: str, *, canonical: bool = False
         model_dir_env=raw.get("model_dir_env", ""),
         instance_name=raw.get("instance_name", ""),
         requires_cards=int(raw.get("requires_cards", 1)),
+        max_replicas_per_card=max(1, int(raw.get("max_replicas_per_card", 1) or 1)),
         card_requirements=_parse_card_requirements(raw.get("card_requirements")),
         memory_estimate_mb=int(raw.get("memory_estimate_mb", 0)),
         estimated_init_seconds=int(raw.get("estimated_init_seconds", 60)),
