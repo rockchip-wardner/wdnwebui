@@ -19,7 +19,7 @@ def main():
         for app_id in apps:
             print(f"\n=== {app_id} ===")
             try:
-                page.goto(f"http://127.0.0.1:8000/#{app_id}", wait_until="domcontentloaded", timeout=15000)
+                page.goto(f"https://127.0.0.1:8000/#{app_id}", wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_selector(".wd-wizard-section", timeout=8000)
                 page.wait_for_timeout(500)
 

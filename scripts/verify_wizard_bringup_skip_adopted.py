@@ -83,7 +83,7 @@ def main():
                 route.fulfill(status=200, body="{}")
         page.route("**/api/compute/instances", handle_request)
 
-        page.goto("http://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
+        page.goto("https://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
         page.wait_for_timeout(800)
 
         result = page.evaluate("""
@@ -123,7 +123,7 @@ def main():
         # 403 护栏其实好好的)。改成从真实快照里挑一个 adopted 实例。
         print(f"\n=== Layer 2: 真实 server DELETE adopted ===")
         snap = json.loads(urllib.request.urlopen(
-            "http://127.0.0.1:8000/api/compute", timeout=5).read())
+            "https://127.0.0.1:8000/api/compute", timeout=5).read())
         adopted = [i for i in (snap.get("instances") or [])
                    if i.get("_source") == "adopted"]
         if not adopted:
@@ -135,7 +135,7 @@ def main():
         print(f"  目标: {target.get('model_id')} @ npu{target.get('npu_index')}"
               f" (peer={target.get('_peer_name')})")
         req = urllib.request.Request(
-            "http://127.0.0.1:8000/api/compute/instances",
+            "https://127.0.0.1:8000/api/compute/instances",
             method="DELETE",
             data=json.dumps({"model": target.get("model_id"),
                              "npu_index": target.get("npu_index")}).encode(),

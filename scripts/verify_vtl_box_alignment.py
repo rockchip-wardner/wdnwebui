@@ -35,7 +35,7 @@ import cv2
 import numpy as np
 import websockets
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 API = BASE + "/api/video-target-localization"
 VIDEO = "/userdata/assets/uploads/rk-0.mp4"
 CDP_PORT = 9333

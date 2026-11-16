@@ -23,7 +23,7 @@ playsinline loop>``）。只要 manifest 写了 ``preview_video``，而对应的
 用法::
 
     .venv/bin/python scripts/verify_app_panel_preview.py
-    .venv/bin/python scripts/verify_app_panel_preview.py --base http://127.0.0.1:8000
+    .venv/bin/python scripts/verify_app_panel_preview.py --base https://127.0.0.1:8000
     .venv/bin/python scripts/verify_app_panel_preview.py --skip-browser
 
 注意：卡片 manifest 是**启动时**扫的（``app/core/manifest.py``），改了
@@ -247,7 +247,7 @@ def _browser_check(base: str, want_ids: list[str], shot: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="应用面板动态预览视频验证")
-    ap.add_argument("--base", default="http://127.0.0.1:8000")
+    ap.add_argument("--base", default="https://127.0.0.1:8000")
     ap.add_argument("--shot", default="/tmp/app_panel_preview.png")
     ap.add_argument("--skip-browser", action="store_true")
     args = ap.parse_args()

@@ -23,7 +23,7 @@ import sys
 
 from playwright.async_api import async_playwright
 
-BASE = "http://localhost:8000"
+BASE = "https://localhost:8000"
 # 素材路径曾写死，板子上文件清掉后脚本就永远红着（且看不出是环境还是布局问题）。
 VIDEO_CANDIDATES = [
     "/home/rockchip/test/test/carplant_29132868.mp4",

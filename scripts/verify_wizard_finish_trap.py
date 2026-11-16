@@ -26,7 +26,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 APP_ID = "usb-hid"
-BASE = "http://localhost:8000"
+BASE = "https://localhost:8000"
 
 
 class Verdict(Exception):

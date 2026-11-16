@@ -21,7 +21,8 @@ set -u
 STEPS="${1:-8}"
 PROMPT="${2:-a cute cat sitting on a wooden chair}"
 OUT=${OUT:-/tmp/e2e_topo.png}
-BASE=${BASE:-http://127.0.0.1:8000}
+# 8000 只说 HTTPS（uvicorn 原生 TLS）⇒ 这里必须用 https://
+BASE=${BASE:-https://127.0.0.1:8000}
 PY=/home/rockchip/wdnwebui/.venv/bin/python
 
 echo "== waiting for capability_ready =="

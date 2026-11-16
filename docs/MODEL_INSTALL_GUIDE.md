@@ -23,7 +23,7 @@
 git clone https://huggingface.co/<org>/Qwen3-VL-4B /userdata/models/Qwen3-VL-4B
 
 # 2. 刷新（可选）—— 后台每 ~2s 自动扫一次，一般等一下就出来了
-curl -X POST http://<板子IP>:8000/api/compute/refresh-models
+curl -X POST https://<板子IP>:8000/api/compute/refresh-models
 ```
 
 然后打开**算力配置**页，「本地算力」栏里就有这张模型卡片了，点「启用」即可。

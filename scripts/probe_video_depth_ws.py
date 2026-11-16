@@ -77,7 +77,7 @@ async def main(url: str, seconds: float) -> int:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="ws://127.0.0.1:8000/api/video-depth/ws")
+    ap.add_argument("--url", default="wss://127.0.0.1:8000/api/video-depth/ws")
     ap.add_argument("--seconds", type=float, default=12.0)
     a = ap.parse_args()
     raise SystemExit(asyncio.run(main(a.url, a.seconds)))

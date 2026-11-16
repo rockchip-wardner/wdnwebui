@@ -14,7 +14,7 @@ import time
 
 from playwright.sync_api import sync_playwright
 
-URL = "http://127.0.0.1:8000/"
+URL = "https://127.0.0.1:8000/"
 
 # 注入页面的探针：记录 WS 帧到达时刻
 PROBE = """

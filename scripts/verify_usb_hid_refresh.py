@@ -72,7 +72,7 @@ def run(exe: str) -> None:
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
         print("=== open page + nav to #usb-hid ===")
-        page.goto("http://localhost:8000", wait_until="networkidle", timeout=15000)
+        page.goto("https://localhost:8000", wait_until="networkidle", timeout=15000)
         page.wait_for_function(
             "() => window.__APP_MANIFESTS__ && window.ROUTER",
             timeout=10000,

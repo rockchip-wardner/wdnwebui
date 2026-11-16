@@ -80,7 +80,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 
 #: 静音前缀（秒）—— 让模型先踩进「没有新内容」的状态。
 SILENCE_LEAD_SEC = 10.0

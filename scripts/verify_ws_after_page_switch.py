@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import sys
+import ssl
 import threading
 import time
 import urllib.request
@@ -28,21 +29,38 @@ VIDEO_PATH = os.environ.get("WDNWEBUI_VIDEO", "/userdata/video_test/rk-0.mp4")
 SAMPLE_S = 3.0
 
 
+def _ssl_context():
+    """TLS 上下文：默认走系统信任库；给了 CA 文件就用它。
+
+    8000 只说 HTTPS（uvicorn 原生 TLS）⇒ urllib 与 websockets 都要验签。
+
+    * 板子上 CA 已装进系统信任库 ⇒ 不设这个变量也能过；
+    * CI runner 上没装 ⇒ 指一份：``REQUESTS_CA_BUNDLE=/path/to/ca.pem``。
+
+    返回 ``None`` ⇒ 交给库自己用默认上下文（不验签的系统默认）。
+    """
+    ca = (os.environ.get("REQUESTS_CA_BUNDLE")
+          or os.environ.get("WDNWEBUI_CA_BUNDLE") or "")
+    if ca and os.path.isfile(ca):
+        return ssl.create_default_context(cafile=ca)
+    return None
+
+
 def open_video():
     req = urllib.request.Request(
-        f"http://{API_HOST}/api/video-detection/open",
+        f"https://{API_HOST}/api/video-detection/open",
         data=json.dumps({"source": VIDEO_PATH, "loop": True}).encode(),
         headers={"Content-Type": "application/json"},
     )
-    urllib.request.urlopen(req).read()
+    urllib.request.urlopen(req, context=_ssl_context()).read()
 
 
 def close_video():
     try:
         urllib.request.urlopen(urllib.request.Request(
-            f"http://{API_HOST}/api/video-detection/close",
+            f"https://{API_HOST}/api/video-detection/close",
             data=b"", method="POST",
-        )).read()
+        ), context=_ssl_context()).read()
     except Exception:
         pass
 
@@ -50,7 +68,7 @@ def close_video():
 async def _collect_async(url, duration_s):
     """Single async task: collect binary frame count for `duration_s`."""
     received = 0
-    async with websockets.connect(url) as ws:
+    async with websockets.connect(url, ssl=_ssl_context()) as ws:
         t0 = time.monotonic()
         try:
             while time.monotonic() - t0 < duration_s:
@@ -110,15 +128,15 @@ async def main():
 
     for stage, name, params in [
         ("Stage 1", "仅 VD WS", [
-            (f"ws://{API_HOST}/api/video-detection/ws", SAMPLE_S),
+            (f"wss://{API_HOST}/api/video-detection/ws", SAMPLE_S),
         ]),
         ("Stage 2", "VD 后台 + VTD 当前(并发,独立线程)", [
-            (f"ws://{API_HOST}/api/video-detection/ws", SAMPLE_S),
-            (f"ws://{API_HOST}/api/video-target-detection/ws", SAMPLE_S),
+            (f"wss://{API_HOST}/api/video-detection/ws", SAMPLE_S),
+            (f"wss://{API_HOST}/api/video-target-detection/ws", SAMPLE_S),
         ]),
         ("Stage 3", "VTD 后台 + VD 当前(并发,独立线程)", [
-            (f"ws://{API_HOST}/api/video-target-detection/ws", SAMPLE_S),
-            (f"ws://{API_HOST}/api/video-detection/ws", SAMPLE_S),
+            (f"wss://{API_HOST}/api/video-target-detection/ws", SAMPLE_S),
+            (f"wss://{API_HOST}/api/video-detection/ws", SAMPLE_S),
         ]),
     ]:
         close_video()

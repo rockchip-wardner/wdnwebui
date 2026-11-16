@@ -47,6 +47,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import sys
 import urllib.error
 import urllib.parse
@@ -60,7 +61,11 @@ sys.path.insert(0, str(REPO))
 # 对不上」的问题，直接用 playwright 自带的 launch 会找不到浏览器）。
 sys.path.insert(0, str(REPO / "scripts"))
 
-BASE = os.environ.get("WDNWEBUI_BASE", "http://127.0.0.1:8000").rstrip("/")
+# 卡片已插件化 ⇒ 真实卡片目录在 wdnapps_* 包里（app/apps/ 只剩 __init__.py），
+# 用 card_dirs.resolve_cards() 拿，别再 glob app/apps/。
+from card_dirs import resolve_cards  # noqa: E402
+
+BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000").rstrip("/")
 
 _PASS = 0
 _FAIL = 0
@@ -159,10 +164,17 @@ def test_gzip_first_load_bytes() -> None:
 def test_video_not_breaks() -> None:
     print("\n=== B. 视频与 Range 请求不被压坏 ===")
     # 找一张带 preview.mp4 的卡
+    #
+    # ⚠️ 卡片已**插件化**（v0.44 起迁到 wdnapps_* 包），``app/apps/`` 下只剩
+    #    ``__init__.py`` ⇒ 老的 ``app/apps/*/static/preview.mp4`` glob **恒为空**
+    #    （这是插件化之后遗留的 bug，与 8000 改 HTTPS 无关）。
+    #    现在用 card_dirs.resolve_cards() 拿到**真实**卡片目录。
     video = None
-    for m in sorted((REPO / "app" / "apps").glob("*/static/preview.mp4")):
-        card_id = m.parent.parent.name.replace("_", "-")
-        cand = "/static/apps/%s/preview.mp4" % card_id
+    for card in resolve_cards():
+        m = Path(card["dir"]) / "static" / "preview.mp4"
+        if not m.is_file():
+            continue
+        cand = "/static/apps/%s/preview.mp4" % card["id"]
         st, _, _ = fetch(cand)
         if st == 200:
             video = (cand, m)
@@ -278,6 +290,12 @@ def test_websocket_unaffected() -> None:
     )
     try:
         s = socket.create_connection((host, port), timeout=10)
+        # 8000 已是原生 TLS ⇒ 裸 socket 必须包一层 TLS，否则服务端看到的是
+        # 一段明文 HTTP，服务端直接断开（拿不到 101）。
+        # 默认 SSL 上下文读**系统信任库**，而板子已装私有 CA ⇒ 验签通过。
+        if parts.scheme == "https":
+            s = ssl.create_default_context().wrap_socket(
+                s, server_hostname=host)
     except OSError as exc:
         check(False, "连上 %s:%d" % (host, port), repr(exc))
         return

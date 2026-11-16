@@ -6,43 +6,52 @@
 
 | 访问地址 | 安全上下文 | `navigator.mediaDevices` | 浏览器麦克风 |
 |---|---|---|---|
-| `https://<板子IP>:8443` | ✅ | ✅ 存在 | **可用** |
-| `http://127.0.0.1:8000` | ✅ | ✅ 存在 | 可用（但只能本机访问） |
-| `http://<板子IP>:8000` | ❌ | ❌ **undefined** | **打不开** |
+| `https://<板子IP>:8000` | ✅ | ✅ 存在 | **可用** |
+| `https://127.0.0.1:8000` | ✅ | ✅ 存在 | 可用（只能本机访问） |
+| `http://<板子IP>:8000` | ❌ | ❌ **undefined** | **打不开**（明文已被切断） |
 
-本板部署是**纯 HTTP**（`0.0.0.0:8000`，无 TLS），所以从别的机器用
-`http://172.16.9.65:8000` 访问时，浏览器**根本不提供**麦克风 API ——
-不是 webui 的 bug，是浏览器的硬性限制。
+> ⚠️ **2026-11-16 起，8000 已改为 uvicorn 原生 TLS**（`--ssl-certfile` /
+> `--ssl-keyfile`），**8443 的 TLS 中继已退役**。访问地址从
+> `https://<板子IP>:8443` 变成 `https://<板子IP>:8000`。
+>
+> * 客户端信任的**根证书没变**（信任的是 CA 根，与端口无关）⇒ **不用重装 CA**
+> * 服务端证书的 **SAN 不含端口** ⇒ **不用重签**
+> * 明文 `http://…:8000` **已不可用**（curl 返回 exit=52 / Empty reply）
 
-> 实测（同一服务、同一浏览器）：
-> `http://127.0.0.1:8000` → `isSecureContext=true`、麦克风可用；
-> `http://172.16.9.65:8000` → `isSecureContext=false`、`mediaDevices` 不存在。
+本板部署是**纯 HTTPS**（`0.0.0.0:8000`，uvicorn 原生 TLS），所以从任何机器
+用 `https://172.16.9.65:8000` 访问都是安全上下文 —— 浏览器**正常提供**麦克风 API。
+
+> 实测（同一服务、同一浏览器，2026-11-16）：
+> `https://127.0.0.1:8000` 与 `https://172.16.9.65:8000` 均
+> `isSecureContext=true`、`getUserMedia()` 返回 live 音轨（48 kHz / 单声道）。
 
 ## 现在的部署长什么样
 
 ```
-浏览器  ──https://172.16.9.65:8443──▶  tls_relay（TLS 终结，8443）
-                                            │  注入 X-Forwarded-Proto: https
+浏览器  ──https://172.16.9.65:8000──▶  uvicorn（原生 TLS，0.0.0.0:8000）
+                                            │  scope["scheme"] 天然是 https
                                             ▼
-                                      uvicorn（明文，127.0.0.1:8000）
+                                      FastAPI 应用
 ```
 
-* **`8000` 一行没改** —— 板子上别的人还在用 `http://…:8000`，照常可用；
-  内部调用方（板载麦克风 agent、回归脚本）也**不受影响**。
-* **`8443` 是新增的** —— TLS 在 relay 里终结，转成明文再给后端。
-  后端通过 `X-Forwarded-Proto` 知道原始 scheme（否则 307 重定向会写出
-  `http://` 的 Location，https 页面按 mixed content 拦掉 → `Failed to fetch`）。
+* **TLS 在 uvicorn 进程内终结** —— 不再有中间中继，少一跳、少一个进程。
+* **不再需要 `X-Forwarded-Proto`** —— scheme 由 uvicorn 直接给出
+  （`app/core/forwarded.py` 的中间件保留但不再命中，详见该文件的说明）。
 * **前端不用改** —— WebSocket 地址按 `location.protocol` 自动选 `ws://` / `wss://`。
+* **证书缺失 ⇒ 服务不启动** —— systemd 单元里的 `ConditionPathExists`（**必须在
+  `[Unit]` 段**）会挡住启动，避免 uvicorn 抛异常后被 `Restart=on-failure`
+  无限重启。每日巡检由 `wdnwebui-cert-check.timer` 负责。
 
 相关文件：
 
 | 文件 | 作用 |
 |---|---|
-| `scripts/tls_relay.py` | TLS 终结 + 转发（8443 → 8000） |
+| `/etc/systemd/system/wdnwebui.service` | 主服务单元（带 `--ssl-certfile` / `--ssl-keyfile`） |
 | `scripts/gen_tls_ca.sh` | **私有 CA** + 签发服务端证书（本文档用的就是它） |
 | `scripts/gen_tls_cert.sh` | 另一条路：直接自签一张叶子证书（要点「继续前往」） |
-| `scripts/verify_tls_scheme.py` | 回归：scheme 必须传给后端 + 请求体不能被搞坏 |
-| `/etc/systemd/system/wdnwebui-tls-relay.service` | relay 的 systemd 单元（开机自启） |
+| `scripts/verify_tls_scheme.py` | 回归：转发头 scheme 处理 + 请求体不被搞坏 |
+| `scripts/verify_run_py_tls_guard.py` | 回归：`run.py` 不许在 8000 上以明文启动 |
+| `/etc/systemd/system/wdnwebui-cert-check.{service,timer}` | 证书存在性 / 有效期每日巡检 |
 
 ## 证书在哪
 
@@ -113,11 +122,11 @@ openssl verify -CAfile ca.pem /home/rockchip/.config/wdnwebui/tls/cert.pem
 
 # HTTPS 能不能通（不加 -k，不加 --cacert —— 说明系统信任库已经认它）
 curl -sS -o /dev/null -w "%{http_code} tls_verify=%{ssl_verify_result}\n" \
-     https://172.16.9.65:8443/
+     https://172.16.9.65:8000/
 #   期望：200 tls_verify=0
 ```
 
-浏览器打开 `https://172.16.9.65:8443/` —— **地址栏不该再出现「不是私密连接」**，
+浏览器打开 `https://172.16.9.65:8000/` —— **地址栏不该再出现「不是私密连接」**，
 然后进「流式语音识别」→ 选「浏览器麦克风」→ 点「开始实时识别」。
 
 ## 板子上已经装好的部分
@@ -127,8 +136,15 @@ curl -sS -o /dev/null -w "%{http_code} tls_verify=%{ssl_verify_result}\n" \
 | 位置 | 内容 |
 |---|---|
 | `/usr/local/share/ca-certificates/wdnwebui-local-ca.crt` | CA 根（`update-ca-certificates` 已跑过）→ `curl` / Python / Firefox 都认 |
-| `~/.pki/nssdb` | CA 根（NSS）→ 本机的 Chromium 认 |
-| `wdnwebui-tls-relay.service` | relay（`enabled`，开机自启） |
+| `~/.pki/nssdb` | CA 根（NSS）→ 本机的 Chromium 认（**Playwright 的浏览器页也认**） |
+| `wdnwebui.service` | 主服务（`--ssl-certfile` / `--ssl-keyfile`，开机自启） |
+| `wdnwebui-cert-check.timer` | 证书存在性 / 有效期每日巡检 |
+
+> ⚠️ **Playwright 的 `page.request`（APIRequestContext）走 Node.js 的 TLS 栈**，
+> **既不读 NSS 也不读系统信任库** ⇒ 会报
+> `unable to verify the first certificate`。需要它的脚本必须设
+> `NODE_EXTRA_CA_CERTS=/home/rockchip/.config/wdnwebui/tls/ca.pem`
+> （`scripts/verify_plugin_cards.py` 已经这么做了）。
 
 ## 续签 / 换 IP
 
@@ -137,13 +153,18 @@ curl -sS -o /dev/null -w "%{http_code} tls_verify=%{ssl_verify_result}\n" \
 ```bash
 # 重签（保留 CA）
 bash scripts/gen_tls_ca.sh 172.16.9.65 --force-leaf
-sudo systemctl restart wdnwebui-tls-relay.service
+sudo systemctl restart wdnwebui.service
 ```
+
+> ⚠️ 现在 8000 就是 TLS 端口，**重签后必须重启主服务**（不再是只重启 relay）。
+> 证书文件缺失时主服务**不会启动**（`ConditionPathExists`）—— 应急恢复走 SSH：
+> `bash scripts/gen_tls_ca.sh <IP> --force-leaf && sudo systemctl restart wdnwebui`。
 
 换 IP 时把新 IP 加进 SAN 再重签：
 
 ```bash
 bash scripts/gen_tls_ca.sh <新IP> --force-leaf
+sudo systemctl restart wdnwebui.service
 ```
 
 ## 排查
@@ -152,13 +173,15 @@ bash scripts/gen_tls_ca.sh <新IP> --force-leaf
 |---|---|
 | 浏览器还报「不是私密连接」 | CA 没装进**这个浏览器**用的那个库（Chrome 读 NSS，不读系统库） |
 | `ERR_CERT_AUTHORITY_INVALID` | 同上；或证书过期（`openssl x509 -enddate` 看） |
-| `ERR_CERT_COMMON_NAME_INVALID` | 访问地址不在 SAN 里 → 用 `https://172.16.9.65:8443`（SAN 含 IP + `debian` + `localhost`） |
-| 页面能开但 `Failed to fetch` | 后端没收到 `X-Forwarded-Proto` → 跑 `python -m scripts.verify_tls_scheme` 查 |
-| 8443 连不上 | `systemctl status wdnwebui-tls-relay`；证书不在 → `bash scripts/gen_tls_ca.sh` |
-| 麦克风还是打不开 | 看浏览器控制台；**必须**是 `https://` 或 `localhost` |
+| `ERR_CERT_COMMON_NAME_INVALID` | 访问地址不在 SAN 里 → 用 `https://172.16.9.65:8000`（SAN 含 IP + `debian` + `localhost` + `127.0.0.1`） |
+| **服务整个起不来**（8000 连不上） | 证书缺失 / 私钥不可读 → `ConditionPathExists` 挡住了启动。查 `journalctl -u wdnwebui` 与 `ls -l /home/rockchip/.config/wdnwebui/tls/` |
+| `curl` 报 exit=52（Empty reply） | 用明文 http 访问了 8000 —— 8000 **只说 HTTPS** |
+| 页面能开但 `Failed to fetch` | 查 `curl -sSI https://127.0.0.1:8000/api/tts \| grep -i location` 是否为 `https://` |
+| 麦克风还是打不开 | 看浏览器控制台；**必须**是 `https://`（`http://localhost` 在非回环地址上不算） |
 
 ```bash
-systemctl status wdnwebui-tls-relay.service
-sudo journalctl -u wdnwebui-tls-relay.service -n 50
-sudo ss -ltnp | grep 8443
+systemctl status wdnwebui.service
+sudo journalctl -u wdnwebui.service -n 50
+sudo ss -ltnp | grep 8000
+systemctl list-timers wdnwebui-cert-check.timer
 ```

@@ -29,12 +29,28 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 from pathlib import Path
 
+# 8000 已是原生 TLS（uvicorn --ssl-certfile）。
+#
+# ⚠️ **Playwright 的两套 TLS 栈不一样**：
+#   * 浏览器页（page.goto）走 **Chromium**，读 ``~/.pki/nssdb`` 共享库 ⇒ 认板子 CA
+#   * APIRequestContext（ctx.request）走 **Node.js**，读 Node 自带的 CA bundle
+#     ⇒ **不认**板子的私有 CA ⇒ "unable to verify the first certificate"
+#
+# 本脚本用 ``ctx.request.delete(...)`` 清 active-app（避免 boot-restore 跳卡），
+# 正好落在 Node 那一侧 ⇒ 必须给 Node 也塞 CA。**必须在 Node 进程起来之前设**
+# —— Playwright 的驱动是 ``sync_playwright()`` 启动时 spawn 的，模块导入期设
+# 一次就够了。
+os.environ.setdefault(
+    "NODE_EXTRA_CA_CERTS",
+    "/home/rockchip/.config/wdnwebui/tls/ca.pem")
+
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 CARD = "image-editor"
 DEFAULT_SOURCE = "/home/rockchip/assets/media_generator/runs/022a16e93794/img01.png"
 

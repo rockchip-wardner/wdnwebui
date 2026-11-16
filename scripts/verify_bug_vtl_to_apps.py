@@ -15,7 +15,7 @@ def main():
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
         print("\n=== 1. 加载首页 ===")
-        page.goto("http://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
+        page.goto("https://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
 
         # 清掉 wizard localStorage,确保纯净测试
         page.evaluate("Object.keys(localStorage).filter(k => k.includes('wizard')).forEach(k => localStorage.removeItem(k))")
@@ -34,7 +34,7 @@ def main():
         print(f"  _activeApp = {active_before!r}")
 
         print("\n=== 3. 进入 视频目标定位 ===")
-        page.goto("http://127.0.0.1:8000/#video-target-localization", wait_until="domcontentloaded", timeout=15000)
+        page.goto("https://127.0.0.1:8000/#video-target-localization", wait_until="domcontentloaded", timeout=15000)
         page.wait_for_selector(".wd-wizard-section", timeout=8000)
         print("  ✅ wizard mounted")
 

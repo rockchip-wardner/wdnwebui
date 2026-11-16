@@ -20,7 +20,7 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = "http://localhost:8000"
+BASE = "https://localhost:8000"
 API = f"{BASE}/api/video-target-localization"
 # 竖屏 576x1280：长边正好 1280，放大档能吃满 720p 的像素量（737k px，
 # 与横屏 1280x720 的 921k px 同量级），本机没有横屏大素材。

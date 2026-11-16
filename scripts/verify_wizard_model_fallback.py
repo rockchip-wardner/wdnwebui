@@ -51,7 +51,7 @@ if str(ROOT) not in sys.path:
 
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 CARD = "text-chat"
 CAP = "swcap_text_chat"
 

@@ -40,7 +40,7 @@ from card_dirs import card_dir  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CORE = REPO / "app" / "static" / "core"
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 
 #: 浮层 → 必须压在画面之上的选择器
 OVERLAYS = (".vd-overlay", ".vd-event-badge")

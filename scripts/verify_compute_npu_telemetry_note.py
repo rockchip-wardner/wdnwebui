@@ -28,7 +28,7 @@ import os
 import sys
 from pathlib import Path
 
-BASE = os.environ.get("WDNAWEBUI_BASE", "http://127.0.0.1:8000")
+BASE = os.environ.get("WDNAWEBUI_BASE", "https://127.0.0.1:8000")
 
 PASS = 0
 FAIL = 0

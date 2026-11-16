@@ -21,7 +21,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-BASE = "http://localhost:8000"
+BASE = "https://localhost:8000"
 # 素材在**插件包里**（卡片已迁出仓库），路径问解析器，别硬编码。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from card_dirs import card_dir  # noqa: E402

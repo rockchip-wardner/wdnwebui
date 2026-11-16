@@ -19,7 +19,7 @@ import sys
 
 from playwright.async_api import async_playwright
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 NS = "wd-wizard-"
 
 CASES = [

@@ -28,7 +28,7 @@ task**：客户端每次断开都漏一个 handler，而 uvicorn 关停时要等
 用法::
 
     .venv/bin/python scripts/verify_ws_disconnect.py
-    .venv/bin/python scripts/verify_ws_disconnect.py --base http://127.0.0.1:8000
+    .venv/bin/python scripts/verify_ws_disconnect.py --base https://127.0.0.1:8000
 """
 
 from __future__ import annotations
@@ -46,6 +46,23 @@ from datetime import datetime
 
 import requests
 import websockets
+
+# 8000 已是原生 TLS（uvicorn --ssl-certfile）。
+#
+# ⚠️ ``requests`` 用自带的 **certifi** bundle，**不读**系统信任库 ⇒ 板子的
+# 私有 CA 会被判为不受信任（SSLCertVerificationError）。实测：
+#   requests 默认              -> FAIL SSLError ... SSLCertVerificationError
+#   requests + REQUESTS_CA_BUNDLE -> 200
+#
+# ``REQUESTS_CA_BUNDLE`` 让 requests 改用板子的 CA 文件（系统信任库里装的
+# 是同一个根证书 wdnwebui Local CA）。requests 在**每次请求**时读这个环境
+# 变量（Session.merge_environment_settings），所以模块导入时设一次就够。
+# 用 setdefault：外部显式指定时不覆盖。
+#
+# 注意：这会**替换** certifi 的 bundle（只用于访问本板够用）。
+os.environ.setdefault(
+    "REQUESTS_CA_BUNDLE",
+    "/home/rockchip/.config/wdnwebui/tls/ca.pem")
 
 # 端点 → (服务端关闭标志的正则, 是否伴随子进程需要清理)
 ENDPOINTS = {
@@ -97,8 +114,21 @@ async def _first_frame(ws) -> None:
         pass
 
 
+def _ws_url(base: str, path: str) -> str:
+    """把 base 的 scheme 映射成对应的 WebSocket scheme。
+
+    ⚠️ 8000 已改为 uvicorn 原生 TLS ⇒ base 是 ``https://`` ⇒ WS 必须用
+    ``wss://``。原来 base 是 ``http://`` 时才用 ``ws://`` —— 写死 ws:// 会
+    拿明文去连 TLS 端口，服务端直接断开，握手报
+    "did not receive a valid HTTP response"。
+    """
+    scheme, _, rest = base.partition("://")
+    ws_scheme = "wss" if scheme.lower() == "https" else "ws"
+    return "%s://%s%s" % (ws_scheme, rest, path)
+
+
 async def _close_normal(base: str, path: str) -> None:
-    url = "ws://" + base.split("://", 1)[-1] + path
+    url = _ws_url(base, path)
     async with websockets.connect(url, open_timeout=15) as ws:
         try:
             await _first_frame(ws)
@@ -120,7 +150,7 @@ async def _close_via_relay(path: str) -> None:
 
 def _close_sigkill(base: str, path: str) -> None:
     """Connect from a child process, then SIGKILL it (no close frame)."""
-    url = "ws://" + base.split("://", 1)[-1] + path
+    url = _ws_url(base, path)
     code = (
         "import asyncio,websockets\n"
         "async def m():\n"
@@ -138,7 +168,7 @@ def _close_sigkill(base: str, path: str) -> None:
 # --------------------------------------------------------------------------- #
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="http://127.0.0.1:8000")
+    ap.add_argument("--base", default="https://127.0.0.1:8000")
     ap.add_argument("--wait", type=float, default=6.0,
                     help="seconds to wait after the disconnect before judging")
     args = ap.parse_args(argv)
@@ -151,7 +181,11 @@ def main(argv=None) -> int:
         return 2
 
     have_relay = relay_available()
-    print("服务: %s    TLS relay(8443): %s" % (base, "有" if have_relay else "无（跳过 relay 用例）"))
+    # 8443 的 TLS relay 已于 2026-11-16 退役（8000 直接由 uvicorn 提供 TLS），
+    # 「经 relay 断开」这个场景不再存在 → 该用例自动跳过。
+    print("服务: %s    TLS relay(8443): %s"
+          % (base, "有" if have_relay
+             else "无（relay 已退役，跳过 relay 用例）"))
     print()
 
     total = failed = skipped = 0

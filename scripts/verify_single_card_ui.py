@@ -17,7 +17,7 @@ import sys
 
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 NS = "wd-wizard-"
 
 PASS, FAIL = 0, 0

@@ -66,7 +66,7 @@ def run(exe: str) -> None:
         page.on("console", lambda m: print(f"  [console.{m.type}] {m.text}"))
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
-        page.goto("http://localhost:8000", wait_until="networkidle", timeout=15000)
+        page.goto("https://localhost:8000", wait_until="networkidle", timeout=15000)
         page.wait_for_function(
             "() => window.__APP_MANIFESTS__ && window.ROUTER",
             timeout=10000,

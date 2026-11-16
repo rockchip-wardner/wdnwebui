@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BASE = os.environ.get("WDNWEBUI_BASE", "http://127.0.0.1:8000")
+BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000")
 VIDEO = os.environ.get("WDNWEBUI_TEST_VIDEO",
                        "/home/rockchip/samples/data/1.mp4")
 APP_ID = "video-detection"

@@ -49,7 +49,7 @@ def main():
         print("=" * 60)
         print(" 0. clean + 模拟 completed wizard 状态")
         print("=" * 60)
-        page.goto("http://127.0.0.1:8000/", wait_until="domcontentloaded",
+        page.goto("https://127.0.0.1:8000/", wait_until="domcontentloaded",
                   timeout=15000)
 
         # 把 wizard 的 localStorage 灌成"已完成的 wizard"状态
@@ -74,7 +74,7 @@ def main():
         page.wait_for_timeout(500)
 
         # 先访问 vtd 一次让 framework 加载它的 JS。
-        page.goto("http://127.0.0.1:8000/#video-target-detection",
+        page.goto("https://127.0.0.1:8000/#video-target-detection",
                   wait_until="domcontentloaded", timeout=15000)
         page.wait_for_timeout(2500)
         dump("after first vtd entry")

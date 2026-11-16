@@ -30,7 +30,7 @@ import json
 import sys
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 APP = "video-detection"
 
 # 两张卡都跑 qwen3-vl-4b —— 复现用户场景

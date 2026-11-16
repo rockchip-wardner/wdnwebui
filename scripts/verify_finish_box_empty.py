@@ -13,7 +13,7 @@ def main():
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
-        page.goto("http://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
+        page.goto("https://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
         page.evaluate("Object.keys(localStorage).filter(k => k.includes('wizard')).forEach(k => localStorage.removeItem(k))")
         page.evaluate("try { window.WizardState.unmount(); } catch(_) {}")
 

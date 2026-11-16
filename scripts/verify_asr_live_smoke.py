@@ -29,16 +29,30 @@ VAD、语言头拆解……），跑一次要几分钟，而且需要浏览器�
 用法::
 
     .venv/bin/python scripts/verify_asr_live_smoke.py
-    .venv/bin/python scripts/verify_asr_live_smoke.py --base http://127.0.0.1:8000
+    .venv/bin/python scripts/verify_asr_live_smoke.py --base https://127.0.0.1:8000
 """
 
 import argparse
 import json
+import os
 import sys
 import wave
 from pathlib import Path
 
 import requests
+
+# 8000 已是原生 TLS（uvicorn --ssl-certfile）。
+#
+# ⚠️ ``requests`` 用自带的 **certifi** bundle，**不读**系统信任库 ⇒ 板子的
+# 私有 CA 会被判为不受信任（SSLCertVerificationError）。实测：
+#   requests 默认              -> FAIL SSLError ... SSLCertVerificationError
+#   requests + REQUESTS_CA_BUNDLE -> 200
+#
+# requests 在**每次请求**时读这个环境变量（Session.merge_environment_settings），
+# 所以模块导入时设一次就够。用 setdefault：外部显式指定时不覆盖。
+os.environ.setdefault(
+    "REQUESTS_CA_BUNDLE",
+    "/home/rockchip/.config/wdnwebui/tls/ca.pem")
 
 WAV = Path("/tmp/asr_ref/asr_16k_mono_s16.wav")
 CHUNK_MS = 500
@@ -70,7 +84,7 @@ class Checker:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="http://127.0.0.1:8000")
+    ap.add_argument("--base", default="https://127.0.0.1:8000")
     args = ap.parse_args(argv)
     base = args.base.rstrip("/")
     ck = Checker()

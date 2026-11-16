@@ -55,7 +55,7 @@ except Exception as exc:  # noqa: BLE001
     print(f"[SKIP] playwright 不可用: {exc}")
     sys.exit(0)
 
-BASE = os.environ.get("WDNWEBUI_BASE", "http://127.0.0.1:8000")
+BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000")
 APP = "qwen3-asr"
 NS = "wd-wizard-"
 

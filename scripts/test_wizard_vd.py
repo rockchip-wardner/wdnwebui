@@ -12,7 +12,7 @@ import sys
 import time
 from playwright.sync_api import sync_playwright, expect
 
-URL = "http://127.0.0.1:8000/#video-detection"
+URL = "https://127.0.0.1:8000/#video-detection"
 
 
 def fail(msg):

@@ -1,10 +1,10 @@
 [English](README.md) | [简体中文](README_CN.md)
 # wdnwebui
 
-一个 Python web 服务，通过 FastAPI 以 HTTP 方式对外暴露 Rockchip 平台 SDK
+一个 Python web 服务，通过 FastAPI 以 HTTPS 方式对外暴露 Rockchip 平台 SDK
 （[`wdnav`](https://github.com/rockchip-wardner/wdnav) —— MPP / RGA2 / V4L2 视频，
 [`wdnai`](https://github.com/rockchip-wardner/wdnai) —— RKNN LLM / VLM）。
-单页 UI 在 `http://<host>:8000/`，四个板块：系统监控、视频检测、系统日志、
+单页 UI 在 `https://<host>:8000/`，四个板块：系统监控、视频检测、系统日志、
 电源控制（关机 / 重启）。
 
 ## 环境要求
@@ -176,36 +176,53 @@ wdndds 的 `.so`，到那一步已经做完了）。每条报出来的依赖都�
 开发模式（Python 改动自动重载）：
 
 ```bash
-python run.py
-# → Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+# 8000 只提供 HTTPS ⇒ 开发模式也必须带 TLS 参数。
+python run.py \
+  --ssl-certfile /home/rockchip/.config/wdnwebui/tls/cert.pem \
+  --ssl-keyfile  /home/rockchip/.config/wdnwebui/tls/key.pem
+# → Uvicorn running on https://0.0.0.0:8000 (Press CTRL+C to quit)
+```
+
+`run.py` **拒绝**在 8000 上以明文启动 —— 它默认会杀掉占着 8000 的旧实例再接管，
+明文启动等于把生产的 HTTPS 入口换成明文。本地调试要明文就换端口：
+
+```bash
+python run.py --port 8001        # 其它端口允许明文
 ```
 
 电源控制要真正能用，得用 sudo 跑（shutdown / reboot 系统调用需要 root）：
 
 ```bash
-sudo .venv/bin/python run.py
+sudo .venv/bin/python run.py --port 8001
 ```
 
 生产方式（不自动重载，单 worker）：
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 \
+  --ssl-certfile /home/rockchip/.config/wdnwebui/tls/cert.pem \
+  --ssl-keyfile  /home/rockchip/.config/wdnwebui/tls/key.pem
 ```
+
+> 板子的私有 CA 在 `/home/rockchip/.config/wdnwebui/tls/`（由
+> `scripts/gen_tls_ca.sh` 生成），**不在仓库里** ⇒ 上面写的是绝对路径。
 
 ## 6. 验证
 
 ```bash
-curl http://127.0.0.1:8000/health
+# 8000 **只提供 HTTPS**（uvicorn 原生 TLS）。板子的私有 CA 已在系统信任库里，
+# 所以 curl 直接就能验签通过，不需要 --cacert。
+curl https://127.0.0.1:8000/health
 # {"status":"ok"}
 
-curl http://127.0.0.1:8000/api/power
+curl https://127.0.0.1:8000/api/power
 # {"uptime_seconds": ..., "uptime_human": "...", "is_root": true}
 ```
 
 `is_root` 是 `false` 的话，Web UI 顶部会挂一条黄色警告横幅 —— 用 sudo 重启之前，
 电源操作是禁用的。
 
-浏览器打开 `http://<host>:8000/` 看完整 UI。开发模式下静态资源带
+浏览器打开 `https://<host>:8000/` 看完整 UI。开发模式下静态资源带
 `Cache-Control: no-cache`，改完 JS / CSS 硬刷新就能看到，不用重启。
 
 ## 接口一览

@@ -40,7 +40,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "app" / "static" / "index.html.template"
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 
 _CARD_SLOT_RE = re.compile(r'\{%\s*card_slot\s+"([^"]+)"\s*%\}')
 
