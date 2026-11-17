@@ -243,10 +243,24 @@ def _score_hits(qvec: np.ndarray, index: List[dict], sim_threshold: float,
 
 
 
+def _fit_output_size(src_w: int, src_h: int,
+                     win_w: int, win_h: int) -> Optional[tuple]:
+    """按源宽高比适配到窗口尺寸（contain），且**不放大**。
+
+    ``win_w`` / ``win_h`` <= 0 表示客户端没给尺寸（回退源分辨率）。
+    """
+    if src_w <= 0 or src_h <= 0 or win_w <= 0 or win_h <= 0:
+        return None
+    scale = min(win_w / src_w, win_h / src_h, 1.0)
+    return max(2, int(round(src_w * scale))), max(2, int(round(src_h * scale)))
+
+
 def iter_segment_jpeg(source: str, start_s: float, end_s: float,
                       max_frames: int = 600, paced: bool = False,
                       fallback_fps: float = 25.0,
-                      pause_event=None) -> Iterator[bytes]:
+                      pause_event=None,
+                      out_size_provider: Optional[Callable[[], Optional[tuple]]] = None
+                      ) -> Iterator[bytes]:
     """按播放顺序生成 [start_s, end_s) 区间内每一帧的 JPEG bytes。
 
     PyAV 打开一次容器，seek 到 start_s 附近 keyframe 后顺序 decode 到
@@ -261,6 +275,10 @@ def iter_segment_jpeg(source: str, start_s: float, end_s: float,
     节流每帧前检查，若被 clear 则阻塞等待；唤醒后**重置时钟基准**
     （按首帧重新对齐）—— 否则 ``next_t`` 落后"暂停时长"，恢复播放时
     会连续不 sleep 补帧（burst）。
+
+    ``out_size_provider``（可选）每帧返回 ``(win_w, win_h)``：按源宽高比
+    contain 到窗口尺寸后再编码（**不放大**）。客户端窗口尺寸会变，所以
+    每帧都问一次，而不是启动时算死。
     """
     import av
     import cv2
@@ -298,6 +316,17 @@ def iter_segment_jpeg(source: str, start_s: float, end_s: float,
             if sent >= max_frames:
                 break
             bgr = frame.to_ndarray(format="bgr24")
+            if out_size_provider is not None:
+                try:
+                    win = out_size_provider()
+                except Exception:  # noqa: BLE001
+                    win = None
+                if win:
+                    out_size = _fit_output_size(
+                        bgr.shape[1], bgr.shape[0], int(win[0]), int(win[1]))
+                    if out_size and out_size != (bgr.shape[1], bgr.shape[0]):
+                        bgr = cv2.resize(
+                            bgr, out_size, interpolation=cv2.INTER_AREA)
             ok, buf = cv2.imencode(
                 ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
             )

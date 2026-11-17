@@ -8143,6 +8143,43 @@ RIFF header by hand.
   长视频（>1h，按「有效帧上限 4 / 重叠 1 帧」≈ 900~1200 片 × 2048 维 fp32
   ≈ 10MB 向量）可忽略。播放走 PyAV 顺序解码，不占 NPU。
 
+### 回放：队列丢帧 + 按窗口尺寸编码（2026-11-17）
+
+**现象**：播放 1080p 长片段时服务端日志暴涨到几百 MB，内容是
+`[ERROR] asyncio: Exception in callback <bound method Queue.put_nowait ...
+_queue=[b'\xff\xd8...']>`，播放和其它接口一起卡死。
+
+**根因**（`video_retrieval/api.py::vr_play_ws`）：旧写法
+`loop.call_soon_threadsafe(main_q.put_nowait, jpeg)` 把 `put_nowait` 的
+`QueueFull` 抛在**事件循环回调**里，外层 `try/except` 接不住；
+`asyncio` 默认异常处理器把 `<Queue ... _queue=[...]>` 的 repr 整段写日志
+（16 槽 × 320KB ≈ 5MB/条），25fps 下几十秒就是 665MB，事件循环被日志 I/O
+拖死。
+
+**两条修法（缺一不可）**：
+1. **入队自己吞 `QueueFull`**：`_enqueue_latest()` 在事件循环内执行，
+   满了就 `get_nowait()` 丢最旧、保最新；`_push_bytes` / `_push_json` 都走它。
+   eof/error 终态 JSON 同样入队（丢一条旧帧，不会丢终态）。
+2. **日志护栏**（`app/core/log_guard.py::install_log_guard`）：任何单条
+   日志 > 16KB 截断，并对每个 `(pathname, lineno)` 只提示一次来源；
+   `websockets` logger 压到 WARNING。防止其它库/回调再打大对象。
+
+**按播放窗口尺寸编码**：浏览器 `#vr-canvas` 的像素尺寸 =
+`.vd-stage` 的 clientWidth × clientHeight（16:9；1600 宽窗口约 966×543，
+1920 宽约 1286×724），不是固定 960×540。`/play` 首条 JSON 带
+`width/height`，播放中 resize 发 `{"action":"resize",...}`；服务端
+`_fit_output_size()` 按源宽高比 contain 到窗口并**不放大**（窗口比源大时
+用源分辨率），再 `cv2.resize(INTER_AREA)` + JPEG。1080p 单帧约 310KB →
+720p 约 120~140KB、540p 约 65~80KB，队列压力同步下降。
+
+**长片段截断**：旧 `iter_segment_jpeg` 默认 `max_frames=600`（25fps 只播
+24s），39s 的命中会被截断且前端进度按 39s 计。现在 `vr_play_ws` 传
+`PLAY_MAX_FRAMES=3000`（≈120s），由 `end_time` 正常截止；前端
+`VR.seg.totalFrames` 也按同口径封顶。
+
+回归：`python -m scripts.verify_vr_play_queue`（入队/终态/尺寸/日志截断/
+真实帧尺寸，13 项，不占 NPU）。
+
 ### 图片检索
 
 `POST /query_batch` 接受每组 `image_path`（绝对路径）—— 图片、
