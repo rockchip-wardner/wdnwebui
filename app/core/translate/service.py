@@ -267,8 +267,10 @@ class TranslateService:
             "failed": failed,
             "elapsed_ms": elapsed_ms,
             "elapsed_s": round(elapsed_ms / 1000.0, 2),
+            # ⚠️ 用 SDK 算好的**主吞吐**（有解码 token 用解码速率，没有就用
+            # 预填充速率）—— 别在这儿自己另算一套。
             "tokens_per_second": round(
-                float(perf_final.get("decode_tokens_per_second") or 0.0), 1),
+                float(perf_final.get("tokens_per_second") or 0.0), 1),
             "perf": perf_final,
         }
         return results, stats

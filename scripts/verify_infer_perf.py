@@ -1,39 +1,56 @@
 #!/usr/bin/env python3
-"""翻译「推理性能」自检 —— 总时间与 tokens/s 是不是真的从板子上透出来了。
+"""推理性能透出自检 —— 总时间与 tokens/s 是不是真的从板子上透出来了。
 
 背景
 ----
-网页翻译卡的「试一下」那一行右边要显示**总耗时**和 **tokens/s**。这两个数
-**不能在前端估**：估出来的数字只是装饰，用户拿它判断「这块板子快不快」
-就会被误导。
+两张卡都要显示「这次推理花了多久、多少 tokens/s」：
+
+* **网页翻译** —— 「自动检测 翻译成 xxx」那一行右边；
+* **图文内容审查** —— 「开始审查」按钮右边。
+
+这两个数**不能在前端估**：估出来的数字只是装饰，用户拿它判断「这块板子
+快不快」就会被误导。⚠️ 而且**前端不许计时**（用户明确要求）—— 计时与
+换算全在后端做完再发过去。
 
 真实的数据链路（**四段**，缺一段数字就是假的）::
 
-    SDK backend                DDS wire              宿主 provider        卡片前端
-    session._backend          worker: reply["perf"]  TranslationResult    #wt-test-perf
-      .sink.perf           →    client: last_perf  →  .perf           →   总耗时 / tok/s
-      (worker 进程内)            (过 wire 过来)          (stats.perf)
+    SDK backend                DDS wire              宿主/插件            卡片前端
+    backend.perf             worker: reply["perf"]  .perf / stats      #wt-test-perf
+      (或 sink.perf)           (过 wire 过来)          tokens_per_second  #cr-perf
+      (worker 进程内)
 
 为什么必须过 wire
 ------------------
-perf sink 住在 **worker 进程**里（``session._backend.sink.perf``），而宿主
-Web UI 进程拿到的是 ``LLMRPCSession`` 代理，**够不着那个 sink** ⇒ worker
-必须显式把数字放进 reply，client 再收进 ``session.last_perf``。
+perf 住在 **worker 进程**里（``session._backend.sink.perf`` 或
+``backend.perf``），而 Web UI 进程拿到的是 ``LLMRPCSession`` 代理，
+**够不着** ⇒ worker 必须显式把数字放进 reply，client 再收进
+``session.last_perf``。
 
-⚠️ **只带数字**：sink 里可能有别的类型，JSON 编不过去 ⇒ **推理成功了但
-调用方收到传输错误**。这是最坑的一种失败，所以本脚本专门断言「非数字
+⚠️ **只带数字**：perf 里可能有别的类型，JSON 编不过去 ⇒ **推理成功了
+但调用方收到传输错误**。这是最坑的一种失败，所以本脚本专门断言「非数字
 字段被丢掉、且不会炸」。
+
+两种 backend
+------------
+* **通用 LLM**（翻译用的 HY-MT）：``backend.sink.perf`` —— 有解码 token，
+  吞吐 = **解码速率**。
+* **决策模型**（Intern-Decision）：**没有** ``StreamSink``（它只收
+  logits）⇒ 自己记 ``backend.perf``。而且它每个字段跑一次
+  ``max_new_tokens=1`` 的 **prefill-only** 推理 ⇒ 解码 token 恒为 0 ⇒
+  吞吐 = **预填充速率**（提示词处理速度）。
 
 本脚本**抠真代码**跑（不复读、不复刻）：
 * ``wdndds.ai_session`` 的 ``_read_perf`` / ``LLMRPCSession._decode_reply``；
+* ``wdnai`` 的 ``perf_table`` 与决策 backend 的 ``_record_perf``；
 * ``app.core.translate.base.TranslationResult``；
 * ``app.core.translate.npu_provider`` 的 ``_session_perf`` / ``_merge_perf``；
 * ``app.core.translate.service.TranslateService``（用假 provider 驱动）；
-* 卡片 ``app.js`` 的 ``_renderPerf`` / ``_clearPerf``（dukpy + DOM stub）。
+* 插件 ``content_review.service`` 的 ``_perf_table``；
+* 两张卡的 ``app.js``（dukpy + DOM stub）。
 
 用法::
 
-    .venv/bin/python scripts/verify_translate_perf.py
+    .venv/bin/python scripts/verify_infer_perf.py
 """
 from __future__ import annotations
 
@@ -548,18 +565,182 @@ def test_template_layout() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [8] 图文内容审查：同一条链路，但 backend 不一样
+# --------------------------------------------------------------------------- #
+REVIEW_CARD = os.path.join(REPO, ".venv/src/wdnapps_audio_chat/src/wdnapps_audio_chat"
+                               "/cards/content_review")
+REVIEW_APP_JS = os.path.join(REVIEW_CARD, "static/app.js")
+REVIEW_TEMPLATE = os.path.join(REVIEW_CARD, "static/template.html")
+REVIEW_CSS = os.path.join(REVIEW_CARD, "static/app.css")
+
+
+def test_decision_backend_perf() -> None:
+    print("\n[8] 决策模型 backend：自己记性能表（它没有 StreamSink）")
+    from wdnai.backends.intern_decision import InternDecisionBackend
+
+    class _Fake:
+        # ⚠️ **每个实例一份**（写成类属性的话两个实例会共用同一个 dict，
+        # 累加断言就会互相污染）
+        def __init__(self):
+            self._perf: dict = {}
+
+    fake = _Fake()
+    # ⚠️ session_run 返回 (n_decode, n_prefill, llm_start, llm_end)
+    InternDecisionBackend._record_perf(fake, (0, 120, 100.0, 100.4), 500.0)
+    check("记下了预填充 token 数",
+          fake._perf.get("n_prefill_tokens") == 120, str(fake._perf))
+    check("用 C 侧的墙钟锚点算耗时",
+          abs(fake._perf.get("prefill_ms", 0) - 400.0) < 1e-6, str(fake._perf))
+
+    # 第二个字段 ⇒ **累加**（每个字段跑一次推理）
+    InternDecisionBackend._record_perf(fake, (0, 80, 200.0, 200.2), 500.0)
+    check("多个字段的 token 是累加的",
+          fake._perf.get("n_prefill_tokens") == 200, str(fake._perf))
+    check("多个字段的耗时也是累加的",
+          abs(fake._perf.get("prefill_ms", 0) - 600.0) < 1e-6, str(fake._perf))
+
+    # ⚠️ **prefill-only ⇒ 解码 token 恒为 0** ⇒ 吞吐走预填充速率
+    from wdnai import perf_table
+    t = perf_table(fake._perf)
+    check("prefill-only 的主吞吐 = 预填充速率",
+          abs(t["tokens_per_second"] - 200 / 0.6) < 1e-6, str(t))
+    check("解码速率是 0（它压根不解码）",
+          t["decode_tokens_per_second"] == 0.0, str(t))
+
+    # 墙钟退路：C 侧锚点缺失时用 Python 侧的墙钟
+    fake2 = _Fake()
+    InternDecisionBackend._record_perf(fake2, None, 250.0)
+    check("锚点缺失时用墙钟退路",
+          abs(fake2._perf.get("prefill_ms", 0) - 250.0) < 1e-6, str(fake2._perf))
+
+
+def test_worker_reads_backend_perf() -> None:
+    print("\n[9] worker 侧：backend.perf 也要读得到（决策模型没有 sink）")
+    from wdndds.ai_session import _read_perf
+
+    class _Backend:
+        # ⚠️ **没有 sink** —— 决策模型就是这种
+        perf = {"n_prefill_tokens": 120.0, "prefill_ms": 400.0}
+
+    class _Session:
+        _backend = _Backend()
+
+    got = _read_perf(_Session())
+    check("读到了 backend.perf",
+          got.get("n_prefill_tokens") == 120.0, str(got))
+    check("耗时也读到了",
+          abs(got.get("prefill_ms", 0) - 400.0) < 1e-6, str(got))
+
+
+def test_review_service_perf() -> None:
+    print("\n[10] 审查 service：把 perf 算好再发给前端")
+    from wdnapps_audio_chat.cards.content_review.service import _perf_table
+
+    class _Session:
+        last_perf = {"n_prefill_tokens": 200.0, "prefill_ms": 600.0}
+
+    t = _perf_table(_Session())
+    check("算出了主吞吐",
+          abs(t.get("tokens_per_second", 0) - 200 / 0.6) < 1e-6, str(t))
+    check("原始计数也在", t.get("n_prefill_tokens") == 200.0, str(t))
+
+    class _Empty:
+        last_perf: dict = {}
+
+    check("没有 perf 时是空字典", _perf_table(_Empty()) == {},
+          str(_perf_table(_Empty())))
+    check("session 是 None 时不炸", _perf_table(None) == {}, "")
+
+
+def test_review_card_render() -> None:
+    print("\n[11] 审查卡前端：按钮右边显示后端算好的数")
+    import dukpy
+
+    src = open(REVIEW_APP_JS, encoding="utf-8").read()
+    fn = _extract_js_function(src, "renderPerf")
+    clear = _extract_js_function(src, "clearPerf")
+    check("app.js 里有 renderPerf", bool(fn), "")
+    check("app.js 里有 clearPerf", bool(clear), "")
+    if not fn or not clear:
+        return
+
+    js = DOM_STUB + "\n" + fn + "\n" + clear + r"""
+const el = document.getElementById("cr-perf");
+renderPerf(el, { elapsed_sec: 9.12, tokens_per_second: 320.5,
+                 perf: { prefill_tokens: 200, prefill_ms: 600,
+                         llm_latency_ms: 600 } });
+JSON.stringify({ text: el.textContent, hidden: el.hidden, title: el.title });
+"""
+    interp = dukpy.JSInterpreter()
+    raw = interp.evaljs(js)
+    got = json.loads(raw if isinstance(raw, str) else str(raw))
+    check("显示了总耗时", "9.12 s" in got["text"], got["text"])
+    check("显示了 tokens/s", "320.5 tok/s" in got["text"], got["text"])
+    check("有标题（悬停细账）", "预填充 200 token" in got["title"], got["title"])
+    check("不是隐藏的", got["hidden"] is False, str(got))
+
+    # ⚠️ **前端不许自己算**
+    check("前端没有用 Date.now() 计时", "Date.now" not in fn, fn[:200])
+    check("前端没有用 performance.now() 计时",
+          "performance.now" not in fn, fn[:200])
+    check("前端没有自己算速率（没碰 prefill_tokens）",
+          "prefill_tokens" not in fn.replace("perf.prefill_tokens", ""),
+          fn[:400])
+    check("前端用的是后端算好的 tokens_per_second",
+          "tokens_per_second" in fn, fn[:400])
+
+    # 没有 perf ⇒ 只显示总耗时
+    js2 = DOM_STUB + "\n" + fn + "\n" + clear + r"""
+const el = document.getElementById("cr-perf");
+renderPerf(el, { elapsed_sec: 9.12, tokens_per_second: 0, perf: {} });
+JSON.stringify({ text: el.textContent, hidden: el.hidden });
+"""
+    interp2 = dukpy.JSInterpreter()
+    raw2 = interp2.evaljs(js2)
+    got2 = json.loads(raw2 if isinstance(raw2, str) else str(raw2))
+    check("无 perf 时仍显示总耗时", "9.12 s" in got2["text"], got2["text"])
+    check("无 perf 时**不编造** tok/s", "tok/s" not in got2["text"], got2["text"])
+
+
+def test_review_template_layout() -> None:
+    print("\n[12] 审查卡模板：计时位在「开始审查」按钮右边")
+    html = open(REVIEW_TEMPLATE, encoding="utf-8").read()
+    css = open(REVIEW_CSS, encoding="utf-8").read()
+
+    check("模板里有 #cr-perf", 'id="cr-perf"' in html, "")
+    check("计时位默认隐藏", 'id="cr-perf" hidden' in html, "")
+
+    m = re.search(r'<div class="cr-run-row">(.*?)</div>', html, re.S)
+    check("找得到 .cr-run-row 那一行", m is not None, "")
+    if m:
+        row = m.group(1)
+        check("计时位在那一行里", 'id="cr-perf"' in row, row[-300:])
+        check("「开始审查」按钮在那一行里", 'id="cr-run-btn"' in row, "")
+        check("计时位在按钮**右边**",
+              row.find('id="cr-perf"') > row.find('id="cr-run-btn"'), "")
+
+    check("CSS 有 .cr-perf 规则", ".cr-perf" in css, "")
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     print("=" * 72)
-    print("翻译「推理性能」自检（总时间 + tokens/s）")
+    print("推理性能透出自检（总时间 + tokens/s）")
     print("=" * 72)
 
     test_worker_read_perf()
     test_client_decode_reply()
     test_translation_result_perf()
+    test_sdk_perf_table()
     test_provider_perf_helpers()
     test_service_stats()
     test_card_perf_render()
     test_template_layout()
+    test_decision_backend_perf()
+    test_worker_reads_backend_perf()
+    test_review_service_perf()
+    test_review_card_render()
+    test_review_template_layout()
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
