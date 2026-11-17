@@ -53,6 +53,122 @@ def check(name: str, cond: bool, extra: str = "") -> None:
         print(f"  FAIL {name} {extra}")
 
 
+# --------------------------------------------------------------------------- #
+# DOM stub —— 把卡片 app.js 原样跑一遍（抠真前端代码，不复刻逻辑）
+# --------------------------------------------------------------------------- #
+DOM_STUB = r"""
+function mkNode(tag) {
+  const classes = new Set();
+  const node = {
+    tagName: tag, textContent: "", style: {}, dataset: {}, innerHTML: "",
+    children: [], hidden: false, checked: false, value: "", type: "",
+    classList: {
+      add: (c) => classes.add(c),
+      remove: (c) => classes.delete(c),
+      contains: (c) => classes.has(c),
+      toggle: (c) => (classes.has(c) ? classes.delete(c) : classes.add(c)),
+    },
+    appendChild(c) { this.children.push(c); return c; },
+    removeChild(c) {
+      const i = this.children.indexOf(c);
+      if (i >= 0) this.children.splice(i, 1);
+      return c;
+    },
+    addEventListener() {},
+    removeEventListener() {},
+    setAttribute() {},
+    getAttribute() { return null; },
+    select() {},
+    querySelectorAll() { return []; },
+  };
+  Object.defineProperty(node, "className", {
+    get: () => Array.from(classes).join(" "),
+    set: (v) => {
+      classes.clear();
+      String(v == null ? "" : v).split(/\s+/)
+        .filter(Boolean).forEach((c) => classes.add(c));
+    },
+  });
+  return node;
+}
+const REG = {};
+globalThis.document = {
+  createElement: mkNode,
+  getElementById: (id) => (REG[id] || (REG[id] = mkNode("div"))),
+  body: mkNode("body"),
+  visibilityState: "visible",
+  execCommand: () => true,
+  querySelectorAll: () => [],
+};
+globalThis.setTimeout = (fn) => { try { fn(); } catch (_) {} return 0; };
+globalThis.setInterval = () => 0;
+globalThis.clearTimeout = () => {};
+globalThis.clearInterval = () => {};
+globalThis.navigator = { clipboard: null, userAgent: "dukpy" };
+globalThis.window = {
+  location: { origin: "http://dukpy", href: "http://dukpy/" },
+  isSecureContext: false,
+  addEventListener() {},
+};
+globalThis.localStorage = {
+  _data: {},
+  getItem(k) { return this._data[k] === undefined ? null : this._data[k]; },
+  setItem(k, v) { this._data[k] = String(v); },
+  removeItem(k) { delete this._data[k]; },
+};
+globalThis.fetch = async () => ({
+  ok: true, status: 200,
+  json: async () => ({
+    enabled: true, model_id: "intern-decision-4b", npu_index: 0,
+    default_npu_index: 0, instance_status: "running", instance_error: "",
+    installed: true, capability: "swcap_decision", max_items: 16,
+    max_text_chars: 4000, detail: "", conflict: "", cards: [],
+  }),
+});
+1;
+"""
+
+#: 取出渲染出来的维度名 / 提示语 / 回写后的 localStorage
+PROBE = r"""
+JSON.stringify({
+  names: ((REG["cr-items"] || {}).children || []).map(
+    (r) => (((r.children || [])[0] || {}).value) || ""
+  ),
+  notice: ((REG["cr-run-note"] || {}).textContent) || "",
+  store: globalThis.localStorage.getItem("wdnwebui.content_review.items"),
+});
+"""
+
+
+def run_card_app_js(seed=None) -> dict:
+    """把卡片 app.js 原样跑一遍（DOM stub + 假 localStorage）。
+
+    ``seed`` = localStorage 里**预先**放好的那条记录：
+      - ``None``  → 模拟「从没用过这张卡的浏览器」
+      - ``list``  → 直接给那条记录的 Python 形态（内部会 JSON 化）
+      - ``str``   → 已经是 JSON 文本，原样塞进去
+
+    ⚠️ localStorage 里存的必须是**字符串**（浏览器就是这么存的）——
+    app.js 拿到后要 ``JSON.parse``，塞数组会 parse 失败然后走「没存过」
+    的分支，看起来就像迁移没生效。
+    """
+    import dukpy
+    src = open(CARD_JS, encoding="utf-8").read()
+    stub = DOM_STUB
+    if seed is not None:
+        text = seed if isinstance(seed, str) else json.dumps(seed, ensure_ascii=False)
+        stub += (
+            'globalThis.localStorage._data["wdnwebui.content_review.items"] = '
+            + json.dumps(text) + ";\n"     # JSON 字符串字面量 = JS 字符串字面量
+        )
+    stub += "1;\n"
+    interp = dukpy.JSInterpreter()
+    interp.evaljs(stub)
+    interp.evaljs(src)
+    raw = interp.evaljs(PROBE)
+    return json.loads(raw if isinstance(raw, str) else str(raw))
+
+
 def main() -> int:
     print("=" * 72)
     print("图文内容审查卡自检")
@@ -293,6 +409,80 @@ def main() -> int:
               str(spec.options.get("keep_vision_resident")))
     except Exception as exc:  # noqa: BLE001
         check("决策模型默认 keep_vision_resident = True", False, repr(exc))
+
+    # ---------------------------------------------------------------- [N] --
+    print("\n[7] 默认维度 + localStorage 增量迁移（真跑 app.js）")
+
+    # 默认维度名（用户能在界面「恢复默认」里看到的那一套）
+    NEW_DEFAULTS = ["广告", "诈骗", "色情低俗", "暴力血腥", "政治", "辱骂", "火星文"]
+    OLD4 = [
+        {"name": "广告", "description": "画面或文字里有推销、引流、优惠信息"},
+        {"name": "诈骗", "description": "涉及转账、冒充、诱导点击等欺诈内容"},
+        {"name": "色情低俗", "description": "露骨或低俗的性相关内容"},
+        {"name": "暴力血腥", "description": "血腥、暴力、伤害相关的画面或描述"},
+    ]
+
+    js_ok = True
+    try:
+        import dukpy  # noqa: F401
+    except Exception:  # noqa: BLE001
+        try:
+            sys.path.append("/tmp/jscheck")
+            import dukpy  # noqa: F401
+        except Exception:  # noqa: BLE001
+            js_ok = False
+
+    if not js_ok:
+        print("  SKIP 缺 dukpy，装上再跑："
+              ".venv/bin/pip install dukpy（前端逻辑项跳过）")
+    else:
+        # [a] 从没用过这张卡的浏览器 ⇒ 全套默认维度
+        r = run_card_app_js(None)
+        names = r["names"]
+        check("新访客拿到 7 个默认维度", len(names) == 7, str(names))
+        check("默认维度含 政治 / 辱骂 / 火星文",
+              all(x in names for x in ("政治", "辱骂", "火星文")), str(names))
+        check("默认维度含原有的 广告 / 诈骗 / 色情低俗 / 暴力血腥",
+              all(x in names for x in ("广告", "诈骗", "色情低俗", "暴力血腥")), str(names))
+
+        # [b] 老访客（浏览器里存的是**旧格式裸数组**）⇒ 补上新增的 3 项
+        r2 = run_card_app_js(json.dumps(OLD4, ensure_ascii=False))
+        n2 = r2["names"]
+        check("老访客自动补齐到 7 项", len(n2) == 7, str(n2))
+        check("老访客原有的 4 项保留在前",
+              n2[:4] == ["广告", "诈骗", "色情低俗", "暴力血腥"], str(n2))
+        check("新增的 3 项追加在后面",
+              n2[4:] == ["政治", "辱骂", "火星文"], str(n2))
+        check("有迁移提示告诉用户默认变了",
+              "政治" in r2["notice"] and "辱骂" in r2["notice"], r2["notice"])
+
+        # [c] 用户自己删掉的旧维度**不复活**（但新增的照样补）
+        r3 = run_card_app_js(json.dumps(OLD4[1:], ensure_ascii=False))
+        n3 = r3["names"]
+        check("用户删掉的默认维度不复活", "广告" not in n3, str(n3))
+        check("用户删掉旧维度后新增的 3 项仍然补上",
+              all(x in n3 for x in ("政治", "辱骂", "火星文")), str(n3))
+
+        # [d] 用户自己加的维度要保住
+        mine = OLD4 + [{"name": "我的自定义", "description": "我自己加的"}]
+        r4 = run_card_app_js(json.dumps(mine, ensure_ascii=False))
+        n4 = r4["names"]
+        check("用户自定义的维度保留",
+              "我的自定义" in n4, str(n4))
+        check("自定义维度不会被默认值挤掉",
+              len(n4) == 8, str(n4))
+
+        # [e] 幂等：拿迁移后写回的数据再跑一次 ⇒ 不重复添加
+        r5 = run_card_app_js(r2["store"] or "")
+        n5 = r5["names"]
+        check("第二次打开不会重复添加", len(n5) == 7, str(n5))
+        check("第二次打开没有多余的迁移提示", not r5["notice"], r5["notice"])
+
+        # [f] 源码里默认维度名单别被改漏了
+        js_src = open(CARD_JS, encoding="utf-8").read()
+        for nm in NEW_DEFAULTS:
+            check("app.js 的默认维度含 %s" % nm,
+                  ('name: "%s"' % nm) in js_src)
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
