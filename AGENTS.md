@@ -990,6 +990,40 @@ session 同时只能有一个推理在飞**。要并发必须有多个 session�
 ⚠️ 这张表是**实测快照**，不是原理：模型换了权重就得重测
 （脚本：`scripts/probe_prompt_order.py`）。
 
+### 🐛 已知缺陷（2026-11-17 查，未修）：NPU 会把**指令当标签**吐出来
+
+部分目标语言下，模型吐出的是「指令 + 译文」的形式，而
+`npu_provider._strip_label` **剥不掉那个前缀** ⇒ 用户看到的是带标签的译文。
+
+实测（真机，NPU 出的，`provider: "npu"`）：
+
+| target | 模型吐出来的（**译文本身是对的，前面多了标签**） |
+|---|---|
+| `id` | `Terjemahkan dari bahasa Indonesia ke bahasa Inggris: Hari ini cuaca sangat baik…` |
+| `ms` | `Terjemahkan dari bahasa Melayu …` |
+| `uk` | `Перевести з китайської на українську: …` |
+| `hi` | `अनुवाद: आज का मौसम बहुत अच्छा…` |
+
+两个成因（都在 `app/core/translate/npu_provider.py` 的 `_strip_label`）：
+
+1. **`_LABEL_WORDS` 只覆盖了部分语言自己的「翻译」词** —— 有 `translate` /
+   `übersetz` / `翻译` / `번역` …，但**没有**印尼/马来语的 `terjemah`、
+   乌克兰语的 `перевести`、印地语的 `अनुवाद`。
+2. **前缀长度上限 45 字符** —— 印尼语那条前缀有 53 个字符，
+   `if idx <= 0 or idx > 45: continue` 直接把它挡掉了。
+
+⚠️ 这**不是**「模型没翻出来」：译文内容是对的，只是前面多了个标签，而
+`_looks_translated` 只看文种（印尼语是拉丁字母，中文是 CJK ⇒ 判定通过）⇒
+**脏东西被当成合格译文返回了**。
+
+⚠️ 影响面：**右上角「界面语言」那 21 种语言同样中招**（卡片和右上角走的是同一条
+provider 链）⇒ 这不是卡片引入的。
+
+⇒ 修法（未做）：`_LABEL_WORDS` 补上各目标语言自己的「翻译」词，并把前缀长度
+上限放宽到 ~80；或者改成「前缀里含有源/目标语言名（任意语言写法的）就当标签」。
+⚠️ 改 `app/core/` 下的 .py 会**触发热重载** ⇒ 运行期状态全丢（模型要重新起，
+约 3 分钟）。
+
 ### ⚠️ 每卡几份 ⇒ 算力页要渲染**几个**复选框
 
 小模型能在一张卡上并行跑几份（manifest 的 ``max_replicas_per_card``，HY-MT
@@ -1082,6 +1116,30 @@ session 同时只能有一个推理在飞**。要并发必须有多个 session�
 
 ⇒ **别把下拉框改成「源语言」选择器**：那是两个语义，用户问「译文是哪种语言」时
 答案是下拉框选的那个。
+
+### ⚠️ 语言清单：**只有一份真相** = 框架的 `window.Translate.languages`
+
+右上角「界面语言」和「试一下」的下拉框**必须是同一份清单**。框架在
+`app/static/core/translate.js` 里把它公开成了 ``window.Translate.languages``
+（21 种，右上角自己再在最前面加一项「中文(原文)」）。
+
+⚠️ **别在卡片里再抄一份** —— 2026-11-17 就是这么对不上的：卡片硬编码了 7 种
+（en/ja/ko/fr/de/es/ru），框架那份是 21 种 + 「中文(原文)」⇒ 用户报「目标语言
+也不全，和右上角对不上，中文都没有」。抄第二份必然漂移。
+
+⇒ 卡片从 `window.Translate.languages` 读（`app.js` 的 `fillTargetLanguages()`），
+模板里的 `<select>` **留空**，选项运行时填。
+
+两个坑：
+
+1. **框架那份不含 `zh-CN`** —— 右上角面板是**自己**在最前面加的「中文(原文)」
+   （`translate.js` 的 `buildUI`）⇒ 直接用 `live` 会漏掉中文，要自己 prepend。
+2. **框架脚本是 `defer`、卡片脚本是动态注入的（异步）** ⇒ 卡片的 IIFE 可能
+   先跑 ⇒ 拿不到 `window.Translate` 时要**重试**几次（卡片的
+   `FALLBACK_LANGUAGES` 只是兜底）。
+
+兜底副本由 `scripts/verify_web_translate_service_url.py` 的 `[8]` 段断言与框架
+那份**逐项相等**（code + 中文名 + 顺序）⇒ 漂移会被回归抓住。
 
 ### 紧凑布局（2026-11-17）
 

@@ -52,6 +52,7 @@ CARD_APP_JS = os.path.join(CARD, "static/app.js")
 CARD_CSS = os.path.join(CARD, "static/app.css")
 CARD_API = os.path.join(CARD, "api.py")
 STATE_JS = os.path.join(REPO, "app/static/core/wizard/state.js")
+FRAMEWORK_TRANSLATE_JS = os.path.join(REPO, "app/static/core/translate.js")
 TRANSLATE_API = os.path.join(REPO, "app/system/api/translate.py")
 SYSTEM_INIT = os.path.join(REPO, "app/system/__init__.py")
 
@@ -108,6 +109,15 @@ function mkNode(tag) {
         .filter(Boolean).forEach((c) => classes.add(c));
     },
   });
+  // innerHTML = "" 在**浏览器里会清掉子节点**。stub 必须照做，否则
+  // 「重新填一遍下拉框」会被误判成「选项累积了 N 份」。
+  Object.defineProperty(node, "innerHTML", {
+    get: () => node.__html || "",
+    set: (v) => {
+      node.__html = String(v == null ? "" : v);
+      if (node.__html === "") node.children.length = 0;
+    },
+  });
   return node;
 }
 const REG = {};
@@ -135,8 +145,12 @@ globalThis.window = {
 # --------------------------------------------------------------------------- #
 # [3] 卡片 app.js —— 真跑整个 IIFE
 # --------------------------------------------------------------------------- #
-def run_card_app_js() -> dict:
-    """把卡片 app.js 原样跑一遍（配 DOM stub），取出它渲染出来的字段。"""
+def run_card_app_js(live_languages: str = "[]") -> dict:
+    """把卡片 app.js 原样跑一遍（配 DOM stub），取出它渲染出来的字段。
+
+    ``live_languages`` = 注入到 ``window.Translate.languages`` 的 JSON 文本
+    （模拟框架那份清单已就绪 / 还没就绪）。
+    """
     import dukpy
     src = open(CARD_APP_JS, encoding="utf-8").read()
     stub = DOM_STUB.replace("ORIGIN_HERE", ORIGIN)
@@ -151,12 +165,16 @@ globalThis.fetch = async (url) => ({
     detail: "", conflict: "", instance_error: "",
   }),
 });
-1;   // dukpy 的 evaljs 要求最后一句有值（否则 "Invalid Result Value"）
 """
+    stub += "globalThis.window.Translate = { languages: " + live_languages + " };\n"
+    stub += "1;   // dukpy 的 evaljs 要求最后一句有值（否则 \"Invalid Result Value\"）\n"
     probe = r"""
 JSON.stringify({
   url: (REG["wt-service-url"] || {}).textContent || "",
   curl: (REG["wt-service-curl"] || {}).textContent || "",
+  options: ((REG["wt-test-target"] || {}).children || []).map(
+    (o) => ({ value: o.value || "", text: o.textContent || "" })
+  ),
 });
 """
     interp = dukpy.JSInterpreter()
@@ -333,13 +351,6 @@ def main() -> int:
     check("后端 payload 同样是 source=zh-CN / target",
           'source: str = "zh-CN"' in card_api and 'target: str = "en"' in card_api,
           card_api[:0])
-    # 下拉框里必须只有目标语言（英语/日语/…），不该出现「源语言」这类选项
-    opts = re.findall(r'<option value="([^"]+)">([^<]+)</option>', tpl)
-    check("下拉框是语言代码列表（目标语言）",
-          len(opts) >= 5 and all(v in ("en", "ja", "ko", "fr", "de", "es", "ru")
-                                 for v, _t in opts), str(opts))
-    check("下拉框里没有「源语言」选项",
-          not any("源" in t for _v, t in opts), str(opts))
 
     # 按钮叫「翻译成」且在**下拉框左边** —— 连读成「翻译成 ▾日语」
     i_btn = tpl.find('id="wt-test-btn"')
@@ -354,6 +365,54 @@ def main() -> int:
     check("按钮上的文字是「翻译成」", btn_tag == "翻译成", repr(btn_tag))
     check("下拉框在按钮**右边**（模板顺序）",
           tpl.find('<select id="wt-test-target"') > tpl.find('<button', 0, i_btn))
+
+    # ---------------------------------------------------------------- [8] --
+    print("\n[8] 目标语言清单 = 右上角「界面语言」那份（不能各抄各的）")
+    # 框架那份（app/static/core/translate.js 的 LANGUAGES）
+    fw_src = open(FRAMEWORK_TRANSLATE_JS, encoding="utf-8").read()
+    fw = re.findall(r'\{\s*code:\s*"([^"]+)",\s*zh:\s*"([^"]+)"', fw_src)
+    check("框架的界面语言清单解析得到 21 种", len(fw) == 21, str(len(fw)))
+
+    # 卡片那份（app.js 的 FALLBACK_LANGUAGES —— 只是兜底）
+    fb_block = re.search(r"const FALLBACK_LANGUAGES\s*=\s*\[(.*?)\n\s*\];",
+                         js_src, re.S)
+    fb = []
+    if fb_block:
+        fb = re.findall(r'\{\s*code:\s*"([^"]+)",\s*zh:\s*"([^"]+)"', fb_block.group(1))
+    check("卡片的兜底清单有 22 项（中文(原文) + 21 种）", len(fb) == 22, str(len(fb)))
+    check("第一项是「中文(原文)」",
+          bool(fb) and fb[0] == ("zh-CN", "中文(原文)"), str(fb[:1]))
+    check("兜底清单与框架那份**逐项相等**（code + 中文名 + 顺序）",
+          fb[1:] == fw, "%s != %s" % (fb[1:][:3], fw[:3]))
+
+    # 模板里不该再有硬编码的 option（那正是漂移的来源）
+    check("模板里没有硬编码的 <option>",
+          "<option" not in tpl, tpl[tpl.find("<option"):][:80])
+    check("app.js 读的是框架的 window.Translate.languages",
+          "window.Translate && window.Translate.languages" in js_src)
+
+    # 真跑一遍：注入框架清单 ⇒ 下拉框应有 22 项且顺序一致
+    live = json.dumps([{"code": c, "zh": z, "native": z} for c, z in fw],
+                      ensure_ascii=False)
+    r_live = run_card_app_js(live)
+    opts = r_live["options"]
+    check("注入框架清单后下拉框有 22 项", len(opts) == 22, str(len(opts)))
+    check("第一项是「中文(原文)」",
+          bool(opts) and opts[0]["value"] == "zh-CN"
+          and opts[0]["text"] == "中文(原文)", str(opts[:1]))
+    check("其余 21 项跟框架那份一致（code + 中文名 + 顺序）",
+          [(o["value"], o["text"]) for o in opts[1:]] == fw,
+          str(opts[1:4]))
+    check("中文名是中文界面用的那个（不是 native）",
+          all(o["text"] in [z for _c, z in fw] or o["value"] == "zh-CN"
+              for o in opts), str(opts[:3]))
+
+    # 框架清单还没就绪时 ⇒ 用兜底，项数一样
+    r_fb = run_card_app_js("[]")
+    check("框架清单没就绪时兜底也给出 22 项",
+          len(r_fb["options"]) == 22, str(len(r_fb["options"])))
+    check("兜底与注入框架清单的结果一致",
+          r_fb["options"] == r_live["options"])
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
