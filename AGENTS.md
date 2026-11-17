@@ -1019,6 +1019,41 @@ session 同时只能有一个推理在飞**。要并发必须有多个 session�
 数渲染出来的复选框，数据取自真实的 ``GET /api/compute``；带一条**负向**
 用例（字段没了 ⇒ 只剩 2 个），保证它不是摆设。
 
+### ✅ 向导走完 ⇒ 要给出「服务地址」（网页翻译）
+
+网页翻译把本板 NPU 变成一个**能被别人调的服务**，所以走完向导后必须告诉
+用户「这个服务在哪儿」。地址出现在两处：
+
+| 位置 | 实现 |
+|---|---|
+| 向导的**完成页** | 框架的 ``finish_extra`` 扩展点（``app/static/core/wizard/state.js`` 的 ``_renderFinishStep``） |
+| 卡片**功能页**「服务详情」 | 插件 ``cards/web_translate/static/{template.html,app.js}`` 的「服务地址」行 + 一行 curl 示例 |
+
+卡片在 ``wizard.json`` 里声明，框架不认得每张卡各有什么服务：
+
+```json
+"finish_extra": [
+  { "label": "服务地址", "url_path": "/api/translate" },
+  { "label": "状态查询", "url_path": "/api/translate/status" }
+]
+```
+
+⚠️ 三个坑：
+
+1. **host/协议必须由 `location.origin` 给** —— 板子前面有 TLS relay，用户
+   可能是 ``http://板子IP:8000`` 也可能是 ``https://板子IP:8443``，端口
+   只有浏览器知道。后端拼端口必错 ⇒ ``url_path`` 只写路径，框架补 origin。
+2. **复制按钮在非安全上下文要退路** —— 板子多半是 http，``navigator.clipboard``
+   不存在（浏览器只在 https/localhost 给）⇒ 必须留 ``execCommand`` 的退路，
+   否则「复制」在真机上永远失败（本地调试却是 https，反而好使）。
+3. **给出的地址必须对照后端路由核一遍** —— 写死一个 ``/api/translate`` 看着
+   像那么回事，真打过去 404，用户拿着它去接别的设备就白忙一场。
+
+回归：`scripts/verify_web_translate_service_url.py` —— 抠**真**前端代码跑
+（卡片 ``app.js`` 整个 IIFE + 框架 ``_renderFinishStep``），断言渲染出来的
+地址、curl 示例、完成页摘要，并核对声明的路径在 ``app/system/api/translate.py``
+里真有路由。
+
 ### ⚠️ 批间 1.2s 间隔：**只对走外网的 provider 生效**
 
 `TranslateService` 每批之间 sleep `_BATCH_GAP` = 1.2s —— 那是**给免费外网
