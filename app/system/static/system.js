@@ -4007,12 +4007,14 @@ const ComputeConfigPage = {
       // 第 1 份的标题保持原样（老截图/文案不变），第 2 份起加后缀。
       for (let rep = 0; rep < maxReplicas; rep++) {
         if (requiresCards > 1 && rep > 0) break;   // 多卡模型：一份一个实例
-        // 「RK182x #0-1」/「RK182x #0-2」= 卡 0 的第 1 份 / 第 2 份。
+        // 「RK182x #0-1」/「#0-2」= 卡 0 的第 1 份 / 第 2 份。
         //
-        // ⚠️ 写法上**两个都要带份号**：早先第 1 份写「RK182x #0」、第 2 份
-        // 写「RK182x #0 (2)」—— 四项并排时又长又不齐（宽度参差），而且
-        // 「(2)」那个括号看着像另一个设备。现在统一成「卡号-份号」。
-        const title = `RK182x #${idx}-${rep + 1}`;
+        // ⚠️ **每张卡只有第一个写全名**，后面的省掉 "RK182x " 前缀 ——
+        // 四个并排时全名太占地方（有溢出风险）。「卡号-份号」的形式本身
+        // 已经能看出是哪个卡哪一份。
+        const title = rep === 0
+          ? `RK182x #${idx}-${rep + 1}`
+          : `#${idx}-${rep + 1}`;
         renderOpt(idx, title,
                   card.device_id || `npu #${idx}`,
                   "182x", supported.has("182x"), rep);
