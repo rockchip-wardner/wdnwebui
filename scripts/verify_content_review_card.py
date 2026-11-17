@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -483,6 +484,51 @@ def main() -> int:
         for nm in NEW_DEFAULTS:
             check("app.js 的默认维度含 %s" % nm,
                   ('name: "%s"' % nm) in js_src)
+
+    # ---------------------------------------------------------------- [N] --
+    print("\n[8] 紧凑布局（别让结果被顶到屏幕外）")
+
+    css = open(os.path.join(CARD_PKG, "static/app.css"), encoding="utf-8").read()
+    tpl2 = open(TEMPLATE, encoding="utf-8").read()
+
+    # 框架的 .imb-card 有 min-height:480px ⇒ 单列堆叠三个卡 = 1440px，
+    # 结果区被顶到屏幕外。这张卡必须显式改回「按内容自适应」。
+    check("卡片高度改回按内容自适应（min-height:0）",
+          "#page-content-review .imb-card" in css
+          and "height: auto;" in css and "min-height: 0;" in css)
+    check("紧凑覆盖都限定在 #page-content-review 作用域内",
+          css.count("#page-content-review") >= 10, str(css.count("#page-content-review")))
+    # 没限定作用域的话，所有卡片的 app.css 拼在一起 ⇒ 会改到别的卡
+    unscoped = []
+    for line in css.splitlines():
+        t = line.strip()
+        if (t.startswith(".imb-card") or t.startswith(".page-header")
+                or t.startswith(".raw-output")) and "{" in t:
+            unscoped.append(t)
+    check("没有没限定作用域的 .imb-card/.page-header 覆盖",
+          not unscoped, str(unscoped))
+    check("维度列表改成多列网格",
+          "#page-content-review .cr-items" in css and "grid-template-columns" in css)
+
+    # 结构：上面两张卡并排（.cr-grid），结果卡仍在外面保持全宽
+    def _div_block(src: str, opener: str) -> str:
+        """取 opener 那个 div 的完整内容（按 <div>/</div> 配平）。"""
+        i = src.find(opener)
+        if i < 0:
+            return ""
+        depth = 0
+        for m in re.finditer(r"<div\b|</div>", src[i:]):
+            depth += 1 if m.group(0).startswith("<div") else -1
+            if depth == 0:
+                return src[i:i + m.end()]
+        return ""
+
+    grid = _div_block(tpl2, '<div class="cr-grid">')
+    check("模板里有 .cr-grid 并排容器", bool(grid))
+    check("审查维度 在并排容器里", "审查维度" in grid)
+    check("待审查内容 在并排容器里", "待审查内容" in grid)
+    check("审查结果 仍在并排容器**外面**（保持全宽）", "审查结果" not in grid)
+    check("输入框收成 3 行", 'rows="3"' in tpl2 and 'rows="4"' not in tpl2)
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
