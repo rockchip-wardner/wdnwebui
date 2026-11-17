@@ -62,8 +62,13 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-CARD = os.path.join(REPO, ".venv/src/wdnapps_audio_chat/src/wdnapps_audio_chat"
-                          "/cards/web_translate")
+# 卡片源码目录问解析器，别硬编码 ``.venv/src/<checkout 名>/…`` ——
+# checkout 目录名跟仓库名不一定一致（本板是 ``wdnapps-audio-chat``，
+# 仓库名是 ``wdnapps_audio_chat``），写死就 FileNotFoundError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from card_dirs import card_dir as _card_dir  # noqa: E402
+
+CARD = str(_card_dir("web-translate"))
 CARD_APP_JS = os.path.join(CARD, "static/app.js")
 CARD_TEMPLATE = os.path.join(CARD, "static/template.html")
 CARD_CSS = os.path.join(CARD, "static/app.css")
@@ -567,8 +572,7 @@ def test_template_layout() -> None:
 # --------------------------------------------------------------------------- #
 # [8] 图文内容审查：同一条链路，但 backend 不一样
 # --------------------------------------------------------------------------- #
-REVIEW_CARD = os.path.join(REPO, ".venv/src/wdnapps_audio_chat/src/wdnapps_audio_chat"
-                               "/cards/content_review")
+REVIEW_CARD = str(_card_dir("content-review"))
 REVIEW_APP_JS = os.path.join(REVIEW_CARD, "static/app.js")
 REVIEW_TEMPLATE = os.path.join(REVIEW_CARD, "static/template.html")
 REVIEW_CSS = os.path.join(REVIEW_CARD, "static/app.css")

@@ -50,8 +50,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-SRC="${ROOT}/.venv/src/${PLUGIN}"
-[ -d "${SRC}" ] || { echo "插件目录不存在: ${SRC}" >&2; exit 1; }
+# checkout 目录名未必等于仓库名：仓库叫 ``wdnapps_audio_chat``（下划线），
+# 本板的 checkout 目录是 ``wdnapps-audio-chat``（连字符）⇒ 两种都试。
+SRC=""
+for _cand in "${ROOT}/.venv/src/${PLUGIN}" "${ROOT}/.venv/src/${PLUGIN//_/-}"; do
+    if [ -d "${_cand}" ]; then SRC="${_cand}"; break; fi
+done
+[ -n "${SRC}" ] || { echo "插件目录不存在: ${ROOT}/.venv/src/${PLUGIN}（也没找到连字符变体）" >&2; exit 1; }
 [ -x "${VENV_PY}" ] || { echo "找不到虚拟环境: ${VENV_PY}" >&2; exit 1; }
 
 mkdir -p "${OUTDIR}"

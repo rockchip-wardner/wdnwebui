@@ -44,8 +44,16 @@ import urllib.request
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-CARD = os.path.join(REPO, ".venv/src/wdnapps_audio_chat/src/wdnapps_audio_chat"
-                          "/cards/web_translate")
+# 卡片源码目录问解析器，别硬编码 ``.venv/src/<checkout 名>/…`` ——
+# checkout 目录名跟仓库名不一定一致（本板是 ``wdnapps-audio-chat``，
+# 仓库名是 ``wdnapps_audio_chat``），写死就 FileNotFoundError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from card_dirs import card_dir as _card_dir  # noqa: E402
+
+CARD = str(_card_dir("web-translate"))
+# 8000 自 2026-11-16 起**只提供 HTTPS**（TLS 在 uvicorn 进程内终结）⇒
+# 明文 http:// 打过去会被 RST（RemoteDisconnected）。可用 WDNWEBUI_BASE 覆盖。
+BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000").rstrip("/")
 WIZARD_JSON = os.path.join(CARD, "static/wizard.json")
 TEMPLATE_HTML = os.path.join(CARD, "static/template.html")
 CARD_APP_JS = os.path.join(CARD, "static/app.js")
@@ -332,7 +340,7 @@ def main() -> int:
         print("\n[6] 在线：打一下状态端点")
         try:
             with urllib.request.urlopen(
-                    "http://127.0.0.1:8000/api/translate/status", timeout=20) as r:
+                    BASE + "/api/translate/status", timeout=20) as r:
                 body = json.loads(r.read().decode())
             check("GET /api/translate/status = 200", True)
             check("返回里带 provider 链", "provider" in body, str(body)[:200])

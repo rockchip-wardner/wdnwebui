@@ -32,9 +32,13 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-CARD_PKG = os.path.join(
-    REPO, ".venv/src/wdnapps_audio_chat/src/wdnapps_audio_chat/cards/content_review"
-)
+# 卡片源码目录问解析器，别硬编码 ``.venv/src/<checkout 名>/…`` ——
+# checkout 目录名跟仓库名不一定一致（本板是 ``wdnapps-audio-chat``，
+# 仓库名是 ``wdnapps_audio_chat``），写死就 FileNotFoundError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from card_dirs import card_dir as _card_dir  # noqa: E402
+
+CARD_PKG = str(_card_dir("content-review"))
 WIZARD_JSON = os.path.join(CARD_PKG, "static/wizard.json")
 MANIFEST = os.path.join(CARD_PKG, "manifest.json")
 TEMPLATE = os.path.join(CARD_PKG, "static/template.html")

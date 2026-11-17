@@ -39,7 +39,10 @@ import urllib.request
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-API = "http://127.0.0.1:8000/api/compute"
+# 8000 自 2026-11-16 起**只提供 HTTPS**（TLS 在 uvicorn 进程内终结）⇒
+# 明文 http:// 打过去会被 RST（RemoteDisconnected）。可用 WDNWEBUI_BASE 覆盖。
+BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000").rstrip("/")
+API = BASE + "/api/compute"
 SYSTEM_JS = os.path.join(REPO, "app/system/static/system.js")
 FRAMEWORK_CSS = os.path.join(REPO, "app/static/core/framework.css")
 
@@ -200,6 +203,30 @@ def frontend_meta(service: dict) -> dict:
     }
 
 
+def _declared_replicas(model_id: str) -> int | None:
+    """模型 manifest 里声明的「每卡几份」；模型没装在本板 → ``None``。
+
+    口径跟宿主一致（``app/core/compute/workers/__init__.py``）：
+    ``max(1, int(raw.get("max_replicas_per_card", 1) or 1))`` —— 缺省就是 1。
+    """
+    try:
+        from app.core.compute.workers import find_manifest_path
+        path = find_manifest_path(model_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    try:
+        return max(1, int(raw.get("max_replicas_per_card", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--offline", action="store_true",
@@ -240,21 +267,46 @@ def main() -> int:
     check("service 条目带 max_replicas_per_card",
           "max_replicas_per_card" in svc,
           str(sorted(svc.keys())))
-    check("hy-mt-1-5 声明的是 2 份/卡",
-          int(svc.get("max_replicas_per_card") or 0) == 2,
-          str(svc.get("max_replicas_per_card")))
+    # ⚠ **这个值由模型 manifest 决定**（宿主只透传，缺省 1）——
+    # **不能写死 2**：写死等于拿「模型数据」当「宿主行为」测，换台板子
+    # （装的模型没声明这键）必挂。改成比「透出的值 == manifest 声明的值」。
+    if args.offline:
+        declared = int(svc.get("max_replicas_per_card") or 1)   # 假数据自洽
+    else:
+        declared = _declared_replicas(svc["model_id"])
+    if declared is None:
+        print("      （模型没装在本板 ⇒ 跳过「值 == manifest 声明值」）")
+    else:
+        check("透出的值 == 模型 manifest 声明的值",
+              int(svc.get("max_replicas_per_card") or 0) == declared,
+              "api=%s manifest=%s" % (svc.get("max_replicas_per_card"), declared))
 
     print("\n[2] 前端 meta 把它抄进去")
     meta = frontend_meta(svc)
-    check("meta.max_replicas_per_card = 2", meta["max_replicas_per_card"] == 2,
-          str(meta["max_replicas_per_card"]))
+    # 抄的是**同一个值**（不是写死 2）—— 漏抄时前端兜底成 1 ⇒ 每卡只
+    # 渲染一个复选框（这才是本脚本要钉住的坑）。
+    check("meta.max_replicas_per_card == service 条目里的值",
+          meta["max_replicas_per_card"] == int(svc.get("max_replicas_per_card") or 1),
+          "meta=%s svc=%s" % (meta["max_replicas_per_card"],
+                              svc.get("max_replicas_per_card")))
 
     print("\n[3] 真跑前端的 _makeTargetFieldset，数复选框")
+    # 渲染这一段用**固定 fixture**（2 张卡 × 每卡 2 份），不拿板子的实况：
+    #   * 「每卡几份」是**模型数据**（各板不同 —— 本板所有模型都声明 1）；
+    #   * 「本板有几张卡」也是板子数据（本板 3 张，UI 上限 2 张）。
+    # 两者都不该影响「前端怎么渲染」的测试。
+    # ⚠ 「第 2 份起带括号」那条路径只有 replicas ≥ 2 才走得到 ⇒ 必须固定 2。
+    render_cards = [{"npu_index": 0, "device_id": "0000:01:00.0"},
+                    {"npu_index": 1, "device_id": "0003:31:00.0"}]
+    render_meta = dict(meta)
+    render_meta["max_replicas_per_card"] = 2
+    render_inst = dict(svc)
+    render_inst["max_replicas_per_card"] = 2
     payload = {
         "modelId": "hy-mt-1-5",
-        "meta": meta,
-        "inst": svc,
-        "cards": snap.get("cards", []),
+        "meta": render_meta,
+        "inst": render_inst,
+        "cards": render_cards,
         "selectedSlots": ["0:0", "1:0"],
         "modelSlots": [{"npu_index": 0, "replica": 0}],
     }

@@ -25,12 +25,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
 
-API = "http://127.0.0.1:8000/api/translate"
+# 8000 自 2026-11-16 起**只提供 HTTPS**（TLS 在 uvicorn 进程内终结）⇒
+# 明文 http:// 打过去会被 RST（RemoteDisconnected）。可用 WDNWEBUI_BASE 覆盖。
+BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000").rstrip("/")
+API = BASE + "/api/translate"
 
 #: 候选文案 —— 短文案和长文案混在一起，好看出「多长才稳」
 CANDIDATES = [
