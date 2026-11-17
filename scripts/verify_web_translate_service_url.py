@@ -237,6 +237,28 @@ summary;
 
 
 # --------------------------------------------------------------------------- #
+# 从 JS 源码里抠出一个函数（按**花括号配平**，正则会被嵌套花括号截断）
+# --------------------------------------------------------------------------- #
+def _extract_js_function(src: str, name: str) -> str:
+    """抠出 ``function <name>(...) {...}`` 的完整源码；抠不到返回空串。"""
+    i = src.find("function %s(" % name)
+    if i < 0:
+        return ""
+    start = src.find("{", i)
+    if start < 0:
+        return ""
+    depth = 0
+    for j in range(start, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[i:j + 1]
+    return ""
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--online", action="store_true",
@@ -346,11 +368,24 @@ def main() -> int:
     check("下拉框标了 aria-label=目标语言", 'aria-label="目标语言"' in tpl)
     check("下拉框 id 是 wt-test-target", 'id="wt-test-target"' in tpl)
     check("值取自下拉框", '$("wt-test-target")' in js_src)
-    check("请求里 source 固定 zh-CN", 'source: "zh-CN"' in js_src)
-    check("请求里 target 用的是下拉框的值", "target: target" in js_src)
-    check("后端 payload 同样是 source=zh-CN / target",
+    check("后端 payload 支持任意 source/target",
           'source: str = "zh-CN"' in card_api and 'target: str = "en"' in card_api,
           card_api[:0])
+
+    # ⚠️ **源语言不能写死**（2026-11-17 用户报：喂英文进去，选「翻译成中文」
+    # 出来还是英文；选「翻译成英语」出来反而是中文）。
+    # 根因：卡片把 source 写死 "zh-CN" ⇒ 这张卡只能做「中文→X」。
+    check("源语言下拉框存在", 'id="wt-test-source"' in tpl)
+    check("源语言默认是「自动检测」",
+          '<option value="auto" selected>自动检测</option>' in tpl)
+    check("app.js 不再把 source 写死成 zh-CN",
+          'source: "zh-CN"' not in js_src)
+    check("请求里 source 用的是算出来的源语言",
+          "source: source" in js_src)
+    check("有源语言检测函数 detectSource",
+          "function detectSource(" in js_src)
+    check("源语言下拉框的 auto 分支会走检测",
+          'srcPick === "auto" ? detectSource(text)' in js_src)
 
     # 按钮叫「翻译成」且在**下拉框左边** —— 连读成「翻译成 ▾日语」
     i_btn = tpl.find('id="wt-test-btn"')
@@ -375,28 +410,73 @@ def main() -> int:
 
     # 卡片那份（template.html 里硬编码的 <option>）
     opts = re.findall(r'<option value="([^"]+)"([^>]*)>([^<]+)</option>', tpl)
-    check("卡片下拉框有 22 项（中文 + 21 种）", len(opts) == 22, str(len(opts)))
+    sel_block = re.search(r'<select id="wt-test-target".*?</select>', tpl, re.S)
+    sel_opts = re.findall(r'<option value="([^"]+)"([^>]*)>([^<]+)</option>',
+                           sel_block.group(0)) if sel_block else []
+    check("卡片目标下拉框有 22 项（中文 + 21 种）", len(sel_opts) == 22, str(len(sel_opts)))
     check("第一项是「中文」",
-          bool(opts) and opts[0][0] == "zh-CN" and opts[0][2].strip() == "中文",
-          str(opts[:1]))
+          bool(sel_opts) and sel_opts[0][0] == "zh-CN" and sel_opts[0][2].strip() == "中文",
+          str(sel_opts[:1]))
     check("中文那一项**不带**「(原文)」",
-          bool(opts) and "原文" not in opts[0][2], str(opts[:1]))
+          bool(sel_opts) and "原文" not in sel_opts[0][2], str(sel_opts[:1]))
     check("其余 21 项跟框架那份一致（code + 中文名 + 顺序）",
-          [(c, t.strip()) for c, _a, t in opts[1:]] == fw,
-          str([(c, t) for c, _a, t in opts[1:4]]))
-    check("没有多余的 option（22 项之外没有别的）",
-          tpl.count("<option") == 22, str(tpl.count("<option")))
+          [(c, t.strip()) for c, _a, t in sel_opts[1:]] == fw,
+          str([(c, t) for c, _a, t in sel_opts[1:4]]))
+    check("目标下拉框里没有多余的 option",
+          tpl.count("<option") == 45, str(tpl.count("<option")))   # 22 + 23
+
+    # 源语言下拉框 = auto + 同样那 22 项（顺序一致）
+    src_block = re.search(r'<select id="wt-test-source".*?</select>', tpl, re.S)
+    src_opts = re.findall(r'<option value="([^"]+)"([^>]*)>([^<]+)</option>',
+                           src_block.group(0)) if src_block else []
+    check("源语言下拉框有 23 项（自动检测 + 22 种）",
+          len(src_opts) == 23, str(len(src_opts)))
+    check("源语言第一项是「自动检测」且默认选中",
+          bool(src_opts) and src_opts[0][0] == "auto"
+          and src_opts[0][2].strip() == "自动检测" and "selected" in src_opts[0][1],
+          str(src_opts[:1]))
+    check("源语言的 22 项与目标那 22 项完全一致（code + 名称 + 顺序）",
+          [(c, t.strip()) for c, _a, t in src_opts[1:]]
+          == [(c, t.strip()) for c, _a, t in sel_opts],
+          str([(c, t) for c, _a, t in src_opts[1:4]]))
 
     # 默认选中英语（中文是「还原原文」，当默认目标没意义）
-    sel_opts = re.findall(r'<option value="([^"]+)"([^>]*)>([^<]+)</option>', tpl)
     picked = [c for c, a, _t in sel_opts if "selected" in a]
-    check("默认选中的是英语", picked == ["en"], str(picked))
+    check("目标默认选中的是英语", picked == ["en"], str(picked))
+    src_picked = [c for c, a, _t in src_opts if "selected" in a]
+    check("源语言默认是 auto", src_picked == ["auto"], str(src_picked))
 
     # 卡片不再从框架那份动态取（用户要求直接抄一份写在模板里）
     check("app.js 不再读 window.Translate.languages",
           "window.Translate" not in js_src)
     check("app.js 里没有残留的 fillTargetLanguages",
           "fillTargetLanguages" not in js_src)
+
+    # ---------------------------------------------------------------- [9] --
+    print("\n[9] 源语言自动检测（按字符集）")
+    import dukpy
+    m_rules = re.search(r"const SOURCE_RULES = \[(.*?)\n\s*\];", js_src, re.S)
+    det_src = _extract_js_function(js_src, "detectSource")
+    check("源码里有 SOURCE_RULES 表", bool(m_rules))
+    check("源码里有 detectSource 函数", bool(det_src))
+    if m_rules and det_src:
+        interp = dukpy.JSInterpreter()
+        interp.evaljs("const SOURCE_RULES = [" + m_rules.group(1) + "\n];")
+        interp.evaljs(det_src)
+        cases = [
+            ("Hello, how are you today?", "en"),
+            ("今天天气很好", "zh-CN"),
+            ("今日はいい天気ですね", "ja"),
+            ("오늘 날씨가 좋습니다", "ko"),
+            ("Сегодня хорошая погода", "ru"),
+            ("اليوم الطقس جميل", "ar"),
+            ("วันนี้อากาศดีมาก", "th"),
+            ("आज का मौसम बहुत अच्छा है", "hi"),
+            ("היום מזג האוויר נפלא", "he"),
+        ]
+        for text, want in cases:
+            got = interp.evaljs('detectSource("%s")' % text)
+            check("detectSource(%r) = %s" % (text[:14], want), got == want, str(got))
 
     # ---------------------------------------------------------------- [9] --
     print("\n[9] 译文框不许被界面翻译**再翻一遍**")
