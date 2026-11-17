@@ -228,10 +228,13 @@ def main() -> int:
     titles = [b["label"] for b in boxes]
     print("      渲染出 %d 个复选框：%s" % (len(boxes), " | ".join(titles)))
     check("渲染出 4 个复选框（2 卡 × 每卡 2 份）", len(boxes) == 4, str(titles))
-    check("标题是 RK182x #0 / #0 (2) / #1 / #1 (2)",
-          titles == ["RK182x #0", "RK182x #0 (2)",
-                     "RK182x #1", "RK182x #1 (2)"],
+    check("标题是 RK182x #0-1 / #0-2 / #1-1 / #1-2",
+          titles == ["RK182x #0-1", "RK182x #0-2",
+                     "RK182x #1-1", "RK182x #1-2"],
           str(titles))
+    check("四个标题长度一致（宽度齐平，不会参差）",
+          len({len(t) for t in titles}) == 1,
+          str([(t, len(t)) for t in titles]))
     check("复选框的值是「卡:份」", [b["value"] for b in boxes] ==
           ["0:0", "0:1", "1:0", "1:1"], str([b["value"] for b in boxes]))
 
