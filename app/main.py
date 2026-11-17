@@ -286,11 +286,16 @@ def create_app() -> FastAPI:
             name="static-core",
         )
     # System pages have their own static dir (not plugin-driven)
+    #
+    # ⚠️ 必须走 _NoCacheStaticFiles —— 普通 StaticFiles **不发 Cache-Control**，
+    # 浏览器就按 Last-Modified 启发式缓存：改了 system.js（算力页的复选框
+    # 数量这类）之后，用户看到的仍是旧副本，只能硬刷新才生效。
+    # 症状就是「代码里明明写了 4 个复选框，页面上还是 2 个」。
     system_static = Path(__file__).parent / "system" / "static"
     if system_static.is_dir():
         app.mount(
             "/static/system",
-            StaticFiles(directory=str(system_static)),
+            _NoCacheStaticFiles(directory=str(system_static)),
             name="static-system",
         )
     app.mount(
