@@ -367,52 +367,36 @@ def main() -> int:
           tpl.find('<select id="wt-test-target"') > tpl.find('<button', 0, i_btn))
 
     # ---------------------------------------------------------------- [8] --
-    print("\n[8] 目标语言清单 = 右上角「界面语言」那份（不能各抄各的）")
-    # 框架那份（app/static/core/translate.js 的 LANGUAGES）
+    print("\n[8] 目标语言清单 = 右上角「界面语言」那份（22 项，不能漏）")
+    # 框架那份（app/static/core/translate.js 的 LANGUAGES，21 种）
     fw_src = open(FRAMEWORK_TRANSLATE_JS, encoding="utf-8").read()
     fw = re.findall(r'\{\s*code:\s*"([^"]+)",\s*zh:\s*"([^"]+)"', fw_src)
     check("框架的界面语言清单解析得到 21 种", len(fw) == 21, str(len(fw)))
 
-    # 卡片那份（app.js 的 FALLBACK_LANGUAGES —— 只是兜底）
-    fb_block = re.search(r"const FALLBACK_LANGUAGES\s*=\s*\[(.*?)\n\s*\];",
-                         js_src, re.S)
-    fb = []
-    if fb_block:
-        fb = re.findall(r'\{\s*code:\s*"([^"]+)",\s*zh:\s*"([^"]+)"', fb_block.group(1))
-    check("卡片的兜底清单有 22 项（中文(原文) + 21 种）", len(fb) == 22, str(len(fb)))
-    check("第一项是「中文(原文)」",
-          bool(fb) and fb[0] == ("zh-CN", "中文(原文)"), str(fb[:1]))
-    check("兜底清单与框架那份**逐项相等**（code + 中文名 + 顺序）",
-          fb[1:] == fw, "%s != %s" % (fb[1:][:3], fw[:3]))
-
-    # 模板里不该再有硬编码的 option（那正是漂移的来源）
-    check("模板里没有硬编码的 <option>",
-          "<option" not in tpl, tpl[tpl.find("<option"):][:80])
-    check("app.js 读的是框架的 window.Translate.languages",
-          "window.Translate && window.Translate.languages" in js_src)
-
-    # 真跑一遍：注入框架清单 ⇒ 下拉框应有 22 项且顺序一致
-    live = json.dumps([{"code": c, "zh": z, "native": z} for c, z in fw],
-                      ensure_ascii=False)
-    r_live = run_card_app_js(live)
-    opts = r_live["options"]
-    check("注入框架清单后下拉框有 22 项", len(opts) == 22, str(len(opts)))
-    check("第一项是「中文(原文)」",
-          bool(opts) and opts[0]["value"] == "zh-CN"
-          and opts[0]["text"] == "中文(原文)", str(opts[:1]))
+    # 卡片那份（template.html 里硬编码的 <option>）
+    opts = re.findall(r'<option value="([^"]+)"([^>]*)>([^<]+)</option>', tpl)
+    check("卡片下拉框有 22 项（中文 + 21 种）", len(opts) == 22, str(len(opts)))
+    check("第一项是「中文」",
+          bool(opts) and opts[0][0] == "zh-CN" and opts[0][2].strip() == "中文",
+          str(opts[:1]))
+    check("中文那一项**不带**「(原文)」",
+          bool(opts) and "原文" not in opts[0][2], str(opts[:1]))
     check("其余 21 项跟框架那份一致（code + 中文名 + 顺序）",
-          [(o["value"], o["text"]) for o in opts[1:]] == fw,
-          str(opts[1:4]))
-    check("中文名是中文界面用的那个（不是 native）",
-          all(o["text"] in [z for _c, z in fw] or o["value"] == "zh-CN"
-              for o in opts), str(opts[:3]))
+          [(c, t.strip()) for c, _a, t in opts[1:]] == fw,
+          str([(c, t) for c, _a, t in opts[1:4]]))
+    check("没有多余的 option（22 项之外没有别的）",
+          tpl.count("<option") == 22, str(tpl.count("<option")))
 
-    # 框架清单还没就绪时 ⇒ 用兜底，项数一样
-    r_fb = run_card_app_js("[]")
-    check("框架清单没就绪时兜底也给出 22 项",
-          len(r_fb["options"]) == 22, str(len(r_fb["options"])))
-    check("兜底与注入框架清单的结果一致",
-          r_fb["options"] == r_live["options"])
+    # 默认选中英语（中文是「还原原文」，当默认目标没意义）
+    sel_opts = re.findall(r'<option value="([^"]+)"([^>]*)>([^<]+)</option>', tpl)
+    picked = [c for c, a, _t in sel_opts if "selected" in a]
+    check("默认选中的是英语", picked == ["en"], str(picked))
+
+    # 卡片不再从框架那份动态取（用户要求直接抄一份写在模板里）
+    check("app.js 不再读 window.Translate.languages",
+          "window.Translate" not in js_src)
+    check("app.js 里没有残留的 fillTargetLanguages",
+          "fillTargetLanguages" not in js_src)
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
