@@ -191,6 +191,109 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check("wdndds 附件编解码可用", False, repr(exc))
 
+    # ---------------------------------------------------------------- [6] --
+    print("\n[6] 独占：启用决策要自动清场，翻译要避开被占的卡")
+    import contextlib
+
+    class FakeReg:
+        """假的算力注册表 —— 只给这两个函数用到的部分。
+
+        ⚠️ ``model_cards()`` 必须返回 **List[int]**（卡号列表）——
+        真实现就是这个形状；写成 dict 列表会掩盖「取下标」那类 bug
+        （历史上就因为当成 dict 读而 TypeError，冲突检测静默失效）。
+        """
+
+        def __init__(self, instances, cards=(0, 1)):
+            self._instances = [dict(i) for i in instances]
+            self._cards = list(cards)
+            self.stopped = []
+
+        def snapshot(self):
+            return {"instances": self._instances}
+
+        def list_cards(self):
+            return [{"npu_index": c, "device_id": "x"} for c in self._cards]
+
+        def model_cards(self):
+            return list(self._cards)
+
+        def model_op_lock(self, _mid):
+            return contextlib.nullcontext()
+
+        def stop_instance_local(self, model, npu, replica):
+            self.stopped.append((model, npu, replica))
+            self._instances = [
+                i for i in self._instances
+                if not (i["model_id"] == model
+                        and i["npu_index"] == npu
+                        and i["replica"] == replica)
+            ]
+
+    def inst(model, card, replica, status="running", mem=2200):
+        return {"model_id": model, "label": model, "npu_index": card,
+                "npu_indices": [card], "replica": replica, "status": status,
+                "memory_estimate_mb": mem, "capability_types": ["x"]}
+
+    # 清场：卡 0 上有翻译 **2 份** + 另一个模型 1 份 ⇒ 三个实例都要停
+    reg = FakeReg([
+        inst("hy-mt-1-5", 0, 0),
+        inst("hy-mt-1-5", 0, 1),
+        inst("qwen3-vl-4b", 0, 0),
+        inst("hy-mt-1-5", 1, 0),      # 另一张卡 —— 不该被动
+    ])
+    stopped = ContentReviewManager._clear_card(reg, 0)
+    check("清场停掉了卡 0 上的全部 3 个实例", len(stopped) == 3,
+          str([(s["model_id"], s["replica"]) for s in stopped]))
+    check("同卡第 2 份也没漏（stop_instance_local 只停一个实例）",
+          ("hy-mt-1-5", 0, 1) in reg.stopped, str(reg.stopped))
+    check("另一张卡上的实例没被动", ("hy-mt-1-5", 1, 0) not in reg.stopped,
+          str(reg.stopped))
+    check("决策模型自己的实例不会被自己清掉",
+          all(s["model_id"] != DEFAULT_MODEL for s in stopped), str(stopped))
+
+    # 清场：决策模型自己已经在那张卡上 ⇒ 什么都不用停
+    reg2 = FakeReg([inst(DEFAULT_MODEL, 0, 0, mem=3200)])
+    check("卡上只有决策模型时清场是空操作",
+          ContentReviewManager._clear_card(reg2, 0) == [], str(reg2.stopped))
+
+    # 翻译避让：卡 0 被决策模型占着（3200）⇒ 翻译只在卡 1 起
+    from wdnapps_audio_chat.cards.web_translate.service import (
+        CARD_MEMORY_MB,
+        TRANSLATE_MEMORY_MB,
+        _cards_with_room_for_one_copy,
+        _slots,
+    )
+    reg3 = FakeReg([inst(DEFAULT_MODEL, 0, 0, mem=3200)])
+    free = _cards_with_room_for_one_copy(reg3)
+    check("决策模型占着的卡对翻译不可用（3200+2200 > 5120）",
+          0 not in free, str(free))
+    check("空卡对翻译可用", 1 in free, str(free))
+    slots = _slots(reg3)
+    check("翻译槽位避开被占用的卡", all(n != 0 for (n, _r) in slots), str(slots))
+    check("翻译槽位仍然落在另一张卡上", len(slots) == 2, str(slots))
+    check("卡容量与每份估算写进了常量",
+          CARD_MEMORY_MB == 5120 and TRANSLATE_MEMORY_MB == 2200,
+          "%s/%s" % (CARD_MEMORY_MB, TRANSLATE_MEMORY_MB))
+
+    # 两张卡都空 ⇒ 翻译照旧 4 份
+    reg4 = FakeReg([])
+    check("没有别的模型时翻译仍是 4 份",
+          len(_slots(reg4)) == 4, str(_slots(reg4)))
+
+    # 视觉常驻：决策模型的视觉编码器默认常驻（启动即加载）
+    try:
+        # ⚠️ 用 ``_intern_decision_4b_spec()`` 而不是
+        # ``SystemLanguageModel.intern_decision_4b()`` —— 后者会**校验模型
+        # 文件是否在默认目录**（/userdata/models），本板装在别处 ⇒ 直接
+        # FileNotFoundError，跟被测的 option 毫无关系。
+        from wdnai.model import _intern_decision_4b_spec
+        spec = _intern_decision_4b_spec()
+        check("决策模型默认 keep_vision_resident = True",
+              bool(spec.options.get("keep_vision_resident")) is True,
+              str(spec.options.get("keep_vision_resident")))
+    except Exception as exc:  # noqa: BLE001
+        check("决策模型默认 keep_vision_resident = True", False, repr(exc))
+
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
     return 1 if _FAIL else 0
