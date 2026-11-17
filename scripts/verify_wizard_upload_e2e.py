@@ -67,7 +67,7 @@ def main():
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
 
-        page.goto(f"http://127.0.0.1:8000/#{APP_ID}",
+        page.goto(f"https://127.0.0.1:8000/#{APP_ID}",
                   wait_until="domcontentloaded", timeout=20000)
         if not goto_source_step(page):
             check("到达 source 步骤", False, "drop-zone 未出现")

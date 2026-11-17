@@ -21,7 +21,7 @@ import urllib.request
 
 from playwright.async_api import async_playwright
 
-BASE = "http://localhost:8000"
+BASE = "https://localhost:8000"
 VIDEO = "/home/rockchip/test/test/carplant_29132868.mp4"
 
 # card_id -> (页面 id 前缀, 画布 id, 源输入框 id, 判据 API)

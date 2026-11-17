@@ -21,7 +21,7 @@ def main():
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
-        page.goto("http://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
+        page.goto("https://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
         page.evaluate("Object.keys(localStorage).filter(k => k.includes('wizard')).forEach(k => localStorage.removeItem(k))")
 
         ok = 0
@@ -39,7 +39,7 @@ def main():
                 print(f"  injected: active = {active0!r}")
 
                 # 进入目标 app
-                page.goto(f"http://127.0.0.1:8000/#{target}", wait_until="domcontentloaded", timeout=15000)
+                page.goto(f"https://127.0.0.1:8000/#{target}", wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_selector(".wd-wizard-section", timeout=8000)
                 active1 = page.evaluate("window.DemoGuard._activeApp")
                 print(f"  after nav: active = {active1!r} (stale 已清)")
@@ -78,7 +78,7 @@ def main():
                     print(f"  ❌ {stale} → {target}: 期望 hash={expected},wizard=0; 实际 hash={new_hash},wizard={wizard_n}")
 
                 # cleanup
-                page.goto("http://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=10000)
+                page.goto("https://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=10000)
                 page.evaluate(f"window.DemoGuard._cache && delete window.DemoGuard._cache['{stale}']")
             except Exception as e:
                 print(f"  ⚠️ skip: {e}")

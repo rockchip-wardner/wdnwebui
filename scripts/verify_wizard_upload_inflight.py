@@ -102,7 +102,7 @@ def main():
         ctx = browser.new_context()
         page = ctx.new_page()
         page.on("pageerror", lambda e: page_errors.append(str(e)))
-        page.goto(f"http://127.0.0.1:8000/#{APP_ID}",
+        page.goto(f"https://127.0.0.1:8000/#{APP_ID}",
                   wait_until="domcontentloaded", timeout=20000)
         if not goto_source_step(page):
             check("到达 source 步骤", False, "drop-zone 未出现")
@@ -166,7 +166,7 @@ def main():
         page2.on("pageerror", lambda e: page_errors.append(str(e)))
         page2.route(f"**{UPLOAD_URL}", lambda route: route.fulfill(
             status=500, content_type="application/json", body='{"ok":false}'))
-        page2.goto(f"http://127.0.0.1:8000/#{APP_ID}",
+        page2.goto(f"https://127.0.0.1:8000/#{APP_ID}",
                    wait_until="domcontentloaded", timeout=20000)
         if not goto_source_step(page2):
             check("C6 失败用例到达 source 步骤", False, "drop-zone 未出现")

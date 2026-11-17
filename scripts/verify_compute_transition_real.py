@@ -36,7 +36,7 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8000/api"
+BASE = "https://127.0.0.1:8000/api"
 FAILED: list[str] = []
 PASSED = 0
 

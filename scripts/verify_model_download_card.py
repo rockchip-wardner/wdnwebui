@@ -39,7 +39,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-BASE = os.environ.get("WDNWEBUI_BASE", "http://127.0.0.1:8000")
+BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000")
 _FAILED: list[str] = []
 
 

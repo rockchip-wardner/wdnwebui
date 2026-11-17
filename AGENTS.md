@@ -83,12 +83,49 @@ github = git@github.com:rockchip-wardner/<repo>.git    ← 只 push
     `LD_LIBRARY_PATH`；缺了它，spawn 出去的 `compute_worker` 加载不了
     cshim，会**秒退**（rc=0，表现为「功能未启用: swcap_vision_grounding」）。
   - **生产 = systemd 单元 `wdnwebui.service`**，`ExecStart` 直接跑
-    `uvicorn app.main:app --host 0.0.0.0 --port 8000`，**不带 `--reload`**
-    → 改了后端代码必须 `sudo systemctl restart wdnwebui` 才生效。
-  - ⚠️ **重启会连坐杀掉 worker**：systemd 的 `KillMode=control-group` 把
-    cgroup 里的 `compute_worker` 一起 SIGTERM 掉 → 重启前确认
-    `compute.autostart` 有值，否则重启后板子没有任何算力，得手工
-    `POST /api/compute/instances` 把模型拉回来。
+    `uvicorn app.main:app --host 0.0.0.0 --port 8000 --ssl-certfile ... --ssl-keyfile ...`，
+    **不带 `--reload`** → 改了后端代码必须 `sudo systemctl restart wdnwebui` 才生效。
+  - **8000 只提供 HTTPS（2026-11-16 起）**：TLS 在 uvicorn 进程内终结，
+    8443 的 TLS 中继（`scripts/tls_relay.py` + `wdnwebui-tls-relay.service`）
+    **已退役**、端口不再监听。⇒
+    - 访问地址是 `https://<板子IP>:8000`；**明文 `http://…:8000` 已不可用**
+      （curl 返回 exit=52 / Empty reply）。
+    - 客户端信任的**根证书不变**（信任 CA 根，与端口无关）⇒ 不用重装；
+      服务端证书 SAN 不含端口 ⇒ 不用重签。
+    - ⚠️ **证书成了主服务的硬依赖**：证书文件缺失 ⇒ uvicorn 在绑定端口前就
+      抛 `FileNotFoundError`（`uvicorn/config.py:129`）⇒ 退出码 1 ⇒
+      `Restart=on-failure` 无限重启。靠单元 `[Unit]` 段的
+      `ConditionPathExists=` 挡住启动（**必须写 `[Unit]` 段** —— 写进
+      `[Service]` 会被 systemd **静默忽略**，等于没有保护；已实测）。
+      `wdnwebui-cert-check.timer` 每日巡检证书存在性 / 30 天有效期。
+    - ⚠️ **重启会连坐杀掉 worker**：systemd 的 `KillMode=control-group` 把
+      cgroup 里的 `compute_worker` 一起 SIGTERM 掉 → 重启前确认
+      `compute.autostart` 有值，否则重启后板子没有任何算力，得手工
+      `POST /api/compute/instances` 把模型拉回来。
+    - **明文撞 HTTPS 端口现在会留明文日志**（`app/core/tls_logging.py`）：
+      ```
+      journalctl -u wdnwebui.service | grep '\[TLS\]'
+      # [ERROR] [TLS] 握手失败  SSLError: [SSL: HTTP_REQUEST] http request
+      # [ERROR] [TLS] 排查提示: 疑似「明文客户端撞上 HTTPS 端口」：客户端用了 http:// 而不是 https://。…
+      ```
+      ⇒ 客户端报「Empty reply from server」时，先看这一行。
+      - ⚠️ **生产跑的是 uvloop，不是 asyncio**（`uvicorn --loop auto` 优先
+        选 uvloop，板上装了 uvloop 0.22.1）⇒ **打在
+        `asyncio.sslproto.SSLProtocol` 上的补丁在生产上完全无效**
+        （2026-11-16 实测：钩子装了、明文撞 8000、日志 0 行）。
+        uvloop 的类型（`uvloop.loop.SSLProtocol` / `Loop` / `TCPTransport`）
+        **全是不可变的**（Cython `cdef class`）⇒ 打不了补丁。
+        真正与 event loop 无关的钩子是 **`ssl.SSLObject.do_handshake`**
+        （`ssl.py` 里的**纯 Python 类**；asyncio 与 uvloop 都走
+        `self._sslobj.do_handshake()`）。
+      - ⚠️ 必须**排除 `SSLWantReadError` / `SSLWantWriteError` /
+        `SSLSyscallError`**（asyncio 叫它们 `SSLAgainErrors`）—— 那是
+        「还要更多数据」的**正常中间态**，每次正常握手都会抛好几次；
+        它们是 `ssl.SSLError` 的子类 ⇒ 不排除的话每次正常握手都刷一条
+        「握手失败」。
+      - 只记 `server_side=True` 的对象（客户端侧握手失败跟本故障无关）。
+      - 回归：`python -m scripts.verify_tls_handshake_log`（asyncio +
+        uvloop 两套都测）。
   - **别和 systemd 单元 `wdnwebui.service` 同时跑**：该单元
     `Restart=on-failure` + `RestartSec=5`，抢不到 8000 端口就每 5 秒
     重启一轮，而**每轮重启都会把 cgroup 里的 `compute_worker` 一起
@@ -97,6 +134,20 @@ github = git@github.com:rockchip-wardner/<repo>.git    ← 只 push
     能直接看到发送方（`si_pid` 指向 systemd，不是 registry）。
     排查前先 `systemctl status wdnwebui.service`，冲突就
     `systemctl stop wdnwebui`。
+  - **`run.py` 有 8000 端口的明文护栏（2026-11-16 加）**：
+    端口是 8000 且没配 TLS ⇒ **`SystemExit(2)`**，不给它启动的机会。
+    理由：`run.py` 默认 `kill_stale=True` ⇒ 会先杀掉占着 8000 的生产
+    HTTPS 实例再接管；没有护栏的话，一次「本地调试」的 `python run.py`
+    就把生产的 HTTPS 入口换成明文，而现场只看得到「服务还在」。
+    ⇒ **护栏必须在 `_kill_stale_wdnwebui_processes()` 之前判定**
+    （顺序反了就等于没护栏）。
+    - 三条出路：给 `--ssl-certfile/--ssl-keyfile`（或环境变量
+      `WDNWEBUI_SSL_CERTFILE` / `WDNWEBUI_SSL_KEYFILE`）/
+      换端口 `--port 8001` / 确实要明文 `--allow-plaintext`
+      （或 `WDNWEBUI_ALLOW_PLAINTEXT=1`）。
+    - TLS 参数**只给一个** ⇒ 也 `SystemExit(2)`（uvicorn 只给一个会
+      **静默**退回明文）；证书文件不存在/不可读 ⇒ 同样 `SystemExit(2)`。
+    - 回归：`python -m scripts.verify_run_py_tls_guard`（10 条）。
 - **Internal SDKs** (installed editable from private SSH git, **not** PyPI):
   - `wdnav` — Rockchip MPP / RGA2 / V4L2 video bindings.
     Native libs (`librockchip_mpp`, `librga`) must be installed on the host;
@@ -5409,11 +5460,17 @@ source .venv/bin/activate
 sudo ./bootstrap_wdndds_native.sh
 
 # run (auto-cleans stale uvicorn / compute_workers from previous unclean shutdowns)
-sudo .venv/bin/python run.py             # 0.0.0.0:8000, reload on
-sudo .venv/bin/python run.py --no-kill-stale   # opt out of stale cleanup
+#
+# ⚠️ 8000 只说 HTTPS ⇒ run.py 在 8000 上**拒绝明文启动**（会 SystemExit(2)，
+#    而且这个判断在「杀掉占着 8000 的旧实例」之前）。要么给 TLS 参数，
+#    要么换端口。
+sudo .venv/bin/python run.py \
+  --ssl-certfile /home/rockchip/.config/wdnwebui/tls/cert.pem \
+  --ssl-keyfile  /home/rockchip/.config/wdnwebui/tls/key.pem   # https://0.0.0.0:8000, reload on
+sudo .venv/bin/python run.py --port 8001   # 其它端口允许明文（本地调试）
 
 # sanity
-curl http://127.0.0.1:8000/health
+curl https://127.0.0.1:8000/health
 ```
 
 Endpoints wired so far: `GET /` (version), `GET /health`.
@@ -6848,7 +6905,7 @@ JSON 落盘）。
 arm64 版：`https://registry.npmmirror.com/-/binary/node/v22.20.0/`）：
 
 1. `npm install --registry=https://registry.npmmirror.com jsdom`；
-2. `new JSDOM(真实首页 HTML, {runScripts:"dangerously", url:"http://127.0.0.1:8000/"})`，
+2. `new JSDOM(真实首页 HTML, {runScripts:"dangerously", url:"https://127.0.0.1:8000/"})`，
    把 `window.fetch` 转发到板子（`fetch` 是**浏览器**在用，板子代理后浏览器
    完全不碰境外站点），再把 `translate.js` 注入进去；
 3. 触发 `.wdn-lang-item` 的 click，等按钮文案变成 English / 日本語，再断言
@@ -10091,7 +10148,7 @@ mp4 → HTTP 200 + `Content-Type: video/*` → 浏览器里那张 `<video>`
 
 ```bash
 .venv/bin/python scripts/verify_app_panel_preview.py            # 默认打 8000
-.venv/bin/python scripts/verify_app_panel_preview.py --base http://127.0.0.1:8000
+.venv/bin/python scripts/verify_app_panel_preview.py --base https://127.0.0.1:8000
 ```
 
 ### favicon：`/favicon.ico` 的 404
@@ -10685,7 +10742,7 @@ SDK 的 `find(sep)` 找不到 → 语种头被当成正文提交）。实测 **1
 
 ### 回归
 
-* `WDNWEBUI_BASE="http://127.0.0.1:8000" .venv/bin/python scripts/verify_asr_wizard.py`
+* `WDNWEBUI_BASE="https://127.0.0.1:8000" .venv/bin/python scripts/verify_asr_wizard.py`
   —— **116 通过 / 0 失败**。其中：
   * **U14**（字幕随播放头变化）：字幕随播放头变、字幕每个词都在最终文本里、
     累计点亮的字数单调不减、当前词有高亮；
@@ -12036,7 +12093,7 @@ playwright._impl._errors.TimeoutError: Page.click: Timeout 30000ms exceeded.
 ⇒ 跑回归**前**先确认实例在跑：
 
 ```bash
-curl -s http://127.0.0.1:8000/api/compute | grep -o '"status": "[a-z]*"'
+curl -s https://127.0.0.1:8000/api/compute | grep -o '"status": "[a-z]*"'
 ```
 
 没有实例就恢复 `config.jsonc` 的 `compute.autostart`（设备级配置，不进

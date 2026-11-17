@@ -20,7 +20,7 @@ def main():
 
         ok_count = 0
         for app_id in APPS:
-            url = f"http://127.0.0.1:8000/#{app_id}"
+            url = f"https://127.0.0.1:8000/#{app_id}"
             print(f"\n=== {app_id} ===")
             # 每个 app 独立 context — 干净 storage,避免 cross-test 干扰
             ctx = browser.new_context()

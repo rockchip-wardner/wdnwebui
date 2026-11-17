@@ -57,7 +57,7 @@ import sys
 
 from playwright.sync_api import sync_playwright
 
-BASE = os.environ.get("WDNWEBUI_BASE", "http://127.0.0.1:8000")
+BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000")
 _FAILED: list[str] = []
 
 

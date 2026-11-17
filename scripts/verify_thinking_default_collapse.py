@@ -12,7 +12,7 @@ def main():
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
-        page.goto("http://127.0.0.1:8000/#text-chat", wait_until="domcontentloaded", timeout=15000)
+        page.goto("https://127.0.0.1:8000/#text-chat", wait_until="domcontentloaded", timeout=15000)
         page.wait_for_selector(".wd-wizard-section", timeout=8000)
         page.wait_for_timeout(800)
 

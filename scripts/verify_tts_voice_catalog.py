@@ -36,7 +36,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from active_app_guard import (  # noqa: E402
     install_on_page as install_active_app_guard)
 
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = "https://127.0.0.1:8000"
 
 # 官方 Qwen3-TTS 的 10 种语言 + auto
 EXPECT_LANGUAGES = {

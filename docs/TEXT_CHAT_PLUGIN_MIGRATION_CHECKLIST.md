@@ -220,7 +220,7 @@
 > for u in /api/text-chat /api/text-chat/history /static/apps/text-chat/app.js \
 >          /static/apps/text-chat/app.css /static/apps/text-chat/template.html \
 >          /static/apps/text-chat/wizard.json; do
->   printf "%-46s %s\n" "$u" "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000$u)"
+>   printf "%-46s %s\n" "$u" "$(curl -s -o /dev/null -w '%{http_code}' https://127.0.0.1:8000$u)"
 > done
 > ```
 

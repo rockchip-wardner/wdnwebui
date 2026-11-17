@@ -15,7 +15,7 @@ async def main():
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--mute-audio"])
         ctx = await browser.new_context(viewport={"width": 1920, "height": 1080})
         page = await ctx.new_page()
-        await page.goto("http://localhost:8000/#apps", wait_until="networkidle")
+        await page.goto("https://localhost:8000/#apps", wait_until="networkidle")
 
         all_ok = True
         for app_id, step_id, field_id, expected_summary in CASES:

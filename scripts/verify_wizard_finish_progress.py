@@ -15,7 +15,7 @@ async def main():
         ctx = await browser.new_context()
         page = await ctx.new_page()
         # 注入 wizard.js 源码到 page 上下文
-        await page.goto("http://localhost:8000/#apps", wait_until="networkidle")
+        await page.goto("https://localhost:8000/#apps", wait_until="networkidle")
         # 提取 wizard.js 脚本注入到 page context
         wizard_src = await page.evaluate("""
 () => fetch('/static/core/wizard/state.js').then(r => r.text())

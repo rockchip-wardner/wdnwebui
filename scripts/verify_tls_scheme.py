@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""回归防护：TLS 转发必须把**原始 scheme** 传给后端。
+"""回归防护：8000 的 **scheme 必须是 https**，且请求体不被搞坏。
 
-背景与根因写在 ``scripts/tls_relay.py`` 的文件头：后端以为自己是 http://，
-307 重定向的 Location 就带 ``http://``，https 页面按 mixed content 拦掉 →
-``TypeError: Failed to fetch`` → 语音生成向导卡 20~30 秒后误报「模型还没
-就绪(或已被关闭)」。
+背景与根因写在 ``scripts/tls_relay.py`` 的文件头：relay 时代后端以为自己是
+http://，307 重定向的 Location 就带 ``http://``，https 页面按 mixed content
+拦掉 → ``TypeError: Failed to fetch`` → 语音生成向导卡 20~30 秒后误报「模型
+还没就绪(或已被关闭)」。
+
+⚠️ **2026-11-16 起架构变了**：8000 改成 **uvicorn 原生 TLS**
+（``--ssl-certfile`` / ``--ssl-keyfile``），**8443 的 relay 已退役**。
+
+⇒ ``scope["scheme"]`` 现在由 uvicorn **直接**给出（``https``），
+``app/core/forwarded.py`` 的中间件**不再命中**（保留它是为了将来加 TLS
+代理时不用重写 —— 它的单元断言仍然有效）。
 
 本脚本断言（都不占 NPU）：
 
-  1. **新连接**：https 路径上的 307 Location 必须是 ``https://``；
-  2. **复用连接**：同一条连接上的**第二个**请求也必须是 ``https://`` ——
-     浏览器复用 keep-alive 连接，只注入第一个请求是不够的（这条最容易被
-     改回去）；
-  3. **明文无回归**：http 路径上的 307 Location 仍然是 ``http://``；
-  4. **请求体没被搞坏**：relay 为了注入请求头要解析 HTTP 帧，算错了就是把
-     二进制体搅乱（音色 WAV 上传就废了）—— 256 KB 随机二进制经 relay 后
-     sha256 不变，Content-Length 与 chunked 都验。
+  0. **中间件单元**：``XForwardedProtoMiddleware`` 对回环/非回环对端、
+     http/websocket、乱填值的处理符合预期（中间件保留 ⇒ 断言也保留）；
+  1. **relay 自身**：请求体经 relay 不被搅坏（``scripts/tls_relay.py`` 的
+     文件还在仓里，留着这段是为了别把它的 body 处理改坏 —— 将来有人再
+     拿它当中继时能用上）；
+  2. **明文连 8000 必须被拒**（8000 只说 HTTPS）；
+  3. **https 新连接**：307 Location 必须是 ``https://``；
+  4. **https 复用连接**：同一条连接上的**第二个**请求也必须是 ``https://``
+     —— 浏览器复用 keep-alive 连接（这条最容易被改回去）。
 
 用法::
 
@@ -321,7 +329,11 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         fails.append(f"app/core/forwarded.py 的单元断言跑不起来: {exc}")
 
-    # ---- 1. 两份独立 relay：一份对假回显后端（验请求体），一份对真后端 --- #
+    # ---- 1. 一份独立 relay：只对假回显后端（验请求体）-------------------- #
+    # ⚠️ **不再**起「relay → 真后端(8000)」那份：8000 自己终结 TLS，
+    #    relay 转过去的是明文 ⇒ 必然连不上。
+    #    relay 的文件（scripts/tls_relay.py）还在仓里（将来有人再拿它当
+    #    中继时能用），所以这里保留它的 body 处理回归。
     echo = _EchoBackend()
     echo.start()
     echo_relay_port = _free_port()
@@ -330,17 +342,9 @@ def main() -> int:
         print(f"❌ relay 没起来（端口 {echo_relay_port}）")
         return 1
     print(f"[1] 测试用 relay: 127.0.0.1:{echo_relay_port} → 127.0.0.1:{echo.port}"
-          f"（假回显后端）")
+          f"（假回显后端；relay 已退役，这里只验它自己的 body 处理）")
 
-    app_relay_port = _free_port()
-    _start_relay(app_relay_port, 8000)
-    if not _wait_port(app_relay_port):
-        print(f"❌ relay 没起来（端口 {app_relay_port}）")
-        return 1
-    print(f"[2] 测试用 relay: 127.0.0.1:{app_relay_port} → 127.0.0.1:8000"
-          f"（真后端）")
-
-    # ---- 3. 请求体完整性（relay 改了请求头，不能把 body 搅坏）-------------- #
+    # ---- 2. 请求体完整性（relay 改了请求头，不能把 body 搅坏）-------------- #
     payload = bytes((i * 37 + (i >> 8) * 11) % 256 for i in range(256 * 1024))
     want = hashlib.sha256(payload).hexdigest()
     got = hashlib.sha256(
@@ -349,7 +353,7 @@ def main() -> int:
         fails.append(f"Content-Length 请求体经 relay 后被改坏了 "
                      f"(want={want[:12]} got={got[:12]})")
     else:
-        print(f"[3] ✅ 256 KB 二进制体（Content-Length）原样送达")
+        print(f"[2] ✅ 256 KB 二进制体（Content-Length）原样送达")
 
     got_c = hashlib.sha256(
         _post_body(echo_relay_port, payload, chunked=True)).hexdigest()
@@ -357,34 +361,43 @@ def main() -> int:
         fails.append(f"chunked 请求体经 relay 后被改坏了 "
                      f"(want={want[:12]} got={got_c[:12]})")
     else:
-        print(f"[4] ✅ 256 KB 二进制体（chunked）原样送达")
+        print(f"[3] ✅ 256 KB 二进制体（chunked）原样送达")
 
-    # ---- 4. 明文路径：Location 还得是 http://（不能把明文也改成 https）----- #
+    # ---- 4. 明文路径：8000 只说 HTTPS ⇒ 明文连上去必须被拒 --------------- #
+    # 2026-11-16 起 8000 是 uvicorn 原生 TLS，明文 HTTP 会被 TLS 层掐掉
+    # （curl exit=52 / Empty reply）。
+    # ⇒ 「明文路径的 Location 还是 http://」这个断言**已经不适用**
+    #    （已经没有明文路径了）⇒ 改成断言「明文连不上」。
+    refused = False
     try:
         plain = http.client.HTTPConnection("127.0.0.1", 8000, timeout=10)
         _, loc = _location(plain, REDIRECT_PATH)
         plain.close()
-    except OSError as exc:
-        loc = ""
-        notes.append(f"明文后端连不上（{exc}）—— 跳过明文断言")
-    if loc:
-        if not loc.startswith("http://"):
-            fails.append(f"明文路径的 Location 不该是 https: {loc}")
-        else:
-            print(f"[5] ✅ 明文路径 Location = {loc}")
+    except (OSError, http.client.HTTPException):
+        # RemoteDisconnected / ConnectionResetError 都是 OSError 的子类
+        refused = True
+    if refused:
+        print("[4] ✅ 明文连 8000 被拒（8000 只说 HTTPS）")
+    else:
+        fails.append("明文连 8000 居然成功了 —— 8000 应该只提供 HTTPS")
 
     # ---- 5. https 路径：新连接 / 复用连接，Location 都得是 https ---------- #
+    # 8000 现在**自己**终结 TLS（不再经过 relay）⇒ 直接连 https://127.0.0.1:8000。
     ctx = ssl._create_unverified_context()
-    conn = http.client.HTTPSConnection("127.0.0.1", app_relay_port,
+    conn = http.client.HTTPSConnection("127.0.0.1", 8000,
                                         context=ctx, timeout=10)
-    status, loc1 = _location(conn, REDIRECT_PATH)
+    try:
+        status, loc1 = _location(conn, REDIRECT_PATH)
+    except (OSError, http.client.HTTPException) as exc:
+        print(f"❌ https 连不上 8000: {exc}")
+        return 1
     if status != 307:
         notes.append(f"后端没有对 {REDIRECT_PATH} 返回 307（实际 {status}）"
                      f"—— 换一条会重定向的路由再验")
     if not loc1.startswith("https://"):
         fails.append(f"https 新连接的 Location 不是 https://: {loc1!r}")
     else:
-        print(f"[6] ✅ https 新连接 Location = {loc1}")
+        print(f"[5] ✅ https 新连接 Location = {loc1}")
 
     # 复用同一条连接再要一次 —— 浏览器就是这么干的（keep-alive）
     _, loc2 = _location(conn, REDIRECT_PATH)
@@ -392,7 +405,7 @@ def main() -> int:
         fails.append(f"https **复用连接** 的 Location 不是 https://: {loc2!r} "
                      f"（只注入第一个请求头是不够的）")
     else:
-        print(f"[7] ✅ https 复用连接 Location = {loc2}")
+        print(f"[6] ✅ https 复用连接 Location = {loc2}")
     conn.close()
 
     for n in notes:

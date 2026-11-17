@@ -62,7 +62,14 @@ from app.core.audio.capture import StreamResampler  # noqa: E402
 
 LOG = logging.getLogger("asr_mic_agent")
 
-DEFAULT_URL = "http://127.0.0.1:8000"
+# 8000 已改为 uvicorn 原生 TLS。
+#
+# 用标准库 urllib 的默认 SSL 上下文即可验签通过，不需要 verify=False，
+# 也不需要自带证书包 —— 两个条件都满足：
+#   ① 板子系统信任库已装私有 CA（/usr/local/share/ca-certificates/）；
+#   ② 叶子证书的 SAN 含 IP:127.0.0.1 ⇒ 主机名校验也过。
+# 实测：urllib.request.urlopen('https://127.0.0.1:8000/health') -> 200
+DEFAULT_URL = "https://127.0.0.1:8000"
 DEFAULT_DEVICE = "hw:1,0"
 DEFAULT_CHUNK_MS = 500
 

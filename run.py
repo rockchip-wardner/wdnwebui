@@ -573,6 +573,45 @@ _ensure_wdndds_built()
 _ensure_wdndds_native_path()
 
 
+# 生产入口端口。8000 已在 2026-11-16 改成 **uvicorn 原生 TLS**
+# （systemd 单元 ExecStart 带 --ssl-certfile/--ssl-keyfile）。
+PRODUCTION_HTTPS_PORT = 8000
+
+
+def _resolve_tls(args) -> dict:
+    """把 ``--ssl-certfile`` / ``--ssl-keyfile`` 解析成 uvicorn 的 kwargs。
+
+    返回 ``{}`` 表示**明文**启动（是否允许由 main() 的端口护栏决定）。
+
+    ⚠️ 校验失败一律 ``SystemExit(2)``，**绝不降级成明文继续跑** ——
+    「证书路径写错了就退回 HTTP」会把生产的 HTTPS 入口悄悄换掉，
+    而现场只看到「服务起来了」，看不出协议变了。
+    """
+    cert = getattr(args, "ssl_certfile", None)
+    key = getattr(args, "ssl_keyfile", None)
+    if not cert and not key:
+        return {}
+    if not (cert and key):
+        print("[run.py] ERROR: --ssl-certfile 与 --ssl-keyfile 必须**成对**"
+              "给出；只给一个无法启用 TLS。", file=sys.stderr)
+        raise SystemExit(2)
+
+    resolved = {}
+    for label, raw in (("--ssl-certfile", cert), ("--ssl-keyfile", key)):
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            print(f"[run.py] ERROR: {label} 不存在: {path}", file=sys.stderr)
+            raise SystemExit(2)
+        if not os.access(path, os.R_OK):
+            print(f"[run.py] ERROR: {label} 不可读: {path}", file=sys.stderr)
+            raise SystemExit(2)
+        resolved[label] = str(path)
+    return {
+        "ssl_certfile": resolved["--ssl-certfile"],
+        "ssl_keyfile": resolved["--ssl-keyfile"],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="wdnwebui",
@@ -614,6 +653,25 @@ def main() -> None:
              "the last flag wins if both are passed. compute_workers "
              "are never killed by run.py regardless of this flag.",
     )
+    parser.add_argument(
+        "--ssl-certfile",
+        default=os.environ.get("WDNWEBUI_SSL_CERTFILE") or None,
+        help="TLS 证书路径。给了（且 --ssl-keyfile 也给了）就启用 HTTPS —— "
+             "生产 systemd 单元用的就是它。默认取环境变量 "
+             "WDNWEBUI_SSL_CERTFILE。",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        default=os.environ.get("WDNWEBUI_SSL_KEYFILE") or None,
+        help="TLS 私钥路径。默认取环境变量 WDNWEBUI_SSL_KEYFILE。",
+    )
+    parser.add_argument(
+        "--allow-plaintext",
+        action="store_true", default=None,
+        help="显式允许在 **生产端口 8000** 上以明文启动（默认拒绝）。"
+             "只有本地调试确实需要明文时才用；等价于环境变量 "
+             "WDNWEBUI_ALLOW_PLAINTEXT=1。",
+    )
     args, _unknown = parser.parse_known_args()
 
     # Resolve kill-stale default: env override > CLI > default ON.
@@ -654,6 +712,34 @@ def main() -> None:
     os.environ["WDNWEBUI_CONFIG"] = str(config_path)
     os.environ["WDNWEBUI_PORT"] = str(port)
 
+    # ---- TLS 解析 + 端口护栏 ----------------------------------------
+    #
+    # ⚠️ **必须在 _kill_stale_wdnwebui_processes 之前**：
+    #    8000 已经是**生产 HTTPS 端口**。run.py 的默认行为是「杀掉占着
+    #    这个端口的旧实例再接管」⇒ 如果护栏放在 kill 之后，一次「本地
+    #    调试」的 `python run.py` 会先把生产的 HTTPS 实例杀掉，然后自己
+    #    以**明文**接管 8000 —— 现场只看得到「服务还在」，看不出协议被换
+    #    掉了。护栏必须在**动生产之前**就生效。
+    _ssl = _resolve_tls(args)
+
+    allow_plaintext = bool(args.allow_plaintext) or (
+        os.environ.get("WDNWEBUI_ALLOW_PLAINTEXT", "").strip() == "1")
+    if port == PRODUCTION_HTTPS_PORT and not _ssl and not allow_plaintext:
+        print(
+            "[run.py] ERROR: 拒绝在生产端口 8000 上以**明文**启动。\n"
+            f"        8000 是生产 HTTPS 入口（systemd 单元带 "
+            f"--ssl-certfile/--ssl-keyfile）。\n"
+            "        而 run.py 默认会杀掉占着 8000 的旧实例再接管 ⇒ 明文\n"
+            "        启动等于把生产的 HTTPS 入口换成明文。\n"
+            "        三条出路：\n"
+            "          1) 给 TLS 参数：--ssl-certfile <cert> --ssl-keyfile <key>\n"
+            "             （或环境变量 WDNWEBUI_SSL_CERTFILE / WDNWEBUI_SSL_KEYFILE）\n"
+            "          2) 换端口调试：--port 8001（其它端口允许明文）\n"
+            "          3) 确实需要明文：--allow-plaintext（或 WDNWEBUI_ALLOW_PLAINTEXT=1）",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
     # Reap the stale uvicorn on **this** port + compute_workers from any
     # previous unclean shutdown BEFORE we try to bind. An instance on
     # another port is left running.
@@ -670,11 +756,24 @@ def main() -> None:
     # 18.8 掉到 16.0 fps/路（解码 24.2 → 18.7），两个互不相干的 commit 上
     # 方向一致，而 deflate 对 JPEG 几乎没有体积收益。机制未查清，先保持
     # 默认开启；systemd 那条 ExecStart 同样别加 --ws-per-message-deflate。
+    # TLS —— 与生产 systemd 单元保持一致。
+    #
+    # 8000 已在生产上改为 uvicorn 原生 TLS（--ssl-certfile/--ssl-keyfile），
+    # 所以开发模式也必须能说 https：否则 `python run.py` 起的是**明文** 8000，
+    # 而 run.py 的 _kill_stale_wdnwebui_processes 会把占着 8000 的生产实例
+    # 杀掉顶替掉 —— 一次「本地调试」就把生产的 HTTPS 入口换成明文。
+    #
+    # TLS 的解析/校验/端口护栏都在上面（_resolve_tls）做完了 —— 这里
+    # 直接把结果交给 uvicorn。uvicorn 的 certfile 是**必填**
+    # （uvicorn/config.py:118），且私钥与证书**不同文件**时 keyfile 也
+    # 必须给 ⇒ 两个都给才生效；只给一个的静默降级已被上面拦住。
+
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=port,
         reload=True,
+        **_ssl,
         # **只监听源码目录**，这是白名单而不是排除。
         #
         # 为什么不用 reload_excludes：uvicorn 把它交给 watchfiles 的

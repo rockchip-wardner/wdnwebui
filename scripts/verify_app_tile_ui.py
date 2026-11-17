@@ -26,8 +26,23 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE = "http://localhost:8000"
+BASE = "https://localhost:8000"
 TMP = Path("/tmp/wheels")
+
+# bootRestore() 靠 GET /api/compute/active-app 决定开机跳哪张卡。板子上
+# ``compute.active_app`` 通常有值（当前是 "usb-hid"）⇒ 页面一加载完就被
+# 抢到那张卡去，``#apps`` 的网格虽然还在 DOM 里但**不可见** ⇒
+# ``wait_for_selector(".apps-grid .app-card")`` 必然 30s 超时。
+#
+# active_app_guard 在 Playwright 层拦下 active-app 的**写**方法（GET 放行），
+# 所以它**不能**阻止跳卡 —— 它挡的是「别把生产配置改了」。
+# 这里要的是「别被 boot-restore 抢路由」⇒ 直接等 boot-restore 跑完再切回
+# #apps，而不是在它之前等网格可见。
+#
+# ⇒ 本脚本**不需要** import active_app_guard，也没有别的 scripts/ 下的
+# 同级模块要引 ⇒ **不要**加 ``sys.path.insert``（曾经加过，纯死代码：
+# 它只会把 scripts/ 目录塞进 sys.path，让「本仓库的模块名」有机会
+# 遮蔽同名第三方包）。
 
 _FAILED: list[str] = []
 _PKG = "wdnapps_demo"
@@ -151,7 +166,15 @@ def main() -> int:
         # 不用 wait_until="networkidle"：这个应用有常驻轮询 / WS 心跳（算力状态
         # 1Hz 刷新），网络永远不静默，等 networkidle 必然 30s 超时。改成
         # domcontentloaded + 显式等元素 —— 我们关心的是 DOM 出来了没有。
+        #
+        # ⚠️ 但 boot-restore 会把 hash 抢回「上次进入的卡片」（active_app），
+        #    于是 #apps 的网格不可见 ⇒ 等 .app-card 可见必然超时。
+        #    做法：等 boot-restore 跑完（它读 active_app 的 GET + 跳 hash），
+        #    再**主动**切回 #apps，然后等网格可见。
         page.goto(f"{BASE}/#apps", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)          # 让 boot-restore 跑完
+        page.evaluate("() => { window.location.hash = '#apps'; }")
+        page.wait_for_timeout(1000)
         page.wait_for_selector(".apps-grid .app-card", timeout=30000)
 
         print("=== 1. 磁位渲染 ===")

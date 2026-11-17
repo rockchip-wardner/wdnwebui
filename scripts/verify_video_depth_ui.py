@@ -23,7 +23,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 SOURCES = ["/userdata/assets/uploads/rk-0.mp4",
            "/userdata/assets/uploads/rk-12.mp4"]
 

@@ -30,7 +30,7 @@ def main():
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
 
-        page.goto("http://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
+        page.goto("https://127.0.0.1:8000/", wait_until="domcontentloaded", timeout=15000)
 
         scenarios = [
             ("A. 长路径", f"已选中: {LONG_PATH}", "应截断"),

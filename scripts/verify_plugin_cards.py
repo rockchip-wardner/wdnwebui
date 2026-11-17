@@ -11,12 +11,28 @@ wizard.json 全部 200、控制台无 pageerror。
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
+# 8000 已是原生 TLS（uvicorn --ssl-certfile）。
+#
+# ⚠️ **Playwright 的两套 TLS 栈不一样**：
+#   * 浏览器页（page.goto）走 **Chromium**，读 ``~/.pki/nssdb`` 共享库 ⇒ 认板子 CA
+#   * APIRequestContext（page.request / context.request）走 **Node.js**，
+#     读 Node 自带的 CA bundle ⇒ **不认**板子的私有 CA ⇒
+#     "unable to verify the first certificate"
+#
+# ``NODE_EXTRA_CA_CERTS`` 让 Node 也认这张 CA。**必须在 Node 进程起来之前设**
+# —— Playwright 的驱动是 ``sync_playwright()`` 启动时 spawn 的，所以模块导入
+# 期设一次就够了（下面这行在 import playwright 之后、启动之前）。
+os.environ.setdefault(
+    "NODE_EXTRA_CA_CERTS",
+    "/home/rockchip/.config/wdnwebui/tls/ca.pem")
+
 from playwright.sync_api import sync_playwright
 
-BASE = "http://localhost:8000"
+BASE = "https://localhost:8000"
 
 # 卡片清单**动态发现**，不写死。
 #

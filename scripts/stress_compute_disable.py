@@ -38,7 +38,7 @@ import urllib.request
 from typing import Any, Optional
 
 
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 # Spec calls for qwen3-vl-4b @ 0 + qwen3-tts @ 1. In a multi-board LAN
 # env qwen3-vl-4b may be ADOPTED from a peer at boot → POST returns
 # 403, can't spawn. resolve_targets() picks the first two spawnable

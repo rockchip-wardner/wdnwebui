@@ -35,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-API = "http://127.0.0.1:8000"
+API = "https://127.0.0.1:8000"
 TIMEOUT_S = 180
 REPEAT = 6
 # 同一音色的 F0 极差上限(半音)。8 半音 ≈ 50%。

@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8000/api/video-target-localization"
+BASE = "https://127.0.0.1:8000/api/video-target-localization"
 
 DEFAULT_VIDEO = "/userdata/assets/uploads/rk-0.mp4"
 DEFAULT_QUERY = "穿黄色衣服的人"

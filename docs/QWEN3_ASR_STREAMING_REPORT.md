@@ -415,7 +415,7 @@ $ grep pcie /proc/interrupts
 ASR worker 目前**运行在 card 1**（运行期状态，不落盘），随时可停：
 
 ```bash
-curl -X DELETE http://127.0.0.1:8000/api/compute/instances \
+curl -X DELETE https://127.0.0.1:8000/api/compute/instances \
   -H 'Content-Type: application/json' -d '{"model":"qwen3-asr"}'
 ```
 
@@ -856,7 +856,7 @@ select 可用宽度约 60px，刚好放下）。
 4. **ASR worker 目前运行在 card 1**（运行期状态，不落盘；重启后需重新启用）。
    停掉：
    ```bash
-   curl -X DELETE http://127.0.0.1:8000/api/compute/instances \
+   curl -X DELETE https://127.0.0.1:8000/api/compute/instances \
        -H 'Content-Type: application/json' -d '{"model":"qwen3-asr"}'
    ```
 5. **留一句给运维**：本机 `pcie_rkep` 驱动有一个已知雷 —— 一条永不完成的 DMA

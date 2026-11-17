@@ -128,7 +128,11 @@ jobs:
   #   scripts/verify_video_ws_broadcast.py
   #   scripts/verify_ws_after_page_switch.py
   # which need /userdata/video_test/rk-0.mp4 and the wdnwebui service
-  # reachable on http://127.0.0.1:8000.
+  # reachable on https://127.0.0.1:8000.
+  #
+  # 8000 只说 HTTPS（uvicorn 原生 TLS）⇒ 这两个脚本用 https:// 与 wss://。
+  # runner 必须信任板子的 CA：板子自己跑 ⇒ CA 已装进系统信任库；别的机器
+  # ⇒ 设 REQUESTS_CA_BUNDLE=/home/rockchip/.config/wdnwebui/tls/ca.pem。
   # ──────────────────────────────────────────────────────────────────
   integration:
     name: integration (WS broadcast end-to-end)

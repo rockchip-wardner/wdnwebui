@@ -14,7 +14,7 @@ import sys
 from playwright.sync_api import sync_playwright
 
 VIDEO = "/userdata/test/tmp/video_target_detection/60b0af0d5cc54e9fa22b169864876c2c.mp4"
-BASE = "http://127.0.0.1:8000"
+BASE = "https://127.0.0.1:8000"
 
 # (app_id, wizard.json 里声明或按 -open→-canvas 推导出的画面 id, 视频源字段 id)
 CARDS = [

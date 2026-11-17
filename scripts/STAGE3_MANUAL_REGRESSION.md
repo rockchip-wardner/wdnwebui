@@ -13,7 +13,7 @@ pkill -9 -f compute_worker            # 清掉打补丁前代码的孤儿 worker
 .venv/bin/python run.py               # uvicorn 会自己 spawn 新 worker
 ```
 
-打开 `http://<板子IP>:8000`。
+打开 `https://<板子IP>:8000`（8000 只说 HTTPS）。
 
 > **每张卡片首次进入都会弹向导**（v0.4 的设计，不是回归）。走完向导再测
 > 主流程。wizard 完成后会自动调 `applyWizardSnapshot` 并触发启动按钮。
