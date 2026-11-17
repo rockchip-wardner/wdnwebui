@@ -623,6 +623,7 @@
       {% card_slot "tts" %}
       {% card_slot "text-chat" %}
       {% card_slot "web-translate" %}
+      {% card_slot "content-review" %}
       {% card_slot "media-generator" %}
       {% card_slot "image-editor" %}
       {% card_slot "usb-hid" %}
