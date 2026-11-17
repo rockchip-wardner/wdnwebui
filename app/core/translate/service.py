@@ -54,6 +54,53 @@ _WS = re.compile(r"\s+")
 _ITEM_RE = re.compile(r"^\s*(\d{1,3})\s*[.)、]?\s*(.*)$")
 
 
+#: perf 表里**可以累加**的原始计数（其余是派生量，不累加）。
+_PERF_COUNTER_KEYS = ("n_decode_tokens", "n_prefill_tokens",
+                      "prefill_ms", "decode_ms")
+
+
+def _merge_perf(dst: dict[str, float], src: dict | None) -> dict[str, float]:
+    """把一份**推理性能表**累加进汇总表。
+
+    ⚠️ 累加而不是覆盖：一个 provider 一条文案可能要试**好几条措辞**
+    （``PROMPT_ORDER``），每条措辞都是一次完整推理 —— 真正花掉的 token
+    和时间是**所有这些推理之和**。只记最后一次的话，tokens/s 会好看得
+    离谱，而用户实际等的是那么久。
+
+    ⚠️ **只累加原始计数**；派生量（tokens/s 等）由 :func:`_finish_perf`
+    从累加后的计数**重算** —— 每次推理各自的速率加起来没有意义。
+
+    ⚠️ 只加**数字**字段：这个 dict 最后要进 JSON 响应，混进别的类型
+    会让整个响应序列化失败（推理成功了但前端收到 500）。
+    """
+    if not isinstance(src, dict):
+        return dst
+    for key, val in src.items():
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            continue
+        if key in _PERF_COUNTER_KEYS:
+            dst[key] = dst.get(key, 0.0) + float(val)
+    return dst
+
+
+def _finish_perf(perf: dict[str, float]) -> dict[str, float]:
+    """把累加好的原始计数算成最终性能表（补上派生量）。
+
+    ⚠️ 派生量用 **SDK 自己的** :func:`wdnai.perf_table` 算 —— 和 SDK 打印的
+    那张 perf 表**同一份公式**。宿主要是自己另写一套，两边迟早漂。
+
+    ⚠️ **没有原始计数就返回空字典**（不是「一堆 0」）：外网 provider 压根
+    没推理 ⇒ 性能表就该是空的 ⇒ 前端一眼看出「这条路没有推理数据」。
+    """
+    if not perf:
+        return {}
+    from wdnai import perf_table
+
+    out = dict(perf)
+    out.update(perf_table(out))
+    return out
+
+
 def normalize(text: str) -> str:
     """把一段文案压成单行。
 
@@ -103,7 +150,18 @@ class TranslateService:
         """把一批文案翻成 ``target``。
 
         返回 ``(译文列表, 统计信息)``;译文列表与入参**一一对应、同序**。
+
+        ⚠️ 统计信息里带了两个**性能**字段（2026-11-17 加）：
+
+        * ``elapsed_ms`` —— **端到端**耗时（毫秒）。从进函数到出函数的
+          墙钟时间，含缓存查找、批次拆分、补翻，以及批与批之间的间隔。
+          这是**用户实际等到的那个时间**。
+        * ``perf`` —— **推理**性能表（数字字典）：
+          ``n_decode_tokens`` / ``n_prefill_tokens`` / ``prefill_ms`` /
+          ``decode_ms``。只有本地 provider（本板 NPU）才有；外网那几家
+          压根不推理 ⇒ 这个字段是空的。
         """
+        t_start = time.perf_counter()
         norm = [normalize(s) for s in segments]
         results: list[str] = [""] * len(norm)
 
@@ -138,11 +196,14 @@ class TranslateService:
         #: 外网那家，但实际是 **23 条 NPU + 1 条外网**。上报「多数条」那家
         #: 才符合实际（前端据此显示 NPU 徽标）。
         provider_counts: dict[str, int] = {}
+        #: **推理性能表汇总**（跨批次累加）—— 只有本地 provider 才有。
+        perf_total: dict[str, float] = {}
         for batch in self._pack(pending):
-            translated, calls, misses, provs = self._translate_batch(
+            translated, calls, misses, provs, perf = self._translate_batch(
                 batch, source, target)
             requests += calls
             failed += len(misses)
+            _merge_perf(perf_total, perf)
             for name, cnt in provs.items():
                 provider_counts[name] = provider_counts.get(name, 0) + cnt
             for j, (text, out) in enumerate(zip(batch, translated)):
@@ -181,6 +242,18 @@ class TranslateService:
             elif used_external:
                 time.sleep(_BATCH_GAP)
 
+        # ⚠️ **性能**（2026-11-17 加）——
+        #
+        # ⚠️ **全部在宿主算好再发给前端** —— 前端只负责显示，一个数都不
+        # 自己算（用户明确要求：不要在 JS 端计时 / 换算）。
+        #
+        # ``elapsed_ms``      = 端到端墙钟耗时（用户实际等的那个时间）。
+        # ``elapsed_s``       = 同一个数，秒为单位（给界面显示用）。
+        # ``tokens_per_second`` = **SDK 算好的**解码吞吐（tokens/s）。
+        # ``perf``            = 完整性能表（原始计数 + 派生量）。
+        #   只有本地 provider（本板 NPU）才有 —— 外网那几家不推理。
+        elapsed_ms = int((time.perf_counter() - t_start) * 1000)
+        perf_final = _finish_perf(perf_total)
         stats = {
             "provider": self._dominant_provider(provider_counts),
             "providers": self.provider_names,
@@ -192,6 +265,11 @@ class TranslateService:
             # 没能翻出来的条数(保留原文)—— 前端要把它显示出来,不然用户
             # 以为整页都翻好了。
             "failed": failed,
+            "elapsed_ms": elapsed_ms,
+            "elapsed_s": round(elapsed_ms / 1000.0, 2),
+            "tokens_per_second": round(
+                float(perf_final.get("decode_tokens_per_second") or 0.0), 1),
+            "perf": perf_final,
         }
         return results, stats
 
@@ -227,11 +305,11 @@ class TranslateService:
 
     def _translate_batch(
         self, texts: Sequence[str], source: str, target: str
-    ) -> tuple[list[str], int, set[int], dict[str, int]]:
+    ) -> tuple[list[str], int, set[int], dict[str, int], dict[str, float]]:
         """翻一批。
 
         返回 ``(译文列表, 本次实际发出的请求数, 失败条在批内的下标集合,
-        各 provider 翻了多少条)``。
+        各 provider 翻了多少条, 推理性能表)``。
 
         失败分三种,处理方式**不一样**:
 
@@ -245,6 +323,7 @@ class TranslateService:
           那个 bug 的修复点。
         """
         joined = self._pack_numbered(texts)
+        perf: dict[str, float] = {}
         try:
             res = self._chain.translate(joined, source, target)
         except QuotaExceeded:
@@ -254,8 +333,9 @@ class TranslateService:
             LOG.warning(
                 "translate: 批次请求失败(%d 条),本批保留原文: %s", len(texts), exc
             )
-            return list(texts), 0, set(range(len(texts))), {}
+            return list(texts), 0, set(range(len(texts))), {}, perf
 
+        _merge_perf(perf, getattr(res, "perf", None))
         parsed = self._parse_numbered(res.text, len(texts))
         if parsed is not None:
             out = parsed
@@ -265,12 +345,13 @@ class TranslateService:
             if res.provider:
                 provs[res.provider] = max(0, len(texts) - len(misses))
             if misses:
-                out, misses, extra, fixed = self._repair(
+                out, misses, extra, fixed, rperf = self._repair(
                     out, misses, texts, source, target, res.failed_provider)
                 calls += extra
+                _merge_perf(perf, rperf)
                 for name, cnt in fixed.items():
                     provs[name] = provs.get(name, 0) + cnt
-            return out, calls, misses, provs
+            return out, calls, misses, provs, perf
 
         # 编号没对上(MT 把两条并成一条、或把编号改写了)→ 逐条翻
         LOG.warning(
@@ -289,6 +370,7 @@ class TranslateService:
                 out.append(text)
                 misses.add(i)
                 continue
+            _merge_perf(perf, getattr(r, "perf", None))
             if r.misses:
                 out.append(text)
                 misses.add(i)
@@ -296,12 +378,12 @@ class TranslateService:
             out.append(r.text)
             if r.provider:
                 provs[r.provider] = provs.get(r.provider, 0) + 1
-        return out, len(texts) + 1, misses, provs
+        return out, len(texts) + 1, misses, provs, perf
 
     def _repair(
         self, out: list[str], misses: set[int], texts: Sequence[str],
         source: str, target: str, failed_provider: str,
-    ) -> tuple[list[str], set[int], int, dict[str, int]]:
+    ) -> tuple[list[str], set[int], int, dict[str, int], dict[str, float]]:
         """**只补翻没翻出来的那几条** —— 已经翻好的不牵连。
 
         provider 侧已经把它们单独报上来了(``TranslationResult.misses``)。
@@ -310,11 +392,15 @@ class TranslateService:
 
         以前是「任何一条失败 → 整批抛异常 → 整批交给外网」—— NPU 已经
         跑完的那 23 条**全白跑**(实测 28 种界面语言里有 7 种栽在这上面)。
+
+        返回值最后一项是**补翻这段的推理性能表**（补翻走的是外网 ⇒ 一般
+        是空的，但 provider 链的顺序不保证，理论上可能有本地 provider 兜底）。
         """
         skip = (failed_provider,) if failed_provider else ()
         left = set(misses)
         calls = 0
         provs: dict[str, int] = {}
+        perf: dict[str, float] = {}
         for i in sorted(misses):
             try:
                 r = self._chain.translate(texts[i], source, target, skip=skip)
@@ -324,6 +410,7 @@ class TranslateService:
                 LOG.warning("translate: 单条补翻失败,保留原文: %s", exc)
                 continue
             calls += 1
+            _merge_perf(perf, getattr(r, "perf", None))
             if r.misses:
                 # 补翻的那家也翻不出来 —— 保留原文
                 continue
@@ -331,7 +418,7 @@ class TranslateService:
             left.discard(i)
             if r.provider:
                 provs[r.provider] = provs.get(r.provider, 0) + 1
-        return out, left, calls, provs
+        return out, left, calls, provs, perf
 
     def _dominant_provider(self, counts: dict[str, int]) -> str:
         """「谁来翻」= **翻了多数条**的那家。

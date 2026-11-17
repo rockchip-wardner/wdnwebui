@@ -66,16 +66,34 @@ class TranslationResult(str):
     ``failed_provider``
         这些条目是哪一家翻不出来的 —— 上层补翻时**跳过它**,免得同一段
         文字在同一家身上又失败一次。
+    ``perf``
+        **推理性能表**（本地 provider 才有）—— 数字字典：
+        ``n_decode_tokens`` / ``n_prefill_tokens`` / ``prefill_ms`` /
+        ``decode_ms``。
+
+        ⚠️ 为什么它得跟着返回值走：这些数字**只有 worker 进程里才有**
+        （SDK 把它们写进 ``session._backend.sink.perf``），而 provider 跑在
+        Web UI 进程里 —— 拿不到 ⇒ worker 必须显式带过 wire（见
+        ``wdndds/ai_session.py``），provider 再从 session 上取回来。
+
+        ⚠️ **本地 provider 才有**：外网那几家（有道 / 金山词霸 / MyMemory）
+        压根不推理 ⇒ 这个字段是空的。
     """
 
-    __slots__ = ("provider", "misses", "failed_provider")
+    __slots__ = ("provider", "misses", "failed_provider", "perf")
 
     def __new__(cls, text, provider: str = "", misses=frozenset(),
-                failed_provider: str = ""):
+                failed_provider: str = "", perf=None):
         obj = super().__new__(cls, text if text is not None else "")
         obj.provider = provider or ""
         obj.misses = frozenset(misses or ())
         obj.failed_provider = failed_provider or ""
+        # ⚠️ 只留**数字**：这个 dict 最后要进 JSON 响应，混进别的类型
+        # 会让整个响应序列化失败（推理成功了但前端收到 500）。
+        obj.perf = {
+            str(k): v for k, v in dict(perf or {}).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
         return obj
 
     @property
