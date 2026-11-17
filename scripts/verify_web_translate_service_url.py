@@ -315,8 +315,11 @@ def main() -> int:
             unscoped.append(t)
     check("没有没限定作用域的 .imb-card/.page-header 覆盖",
           not unscoped, str(unscoped))
-    check("「服务详情」和「试一下」并排（.wt-grid）",
-          '<div class="wt-grid">' in tpl)
+    # ⚠️ 两张卡必须**上下堆叠**（用户明确要求：不要并排）
+    check("没有并排容器（两张卡保持上下堆叠）",
+          "wt-grid" not in tpl and "wt-grid" not in css)
+    check("「服务详情」和「试一下」都在页面里",
+          "服务详情" in tpl and "试一下" in tpl)
 
     # ---------------------------------------------------------------- [7] --
     print("\n[7] 「试一下」的下拉框是**目标**语言（源语言固定中文）")
@@ -337,6 +340,20 @@ def main() -> int:
                                  for v, _t in opts), str(opts))
     check("下拉框里没有「源语言」选项",
           not any("源" in t for _v, t in opts), str(opts))
+
+    # 按钮叫「翻译成」且在**下拉框左边** —— 连读成「翻译成 ▾日语」
+    i_btn = tpl.find('id="wt-test-btn"')
+    i_sel = tpl.find('id="wt-test-target"')
+    check("有「翻译成」按钮", i_btn >= 0 and "翻译成" in tpl, str(i_btn))
+    check("按钮在**下拉框左边**",
+          i_btn >= 0 and i_sel > i_btn, "btn=%d select=%d" % (i_btn, i_sel))
+    btn_tag = ""
+    if i_btn >= 0:
+        m = re.search(r'<button[^>]*id="wt-test-btn"[^>]*>([^<]*)</button>', tpl)
+        btn_tag = (m.group(1).strip() if m else "")
+    check("按钮上的文字是「翻译成」", btn_tag == "翻译成", repr(btn_tag))
+    check("下拉框在按钮**右边**（模板顺序）",
+          tpl.find('<select id="wt-test-target"') > tpl.find('<button', 0, i_btn))
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
