@@ -398,6 +398,20 @@ def main() -> int:
     check("app.js 里没有残留的 fillTargetLanguages",
           "fillTargetLanguages" not in js_src)
 
+    # ---------------------------------------------------------------- [9] --
+    print("\n[9] 译文框不许被界面翻译**再翻一遍**")
+    fw_src2 = open(FRAMEWORK_TRANSLATE_JS, encoding="utf-8").read()
+    check("框架的跳过名单里有 [translate='no']",
+          "[translate='no']" in fw_src2)
+    m_out = re.search(r'<div[^>]*id="wt-test-output"[^>]*>', tpl)
+    check("译文框 wt-test-output 上有 translate=\"no\"",
+          bool(m_out) and 'translate="no"' in m_out.group(0),
+          m_out.group(0) if m_out else "(没找到)")
+    # ⚠️ 这个坑：界面语言是英语时，译文框里的中文原文会被界面翻译翻成英语
+    # ⇒ 用户看到「翻译成中文，出来还是英语」（2026-11-17 用户报）。
+    check("译文框不是「界面文案」容器（不被界面翻译接管）",
+          bool(m_out) and "translate=" in m_out.group(0))
+
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
     return 1 if _FAIL else 0

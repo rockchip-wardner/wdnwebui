@@ -530,6 +530,14 @@ def main() -> int:
     check("审查结果 仍在并排容器**外面**（保持全宽）", "审查结果" not in grid)
     check("输入框收成 3 行", 'rows="3"' in tpl2 and 'rows="4"' not in tpl2)
 
+    # 结果区里的维度名是**数据**（模型的字段名），不能被界面翻译接管：
+    # 界面语言是英语时它们会被翻掉，而上面输入框里的维度名不动（INPUT 在
+    # 跳过名单里）⇒ 两边对不上，用户认不出哪条结果对应哪个维度。
+    m_res = re.search(r'<div[^>]*id="cr-results"[^>]*>', tpl2)
+    check("结果区标了 translate=\"no\"（维度名不许被界面翻译接管）",
+          bool(m_res) and 'translate="no"' in m_res.group(0),
+          m_res.group(0) if m_res else "(没找到)")
+
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
     return 1 if _FAIL else 0
