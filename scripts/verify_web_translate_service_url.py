@@ -49,6 +49,8 @@ CARD = os.path.join(REPO, ".venv/src/wdnapps_audio_chat/src/wdnapps_audio_chat"
 WIZARD_JSON = os.path.join(CARD, "static/wizard.json")
 TEMPLATE_HTML = os.path.join(CARD, "static/template.html")
 CARD_APP_JS = os.path.join(CARD, "static/app.js")
+CARD_CSS = os.path.join(CARD, "static/app.css")
+CARD_API = os.path.join(CARD, "api.py")
 STATE_JS = os.path.join(REPO, "app/static/core/wizard/state.js")
 TRANSLATE_API = os.path.join(REPO, "app/system/api/translate.py")
 SYSTEM_INIT = os.path.join(REPO, "app/system/__init__.py")
@@ -296,6 +298,45 @@ def main() -> int:
             check("返回里带 provider 链", "provider" in body, str(body)[:200])
         except Exception as exc:  # noqa: BLE001
             check("GET /api/translate/status = 200", False, repr(exc))
+
+    # ---------------------------------------------------------------- [6] --
+    print("\n[6] 紧凑布局（别让「服务详情」底下空一大块）")
+    css = open(CARD_CSS, encoding="utf-8").read()
+    check("卡片高度改回按内容自适应（min-height:0）",
+          "#page-web-translate .imb-card" in css
+          and "height: auto;" in css and "min-height: 0;" in css)
+    check("紧凑覆盖都限定在 #page-web-translate 作用域内",
+          css.count("#page-web-translate") >= 8, str(css.count("#page-web-translate")))
+    unscoped = []
+    for line in css.splitlines():
+        t = line.strip()
+        if (t.startswith(".imb-card") or t.startswith(".page-header")
+                or t.startswith(".raw-output")) and "{" in t:
+            unscoped.append(t)
+    check("没有没限定作用域的 .imb-card/.page-header 覆盖",
+          not unscoped, str(unscoped))
+    check("「服务详情」和「试一下」并排（.wt-grid）",
+          '<div class="wt-grid">' in tpl)
+
+    # ---------------------------------------------------------------- [7] --
+    print("\n[7] 「试一下」的下拉框是**目标**语言（源语言固定中文）")
+    js_src = open(CARD_APP_JS, encoding="utf-8").read()
+    card_api = open(CARD_API, encoding="utf-8").read()
+    check("下拉框标了 aria-label=目标语言", 'aria-label="目标语言"' in tpl)
+    check("下拉框 id 是 wt-test-target", 'id="wt-test-target"' in tpl)
+    check("值取自下拉框", '$("wt-test-target")' in js_src)
+    check("请求里 source 固定 zh-CN", 'source: "zh-CN"' in js_src)
+    check("请求里 target 用的是下拉框的值", "target: target" in js_src)
+    check("后端 payload 同样是 source=zh-CN / target",
+          'source: str = "zh-CN"' in card_api and 'target: str = "en"' in card_api,
+          card_api[:0])
+    # 下拉框里必须只有目标语言（英语/日语/…），不该出现「源语言」这类选项
+    opts = re.findall(r'<option value="([^"]+)">([^<]+)</option>', tpl)
+    check("下拉框是语言代码列表（目标语言）",
+          len(opts) >= 5 and all(v in ("en", "ja", "ko", "fr", "de", "es", "ru")
+                                 for v, _t in opts), str(opts))
+    check("下拉框里没有「源语言」选项",
+          not any("源" in t for _v, t in opts), str(opts))
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")

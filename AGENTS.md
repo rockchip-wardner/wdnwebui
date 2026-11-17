@@ -1068,6 +1068,38 @@ session 同时只能有一个推理在飞**。要并发必须有多个 session�
 地址、curl 示例、完成页摘要，并核对声明的路径在 ``app/system/api/translate.py``
 里真有路由。
 
+### 「试一下」的下拉框是**目标**语言（源语言固定中文）
+
+`select#wt-test-target`（``aria-label="目标语言"``，选项 en/ja/ko/fr/de/es/ru）
+选的是**翻成哪种语言**；**源语言写死中文**，不是用户选的：
+
+* 前端发 ``{segments: [text], source: "zh-CN", target: <下拉框的值>}``
+* 后端 ``TranslatePayload``：``source: str = "zh-CN"`` / ``target: str = "en"``
+
+实测（真机，2026-11-17，``providers=['npu', ...]`` 走的是本板 NPU）：
+``target=en`` → *"Today is a nice day…"*；``target=ja`` → *"今日の天気が…"*；
+``target=ko`` → *"오늘 날씨가…"*；``target=ru`` → *"Сегодня хорошая погода…"*。
+
+⇒ **别把下拉框改成「源语言」选择器**：那是两个语义，用户问「译文是哪种语言」时
+答案是下拉框选的那个。
+
+### 紧凑布局（2026-11-17）
+
+⚠️ 同一个框架陷阱：`.imb-card` 带 ``min-height: 480px``（给**并排两列的网格页**
+准备的）。这张卡是**单列堆叠两个大卡** ⇒ 「服务详情」内容只 ~370px 却占 480px
+（底下空 ~110px），「试一下」内容只 ~150px 却占 480px ⇒ 整页大半是空白。
+
+⇒ 处理方式和「图文内容审查」卡一样，**全部限定在 `#page-web-translate`
+作用域内**（所有卡片的 app.css 拼在同一页面，不限定会改到别的卡）：
+
+* `.imb-card { height: auto; min-height: 0; }`
+* 「服务详情」和「试一下」**并排**（模板加 ``.wt-grid`` 包裹，
+  ``minmax(0,1.35fr) minmax(0,1fr)``，``≤1080px`` 回落成上下堆叠）
+* 卡头/卡身/间距收紧、详情表行距 ``0.45rem`` → ``0.3rem``
+
+回归加了两段：``[6]`` 紧凑布局（作用域 / min-height / 并排）、
+``[7]`` 下拉框语义（``source`` 固定 / ``target`` 取自下拉框 / 没有「源语言」选项）。
+
 ### ⚠️ 批间 1.2s 间隔：**只对走外网的 provider 生效**
 
 `TranslateService` 每批之间 sleep `_BATCH_GAP` = 1.2s —— 那是**给免费外网
