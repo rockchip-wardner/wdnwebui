@@ -3972,6 +3972,13 @@ const ComputeConfigPage = {
       const slot = this._slotKey(npuIndex, replica);
       const label = document.createElement("label");
       label.className = "cc-target-opt";
+      // 第 2 份起（每张卡的第二个复选框）**整个选项加括号**：
+      // 「RK182x #0-1 | (☐ #0-2)」。
+      //
+      // ⚠️ 括号要包住**复选框本身** ⇒ 用 CSS 伪元素（::before/::after），
+      // **不能**把括号写进标题文本 —— 那样会变成「☐ (#0-2)」，括号跑到框外，
+      // 而且括号和框之间会被 flex gap 撑开。
+      if (Number(replica || 0) > 0) label.classList.add("cc-target-opt-bracket");
       label.title = sub || "";
       const input = document.createElement("input");
       // checkbox 而非 radio：同一个模型可以同时跑在多张卡上、同一张卡上
@@ -4012,6 +4019,9 @@ const ComputeConfigPage = {
         // ⚠️ **每张卡只有第一个写全名**，后面的省掉 "RK182x " 前缀 ——
         // 四个并排时全名太占地方（有溢出风险）。「卡号-份号」的形式本身
         // 已经能看出是哪个卡哪一份。
+        //
+        // 第 2 份起**整个选项被括号包住**（renderOpt 里加的
+        // cc-target-opt-bracket ⇒ CSS 伪元素）：「(☐ #0-2)」。
         const title = rep === 0
           ? `RK182x #${idx}-${rep + 1}`
           : `#${idx}-${rep + 1}`;

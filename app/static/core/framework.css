@@ -3050,6 +3050,29 @@ body.dg-modal-open .back-home-btn {
   color: var(--muted);
   cursor: not-allowed;
 }
+/* v0.20: 每张卡的**第 2 份起**，整个选项被括号包住：「(☐ #0-2)」。
+ *
+ * ⚠️ 括号必须包住**复选框本身** ⇒ 用伪元素（::before / ::after），
+ * 不能把括号写进标题文本 —— 那样是「☐ (#0-2)」，括号跑到框外。
+ *
+ * ⚠️ .cc-target-opt 是 inline-flex + gap:4px，伪元素也算 flex item ⇒
+ * 会多出 4px 间距，渲染成「( ☐ #0-2 )」。所以这里 gap 归 0，改由
+ * input 的 margin-right 补那 4px（标题和框之间）。
+ * 选择器要压过 `.cc-target-opt input[type=checkbox] { margin: 0 }`
+ * （那条是 (0,2,1)，这条是 (0,3,1)，且写在后面）。 */
+.cc-target-opt.cc-target-opt-bracket {
+  gap: 0;
+}
+.cc-target-opt.cc-target-opt-bracket::before {
+  content: "(";
+}
+.cc-target-opt.cc-target-opt-bracket::after {
+  content: ")";
+}
+.cc-target-opt.cc-target-opt-bracket input[type="radio"],
+.cc-target-opt.cc-target-opt-bracket input[type="checkbox"] {
+  margin: 0 4px 0 0;
+}
 
 /* v0.16: 「运行在」里的**第三个设备**（本机 SoC 自带的 NPU）。
  * 它不是 EP 协卡 ⇒ 不可勾选 —— 由 worker 在 open 阶段自己挑（Qwen-Image-2.1

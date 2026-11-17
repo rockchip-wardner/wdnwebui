@@ -4,8 +4,12 @@
 背景
 ----
 小模型可以在一张卡上并行跑多份（manifest 的 ``max_replicas_per_card``），
-算力页据此给每张卡渲染**多个复选框**（"RK182x #0" / "RK182x #0 (2)"），
+算力页据此给每张卡渲染**多个复选框**（"RK182x #0-1" / "(☐ #0-2)"），
 用户按显存自己勾。
+
+⚠️ 每张卡的**第 2 份起**，整个选项（含复选框）被括号包住 —— 括号用 CSS
+伪元素（``cc-target-opt-bracket``）实现，不在 DOM 文本里，所以本脚本校验的
+是**那个 class**，外加 ``framework.css`` 里的伪元素规则。
 
 踩过的坑
 --------
@@ -37,6 +41,7 @@ sys.path.insert(0, REPO)
 
 API = "http://127.0.0.1:8000/api/compute"
 SYSTEM_JS = os.path.join(REPO, "app/system/static/system.js")
+FRAMEWORK_CSS = os.path.join(REPO, "app/static/core/framework.css")
 
 _PASS = 0
 _FAIL = 0
@@ -84,9 +89,18 @@ def build_js(fieldset_fn: str, payload: dict) -> str:
 
 // ---- 最小 DOM stub ----
 function mkNode(tag) {
-  return {
-    tagName: tag, className: "", textContent: "", style: {}, dataset: {},
+  const classes = new Set();
+  const node = {
+    tagName: tag, textContent: "", style: {}, dataset: {},
     children: [], hidden: false, checked: false, value: "", type: "",
+    // classList：前端用 label.classList.add("cc-target-opt-bracket")
+    // 标记「第 2 份起要加括号」，stub 必须支持（不然这里会直接报错）。
+    classList: {
+      add: (c) => classes.add(c),
+      remove: (c) => classes.delete(c),
+      contains: (c) => classes.has(c),
+      toggle: (c) => (classes.has(c) ? classes.delete(c) : classes.add(c)),
+    },
     appendChild(c) { this.children.push(c); return c; },
     replaceWith() {},
     addEventListener() {},
@@ -94,6 +108,18 @@ function mkNode(tag) {
     getAttribute() { return null; },
     querySelectorAll() { return []; },
   };
+  // className 与 classList **双向同步**（浏览器就是这么做的）——
+  // 前端先 className = "cc-target-opt" 再 classList.add(...)，不同步的话
+  // 序列化出来的 class 会丢掉 "cc-target-opt"（甚至丢掉已加的 class）。
+  Object.defineProperty(node, "className", {
+    get: () => Array.from(classes).join(" "),
+    set: (v) => {
+      classes.clear();
+      String(v == null ? "" : v).split(/\\s+/)
+        .filter(Boolean).forEach((c) => classes.add(c));
+    },
+  });
+  return node;
 }
 globalThis.document = {
   createElement: mkNode,
@@ -131,7 +157,15 @@ const boxes = [];
   const text = own || inherited;
   for (const c of (node.children || [])) {
     if (c.tagName === "input" && c.type === "checkbox") {
-      boxes.push({value: c.value, label: text});
+      boxes.push({
+        value: c.value,
+        label: text,
+        // 括号是 CSS 伪元素，DOM 里看不到 ⇒ 只能校验「label 上挂了
+        // cc-target-opt-bracket 这个 class」。
+        classes: node.className || "",
+        bracket: !!(node.classList
+                    && node.classList.contains("cc-target-opt-bracket")),
+      });
     }
     walk(c, text);
   }
@@ -242,7 +276,36 @@ def main() -> int:
     check("复选框的值是「卡:份」", [b["value"] for b in boxes] ==
           ["0:0", "0:1", "1:0", "1:1"], str([b["value"] for b in boxes]))
 
-    print("\n[4] 每卡只跑 1 份时（max=1）只渲染 2 个")
+    print("\n[4] 第 2 份起的整个选项被括号包住：(☐ #0-2) / (☐ #1-2)")
+    check("第 1/3 个（每卡第 1 份）不带括号",
+          not boxes[0]["bracket"] and not boxes[2]["bracket"],
+          str([b["bracket"] for b in boxes]))
+    check("第 2/4 个（每卡第 2 份）带括号",
+          boxes[1]["bracket"] and boxes[3]["bracket"],
+          str([b["bracket"] for b in boxes]))
+    check("className 上带着 cc-target-opt-bracket（浏览器里看得到的那串）",
+          all("cc-target-opt-bracket" in b["classes"]
+              for b in (boxes[1], boxes[3]))
+          and all("cc-target-opt-bracket" not in b["classes"]
+                  for b in (boxes[0], boxes[2])),
+          str([b["classes"] for b in boxes]))
+    # 括号用 CSS 伪元素包住**整个选项**（含复选框）⇒ 标题文本里**不能**
+    # 出现括号，否则会渲染成「☐ (#0-2)」——括号跑到框外去了。
+    check("标题文本里没有括号（括号由 CSS 伪元素负责）",
+          not any("(" in b["label"] or ")" in b["label"] for b in boxes),
+          str(titles))
+    css = open(FRAMEWORK_CSS, encoding="utf-8").read()
+    check("framework.css 有 cc-target-opt-bracket 的伪元素规则",
+          ".cc-target-opt.cc-target-opt-bracket::before" in css
+          and 'content: "("' in css
+          and 'content: ")"' in css,
+          "framework.css 缺括号伪元素规则")
+    check("括号规则里 gap 归 0（不然会渲染成「( ☐ #0-2 )」）",
+          ".cc-target-opt.cc-target-opt-bracket {" in css
+          and "gap: 0;" in css,
+          "framework.css 的括号规则没有 gap: 0")
+
+    print("\n[5] 每卡只跑 1 份时（max=1）只渲染 2 个")
     svc1 = dict(svc)
     svc1["max_replicas_per_card"] = 1
     payload1 = dict(payload)
@@ -250,8 +313,11 @@ def main() -> int:
     payload1["inst"] = svc1
     boxes1 = run_js(build_js(fieldset_fn, payload1))
     check("只渲染 2 个复选框", len(boxes1) == 2, str(len(boxes1)))
+    check("每卡只有第 1 份 ⇒ 没有括号",
+          not any(b["bracket"] for b in boxes1),
+          str([b["bracket"] for b in boxes1]))
 
-    print("\n[5] 负向：旧行为（service 条目没有这个字段）只能渲染 2 个")
+    print("\n[6] 负向：旧行为（service 条目没有这个字段）只能渲染 2 个")
     # 旧后端：service 条目里没有 max_replicas_per_card，前端 meta 也就抄不到
     # → 函数里兜底成 1 → 每卡一个复选框。这个断言保证本脚本**不是摆设**：
     # 有人把字段删掉时它会立刻炸。
