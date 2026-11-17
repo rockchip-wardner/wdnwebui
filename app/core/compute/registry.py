@@ -1157,6 +1157,13 @@ class ModelInstance:
             "capability_types":   list(self.capability_types),
             "memory_estimate_mb": self.memory_estimate_mb,
             "requires_cards":    int(preset.get("requires_cards", 1) or 1),
+            # **同一张卡上可以并行跑几份** —— 算力页据此渲染复选框：
+            # 2 ⇒ 每张卡给两个复选框（1828#0 的第 1 份 / 第 2 份）。
+            # ⚠️ 这个字段**必须**出现在 service 条目里：算力页的模型卡片是
+            # 从 service 条目拼 meta 的（不是从 supported_models），漏了它
+            # 前端就只会渲染每卡一个复选框。
+            "max_replicas_per_card": int(
+                preset.get("max_replicas_per_card", 1) or 1),
             "description":        preset.get("description", ""),
             "available_targets":  list(preset.get("available_targets", ["182x"])),
             "model_dir":          self.model_dir,
@@ -4201,6 +4208,10 @@ class ComputeRegistry:
                 "capability_types":   list(preset["capability_types"]),
                 "memory_estimate_mb": preset["memory_estimate_mb"],
                 "requires_cards":    int(preset.get("requires_cards", 1) or 1),
+                # 同上：未启用的模型也要告诉前端「每卡能跑几份」，
+                # 否则它的「运行在」也只渲染一个复选框。
+                "max_replicas_per_card": int(
+                    preset.get("max_replicas_per_card", 1) or 1),
                 "description":        preset.get("description", ""),
                 "available_targets":  list(preset.get("available_targets", ["182x"])),
                 "status":             "unavailable",

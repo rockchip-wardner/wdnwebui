@@ -976,6 +976,35 @@ session 同时只能有一个推理在飞**。要并发必须有多个 session�
 ⚠️ 这张表是**实测快照**，不是原理：模型换了权重就得重测
 （脚本：`scripts/probe_prompt_order.py`）。
 
+### ⚠️ 每卡几份 ⇒ 算力页要渲染**几个**复选框
+
+小模型能在一张卡上并行跑几份（manifest 的 ``max_replicas_per_card``，HY-MT
+是 2）⇒ 算力页「运行在」要给每张卡**两个**复选框：
+
+```
+☐ RK182x #0   ☐ RK182x #0 (2)   ☐ RK182x #1   ☐ RK182x #1 (2)
+```
+
+用户按显存自己勾 —— 只勾第 1 份就是「每卡 1 个实例」（2200/5120MB），
+全勾就是「每卡 2 个」（4400/5120MB，放得下）。
+
+⚠️ **踩过的坑：这个字段断了三处，页面就只出 2 个复选框**（症状很像浏览器
+缓存 —— 我一度去查 `Cache-Control`，结果浏览器拿的是最新版）：
+
+1. **后端**：`ModelInstance.to_dict()` 与 `_unavailable_entry()` 都要带
+   ``max_replicas_per_card``。`supported_models` 里**早就有**这个字段，
+   但算力页的模型卡片是从 **service 条目**拼 meta 的，不是从
+   `supported_models` 拿 —— 只在后者里加，页面照样看不到。
+2. **前端**：`system.js` 里的 ``meta`` 是**逐字段**抄的，漏抄
+   ``max_replicas_per_card`` 就兜底成 1 ⇒ 每卡一个复选框。
+3. **签名**：``sig`` / ``radioSig`` 都要带上它，否则改了 manifest 卡片被复用、
+   复选框数量停在旧值。
+
+回归：`scripts/verify_compute_replica_boxes.py` —— 它把 ``system.js`` 里
+的 ``_makeTargetFieldset`` **原样抠出来**（配最小 DOM stub）在 dukpy 里跑，
+数渲染出来的复选框，数据取自真实的 ``GET /api/compute``；带一条**负向**
+用例（字段没了 ⇒ 只剩 2 个），保证它不是摆设。
+
 ### ⚠️ 批间 1.2s 间隔：**只对走外网的 provider 生效**
 
 `TranslateService` 每批之间 sleep `_BATCH_GAP` = 1.2s —— 那是**给免费外网
