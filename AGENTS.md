@@ -12364,6 +12364,41 @@ for parent in Path(core_file).resolve().parents:
 ⚠️ 重启会连坐杀掉 `compute_worker`（`KillMode=control-group`）⇒ 确认
 `config.jsonc` 的 `compute.autostart` 里有条目，否则重启后板子没有算力。
 
+### ⚠ 坑四：`pip wheel` 会在**被监听的目录**里写 `.py` ⇒ 触发热重载 ⇒ 运行期状态全丢
+
+宿主用 uvicorn 的 reload 盯着 `.venv/src/`（`run.py` 的 `reload_dirs`），
+监听的是**源码目录本身**。而 `pip wheel .` 要跑 setuptools 的 `build_wheel`，
+会在工程目录旁边写出 `build/` —— 里面全是 `.py` 副本
+（`build/lib/**.py`、`build/bdist.*/**.py`）。
+
+**每一个 `.py` 写入都会让 WatchFiles 触发一次 reload**，后果是：
+
+* Web UI 进程重启 ⇒ 运行期状态全丢（已启用的卡片 / registry / 实例表）
+* `compute_worker` 被 SIGTERM ⇒ NPU 上的模型被回收
+* 但**显存释放是异步的** ⇒ 状态接口已经报「未启用」，显存却还占着
+  ⇒ 此时再点「启用」就可能**重复加载** ⇒ 显存超限
+
+2026-11-17 实测踩了两次：跑完 `pip wheel` 后
+`/api/content-review/status` 报 `enabled=false`，而 `rknnsmi` 量到卡 0
+仍有 3130 MB、卡 1 仍有 4499 MB —— 对不上。
+
+⇒ **构建 wheel 一律用 `scripts/build_plugin_wheel.sh`**：它在临时副本里
+构建，被监听的源码树保持干净（脚本会自证：构建前后 reload 计数不变）。
+
+```bash
+scripts/build_plugin_wheel.sh              # 构建 wheel → /tmp/wdnwebui_wheels
+scripts/build_plugin_wheel.sh --install    # 再原地刷新 editable 安装
+scripts/build_plugin_wheel.sh --list       # 顺便打印 wheel 内文件清单
+```
+
+✅ **`pip install -e .` 是安全的，不需要副本**：PEP 660 的 setuptools
+editable 安装往源码树里**什么都不写**（实测：无 `.py`，也无 `.egg-info`），
+所以刷新 entry point / package-data 仍然可以直接在原地装。
+
+> 顺带：`package-data` 漏了 `static/*` 时，**editable 装法看不出来，
+> 只有真 wheel 才暴露**（静态资源 404）。所以验 package-data 一定要
+> 真构建一次 wheel 看清单。
+
 ### 验证结果（本机 RK3588）
 
 | 脚本 | 结果 |
