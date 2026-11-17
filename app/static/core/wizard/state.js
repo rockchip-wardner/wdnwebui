@@ -2188,6 +2188,30 @@
         summary.appendChild(row);
       });
     });
+    // ---- 卡片自定义的补充行（可选） ----
+    //
+    // 有些卡片走完向导后要告诉用户「服务在哪儿」—— 比如网页翻译要给
+    // 出板端翻译接口的 URL（别的程序要照着它调）。框架不可能知道每个
+    // 卡片各有什么服务，所以由卡片在 wizard.json 里声明：
+    //
+    //   "finish_extra": [
+    //     {"label": "服务地址", "url_path": "/api/translate"}
+    //   ]
+    //
+    // ``url_path`` 由框架拼上**当前页面的 origin** —— 卡片自己不知道用户
+    // 是用 http://板子IP:8000 还是 https://板子IP:8443（TLS relay 在前面
+    // 终结）访问的，硬拼端口/协议必错。``value`` 则是原样显示的静态文本。
+    (cfg.finish_extra || []).forEach((ex) => {
+      if (!ex) return;
+      const row = _ce("div", WIZARD_NS + "summary-row");
+      row.appendChild(_ce("span", null, (ex.label || "服务地址") + ":"));
+      const val = ex.url_path
+        ? ((window.location && window.location.origin) || "") + ex.url_path
+        : (ex.value || "");
+      row.appendChild(_ce("span", WIZARD_NS + "summary-val", val));
+      summary.appendChild(row);
+      hasAny = true;   // 有补充行 ⇒ 不该再显示「(未填任何配置)」
+    });
     if (!hasAny) {
       summary.appendChild(_ce("div", null, "(未填任何配置)"));
     }

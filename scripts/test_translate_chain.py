@@ -342,12 +342,12 @@ def test_npu_negative_cache() -> None:
     from app.core.translate.npu_provider import NpuTranslateProvider
 
     prov = NpuTranslateProvider()
-    prov._infer = lambda session, prompt: "算力配置"   # 复读原文 -> 翻不出来
     calls = {"n": 0}
 
     def counting(session, prompt):
+        # ⚠️ `_infer` 现在返回 ``(文本, 性能表)``（2026-11-17 加了 perf 透出）
         calls["n"] += 1
-        return "算力配置"
+        return "算力配置", {}
 
     prov._infer = counting
     try:

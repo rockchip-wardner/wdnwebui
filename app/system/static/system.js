@@ -2669,6 +2669,12 @@ const ComputeConfigPage = {
         submodels:            [],
         description:          s.description || "",
         requires_cards:       Number(s.requires_cards || 1),
+        // ⭐ **同一张卡上能跑几份** —— 2 ⇒ 每张卡两个复选框
+        // （「RK182x #0」/「RK182x #0 (2)」），用户可以按显存勾选。
+        // ⚠️ 必须从 service 条目抄过来：模型卡片的 meta 是**逐字段**拼的
+        // （不是整个 supported_models 丢过来），漏了它前端会兜底成 1
+        // —— 症状是「manifest 写了 2，页面上还是每卡一个复选框」。
+        max_replicas_per_card: Number(s.max_replicas_per_card || 1),
         // ⭐ 设备拓扑要求（EP 协卡 + 本机 NPU）。requires_cards 只数 EP
         //    协卡；Qwen-Image-2.1 这类模型还要占住第三个 NPU 设备（本机
         //    3588 的 NPU 或第三张 1828）—— 那个设备不在算力卡列表里。
@@ -2686,6 +2692,9 @@ const ComputeConfigPage = {
         (s.npu_indices || []).join(","),
         s.requires_cards || 1,
         s.requires_devices || 1,
+        // 「每卡几份」进 sig —— manifest 改了它，复选框数量要跟着变，
+        // 而 sig 没变的话卡片会被复用、复选框数量停留在旧值。
+        s.max_replicas_per_card || 1,
         // 设备拓扑判定结果会变（插了第三张卡 / 装了 rknn2-runtime /
         // 模型包文件变了）⇒ 进 sig，让卡片重建并刷新阻断状态。
         (s.card_requirements && s.card_requirements.ok) ? "devok" : "devno",
@@ -3471,6 +3480,8 @@ const ComputeConfigPage = {
     const radioSig = [
       (cards || []).map(c => `${c.npu_index}:${c.device_id || ""}`).join(","),
       (meta.available_targets || []).join(","),
+      // 「每卡几份」进 sig —— 它决定渲染几个复选框，变了就得重建 fieldset。
+      meta.max_replicas_per_card || 1,
       this._modelNpus(card.dataset.model).join(","),
       this._selectedSlots(card.dataset.model).join(","),
       // 设备拓扑布局进了 sig —— 插了第三张卡 / 装了 rknn2-runtime 之后，
@@ -3961,6 +3972,13 @@ const ComputeConfigPage = {
       const slot = this._slotKey(npuIndex, replica);
       const label = document.createElement("label");
       label.className = "cc-target-opt";
+      // 第 2 份起（每张卡的第二个复选框）**整个选项加括号**：
+      // 「RK182x #0-1 | (☐ #0-2)」。
+      //
+      // ⚠️ 括号要包住**复选框本身** ⇒ 用 CSS 伪元素（::before/::after），
+      // **不能**把括号写进标题文本 —— 那样会变成「☐ (#0-2)」，括号跑到框外，
+      // 而且括号和框之间会被 flex gap 撑开。
+      if (Number(replica || 0) > 0) label.classList.add("cc-target-opt-bracket");
       label.title = sub || "";
       const input = document.createElement("input");
       // checkbox 而非 radio：同一个模型可以同时跑在多张卡上、同一张卡上
@@ -3996,9 +4014,17 @@ const ComputeConfigPage = {
       // 第 1 份的标题保持原样（老截图/文案不变），第 2 份起加后缀。
       for (let rep = 0; rep < maxReplicas; rep++) {
         if (requiresCards > 1 && rep > 0) break;   // 多卡模型：一份一个实例
+        // 「RK182x #0-1」/「#0-2」= 卡 0 的第 1 份 / 第 2 份。
+        //
+        // ⚠️ **每张卡只有第一个写全名**，后面的省掉 "RK182x " 前缀 ——
+        // 四个并排时全名太占地方（有溢出风险）。「卡号-份号」的形式本身
+        // 已经能看出是哪个卡哪一份。
+        //
+        // 第 2 份起**整个选项被括号包住**（renderOpt 里加的
+        // cc-target-opt-bracket ⇒ CSS 伪元素）：「(☐ #0-2)」。
         const title = rep === 0
-          ? `RK182x #${idx}`
-          : `RK182x #${idx} (${rep + 1})`;
+          ? `RK182x #${idx}-${rep + 1}`
+          : `#${idx}-${rep + 1}`;
         renderOpt(idx, title,
                   card.device_id || `npu #${idx}`,
                   "182x", supported.has("182x"), rep);

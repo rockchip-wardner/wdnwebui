@@ -130,7 +130,19 @@ class NpuQualityError(TranslationError):
       (否则这一分钟内所有语言都走外网)。
 
     ⚠️ 这个区分就是「一条不合格拖垮 24 条」那个 bug 的根因。
+
+    ⚠️ **带着 ``perf``**（2026-11-17）：这条翻不出来之前**已经烧掉了几次
+    推理**（每次试一条措辞），那些 token 和时间是真花掉了。抛异常时把它
+    带上 ⇒ 上层能把这次**失败的**推理也计进性能汇总。
+
+    不带的话：界面上的「总耗时」算了两次推理，而「tokens/s」只算了成功
+    那一次 ⇒ 两个数对不上，用户自己一除就觉得界面在骗人。
     """
+
+    def __init__(self, message: str, perf: Optional[Dict[str, float]] = None):
+        super().__init__(message)
+        #: 这条翻不出来之前**已经烧掉**的推理性能表（原始计数 + 派生量）。
+        self.perf: Dict[str, float] = dict(perf or {})
 
 # --------------------------------------------------------------------------- #
 # 语言表
@@ -552,35 +564,40 @@ class NpuTranslateProvider(TranslationProvider):
         items = self._split_numbered(text)
         if len(items) > 1:
             bodies = [body for (_num, body) in items]
-            outs, misses = self._translate_many(bodies, source, target)
+            outs, misses, perf = self._translate_many(bodies, source, target)
             joined = "\n".join("%d. %s" % (i, out)
                                for i, out in enumerate(outs, 1))
             return TranslationResult(
                 joined, provider=self.name,
                 misses=frozenset(misses),
                 failed_provider=self.name if misses else "",
+                perf=perf,
             )
 
         # 单条(没有编号可拆)
         try:
-            out = self._translate_one(text, source, target)
+            out, perf = self._translate_one(text, source, target)
         except NpuQualityError as exc:
             # 这条它就是翻不出来 —— **不牵连别人**,交给上层补翻
             LOG.warning("translate: NPU 这条没翻出来(保留原文): %s", exc)
+            # ⚠️ **失败那次的推理也要计入性能汇总** —— 那些 token 和时间
+            # 是真花掉了（用户等了那么久）。不带的话「总耗时」算了两次
+            # 推理、而「tokens/s」只算成功那次 ⇒ 两个数对不上。
             return TranslationResult(text, provider=self.name,
                                     misses=frozenset({0}),
-                                    failed_provider=self.name)
-        return TranslationResult(out, provider=self.name)
+                                    failed_provider=self.name,
+                                    perf=getattr(exc, "perf", None))
+        return TranslationResult(out, provider=self.name, perf=perf)
 
     def _translate_many(self, bodies: List[str], source: str,
-                        target: str) -> Tuple[List[str], set]:
+                        target: str) -> Tuple[List[str], set, Dict[str, float]]:
         """把一批文案翻完；能并行就并行。
 
         分发方式 = **按条轮转**（第 i 条给第 ``i % N`` 个 session）。
         轮转而不是「前一段给 A、后一段给 B」：轮转让**任何一个 session 慢**
         只影响它自己那 1/N 的条目，成块分配则慢的那份会把整块都拖住。
 
-        返回 ``(译文列表, 没翻出来的条目下标集合)``。
+        返回 ``(译文列表, 没翻出来的条目下标集合, 累计的推理性能表)``。
 
         ⚠️ **单条失败不再牵连整批**（2026-11-16 修）。以前任何一条抛异常
         → 整批抛 → 链把整批交给外网 → NPU 已经跑完的那 23 条全白跑。
@@ -591,18 +608,27 @@ class NpuTranslateProvider(TranslationProvider):
         """
         sessions = self._sessions()
         misses: set = set()
+        perf: Dict[str, float] = {}
+        perf_lock = threading.Lock()
 
         if len(sessions) <= 1:
             sess = sessions[0] if sessions else None
             out: List[str] = []
             for idx, body in enumerate(bodies):
                 try:
-                    out.append(self._translate_one(body, source, target, sess))
+                    val, one = self._translate_one(body, source, target, sess)
                 except NpuQualityError as exc:
                     LOG.warning("translate: NPU 这条没翻出来(保留原文): %s", exc)
                     out.append(body)
                     misses.add(idx)
-            return out, misses
+                    # ⚠️ 失败那次的推理也计入性能汇总（真花掉了）
+                    with perf_lock:
+                        _merge_perf(perf, getattr(exc, "perf", None))
+                    continue
+                with perf_lock:
+                    _merge_perf(perf, one)
+                out.append(val)
+            return out, misses, _finish_perf(perf)
 
         out2: List[Optional[str]] = [None] * len(bodies)
         lock = threading.Lock()
@@ -610,14 +636,18 @@ class NpuTranslateProvider(TranslationProvider):
         def one(idx: int, body: str) -> None:
             sess = sessions[idx % len(sessions)]
             try:
-                val = self._translate_one(body, source, target, sess)
+                val, one_perf = self._translate_one(body, source, target, sess)
             except NpuQualityError as exc:
                 # 这条翻不出来 —— **不牵连整批**，保留原文、记进 misses
                 LOG.warning("translate: NPU 这条没翻出来(保留原文): %s", exc)
+                with perf_lock:
+                    _merge_perf(perf, getattr(exc, "perf", None))
                 with lock:
                     out2[idx] = body
                     misses.add(idx)
                 return
+            with perf_lock:
+                _merge_perf(perf, one_perf)
             with lock:
                 out2[idx] = val
 
@@ -627,7 +657,7 @@ class NpuTranslateProvider(TranslationProvider):
             futs = [ex.submit(one, i, b) for i, b in enumerate(bodies)]
             for fut in futs:
                 fut.result()   # 推理级异常在这里冒出来 → 链切下一个 provider
-        return [o if o is not None else "" for o in out2], misses
+        return [o if o is not None else "" for o in out2], misses, _finish_perf(perf)
 
     # ------------------------------------------------------------------ #
     # 内部
@@ -653,10 +683,16 @@ class NpuTranslateProvider(TranslationProvider):
         return out
 
     def _translate_one(self, text: str, source: str, target: str,
-                       session: Any = None) -> str:
+                       session: Any = None) -> Tuple[str, Dict[str, float]]:
         """翻一条，按实测成功率顺序试措辞，用文种校验挑真正翻出来的那个。
 
         ``session`` 不传就现取一个（单实例路径）。
+
+        返回 ``(译文, 本条累计的推理性能表)``。
+
+        ⚠️ 性能表是**所有尝试之和**：一条文案可能要试好几条措辞
+        （:data:`PROMPT_ORDER`），每条都是一次完整推理 —— 用户等的是
+        全部这些加起来的时间，只记最后一次的话 tokens/s 会好看得离谱。
 
         抛的异常分两类 —— **这个区分很重要**：
 
@@ -669,9 +705,9 @@ class NpuTranslateProvider(TranslationProvider):
         """
         text = (text or "").strip()
         if not text:
-            return text
+            return text, {}
         if source == target:
-            return text
+            return text, {}
         self._check_pair(source, target)
 
         key = (source, target, text)
@@ -702,22 +738,25 @@ class NpuTranslateProvider(TranslationProvider):
             )
 
         last = ""
+        perf: Dict[str, float] = {}
         for prompt in attempts:
             try:
-                out = self._infer(session, prompt)
+                out, one = self._infer(session, prompt)
             except TranslationError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("translate: NPU 推理失败(%s): %s", type(exc).__name__, exc)
                 raise TranslationError(f"NPU 翻译推理失败: {exc}") from exc
+            _merge_perf(perf, one)
             last = out
             cleaned = self._strip_label(out, source, target)
             if self._looks_translated(cleaned, text, target):
-                return cleaned
+                return cleaned, _finish_perf(perf)
             LOG.debug("translate: NPU 这次没翻出来，换下一个措辞: %r", out[:60])
         self._mark_bad(key)
         raise NpuQualityError(
-            f"NPU 翻译没能翻出目标语言（最后得到: {last[:60]!r}）"
+            f"NPU 翻译没能翻出目标语言（最后得到: {last[:60]!r}）",
+            perf=_finish_perf(perf),
         )
 
     @staticmethod
@@ -877,12 +916,101 @@ class NpuTranslateProvider(TranslationProvider):
                 f"NPU 翻译未启用（{self.capability} 没有正在运行的实例）"
             ) from exc
 
-    def _infer(self, session: Any, prompt: str) -> str:
-        """跑一次推理并取回纯文本。"""
+    def _infer(self, session: Any, prompt: str) -> Tuple[str, Dict[str, float]]:
+        """跑一次推理，返回 ``(纯文本, 本次推理的性能表)``。
+
+        ⚠️ 性能表必须**在 respond() 返回的当下**就从 session 上取走 ——
+        ``session.last_perf`` 是「最近一次推理」的单槽位，如果同一个 session
+        被两条线程同时用（理论上不该发生：一个 session 同时只能一个推理在
+        飞），后一个会把前一个的覆盖掉。取完立刻用掉才安全。
+        """
         result = _run_coro(session.respond(prompt=prompt, max_new_tokens=512))
+        # ⚠️ 先取 perf，再处理文本 —— 顺序不能反（见上面的说明）。
+        perf = _session_perf(session)
         if isinstance(result, str):
-            return result
+            return result, perf
         text = getattr(result, "text", None)
         if isinstance(text, str):
-            return text
-        return "" if result is None else str(result)
+            return text, perf
+        return ("" if result is None else str(result)), perf
+
+
+# --------------------------------------------------------------------------- #
+# 推理性能表（tokens/s 的原料）
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ **数字只在 worker 进程里**。SDK 的 backend 把它们写进
+# ``session._backend.sink.perf``（``n_decode_tokens`` / ``n_prefill_tokens``
+# / ``prefill_ms`` / ``decode_ms``），而 provider 跑在 **Web UI 进程**里 ——
+# 那边拿到的是 RPC 代理，够不着那个 sink。
+#
+# ⇒ worker 必须显式把数字带过 wire（见 ``wdndds/ai_session.py`` 的
+# ``_handle_request``），client 侧收在 ``session.last_perf``。
+#
+# 两条取法：
+#   * ``last_perf``      —— RPC 代理（**本板正常路径**）
+#   * ``_backend.sink`` —— 本地 session（调试 / 同进程直连时的退路）
+def _session_perf(session: Any) -> Dict[str, float]:
+    """从一个 session 上读出最近一次推理的性能表（读不到就空字典）。"""
+    if session is None:
+        return {}
+    perf = getattr(session, "last_perf", None)
+    if not isinstance(perf, dict) or not perf:
+        # 退路：本地 session（没走 RPC）—— 直接读 SDK 的 sink
+        sink = getattr(getattr(session, "_backend", None), "sink", None)
+        perf = getattr(sink, "perf", None)
+    if not isinstance(perf, dict):
+        return {}
+    return {
+        str(k): float(v) for k, v in perf.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+
+
+def _merge_perf(dst: Dict[str, float], src: Dict[str, float]) -> Dict[str, float]:
+    """把一次推理的性能表**累加**进汇总表。
+
+    ⚠️ 为什么要累加而不是覆盖：provider 一条文案可能要试**好几条措辞**
+    （:data:`PROMPT_ORDER`），每条措辞都是一次完整推理。真正花掉的 token
+    和时间是**所有这些推理之和** —— 只记最后一次的话，tokens/s 会好看得
+    离谱，而用户实际等的是那么久。
+
+    ⚠️ **只累加原始计数**（token 数 / 两段耗时）；派生量（tokens/s 等）
+    **不累加** —— 每次推理各自的速率加起来没有意义。它们由
+    :func:`wdnai.perf_table` 从累加后的原始计数**重算**（见
+    :func:`_finish_perf`）。
+
+    ⚠️ 派生量用 **SDK 自己的算法**算（``wdnai.perf_table``）—— 和 SDK
+    打印的那张 perf 表**同一份公式**，不会两边漂。
+    """
+    for key, val in (src or {}).items():
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            continue
+        if key in _PERF_COUNTER_KEYS:
+            dst[key] = dst.get(key, 0.0) + float(val)
+        # 派生量不累加 —— 稍后统一重算
+    return dst
+
+
+#: perf 表里**可以累加**的原始计数（其余是派生量，不累加）。
+_PERF_COUNTER_KEYS = ("n_decode_tokens", "n_prefill_tokens",
+                      "prefill_ms", "decode_ms")
+
+
+def _finish_perf(perf: Dict[str, float]) -> Dict[str, float]:
+    """把累加好的原始计数**算成**最终的性能表（含派生量）。
+
+    ⚠️ 派生量由 **SDK 的** :func:`wdnai.perf_table` 算 —— 和 SDK 打印的
+    perf 表**同一份公式**。宿主要是自己另写一套，两边迟早漂（改了 SDK
+    的算法，界面上的 tokens/s 就悄悄对不上打印出来的表了）。
+
+    ⚠️ **没有原始计数就返回空字典**（不是「一堆 0」）：压根没推理过 ⇒
+    性能表就该是空的。
+    """
+    if not perf:
+        return {}
+    from wdnai import perf_table
+
+    out = dict(perf)
+    out.update(perf_table(out))
+    return out
