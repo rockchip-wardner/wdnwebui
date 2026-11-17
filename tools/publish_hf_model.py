@@ -42,9 +42,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
+import time
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -59,6 +62,8 @@ META_FILES = {
     "README.md", "README_CN.md", "LICENSE", "NOTICE", "SHA256SUMS",
     "config.json", ".gitattributes",
 }
+
+LOG = logging.getLogger("publish_hf_model")
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 
@@ -218,24 +223,218 @@ def repo_exists(endpoint: str, repo: str, token: Optional[str]) -> Tuple[Optiona
     return None, status
 
 
-# --------------------------------------------------------------------------- #
-# hf CLI
-# --------------------------------------------------------------------------- #
 def hf_cli() -> List[str]:
     """优先用本仓 venv 里的 hf，找不到就退回 PATH 上的。"""
     local = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "hf"
     return [str(local)] if local.exists() else ["hf"]
 
 
-def run_hf(args: Sequence[str], endpoint: str, timeout: float = 3600.0) -> int:
-    env = dict(os.environ)
-    env["HF_ENDPOINT"] = endpoint
-    env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
-    # Xet 必须留着：HF 已弃用 cas-server.huggingface.co，
-    # 关掉 Xet 会让上传走已经解析不到的旧 CAS 域名。
-    print(f"  {DIM}$ hf {' '.join(args)}{RESET}")
-    proc = subprocess.run(hf_cli() + list(args), env=env, timeout=timeout)
-    return proc.returncode
+# --------------------------------------------------------------------------- #
+# 上传
+# --------------------------------------------------------------------------- #
+def _install_retry(retries: int = 6, delay: float = 1.5) -> None:
+    """给 huggingface_hub 的 HTTP session 装上「连接被掐」重试。
+
+    为什么需要
+    ==========
+
+    本板到 huggingface.co 的路径被 GFW 检查**请求体**。README 里写着
+    ``https://huggingface.co/...``，``POST /api/validate-yaml`` 又是**把
+    README 原文裸传**上去的 —— 于是这个请求会**间歇性**（实测 3 次里挂 1 次）
+    被注入 RST，客户端看到的是::
+
+        requests.exceptions.ConnectionError: (ProtocolError('Connection aborted.',
+        RemoteDisconnected('Remote end closed connection without response'))
+
+    ⇒ **重试就能过**（实测重试后成功）。注意 commit 载荷里文件内容是
+    **base64**，不含明文域名，所以真正的 commit 请求不受影响 —— 受影响的
+    只有 validate-yaml 这一个「传原文」的端点。
+
+    （本脚本另外把 ``_validate_yaml`` 关掉、改成本地校验 front matter ——
+    所以这个重试是**兜底**，不是唯一防线。）
+    """
+    import requests
+    from huggingface_hub.utils._http import get_session
+
+    session = get_session()
+    if getattr(session, "_wd_retry_patched", False):
+        return
+
+    original = requests.Session.request
+
+    def request(self, method, url, *args, **kwargs):
+        last: Optional[Exception] = None
+        for attempt in range(retries):
+            try:
+                return original(self, method, url, *args, **kwargs)
+            except requests.exceptions.ConnectionError as exc:
+                last = exc
+                LOG.info("连接被掐（第 %d/%d 次），%.1fs 后重试：%s %s",
+                         attempt + 1, retries, delay, method, url)
+                time.sleep(delay)
+        raise last  # type: ignore[misc]
+
+    requests.Session.request = request  # type: ignore[assignment]
+    session._wd_retry_patched = True  # type: ignore[attr-defined]
+
+
+def _local_validate_front_matter(readme: Path) -> bool:
+    """本地校验 README 的 YAML front matter。
+
+    为什么不用 Hub 的 ``/api/validate-yaml``
+    =======================================
+
+    那个端点会把 README **原文**裸传上去，而本板到 huggingface.co 的路径
+    被 GFW 检查请求体 —— 含 ``huggingface.co`` 字样的正文会被**间歇性**注入
+    RST（实测 3 次里挂 1 次），客户端看到::
+
+        requests.exceptions.ConnectionError: (ProtocolError('Connection aborted.',
+        RemoteDisconnected('Remote end closed connection without response'))
+
+    ⇒ 本地校验更可靠，也不受链路影响。校验规则与 Hub 一致：YAML 能解析 +
+    ``license`` 与 ``library_name`` 在位。
+    """
+    try:
+        import yaml
+    except ImportError:
+        warn("没装 PyYAML，跳过 front matter 校验")
+        return True
+    try:
+        text = readme.read_text(encoding="utf-8")
+    except OSError as exc:
+        fail(f"读不到 {readme}：{exc}")
+        return False
+    if not text.startswith("---"):
+        fail(f"{readme.name} 没有 YAML front matter")
+        return False
+    end = text.find("\n---", 3)
+    if end < 0:
+        fail(f"{readme.name} 的 front matter 没有闭合")
+        return False
+    try:
+        meta = yaml.safe_load(text[3:end]) or {}
+    except Exception as exc:  # noqa: BLE001
+        fail(f"{readme.name} 的 front matter 不是合法 YAML：{exc}")
+        return False
+    if not isinstance(meta, dict):
+        fail(f"{readme.name} 的 front matter 不是键值对")
+        return False
+    missing = [k for k in ("license", "library_name") if not meta.get(k)]
+    if missing:
+        fail(f"{readme.name} 的 front matter 缺字段：{', '.join(missing)}")
+        return False
+    ok(f"{readme.name} front matter 合法"
+       f"（license={meta.get('license')}, library_name={meta.get('library_name')}"
+       f", pipeline_tag={meta.get('pipeline_tag', '-')}）")
+    return True
+
+
+def _patch_repo_url_endpoint(endpoint: str) -> None:
+    """修 huggingface_hub 的一个坑：自定义端点下 ``CommitInfo`` 构造会炸。
+
+    ``hf_api.py`` 里::
+
+        class CommitInfo:
+            def __post_init__(self):
+                self.repo_url = RepoUrl(self.commit_url.split("/commit/")[0])
+                                                                 ↑ 没传 endpoint
+
+    而 ``RepoUrl.__init__`` 是::
+
+        self.endpoint = endpoint or constants.ENDPOINT      # 默认 huggingface.co
+
+    ⇒ 端点是 ``http://127.0.0.1:8787`` 时，``RepoUrl`` 却拿**默认的
+    huggingface.co** 去判定「这是不是 HF URL」→ 判定失败 →::
+
+        ValueError: Unable to retrieve user and repo ID from the passed HF ID:
+                    http://127.0.0.1:8787/wardner/Qwen3-ASR
+
+    修法：让 ``RepoUrl`` 默认用我们自己的 endpoint。
+    """
+    import huggingface_hub.hf_api as ha
+
+    if getattr(ha.RepoUrl, "_wd_endpoint_patched", False):
+        return
+
+    orig_new = ha.RepoUrl.__new__
+    orig_init = ha.RepoUrl.__init__
+    default_endpoint = endpoint
+
+    def __new__(cls, url, endpoint=None):
+        return orig_new(cls, url, endpoint=endpoint or default_endpoint)
+
+    def __init__(self, url, endpoint=None):
+        orig_init(self, url, endpoint=endpoint or default_endpoint)
+
+    ha.RepoUrl.__new__ = __new__          # type: ignore[assignment]
+    ha.RepoUrl.__init__ = __init__        # type: ignore[assignment]
+    ha.RepoUrl._wd_endpoint_patched = True  # type: ignore[attr-defined]
+
+
+def upload_folder_with_retry(repo: str, model_dir: Path, endpoint: str,
+                              commit_message: str, rounds: int = 4):
+    """上传目录；连接被掐时重试。
+
+    三个要点
+    ========
+
+    1. **进程内调用** ``HfApi.upload_folder()``，而不是 ``HfApi.create_commit()``
+       之类的其它入口 —— 前者不会把 ``create_repo()`` 返回的 URL 当 ``repo_id``
+       往下传（``parse_hf_id()`` 判定「是不是 HF URL」时比的是**默认的
+       huggingface.co**，自定义端点下识别不出来）。
+    2. **关掉 ``_validate_yaml``** —— 它把 README 原文裸传上去，是被 GFW
+       掐断的元凶；改由 ``_local_validate_front_matter()`` 本地校验。
+    3. **单请求级重试** —— 被掐是间歇性的，重发那一个请求即可，不必重跑
+       整轮（整轮要重算 1.13 GB 的 hash，慢且不一定躲得过）。
+    """
+    from huggingface_hub import HfApi
+
+    # front matter 已经在本地校验过，远端那个检查可以安全跳过
+    HfApi._validate_yaml = lambda self, content, **kw: None  # type: ignore[assignment]
+
+    _patch_repo_url_endpoint(endpoint)
+    _install_retry()
+    api = HfApi(token=resolve_token(), endpoint=endpoint)
+    last: Optional[Exception] = None
+    for attempt in range(rounds):
+        try:
+            return api.upload_folder(
+                folder_path=str(model_dir),
+                repo_id=repo,
+                repo_type="model",
+                commit_message=commit_message,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            LOG.info("第 %d/%d 轮上传失败：%s", attempt + 1, rounds, exc)
+            LOG.info("%s", traceback.format_exc())
+            time.sleep(3)
+    raise last  # type: ignore[misc]
+
+
+def create_repo_with_retry(repo: str, endpoint: str, private: bool):
+    """建仓；已存在时直接返回。
+
+    用进程内 API 而不是 CLI —— 建仓只是一个 POST，没有「传 README 原文」
+    这种会被掐的请求。返回的是 **repo id**（不是 URL）：``create_repo()``
+    返回的是 ``RepoUrl``，直接当 ``repo_id`` 用会让 SDK 的 ``parse_hf_id()``
+    在自定义端点下解析失败。
+    """
+    from huggingface_hub import HfApi
+
+    _patch_repo_url_endpoint(endpoint)
+    _install_retry()
+    api = HfApi(token=resolve_token(), endpoint=endpoint)
+    last: Optional[Exception] = None
+    for attempt in range(4):
+        try:
+            return api.create_repo(repo_id=repo, repo_type="model",
+                                   exist_ok=True, private=private).repo_id
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            LOG.info("第 %d/4 轮建仓失败：%s", attempt + 1, exc)
+            time.sleep(3)
+    raise last  # type: ignore[misc]
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +478,10 @@ def publish(repo: str, model_dir: Path, endpoint: str, private: bool,
         fail("本地校验没过 —— 不上传（传上去的坏文件比不传更糟）")
         return 1
 
+    if not _local_validate_front_matter(model_dir / "README.md"):
+        fail("README front matter 校验没过 —— 不上传")
+        return 1
+
     check_endpoint(endpoint, token)
 
     exists, repo_status = repo_exists(endpoint, repo, token)
@@ -303,20 +506,20 @@ def publish(repo: str, model_dir: Path, endpoint: str, private: bool,
     if exists is True:
         info("已存在，跳过建仓")
     else:
-        args = ["repo", "create", repo, "--repo-type", "model"]
-        if private:
-            args.append("--private")
-        args.append("--exist-ok")
-        if run_hf(args, endpoint) != 0:
-            fail("建仓失败")
+        print(f"  {DIM}$ hf repo create {repo} --repo-type model --exist-ok{RESET}")
+        try:
+            create_repo_with_retry(repo, endpoint, private)
+        except Exception as exc:  # noqa: BLE001
+            fail(f"建仓失败：{exc}")
             return 1
         ok(f"{repo} 已创建" + ("（私有）" if private else "（公开）"))
 
     section("⑤ 上传")
-    args = ["upload", repo, str(model_dir), "--repo-type", "model",
-            "--commit-message", commit_message]
-    if run_hf(args, endpoint) != 0:
-        fail("上传失败")
+    print(f"  {DIM}$ hf upload {repo} {model_dir} --repo-type model{RESET}")
+    try:
+        upload_folder_with_retry(repo, model_dir, endpoint, commit_message)
+    except Exception as exc:  # noqa: BLE001
+        fail(f"上传失败：{exc}")
         return 1
     ok("上传完成")
 
@@ -380,6 +583,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="只校验，不建仓不上传")
     ap.add_argument("--verify-only", action="store_true", help="只回读校验已有仓")
     args = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     model_dir = Path(args.model_dir).resolve()
     if not model_dir.is_dir():

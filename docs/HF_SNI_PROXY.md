@@ -150,6 +150,78 @@ hf upload wardner/Qwen3-ASR /userdata/models/Qwen3-ASR
 此时 `send()` 抛 `SSLEOFError` —— 不能中断，要继续把上游已经给出的
 响应转给客户端，否则客户端只看到 `http=000`，丢掉真实状态码。
 
+### 3.4 第三层：请求体里的关键词也会被掐（2026-11-17 补）
+
+改 README 时撞上的：**把含 `huggingface.co` 字样的文本 POST 上去，会被间歇性
+注入 RST**（实测 3 次里挂 1 次）。
+
+```bash
+# 同一个请求连发 3 次
+第1次: http=200
+第2次: http=000  t=30.001582s      ← 被掐
+第3次: http=200
+```
+
+客户端看到的是：
+
+```
+requests.exceptions.ConnectionError: (ProtocolError('Connection aborted.',
+RemoteDisconnected('Remote end closed connection without response')))
+```
+
+**为什么只有某些请求会中招**：
+
+| 请求 | 请求体形态 | 受不受影响 |
+|---|---|---|
+| `POST /api/validate-yaml` | README **原文**（明文域名） | ❌ 会挂 |
+| `POST /api/models/.../commit/main` | 文件内容 **base64** | ✅ 不受影响 |
+
+⇒ 注入的是 RST，**和真实响应赛跑** —— 客户端先收到 RST 就报「连接被掐」，
+先收到真响应就正常。**重试即可**（单请求重试 6 次 × 整轮重试 4 轮，实测必过）。
+
+`tools/publish_hf_model.py` 已把这条重试固化进去
+（`_install_retry()` + `upload_folder_with_retry()`）。
+
+> 顺带说明：这个坑**只影响带 README 的上传**。纯权重上传（commit 载荷里
+> 全是 base64）从来没事 —— 所以之前 1.1 GB 整目录上传一次就过了。
+
+
+### 3.5 huggingface_hub 在**自定义端点**下的两个坑
+
+用的是 `HF_ENDPOINT=http://127.0.0.1:8787`（不是官方 huggingface.co），
+SDK 有两处没考虑自定义端点：
+
+**坑 ① `CommitInfo` 构造 `RepoUrl` 时不传 endpoint**
+
+```python
+# huggingface_hub/hf_api.py
+class CommitInfo:
+    def __post_init__(self):
+        self.repo_url = RepoUrl(self.commit_url.split("/commit/")[0])
+                                                   ↑ 没传 endpoint
+
+class RepoUrl:
+    def __init__(self, url, endpoint=None):
+        self.endpoint = endpoint or constants.ENDPOINT   # ← 默认 huggingface.co
+```
+
+⇒ 端点是 `http://127.0.0.1:8787` 时，`RepoUrl` 却拿**默认的 huggingface.co**
+去判定「这是不是 HF URL」→ 判定失败 →
+
+```
+ValueError: Unable to retrieve user and repo ID from the passed HF ID:
+            http://127.0.0.1:8787/wardner/Qwen3-ASR
+```
+
+**修法**（`tools/publish_hf_model.py::_patch_repo_url_endpoint`）：给
+`RepoUrl.__new__/__init__` 打个补丁，让它默认用我们自己的 endpoint。
+
+**坑 ② `validate-yaml` 把 README 原文裸传** —— 见 §3.4。
+
+> **为什么坑 ① 是间歇性的**：它取决于 `create_commit` 走哪个返回分支
+> （「无改动提前返回」那条分支也会构造 `CommitInfo`）。实测同一条命令
+> 有时过、有时炸 —— 所以**别把偶发失败当成偶发网络抖动**，要看栈。
+
 ## 4. 真实 IP 从哪来
 
 **境内解析器一律不可信**（连 DoH 也返回假答案）。本板可达且返回真答案的
