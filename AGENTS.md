@@ -1012,11 +1012,28 @@ RK182x 卡上**根本没有别的模型**。三条独立断链：
 而本板 **3 张 1828 全空**、零本地 worker。⇒ 「算力配置」是**对的**，
 错的是翻译卡的估算。
 
-⚠️ **`registry.snapshot()` 的 `per_card_memory_mb` 有同样的毛病**（peer 的
-5500MB 被记到本板卡 1 ⇒ API 说卡 1 用了 5500MB，其实用了 0）。还没修。
+✅ **`registry.snapshot()` 的 `per_card_memory_mb` 已修**（2026-11-18）。
+`registry.py::_local_memory_usage()` 现在按**两条**规则算：
+
+1. **只算本机实例**（`spawned` / `adopted_local`）—— peer（`adopted`）的
+   `npu_index` 是**对端板自己的卡号**，它的显存吃在**对端板**上 ⇒ 算进来
+   等于把别人的显存记到本板头上（真机：peer 的 5500MB 被记到本板卡 1 ⇒
+   API 说卡 1 用了 5500MB，其实用了 0）。peer 的数字单独给
+   **新字段 `remote_memory_mb`**（信息不丢，但**不占**本板任何一张卡）；
+2. **多卡实例平摊** —— 分段式 9B / qwenimage21 的显存估算值是几张卡
+   **加起来**的（7000MB / 2 张）⇒ 平摊到它占的每一张卡上（余数给第一张）。
+   单卡模型的算法与旧版逐字节相同。
+
+⚠️ 口径与 `local_running_count` / `remote_running_count` 那组计数**共用
+同一个判据**（`_is_local_instance()`）—— 两处口径漂移过一次（显存那边
+把 peer 算进来、计数那边没算）。
 
 **回归**：
 
+* `scripts/verify_registry_memory_accounting.py` —— 规则 + 端到端
+  `ComputeRegistry.snapshot()`：peer 不占本板卡 / 本机实例占卡 /
+  `adopted_local` 也要算 / 多卡平摊 / 非 running 不计 / **反向验证**
+  （修复前的口径必须算出不同结果，否则这个回归抓不住任何东西）；
 * `scripts/verify_web_translate_peer_isolation.py` —— 假 registry，断言
   peer 不占卡 / 本机实例占卡 / `adopted_local` 也要算 / `_conflict` 不认 peer；
 * `scripts/verify_wizard_replica_clamp.py` —— 浏览器里 mock `/api/compute`，
@@ -1024,6 +1041,11 @@ RK182x 卡上**根本没有别的模型**。三条独立断链：
 * `scripts/verify_translate_replica_manifest.py` —— 盘上 manifest 声明
   `max_replicas_per_card=2` + 后端报得出来 + 卡片计划不超上限；
 * `scripts/verify_web_translate_wizard_e2e.py` —— 真机真浏览器走一遍向导。
+* `scripts/verify_peer_isolation.py` —— API 层的启停隔离（stop-all /
+  DELETE / restart 不波及 peer）。
+  ⚠️ 它的模型名**从 `MODEL_PRESETS` 动态取**（`_pick_models()`）——
+  写死会随模型包改名（`qwen3-vl-4b` → `qwen3.5-vl-4b`）而挂在 pydantic
+  的「未知 model」校验上，**连断言都跑不到**。
 
 ### 🚧 rc=-6 的真因多半是 **toolkit 比 runtime 新**（2026-11-18 查）
 

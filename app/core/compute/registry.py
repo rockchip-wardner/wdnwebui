@@ -226,6 +226,80 @@ _PEER_LOST_CONSECUTIVE_FAILURES = 5
 _RKNN_PROBE_TIMEOUT = 5.0
 
 
+#: **本机**实例的来源标记 —— 只有这两种真的吃**本板**的 NPU 显存。
+#:
+#: ``spawned``        = 本进程 spawn 出来的 worker；
+#: ``adopted_local``  = 本机的孤儿 worker（上次 uvicorn 重载留下的），
+#:                       本板 /proc 里能看到它的进程 ⇒ 它的显存吃在**本板**。
+#:
+#: ⚠️ ``adopted`` **不算** —— 那是**别的板子**通过 DDS 暴露的 service：
+#: 它的 ``npu_index`` 是**对端板自己的卡号**，它的显存吃在**对端板**上，
+#: 本板一字节都没用。
+LOCAL_INSTANCE_SOURCES = ("spawned", "adopted_local")
+
+
+def _is_local_instance(source: Optional[str]) -> bool:
+    """这份实例是不是**本板**的（它的显存吃在本板的协卡上）。
+
+    ⚠️ 判据必须看 ``_source``，**不能**只看 ``npu_index`` ——
+    ``npu_index`` 是「这个 worker 加载在哪张卡上」，而**远端 peer 的卡号
+    是对端板自己的编号**（本板也有 0/1/2），跟本板的卡位没有任何关系。
+
+    真机现场（2026-11-18）：peer 板 ``172.16.9.147`` 的
+    ``LocateAnything-3b`` 报 ``npu=1 / 5500MB`` ⇒ 本板卡 1 被误判占满
+    （5500 + 2200 > 5120）⇒ 翻译模型只起卡 0 的 2 份，日志还打
+    「卡 [1] 放不下翻译模型（被别的模型占着）」—— 而本板 **3 张 1828
+    全空**、零本地 worker。
+    """
+    return (source or "spawned") in LOCAL_INSTANCE_SOURCES
+
+
+def _local_memory_usage(instances: list[dict]) -> tuple[dict[int, int], int, int]:
+    """按卡统计**本板**的显存占用。
+
+    返回 ``(per_card_mb, total_mb, remote_mb)``：
+
+    * ``per_card_mb`` —— 卡号 → 本板该卡上正在跑的模型的显存估算（MB）；
+    * ``total_mb``    —— 本板显存占用合计（**只含本机实例**）；
+    * ``remote_mb``   —— 远端 peer 的显存合计（**不占本板任何一张卡**）。
+
+    口径（2026-11-18 修）：
+
+    1. **只算本机实例**（``spawned`` / ``adopted_local``）——
+       远端 peer（``_source == "adopted"``）的 ``npu_index`` 是**对端板
+       自己的卡号**，它的显存吃在**对端板**上；算进来会把本板一张**空卡**
+       判成占满（真机：peer 的 5500MB 被记到本板卡 1，其实用了 0）。
+       peer 的数字单独进 ``remote_mb`` —— 信息不丢，但**不占**本板卡位。
+    2. **多卡实例平摊** —— 一份实例可能占**多张**卡（分段式 9B /
+       qwenimage21），它的显存估算值是几张卡**加起来**的 ⇒ 平摊到它占的
+       每一张卡上（余数给第一张）。单卡模型的算法与旧版逐字节相同。
+
+    只统计 ``status == "running"`` 的实例（与旧版一致）。
+    """
+    per_card_mb: dict[int, int] = {}
+    total_mb = 0
+    remote_mb = 0
+    for inst in instances:
+        if inst.get("status") != "running":
+            continue
+        mem = int(inst.get("memory_estimate_mb") or 0)
+        if not _is_local_instance(inst.get("_source")):
+            remote_mb += mem
+            continue
+        total_mb += mem
+        cards = [int(c) for c in (inst.get("npu_indices") or [])
+                 if isinstance(c, int) and c >= 0]
+        if not cards:
+            npu = inst.get("npu_index")
+            cards = [npu] if isinstance(npu, int) and npu >= 0 else []
+        if not cards:
+            continue
+        share, rest = divmod(mem, len(cards))
+        for i, c in enumerate(cards):
+            per_card_mb[c] = per_card_mb.get(c, 0) + share + (rest if i == 0 else 0)
+    return per_card_mb, total_mb, remote_mb
+
+
 def _read_device_name() -> str:
     """Read ``device_name`` from ``config.jsonc["base"]``.
 
@@ -1931,32 +2005,31 @@ class ComputeRegistry:
             for c in self.list_cards()
         ]
         supported = self.list_supported_models()
-        per_card_mb: dict[int, int] = {}
-        total_mb = 0
-        for inst in instances:
-            if inst["status"] != "running":
-                continue
-            per_card_mb[inst["npu_index"]] = per_card_mb.get(
-                inst["npu_index"], 0) + inst["memory_estimate_mb"]
-            total_mb += inst["memory_estimate_mb"]
+        # ⚠️ **只把本机实例算进本板卡位**（2026-11-18 修）——
+        # 远端 peer 的 ``npu_index`` 是**对端板自己的卡号**，它的显存吃在
+        # **对端板**上 ⇒ 算进来等于把别人的显存记到本板头上：一张**空卡**
+        # 被判成「占满」。真机现场：peer 的 ``LocateAnything-3b`` 报
+        # ``npu=1 / 5500MB`` ⇒ API 说本板卡 1 用了 5500MB，其实用了 **0**。
+        # 详见 :func:`_local_memory_usage`。
+        per_card_mb, total_mb, remote_mb = _local_memory_usage(instances)
         running_count = sum(1 for i in instances if i["status"] == "running")
         error_count   = sum(1 for i in instances if i["status"] == "error")
         loaded_count = sum(1 for i in instances
                            if i["status"] in {"running", "loading"})
         # v0.15: per-source 拆分,顶部汇总"本机 X / 远端 Y"用。本机 =
         # spawned ∪ adopted_local;远端 = adopted。unavailable 不进任何桶。
-        def _is_local(s):
-            return s in ("spawned", "adopted_local")
+        # ⚠️ 与上面算显存用的是**同一个**口径（``_is_local_instance``）——
+        #    两处口径漂移过一次（显存那边把 peer 算进来、计数那边没算）。
         local_running_count  = sum(1 for i in instances
-                                   if i["status"] == "running" and _is_local(i.get("_source")))
+                                   if i["status"] == "running" and _is_local_instance(i.get("_source")))
         remote_running_count  = sum(1 for i in instances
                                    if i["status"] == "running" and i.get("_source") == "adopted")
         local_loading_count  = sum(1 for i in instances
-                                   if i["status"] == "loading" and _is_local(i.get("_source")))
+                                   if i["status"] == "loading" and _is_local_instance(i.get("_source")))
         remote_loading_count = sum(1 for i in instances
                                    if i["status"] == "loading" and i.get("_source") == "adopted")
         local_error_count    = sum(1 for i in instances
-                                   if i["status"] == "error" and _is_local(i.get("_source")))
+                                   if i["status"] == "error" and _is_local_instance(i.get("_source")))
         remote_error_count   = sum(1 for i in instances
                                    if i["status"] == "error" and i.get("_source") == "adopted")
         capabilities = self.list_active_capabilities()
@@ -2024,8 +2097,14 @@ class ComputeRegistry:
             "supported_models":  supported,
             "services":          services,
             "instances":         instances,
+            # ⚠️ **本板**显存占用（2026-11-18 修）—— 只算本机实例
+            # （spawned / adopted_local）。远端 peer 的显存吃在**对端板**上，
+            # 算进来会把本板一张**空卡**判成占满（真机：peer 的 5500MB 被
+            # 记到本板卡 1，其实用了 0）。peer 的数字单独给
+            # ``remote_memory_mb``，**不占**本板任何一张卡。
             "total_memory_mb":   total_mb,
             "per_card_memory_mb": per_card_mb,
+            "remote_memory_mb":  remote_mb,
             "queue_length":      sum(1 for s in services
                                      if s["status"] in {"not_loaded", "loading"}),
             "running_count":     running_count,
