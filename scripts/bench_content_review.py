@@ -16,8 +16,14 @@ Intern-Decision-4B 是 **prefill-only** 的结构化决策模型：
   linear-attention 层，递归状态跨调用残留，C++ 参考实现每个字段都
   ``rknn3_session_init/destroy``。
 
-⇒ 所以耗时随**维度数**增长，而且因为「字段 i 的 prompt 前缀包含字段 0..i-1 的
-定义」，总 prefill token 是 **O(N²)**。本脚本就是把这条曲线测出来。
+⇒ **字段数 = 前向次数**（一次前向只在**一个**位置输出 62 维符号 logits）。
+
+所以卡片把用户维护的整张列表压成**一个** ``choice`` 字段（列表项当选项）
+—— **1 次前向**出全部维度。
+
+⚠️ **旧方案**（每项一个 ``noul`` 字段）耗时随维度数**平方**增长：字段 i 的
+prompt 前缀含**全部**字段的定义，总 prefill ∝ N² ⇒ 16 个维度要 **26.4 s**。
+本脚本现在测的是**新方案**：曲线应当**基本持平**（1~16 维都约 1 s）。
 
 ⚠️ **并发请求会串行叠加**
 ------------------------
@@ -28,7 +34,7 @@ worker 一次只跑一个推理。并发 N 个请求不是并行，而是排队�
 ⚠️ **图片大小几乎不影响耗时**
 ---------------------------
 服务端最终一律缩到 384×384，视觉编码器输出固定 151 个 token —— 那 151 个
-token 会被**每个字段重新 prefill 一遍**（151 × N）。所以「传小图省时间」是
+token 只会被 prefill **一遍**（新方案只有一次前向）。所以「传小图省时间」是
 错觉：实测 320×240 与 4K 的耗时差 < 0.2 s，差的只是解码开销。
 """
 from __future__ import annotations
@@ -123,8 +129,8 @@ def one(n: int, text: str, image_b64: str, repeat: int):
         "wall": wall,
         "prefill_ms": prefill_ms,
         "prefill_tok": statistics.median(toks),
-        # 非 prefill 的开销 ≈ 每字段重建 session + 视觉编码 + RPC
-        "overhead_per_dim": (wall * 1000.0 - prefill_ms) / max(n, 1),
+        # 非 prefill 的开销 ≈ 视觉编码 + RPC + （旧方案里）每字段重建 session
+        "overhead_ms": wall * 1000.0 - prefill_ms,
     }
 
 
@@ -133,9 +139,12 @@ def _fit_quadratic(points):
 
     为什么要二次拟合而不是「除以维度数」
     ------------------------------------
-    Intern-Decision 的 prompt 前缀是**在每个 ``<decision>`` 标记处切开**的
-    ⇒ 字段 i 的前缀里已经含有字段 0..i-1 的定义 ⇒ 总 prefill token 随维度数
-    **平方**增长。两点割线求斜率会把二次项算丢，必须做二次拟合。
+    旧方案（N 个 ``noul`` 字段）里，每个字段的 prompt 前缀都含**全部**字段的
+    定义 ⇒ 总 prefill token 随维度数**平方**增长。两点割线求斜率会把二次项
+    算丢，必须做二次拟合。
+
+    新方案（一个 ``choice`` 字段）只有一次前向，二次项应该**接近 0** ——
+    这个拟合就是用来验证「平方项已经没了」的。
     """
     if len(points) < 3:
         return None, None
@@ -181,30 +190,29 @@ def main() -> int:
           % ("纯文本" if args.no_image else "图文"))
     print("=" * 88)
     print("  %-6s %10s %12s %13s %14s"
-          % ("维度", "wall(s)", "prefill_ms", "prefill_tok", "开销/字段(ms)"))
+          % ("维度", "wall(s)", "prefill_ms", "prefill_tok", "非prefill(ms)"))
     rows = []
     for n in dims:
         r = one(n, args.text, image_b64, args.repeat)
         rows.append(r)
         print("  %-6d %10.2f %12.1f %13.0f %14.0f"
               % (r["dims"], r["wall"], r["prefill_ms"],
-                 r["prefill_tok"], r["overhead_per_dim"]))
+                 r["prefill_tok"], r["overhead_ms"]))
 
     if len(rows) >= 2:
-        # prefill_tok 随维度数是**二次**的（字段 i 的 prompt 前缀包含字段
-        # 0..i-1 的定义）⇒ 拟合 pt = A·N + B·N²（最小二乘），再报：
-        #   base   = 固定前缀（system + state + 首字段定义 + 图片占位）
-        #   边际   = 第 N 个维度额外带进来的 token 数（A + B·(2N-1)）
+        # 新方案：整张列表 = **一个** choice 字段 ⇒ 只有 **1 次**前向。
+        # ⇒ 曲线应当**基本持平**：prompt 随维度数线性变长（每多一个选项多
+        # 一行），但不再有「每字段重跑一遍全部定义」的平方项。
         A, B = _fit_quadratic([(r["dims"], r["prefill_tok"]) for r in rows])
+        n0, w0 = rows[0]["dims"], rows[0]["wall"]
+        n1, w1 = rows[-1]["dims"], rows[-1]["wall"]
+        print("\n  → 维度 %d → %d：墙钟 %.2fs → %.2fs（%.2fx）"
+              % (n0, n1, w0, w1, w1 / max(w0, 1e-9)))
         if A is not None:
-            n0, t0 = rows[0]["dims"], rows[0]["prefill_tok"]
-            n1, t1 = rows[-1]["dims"], rows[-1]["prefill_tok"]
-            print("\n  → 拟合 prefill_tok ≈ %.0f·N %+.0f·N²"
+            print("  → 拟合 prefill_tok ≈ %.0f·N %+.0f·N²"
                   % (A, B))
-            print("  → 固定前缀 %.0f token；第 %d 个维度边际 +%.0f token"
-                  % (A + B, n1, A + B * (2 * n1 - 1)))
-            print("  → 维度从 %d 减到 %d：prefill token %.0f → %.0f（省 %.0f%%）"
-                  % (n1, n0, t1, t0, (t1 - t0) / max(t1, 1) * 100))
+            print("  → 二次项 %.0f·N² ⇒ N=%d 时占总 token 的 %.0f%%（旧方案是主导项）"
+                  % (B, n1, (B * n1 * n1) / max(A * n1 + B * n1 * n1, 1) * 100))
 
     if image_b64 and args.concurrency > 1:
         print()

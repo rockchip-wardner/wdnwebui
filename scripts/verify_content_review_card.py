@@ -4,14 +4,19 @@
 背景
 ----
 「图文内容审查」卡把用户维护的**可增删列表**翻译成 Intern-Decision 的
-决策任务（每个列表项 = 一个 ``noul`` 字段 = 一次是否判断），再把模型
+决策任务（整张列表 = **一个** ``choice`` 字段 = 列表项当选项），再把模型
 返回的**概率**画成进度条。
 
 这条链路上有三个**不报错但会静默出错**的坑，本脚本逐个钉住：
 
-1. **决策任务形状**：``noul`` 的 ``criteria`` 必须**恰好两项**且键命中
-   no/yes，否则 ``wdnai.decision.parse_decision_task`` 直接抛错 —— 本脚本
-   用**官方解析器**校验我们构造的任务，而不是自己断言字段名。
+1. **决策任务形状**：整张列表必须落在**一个** ``choice`` 字段里（选项键 =
+   列表项名称），且选项数不能超过候选符号数（62）—— 否则
+   ``wdnai.decision.parse_decision_task`` 直接抛错。本脚本用**官方解析器**
+   校验我们构造的任务，而不是自己断言字段名。
+   ⚠️ 2026-11-18 起任务从「每项一个 ``noul`` 字段」改成「**一个**
+   ``choice`` 字段、列表项当选项」：RKNN 上是 prefill-only 模型，N 个字段
+   = N 次前向且总 prefill ∝ N²（16 项要 26 秒），压成一个字段后 1~16 项
+   都约 1 秒。
 2. **概率过 DDS**：决策模型的完整概率 / logits 在 ``TextAttachment`` 里，
    而 ``wdndds`` 的 ``encode_attachments_out`` 曾经**只认图片和音频** ⇒
    文本附件被静默丢掉 ⇒ 调用方只拿到答案 JSON，概率全是 0（判定对、
@@ -180,6 +185,7 @@ def main() -> int:
     print("=" * 72)
 
     from wdnapps_audio_chat.cards.content_review.service import (
+        CHOICE_FIELD,
         ContentReviewManager,
         DEFAULT_MODEL,
         MAX_ITEMS,
@@ -238,58 +244,82 @@ def main() -> int:
         {"name": "诈骗", "description": ""},
     ])
     questions, field_map = ContentReviewManager._build_questions(clean)
-    check("每个列表项一个字段", len(questions) == 2, str(list(questions)))
-    check("字段名 = 列表项名称（它直接进模型 prompt）",
-          set(questions) == {"广告", "诈骗"}, str(list(questions)))
-    check("字段类型是 noul（每项独立的肯定概率，不归一化）",
-          all(q["type"] == "noul" for q in questions.values()),
+    check("整张列表压成**一个**决策字段（1 次前向出全部维度）",
+          len(questions) == 1, str(list(questions)))
+    check("字段名是固定的 choice 字段名",
+          list(questions) == [CHOICE_FIELD], str(list(questions)))
+    check("字段类型是 choice",
+          all(q["type"] == "choice" for q in questions.values()),
           str({k: v["type"] for k, v in questions.items()}))
-    check("criteria 恰好两项且键是 no/yes",
-          all(sorted(q["criteria"]) == ["no", "yes"] for q in questions.values()),
-          str({k: sorted(v["criteria"]) for k, v in questions.items()}))
-    check("说明写进了 instructions",
-          "推销" in questions["广告"]["instructions"],
-          questions["广告"]["instructions"])
+    criteria = questions[CHOICE_FIELD]["criteria"]
+    check("每个列表项 = 一个选项（选项键 = 列表项名称）",
+          list(criteria) == ["广告", "诈骗"], str(list(criteria)))
+    check("选项说明 = 列表项的说明",
+          "推销" in criteria["广告"], criteria.get("广告", ""))
+    check("没有说明的项也有可读的兜底说明",
+          bool(criteria.get("诈骗")), str(criteria.get("诈骗")))
+    check("选项数不超过候选符号数（62）",
+          len(criteria) <= 62, str(len(criteria)))
+    check("字段映射与列表项一一对应",
+          [k for _, k in field_map] == ["广告", "诈骗"], str(field_map))
     try:
         task = parse_decision_task({"questions": questions})
         check("官方 parse_decision_task 接受我们构造的任务", True)
-        check("解析出的字段数一致", len(task.fields) == 2, str(len(task.fields)))
-        check("解析出的选项是 no/yes 两项",
-              all(len(f.options) == 2 for f in task.fields),
-              str([f.options for f in task.fields]))
+        check("解析出的字段数 = 1", len(task.fields) == 1, str(len(task.fields)))
+        check("解析出的选项就是列表项",
+              [o.key for o in task.fields[0].options] == ["广告", "诈骗"],
+              str([o.key for o in task.fields[0].options]))
     except Exception as exc:  # noqa: BLE001
         check("官方 parse_decision_task 接受我们构造的任务", False, repr(exc))
 
-    # 重名项：字段名必须唯一（JSON key 重复会被静默覆盖）
+    # 重名项：选项键必须唯一（JSON key 重复会被静默覆盖）
     dup = ContentReviewManager._normalize_items([
         {"name": "广告"}, {"name": "广告", "description": "x"},
     ])
     q2, fmap2 = ContentReviewManager._build_questions(dup)
-    check("同名的两项被合并成一个（不会覆盖字段）", len(q2) == 1, str(list(q2)))
-    check("字段映射与任务一一对应", len(fmap2) == len(q2), str(fmap2))
+    check("同名的两项被合并成一个选项（不会覆盖）",
+          len(q2[CHOICE_FIELD]["criteria"]) == 1,
+          str(list(q2[CHOICE_FIELD]["criteria"])))
+    check("字段映射与任务一一对应", len(fmap2) == 1, str(fmap2))
 
     # ---------------------------------------------------------------- [4] --
-    print("\n[4] 概率明细解析（附件 → 每项概率）")
+    print("\n[4] 概率明细解析（附件 → 每维占比）")
     detail = {
         "decisions": {
-            "广告": {"type": "noul", "symbol": "B", "label": "yes",
-                     "probabilities": {"no": 0.03, "yes": 0.97},
-                     "logits": [1.0, 2.0]},
+            CHOICE_FIELD: {"type": "choice", "symbol": "A", "label": "广告",
+                            "probabilities": {"广告": 0.68, "诈骗": 0.32},
+                            "logits": [1.0, 0.5]},
         },
         "temperature": 1.9924182891845703,
     }
-    summary = "广告[B]=yes (97.00%)"
+    summary = "内容类型[A]=广告 (68.00%)"
     from wdnai.attachment import TextAttachment
     atts = [TextAttachment(summary + "\n" + json.dumps(detail, ensure_ascii=False))]
     got = ContentReviewManager._parse_detail(atts)
     check("能从附件里抠出明细 JSON", bool(got.get("decisions")), str(got)[:120])
     check("概率读得出来",
-          abs(got["decisions"]["广告"]["probabilities"]["yes"] - 0.97) < 1e-9,
-          str(got.get("decisions", {}).get("广告")))
+          abs(got["decisions"][CHOICE_FIELD]["probabilities"]["广告"] - 0.68) < 1e-9,
+          str(got.get("decisions", {}).get(CHOICE_FIELD)))
     check("校准温度也在", "temperature" in got, str(got.get("temperature")))
     check("附件为空时返回空 dict（不炸）",
           ContentReviewManager._parse_detail([]) == {},
           str(ContentReviewManager._parse_detail([])))
+
+    # 一个 choice 字段 → 拆回每个维度（不碰 NPU 就能测）
+    res, picked, picked_symbol = ContentReviewManager._split_choice(
+        got.get("decisions") or {}, field_map)
+    check("每个维度一行", len(res) == len(field_map), str(len(res)))
+    check("维度顺序与列表一致",
+          [r["name"] for r in res] == [i["name"] for i, _ in field_map],
+          str([r["name"] for r in res]))
+    check("占比来自归一化分布",
+          abs(res[0]["probability"] - 0.68) < 1e-9, str(res[0]))
+    check("选项符号按顺序 A、B、C…",
+          [r["symbol"] for r in res] == ["A", "B"], str([r["symbol"] for r in res]))
+    check("选中的那一类被标出来",
+          picked == "广告" and res[0]["selected"] and not res[1]["selected"],
+          "%s / %s" % (picked, [r["selected"] for r in res]))
+    check("模型选的符号带回来了", picked_symbol == "A", picked_symbol)
 
     # ---------------------------------------------------------------- [5] --
     print("\n[5] 概率能不能过 DDS wire（wdndds 的附件编解码）")
@@ -306,9 +336,14 @@ def main() -> int:
               str(dec)[:160])
         parsed = ContentReviewManager._parse_detail(dec)
         check("过完 wire 仍能读出概率",
-              abs(parsed.get("decisions", {}).get("广告", {})
-                  .get("probabilities", {}).get("yes", 0) - 0.97) < 1e-9,
+              abs(parsed.get("decisions", {}).get(CHOICE_FIELD, {})
+                  .get("probabilities", {}).get("广告", 0) - 0.68) < 1e-9,
               str(parsed)[:160])
+        res2, picked2, _ = ContentReviewManager._split_choice(
+            parsed.get("decisions") or {}, field_map)
+        check("过完 wire 仍能拆回每个维度",
+              len(res2) == len(field_map) and res2[0]["probability"] > 0.67,
+              str(res2)[:160])
     except Exception as exc:  # noqa: BLE001
         check("wdndds 附件编解码可用", False, repr(exc))
 
