@@ -84,8 +84,17 @@ function mkNode(tag) {
       if (i >= 0) this.children.splice(i, 1);
       return c;
     },
-    addEventListener() {},
+    addEventListener(type, fn) {
+      (this._h || (this._h = {}))[type] = (this._h[type] || []).concat([fn]);
+    },
     removeEventListener() {},
+    // ⚠️ **派发 click** —— 自检要**模拟用户点「开始审查」**，而不是直接调
+    // 内部函数：只有走真实的监听器，才能钉住「事件 → 徽章」这条链路。
+    // 以前 stub 里的 addEventListener 是空的 ⇒ 点按钮什么都不会发生。
+    click() {
+      const hs = (this._h || {}).click || [];
+      hs.forEach((fn) => { try { fn({ target: this }); } catch (_) {} });
+    },
     setAttribute() {},
     getAttribute() { return null; },
     select() {},
@@ -177,6 +186,44 @@ def run_card_app_js(seed=None) -> dict:
     interp.evaljs(src)
     raw = interp.evaljs(PROBE)
     return json.loads(raw if isinstance(raw, str) else str(raw))
+
+
+def run_review_click() -> dict:
+    """模拟用户点「开始审查」，返回徽章 / 提示语的最终状态。
+
+    ⚠️ **必须走真实的 click 监听器**（不是直接调内部函数）—— 只有这样才能
+    钉住「点按钮 → 徽章变」这条链路；直接调内部函数的话，徽章没接线也能
+    「测过」（2026-11-18 那个「结果卡永远是未审查」的 bug 就是这么漏掉的）。
+
+    ``run()`` 是 async 而监听器不 await 它 ⇒ 轮询提示语等它落定。
+    """
+    import time
+
+    import dukpy
+
+    src = open(CARD_JS, encoding="utf-8").read()
+    interp = dukpy.JSInterpreter()
+    interp.evaljs(DOM_STUB)
+    interp.evaljs(src)
+    interp.evaljs(
+        'document.getElementById("cr-text").value = "限时优惠，点击领取优惠券";'
+        'document.getElementById("cr-run-btn").click();'
+    )
+    note = ""
+    for _ in range(100):
+        note = interp.evaljs('((REG["cr-run-note"] || {}).textContent) || ""')
+        if note in ("完成", "失败"):
+            break
+        time.sleep(0.02)
+    return {
+        "note": note,
+        "result_badge": interp.evaljs(
+            '((REG["cr-result-badge"] || {}).textContent) || ""'),
+        "result_state": interp.evaljs(
+            '(((REG["cr-result-badge"] || {}).dataset || {}).state) || ""'),
+        "review_badge": interp.evaljs(
+            '((REG["cr-review-badge"] || {}).textContent) || ""'),
+    }
 
 
 def main() -> int:
@@ -576,6 +623,35 @@ def main() -> int:
     check("结果区标了 translate=\"no\"（维度名不许被界面翻译接管）",
           bool(m_res) and 'translate="no"' in m_res.group(0),
           m_res.group(0) if m_res else "(没找到)")
+
+    # ---------------------------------------------------------------- [9] --
+    print("\n[9] 结果卡徽章会跟着走（模拟用户点「开始审查」）")
+
+    # ⚠️ **这条是被真实 bug 逼出来的**（2026-11-18 修）：结果卡的抬头徽章
+    # ``cr-result-badge`` 是模板里写死的「未审查」，而 app.js 从来没碰过它
+    # （只更新了另一个元素 ``cr-review-badge``）⇒ 审查完了抬头还是「未审查」。
+    # 症状很像「审查没生效」，其实是徽章没接线。
+    r = run_review_click()
+    check("点「开始审查」后提示语落定为「完成」",
+          r["note"] == "完成", r["note"])
+    check("**结果卡抬头徽章**跟着变成「完成」（原来是永远「未审查」）",
+          r["result_badge"] == "完成", r["result_badge"])
+    check("结果卡徽章的 state 是 ok",
+          r["result_state"] == "ok", r["result_state"])
+    check("待审查卡那个徽章也在「完成」",
+          r["review_badge"] == "完成", r["review_badge"])
+    check("app.js 确实提到了 cr-result-badge",
+          "cr-result-badge" in js, "")
+
+    # 徽章的状态色：框架只给 awaiting_scan/scanned/confirmed/running/
+    # expired/error/cancelled 配了色，这张卡用的 idle/busy/ok 一律落回灰底
+    # ⇒ 「完成」跟「未审查」长得一模一样。
+    check("ok 状态的徽章配了绿色",
+          '#page-content-review #cr-result-badge[data-state="ok"]' in css,
+          "")
+    check("busy 状态的徽章配了琥珀色",
+          '#page-content-review #cr-result-badge[data-state="busy"]' in css,
+          "")
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")
