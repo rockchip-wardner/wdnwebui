@@ -46,10 +46,42 @@
 # this board accepts.**
 set -euo pipefail
 
-IP="${1:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tls_common.sh
+source "$SCRIPT_DIR/tls_common.sh"
+
+usage() {
+    cat >&2 <<EOF
+usage: $0 [IP] [--force-leaf]
+       $0 --ip=<addr> [--force-leaf]
+
+  IP            板子对外的 IP，省略则自动探测
+  --force-leaf  强制重签服务器证书（换 IP 后必须加，否则旧证书被原样跳过）
+  --ip=<addr>   同位置参数 IP
+EOF
+}
+
+# 参数解析。IP 曾是裸位置参数（$1），于是 `--force-leaf` 会被当成 IP ⇒
+# SAN 写成 "IP:--force-leaf" ⇒ openssl 失败 ⇒ 留下半成品目录。
+IP=""
 FORCE_LEAF=0
+_IP_GIVEN=0
+
 for a in "$@"; do
-  [ "$a" = "--force-leaf" ] && FORCE_LEAF=1
+    case "$a" in
+        --force-leaf) FORCE_LEAF=1 ;;
+        --ip=*)       IP="${a#--ip=}"; _IP_GIVEN=1 ;;
+        -h|--help)    usage; exit 0 ;;
+        -*)           echo "unknown option: $a" >&2; usage; exit 2 ;;
+        *)
+            if [ "$_IP_GIVEN" -eq 1 ]; then
+                echo "unexpected argument: $a (IP already given)" >&2
+                usage
+                exit 2
+            fi
+            IP="$a"; _IP_GIVEN=1
+            ;;
+    esac
 done
 
 DIR="${WDNWEBUI_TLS_DIR:-/home/rockchip/.config/wdnwebui/tls}"
@@ -58,19 +90,36 @@ KEY="$DIR/key.pem"
 CA_CERT="$DIR/ca.pem"
 CA_KEY="$DIR/ca-key.pem"
 
-if [ -z "$IP" ]; then
-  echo "usage: $0 <board IP> [--force-leaf]" >&2
-  exit 2
+if [ "$_IP_GIVEN" -eq 1 ]; then
+    if ! wdn_tls_is_ip "$IP"; then
+        echo "ERROR: '$IP' 不是合法的 IP 地址。" >&2
+        usage
+        exit 2
+    fi
+else
+    IP="$(wdn_tls_detect_ip)"
+    if [ -z "$IP" ]; then
+        echo "ERROR: 探测不到本机对外 IP，请显式指定（$0 <IP>）。" >&2
+        usage
+        exit 2
+    fi
 fi
 
 mkdir -p "$DIR"
 chmod 700 "$DIR"
 
-HOSTN="$(hostname 2>/dev/null || true)"
-SAN="IP:$IP"
+# 主机名必须是合法 DNS label —— 含非法字符时 openssl 会写出一条无效 SAN。
+HOSTN="$( { hostname 2>/dev/null || true; } | tr -cd 'A-Za-z0-9.-' | sed 's/^[.-]*//; s/[.-]*$//')"
+
+# SAN 的 IP 条目：显式给的 IP 在前，其余候选地址追加。
+# 候选全写进去是「探测猜错时的兜底」——猜错只是多一条无害条目，漏了却是
+# 浏览器报「证书名称与域名不符」。
+SAN="$( { printf '%s\n' "$IP"; wdn_tls_detect_ips; } \
+        | awk 'NF && !seen[$0]++' | sed 's/.*/IP:&/' | paste -sd, - )"
+
 [ -n "$HOSTN" ] && SAN="$SAN,DNS:$HOSTN"
 # Add localhost as well: it is just as trusted when the client uses
-# https://localhost:8443.
+# https://localhost:8000.
 SAN="$SAN,DNS:localhost,IP:127.0.0.1"
 
 # --------------------------------------------------------------------------- #

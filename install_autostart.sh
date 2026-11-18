@@ -7,6 +7,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$SCRIPT_DIR/.venv/bin/python"
 
+# TLS 公共 helper —— IP 探测 + SAN 精确比对。
+# 与 scripts/gen_tls_ca.sh、scripts/tls_cert_check.sh 共用**同一份**实现，
+# 免得三处各写各的、慢慢漂移。
+TLS_COMMON="$SCRIPT_DIR/scripts/tls_common.sh"
+if [ ! -f "$TLS_COMMON" ]; then
+    echo "ERROR: 缺少 $TLS_COMMON（TLS 公共 helper）。" >&2
+    exit 1
+fi
+# shellcheck source=scripts/tls_common.sh
+source "$TLS_COMMON"
+
 WEB_UNIT="/etc/systemd/system/wdnwebui.service"
 CERT_CHECK_UNIT="/etc/systemd/system/wdnwebui-cert-check.service"
 CERT_CHECK_TIMER="/etc/systemd/system/wdnwebui-cert-check.timer"
@@ -107,6 +118,60 @@ EOF
     echo "wrote $CERT_CHECK_UNIT / $CERT_CHECK_TIMER (timer enabled)"
 }
 
+# TLS 证书 —— 单元的 ``ConditionPathExists`` 直接依赖它。
+#
+# 必须在写单元**之前**准备好：证书缺失时 systemd 会**静默跳过**单元
+# （Result=success / ActiveState=inactive / ConditionResult=no，journal 里
+# 一条记录都没有）—— 现场只看到「服务 enabled 但没起来」，查不到任何报错。
+ensure_tls_cert() {
+    local gen="$SCRIPT_DIR/scripts/gen_tls_ca.sh"
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "ERROR: 找不到 openssl，无法签发/校验 TLS 证书。" >&2
+        return 1
+    fi
+
+    local ip
+    ip="$(wdn_tls_detect_ip)"
+    if [ -z "$ip" ]; then
+        echo "ERROR: 探测不到本机 IP，无法签发带正确 SAN 的证书。" >&2
+        echo "       手动执行: bash $gen --ip=<本机IP>" >&2
+        return 1
+    fi
+
+    # 已有证书：SAN 覆盖当前 IP 就复用；不覆盖（板子换 IP 了）就重签。
+    local force=""
+    if [ -r "$TLS_CERT" ] && [ -r "$TLS_KEY" ]; then
+        if wdn_tls_san_has_ip "$TLS_CERT" "$ip"; then
+            echo "TLS 证书已存在且 SAN 覆盖 $ip: $TLS_CERT"
+            return 0
+        fi
+        echo "== 现有证书的 SAN 不含当前 IP $ip ⇒ 重新签发 =="
+        force="--force-leaf"
+    else
+        echo "== 未找到 TLS 证书 ⇒ 签发 =="
+    fi
+
+    if [ ! -f "$gen" ]; then
+        echo "ERROR: 缺少 $gen，无法自动签发 TLS 证书。" >&2
+        echo "       手动执行: bash $gen --ip=$ip" >&2
+        return 1
+    fi
+
+    # 以普通用户身份签发 ⇒ 文件属主跟家目录一致（服务以 root 跑 ⇒ 可读）。
+    if [ "$EUID" -eq 0 ] && [ "$SERVICE_USER" != "root" ] && id "$SERVICE_USER" >/dev/null 2>&1; then
+        sudo -u "$SERVICE_USER" bash "$gen" "$ip" $force
+    else
+        bash "$gen" "$ip" $force
+    fi
+
+    if [ ! -r "$TLS_CERT" ] || [ ! -r "$TLS_KEY" ]; then
+        echo "ERROR: 证书签发后仍不可读: $TLS_CERT / $TLS_KEY" >&2
+        return 1
+    fi
+    echo "TLS 证书就绪: $TLS_CERT"
+}
+
 write_web_unit() {
     cat > "$WEB_UNIT" <<EOF
 [Unit]
@@ -162,6 +227,9 @@ if [ "$UNINSTALL" = true ]; then
     exit 0
 fi
 
+# ⚠️ 顺序：先签证书，再写单元 —— 反过来的话单元会被装成「证书缺失 ⇒ 静默
+#    跳过」的状态，而 journal 里一条记录都没有。
+ensure_tls_cert
 write_web_unit
 write_cert_check_units
 
@@ -170,5 +238,6 @@ echo "v0.6+: discovery uses FastDDS SIMPLE multicast (239.255.0.1:7400), there i
 echo "If LAN multicast is blocked, add Environment=WDNDDS_INITIAL_PEERS=ip1,ip2,... to the systemd unit"
 echo ""
 echo "TLS: 8000 只提供 HTTPS，证书在 $TLS_DIR"
+echo "  ⚠️ 访问地址是 https://<板子IP>:8000 —— http:// 打不开（明文协议已被移除）"
 echo "  客户端需信任 CA 根：$TLS_DIR/ca.pem"
-echo "  证书缺失时服务**不会启动**（ConditionPathExists）—— 先跑 scripts/gen_tls_ca.sh"
+echo "  证书缺失时服务**不会启动**（ConditionPathExists）—— 上面已自动签发"
