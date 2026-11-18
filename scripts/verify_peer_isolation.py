@@ -35,6 +35,29 @@ from app.system.api import compute as capi
 _FAILED: list[str] = []
 
 
+def _pick_models() -> tuple[str, str]:
+    """挑「本机模型」与「peer 模型」两个 model id。
+
+    ⚠️ **不要写死模型名** —— 目录里的模型随分发变化（``qwen3-vl-4b``
+    已经改名成 ``qwen3.5-vl-4b``），写死的名字会让这个回归在换包后直接
+    抛 pydantic 校验错误（``未知 model: 'qwen3-vl-4b'``），**连断言都
+    跑不到** —— 脚本看上去「失败」，其实是被前置校验挡在门外。
+
+    ``StopInstanceRequest`` 的校验用的是 ``MODEL_PRESETS``（= 本板**已
+    安装**的模型目录），所以这里从它里面挑，保证一定能过校验。
+    """
+    from app.core.compute.registry import MODEL_PRESETS
+
+    ids = sorted(MODEL_PRESETS.keys())
+    if len(ids) < 2:
+        raise SystemExit("本板装的模型少于 2 个，跑不了这个回归")
+    peer, local = ids[0], ids[1]
+    return local, peer
+
+
+LOCAL_MODEL, PEER_MODEL = _pick_models()
+
+
 def check(ok: bool, label: str, detail: str = "") -> None:
     print(f"[{'PASS' if ok else 'FAIL'}] {label}")
     if not ok:
@@ -66,18 +89,28 @@ def make_reg() -> ComputeRegistry:
     """真 registry 对象,只注入实例表 —— 方法全是真的。
 
     场景:一块本板 + 一块远端 peer 板。
-      - 本板:qwen3-vl-4b @npu0 (spawned)
-      - peer:LocateAnything-3b @npu1 (adopted)
+      - 本板:<local model> @npu0 (spawned)
+      - peer:<peer model> @npu1 (adopted)
+
+    ⚠️ 模型名**从 ``MODEL_PRESETS`` 动态取**（见 :func:`_pick_models`）——
+    写死会随模型包改名而失效。
     """
     reg = ComputeRegistry.__new__(ComputeRegistry)
     reg._lock = threading.RLock()
     reg._model_locks = {}
     reg._recently_stopped = {}
     reg._instances = {}
+    # 设备拓扑评估跟本回归无关（它会去探真卡）—— mock 掉，保持脚本不碰硬件
+    reg._dev_req_cache = {}
+    reg.evaluate_device_requirements = (
+        lambda model_id, ep_card_count=None: {
+            "total_devices": 1, "ok": True, "reason": "",
+            "selected": [], "layouts": {},
+        })
     # snapshot() 依赖一堆 probe/卡表内部状态,本脚本不看快照 → 直接覆盖
     reg.snapshot = lambda: {"instances": []}
-    for m, npu, src in (("qwen3-vl-4b", 0, "spawned"),
-                        ("LocateAnything-3b", 1, "adopted")):
+    for m, npu, src in ((LOCAL_MODEL, 0, "spawned"),
+                        (PEER_MODEL, 1, "adopted")):
         inst = ModelInstance(key=(npu, m, src), model_id=m, npu_index=npu,
                              _source=src, status="running")
         reg._instances[inst.key] = inst
@@ -99,7 +132,7 @@ def make_restart_reg() -> tuple[ComputeRegistry, list, list]:
     「有没有走 adopt」与「spawn 的 allow_adopt 是什么」,不真起进程。
     """
     reg = make_reg()
-    reg._instances[(0, "qwen3-vl-4b", "spawned")].proc = FakeProc()
+    reg._instances[(0, LOCAL_MODEL, "spawned")].proc = FakeProc()
     adopted_calls: list = []
     spawn_calls: list = []
 
@@ -127,7 +160,7 @@ def main() -> int:
     peer_hit = [h for h in hits if h[2] == "adopted"]
     check(not peer_hit, "stop-all 不 unload 远端 peer 的实例",
           f"却 unload 了 {peer_hit}")
-    check("LocateAnything-3b" not in res["stopped"],
+    check(PEER_MODEL not in res["stopped"],
           "stop-all 的 stopped 列表不含 peer 模型", f"stopped={res['stopped']}")
     check(any(h[2] == "spawned" for h in hits),
           "stop-all 仍会卸本机实例", f"hits={hits}")
@@ -139,7 +172,7 @@ def main() -> int:
     capi.get_registry = lambda: reg
     try:
         asyncio.run(capi.stop_instance(
-            capi.StopInstanceRequest(model="LocateAnything-3b", npu_index=1)))
+            capi.StopInstanceRequest(model=PEER_MODEL, npu_index=1)))
         check(False, "DELETE peer 实例应被 403 拒绝", "却返回成功")
     except HTTPException as e:
         check(e.status_code == 403,
@@ -154,7 +187,7 @@ def main() -> int:
     capi.get_registry = lambda: reg
     try:
         asyncio.run(capi.stop_instance(
-            capi.StopInstanceRequest(model="qwen3-vl-4b", npu_index=0)))
+            capi.StopInstanceRequest(model=LOCAL_MODEL, npu_index=0)))
         check(True, "DELETE 本机实例成功")
     except HTTPException as e:
         check(False, "DELETE 本机实例应成功",
@@ -169,7 +202,7 @@ def main() -> int:
     # restart 语义的一部分(no-op 掉会让 ensure 复用旧实例,测不到 spawn)。
     print("\n=== 4. restart_instance_local（算力页「重启服务」）===")
     reg, adopted_calls, spawn_calls = make_restart_reg()
-    reg.restart_instance_local("qwen3-vl-4b")
+    reg.restart_instance_local(LOCAL_MODEL)
     check(not adopted_calls,
           "重启本机模型不 adopt peer（allow_adopt=False）",
           f"adopted_calls={adopted_calls}")
@@ -183,7 +216,7 @@ def main() -> int:
     print("    restart_all_local ->", lines)
     check(not adopted_calls,
           "重启所有协处理器时不 adopt peer", f"adopted_calls={adopted_calls}")
-    check(not any("LocateAnything-3b" in ln for ln in lines),
+    check(not any(PEER_MODEL in ln for ln in lines),
           "peer 自身不被重启（只收 proc is not None 的本机 worker）",
           f"lines={lines}")
 
