@@ -12759,3 +12759,98 @@ text-chat 提交把 `app/apps/tts/static/app.js` 又加了回来**（2574 行全
 > `BrowserContext.route` 和 `Page.route`）。`browser.new_page()` 隐式建
 > context、拿不到它 ⇒ 这种脚本只能**给 page 装**（`install_on_page`），
 > 且**每个 page 都要单独装**。
+
+## 磁盘保护守护：自有实现取代系统那份 `log-guardian`（2026-11-18）
+
+板子上「磁盘快满就回收日志」的守护是 **`/usr/bin/log-guardian` —— 系统镜像自带，
+仓库里没有源副本**。它在 2026-11-18 之前**从开机到那时一次都没截断过日志**
+（`journalctl -u log-guardian | grep -cE "Rotating|Truncating"` = 0）。
+
+### 根因：awk 的默认输出格式是科学计数法
+
+```sh
+total_size() { df -k "$1" 2>/dev/null | tail -n 1 | awk '{print $2 * 1024}'; }
+avail_size() { df -k "$1" 2>/dev/null | tail -n 1 | awk '{print $4 * 1024}'; }
+is_full()    { [ "$(avail_size "$1")" -lt "$MIN_AVAIL_BYTE" ]; }
+```
+
+awk 的默认 `OFMT=%.6g` ⇒ 6.2 GB 被输出成 `6.22099e+09` ⇒ dash 的 `[` 不认这个
+写法 ⇒ `[: Illegal number: 6.22099e+09` ⇒ **`is_full()` 恒假** ⇒ 磁盘保护是空的。
+
+### ⚠️ 别用 `printf "%d"` 修 —— mawk 的 32 位截断
+
+直觉的修法（`awk '{printf "%d", $4 * 1024}'`）**在这台板上是错的**：本机 awk 是
+**mawk**，`%d` 是 32 位 int，超过 2^31 就**饱和成 2147483647**：
+
+```
+$ awk 'BEGIN{printf "%d", 6221140000}'    →  2147483647     ← 静默截断
+$ awk 'BEGIN{printf "%.0f", 6221140000}'  →  6221140000     ← 正确
+```
+
+那样改完 `avail_size` 会恒返回 2 GiB-1 ⇒ **磁盘真的快满时 `is_full()` 依然判不出
+TRUE** —— 比原 bug 更隐蔽，因为它「看起来修好了」。**必须用 `%.0f`。**
+
+### 系统那份另外两个隐患（一起修掉）
+
+1. **无条件截断目录下每一个普通文件**：不看年龄、不看是不是正在写 ⇒
+   `/tmp/mdns_discovery.log`、`/tmp/wdnwebui-worker/*.log` 这种**正在写**的文件
+   也在射程内；`/tmp/wdnai_gguf_tok_*/vocab.json`（GGUF 分词器缓存）也会被截。
+2. **用 `find | xargs ls -dS` 解析路径** ⇒ 文件名带空格/换行就乱。
+
+### 现在的做法：仓库自有实现
+
+| 文件 | 作用 |
+|---|---|
+| `scripts/log_guardian.py` | 实现本体（**只依赖标准库**，`shutil.disk_usage` 取可用空间，**不用 df+awk** ⇒ 没有科学计数法、没有列序问题、没有本地化问题） |
+| `scripts/install_log_guardian.sh` | 安装到 `/usr/local/sbin/log-guardian` + `/etc/systemd/system/log-guardian.service`，并把 enable 软链从 `/usr/lib/…` 指到 `/etc/…` |
+| `scripts/verify_log_guardian.py` | 回归（27 条断言，全在临时目录里跑，不碰生产目录） |
+
+策略：
+
+* **`/var/log`**：`min_age=0` ⇒ 活跃日志也要截（截断正在写的日志是标准做法，
+  logrotate 的 copytruncate）；只处理**普通文件**（socket / 设备 / 符号链接天然
+  免疫）；`journal/` 目录交给 `journalctl --vacuum-size`。
+* **`/tmp`**：`min_age=3600` ⇒ **只动 1 小时前改过的文件** ⇒ 正在写的临时文件
+  不会被截；外加**受保护前缀** `/tmp/wdnai_gguf_tok_`、`/tmp/wdnwebui-worker`
+  （模型分词器缓存、worker 活日志）—— 磁盘满了也不碰。
+* 回收顺序：删旧轮转（`*.1` / `*.2.gz` / `*~`）→ journald vacuum → 大文件
+  **轮转**（保留尾部 10 MB 到 `.1` 再截断原文件）→ 仍不够就**直接截断**（从最大
+  的开始）；**单轮有 512 MB 预算封顶**（先算收益再动手，不许超额）。
+
+### 装在哪、为什么这次不用再「重打补丁」
+
+```
+/usr/local/sbin/log-guardian                 ← 实现（仓库有源）
+/etc/systemd/system/log-guardian.service     ← unit（仓库有源）
+```
+
+`/usr/local` 与 `/etc/systemd/system` 都是 Debian 留给管理员的目录，**系统包升级 /
+重刷系统不会覆盖** ⇒ **升级后不需要任何「重打补丁」动作**。
+
+unit **故意与系统那份同名** ⇒ systemd 只加载 `/etc` 这一份 ⇒ 系统那份被「顶掉」
+而不是「两份一起跑」（两份守护互相抢着截日志）。`/usr/bin/log-guardian` 保留在原处
+（早前打过 awk 补丁），但**永远不会被执行**。
+
+⚠️ 早期方案是「给 `/usr/bin/log-guardian` 打补丁 + 升级后重打」，**已废弃** ——
+仓库里没有那份代码的源真相，升级即失效且无人察觉。要恢复系统那份：
+`sudo bash scripts/install_log_guardian.sh --uninstall`（会把 enable 软链指回
+`/usr/lib` 并重新拉起系统 unit）。
+
+### 回归
+
+```bash
+python3 scripts/verify_log_guardian.py      # 27 条断言
+```
+
+覆盖：size 解析、`free_bytes` 不被 32 位截断、只认普通文件、符号链接不入选、
+`/tmp` 的年龄免疫、`/var/log` 的活跃日志入选、旧轮转优先删、轮转保留尾部字节、
+端到端 `reclaim()` 真的把文件变小且不碰太新的文件、预算封顶、dry-run 不动手、
+分词器缓存受保护。
+
+### 板端现状（2026-11-18）
+
+* `systemctl is-active log-guardian.service` = active，**MainPID 是真实 PID**
+  （系统那份把自己丢到后台 ⇒ systemd 里 MainPID=0，`systemctl status` 根本看不到
+  真正干活的进程 —— 这是系统那份的另一个毛病）。
+* 想看它会动什么：`sudo /usr/local/sbin/log-guardian --once --dry-run --min-free=1T`
+  （`--min-free=1T` 强制把所有候选列出来；**dry-run 不动任何文件**）。
