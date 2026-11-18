@@ -447,3 +447,128 @@ MT 实测（npu_provider.py:12, 48-58）
 ASR 端点参数（app/core/audio/endpoint.py:160）
   静音门限 -45 dBFS、端点 1200 ms、最小语音 0.3 s、纯静音超时 30 s
 ```
+
+---
+
+## 11. 方案修订（2026-11-18 决策）：**合并进「流式语音识别」卡**
+
+> 本节是对 §0~§6 的**修订**。§1~§5 的盘点、延迟账、卡位账、协议设计
+> **全部继续有效**；变的是**落地形态**：不新开 `live-interpreter` 卡，
+> 而是把「实时翻译字幕」做成 **ASR 卡的一个可选功能**。
+
+### 11.1 为什么改：实时 ASR 流是**单例**的
+
+`_LiveAsrManager` 看似允许多个会话（`cards/qwen3_asr/service.py:1969`），
+但每个会话的 `select_session()` 取的都是 registry 里**同一个** ASR
+worker 的 session（`service.py:1449-1460`）：
+
+```python
+handles = registry.list_sessions(self.CAPABILITY, include_remote=True)
+chosen = handles[0]
+self._session = chosen.session      # ← 所有 live 会话共用一个增量解码器
+```
+
+⇒ **两张卡各开一条实时流会把同一个解码器搅在一起**。独立同传卡要么
+跨卡 HTTP 调 ASR 卡的 `/live/*`（违反插件「禁止跨卡依赖」约定），要么
+自己开一条（搅在一起）。合并则：翻译挂在 ASR **已有**的 `endpoint` 帧上，
+**零新增音频通道**。
+
+| 维度 | 合并进 ASR 卡 | 独立 `live-interpreter` 卡 |
+|---|---|---|
+| 实时 ASR 流 | 复用，零新增 | 跨卡 HTTP 或自开一条（搅在一起）|
+| WebSocket | **1 条**（live 帧统一走 `broadcast()`，`service.py:1951`）| 2 条，前端要按 id 合并帧 |
+| DemoGuard / 停止语义 | 已有 3 个 stop 端点；ASR 一停翻译就停 | 另做一套 |
+| 插件重构 | **零** | 要把 `_LiveAsrSession` 搬进宿主（原 M2）|
+| 卡位 | ASR 1600 + MT 2200 = **3800 ≤ 5120，同卡放得下** | 要占 2 张卡 |
+| ASR 回归面 | 变大（开关默认关 + 断言守住 manifest）| 不变 |
+| 卡片语义 | 识别卡多一个**可选**翻译功能 | 语义更纯 |
+
+### 11.2 三条硬约束（不做就是回归）
+
+**约束 1（最致命）：`software_capabilities` 保持只有 `swcap_audio_asr`。**
+
+`app/static/core/framework.js:205-224` 的 `_capsAllLocalRunning()` 是
+`caps.every(...)` —— 声明的**每一个** cap 都得本机 running，卡片才会被
+写进 `compute.active_app`、cap 才会增量写进 `compute.autostart`。
+
+⇒ 加了 `swcap_translate`：用户只跑 ASR 时判定为 false ⇒ **ASR 不再进
+autostart**（重启不自动起）+ **active_app 不落盘**（开机不恢复向导）。
+另 `wizard/state.js:931-933` 会把没跑的 cap 列为「缺能力」，向导弹
+"翻译能力未就绪"。
+
+⇒ 翻译是**页内可选功能**，不是卡片声明的能力。
+
+**约束 2：翻译做成页内开关，默认关闭**，且**不动** `wizard.json` 的
+`swcap_to_model`（那是「一键开启所需模型」的依据；加了会让只想识别的人
+也白起一个 2200 MB 的翻译模型）。⇒ 现有 ASR 用户零行为变化。
+
+**约束 3：MT 实例的启停放宿主共享模块。** 插件明令禁止跨卡 import
+（`cards/qwen3_asr/__init__.py`："No cross-card imports."），所以 ASR 卡
+不能 import web-translate 卡的 `WebTranslateManager`；但在 ASR 卡里
+**照抄**一份 = 又一份近似副本（AGENTS 明令消灭的东西）。
+
+⇒ 新增宿主 `app/core/translate/npu_manager.py`，只管「起/停 MT 实例 +
+选 session + 卡位检查」，**不含**界面翻译的 provider 链（那是 web-translate
+卡的私事）。web-translate 卡后续可切过去。
+
+### 11.3 实现要点
+
+**后端**
+
+1. **宿主** `app/core/translate/npu_manager.py`（新）
+   —— `ensure()` / `stop_all()` / `pick_session()` / `status()`；
+   起之前用 §M0 修好的 `_local_memory_usage()` 查本机占用。
+2. **宿主** `app/core/translate/npu_provider.py` —— 加
+   `translate_one_fast(text, src, tgt)`：**单次措辞、不重试**
+   （现有 `_translate_one` 最多试 5 条措辞，同传里是致命的 5×0.5 s）；
+   复用现成的 `LANG_CODES` / `PROMPT_ORDER` / `_looks_translated` 文种校验。
+3. **ASR 卡** `service.py` —— `endpoint` 分支挂「送去翻译」的钩子 →
+   有界队列（满时丢最旧）→ 翻译线程池，**每个 MT 实例一个 session、
+   实例内串行**（`LLMRPCSession` 执行器 `max_workers=1` ⇒ 并发单位是
+   **实例**不是线程）。
+4. **ASR 卡** `api.py` —— `POST /api/qwen3-asr/translate/settings`
+   （目标语种 / 开关）、`/translate/enable`、`/translate/disable`、
+   `GET /translate/status`。
+5. **WS 新帧**（搭 `broadcast()` 同一班车）——
+   `{"type":"translation","stream_id":…,"index":…,"source":…,"text":…,
+   "status":…,"latency_ms":…}`。
+
+**前端**
+
+- `template.html` —— 实时区加一列译文 + 目标语言下拉 + 「实时翻译」开关
+  + 「启用翻译模型」按钮。
+- `app.js` —— 新增 `case "translation"` 分支；`_liveRender()`
+  （`app.js:1861`）扩成「原文行 + 译文行」；`endpoint` case
+  （`app.js:2838`）里 `L.segments.push(text)` 时建立「句序号 ↔ 译文」对应。
+- 板端无 emoji 字体 ⇒ 只用内联 SVG。
+
+**只做实时路径（第一期）**
+
+文件/视频路径**没有句级信号** —— 它的 `round` 帧只有 committed/unfixed，
+收尾只有一个 `done`（`service.py:1107-1123`）⇒ 要出双语字幕得自己按
+标点/静音断句。⇒ 第一期只做**麦克风 / 板载麦克风**；「视频批量双语字幕」
+是另一条批处理管线，将来单独开卡更合适。
+
+**降级**
+
+| 情况 | 表现 |
+|---|---|
+| MT 没启用 | 只出原文，译文区标「翻译未启用」 |
+| 翻不出来（复读原文）| 显示原文 + 标「未翻译」，**不重试** |
+| 源语 == 目标语 | 透传（`status=skipped`）|
+| ASR 停止 | 翻译队列清空，状态落 `stopped`（**不是** error）|
+| 翻译出错 | **不影响** ASR（完全解耦）|
+
+**SRT 导出的前提** —— `endpoint` 帧只有 `index` 与 `elapsed_sec`（句子
+**结束**时刻），没有句子起止 ⇒ 要用 `round` 帧的 `chunk_start_sec`
+（`service.py:1781-1789`）记下每句起点。
+
+### 11.4 回归
+
+* 现有 ASR 回归必须全过：`scripts/verify_asr_live.py` /
+  `verify_asr_live_smoke.py` / `verify_asr_long_audio.py` /
+  `verify_asr_wizard.py`；
+* 新增 `scripts/verify_asr_translation.py` —— 假 MT session 断言
+  endpoint→翻译→回填的时序与各条降级；**外加一条守住 manifest 的断言**：
+  `software_capabilities` 必须仍然只有 `swcap_audio_asr`（防止后人
+  「顺手」加上去把 autostart 打断）。
