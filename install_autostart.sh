@@ -81,23 +81,23 @@ uninstall() {
     echo "uninstall complete"
 }
 
-# 证书巡检：每天查一次「证书在不在 / 私钥读得到吗 / 30 天内会不会过期」。
+# 证书巡检：查文件在不在 / 私钥读不读得到 / 30 天内过期不 / **SAN 是否覆盖
+# 当前对外 IP**，最后一项不满足时自动重签 + 重启主服务。
 #
-# 为什么需要：8000 改为原生 TLS 后，**证书成了主服务的硬依赖** ——
-# 证书文件缺失 ⇒ uvicorn 在绑定端口前就退出 ⇒ systemd 反复重启 ⇒ 全站不可用。
-# 这个定时器把「事后才发现」变成「提前一天在 journal 里看到」。
+# 逻辑放在 scripts/tls_cert_check.sh 而不是内联进 ExecStart —— 它要自动修复，
+# 内联的单引号地狱没法维护。
 write_cert_check_units() {
     cat > "$CERT_CHECK_UNIT" <<EOF
 [Unit]
-Description=wdnwebui TLS 证书巡检（存在性 + 30 天有效期）
+Description=wdnwebui TLS 证书巡检（存在性 + 30 天有效期 + SAN 覆盖当前 IP）
+# 等网络就绪 —— 开机时 DHCP 租约可能还没拿到 IP，此时巡检会误判「SAN 没覆盖」。
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-# ⚠️ 失败必须**非零退出**（exit 1）⇒ systemd 把单元标成 failed
-#    ⇒ ``systemctl status`` 能看出异常、按单元失败告警的监控也会触发。
-#    早先写成 ``a && b && echo OK || echo WARN`` 的形式 —— 那个链条的最后
-#    一个命令是 echo，退出码恒为 0 ⇒ 证书没了也显示 success（已实测）。
-ExecStart=/bin/sh -c 'if /usr/bin/test -r $TLS_CERT && /usr/bin/test -r $TLS_KEY && /usr/bin/openssl x509 -checkend 2592000 -noout -in $TLS_CERT; then echo "wdnwebui 证书 OK"; else echo "WARN: wdnwebui 证书缺失/不可读/30 天内过期 —— 服务将无法启动" >&2; exit 1; fi'
+# 退出码语义 = 当前是否还有问题：0 正常或已自动修复，1 修不好 ⇒ failed ⇒ 告警。
+ExecStart=/bin/bash $SCRIPT_DIR/scripts/tls_cert_check.sh
 
 [Install]
 WantedBy=multi-user.target
@@ -114,8 +114,11 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
+    # 开机跑一次 —— 开机后 IP 变了要能当场发现并修复（而不是等午夜定时器）。
+    systemctl enable --now "$(basename "$CERT_CHECK_UNIT")"
+    # 每日巡检 —— 把「事后才发现」变成「提前一天在 journal 里看到」。
     systemctl enable --now "$(basename "$CERT_CHECK_TIMER")"
-    echo "wrote $CERT_CHECK_UNIT / $CERT_CHECK_TIMER (timer enabled)"
+    echo "wrote $CERT_CHECK_UNIT / $CERT_CHECK_TIMER (service+timer enabled)"
 }
 
 # TLS 证书 —— 单元的 ``ConditionPathExists`` 直接依赖它。

@@ -111,7 +111,34 @@ commit 仍能按 SHA 访问）。
       `Restart=on-failure` 无限重启。靠单元 `[Unit]` 段的
       `ConditionPathExists=` 挡住启动（**必须写 `[Unit]` 段** —— 写进
       `[Service]` 会被 systemd **静默忽略**，等于没有保护；已实测）。
-      `wdnwebui-cert-check.timer` 每日巡检证书存在性 / 30 天有效期。
+      `wdnwebui-cert-check.timer` 每日巡检证书（见下）。
+    - ⚠️ **证书缺失时 systemd 是「静默跳过」，不是报错**（2026-11-18 实测）：
+      `ConditionPathExists` 不满足 ⇒ 单元**根本不执行** ⇒
+      `Result=success  ActiveState=inactive  ConditionResult=no`，而
+      **journal 一条记录都没有**。
+      ⇒ 排查口诀：`systemctl show wdnwebui.service -p ConditionResult` ⇒
+      `no` 就是证书（或条件路径）缺失。
+    - ✅ **TLS 三脚本共用 `scripts/tls_common.sh`** —— IP 探测 / SAN 精确比对 /
+      IP 字面量校验只有一份实现（各写各的漂移过一次）。
+    - ⚠️ **IP 探测用默认路由的出口地址**（`wdn_tls_detect_ip`：`ip route get` 的
+      `src`），不是 `hostname -I` 的第一个 —— 后者顺序任意，多网卡时第一个未必
+      是对外那个。SAN 里写**所有**候选 IP ⇒ 探测猜错只是多一条无害条目。
+    - ⚠️ **SAN 比对必须精确匹配**（`grep -Fxq`）：子串匹配会让 `172.16.9.1`
+      命中 `172.16.9.117` ⇒ 误判「已覆盖」⇒ 不重签。
+    - ⚠️ **`gen_tls_ca.sh` 的 IP 曾是裸位置参数** —— `--force-leaf` 会被当成 IP
+      ⇒ 签出废证书 + 半成品目录。现已完整解析（`--force-leaf` 可单独给、
+      `--ip=<addr>`、非法 IP 当场报错）。
+      ⚠️ **换 IP 后手动重签要显式带 IP**：
+      `bash scripts/gen_tls_ca.sh "$(hostname -I | awk '{print $1}')" --force-leaf`
+    - ✅ **`install_autostart.sh` 先签证书再装单元**（`ensure_tls_cert()`）：
+      证书缺失 ⇒ 自动签发；换 IP 而 SAN 不含新 IP ⇒ 自动重签。
+    - ✅ **巡检查 SAN 并自动修复**（`scripts/tls_cert_check.sh`，逻辑不放单元
+      内联）：不匹配 ⇒ **重签 + `systemctl restart wdnwebui.service`**。
+      查 SAN 是**换 IP 场景的唯一探测器**（只查「文件在不在」永远发现不了）。
+      退出码 = 当前是否还有问题：修好 exit 0，修不好 exit 1 ⇒ 单元 failed 告警。
+      巡检 service **开机也跑一次**；探测不到 IP 时**跳过**（开机 DHCP 租约
+      可能还没拿到）。
+      回归：`python scripts/verify_install_autostart_tls.py`（21 条行为断言）。
     - ⚠️ **重启会连坐杀掉 worker**：systemd 的 `KillMode=control-group` 把
       cgroup 里的 `compute_worker` 一起 SIGTERM 掉 → 重启前确认
       `compute.autostart` 有值，否则重启后板子没有任何算力，得手工
