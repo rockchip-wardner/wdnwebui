@@ -247,6 +247,61 @@ LANG_NAMES: Dict[str, str] = {
     "ug": "Uyghur",
 }
 
+#: 语言**名** → provider 的语言 key（``LANG_NAMES`` 的键）。
+#:
+#: 为什么需要它：**ASR 报的是语言名**（SDK 的 ``language English`` 头），
+#: 而翻译的语言表用的是 ``zh-CN`` / ``en`` 这类 key ⇒ 两边对不上。
+_LANG_BY_NAME: Dict[str, str] = {}
+for _k, _v in LANG_NAMES.items():
+    _LANG_BY_NAME.setdefault(_v.lower(), _k)
+
+#: 常见别名 → key（模型偶尔报的不是标准名）。
+_LANG_ALIASES: Dict[str, str] = {
+    "mandarin": "zh-CN",
+    "mandarin chinese": "zh-CN",
+    "simplified chinese": "zh-CN",
+    "chinese (simplified)": "zh-CN",
+    # 粤语模型归到 zh（模型的词表里没有粤语这一档）
+    "cantonese": "zh-CN",
+    "traditional chinese": "zh-TW",
+    "chinese (traditional)": "zh-TW",
+    "farsi": "fa",
+    "castilian": "es",
+    "brazilian portuguese": "pt",
+}
+
+
+def normalize_language(raw: str) -> str:
+    """把「随便什么语言写法」归一成 provider 的语言 key。
+
+    接受：
+
+    * provider 的 key（``zh-CN`` / ``en`` / ``ja``）；
+    * provider 的语言**码**（``zh`` / ``en`` / ``ja``）；
+    * 语言**名**（``English`` / ``Chinese`` / ``Japanese``）——
+      **ASR 报的就是这个**（SDK 的 ``language English`` 头）；
+    * 常见别名（``Mandarin`` / ``Farsi`` / …）。
+
+    返回 ``""`` = 认不出来 —— 调用方据此**不翻**（而不是瞎猜一个语言：
+    那样出来的译文是另一种语言，比不翻译更糟）。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    if raw in LANG_CODES:
+        return raw
+    if low in _LANG_BY_NAME:
+        return _LANG_BY_NAME[low]
+    if low in _LANG_ALIASES:
+        return _LANG_ALIASES[low]
+    # 语言**码**（zh / en / ja …）—— ``LANG_CODES`` 的值。
+    # ⚠️ ``zh`` 同时是 zh-CN 与 zh-TW 的码 ⇒ 取**第一个**（zh-CN）。
+    for key, code in LANG_CODES.items():
+        if code == low:
+            return key
+    return ""
+
 #: 目标语言期望的**文种**（用来判定模型到底翻没翻）。
 #:
 #: 没有这一层的话，「模型没翻、直接把原文改两个字吐回来」会被当成成功 ——
@@ -286,6 +341,33 @@ _PROMPTS_CODE = (
 _PROMPTS_NAME = (
     "Translate the following text from {nsrc} to {ntgt}:\n{text}",
     "Translate from {nsrc} to {ntgt}: {text}",
+)
+
+#: **混搭措辞**：源用**码**、目标用**名**。
+#:
+#: 这是实测里**唯一在两个方向都全中**的写法（2026-11-18，HY-MT1.5-1.8B，
+#: 贪心；10 句英文 + 10 句中文）。四种「源/目标用名还是用码」的组合:
+#:
+#:   写法              en→zh    zh→en
+#:   源=名 目标=名      10/10     6/10
+#:   源=名 目标=码       0/10     2/10
+#:   源=码 目标=名      10/10    10/10    ← 只有这条两边都全中
+#:   源=码 目标=码       4/10    10/10
+#:
+#: 失败的样子永远是**复读原文**（把英文原文带着弯引号吐回来）——
+#: 模型没听懂指令就当成了「照着写一遍」。所以「没翻出来」= 指令没被认出来，
+#: 换一种写法往往就中了。
+#:
+#: 为什么「源用码」更好：HY-MT 见过 ``from zh``/``from en`` 这种写法，
+#: 而 ``from Chinese`` 在目标语言是英语时会和正文里的 "Chinese" 撞车。
+#: 为什么「目标用名」更好：目标语言**名**比码更明确（``zh`` 是「简体还是
+#: 繁体？」，``Chinese`` 在模型词表里就是简体）。
+#:
+#: ⚠️ 只在**流式快路径**用这一条 —— 界面翻译（``_translate_one``）的
+#: :data:`PROMPT_ORDER` 是**按目标语言**逐个实测出来的（2026-11-16，
+#: 24 条界面文案 × 5 条措辞），改成混搭要**整套重测**，不在本期范围。
+_PROMPTS_MIXED = (
+    "Translate the following text from {csrc} to {ntgt}:\n{text}",
 )
 
 #: 全部措辞（``_PROMPTS_CODE`` + ``_PROMPTS_NAME``）—— 下标含义:
@@ -720,22 +802,7 @@ class NpuTranslateProvider(TranslationProvider):
         if session is None:
             session = self._session()
 
-        csrc = LANG_CODES.get(source)
-        ctgt = LANG_CODES.get(target)
-        nsrc = LANG_NAMES.get(source)
-        ntgt = LANG_NAMES.get(target)
-
-        # ⚠️ **按语言的措辞顺序**（实测，:data:`PROMPT_ORDER`）——
-        # 非拉丁字母的语言用「码」写指令模型会译错语言，先按「名」写才成。
-        order = PROMPT_ORDER.get(target, DEFAULT_PROMPT_ORDER)
-        attempts = []
-        for i in order:
-            if i >= 3 and not (nsrc and ntgt):
-                continue   # 没有名字 → 这两条「按名写」的措辞用不了
-            attempts.append(
-                _ALL_PROMPTS[i].format(csrc=csrc, ctgt=ctgt, nsrc=nsrc,
-                                       ntgt=ntgt, text=text)
-            )
+        attempts = self._prompt_attempts(text, source, target)
 
         last = ""
         perf: Dict[str, float] = {}
@@ -758,6 +825,131 @@ class NpuTranslateProvider(TranslationProvider):
             f"NPU 翻译没能翻出目标语言（最后得到: {last[:60]!r}）",
             perf=_finish_perf(perf),
         )
+
+    def _prompt_attempts(self, text: str, source: str,
+                         target: str) -> List[str]:
+        """按**实测成功率顺序**生成措辞列表。
+
+        ⚠️ 顺序是**按目标语言**定的（:data:`PROMPT_ORDER`）——
+        非拉丁字母的语言用「码」写指令模型会译错语言，先按「名」写才成
+        （实测 ``zh→hi`` 用码写它回英文 —— "hi" 被当成了问候语）。
+
+        列表的**第一条**就是该目标语言的最佳措辞 ⇒ 界面翻译逐条试到中为止。
+        ⚠️ **流式场景不走这个列表** —— 它有专门的
+        :meth:`_fast_prompt_attempts`（混搭措辞优先，见 :data:`_PROMPTS_MIXED`）。
+        """
+        csrc = LANG_CODES.get(source)
+        ctgt = LANG_CODES.get(target)
+        nsrc = LANG_NAMES.get(source)
+        ntgt = LANG_NAMES.get(target)
+
+        order = PROMPT_ORDER.get(target, DEFAULT_PROMPT_ORDER)
+        attempts: List[str] = []
+        for i in order:
+            if i >= 3 and not (nsrc and ntgt):
+                continue   # 没有名字 → 这两条「按名写」的措辞用不了
+            attempts.append(
+                _ALL_PROMPTS[i].format(csrc=csrc, ctgt=ctgt, nsrc=nsrc,
+                                       ntgt=ntgt, text=text)
+            )
+        return attempts
+
+    def translate_one_fast(self, text: str, source: str, target: str,
+                           session: Any = None) -> Tuple[str, Dict[str, float]]:
+        """翻一句，**最多试两条措辞** —— 供流式场景使用。
+
+        与 :meth:`_translate_one` 的差别：**最多试 2 条**，不是 5 条。
+
+        为什么流式场景不能试 5 条：界面翻译里「最多试 5 条措辞」是优点
+        （不漏译），但同传里每句的预算是 **~1 秒** —— 5 次推理就是
+        5 × 0.5 s，字幕会**滞后一句话**。⇒ 这里只试 **2 条**：第一条是
+        实测两边都全中的**混搭措辞**（:data:`_PROMPTS_MIXED`，源用码、
+        目标用名），第二条是「另一种写法」的兜底。
+
+        为什么兜底**值得**多花一次推理：失败的样子是**复读原文** ——
+        模型没听懂指令就照着原文写了一遍。这种失败**换一条措辞往往就中了**
+        （实测同一句口语长句：第一条复读、第二条就翻对）。而「不翻」在
+        同传里等于**整句作废** —— 字幕上空一行，比慢半拍难受得多。
+        ⇒ 第 2 条只在第 1 条失败时才跑，延迟上界 ~1 s。
+
+        ⚠️ **不走负缓存**（``_is_known_bad``）—— 那是界面翻译的「这句话
+        刚才翻不出来，别再烧推理」用的；同传的句子各不相同，缓存命中率
+        接近 0，却会**误伤**重复句（「好的」「对」这种一句话能重复十次）。
+
+        ``session`` 不传就现取一个（:meth:`_session`）。
+        """
+        text = (text or "").strip()
+        if not text:
+            return text, {}
+        if source == target:
+            return text, {}
+        self._check_pair(source, target)
+
+        if session is None:
+            session = self._session()
+
+        attempts = self._fast_prompt_attempts(text, source, target)
+        if not attempts:
+            raise NpuQualityError(
+                f"拼不出翻译指令（{source!r} → {target!r} 缺语言名）")
+
+        perf: Dict[str, float] = {}
+        last_out = ""
+        for idx, prompt in enumerate(attempts):
+            try:
+                out, one = self._infer(session, prompt)
+            except TranslationError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("translate: NPU 推理失败(%s): %s",
+                            type(exc).__name__, exc)
+                raise TranslationError(f"NPU 翻译推理失败: {exc}") from exc
+            _merge_perf(perf, one)
+            last_out = out
+            cleaned = self._strip_label(out, source, target)
+            if self._looks_translated(cleaned, text, target):
+                return cleaned, _finish_perf(perf)
+            # ⚠️ 把**原始输出**记下来 —— 「没翻出来」有几种完全不同的成因
+            # （复读原文 / 方向反了 / 输出是空），现场只看「没翻出来」没法查。
+            LOG.info("translate: fast path 第 %d 条措辞没翻出来（raw=%r）",
+                     idx + 1, out[:120])
+        raise NpuQualityError(
+            f"NPU 翻译这次没翻出来（{last_out[:60]!r}）", perf=_finish_perf(perf))
+
+    def _fast_prompt_attempts(self, text: str, source: str,
+                              target: str) -> List[str]:
+        """流式快路径的措辞列表（**最多 2 条**）。
+
+        顺序：
+
+        1. **混搭措辞**（源=码、目标=名）—— 实测在 en→zh / zh→en 两个
+           方向、以及 en→11 种目标语言上都是 10/10（见
+           :data:`_PROMPTS_MIXED` 的实测表）；
+        2. **兜底**：该目标语言在 :data:`PROMPT_ORDER` 里实测命中率最高
+           的那条（与第 1 条写法不同 ⇒ 才算「换个写法再试」）。
+
+        ⚠️ 第 2 条必须与第 1 条**写法不同** —— 同样写法换个位置没有意义
+        （模型看到的是同一条指令）。
+        """
+        csrc = LANG_CODES.get(source)
+        ntgt = LANG_NAMES.get(target)
+        attempts: List[str] = []
+        if csrc and ntgt:
+            attempts.append(_PROMPTS_MIXED[0].format(
+                csrc=csrc, ntgt=ntgt, text=text))
+        # 兜底：PROMPT_ORDER 里该目标语言的第一条。
+        order = PROMPT_ORDER.get(target, DEFAULT_PROMPT_ORDER)
+        for i in order:
+            if i >= 3 and not (LANG_NAMES.get(source) and LANG_NAMES.get(target)):
+                continue
+            backup = _ALL_PROMPTS[i].format(
+                csrc=LANG_CODES.get(source), ctgt=LANG_CODES.get(target),
+                nsrc=LANG_NAMES.get(source), ntgt=LANG_NAMES.get(target),
+                text=text)
+            if backup not in attempts:
+                attempts.append(backup)
+            break
+        return attempts[:2]
 
     @staticmethod
     def _check_pair(source: str, target: str) -> None:

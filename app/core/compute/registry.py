@@ -1798,6 +1798,24 @@ class ComputeRegistry:
             detected = detected[:cap]
         return detected
 
+    def local_memory_usage(self) -> tuple[dict[int, int], int, int]:
+        """本板显存占用 —— ``(per_card_mb, total_mb, remote_mb)``。
+
+        与 :meth:`snapshot` 里的 ``per_card_memory_mb`` / ``total_memory_mb``
+        **同一套口径**（:func:`_local_memory_usage`）：只算本机实例
+        （``spawned`` / ``adopted_local``），远端 peer 的显存吃在**对端板**
+        上，单列在 ``remote_mb``，**不占**本板任何一张卡。
+
+        给「要起一个新模型的调用方」用：先看一眼哪张卡还放得下，再决定
+        起在哪张卡上（而不是等 worker 起来之后 rc=-6 才发现没卡位）。
+
+        ⚠️ 比 ``snapshot()`` 里的那份**新鲜**：快照每秒轮询一次，模型刚起
+        还没写进快照时它是旧的 —— 规划卡位要用这里。
+        """
+        with self._lock:
+            instances = [inst.to_dict() for inst in self._instances.values()]
+        return _local_memory_usage(instances)
+
     def card_device_id(self, npu_index: Optional[int]) -> Optional[str]:
         """卡号 → 物理身份（PCI BDF，如 ``0001:11:00.0``）。
 
