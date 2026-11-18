@@ -336,6 +336,31 @@
   }
 
   // ------------------------------------------------------------------ //
+  // 「这个模型每张卡能并行跑几份」—— 后端 /api/compute 的 supported_models
+  // 里带 max_replicas_per_card（manifest 声明，**默认 1**）。
+  //
+  // 为什么需要它：卡片的 instance_slots 是「按模型包的假设」写的，
+  // 而后端会**硬校验**这个上限（POST /api/compute/instances 返 400
+  // 「每张卡最多 N 份」）。模型包没带这个字段时（老包 / 重新分发漏字段），
+  // 计划与契约打架 ⇒ 一键开启整条死路（2026-11-18 实测：网页翻译按
+  // 「每卡 2 份」规划 4 份，manifest 缺字段 ⇒ 400 ⇒ 翻译起不来）。
+  //
+  // ⇒ 向导按这个上限**夹紧**槽位：能起几份起几份，不硬撞 400。
+  // 找不到模型 / 字段缺失 ⇒ 返回 1（后端的默认值，保守）。
+  // ------------------------------------------------------------------ //
+  function _maxReplicasPerCard(supportedModels, modelId) {
+    const def = 1;
+    if (!Array.isArray(supportedModels) || !modelId) return def;
+    for (const m of supportedModels) {
+      if (!m || m.id !== modelId) continue;
+      const v = Number(m.max_replicas_per_card);
+      if (!Number.isFinite(v) || v < 1) return def;
+      return Math.floor(v);
+    }
+    return def;
+  }
+
+  // ------------------------------------------------------------------ //
   // 「这个能力本板还有谁顶上」—— 按 capability 列出**已安装**的 provider
   // ------------------------------------------------------------------ //
   //
@@ -2999,6 +3024,9 @@
     __candidateModels: _candidateModels,
     __resolvePin: _resolvePin,
     __resolveEffectiveCfg: _resolveEffectiveCfg,
+    // 「每张卡能并行跑几份」—— 纯函数，给 scripts/verify_wizard_replica_clamp.py
+    // 断言夹紧口径（默认 1 / 按 manifest 声明）。
+    __maxReplicasPerCard: _maxReplicasPerCard,
   };
 
   // ------------------------------------------------------------------ #
@@ -3161,6 +3189,31 @@
             replica: Number(sl.replica || 0),
           })).filter((sl) => Number.isInteger(sl.npu_index)
                            && sl.npu_index >= 0);
+        }
+        // ⚠️ **按模型声明的「每卡几份」夹紧槽位** ——
+        //
+        // 后端 POST /api/compute/instances 会校验
+        // ``max_replicas_per_card``（manifest 声明，默认 1）：请求了
+        // 第 2 份就 400「hy-mt-1-5 每张卡最多 1 份（请求了第 2 份）」。
+        //
+        // 而卡片的 instance_slots 是**按模型包的假设**写的（网页翻译
+        // 按「每卡 2 份」规划 4 份）。模型包里的 manifest 一旦没带
+        // max_replicas_per_card（老包 / 重新分发漏字段），计划与后端
+        // 契约就打架 ⇒ 整条「一键开启」直接 400 死路（2026-11-18 实测）。
+        //
+        // ⇒ 这里按后端告诉我们的上限夹紧：**能起几份起几份**，别硬撞。
+        const maxRep = _maxReplicasPerCard(data.supported_models, m.model_id);
+        if (slots && slots.length && maxRep >= 1) {
+          const clamped = slots.filter((sl) => sl.replica < maxRep);
+          if (clamped.length !== slots.length) {
+            const dropped = slots.length - clamped.length;
+            console.warn("[wizard-state] slot clamp", m.model_id,
+                         "max_replicas_per_card=" + maxRep,
+                         "dropped=" + dropped);
+            say(`「${m.model_id}」每张卡最多 ${maxRep} 份`
+                + `（已跳过 ${dropped} 个槽位）`);
+            slots = clamped.length ? clamped : null;
+          }
         }
         const body = { model: m.model_id, npu_index: m.npu_index };
         if (slots && slots.length) {

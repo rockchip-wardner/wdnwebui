@@ -966,6 +966,64 @@ pickle 等于执行任意代码，没有理由做。
 session 同时只能有一个推理在飞**。要并发必须有多个 session（多 worker 进程）。
 实测 1 实例开 8 线程 = 1.03×（客户端线程无用）。
 
+### 🐛 网页翻译「一键开启」三条断链（2026-11-18 修）
+
+现场：用户点「一键开启所需模型」→ `POST /api/compute/instances` **400**
+`hy-mt-1-5 每张卡最多 1 份（请求了第 2 份）`；日志同时刷
+`卡 [0] 放不下翻译模型（被别的模型占着）` —— 而「算力配置」里
+RK182x 卡上**根本没有别的模型**。三条独立断链：
+
+| # | 断链 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | **副本数被拒（400）** | 卡片的 `instance_slots` 按「每卡 2 份」规划 4 份；后端按 **manifest 的 `max_replicas_per_card`** 校验（**缺省 = 1**）⇒ 计划与契约打架 | 模型包 manifest 必须带 `"max_replicas_per_card": 2`（**随模型分发！** 见下）+ 向导按上限**夹紧**槽位 |
+| 2 | **向导硬撞 400** | 卡片计划是「按模型包的假设」写的；模型包一换/一重装就可能对不上 | `state.js::_wizardBringUpModels` 按 `/api/compute` 的 `max_replicas_per_card` **夹紧** `slots`，并把「已跳过 N 个槽位」说给用户 |
+| 3 | **peer 误占本板卡位** | `_cards_with_room_for_one_copy()` 遍历快照时**没看 `_source`** ⇒ `_source="adopted"`（**别的板子**的 worker）的 `npu_index`（**对端板自己的卡号**）+ 显存被算成**本板**占用 | 只统计本机实例（`spawned` / `adopted_local`）；见 `web_translate/service.py::_local_card_occupancy` |
+
+**为什么 #3 的现场症状那么怪**：peer 板 `172.16.9.147` 的
+`LocateAnything-3b` 报 `npu=1 / 5500MB` ⇒ 本板卡 1 被判占满
+（5500+2200 > 5120）⇒ 翻译只剩卡 0 的 2 份，日志还说「被别的模型占着」——
+而本板 **3 张 1828 全空**、零本地 worker。⇒ 「算力配置」是**对的**，
+错的是翻译卡的估算。
+
+⚠️ **`registry.snapshot()` 的 `per_card_memory_mb` 有同样的毛病**（peer 的
+5500MB 被记到本板卡 1 ⇒ API 说卡 1 用了 5500MB，其实用了 0）。还没修。
+
+**回归**：
+
+* `scripts/verify_web_translate_peer_isolation.py` —— 假 registry，断言
+  peer 不占卡 / 本机实例占卡 / `adopted_local` 也要算 / `_conflict` 不认 peer；
+* `scripts/verify_wizard_replica_clamp.py` —— 浏览器里 mock `/api/compute`，
+  断言向导按上限夹紧槽位（上限 1 → 每卡 1 份；上限 2 → 4 份原样）；
+* `scripts/verify_translate_replica_manifest.py` —— 盘上 manifest 声明
+  `max_replicas_per_card=2` + 后端报得出来 + 卡片计划不超上限；
+* `scripts/verify_web_translate_wizard_e2e.py` —— 真机真浏览器走一遍向导。
+
+### 🚧 rc=-6 的真因多半是 **toolkit 比 runtime 新**（2026-11-18 查）
+
+翻译模型在板上装不上：worker 起来就 abort，`rc=-6`，日志只有
+
+```
+E RKNNAPI: MODEL_SETUP fail, ack = ACK_FAIL, expect = ACK_SUCC!
+```
+
+看着像「显存不够 / 卡被占着」，其实**都不是**（卡是空的、单起一份也一样、
+模型文件 sha256 与 HF 上游逐字节一致）。真因是**版本错配**：
+
+| | 版本 |
+|---|---|
+| 模型 `HY-MT1.5-1.8B.1820.rknn` | rknn3-toolkit **1.2.0**（2026-11-02 构建） |
+| 本板 `/usr/lib/librknn3_api.so` | librknn3 **1.1.0**（2026-08-13 构建） |
+
+⇒ 用 1.2.0 编译的模型，本板 1.1.0 的 runtime/EP 固件不认 ⇒ MODEL_SETUP 失败。
+本板其它模型（toolkit 1.0.4 / 1.1.0）**全都正常加载**，只有 HY-MT 是 1.2.0 ——
+它是唯一的例外，也就是唯一的受害者。
+
+**门禁**：`scripts/verify_model_runtime_compat.py` —— 扫模型根，比对每个
+模型的构建 toolkit 与本板 runtime；超了直接点名。⇒ 别再对着 rc=-6 猜显存。
+
+**修法**：① 升板端 rknn3 runtime + EP 固件（`rknn3_rk1820.img`）；
+或 ② 用 ≤ 本板 runtime 的 toolkit 重编该模型再分发。
+
 ### ⚠️ 措辞顺序**按语言定制**（实测表，不是原理）
 
 模型对「裸语言码」的反应很看语言 —— 拉丁字母系（en/fr/de/es/pt/nl/pl…）
