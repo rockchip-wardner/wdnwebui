@@ -355,6 +355,18 @@ commit 仍能按 SHA 访问）。
    > `DELETE` 会把 `compute.autostart` **一起清空**（`clear_active_app`），
    > 回归脚本不该改生产配置。`PUT` 会把承载该卡 caps 的 `(model, npu)`
    > 增量写进 `compute.autostart`。
+   >
+   > ✅ 用 `scripts/active_app_guard.py`：`install(ctx)` 拦 PUT/DELETE，
+   > `install_active_app_spoof(ctx)` 让页面里的 GET 读不到 active_app
+   > （前端 `bootRestore()` 就不会把浏览器跳到上一张卡）。
+   > ⇒ **服务端配置一个字节都不动**。
+   >
+   > ⚠️ **别用「备份 + 跑完写回磁盘」来还原** —— 服务进程内存里的
+   > `compute` section 才是权威：它每次 `set_section("compute", ...)` 都先
+   > 重读磁盘（`ConfigStore._merge_disk`），但随后用**调用方手里的旧快照**
+   > 覆盖该 section ⇒ 外部脚本写回磁盘的内容会被服务**下一次写配置吃掉**
+   > （前端每秒 PUT 一次 active-app ⇒ 几秒内就被覆盖回去）。
+   > ⇒ 要么让服务端自己写，要么**根本不碰**。
 
 ## 加一张新卡：卡位占位符是**硬要求**（2026-11-06）
 
@@ -400,8 +412,13 @@ app/core/html_assembly.py::assemble_index_html  ←  逐个替换成该卡的 st
 > 开机时 `ActivateManager.bootRestore()` 会把它还原成 `location.hash`
 > ⇒ **上一张卡**（谁刚用过就留谁）的向导会先挂上，再在切页时被卸载
 > ⇒ 脚本断言的「第一个向导事件」看到的是别的卡的 `wizard:unmounted`
-> ⇒ **假失败**。⇒ 跑之前 `DELETE /api/compute/active-app`（`verify_usb_hid_wizard.py`
-> 已经这么加固了）。
+> ⇒ **假失败**。
+>
+> ⇒ 2026-11-19 起**不要**再 `DELETE /api/compute/active-app`（它会连带
+> 清空 `compute.autostart` ⇒ 板子重启后没有任何算力自启），改用
+> `active_app_guard.install_active_app_spoof(ctx)`：页面里的
+> `GET /api/compute/active-app` 恒返回空 ⇒ `bootRestore()` 不跳卡，
+> 而服务端配置一点没动。
 
 ### 向导的 `type: "image"` 字段（拖拽上传一张图）
 
@@ -12935,6 +12952,39 @@ text-chat 提交把 `app/apps/tts/static/app.js` 又加了回来**（2574 行全
 > `BrowserContext.route` 和 `Page.route`）。`browser.new_page()` 隐式建
 > context、拿不到它 ⇒ 这种脚本只能**给 page 装**（`install_on_page`），
 > 且**每个 page 都要单独装**。
+
+> ⚠️ **`ctx.request`（APIRequestContext）绕过 `route` 拦截** —— 只有
+> **页面**发出的请求才走 `ctx.route`。⇒ `ctx.request.delete(...)`
+> 真的打到了服务端。
+
+#### 2026-11-19：脚本要「清 active_app」时，用**前端伪装**而不是真 DELETE
+
+`verify_usb_hid_wizard.py` / `verify_wizard_image_field.py` /
+`verify_web_translate_wizard_e2e.py` / `verify_asr_wizard_translate.py`
+以前都发真的 `DELETE /api/compute/active-app`，目的只有一个：
+**别让前端 `bootRestore()` 把浏览器跳到上一张用过的卡**（否则脚本看到
+的是别的卡的向导 ⇒ 假失败）。
+
+但那个 DELETE **连带清空 `compute.autostart`** ⇒ 跑一次回归，板子重启后
+没有任何算力自启。2026-11-19 实测踩到：跑完回归后磁盘上的 autostart 从
+3 条变成 1 条（只剩 ASR —— 前端 PUT active-app 时只补回了**当前卡**的
+模型，翻译模型和 TTS 永远回不来）。
+
+⇒ 新做法 `active_app_guard.install_active_app_spoof(ctx)`：给 context 装
+一段 **init script**，把页面里的 `GET /api/compute/active-app` 伪装成
+`{"active_app": null}` ⇒ `bootRestore()` 直接 return，不跳卡 ⇒
+**服务端一个字节都没动**。
+
+⚠️ **init script 只对之后创建的 page 生效** ⇒ 必须装在 `ctx.new_page()`
+**之前**。同时建议 `install(ctx)` 拦掉 PUT/DELETE（脚本期间万一触发
+`_exit()`，那也是一次 DELETE ⇒ 同样清空 autostart）。
+
+⚠️ **别用「备份 + 跑完写回磁盘」来还原**：服务进程内存里的 `compute`
+section 才是权威 —— `ConfigStore.set_section` 先 `_merge_disk()` 重读
+磁盘，但随后 `self._data[name] = value` 用**调用方手里的旧快照**覆盖
+⇒ 外部脚本写回磁盘的内容会被服务**下一次写配置吃掉**（前端每秒 PUT
+一次 active-app ⇒ 几秒内就被覆盖回 1 条）。实测：还原写回 3 条后不到
+一分钟，磁盘又变回 1 条。
 
 ## 磁盘保护守护：自有实现取代系统那份 `log-guardian`（2026-11-18）
 

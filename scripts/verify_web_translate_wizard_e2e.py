@@ -39,6 +39,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from active_app_guard import (  # noqa: E402
+    install as install_active_app_guard,
+    install_active_app_spoof,
+)
+
 BASE = os.environ.get("WDNWEBUI_BASE", "https://127.0.0.1:8000").rstrip("/")
 APP_ID = "web-translate"
 WIZARD_NS = "wd-wizard-"
@@ -147,14 +152,9 @@ def main() -> int:
 
     # ---------------------------------------------------------------- [0] --
     print("\n[0] 清场：清掉「上次用的卡」，避免开机恢复把别的卡的向导挂上来")
-    try:
-        req = urllib.request.Request(BASE + "/api/compute/active-app",
-                                     method="DELETE")
-        urllib.request.urlopen(req, timeout=10, context=_ctx()).read()
-        print("  已 DELETE /api/compute/active-app")
-    except Exception as exc:  # noqa: BLE001
-        print(f"  ⚠ 清场失败（不致命）: {exc}")
-
+    # ⚠️ 以前这里发真的 DELETE /api/compute/active-app ⇒ **连带清空**
+    # compute.autostart（板子的开机自启就没了）⇒ 现在改成在前端伪装
+    # 「没有 active_app」（见下面建 context 处），服务端配置不动。
     snap = get_json("/api/compute")
     peers = [i for i in (snap.get("instances") or [])
              if i.get("_source") == "adopted"]
@@ -183,6 +183,15 @@ def main() -> int:
                                     args=["--no-sandbox", "--disable-gpu",
                                           "--mute-audio"])
         ctx = browser.new_context()
+        # ⚠️ 前端 bootRestore 读到后端记的 active_app 会把浏览器跳到**上一张
+        # 用过的卡** ⇒ 本脚本看到的向导事件是别的卡的 ⇒ 假失败。
+        # ⚠️ **不要发真的 DELETE /api/compute/active-app** —— 它会连带
+        # 清空 compute.autostart（板子的开机自启就没了）⇒ 改成在前端
+        # 伪装「没有 active_app」，服务端配置一个字节都不动。
+        # ⚠️ init script 只对**之后创建**的 page 生效 ⇒ 必须在
+        #    ``ctx.new_page()`` 之前装。
+        install_active_app_guard(ctx)
+        install_active_app_spoof(ctx)
         page = ctx.new_page()
         page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
         page.on("console", lambda m: (print(f"  [console.{m.type}] {m.text}")

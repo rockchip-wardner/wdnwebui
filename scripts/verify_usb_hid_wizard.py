@@ -20,6 +20,16 @@ import sys
 import time
 from pathlib import Path
 
+# 让 ``active_app_guard`` 可导入（保留板子的算力配置）
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from active_app_guard import (  # noqa: E402
+    install as install_active_app_guard,
+    install_active_app_spoof,
+)
+
 # 8000 已是原生 TLS（uvicorn --ssl-certfile）。
 #
 # ⚠️ **Playwright 的两套 TLS 栈不一样**：
@@ -107,22 +117,26 @@ def run(exe: str) -> None:
                   "--disable-dev-shm-usage"],
         )
         ctx = browser.new_context(viewport={"width": 1400, "height": 900})
-        page = ctx.new_page()
-
-        page.on("console", lambda m: print(f"  [console.{m.type}] {m.text}"))
-        page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
-
-        print("=== step 1: open homepage ===")
         # ⚠️ 先清掉后端记的 active_app —— 开机时 ActivateManager.bootRestore()
         # 会把它还原成 location.hash ⇒ **上一张卡**（比如别人刚用过的
         # image-editor）的向导会先挂上，再在切到 #usb-hid 时被卸载 ⇒
         # 本脚本断言的「第一个向导事件 = wizard:mounted」看到的是
         # `wizard:unmounted(别的卡)` ⇒ **假失败**（2026-11-06 实测）。
         # 测试不该依赖「上一个用过哪张卡」这种全局状态。
-        try:
-            ctx.request.delete("https://localhost:8000/api/compute/active-app")
-        except Exception as e:  # noqa: BLE001
-            print(f"  [warn] 清 active_app 失败（忽略）: {e}")
+        #
+        # ⚠️ **不要发真的 DELETE /api/compute/active-app** —— 它会连带
+        # 清空 compute.autostart（板子的开机自启就没了）⇒ 改成在前端
+        # 伪装「没有 active_app」，服务端配置一个字节都不动。
+        # ⚠️ init script 只对**之后创建**的 page 生效 ⇒ 必须在
+        #    ``ctx.new_page()`` 之前装。
+        install_active_app_guard(ctx)
+        install_active_app_spoof(ctx)
+        page = ctx.new_page()
+
+        page.on("console", lambda m: print(f"  [console.{m.type}] {m.text}"))
+        page.on("pageerror", lambda e: print(f"  [pageerror] {e}"))
+
+        print("=== step 1: open homepage ===")
         page.goto("https://localhost:8000", wait_until="networkidle", timeout=15000)
 
         # Wait for boot to finish

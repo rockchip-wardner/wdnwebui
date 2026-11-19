@@ -33,6 +33,16 @@ import os
 import sys
 from pathlib import Path
 
+# 让 ``active_app_guard`` 可导入（保留板子的算力配置）
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from active_app_guard import (  # noqa: E402
+    install as install_active_app_guard,
+    install_active_app_spoof,
+)
+
 # 8000 已是原生 TLS（uvicorn --ssl-certfile）。
 #
 # ⚠️ **Playwright 的两套 TLS 栈不一样**：
@@ -120,12 +130,13 @@ def main() -> int:
         # ⚠️ 清掉两处**跨测试残留**，否则本脚本会假失败：
         #  1) 后端记的 active_app —— 开机时 bootRestore 把它还原成
         #     location.hash ⇒ 上一张卡的向导先挂上再被卸载。
+        #     ⚠️ **不要发真的 DELETE /api/compute/active-app** —— 它会连带
+        #     清空 compute.autostart（板子的开机自启就没了）⇒ 改成在前端
+        #     伪装「没有 active_app」，服务端配置一个字节都不动。
         #  2) localStorage 里的向导状态（completed / step / values）——
         #     上一次跑完本脚本后 completed=1 ⇒ 这次进卡**不弹向导**。
-        try:
-            ctx.request.delete(f"{BASE}/api/compute/active-app")
-        except Exception as e:  # noqa: BLE001
-            print(f"  [warn] 清 active_app 失败（忽略）: {e}")
+        install_active_app_guard(ctx)
+        install_active_app_spoof(ctx)
         ctx.add_init_script("try { localStorage.clear(); } catch (e) {}")
         page = ctx.new_page()
         errors: list[str] = []

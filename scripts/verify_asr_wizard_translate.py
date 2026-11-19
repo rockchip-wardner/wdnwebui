@@ -30,6 +30,11 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# 让 ``active_app_guard`` 可导入（保留板子的算力配置）
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
 # ⚠️ Playwright 的两套 TLS 栈不一样：页面走 Chromium（认板子 CA），
 #    ctx.request 走 Node（不认）⇒ 必须在 Node 进程起来之前设 CA。
 os.environ.setdefault(
@@ -37,6 +42,11 @@ os.environ.setdefault(
     "/home/rockchip/.config/wdnwebui/tls/ca.pem")
 
 from playwright.sync_api import sync_playwright  # noqa: E402
+
+from active_app_guard import (  # noqa: E402
+    install as install_active_app_guard,
+    install_active_app_spoof,
+)
 
 BASE = "https://127.0.0.1:8000"
 CARD = "qwen3-asr"
@@ -73,33 +83,6 @@ def api(method: str, path: str, payload=None, timeout: int = 30):
             return e.code, {"raw": body}
     except Exception as e:  # noqa: BLE001
         return -1, {"error": repr(e)}
-
-
-# --------------------------------------------------------------------------- #
-# 生产配置保护
-# --------------------------------------------------------------------------- #
-# ``DELETE /api/compute/active-app`` 会连带 ``clear_active_app`` **清空**
-# ``compute.autostart``（AGENTS.md「回归脚本必须 mock PUT/DELETE
-# /api/compute/active-app」）⇒ 跑一次回归，板子上开机自启的模型（ASR /
-# 翻译 / TTS）就没了 —— 重启后不再自动起来。
-# ⇒ 跑之前备份，跑完原样写回。
-def _backup_compute() -> dict:
-    from app.core.config import get_config
-    section = get_config().get_section("compute", {}) or {}
-    return {
-        "autostart": json.loads(json.dumps(section.get("autostart") or [])),
-        "active_app": section.get("active_app"),
-    }
-
-
-def _restore_compute(saved: dict) -> None:
-    from app.core.config import get_config
-    cfg = get_config()
-    section = cfg.get_section("compute", {}) or {}
-    section["autostart"] = saved.get("autostart") or []
-    if saved.get("active_app") is not None:
-        section["active_app"] = saved["active_app"]
-    cfg.set_section("compute", section)
 
 
 # --------------------------------------------------------------------------- #
@@ -229,10 +212,11 @@ def _wait_idle(timeout_s: int = 120) -> None:
 def _run_case(browser, *, fail_enable: bool, lang: str) -> tuple[list, list]:
     """跑一遍向导。返回 (requests, console_errors)。"""
     ctx = browser.new_context(viewport={"width": 1440, "height": 1000})
-    try:
-        ctx.request.delete(f"{BASE}/api/compute/active-app")
-    except Exception as e:  # noqa: BLE001
-        print(f"  [warn] 清 active_app 失败（忽略）: {e}")
+    # ⚠️ 别真发 DELETE /api/compute/active-app —— 它会连带清空
+    # compute.autostart（板子的开机自启）。改成在前端伪装「没有
+    # active_app」，让 bootRestore 不把浏览器跳到上一张卡。
+    install_active_app_guard(ctx)
+    install_active_app_spoof(ctx)
     page, errors = _new_page(ctx)
 
     if fail_enable:
@@ -310,16 +294,9 @@ def main() -> int:
         print(f"❌ 测试音频不存在: {SOURCE}")
         return 2
 
-    saved = _backup_compute()
-    print(f"[保护] 已备份 compute.autostart ({len(saved['autostart'])} 条) "
-          f"与 active_app={saved['active_app']!r}")
-    try:
-        rc = _run_all()
-    finally:
-        _restore_compute(saved)
-        print("[保护] compute.autostart / active_app 已还原")
-    return rc
-
+    # ⚠️ 本脚本**不改**板子的算力配置：active-app 的写操作被 route 拦下，
+    #    读操作在前端被伪装成「空」⇒ compute.autostart 原样不动。
+    return _run_all()
 
 def _run_all() -> int:
     with sync_playwright() as p:
