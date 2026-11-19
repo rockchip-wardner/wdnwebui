@@ -1870,6 +1870,10 @@ const ComputeConfigPage = {
   _system: null,        // /api/system-monitor 缓存
   _loading: false,
   _selectedTarget: {},  // {model_id: [npu_index, ...]} —— 用户勾选的卡（可多张）
+  // {model_id: true} —— 「运行在」选了**自动**：不指定卡号，由**后端的
+  // 卡位策略**挑（翻译模型跟随识别模型所在的卡；语音合成模型独占剩下
+  // 那张卡）。见宿主 app/core/compute/card_roles.py。
+  _autoTarget: {},
   _pendingModels: new Set(),  // 在飞的启停请求（model_id）—— 防连点
   // 「已装 N/M」角标的数据源：/api/compute/model-repos 的清单（和下载弹框
   // 同一个口径）。30s 刷新一次 —— 不能 1Hz 拉，那个端点要扫本地模型目录。
@@ -3166,7 +3170,9 @@ const ComputeConfigPage = {
                             : this._defaultTargetNpu(curCards),
                           (curSvc && curSvc.replica) || 0) ];
       if (toggleInput.checked) {
-        this._enableInstance(finalTargets, modelId);
+        // 选了「自动」⇒ **不传卡号**，由后端按卡位策略挑
+        this._enableInstance(this._isAutoTarget(modelId) ? null : finalTargets,
+                             modelId);
       } else {
         // 只停**这张卡上这一份** —— 同一模型还跑在别的卡 / 别的副本上时，
         // 不该被一起停掉。
@@ -3484,6 +3490,9 @@ const ComputeConfigPage = {
       meta.max_replicas_per_card || 1,
       this._modelNpus(card.dataset.model).join(","),
       this._selectedSlots(card.dataset.model).join(","),
+      // 「自动」进 sig —— 勾/取消它都要重建 fieldset（复选框状态 +
+      // toggle 的可用状态都跟着变）。
+      this._isAutoTarget(card.dataset.model) ? "auto" : "",
       // 设备拓扑布局进了 sig —— 插了第三张卡 / 装了 rknn2-runtime 之后，
       // 「运行在」里的第三个设备（EP 卡 or 本机 NPU）要跟着变。
       ((meta.card_requirements && meta.card_requirements.selected) || {}).id || "",
@@ -3572,6 +3581,11 @@ const ComputeConfigPage = {
       if (n >= 0 && !cards.includes(n)) cards.push(n);
     }
     return cards;
+  },
+
+  // 「运行在」是否选了**自动**（卡号交给后端的卡位策略挑）。
+  _isAutoTarget(modelId) {
+    return this._autoTarget[modelId] === true;
   },
 
   // 本模型**正在跑**的槽位（"卡:份"）
@@ -3691,6 +3705,12 @@ const ComputeConfigPage = {
   // ``slots`` 是槽位数组（"卡:份" 或 {npu_index, replica}）；``npu_index``
   // 仍然带上（老后端 / 排障时看快照用），但后端以 ``slots`` 为准。
   _enableInstance(slots, model) {
+    // slots 为 null ⇒ 「自动」：**不带 npu_index / slots**，后端按卡位
+    // 策略挑卡（app/core/compute/card_roles.py）。
+    if (slots === null || slots === undefined) {
+      return this._computeAction("/compute/instances", "POST",
+                                 {model}, "启用");
+    }
     const list = (Array.isArray(slots) ? slots : [slots]).map((s) => {
       if (typeof s === "string") {
         const [n, r] = this._parseSlot(s);
@@ -3956,6 +3976,46 @@ const ComputeConfigPage = {
     }
     this._selectedTarget[modelId] = Array.from(defaults);
 
+    // 「自动（按卡位策略）」选项 —— 不指定卡号，由**后端**挑：
+    //   翻译模型 → 跟随识别模型所在的卡（感知链同卡）
+    //   语音合成 → 独占剩下那张卡（发声链不与识别共卡）
+    // 见宿主 app/core/compute/card_roles.py。
+    // ⚠️ 选了自动 ⇒ **不预选任何槽位**（卡号交给后端）。
+    const autoOn = this._isAutoTarget(modelId);
+    if (autoOn) this._selectedTarget[modelId] = [];
+
+    const autoLabel = document.createElement("label");
+    autoLabel.className = "cc-target-opt cc-target-opt-auto";
+    autoLabel.title = "不指定卡号，由后端按卡位策略挑："
+      + "翻译模型跟随识别模型所在的卡；语音合成模型独占剩下那张卡";
+    const autoInput = document.createElement("input");
+    autoInput.type = "checkbox";
+    autoInput.value = "__auto__";
+    autoInput.className = "cc-target-radio";
+    autoInput.checked = autoOn;
+    // 多卡模型（要占 N 张卡的那种）策略管不了 ⇒ 不给「自动」
+    if (requiresCards > 1) {
+      autoInput.disabled = true;
+      autoLabel.title = "多卡模型不支持自动卡位";
+    }
+    autoInput.addEventListener("change", () => {
+      if (autoInput.checked) {
+        this._autoTarget[modelId] = true;
+        this._selectedTarget[modelId] = [];
+        // 取消所有具体槽位的勾选（自动 = 不指定卡号）
+        opts.querySelectorAll("input.cc-target-radio").forEach((el) => {
+          if (el !== autoInput) el.checked = false;
+        });
+      } else {
+        this._autoTarget[modelId] = false;
+      }
+    });
+    autoLabel.appendChild(autoInput);
+    const autoTxt = document.createElement("span");
+    autoTxt.textContent = "自动（按卡位策略）";
+    autoLabel.appendChild(autoTxt);
+    opts.appendChild(autoLabel);
+
     let rendered = 0;
     // 同一张卡上可以跑几份 —— 模型 manifest 的 ``max_replicas_per_card``。
     // 2 ⇒ 每张卡两个复选框（"1828#0" 的第 1 份 / 第 2 份）。
@@ -3993,6 +4053,11 @@ const ComputeConfigPage = {
         const cur = new Set(this._selectedSlots(modelId));
         if (input.checked) cur.add(slot); else cur.delete(slot);
         this._selectedTarget[modelId] = Array.from(cur);
+        // 手动勾了卡 ⇒ 取消「自动」（显式指定永远优先于策略）
+        if (input.checked) {
+          this._autoTarget[modelId] = false;
+          autoInput.checked = false;
+        }
       });
       label.appendChild(input);
       const txt = document.createElement("span");
@@ -4122,6 +4187,7 @@ const ComputeConfigPage = {
   _hasTargetPicked(modelId, svc) {
     if (svc && svc.npu_index >= 0) return true;
     if (this._modelNpus(modelId).length) return true;
+    if (this._isAutoTarget(modelId)) return true;   // 自动 = 也是一种「选好了」
     return this._selectedTargets(modelId).length > 0;
   },
 

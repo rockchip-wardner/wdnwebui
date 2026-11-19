@@ -7003,6 +7003,12 @@ config 派生（实例上的快照会过期）、peer 卡不显示徽章、
 
 ⚠️ **用户显式指定的卡号永远优先于策略** —— 策略只在**没给卡号**时生效。
 
+算力页（**宿主** `app/system/static/system.js` 里的 `ComputeConfigPage` ——
+⚠️ 插件 `cards/tts/static/app.js` 里那份 `ComputeConfigPage` 是**早期遗留
+的死代码**，没人调用，别照着改）的「运行在」里多了一个
+**「自动（按卡位策略）」** 选项：勾上它 ⇒ 启用请求**不带** `npu_index`
+⇒ 后端按策略挑卡。
+
 回归：`scripts/verify_card_roles.py`（36/36，`--live` 段还会查真机的
 `GET /api/compute/card-roles`）。
 
