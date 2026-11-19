@@ -178,6 +178,20 @@ def click_next(page) -> None:
     page.wait_for_timeout(450)
 
 
+def click_to_finish(page, limit: int = 6) -> None:
+    """一路点「下一步」直到完成配置步。
+
+    向导现在是 4 步（env → source → translate → finish）—— 加了新步
+    之后，逐处硬编码点几下很容易漏。**只有**需要断言中间某一步标题
+    的地方才用 click_next 显式点。
+    """
+    for _ in range(limit):
+        if page.evaluate(
+                f"() => !!document.getElementById('{NS}root-{APP} #{NS}finish-btn')"):
+            return
+        click_next(page)
+
+
 def set_field(page, fid: str, value: str) -> None:
     page.fill(f'#{NS}root-{APP} [data-field-id="{fid}"]', value)
     page.dispatch_event(
@@ -2893,7 +2907,7 @@ def verify_wizard_video_source(page, shot_dir: Path) -> None:
         click_next(page)               # env → source
         print("  步骤:", step_title(page))
         set_field(page, "asr-source", str(mp4_in))
-        click_next(page)               # source → finish
+        click_to_finish(page)           # source → translate → finish
         page.wait_for_selector(f"#{NS}root-{APP} #{NS}finish-btn", timeout=10000)
         print("  步骤:", step_title(page))
 
@@ -3271,24 +3285,27 @@ def main() -> int:
               f"labels={labels}")
         page.screenshot(path=str(shot_dir / "2_source.png"))
 
-        # ---------------- 第 3 步：完成配置 → 真的发起识别 ----------------
-        # 流程只有 3 步：运行环境检查 → 音频源 → 完成配置。
-        # **没有「识别参数」步** —— 分块长度 / token 上限 / 回退策略
+        # ---------------- 第 3/4 步：翻译目标语言 → 完成配置 → 真的发起识别 --------
+        # 流程 4 步：运行环境检查 → 音频源 → 实时翻译（可选）→ 完成配置。
+        # **仍然没有「识别参数」步** —— 分块长度 / token 上限 / 回退策略
         # 等于 C++ demo 的 ONLINE_* 常量，属于内部契约，不暴露给用户。
-        print("\n=== 第 3 步：完成配置 → 发起识别 ===")
+        print("\n=== 第 3/4 步：翻译目标语言 → 完成配置 → 发起识别 ===")
         set_field(page, "asr-source", WAV)
+        click_next(page)
+        check("W5 第 3 步是「实时翻译（可选）」",
+              step_title(page) == "实时翻译（可选）", step_title(page))
         click_next(page)
         check("W5 步骤标题是「完成配置」", step_title(page) == "完成配置",
               step_title(page))
-        # 向导总步数 = 3（env / source / finish），没有识别参数步
+        # 向导总步数 = 4（env / source / translate / finish），没有识别参数步
         nsteps = page.evaluate(
             f"""() => {{
                 const el = document.getElementById('{NS}root-{APP}');
                 return el ? el.querySelectorAll('.{NS}step-dot').length : -1;
             }}""")
         print(f"  向导步骤数: {nsteps}")
-        check("W5 向导只有 3 步（没有识别参数步）",
-              nsteps in (3, -1), f"steps={nsteps}")
+        check("W5 向导只有 4 步（没有识别参数步）",
+              nsteps in (4, -1), f"steps={nsteps}")
         # **直接读 wizard.json** —— 比查 DOM 硬：DOM 只能看到当前这一步，
         # 配置里藏着的参数步照样能过 DOM 检查。
         cfg = json.loads(
@@ -3365,7 +3382,7 @@ def main() -> int:
             open_wizard(page)
             click_next(page)          # env → source
             set_field(page, "asr-source", MP4)
-            click_next(page)          # source → finish（3 步流程，没有识别参数步）
+            click_to_finish(page)       # source → translate → finish
             page.wait_for_selector(f"#{NS}root-{APP} #{NS}finish-btn", timeout=10000)
             vreq = api_state().get("current_request_id") or 0
             page.click(f"#{NS}root-{APP} #{NS}finish-btn")
