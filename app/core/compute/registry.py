@@ -52,6 +52,7 @@ from wdnai import RetiredCapabilityError, migrate_legacy
 
 from app.core.config import default_models_root, get_config
 from app.core.compute import cards as cards_mod
+from app.core.compute.card_roles import CARD_MEMORY_MB
 from app.core.compute.workers import (
     WorkerManifest,
     build_model_spec,
@@ -950,40 +951,123 @@ def transition_of(inst) -> str:
     return ""
 
 
-def _crop_autostart_for_cards(entries: list[dict],
-                              model_cards: list[int]) -> tuple[list[dict], list[dict]]:
-    """按算力卡位裁剪 autostart：非算力卡丢弃，**每张卡只留第一条**。
+def _autostart_entry_cards(entry: dict) -> list[int]:
+    """一条 autostart 条目占用的卡号（单卡 → 长度 1 的列表）。"""
+    raw = entry.get("npu_index")
+    if isinstance(raw, (list, tuple)):
+        return [int(x) for x in raw]
+    return [int(raw)]
 
-    返回 ``(保留的, 丢弃的)``，丢弃的由调用方记日志。保留哪条按 config
-    的先后顺序（第一条优先）—— 那是用户写入时的意图顺序。
+
+def _autostart_entry_share(entry: dict, presets=None) -> dict[int, int]:
+    """一条 autostart 条目摊到它占的**每一张**卡上的显存（MB）。
+
+    多卡模型（分段式 9B）的 ``memory_estimate_mb`` 是几张卡**加起来**
+    的 ⇒ 平摊，余数给第一张 —— 与 :func:`_local_memory_usage` 同一口径。
+    """
+    from app.core.compute import card_roles
+    return card_roles.card_share(str(entry.get("model") or ""),
+                                  _autostart_entry_cards(entry), presets)
+
+
+def _crop_autostart_for_cards(entries: list[dict],
+                              model_cards: list[int],
+                              presets: Optional[dict] = None
+                              ) -> tuple[list[dict], list[dict]]:
+    """按算力卡位裁剪 autostart：非算力卡丢弃 + 同卡冲突的丢弃。
+
+    返回 ``(保留的, 丢弃的)``；丢弃的每条多带一个 ``reason``（人类可读
+    的原因，调用方直接拿去记日志）。保留哪条按 config 的先后顺序
+    （第一条优先）—— 那是用户写入时的意图顺序。
+
+    裁剪规则
+    --------
+    1. 条目占用的卡**不在本机算力卡位**内 → 丢弃；
+    2. 同一个 ``(model, cards)`` 重复 → 丢弃（配置层已经拒过，这里兜底）；
+    3. **同卡冲突** → 丢弃。判据是「**能不能共卡**」：
+
+       * 感知链内部（ASR + 翻译）**允许共卡** —— 真机实测 1600 MB +
+         2200 MB = 3800 MB ≤ 5120 MB，同卡稳定共卡；
+       * 其余组合维持「**一卡一模型**」（AGENTS.md「一卡一模型是不变量」）。
+
+    4. **显存不够** → 丢弃（同卡共卡时求和超了卡容量）。
+
+    ⚠️ v0.32：旧规则是「每张卡只留第一条」，理由写的是「一张 RK1828
+    协卡装不下两个模型，同卡叠模型 rc=-6」。那个理由把「**显存**」
+    当成了「**模型个数**」—— 3500 MB 的视觉模型 + 2500 MB 的 omni 确实
+    装不下，但 1600 MB 的 ASR + 2200 MB 的翻译装得下（3800 ≤ 5120），
+    实测同卡长时间稳定。⇒ 判据从「模型个数」改成「**显存预算**」，
+    并用感知链白名单限定「哪些组合允许共卡」。
     """
     if not model_cards:
         return list(entries), []
+    from app.core.compute import card_roles
     keep_cards = set(model_cards)
+    presets = presets if presets is not None else MODEL_PRESETS
     kept: list[dict] = []
     dropped: list[dict] = []
-    seen_cards: set[int] = set()
+    #: 卡号 → 已保留的条目（用来判共卡 / 累加显存）
+    per_card: dict[int, list[dict]] = {}
+    seen: set[tuple[str, tuple[int, ...]]] = set()
     for e in entries:
-        raw_card = e.get("npu_index")
-        cards = ([int(x) for x in raw_card]
-                 if isinstance(raw_card, (list, tuple))
-                 else [int(raw_card)])
-        if (any(c not in keep_cards for c in cards)
-                or any(c in seen_cards for c in cards)):
-            dropped.append(e)
+        cards = _autostart_entry_cards(e)
+        model = str(e.get("model") or "")
+        if any(c not in keep_cards for c in cards):
+            dropped.append(dict(e, reason=(
+                "该卡不在本机算力卡位 %s 内（本机共 %d 张协卡）"
+                % (sorted(keep_cards), len(keep_cards)))))
             continue
-        seen_cards.update(cards)
+        key = (model, tuple(cards))
+        if key in seen:
+            dropped.append(dict(e, reason="重复条目（同模型同卡）"))
+            continue
+        # 同卡冲突判定：卡上已有的每个模型都要允许与新模型共卡
+        conflict = None
+        for c in cards:
+            for other in per_card.get(c, ()):
+                if not card_roles.can_share_card(model,
+                                                 str(other.get("model") or "")):
+                    conflict = str(other.get("model") or "")
+                    break
+            if conflict:
+                break
+        if conflict:
+            dropped.append(dict(e, reason=(
+                "一张卡只能承载一个模型（该卡上已有 %s；感知链内部的组合"
+                "允许共卡）" % conflict)))
+            continue
+        # 显存预算：同卡所有保留条目的估算之和 ≤ 卡容量
+        share = _autostart_entry_share(e, presets)
+        used: dict[int, int] = {c: 0 for c in cards}
+        for c in cards:
+            for other in per_card.get(c, ()):
+                used[c] += _autostart_entry_share(other, presets).get(c, 0)
+        if any(used.get(c, 0) + share.get(c, 0) > CARD_MEMORY_MB
+               for c in cards):
+            dropped.append(dict(e, reason=(
+                "该卡显存不够（已占 %d MB + 需 %d MB > %d MB）"
+                % (used.get(cards[0], 0), share.get(cards[0], 0),
+                   CARD_MEMORY_MB))))
+            continue
+        for c in cards:
+            per_card.setdefault(c, []).append(e)
+        seen.add(key)
         kept.append(e)
     return kept, dropped
 
 
 def _merge_autostart_entry(prev: list[dict], model_id: str,
                             npu_index) -> tuple[list[dict], bool, list[dict]]:
-    """把 ``(model_id, npu_index)`` 并入 autostart，保持「一卡一模型」。
+    """把 ``(model_id, npu_index)`` 并入 autostart。
 
     ``npu_index`` 可以是单卡或双卡（9B）。返回
     ``(新列表, 是否新增, 被替换掉的旧条目)``。
+
+    ⚠️ 「一卡一模型」不再是**无条件**的：感知链内部（ASR + 翻译）允许
+    共卡（实测 3800 MB ≤ 5120 MB 稳定）⇒ 同卡的旧条目**不再**被当成
+    陈旧条目替换掉；只有「不能共卡」或「显存不够」时才替换。
     """
+    from app.core.compute import card_roles
     cards = ([int(x) for x in npu_index]
              if isinstance(npu_index, (list, tuple))
              else [int(npu_index)])
@@ -991,12 +1075,22 @@ def _merge_autostart_entry(prev: list[dict], model_id: str,
     canonical = cards[0] if len(cards) == 1 else cards
 
     def _entry_cards(e: dict) -> set:
-        raw = e.get("npu_index")
-        return set(raw) if isinstance(raw, (list, tuple)) else {raw}
+        return set(_autostart_entry_cards(e))
 
     def _is_stale(e: dict) -> bool:
-        return (e.get("model") != model_id
-                and bool(_entry_cards(e) & card_set))
+        """同卡的旧条目是不是该被这次写入挤掉。
+
+        * **同一个模型** → 不算陈旧（重复条目由 ``has_self`` /
+          ``kept_self`` 处理 —— 幂等，不新增也不替换）；
+        * **别的模型** → **只有不能共卡时**才算陈旧（感知链内部的组合
+          允许共卡 ⇒ 同卡的旧条目留着）。
+        """
+        if e.get("model") == model_id:
+            return False
+        if not (_entry_cards(e) & card_set):
+            return False
+        return not card_roles.can_share_card(
+            model_id, str(e.get("model") or ""))
 
     stale = [e for e in prev if _is_stale(e)]
     has_self = any(
@@ -1816,6 +1910,67 @@ class ComputeRegistry:
             instances = [inst.to_dict() for inst in self._instances.values()]
         return _local_memory_usage(instances)
 
+    def local_model_cards(self, model_id: str) -> List[int]:
+        """本机某个模型跑在**哪些卡**上（升序）。
+
+        只算**本机实例**（``spawned`` / ``adopted_local``）—— 远端 peer
+        的 ``npu_index`` 是**对端板自己的卡号**，不是本板的。
+
+        给「卡位策略」用：翻译模型要**跟随 ASR 所在的卡**（见
+        :mod:`app.core.compute.card_roles`），就得先知道 ASR 在哪张卡。
+
+        ⚠️ 状态用 ``status in ("running", "loading")`` 过滤 —— 正在加载
+        的实例**已经占了卡**（显存正在被申请），策略必须把它算进去。
+        """
+        out: set[int] = set()
+        with self._lock:
+            instances = list(self._instances.values())
+        for inst in instances:
+            if inst.model_id != model_id:
+                continue
+            if inst._source not in ("spawned", "adopted_local"):
+                continue
+            if inst.status not in ("running", "loading"):
+                continue
+            for c in (inst.npu_indices or ()):
+                out.add(int(c))
+            if inst.npu_index is not None and int(inst.npu_index) >= 0:
+                out.add(int(inst.npu_index))
+        return sorted(out)
+
+    def record_autostart_entry(self, model_id: str, npu_index) -> bool:
+        """把 ``(model_id, npu_index)`` 记进 ``compute.autostart`` 并落盘。
+
+        给「模型由宿主侧起、但卡片只声明了别的能力」的场景用 —— 例如
+        流式同传的翻译模型：ASR 卡的 ``software_capabilities`` **只有**
+        ``swcap_audio_asr``（故意不加 ``swcap_translate``，否则会打断
+        ASR 自己的 active_app / autostart 落盘），⇒ 翻译模型不会被
+        ``set_active_app`` 记进去 ⇒ 板子重启后翻译模型不会自动起来。
+
+        这里补上：**模型真的跑起来了，就把它的卡位记下来** ⇒ 下次开机
+        恢复出来的布局与现在**一致**。
+
+        返回 ``True`` = 配置有变化（已落盘）。
+        """
+        try:
+            section = get_config().get_section("compute", {}) or {}
+        except Exception:  # noqa: BLE001
+            section = {}
+        if not isinstance(section, dict):
+            section = {}
+        prev = _parse_autostart_config(section.get("autostart"))
+        new, added, stale = _merge_autostart_entry(prev, model_id, npu_index)
+        if not added and not stale:
+            return False
+        for e in stale:
+            LOG.info("record_autostart: 移除同卡旧条目 %s @ npu%s",
+                     e.get("model"), e.get("npu_index"))
+        section["autostart"] = new
+        get_config().set_section("compute", section)
+        LOG.info("record_autostart: %s @ npu%s 已写入 compute.autostart",
+                 model_id, npu_index)
+        return True
+
     def card_device_id(self, npu_index: Optional[int]) -> Optional[str]:
         """卡号 → 物理身份（PCI BDF，如 ``0001:11:00.0``）。
 
@@ -1838,7 +1993,7 @@ class ComputeRegistry:
         """按本机算力卡位裁剪 autostart 条目，**并记录被裁掉的那些**。
 
         裁剪规则见 :func:`_crop_autostart_for_cards`：不在算力卡位内的
-        条目丢弃、一张卡只留第一条。
+        条目丢弃、同卡冲突的丢弃、同卡显存超预算的丢弃。
 
         被丢弃的条目记进 ``self._autostart_skipped``（并由 ``snapshot()``
         暴露给算力页）—— **不能静默**：一条 autostart 没生效 = 少起一个
@@ -1852,14 +2007,7 @@ class ComputeRegistry:
         if entries:
             kept, dropped = _crop_autostart_for_cards(entries, model_cards)
             for e in dropped:
-                cards = (e["npu_index"]
-                         if isinstance(e["npu_index"], (list, tuple))
-                         else [e["npu_index"]])
-                if any(c not in model_cards for c in cards):
-                    reason = (f"该卡不在本机算力卡位 {model_cards} 内"
-                              f"（本机共 {len(model_cards)} 张协卡）")
-                else:
-                    reason = "一张卡只能承载一个模型（同卡叠模型 rc=-6）"
+                reason = e.get("reason") or "被裁剪（原因未知）"
                 # **WARNING 而不是 INFO**：这条被丢弃 = 「用户配的自启没
                 # 生效」。只打 INFO 等于静默少起一个实例。
                 LOG.warning("boot: autostart 跳过 %s @ npu%s —— %s",

@@ -120,7 +120,15 @@ class InstanceSlot(BaseModel):
 class InstanceRequest(BaseModel):
     """``POST /compute/instances`` 入参：用户选好 (model, npu) 后启用。
 
-    ``npu_index`` 必填 —— enable 步骤包含 RPC load 绑定 NPU。
+    ``npu_index`` **可以不传** —— 缺省 = 按**卡位策略**自动挑一张卡
+    （见 :mod:`app.core.compute.card_roles`）：
+
+    * 翻译模型 → **跟随 ASR 所在的卡**（感知链同卡，争用实测 ≈ 0）；
+    * TTS → 挑一张**没被感知链占用**的卡（发声链独占：播报那几秒 NPU
+      一直忙，与识别共卡会挤掉识别 ⇒ 丢块）；
+    * 其余模型 → 挑一张放得下的卡（与旧行为一致）。
+
+    传了就用你传的（**用户显式指定永远优先于策略**）。
 
     **可以是单个卡号，也可以是一串卡号**：算力页的「运行在」是多选，
     同一个模型可以同时跑在两张卡上（两个独立 worker，各占一卡，各自
@@ -133,7 +141,9 @@ class InstanceRequest(BaseModel):
     #: 这里只校验**形状**（整数 / 非负 / 去重）。「卡号是否真的存在」是
     #: **运行时状态**（本机探测到几张卡、哪几张能跑 rknn 模型），只能在
     #: handler 里查 —— 见 ``start_instance`` 里的 ``reg.npu_card_error()``。
-    npu_index: int | list[int]
+    #:
+    #: ⚠️ **可以是 None**（不给 = 按策略挑卡）。
+    npu_index: Optional[int | list[int]] = None
     model: str
     #: **槽位**（卡号 + 本卡第几份）。给了它就按槽位启停，``npu_index``
     #: 被忽略 —— 算力页勾「1828#0 的第 2 份」时发的是这个。
@@ -145,7 +155,12 @@ class InstanceRequest(BaseModel):
     @field_validator("npu_index")
     @classmethod
     def _npu_list(cls, v):
-        """Normalise ``0`` / ``[0]`` / ``[0, 1]`` to a de-duplicated list."""
+        """Normalise ``0`` / ``[0]`` / ``[0, 1]`` to a de-duplicated list.
+
+        ``None`` 保持 ``None`` —— 它表示「按卡位策略自己挑」。
+        """
+        if v is None:
+            return None
         items = [v] if isinstance(v, int) else list(v)
         if not items:
             raise ValueError("npu_index 不能为空列表")
@@ -447,6 +462,32 @@ async def get_compute(response: Response) -> dict:
     return get_registry().snapshot()
 
 
+@router.get("/compute/card-roles")
+async def get_card_roles() -> dict:
+    """卡位策略的现状 + 建议布局（**只读**，不启停任何模型）。
+
+    给「这几个模型该怎么摆」一个可观测的答案：
+
+    * ``current`` —— 现在每个模型实际跑在哪张卡；
+    * ``plan``    —— 按策略建议放哪（翻译**跟随 ASR**、TTS 独占**剩余卡**）；
+    * ``roles``   —— 每个模型属于哪条链（感知链 / 发声链）；
+    * ``notes``   —— 人类可读的解释。
+
+    ⚠️ **不拉起 registry** —— 走 ``peek_registry()``：别因为看一眼布局
+    就把整个算力注册表初始化了（DDS hub + 对端发现 + 硬件探测，慢且有
+    副作用）。
+    """
+    from app.core.compute import card_roles
+    from app.core.compute.registry import peek_registry
+    reg = peek_registry()
+    if reg is None:
+        return {"registry_up": False, "cards": [], "plan": {}, "current": {},
+                "roles": {}, "per_card_memory_mb": {}, "notes": []}
+    out = card_roles.plan_layout(reg)
+    out["registry_up"] = True
+    return out
+
+
 @router.get("/compute/config")
 async def get_compute_config() -> dict:
     """读 ``config.jsonc["compute"]``（不触发任何启动）。
@@ -514,8 +555,18 @@ async def start_instance(req: InstanceRequest) -> dict:
         422: pydantic 校验失败（缺字段 / model 未知 / npu_index 不是整数）。
     """
     reg = get_registry()
-    npu_indices = (req.npu_index if isinstance(req.npu_index, list)
-                   else [req.npu_index])
+    if req.npu_index is None:
+        # **不给卡号 = 按卡位策略自己挑**（见
+        # :mod:`app.core.compute.card_roles`）：翻译模型跟随 ASR 所在的卡，
+        # TTS 挑一张没被感知链占用的卡，其余模型挑一张放得下的卡。
+        from app.core.compute import card_roles
+        try:
+            npu_indices = [card_roles.pick_card(reg, req.model)]
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    else:
+        npu_indices = (req.npu_index if isinstance(req.npu_index, list)
+                       else [req.npu_index])
     # **槽位** = (卡号, 本卡第几份)。``slots`` 给了就以它为准（算力页勾
     # 「1828#0 的第 2 份」时发的是它）；没给就退化成「每张卡第 0 份」——
     # 老调用方（向导 / 卡片 / config autostart）的语义完全不变。

@@ -124,8 +124,10 @@ class NpuTranslateInstances:
     def ensure(self, npu_index: Optional[int] = None) -> Dict[str, Any]:
         """确保本板有一个**正在跑**的翻译实例；返回状态快照。
 
-        * ``npu_index`` 给了就起在那张卡上；不给就自动挑一张**放得下**的卡。
-        * 已经有实例在跑 ⇒ 直接复用（不重复 load）。
+        * ``npu_index`` 给了就起在那张卡上；不给就按**卡位策略**挑 ——
+          翻译模型**跟随 ASR 所在的卡**（见
+          :mod:`app.core.compute.card_roles`）。
+        * 已经有实例在跑 ⇒ 直接复用（不重复 load，也不换卡）。
         * 起的是**本机** worker（``allow_adopt=False``）——
           「每块板子只管自己的算力」，也不要把 peer 的 service 摘掉。
 
@@ -137,6 +139,12 @@ class NpuTranslateInstances:
                 raise RuntimeError(
                     "本机没有安装翻译模型 %s（模型目录里找不到）"
                     % self.MODEL_ID)
+            # 已经有翻译实例在跑 ⇒ 直接复用（**不换卡**：用户手动摆过的
+            # 卡位是有意为之，策略不该把它搬走）。
+            running = [i for i in self._local_instances(reg)
+                       if i.get("status") == "running"]
+            if running and npu_index is None:
+                return self.status()
             card = (int(npu_index) if npu_index is not None
                     else self._pick_card(reg))
             bad = reg.npu_card_error(card)
@@ -145,10 +153,12 @@ class NpuTranslateInstances:
 
             inst = self._find_slot(reg, card)
             if inst and inst.get("status") == "running":
+                self._record_autostart(reg, card)
                 return self.status()
             if inst and inst.get("status") == "loading":
                 # 正在加载 —— 等它，别再起一份（两份抢同一份显存 ⇒ rc=-6）
                 if self._wait_ready(reg, card):
+                    self._record_autostart(reg, card)
                     return self.status()
                 raise RuntimeError("翻译模型加载超时（卡 #%d）" % card)
 
@@ -163,6 +173,7 @@ class NpuTranslateInstances:
                 raise RuntimeError(
                     "翻译模型启动失败（卡 #%d）：%s"
                     % (card, err.get("error") or "未知原因"))
+            self._record_autostart(reg, card)
             return self.status()
 
     def disable(self) -> Dict[str, Any]:
@@ -351,25 +362,48 @@ class NpuTranslateInstances:
         return None
 
     def _pick_card(self, reg) -> int:
-        """挑一张**放得下**一份翻译模型的卡。
+        """按**卡位策略**挑一张卡（抛 RuntimeError 表示挑不出来）。
+
+        策略见 :mod:`app.core.compute.card_roles`：
+
+        * 翻译模型属于**感知链** ⇒ **跟随 ASR 所在的卡**（ASR 在哪张卡，
+          翻译就跟到哪张）。真机实测同卡与分卡的争用 ≈ 0
+          （ASR 轮间隔中位 1.21 s vs 1.22 s，端点后第一轮都是 1.68 s）——
+          因为 ASR 的端点判定发生在**收尾推理之后**，翻译那一拍正好落在
+          ASR 的空档里。
+        * ASR 没跑（还没起 / 起不来）⇒ 退化成「挑一张放得下的卡」。
 
         ⚠️ 只算**本机**实例的占用 —— 远端 peer 的 ``npu_index`` 是**对端板
         自己的卡号**，把它算进来会把一张空卡判成占满（真机现场：peer 的
         5500 MB 被记到本板卡 1 ⇒ 本板 3 张卡全空却被判成「卡 1 满了」）。
         """
+        from app.core.compute import card_roles
         try:
-            cards = list(reg.model_cards())
-        except Exception:  # noqa: BLE001
-            cards = []
-        if not cards:
-            raise RuntimeError("本机没有可用的 NPU 协卡")
-        per_card, _total, _remote = self._usage(reg)
-        for card in cards:
-            if per_card.get(card, 0) + self.MEMORY_MB <= CARD_MEMORY_MB:
-                return card
-        raise RuntimeError(
-            "没有一张协卡放得下翻译模型（每份约 %d MB，一张卡 %d MB）"
-            % (self.MEMORY_MB, CARD_MEMORY_MB))
+            return card_roles.pick_card(reg, self.MODEL_ID)
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("挑不出翻译模型的卡位: %s" % exc) from exc
+
+    def _record_autostart(self, reg, card: int) -> None:
+        """把翻译模型的卡位记进 ``compute.autostart``。
+
+        为什么宿主侧要写这个：ASR 卡的 ``software_capabilities`` **只有**
+        ``swcap_audio_asr``（故意不加 ``swcap_translate`` —— 加了会打断
+        ASR 自己的 active_app / autostart 落盘逻辑，见 AGENTS.md）。
+        ⇒ 翻译模型不会被 ``set_active_app`` 记进 autostart ⇒ 板子重启
+        后翻译模型不会自动起来 ⇒ **重启后布局变了**。
+
+        这里补上：模型真跑起来了就把卡位记下来 ⇒ 重启后恢复出来的布局
+        与现在一致。
+
+        ⚠️ **失败不影响主流程** —— 写配置失败只记日志，模型该跑还是跑。
+        """
+        try:
+            reg.record_autostart_entry(self.MODEL_ID, int(card))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("npu_manager: 记录翻译模型 autostart 失败（卡 #%d）: %s",
+                        card, exc)
 
     def _wait_ready(self, reg, card: int) -> bool:
         """等卡上的翻译实例变成 running（最多 :attr:`LOAD_TIMEOUT_S`）。"""
