@@ -18,6 +18,10 @@
 
 3. **翻译服务** —— 开关 / 队列 / 译文帧 / 各条降级 / endpoint 钩子。
 
+4. **文件 / 视频路径的「自己断句」** —— 那条路径**没有** ``endpoint``
+   帧（没有句级信号）⇒ 后端按标点自己切句（``_SentenceSplitter``），
+   切出的完整句再送翻译；句序号落在**另一个区间**，不与实时路径撞。
+
 **不碰真机**：假 provider（``translate_sentence`` 直接返回或抛异常）、
 假广播订阅者。零 RPC、零 NPU 占用。
 
@@ -32,6 +36,7 @@ import json
 import os
 import sys
 import time
+from typing import Optional
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -108,6 +113,36 @@ def _collect(svc, q, timeout: float = 5.0) -> list:
                 if out:
                     break
                 time.sleep(0.05)
+    finally:
+        svc.unregister_subscriber(q)
+    return out
+
+
+def _collect_until(svc, q, pred, timeout: float = 8.0,
+                   settle: float = 1.0) -> list:
+    """收帧直到 ``pred(frame)`` 命中，**再静置** ``settle`` 秒收尾。
+
+    ⚠️ **不能**用 :func:`_collect`：它「一收到东西就收工」⇒ 翻译帧是在
+    **工作线程**里异步推的，很可能比先到的 round 帧晚几十毫秒 ⇒ 会漏。
+
+    ⚠️ 为什么要**静置**：一次识别会切出**好几句**，译文由**两个工作线程**
+    并行推 ⇒ 先到的那条不代表最后一条都到齐了。
+    """
+    out = []
+    deadline = time.time() + timeout
+    hit_at: Optional[float] = None
+    try:
+        while time.time() < deadline:
+            try:
+                out.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                pass
+            if any(pred(f) for f in out):
+                if hit_at is None:
+                    hit_at = time.time()
+                elif time.time() - hit_at >= settle:
+                    break
+            time.sleep(0.05)
     finally:
         svc.unregister_subscriber(q)
     return out
@@ -350,7 +385,10 @@ def test_translation_service() -> None:
     # --- clear() 清统计 ---
     svc5.clear()
     st = svc5.status()
-    check("clear() 清统计", st["submitted"] == 0 and st["dropped"] == 0,
+    # ⚠️ **不能**断言 dropped == 0 —— clear() 会把代数 +1，正在推理的那
+    # 一句回来时算「作废」⇒ dropped 会 +1（这是**故意**的：清空后不该再
+    # 有译文冒出来）。
+    check("clear() 清统计", st["submitted"] == 0 and st["translated"] == 0,
           f"status={st}")
 
 
@@ -418,10 +456,180 @@ def test_endpoint_hook() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# [6] API 路由
+# [6] 文件 / 视频路径：自己断句
+# --------------------------------------------------------------------------- #
+def test_clear_drops_inflight() -> None:
+    """「清空」⇒ **正在推理**的那一句不再推给页面。"""
+    print("\n[6] 「清空」：正在推理的译文不再推回来")
+    from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+        TranslationService,
+    )
+    import app.core.translate.npu_manager as npu_mod
+
+    class SlowManager:
+        """慢吞吞的假管理器（好让「推理中」这个窗口稳定复现）。"""
+
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def translate_sentence(self, text: str, source: str, target: str):
+            self.calls.append((text, source, target))
+            time.sleep(1.5)
+            return "你好", {"decode_ms": 10.0}
+
+    fake = SlowManager()
+    npu_mod._INSTANCES = fake
+
+    svc = TranslationService()
+    # ⚠️ 目标语言**不能**是 zh-CN —— 源语 Chinese 归一后也是 zh-CN ⇒
+    # 源语 == 目标语 ⇒ 走「透传、不推理」分支 ⇒ 根本没有推理窗口。
+    svc.configure(enabled=True, target_lang="en")
+    sub_svc, sub_q = _subscribe()
+    svc.submit(index=1, text="你好，世界", lang="Chinese",
+               stream_id="live-gen", loop=None)
+    time.sleep(0.4)          # 让工作线程**开始**推理（进入 sleep）
+    check("推理已经开始", bool(fake.calls), f"calls={fake.calls}")
+    svc.clear()              # ← 用户点了「清空」
+    frames = _collect(sub_svc, sub_q, timeout=3.0)
+    tr = [f for f in frames if f.get("type") == "translation"]
+    check("「清空」⇒ 已经在跑的那句**不再推**（页面不会又冒一行）",
+          len(tr) == 0, f"frames={frames}")
+
+
+def test_file_path_splitter() -> None:
+    print("\n[7] 文件 / 视频路径：自己断句（_SentenceSplitter）")
+    from wdnapps_audio_chat.cards.qwen3_asr.service import _SentenceSplitter
+
+    def run(steps, flush: bool = True) -> list:
+        sp = _SentenceSplitter()
+        out: list = []
+        emit = lambda t, i: out.append((i, t))   # noqa: E731
+        for c in steps:
+            sp.feed(c, emit)
+        if flush:
+            sp.flush(emit)
+        return out
+
+    # --- 中文句末标点 ---
+    out = run(["第一句。第二句。第三句。"])
+    check("中文句末标点 ⇒ 一句一条", len(out) == 3, f"out={out}")
+    check("切出来的内容对",
+          [t for _, t in out] == ["第一句。", "第二句。", "第三句。"], f"out={out}")
+    check("句序号从 1 起、连续", [i for i, _ in out] == [1, 2, 3], f"out={out}")
+
+    # --- 英文句点（带护栏）---
+    out = run(["Hello there. This is a test."])
+    check("英文句点 ⇒ 切句", len(out) == 2, f"out={out}")
+
+    # --- 小数不切 ---
+    out = run(["The value is 3.14 exactly."])
+    check("小数里的点**不**当句末", len(out) == 1, f"out={out}")
+
+    # --- 缩写不切 ---
+    out = run(["Mr. Smith and Dr. Jones went home."])
+    check("缩写后的点**不**当句末", len(out) == 1, f"out={out}")
+
+    # --- 长度兜底（没标点的长音频也要边播边出译文）---
+    out = run(["x" * 130])
+    check("没有标点 ⇒ 超长强制切", len(out) >= 2, f"out={len(out)}")
+
+    # --- 收尾 flush（最后一句通常没标点）---
+    out = run(["Hello there. And this tail has no punctuation"])
+    check("收尾时把没标点的尾巴也提交了",
+          bool(out) and out[-1][1] == "And this tail has no punctuation",
+          f"out={out}")
+
+    # --- epoch 切换：显式 flush + 句序号继续 ---
+    sp = _SentenceSplitter()
+    out = []
+    emit = lambda t, i: out.append((i, t))       # noqa: E731
+    sp.feed("first epoch text without punctuation", emit)
+    sp.flush(emit)          # ← _rotate_epoch 里的显式 flush
+    sp.reset_epoch()
+    sp.feed("second epoch text without punctuation", emit)
+    sp.flush(emit)
+    check("epoch 切换 ⇒ 两段各出一条", len(out) == 2, f"out={out}")
+    check("epoch 切换后句序号继续（不归零）",
+          [i for i, _ in out] == [1, 2], f"out={out}")
+
+
+# --------------------------------------------------------------------------- #
+# [8] 文件 / 视频路径：round 帧 ⇒ 自己断句 ⇒ 译文
+# --------------------------------------------------------------------------- #
+def test_file_path_hook() -> None:
+    print("\n[8] 文件 / 视频路径：round 帧 ⇒ 切句 ⇒ 译文帧")
+    from wdnapps_audio_chat.cards.qwen3_asr import service as asr_service
+    from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+        TranslationService,
+    )
+    import wdnapps_audio_chat.cards.qwen3_asr.translation as tr_mod
+
+    fake = _install_fake_manager("ok")
+    tr_svc = TranslationService()
+    # ⚠️ 目标语言**不能**选 en —— 源语是 English（归一后也是 en）⇒
+    # 源语 == 目标语 ⇒ 走「透传、不推理」分支 ⇒ 根本不会调翻译模型。
+    tr_svc.configure(enabled=True, target_lang="zh-CN")
+    tr_mod._SERVICE = tr_svc
+
+    svc = asr_service.get_asr_service()
+    base = 7 * asr_service._TR_FILE_INDEX_BASE
+    svc._tr_ctx = {
+        "rid": 7,
+        "stream_id": "file-7",
+        "base": base,
+        "loop": None,
+    }
+    svc._language = "English"
+
+    # ⚠️ **只订阅一次** —— 两次订阅会把第一批的译文帧吃掉（第一批的帧
+    # 在第一次收帧时就到了），后面就只剩第二批 ⇒ 序号对不上。
+    sub_svc, sub_q = _subscribe()
+    svc._on_delta(json.dumps({
+        "type": "asr_round", "round": 1,
+        "committed": "Hello there. This is fine.",
+        "unfixed": "", "language": "English",
+    }))
+    # --- 收尾 flush：最后一句没标点也要译 ---
+    svc._on_delta(json.dumps({
+        "type": "asr_round", "round": 2,
+        "committed": "Hello there. This is fine. And a tail",
+        "unfixed": "", "language": "English",
+    }))
+    svc._tr_flush()
+    frames = _collect_until(sub_svc, sub_q,
+                             lambda f: f.get("type") == "translation")
+    tr = sorted((f for f in frames if f.get("type") == "translation"),
+                key=lambda f: f.get("index") or 0)
+    check("round 帧 ⇒ 自己切句 ⇒ 译文帧", len(tr) >= 1, f"frames={frames}")
+    if tr:
+        f = tr[0]
+        check("译文帧带文件路径的 stream_id", f.get("stream_id") == "file-7",
+              f"stream_id={f.get('stream_id')}")
+        check("句序号落在文件路径的区间（不与实时路径的小整数撞）",
+              int(f.get("index") or 0) >= asr_service._TR_FILE_INDEX_BASE,
+              f"index={f.get('index')}")
+        check("送去翻译的是切出来的那一句",
+              bool(fake.calls) and fake.calls[0][0] == "Hello there.",
+              f"calls={fake.calls}")
+        check("尾巴那一句送去了翻译",
+              any(c[0] == "And a tail" for c in fake.calls), f"calls={fake.calls}")
+        idxs = [int(f.get("index") or 0) for f in tr]
+        check("句序号连续（base+1、base+2…）",
+              idxs == list(range(base + 1, base + 1 + len(idxs))), f"idxs={idxs}")
+        srcs = [f.get("source") for f in tr]
+        check("三句都切出来了",
+              srcs == ["Hello there.", "This is fine.", "And a tail"],
+              f"srcs={srcs}")
+
+    svc._tr_ctx = None
+    tr_mod._SERVICE = None
+
+
+# --------------------------------------------------------------------------- #
+# [9] API 路由
 # --------------------------------------------------------------------------- #
 def test_api_routes() -> None:
-    print("\n[6] API 路由齐了")
+    print("\n[9] API 路由齐了")
     from wdnapps_audio_chat.cards.qwen3_asr import api
     paths = {}
     for r in api.router.routes:
@@ -439,7 +647,7 @@ def test_api_routes() -> None:
 
 def main() -> int:
     print("=" * 72)
-    print("ASR 卡：实时翻译（流式同传，第一期）")
+    print("ASR 卡：实时翻译（实时路径 + 文件 / 视频路径）")
     print("=" * 72)
 
     test_manifest_guard()
@@ -447,6 +655,9 @@ def main() -> int:
     test_language_normalize()
     test_translation_service()
     test_endpoint_hook()
+    test_clear_drops_inflight()
+    test_file_path_splitter()
+    test_file_path_hook()
     test_api_routes()
 
     print("\n" + "=" * 72)
