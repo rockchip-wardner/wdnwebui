@@ -356,8 +356,9 @@ class ComputeConfigPayload(BaseModel):
             if key in seen:
                 raise ValueError(
                     f"compute.autostart 含重复条目: model={entry.model!r} "
-                    f"npu_index={entry.npu_index}；同一张卡上不能挂两份同一个"
-                    "模型（同卡叠模型会加载失败），换卡请写不同的 npu_index。"
+                    f"npu_index={entry.npu_index}；autostart 的 schema 没有"
+                    "副本号字段，同一张卡上写两条同一个模型没法表达成两份"
+                    "实例，换卡请写不同的 npu_index。"
                 )
             seen.add(key)
         return v

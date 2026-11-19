@@ -50,7 +50,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence
 
 LOG = logging.getLogger("core.compute.card_roles")
 
@@ -117,11 +117,6 @@ def role_of(model_id: str) -> str:
 def perception_models() -> List[str]:
     """感知链上的模型 id（顺序 = :data:`MODEL_ROLES` 的声明顺序）。"""
     return [m for m, r in MODEL_ROLES.items() if r == ROLE_PERCEPTION]
-
-
-def speech_models() -> List[str]:
-    """发声链上的模型 id。"""
-    return [m for m, r in MODEL_ROLES.items() if r == ROLE_SPEECH]
 
 
 def can_share_card(model_a: str, model_b: str) -> bool:
@@ -213,19 +208,6 @@ def perception_anchor_card(reg) -> Optional[int]:
     except Exception:  # noqa: BLE001
         return None
     return int(cards[0]) if cards else None
-
-
-def perception_cards(reg) -> Set[int]:
-    """本板被**感知链**占用的卡（ASR + MT）。"""
-    out: Set[int] = set()
-    if reg is None:
-        return out
-    for model_id in perception_models():
-        try:
-            out.update(int(c) for c in reg.local_model_cards(model_id))
-        except Exception:  # noqa: BLE001
-            continue
-    return out
 
 
 def current_layout(reg) -> Dict[str, List[int]]:

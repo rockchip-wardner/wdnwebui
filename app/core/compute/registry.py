@@ -5603,7 +5603,7 @@ class ComputeRegistry:
             其中 ``autostart_extended`` 列出了本次新增的 (model,
             npu_index) —— 方便前端 / 运维看出"这次开启"实际多挂了几张
             卡的 worker；``autostart_replaced`` 列出被替换掉的同卡旧条目
-            （维护「一卡一模型」不变量）。
+            （维护同卡唯一性 —— 感知链内部的组合允许共卡，不算陈旧）。
         Raises
         ------
         ValueError
@@ -5715,8 +5715,9 @@ class ComputeRegistry:
                     list(cards) if len(cards) > 1
                     else (cards[0] if cards else inst.npu_index)
                 )
-                # 维护「一卡一模型」不变量 —— 同卡的旧条目是陈旧的，替换掉
-                # （理由见 _merge_autostart_entry）。
+                # 维护同卡唯一性 —— 同卡的旧条目**只有**在「不能与新模型共卡」
+                # 时才是陈旧的（感知链内部的组合允许共卡），
+                # 见 _merge_autostart_entry。
                 new_autostart, added, stale = _merge_autostart_entry(
                     new_autostart, inst.model_id, target_npu)
                 replaced.extend(stale)
@@ -5747,7 +5748,7 @@ class ComputeRegistry:
             "active_app": app_id,
             "autostart": list(new_autostart),
             "autostart_extended": extended,
-            # 同卡旧条目被替换掉的那些（维护「一卡一模型」不变量）。
+            # 同卡旧条目被替换掉的那些（维护同卡唯一性）。
             "autostart_replaced": replaced,
         }
 
