@@ -523,6 +523,12 @@ Hub 的 service 列表是**启动时一次性**按 `MODEL_PRESETS` 生成的。D
 
 ### 9.1 维护者侧
 
+> **落地时改过命令**：原计划是 `git push https://huggingface.co/...`，但本板
+> `huggingface.co` 是 DNS 污染 + SNI 阻断 ⇒ 这条**跑不通**。
+> 实际可行的是 `git push git@hf.co:...`（SSH + git-lfs，账号注册了公钥就
+> 不需要 token），或者走 Hub API + write token。
+> 完整流程见 [`docs/MODEL_PUBLISH_GUIDE.md`](MODEL_PUBLISH_GUIDE.md)。
+
 ```bash
 # 每个模型一个 HF repo
 huggingface-cli repo create Qwen3-VL-4B --repo-type model
@@ -530,8 +536,11 @@ cd /userdata/models/Qwen3-VL-4B
 git init && git lfs install
 git add .            # 权重 + worker.json 一起
 git commit -m "Qwen3-VL-4B rk3588 + worker manifest"
-git push https://huggingface.co/<org>/Qwen3-VL-4B main
+git push git@hf.co:<org>/Qwen3-VL-4B.git main
 ```
+
+发布**前**还要先把 `SHA256SUMS` / `config.json` 刷对
+（`tools/refresh_model_metadata.py`），否则发布工具的传前校验会拒传。
 
 ### 9.2 用户侧
 

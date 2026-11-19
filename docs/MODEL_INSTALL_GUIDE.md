@@ -112,3 +112,12 @@ python -m scripts.migrate_worker_manifests             # 实际写入
 
 模型目录不存在的会被跳过（那个模型没装，正常状态）。clone 完模型后
 重跑一次即可补上它的 worker 配置。
+
+## 维护者：把模型发布到 HuggingFace
+
+**怎么把模型推上去** —— 发布前的元数据刷新、两条推送路线（Hub API +
+write token / SSH + git-lfs，不需要 token）、发布后的复核方式，都在
+[`docs/MODEL_PUBLISH_GUIDE.md`](MODEL_PUBLISH_GUIDE.md)。
+
+这块板子连不上 `huggingface.co` 的原因与 SNI 绕行代理，见
+[`docs/HF_SNI_PROXY.md`](HF_SNI_PROXY.md)。

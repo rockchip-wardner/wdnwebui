@@ -84,8 +84,17 @@ function mkNode(tag) {
       if (i >= 0) this.children.splice(i, 1);
       return c;
     },
-    addEventListener() {},
+    addEventListener(type, fn) {
+      (this._h || (this._h = {}))[type] = (this._h[type] || []).concat([fn]);
+    },
     removeEventListener() {},
+    // ⚠️ **派发 click** —— 自检要**模拟用户点「开始审查」**，而不是直接调
+    // 内部函数：只有走真实的监听器，才能钉住「事件 → 徽章」这条链路。
+    // 以前 stub 里的 addEventListener 是空的 ⇒ 点按钮什么都不会发生。
+    click() {
+      const hs = (this._h || {}).click || [];
+      hs.forEach((fn) => { try { fn({ target: this }); } catch (_) {} });
+    },
     setAttribute() {},
     getAttribute() { return null; },
     select() {},
@@ -132,7 +141,17 @@ globalThis.fetch = async () => ({
     enabled: true, model_id: "intern-decision-4b", npu_index: 0,
     default_npu_index: 0, instance_status: "running", instance_error: "",
     installed: true, capability: "swcap_decision", max_items: 16,
-    max_text_chars: 4000, detail: "", conflict: "", cards: [],
+    max_text_chars: 4000, detail: "", warning: "", cards: [],
+    card_memory_mb: 5120,
+    // ⚠️ **模型候选列表**（2026-11-19）—— 标签 / 显存估算的真源是 manifest。
+    models: [
+      { id: "intern-decision-4b", label: "[JEV]图像文字决策模型4B",
+        installed: true, memory_mb: 3200, running: true,
+        instance_status: "running", npu_index: 0 },
+      { id: "intern-decision-0.8b", label: "[JEV]图像文字决策模型0.8B",
+        installed: true, memory_mb: 900, running: false,
+        instance_status: "not_loaded", npu_index: null },
+    ],
   }),
 });
 1;
@@ -179,6 +198,96 @@ def run_card_app_js(seed=None) -> dict:
     return json.loads(raw if isinstance(raw, str) else str(raw))
 
 
+#: 探模型下拉：选项（值 / 文案 / 禁用 / 选中）+ 提示语 + 记住的 model id
+PROBE_MODEL = r"""
+JSON.stringify({
+  options: (((REG["cr-model-select"] || {}).children) || []).map(
+    (o) => ({
+      value: o.value || "",
+      text: o.textContent || "",
+      disabled: !!o.disabled,
+      selected: !!o.selected,
+    })
+  ),
+  hint: ((REG["cr-model-hint"] || {}).textContent) || "",
+  selectDisabled: !!((REG["cr-model-select"] || {}).disabled),
+  store: globalThis.localStorage.getItem("wdnwebui.content_review.model"),
+});
+"""
+
+
+def run_model_select() -> dict:
+    """把卡片 app.js 跑一遍，探模型下拉渲染出来的选项。
+
+    顺带模拟**用户切换模型**（派发 change 事件）⇒ 断言选择被记住了
+    （localStorage）—— 下拉只是画出来不算数，得真的切得动。
+
+    ⚠️ 下拉是 ``refresh()``（**异步**）之后才渲染的 ⇒ 要轮询等它落定，
+    不能 evaljs 完就探。
+    """
+    import time
+
+    import dukpy
+
+    src = open(CARD_JS, encoding="utf-8").read()
+    interp = dukpy.JSInterpreter()
+    interp.evaljs(DOM_STUB)
+    interp.evaljs(src)
+    before = {}
+    for _ in range(100):
+        before = json.loads(interp.evaljs(PROBE_MODEL))
+        if before.get("options"):
+            break
+        time.sleep(0.02)
+    # 模拟用户在下拉里选了 0.8B（走**真实的** change 监听器）
+    interp.evaljs(
+        'var _sel = REG["cr-model-select"];'
+        '(_sel._h && _sel._h.change || []).forEach(function (fn) {'
+        '  fn({ target: { value: "intern-decision-0.8b" } });'
+        '});'
+    )
+    after = json.loads(interp.evaljs(PROBE_MODEL))
+    return {"before": before, "after": after}
+
+
+def run_review_click() -> dict:
+    """模拟用户点「开始审查」，返回徽章 / 提示语的最终状态。
+
+    ⚠️ **必须走真实的 click 监听器**（不是直接调内部函数）—— 只有这样才能
+    钉住「点按钮 → 徽章变」这条链路；直接调内部函数的话，徽章没接线也能
+    「测过」（2026-11-18 那个「结果卡永远是未审查」的 bug 就是这么漏掉的）。
+
+    ``run()`` 是 async 而监听器不 await 它 ⇒ 轮询提示语等它落定。
+    """
+    import time
+
+    import dukpy
+
+    src = open(CARD_JS, encoding="utf-8").read()
+    interp = dukpy.JSInterpreter()
+    interp.evaljs(DOM_STUB)
+    interp.evaljs(src)
+    interp.evaljs(
+        'document.getElementById("cr-text").value = "限时优惠，点击领取优惠券";'
+        'document.getElementById("cr-run-btn").click();'
+    )
+    note = ""
+    for _ in range(100):
+        note = interp.evaljs('((REG["cr-run-note"] || {}).textContent) || ""')
+        if note in ("完成", "失败"):
+            break
+        time.sleep(0.02)
+    return {
+        "note": note,
+        "result_badge": interp.evaljs(
+            '((REG["cr-result-badge"] || {}).textContent) || ""'),
+        "result_state": interp.evaljs(
+            '(((REG["cr-result-badge"] || {}).dataset || {}).state) || ""'),
+        "review_badge": interp.evaljs(
+            '((REG["cr-review-badge"] || {}).textContent) || ""'),
+    }
+
+
 def main() -> int:
     print("=" * 72)
     print("图文内容审查卡自检")
@@ -189,11 +298,12 @@ def main() -> int:
         ContentReviewManager,
         DEFAULT_MODEL,
         MAX_ITEMS,
+        MODEL_IDS,
     )
 
     # ---------------------------------------------------------------- [1] --
     print("\n[1] 卡片声明")
-    man = json.load(open(MANIFEST, encoding="utf-8"))
+    man = json.load(open(MANIFEST, encoding="utf-8"),)
     check("manifest id = content-review", man.get("id") == "content-review", str(man.get("id")))
     check("标题是「图文内容审查」", man.get("title") == "图文内容审查", str(man.get("title")))
     check("display_order = 72（排在网页翻译 71 后面）",
@@ -201,20 +311,31 @@ def main() -> int:
     check("用的是决策能力 swcap_decision",
           "swcap_decision" in (man.get("software_capabilities") or []),
           str(man.get("software_capabilities")))
-    check("模型是 intern-decision-4b（= [JEV]图像文字决策模型4B）",
+    check("默认模型是 intern-decision-4b（= [JEV]图像文字决策模型4B）",
           DEFAULT_MODEL == "intern-decision-4b", DEFAULT_MODEL)
+    check("支持两个型号：4B + 0.8B（0.8B 同规格同协议，只是更小更快）",
+          MODEL_IDS == ("intern-decision-4b", "intern-decision-0.8b"),
+          str(MODEL_IDS))
 
     tpl = open(TEMPLATE, encoding="utf-8").read()
     check("页面 section id = page-content-review",
           'id="page-content-review"' in tpl)
+    check("模板里有模型下拉（cr-model-select）",
+          'id="cr-model-select"' in tpl)
     js = open(CARD_JS, encoding="utf-8").read()
     check("前端挂了向导完成钩子 applyWizardSnapshot",
           "ImApp_content_review" in js and "applyWizardSnapshot" in js)
+    check("前端启停/审查都带 model_id",
+          js.count("model_id") >= 4, str(js.count("model_id")))
+    check("前端不再用 st.conflict（改成 warning 告警）",
+          "st.conflict" not in js and "st.warning" in js)
 
     wiz = json.load(open(WIZARD_JSON, encoding="utf-8"))
     m = (wiz.get("swcap_to_model") or {}).get("swcap_decision") or {}
-    check("向导把 swcap_decision 绑到 intern-decision-4b",
+    check("向导首选仍是 intern-decision-4b",
           m.get("model_id") == "intern-decision-4b", str(m.get("model_id")))
+    check("向导候选里也列了 0.8B（首选没装时能退过去）",
+          "intern-decision-0.8b" in (m.get("models") or []), str(m.get("models")))
 
     # ---------------------------------------------------------------- [2] --
     print("\n[2] 列表清洗：空项丢 / 重名合并 / 超上限拦下")
@@ -348,16 +469,26 @@ def main() -> int:
         check("wdndds 附件编解码可用", False, repr(exc))
 
     # ---------------------------------------------------------------- [6] --
-    print("\n[6] 独占：启用决策要自动清场，翻译要避开被占的卡")
+    print("\n[6] 共驻：决策模型不再独占整卡，卡上挤了只告警不拦停")
     import contextlib
 
     class FakeReg:
-        """假的算力注册表 —— 只给这两个函数用到的部分。
+        """假的算力注册表 —— 只给这几个函数用到的部分。
 
         ⚠️ ``model_cards()`` 必须返回 **List[int]**（卡号列表）——
         真实现就是这个形状；写成 dict 列表会掩盖「取下标」那类 bug
         （历史上就因为当成 dict 读而 TypeError，冲突检测静默失效）。
         """
+
+        #: 算力页的模型清单 —— 标签 / 显存估算的真源是模型目录里的 manifest。
+        _MODELS = [
+            {"id": "intern-decision-4b", "label": "[JEV]图像文字决策模型4B",
+             "capability_types": ["swcap_decision"], "exists": True,
+             "memory_estimate_mb": 3200},
+            {"id": "intern-decision-0.8b", "label": "[JEV]图像文字决策模型0.8B",
+             "capability_types": ["swcap_decision"], "exists": True,
+             "memory_estimate_mb": 900},
+        ]
 
         def __init__(self, instances, cards=(0, 1)):
             self._instances = [dict(i) for i in instances]
@@ -373,6 +504,9 @@ def main() -> int:
         def model_cards(self):
             return list(self._cards)
 
+        def list_supported_models(self):
+            return [dict(m) for m in self._MODELS]
+
         def model_op_lock(self, _mid):
             return contextlib.nullcontext()
 
@@ -385,46 +519,101 @@ def main() -> int:
                         and i["replica"] == replica)
             ]
 
-    def inst(model, card, replica, status="running", mem=2200):
+    def inst(model, card, replica, status="running", mem=2200, source="spawned",
+             caps=("x",)):
         return {"model_id": model, "label": model, "npu_index": card,
                 "npu_indices": [card], "replica": replica, "status": status,
-                "memory_estimate_mb": mem, "capability_types": ["x"]}
+                "memory_estimate_mb": mem, "capability_types": list(caps),
+                "_source": source}
 
-    # 清场：卡 0 上有翻译 **2 份** + 另一个模型 1 份 ⇒ 三个实例都要停
-    reg = FakeReg([
-        inst("hy-mt-1-5", 0, 0),
-        inst("hy-mt-1-5", 0, 1),
-        inst("qwen3-vl-4b", 0, 0),
-        inst("hy-mt-1-5", 1, 0),      # 另一张卡 —— 不该被动
-    ])
-    stopped = ContentReviewManager._clear_card(reg, 0)
-    check("清场停掉了卡 0 上的全部 3 个实例", len(stopped) == 3,
-          str([(s["model_id"], s["replica"]) for s in stopped]))
-    check("同卡第 2 份也没漏（stop_instance_local 只停一个实例）",
-          ("hy-mt-1-5", 0, 1) in reg.stopped, str(reg.stopped))
-    check("另一张卡上的实例没被动", ("hy-mt-1-5", 1, 0) not in reg.stopped,
-          str(reg.stopped))
-    check("决策模型自己的实例不会被自己清掉",
-          all(s["model_id"] != DEFAULT_MODEL for s in stopped), str(stopped))
+    M4B = "intern-decision-4b"
+    M08B = "intern-decision-0.8b"
 
-    # 清场：决策模型自己已经在那张卡上 ⇒ 什么都不用停
-    reg2 = FakeReg([inst(DEFAULT_MODEL, 0, 0, mem=3200)])
-    check("卡上只有决策模型时清场是空操作",
-          ContentReviewManager._clear_card(reg2, 0) == [], str(reg2.stopped))
+    # ---- 不再清场：启用决策模型不会停掉卡上的其它模型 ----
+    check("启用不再自动清场（_clear_card 已移除）",
+          not hasattr(ContentReviewManager, "_clear_card"))
 
-    # 翻译避让：卡 0 被决策模型占着（3200）⇒ 翻译只在卡 1 起
+    # ---- 余量够 ⇒ 没有告警（0.8B 900 + 翻译 2200 = 3100 < 5120） ----
+    reg = FakeReg([inst("hy-mt-1-5", 0, 0, mem=2200)])
+    warn = ContentReviewManager._memory_warning(reg, 0, M08B)
+    check("0.8B 与翻译同卡放得下（2200+900 < 5120）⇒ 不告警",
+          warn == "", warn)
+    check("清场没发生：卡上的翻译实例没被动",
+          reg.stopped == [], str(reg.stopped))
+
+    # ---- 余量不够 ⇒ 有告警（4B 3200 + 翻译 2 份 4400 > 5120） ----
+    reg2 = FakeReg([inst("hy-mt-1-5", 0, 0, mem=2200),
+                     inst("hy-mt-1-5", 0, 1, mem=2200)])
+    warn2 = ContentReviewManager._memory_warning(reg2, 0, M4B)
+    check("4B 与两份额译同卡放不下 ⇒ 有告警", bool(warn2), warn2)
+    check("告警里说清了余量与上限",
+          "5120" in warn2 and "3200" in warn2, warn2)
+    check("告警不是拦截（enable 不会因此拒绝）",
+          not isinstance(warn2, RuntimeError), type(warn2).__name__)
+
+    # ---- 本模型自己的实例不计入占用（问的是「还能不能再加一份」） ----
+    reg3 = FakeReg([inst(M4B, 0, 0, mem=3200)])
+    check("卡上只有决策模型自己时不算占用 ⇒ 不告警",
+          ContentReviewManager._memory_warning(reg3, 0, M4B) == "",
+          ContentReviewManager._memory_warning(reg3, 0, M4B))
+
+    # ---- 远端 peer 不占本板显存 ----
+    reg4 = FakeReg([inst("peer-model", 0, 0, mem=5500, source="adopted")])
+    check("远端 peer 的显存不计入本板卡位 ⇒ 不告警",
+          ContentReviewManager._memory_warning(reg4, 0, M4B) == "",
+          ContentReviewManager._memory_warning(reg4, 0, M4B))
+
+    # ---- 另一张卡上的实例不计入 ----
+    reg5 = FakeReg([inst("hy-mt-1-5", 1, 0, mem=2200)])
+    check("另一张卡上的实例不计入本卡 ⇒ 不告警",
+          ContentReviewManager._memory_warning(reg5, 0, M4B) == "",
+          ContentReviewManager._memory_warning(reg5, 0, M4B))
+
+    # ---- 两个决策模型不叠同一张卡（否则 autostart 条目互相顶掉）----
+    DEC = ("swcap_decision",)
+    reg8 = FakeReg([inst(M4B, 0, 0, mem=3200, caps=DEC)])
+    check("首选卡上跑着别的决策模型 ⇒ 换一张空卡",
+          ContentReviewManager._pick_card(reg8, 0, M08B) == 1,
+          str(ContentReviewManager._pick_card(reg8, 0, M08B)))
+    check("首选卡空着 ⇒ 就用它",
+          ContentReviewManager._pick_card(reg8, 1, M08B) == 1,
+          str(ContentReviewManager._pick_card(reg8, 1, M08B)))
+    check("自己已经在那张卡上 ⇒ 不换卡",
+          ContentReviewManager._pick_card(reg8, 0, M4B) == 0,
+          str(ContentReviewManager._pick_card(reg8, 0, M4B)))
+    # 每张卡都被**别的**决策模型占着 ⇒ 只能报错（用第三、第四个模型 id
+    # 构造 —— 真实只有 4B / 0.8B 两个型号时这条走不到，属防御分支）
+    reg9 = FakeReg([inst("dec-third", 0, 0, mem=3200, caps=DEC),
+                     inst("dec-fourth", 1, 0, mem=900, caps=DEC)])
+    try:
+        got = ContentReviewManager._pick_card(reg9, 0, "dec-fifth")
+        check("每张卡都被别的决策模型占着 ⇒ 明确报错", False,
+              "居然返回了 %r" % got)
+    except RuntimeError as exc:
+        check("每张卡都被别的决策模型占着 ⇒ 明确报错", True, str(exc))
+    # 另一个型号已经在的那张卡，对它自己是可以用的
+    check("自己已经跑在某张卡上 ⇒ 换过去是对的",
+          ContentReviewManager._pick_card(reg9, 0, "dec-fourth") == 1,
+          str(ContentReviewManager._pick_card(reg9, 0, "dec-fourth")))
+    # 别的模型（翻译）占着卡不算「决策模型占卡」⇒ 决策模型照常能上去
+    reg10 = FakeReg([inst("hy-mt-1-5", 0, 0, mem=2200)])
+    check("卡上跑的是**别的**模型 ⇒ 决策模型照常能用这张卡",
+          ContentReviewManager._pick_card(reg10, 0, M08B) == 0,
+          str(ContentReviewManager._pick_card(reg10, 0, M08B)))
+
+    # ---- 翻译避让：卡 0 被决策模型占着（3200）⇒ 翻译只在卡 1 起 ----
     from wdnapps_audio_chat.cards.web_translate.service import (
         CARD_MEMORY_MB,
         TRANSLATE_MEMORY_MB,
         _cards_with_room_for_one_copy,
         _slots,
     )
-    reg3 = FakeReg([inst(DEFAULT_MODEL, 0, 0, mem=3200)])
-    free = _cards_with_room_for_one_copy(reg3)
+    reg6 = FakeReg([inst(M4B, 0, 0, mem=3200)])
+    free = _cards_with_room_for_one_copy(reg6)
     check("决策模型占着的卡对翻译不可用（3200+2200 > 5120）",
           0 not in free, str(free))
     check("空卡对翻译可用", 1 in free, str(free))
-    slots = _slots(reg3)
+    slots = _slots(reg6)
     check("翻译槽位避开被占用的卡", all(n != 0 for (n, _r) in slots), str(slots))
     check("翻译槽位仍然落在另一张卡上", len(slots) == 2, str(slots))
     check("卡容量与每份估算写进了常量",
@@ -432,21 +621,25 @@ def main() -> int:
           "%s/%s" % (CARD_MEMORY_MB, TRANSLATE_MEMORY_MB))
 
     # 两张卡都空 ⇒ 翻译照旧 4 份
-    reg4 = FakeReg([])
+    reg7 = FakeReg([])
     check("没有别的模型时翻译仍是 4 份",
-          len(_slots(reg4)) == 4, str(_slots(reg4)))
+          len(_slots(reg7)) == 4, str(_slots(reg7)))
 
     # 视觉常驻：决策模型的视觉编码器默认常驻（启动即加载）
     try:
-        # ⚠️ 用 ``_intern_decision_4b_spec()`` 而不是
+        # ⚠️ 用 ``_intern_decision_spec()`` 而不是
         # ``SystemLanguageModel.intern_decision_4b()`` —— 后者会**校验模型
         # 文件是否在默认目录**（/userdata/models），本板装在别处 ⇒ 直接
         # FileNotFoundError，跟被测的 option 毫无关系。
-        from wdnai.model import _intern_decision_4b_spec
-        spec = _intern_decision_4b_spec()
-        check("决策模型默认 keep_vision_resident = True",
-              bool(spec.options.get("keep_vision_resident")) is True,
-              str(spec.options.get("keep_vision_resident")))
+        from wdnai.model import (
+            _INTERN_DECISION_MODELS,
+            _intern_decision_spec,
+        )
+        for tag in ("4B", "0.8B"):
+            spec = _intern_decision_spec(_INTERN_DECISION_MODELS[tag])
+            check("%s 决策模型默认 keep_vision_resident = True" % tag,
+                  bool(spec.options.get("keep_vision_resident")) is True,
+                  str(spec.options.get("keep_vision_resident")))
     except Exception as exc:  # noqa: BLE001
         check("决策模型默认 keep_vision_resident = True", False, repr(exc))
 
@@ -524,6 +717,27 @@ def main() -> int:
             check("app.js 的默认维度含 %s" % nm,
                   ('name: "%s"' % nm) in js_src)
 
+        # [g] 模型下拉：两个型号都在、标签来自后端、切换得动
+        rm = run_model_select()
+        opts = rm["before"].get("options") or []
+        check("模型下拉列出了两个型号", len(opts) == 2, str(opts))
+        vals = [o["value"] for o in opts]
+        check("下拉里两个型号的 id 正确",
+              vals == ["intern-decision-4b", "intern-decision-0.8b"], str(vals))
+        check("下拉标签来自后端（不是前端写死的）",
+              "决策模型4B" in opts[0]["text"] and "决策模型0.8B" in opts[1]["text"],
+              str([o["text"] for o in opts]))
+        check("下拉里带上了显存估算",
+              "3200 MB" in opts[0]["text"] and "900 MB" in opts[1]["text"],
+              str([o["text"] for o in opts]))
+        check("运行中的型号在选项里标出来",
+              "运行中" in opts[0]["text"], str(opts[0]["text"]))
+        check("提示语给出当前型号的显存", "3200 MB" in rm["before"].get("hint", ""),
+              rm["before"].get("hint"))
+        check("切换模型后选择被记住了（localStorage）",
+              rm["after"].get("store") == "intern-decision-0.8b",
+              str(rm["after"].get("store")))
+
     # ---------------------------------------------------------------- [N] --
     print("\n[8] 紧凑布局（别让结果被顶到屏幕外）")
 
@@ -576,6 +790,35 @@ def main() -> int:
     check("结果区标了 translate=\"no\"（维度名不许被界面翻译接管）",
           bool(m_res) and 'translate="no"' in m_res.group(0),
           m_res.group(0) if m_res else "(没找到)")
+
+    # ---------------------------------------------------------------- [9] --
+    print("\n[9] 结果卡徽章会跟着走（模拟用户点「开始审查」）")
+
+    # ⚠️ **这条是被真实 bug 逼出来的**（2026-11-18 修）：结果卡的抬头徽章
+    # ``cr-result-badge`` 是模板里写死的「未审查」，而 app.js 从来没碰过它
+    # （只更新了另一个元素 ``cr-review-badge``）⇒ 审查完了抬头还是「未审查」。
+    # 症状很像「审查没生效」，其实是徽章没接线。
+    r = run_review_click()
+    check("点「开始审查」后提示语落定为「完成」",
+          r["note"] == "完成", r["note"])
+    check("**结果卡抬头徽章**跟着变成「完成」（原来是永远「未审查」）",
+          r["result_badge"] == "完成", r["result_badge"])
+    check("结果卡徽章的 state 是 ok",
+          r["result_state"] == "ok", r["result_state"])
+    check("待审查卡那个徽章也在「完成」",
+          r["review_badge"] == "完成", r["review_badge"])
+    check("app.js 确实提到了 cr-result-badge",
+          "cr-result-badge" in js, "")
+
+    # 徽章的状态色：框架只给 awaiting_scan/scanned/confirmed/running/
+    # expired/error/cancelled 配了色，这张卡用的 idle/busy/ok 一律落回灰底
+    # ⇒ 「完成」跟「未审查」长得一模一样。
+    check("ok 状态的徽章配了绿色",
+          '#page-content-review #cr-result-badge[data-state="ok"]' in css,
+          "")
+    check("busy 状态的徽章配了琥珀色",
+          '#page-content-review #cr-result-badge[data-state="busy"]' in css,
+          "")
 
     print("\n" + "=" * 72)
     print(f"通过 {_PASS} 项,失败 {_FAIL} 项")

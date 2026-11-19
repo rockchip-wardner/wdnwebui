@@ -63,6 +63,15 @@ META_FILES = {
     "config.json", ".gitattributes",
 }
 
+#: 上传时**永远排除**的路径。
+#:
+#: ``.cache/`` 是 ``hf_transfer`` 下载时留下的元数据目录（download.log 等），
+#: 里面没有模型内容；而 Hub 的 commit API **硬拒**任何 ``.cache/`` 下的路径
+#: （``_validate_path_in_repo`` 直接抛 ValueError），huggingface_hub 自带的
+#: ``DEFAULT_IGNORE_PATTERNS`` 只挡 ``.cache/huggingface/*``，挡不住
+#: ``.cache/download.log`` ⇒ 不显式排除就是一次硬失败。
+IGNORE_PATTERNS = [".cache/*"]
+
 LOG = logging.getLogger("publish_hf_model")
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
@@ -403,6 +412,7 @@ def upload_folder_with_retry(repo: str, model_dir: Path, endpoint: str,
                 repo_id=repo,
                 repo_type="model",
                 commit_message=commit_message,
+                ignore_patterns=IGNORE_PATTERNS,
             )
         except Exception as exc:  # noqa: BLE001
             last = exc
