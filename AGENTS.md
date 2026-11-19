@@ -4194,6 +4194,42 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
 验共享启动器的三种行为(不就绪不启动 / 等到就绪才启动 / 启动没成功要报错)
 + 四张卡的 hook 里不再有 `btn.click()` + 框架认识新错误码。
 
+### `window.WizardProgress` —— 模型加载进度条的对外入口（2026-11-19）
+
+finish 步等模型就绪时本来就有进度条（`#wd-wizard-finish-error` 里那几行
+`model@npu` + 百分比）。但那只会等**向导自己声明的模型**
+（`wizard.json` 的 `swcap_to_model`）。
+
+**卡片在自己的流程里额外要加载的模型**（例：ASR 卡选了「翻译目标语言」
+后要起的翻译模型）以前**没有任何进度反馈** —— `POST /translate/enable`
+是慢端点（服务端等模型加载完才返回，~30 s），串行 await 的话那 30 秒
+里屏幕上是空的，用户只看到「卡住了」。
+
+⇒ 宿主把 finish 步的等待循环**提取**成通用函数，并对外暴露：
+
+```js
+const w = WizardProgress.watch(
+  [{ model_id: "hy-mt-1-5", npu_index: null }],
+  { headerText: "翻译模型加载中", timeoutMs: 150000 });
+try { await startTheModel(); }        // 与进度条**并行**
+finally { await w.settle(); }          // 或 w.cancel("原因")
+```
+
+* **一份算法两处用** —— 进度行 DOM / 百分比 / 顶替 / 宽限 / 终态判定
+  全在 `_watchModelProgress()` 里（`_waitForModelsRunning` 现在只是
+  「算 targets + 调它」），样式与 ASR 模型那条完全一致。
+* `npu_index: null` = **任意一张卡**起来即可 —— 落哪张卡由后端卡位策略
+  决定（翻译模型跟随 ASR 所在的卡），前端事先不知道。
+* `cancel(reason)` = 放弃等待；带 reason 时在框里显示一行原因（卡片用来
+  报「翻译模型加载失败 —— 识别照常启动」）。
+* ⚠️ **进度条加载完就消失**（框架 `clearBox()`）⇒ 想断言它出现过，
+  **只能轮询抓**，事后查 DOM 永远是空的。
+
+**回归**：`scripts/verify_asr_wizard_translate.py`（25/25）—— 用例 1 先
+`POST /translate/disable` 把翻译模型停掉（模型已经在跑的话 enable 直接
+复用 ⇒ 没有 loading 进度可看），再断言「出现了 hy-mt-1-5 的进度行」+
+「显示过百分比」。
+
 #### 同一个坑的第 5 张卡:语音生成(tts)—— v0.30 修
 
 **症状**:第一次跑完「语音生成快速配置」向导,**没有出声**;等模型加载完再

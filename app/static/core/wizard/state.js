@@ -2626,13 +2626,15 @@
     return e;
   }
 
-  async function _waitForModelsRunning(cfg) {
-    // 展开成 (model_id, npu_index) 对：只按 model_id 判的话，多卡场景下
-    // "任意一张卡起来了"就算齐，用户要两张卡却只等到一张，推理退化成单卡
-    // 还不报错。
-    //
-    // 目标也用**解析后**的模型：钉的首选没装、启用的是替代模型时，进度行
-    // 得显示真正在加载的那个（否则用户看到 "9b@0 加载中"，实际在起 4B）。
+  /** 收集「要等哪些模型」—— (model_id, npu_index) 对。
+   *
+   *  展开成对而不是只按 model_id 判：多卡场景下"任意一张卡起来了"就算齐，
+   *  用户要两张卡却只等到一张，推理退化成单卡还不报错。
+   *
+   *  目标也用**解析后**的模型：钉的首选没装、启用的是替代模型时，进度行
+   *  得显示真正在加载的那个（否则用户看到 "9b@0 加载中"，实际在起 4B）。
+   */
+  async function _collectModelTargets(cfg) {
     let effCfg = cfg;
     try {
       const rr = await fetch("/api/compute", { cache: "no-store" });
@@ -2663,23 +2665,47 @@
         targets.push({ model_id: m.model_id, npu_index: n, cap });
       }
     }
-    if (targets.length === 0) return;
-    const statusBox = _q("#" + WIZARD_NS + "finish-error");
-    if (!statusBox) return;
-    const deadline = Date.now() + 90 * 1000; // 90s 兜底超时
+    return targets;
+  }
+
+  /** 等一组模型跑到 running，并在 finish 状态框里画加载进度。
+   *
+   *  这是 finish 步「等模型就绪」和卡片「额外模型加载进度」**共用**的
+   *  实现 —— 一份算法两处用，避免进度条样式/百分比算法各写一份漂移。
+   *
+   *  opts:
+   *    statusBox    —— 画进哪个框（默认 ``#wd-wizard-finish-error``）
+   *    requireBox   —— true: 框不存在就**直接返回**（finish 步的老行为）
+   *    timeoutMs    —— 兜底超时（默认 90s）
+   *    graceMs      —— 「实例一直不出现」的宽限（默认 15s）
+   *    ctl          —— ``{stopped, reason}``：外部取消（卡片放弃时用）
+   *    headerText   —— 强制显示的标题（默认按目标数自动决定）
+   *    timeoutText  —— 超时文案
+   */
+  async function _watchModelProgress(targets, opts) {
+    const o = opts || {};
+    const ctl = o.ctl || { stopped: false, reason: "" };
+    const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 90 * 1000;
+    const graceMs = Number.isFinite(o.graceMs) ? o.graceMs : 15 * 1000;
+    const statusBox = o.statusBox || _q("#" + WIZARD_NS + "finish-error");
+    // 框不存在时：requireBox=true ⇒ 直接返回（不等了）；否则继续等，只是
+    // 没地方画（卡片在自己的流程里调用时可能还没进 finish 步）。
+    if (!statusBox && o.requireBox !== false) return;
+    const deadline = Date.now() + timeoutMs; // 兜底超时
     // 缺席宽限：模型不在 registry 里持续这么久 → 判定为没启动。POST 后
     // ~1s 实例才出现，15s 足够宽松。
-    const MISSING_GRACE_MS = 15 * 1000;
+    const MISSING_GRACE_MS = graceMs;
     const missingSince = {};
     const PROG_CLS = WIZARD_NS + "finish-progress";
     const FAIL_CLS = WIZARD_NS + "finish-error-fail";
-    const hasHeader = targets.length > 1;
+    const hasHeader = o.headerText ? true : targets.length > 1;
 
     // DOM 只构建一次:tick 内只更新 fill.style.width 让 CSS transition
     // (0.5s) 把"数字跳变"变成视觉上"跑"的进度,避免每秒重建节点导致
     // bar 从 0% 重铺的抖动。
     let initialized = false;
     const initDOM = () => {
+      if (!statusBox) return;
       statusBox.classList.remove(FAIL_CLS);
       statusBox.classList.add(PROG_CLS);
       statusBox.innerHTML = "";
@@ -2716,9 +2742,11 @@
     };
 
     const updateProgress = (statusMap, doneCount) => {
+      if (!statusBox) return;
       if (hasHeader) {
         const h = statusBox.querySelector("[data-role=\"header\"]");
-        if (h) h.textContent = `模型加载进度 (${doneCount}/${targets.length})`;
+        if (h) h.textContent = o.headerText
+          || `模型加载进度 (${doneCount}/${targets.length})`;
       }
       for (const m of targets) {
         const info = statusMap[_targetKey(m)];
@@ -2738,15 +2766,27 @@
     };
 
     const clearBox = () => {
+      if (!statusBox) return;
       statusBox.classList.remove(PROG_CLS, FAIL_CLS);
       statusBox.textContent = "";
     };
 
     while (Date.now() - deadline < 0) {
+      // 外部取消（卡片放弃等待）—— 收工，不报错。带了原因就显示一行，
+      // 让用户知道「为什么没有进度条了」。
+      if (ctl.stopped) {
+        clearBox();
+        if (ctl.reason && statusBox) {
+          statusBox.classList.remove(PROG_CLS);
+          statusBox.classList.add(FAIL_CLS);
+          statusBox.textContent = ctl.reason;
+        }
+        return;
+      }
       // 向导已被卸载（上一步 / 跳过向导 / 切页）→ 中止。注意是**抛错**
       // 不是 return：静默 return 等于「等待成功」，_finish 会接着调
       // applyWizardSnapshot，把没就绪的应用拉起来。
-      if (!statusBox.isConnected) {
+      if (statusBox && !statusBox.isConnected) {
         throw new Error("向导已离开，等待中止。");
       }
       let abort = null;
@@ -2848,7 +2888,16 @@
       await new Promise((r) => setTimeout(r, 1000));
     }
     clearBox();
-    throw _modelWaitError("等待模型启动超时（90s）—— 模型可能已被关闭或加载失败。");
+    throw _modelWaitError(o.timeoutText
+      || `等待模型启动超时（${Math.round(timeoutMs / 1000)}s）—— 模型可能已被关闭或加载失败。`);
+  }
+
+  /** finish 步：等 wizard.json 里 ``swcap_to_model`` 声明的模型就绪。 */
+  async function _waitForModelsRunning(cfg) {
+    const targets = await _collectModelTargets(cfg);
+    if (targets.length === 0) return;
+    // 框不存在 ⇒ 不等（老行为：没有进度框可显示就别卡住用户）
+    await _watchModelProgress(targets, { requireBox: true });
   }
 
   // ------------------------------------------------------------------ #
@@ -3028,6 +3077,47 @@
     // 「每张卡能并行跑几份」—— 纯函数，给 scripts/verify_wizard_replica_clamp.py
     // 断言夹紧口径（默认 1 / 按 manifest 声明）。
     __maxReplicasPerCard: _maxReplicasPerCard,
+  };
+
+  // ------------------------------------------------------------------ #
+  // window.WizardProgress —— 模型加载进度条的**对外**入口
+  //
+  // finish 步等「自己声明的模型」用的是 _watchModelProgress；卡片在自己
+  // 的流程里（applyWizardSnapshot）额外要加载的模型 —— 例如 ASR 卡选了
+  // 翻译目标语言后要起的翻译模型 —— 也用同一份进度条，避免「翻译在转圈
+  // 但屏幕上没有任何反馈」。
+  //
+  // 用法：
+  //   const w = WizardProgress.watch(
+  //     [{ model_id: "hy-mt-1-5", npu_index: null }],
+  //     { headerText: "翻译模型加载中", timeoutMs: 150000 });
+  //   try { await startTheModel(); } finally { await w.settle(); }
+  //
+  //   - npu_index 为 null = 该模型的**任意一张卡**起来即可（后端按卡位
+  //     策略挑卡，前端事先不知道它会落在哪）。
+  //   - settle()：等进度条走到 running；模型起不来时调用方先 cancel()。
+  //   - cancel(reason)：放弃等待（进度条清掉，reason 非空则显示一行原因）。
+  // ------------------------------------------------------------------ #
+  window.WizardProgress = {
+    /**
+     * @param {Array<{model_id:string, npu_index:(number|null), cap?:string}>} targets
+     * @param {object} [opts] 见 _watchModelProgress 的 opts
+     * @returns {{promise: Promise<void>, cancel: (reason?:string)=>void, settle: ()=>Promise<void>}}
+     */
+    watch(targets, opts) {
+      const ctl = { stopped: false, reason: "" };
+      const promise = _watchModelProgress(
+        Array.isArray(targets) ? targets : [],
+        Object.assign({}, opts || {}, { ctl }));
+      return {
+        promise,
+        cancel(reason) {
+          ctl.stopped = true;
+          ctl.reason = reason || "";
+        },
+        settle() { return promise.catch(() => {}); },
+      };
+    },
   };
 
   // ------------------------------------------------------------------ #

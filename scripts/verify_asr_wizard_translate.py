@@ -137,6 +137,38 @@ def _wizard_err(page) -> str:
     )
 
 
+def _progress_rows(page) -> list[dict]:
+    """当前向导 finish 框里的模型加载进度行。
+
+    ⚠️ 进度条**加载完就消失**（框架 clearBox）⇒ 断言只能靠**轮询抓**，
+    事后查 DOM 永远是空的。
+    """
+    return page.evaluate(
+        """() => [...document.querySelectorAll(
+             '#wd-wizard-root-qwen3-asr .wd-wizard-finish-progress .wd-wizard-progress-row')]
+           .map(r => ({
+             model: r.dataset.modelId || '',
+             pct: (r.querySelector('.wd-wizard-progress-row-pct') || {}).textContent || '',
+           }))"""
+    )
+
+
+def _capture_progress(page, seconds: float = 14.0, interval: float = 0.5) -> list[dict]:
+    """轮询抓进度条内容（去重后返回见过的一切状态）。"""
+    seen: list[dict] = []
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        try:
+            rows = _progress_rows(page)
+        except Exception:  # noqa: BLE001
+            rows = []
+        for r in rows:
+            if r not in seen:
+                seen.append(r)
+        page.wait_for_timeout(int(interval * 1000))
+    return seen
+
+
 def _card_hint(page) -> str:
     return page.evaluate(
         """() => {
@@ -270,6 +302,11 @@ def _run_case(browser, *, fail_enable: bool, lang: str) -> tuple[list, list]:
 
     page.locator(".wd-wizard-foot button", has_text="完成配置").first.click()
 
+    # ⚠️ 翻译模型的加载进度条**加载完就消失**（框架 clearBox）⇒ 只能在这
+    # 段窗口里轮询抓，事后查 DOM 永远是空的。
+    progress = _capture_progress(page, 14.0)
+    print("  进度条:", json.dumps(progress, ensure_ascii=False))
+
     enable_seen = _wait_calls(page, calls, "/translate/enable", 90)
     started, snap = _wait_new_round(page, baseline, 120)
     err = _wizard_err(page)
@@ -286,7 +323,7 @@ def _run_case(browser, *, fail_enable: bool, lang: str) -> tuple[list, list]:
               and "500 (Internal Server Error)" not in e]
     check("无 JS 错误", not js_err, f"实际 {js_err[:3]}")
     ctx.close()
-    return calls, errors
+    return calls, errors, progress
 
 
 def main() -> int:
@@ -307,13 +344,24 @@ def _run_all() -> int:
         print("\n=== 用例 1：向导有「实时翻译」这一步，默认「不翻译」 ===")
         _wait_idle()
         api("POST", f"/api/{CARD}/translate/settings", {"enabled": False})
+        # ⚠️ 进度条只在**模型真的在加载**时看得到 —— 模型已经在跑的话
+        # enable 直接复用（秒回）⇒ 没有 loading 进度可看。先停掉它。
+        print("  停掉翻译模型（让进度条有东西可看）…")
+        api("POST", f"/api/{CARD}/translate/disable")
         time.sleep(1)
-        _run_case(browser, fail_enable=False, lang="zh-CN")
+        _calls, _errors, progress = _run_case(browser, fail_enable=False, lang="zh-CN")
         st, ts = api("GET", f"/api/{CARD}/translate/status")
         check("实时翻译开关已打开", bool(ts.get("enabled")),
               f"status={json.dumps(ts, ensure_ascii=False)[:200]}")
         check("目标语言是 zh-CN", ts.get("target_lang") == "zh-CN",
               f"实际 {ts.get('target_lang')!r}")
+        # ---- 翻译模型的加载进度条（和 ASR 模型同一套渲染） ----
+        tr_rows = [r for r in progress if "hy-mt-1-5" in (r.get("model") or "")]
+        check("翻译模型加载时出现了进度条", bool(tr_rows),
+              f"实际 {json.dumps(progress, ensure_ascii=False)[:200]}")
+        pct_rows = [r for r in tr_rows if "%" in (r.get("pct") or "")]
+        check("进度条显示了加载百分比", bool(pct_rows),
+              f"实际 {json.dumps(tr_rows, ensure_ascii=False)[:200]}")
 
         # ---------------- 用例 2：翻译模型启用失败 ⇒ 识别照常启动 ---------- #
         print("\n=== 用例 2：翻译模型启用失败 ⇒ 识别照常启动 ===")
