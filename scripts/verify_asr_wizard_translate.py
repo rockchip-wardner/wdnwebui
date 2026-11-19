@@ -26,6 +26,10 @@ import time
 import urllib.error
 import urllib.request
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 # ⚠️ Playwright 的两套 TLS 栈不一样：页面走 Chromium（认板子 CA），
 #    ctx.request 走 Node（不认）⇒ 必须在 Node 进程起来之前设 CA。
 os.environ.setdefault(
@@ -69,6 +73,33 @@ def api(method: str, path: str, payload=None, timeout: int = 30):
             return e.code, {"raw": body}
     except Exception as e:  # noqa: BLE001
         return -1, {"error": repr(e)}
+
+
+# --------------------------------------------------------------------------- #
+# 生产配置保护
+# --------------------------------------------------------------------------- #
+# ``DELETE /api/compute/active-app`` 会连带 ``clear_active_app`` **清空**
+# ``compute.autostart``（AGENTS.md「回归脚本必须 mock PUT/DELETE
+# /api/compute/active-app」）⇒ 跑一次回归，板子上开机自启的模型（ASR /
+# 翻译 / TTS）就没了 —— 重启后不再自动起来。
+# ⇒ 跑之前备份，跑完原样写回。
+def _backup_compute() -> dict:
+    from app.core.config import get_config
+    section = get_config().get_section("compute", {}) or {}
+    return {
+        "autostart": json.loads(json.dumps(section.get("autostart") or [])),
+        "active_app": section.get("active_app"),
+    }
+
+
+def _restore_compute(saved: dict) -> None:
+    from app.core.config import get_config
+    cfg = get_config()
+    section = cfg.get_section("compute", {}) or {}
+    section["autostart"] = saved.get("autostart") or []
+    if saved.get("active_app") is not None:
+        section["active_app"] = saved["active_app"]
+    cfg.set_section("compute", section)
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +310,18 @@ def main() -> int:
         print(f"❌ 测试音频不存在: {SOURCE}")
         return 2
 
+    saved = _backup_compute()
+    print(f"[保护] 已备份 compute.autostart ({len(saved['autostart'])} 条) "
+          f"与 active_app={saved['active_app']!r}")
+    try:
+        rc = _run_all()
+    finally:
+        _restore_compute(saved)
+        print("[保护] compute.autostart / active_app 已还原")
+    return rc
+
+
+def _run_all() -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True,
                                     args=["--no-sandbox", "--disable-gpu"])
