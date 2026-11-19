@@ -39,6 +39,46 @@
 worker 配置各字段的含义见
 [`docs/MODEL_INSTALL_GUIDE.md`](MODEL_INSTALL_GUIDE.md#worker-配置里那些字段是干嘛的)。
 
+### 元文件那一组
+
+除了权重和 worker 配置，仓里还有几个「不上权重、但缺了就出事」的文件：
+
+| 文件 | 作用 | 约定 |
+|---|---|---|
+| `README.md` / `README_CN.md` | **模型卡** —— Hub 用 YAML front matter 把它渲染成仓首页 | front matter 里 `license` 必填；路线 A 的传前校验还会查 `library_name` 在不在位 |
+| `LICENSE` | **上游模型的许可声明**（Apache-2.0 原文） | ⚠️ **不是 wdnwebui 仓根那份** —— 仓根那份是给**代码**的、版权行是 `rockchip-wardner contributors`；模型仓这份版权行是**上游**的（上海人工智能实验室 / Alibaba Cloud） |
+| `NOTICE` | **溯源**：上游是哪个仓、哪个 revision、哪些文件是本仓新增的 | 要明确区分「上游产物的摘要」与「本仓文件的摘要（看 `SHA256SUMS`）」—— 两者指向**不同的文件**（上游是 safetensors 分片，这里是 RKNN 图 + `.weight`） |
+| `.gitattributes` | 声明哪些路径走 LFS | **worker manifest 绝不能进 LFS**；缺了它，权重会变成**裸 git blob** —— 几百 MB 进 git 历史，克隆即炸 |
+
+> ⚠️ **这五个文件在 wdnwebui 仓里没有母本** —— 它们只存在于 HF 仓和模型目录里
+> （下载时一起带下来）。worker manifest 有出厂副本（`tools/worker_manifests/`）
+> + 迁移脚本，**这几个没有** ⇒ 要改只能**直接改模型目录**（通常是 root 的，要
+> `sudo`），改完记得跟权重一起推上去。
+
+### 两种仓形状
+
+不是所有仓的文件集一样，发布前要准备的东西也不同：
+
+| | transformers 布局<br>（`Qwen3.5-VL-9B`） | RKNN 部署包<br>（`Intern_Decision-0.8B` / `-4B`） |
+|---|---|---|
+| 权重 | `.rknn` + `.weight` + `.embed.bin` + `.tokenizer.gguf` | 同 |
+| worker manifest | ✓ | ✓ |
+| `config.json`（自描述：files[] + worker 段） | ✓ | ✗ |
+| `SHA256SUMS` | ✓ | ✓ |
+| `*_report/model_report.html`（RKNX 转换报告） | ✗ | ✓（**子目录**） |
+| `README.md` / `LICENSE` / `NOTICE` / `.gitattributes` | ✓ | ✓ |
+
+差异对发布的影响：
+
+* **有没有 `config.json`** ⇒ 决定 `refresh_model_metadata.py` 走「config 驱动」
+  还是「目录驱动」的文件清单（见 §2）。
+* **有没有 report 子目录** ⇒ `SHA256SUMS` 里会出现**带路径**的条目
+  （`Intern-Decision-0.8B-llm_report/model_report.html`），
+  `sha256sum -c` 在仓根目录下照样能校验。
+* **两种形状都进 LFS** —— `.gitattributes` 的通配规则（`*.rknn` / `*.weight` /
+  `*.bin` / `*.gguf`）覆盖两种形状的权重；但 **`.json` / `.html` 必须是普通
+  blob**（worker manifest、转换报告都要能直接看）。
+
 ## 2. 发布前：把元数据刷对
 
 模型文件被**手工替换**（转换工具重新导出、从别的板子拷过来）之后，
@@ -64,6 +104,17 @@ sudo python tools/refresh_model_metadata.py --dir /userdata/models/Qwen3.5-VL-9B
 它重算 `config.json` 的 `files[]`（size + sha256）、重写 `SHA256SUMS`，
 并把 `config.json` 的 `worker` 段**投影**自模型目录里的 worker manifest
 （标签 / 显存估算只有一个真源，描述文件不再手抄第二份）。
+
+#### 两种模式
+
+| 仓形状 | 模式 | 做什么 |
+|---|---|---|
+| 有 `config.json`（transformers 布局） | **config 驱动** | 文件清单取 `config.json` 的 `files[]`；同时刷新 `files[]` 的 size/sha256 + `worker` 段 |
+| 无 `config.json`（RKNN 部署包） | **目录驱动** | 文件清单 = 目录下**全部文件**（递归），减去元文件本身；只写 `SHA256SUMS` |
+
+两种模式下的 `SHA256SUMS` 覆盖范围一致：**模型内容 + worker manifest +
+转换报告**，**不含** `README*` / `LICENSE` / `NOTICE` / `.gitattributes` /
+`config.json` / `SHA256SUMS` 自己。
 
 ### worker 配置也要同步
 
@@ -197,6 +248,9 @@ git 拿到 `username` + 明文口令后会**重新编码成一模一样的 Basic
 `hf-hub-lfs-us-east-1.s3-accelerate.amazonaws.com` 的 presigned PUT。
 **数据面直连 S3，不经镜像** ⇒ 带宽比走镜像的 HTTP 上传快得多。
 
+> 助手**从 git 的凭据请求里读目标仓**（请求的 `path=` 字段里就带着仓名）
+> ⇒ 同一个助手能推任意仓，不用改代码。
+
 #### 坑 3：verify 这一步的地址是「真 Hub」
 
 镜像在 batch 响应里回的是**真 Hub 的绝对地址**
@@ -280,7 +334,7 @@ Hub 的 preupload 按 **sha256** 判重：远端已有的同摘要文件直接�
 | `wardner/Qwen3-ASR` | ✅ 已发布（11-17） | 15 个文件（6 LFS + 9 普通 blob），走 SNI 代理 + token |
 | `wardner/Qwen3.5-VL-9B` | ✅ 已发布（11-19） | 16 个文件 / 6.89 GB，走 SSH + git-lfs，无 token |
 | `wardner/Intern_Decision-4B` | ✅ 已发布 | RKNN 部署包（带 `*_report/` 子目录），走镜像逐文件上传 |
-| `wardner/Intern_Decision-0.8B` | ⬜ 未发布 | 仓里已有 manifest，出厂清单已就位 |
+| `wardner/Intern_Decision-0.8B` | ✅ 已发布（11-19） | 17 项 / 0.99 GB，走 SSH + git-lfs；模型卡 + 上游两份 LICENSE + NOTICE 齐全 |
 
 `.gitattributes` **会被 Hub 服务端采纳** —— 权重走 LFS，README / LICENSE /
 NOTICE / SHA256SUMS / config.json / worker manifest 都是普通 git blob

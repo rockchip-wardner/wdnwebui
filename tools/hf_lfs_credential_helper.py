@@ -41,18 +41,47 @@ import sys
 REPO = "wardner/Qwen3.5-VL-9B"
 
 
+def _repo_from_request(stdin_text: str) -> str:
+    """从 git 的凭据请求里解析出目标仓。
+
+    git 调凭据助手时会往 stdin 写::
+
+        protocol=https
+        host=hf-mirror.com
+        path=wardner/Qwen3.5-VL-9B.git/info/lfs
+
+    ``path`` 里就带着仓名 ⇒ **不用把仓名写死**。写死的后果是：给 A 仓推
+    的时候拿的是 B 仓的凭据 —— 眼下能跑通（Hub 的 LFS 凭据没按仓收窄），
+    但那是**碰巧**，不是设计。解析不出来时退回默认值。
+    """
+    for line in stdin_text.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() != "path":
+            continue
+        val = value.strip()
+        # `<org>/<name>.git/info/lfs` → `<org>/<name>`
+        for suffix in (".git/info/lfs", "/info/lfs", ".git"):
+            if val.endswith(suffix):
+                return val[: -len(suffix)]
+        return val
+    return REPO
+
+
 def main() -> int:
-    # git 会把请求字段（protocol/host/path…）写到 stdin —— 读掉即可，
-    # 本助手对所有 HTTPS 端点都返回同一份 HF LFS 凭据。
+    # git 会把请求字段（protocol/host/path…）写到 stdin
     try:
-        sys.stdin.read()
+        request = sys.stdin.read()
     except Exception:  # noqa: BLE001 —— 没有 stdin 也不该崩
-        pass
+        request = ""
+
+    repo = _repo_from_request(request)
+    if repo != REPO:
+        print(f"hf-lfs-cred: 用请求里的仓 {repo}", file=sys.stderr)
 
     try:
         proc = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
-             "git@hf.co", f"git-lfs-authenticate {REPO}.git", "upload"],
+             "git@hf.co", f"git-lfs-authenticate {repo}.git", "upload"],
             capture_output=True, text=True, timeout=90)
     except Exception as exc:  # noqa: BLE001
         print(f"hf-lfs-cred: 取凭据失败：{exc}", file=sys.stderr)

@@ -41,12 +41,25 @@
 
 只改**内容**，不改结构：``config.json`` 里 ``files[]`` 的路径清单以磁盘上实际
 存在的文件为准；manifest 缺失时只做前两步。
+
+两种模式
+========
+
+* **config 驱动**（目录里有 ``config.json``，transformers 布局）—— 文件清单取
+  ``config.json`` 的 ``files[]``，同时刷新它的 size/sha256 与 ``worker`` 段。
+* **目录驱动**（目录里**没有** ``config.json``，RKNN 部署包）—— 文件清单 =
+  目录下全部文件（递归），减去元文件本身；只写 ``SHA256SUMS``。
+
+两种模式下的 ``SHA256SUMS`` 覆盖范围一致：**模型内容 + worker manifest +
+转换报告**，不含 ``README*`` / ``LICENSE`` / ``NOTICE`` / ``.gitattributes`` /
+``config.json`` / ``SHA256SUMS`` 自己。
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -63,6 +76,16 @@ WORKER_FIELDS_FROM_MANIFEST = (
     "memory_estimate_mb",
     "estimated_init_seconds",
 )
+
+#: 元文件本身 —— 不进 ``SHA256SUMS``（它是「关于这些文件的清单」，
+#: 把自己也算进去就成了自指）。
+META_FILE_NAMES = {
+    "README.md", "README_CN.md", "LICENSE", "LICENSE-QWEN", "NOTICE",
+    ".gitattributes", "config.json", "SHA256SUMS",
+}
+
+#: 目录驱动模式要跳过的目录。
+SKIP_DIR_NAMES = {".git", ".cache", "__pycache__"}
 
 CHUNK = 1 << 20
 
@@ -87,72 +110,120 @@ def find_manifest(model_dir: Path) -> Optional[Path]:
     return cands[0] if len(cands) == 1 else None
 
 
+def scan_content_files(model_dir: Path) -> List[str]:
+    """目录驱动模式的文件清单：递归全部文件，去掉元文件与隐藏目录。
+
+    返回**相对路径**（用 ``/`` 分隔），按字节序排序 —— 与 ``sha256sum -c``
+    在仓根目录下直接可用。
+    """
+    out: List[str] = []
+    for root, dirs, files in os.walk(model_dir):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIR_NAMES)
+        for name in files:
+            if name in META_FILE_NAMES:
+                continue
+            rel = (Path(root) / name).relative_to(model_dir).as_posix()
+            out.append(rel)
+    return sorted(out)
+
+
+def _read_sums(path: Path) -> Dict[str, str]:
+    """读现有的 ``SHA256SUMS`` → ``{文件名: sha256}``；读不到就当空。"""
+    out: Dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        digest, _, name = line.partition("  ")
+        if name.strip():
+            out[name.strip()] = digest.strip()
+    return out
+
+
 def refresh(model_dir: Path, manifest: Optional[Path], dry_run: bool) -> int:
     cfg_path = model_dir / "config.json"
-    if not cfg_path.exists():
-        print("!! 缺 config.json：%s" % cfg_path)
-        return 1
-
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    listed = cfg.get("files")
-    if not isinstance(listed, list) or not listed:
-        print("!! config.json 没有 files[]")
-        return 1
+    have_cfg = cfg_path.exists()
+    if not have_cfg:
+        print("（目录里没有 config.json —— 走「目录驱动」模式：只写 SHA256SUMS）")
+        cfg = None
+        listed: List[str] = scan_content_files(model_dir)
+        if not listed:
+            print("!! 目录里没有可登记的文件")
+            return 1
+    else:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        raw = cfg.get("files")
+        if not isinstance(raw, list) or not raw:
+            print("!! config.json 没有 files[]")
+            return 1
+        listed = [str(e["path"]) for e in raw]
+        missing = [p for p in listed if not (model_dir / p).is_file()]
+        if missing:
+            print("!! config.json 列了但磁盘上没有：%s" % ", ".join(missing))
+            return 1
 
     # ---- ① 重算每个文件的 size / sha256 ---------------------------------- #
     print("① 重算文件摘要")
-    missing = [f.get("path") for f in listed if not (model_dir / str(f.get("path"))).is_file()]
-    if missing:
-        print("!! config.json 列了但磁盘上没有：%s" % ", ".join(map(str, missing)))
-        return 1
-
+    # 旧值取自现有的 SHA256SUMS（那是唯一权威）；没有就当全变。
+    old = _read_sums(model_dir / "SHA256SUMS")
     digests: Dict[str, str] = {}
+    sizes: Dict[str, int] = {}
     changed: List[str] = []
-    for entry in listed:
-        name = str(entry["path"])
+    for name in listed:
         digest, size = sha256_file(model_dir / name)
         digests[name] = digest
-        old_digest = entry.get("sha256")
-        old_size = entry.get("size")
-        if old_digest != digest or old_size != size:
+        sizes[name] = size
+        if old.get(name) != digest:
             changed.append(name)
-            print("   ~ %-42s %s → %s  (%d → %d B)"
-                  % (name, str(old_digest)[:12], digest[:12], old_size or 0, size))
-        entry["sha256"] = digest
-        entry["size"] = size
+            print("   ~ %-46s %s → %s  (%d B)"
+                  % (name, str(old.get(name))[:12], digest[:12], size))
+        if cfg:
+            for entry in cfg["files"]:
+                if str(entry["path"]) == name:
+                    entry["sha256"] = digest
+                    entry["size"] = size
     if not changed:
-        print("   所有文件的 size / sha256 都已是最新的")
+        print("   所有文件的摘要都已是最新的")
 
     # ---- ② worker 段投影自 manifest -------------------------------------- #
-    print("② worker 段对齐 manifest")
-    if manifest is None:
-        print("   （目录里没有唯一的 worker manifest，跳过）")
-    else:
-        try:
-            man = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            print("   !! manifest 读不了，跳过：%s" % exc)
+    if cfg is not None:
+        print("② worker 段对齐 manifest")
+        if manifest is None:
+            print("   （目录里没有唯一的 worker manifest，跳过）")
         else:
-            worker = cfg.setdefault("worker", {})
-            for key in WORKER_FIELDS_FROM_MANIFEST:
-                if key not in man:
-                    continue
-                if worker.get(key) != man[key]:
-                    print("   ~ worker.%s: %s → %s" % (key, worker.get(key), man[key]))
-                    worker[key] = man[key]
+            try:
+                man = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                print("   !! manifest 读不了，跳过：%s" % exc)
+            else:
+                worker = cfg.setdefault("worker", {})
+                for key in WORKER_FIELDS_FROM_MANIFEST:
+                    if key not in man:
+                        continue
+                    if worker.get(key) != man[key]:
+                        print("   ~ worker.%s: %s → %s" % (key, worker.get(key), man[key]))
+                        worker[key] = man[key]
+    else:
+        print("② worker 段 —— 目录驱动模式不涉及 config.json，跳过")
 
     # ---- ③ 写盘 ----------------------------------------------------------- #
-    sums = "".join("%s  %s\n" % (digests[str(e["path"])], e["path"])
-                   for e in sorted(listed, key=lambda e: str(e["path"])))
+    sums = "".join("%s  %s\n" % (digests[name], name) for name in sorted(listed))
 
     if dry_run:
-        print("\n干跑：未写盘。将刷新 SHA256SUMS（%d 项）与 config.json" % len(listed))
+        print("\n干跑：未写盘。将刷新 SHA256SUMS（%d 项）%s"
+              % (len(listed), "与 config.json" if cfg else ""))
         return 0
 
-    cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n",
-                        encoding="utf-8")
+    if cfg is not None:
+        cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n",
+                            encoding="utf-8")
     (model_dir / "SHA256SUMS").write_text(sums, encoding="utf-8")
-    print("\n已写入：%s / SHA256SUMS" % cfg_path)
+    print("\n已写入：SHA256SUMS%s"
+          % (" / %s" % cfg_path if cfg else ""))
     return 0
 
 
