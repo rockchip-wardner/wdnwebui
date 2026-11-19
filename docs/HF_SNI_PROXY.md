@@ -5,6 +5,10 @@
 > **一句话**：本板访问 `huggingface.co` 有**两层**封锁 —— DNS 应答被污染，
 > 且 TLS ClientHello 里的 SNI 被 RST。**只修 DNS 是不够的**，
 > 必须再叠一层 SNI 绕行代理。本文档是这两层的实测记录与用法。
+>
+> **本文范围**：网络诊断与代理本身。**「怎么把模型发布到 HF」是另一件事**
+> —— 元数据刷新、两条推送路线、复核方式都在
+> [`docs/MODEL_PUBLISH_GUIDE.md`](MODEL_PUBLISH_GUIDE.md)。
 
 ---
 
@@ -254,44 +258,22 @@ HF 换 IP 也不会失联。`tools/hf_sni_proxy.py --print-hosts` 可以直接
 | 45 MB 下载带宽 | **9.4 MB/s**（4.8 s）⇒ 1.1 GB 上传约 2 分钟 ✅ |
 | 响应头指纹 | `X-Powered-By: huggingface-moon`、`X-Request-Id: Root=1-…`、`Via: …cloudfront.net` ✅ 确为真 Hub |
 
-## 6. 发布状态（2026-11-17）
+## 6. 代理已被真实验证过（2026-11-17）
 
-**`wardner/Qwen3-ASR` 已发布**（公开仓，`license: apache-2.0`）。
+代理搭起来之后，**`wardner/Qwen3-ASR` 就是通过它发布成功的**（公开仓，
+`license: apache-2.0`，15 个文件 = 6 个 LFS + 9 个普通 blob，
+`.gitattributes` 被服务端采纳）—— 这既是发布记录，也是「代理确实打通了
+`huggingface.co`」的端到端证据（§5 的响应头指纹
+`X-Powered-By: huggingface-moon`、`Via: …cloudfront.net` 确为真 Hub）。
 
-| 项 | 值 |
-|---|---|
-| 仓地址 | https://huggingface.co/wardner/Qwen3-ASR |
-| 可见性 | public |
-| 文件数 | 15（6 个 LFS + 9 个普通 blob） |
-| 提交信息 | `feat(asr): publish Qwen3-ASR 0.6B streaming ASR for RK182x` |
+**完整的发布流程不在本文** —— 见
+[`docs/MODEL_PUBLISH_GUIDE.md`](MODEL_PUBLISH_GUIDE.md)。
 
-`.gitattributes` **被 Hub 服务端采纳**了 —— 6 个二进制权重走 LFS，
-README / LICENSE / NOTICE / SHA256SUMS / config.json / mel 滤波器 / worker
-manifest 都是普通 git blob（可直接在网页上预览和 diff）。
+## 7. 相关文档
 
-发布用 `tools/publish_hf_model.py`（建仓 + 上传 + 前后校验一条龙）：
-
-```bash
-export HF_ENDPOINT=http://127.0.0.1:8787
-python tools/publish_hf_model.py --repo wardner/Qwen3-ASR --dir /userdata/models/Qwen3-ASR
-```
-
-它做四件事，任一环不过就**停下不传**：
-
-1. 传前：本地 ``SHA256SUMS`` 逐文件重算 + `config.json` 与磁盘对账；
-2. 建仓（``--exist-ok``，已存在就跳过）；
-3. 上传；
-4. 传后：**从 Hub 把 ``SHA256SUMS`` 拉回来**逐条比对，再核对文件清单。
-
-token 只从环境变量 `HF_TOKEN` 或 `hf auth login` 的标准落点
-（`~/.cache/huggingface/token`）读，**不接受命令行传参**（会进 shell
-history 与进程列表）。
-
-### 踩到的坑
-
-- **`hf upload` 第一次失败是瞬时的** —— commit API 的 POST 偶发
-  `RemoteDisconnected`（CloudFront 侧断连）。重跑即可；仓库已建时
-  脚本会跳过建仓直接续传。
-- **相对路径会踩坑** —— `hf upload <repo> SHA256SUMS` 的相对路径按
-  **当前工作目录**解析，不是按 `--local-dir`；传目录时用绝对路径。
-
+* [`docs/MODEL_PUBLISH_GUIDE.md`](MODEL_PUBLISH_GUIDE.md) ——
+  维护者：怎么把模型发布到 HuggingFace
+* [`docs/MODEL_INSTALL_GUIDE.md`](MODEL_INSTALL_GUIDE.md) ——
+  用户：clone 下来怎么装
+* `tools/hf_sni_proxy.py` —— 本文描述的 SNI 绕行代理
+* `tools/publish_hf_model.py` —— 建仓 + 上传 + 前后校验一条龙
