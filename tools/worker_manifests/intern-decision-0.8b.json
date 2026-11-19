@@ -1,0 +1,20 @@
+{
+  "label": "[JEV]图像文字决策模型0.8B",
+  "capability_types": [
+    "swcap_decision"
+  ],
+  "spec_factory": "intern_decision_0_8b",
+  "worker_name": "intern08",
+  "model_dir_name": "Intern_Decision-0.8B",
+  "model_dir_env": "WDNAI_INTERN_DECISION_0_8B_DIR",
+  "instance_name": "decision-intern0.8b",
+  "memory_estimate_mb": 900,
+  "estimated_init_seconds": 30,
+  "infer_timeout_s": 120,
+  "description": "Intern-Decision-0.8B 结构化决策模型（状态→分类/是非/评分）。与 4B 同 tokenizer 同协议，体积约 1/4，速度更快、显存占用更低，可与其它模型同卡共驻",
+  "notes": "⚠️ **它不是对话模型**：Intern-Decision 不生成文本 —— 每个决策字段输出的是 62 个候选符号（A-Z + a-z + 0-9）的 logits，由 CPU 侧换算成选项概率。调用方要传**任务配置**（task=）：字段类型 choice（选一项）/ score（选项键是数字，输出概率加权评分）/ noul（是否，输出肯定概率）。答案 JSON 形如 {\"category\": \"account\", \"urgency\": 0.7676}，完整概率 / logits 随 TextAttachment 一起回传。✅ **与 4B 完全同规格**：同一个 qwen35 tokenizer（vocab 248320、eos 248046），控制 token id 也完全一致（<decision>=248077、<think>=248068、</think>=248069）⇒ prompt 协议、视觉预处理（整幅拉伸 resize 384×384 + RGA 缩放）、预分词正则（按 tokenizer.ggml.pre=qwen35 选）全部照搬 4B。⚠️ **唯一不同的是 embedding 宽度：1024（4B 是 2560）** ⇒ 概率校准温度也不同：**2.747760550703**（4B 是 1.99241824）。温度是**运行时**从 RKNN 内嵌的 LLM_CONFIG 读 embedding_dim 再查 wdnai.decision.CHECKPOINT_TEMPERATURES 得到的（1024 这档已预置），代码里没有写死。⚠️ **控制 token 必须是单 token**：ByteLevel 预分词器会把 <decision> 拆开，所以 wdnai 在**本模型的 tokenizer 实例上**单独注册（不动 Qwen 全局 tokenizer）；追加时必须**合并**而不是替换 additional_special_tokens（替换会把 Qwen 的 <|vision_start|>/<|image_pad|> 踢掉 → C 库定位不到图片占位区 → 图文 prompt 少喂 6 个 token）。⚠️ **每个字段一次 prefill，且必须换 session**：模型有 linear-attention 层，递归状态跨调用残留，keep_history=0 只清 KV cache 不清递归状态 ⇒ wdnai 用 RKNN3Lite.recreate_llm_session() 复刻 C++ 参考实现。⚠️ **视觉模型常驻**：spec.options['keep_vision_resident']=True ⇒ 与 4B 一致，带图请求没有首次加载的 7.5 秒，显存占用稳定可预期。⚠️ **显存估算 900 MB 是估算值**（按 4B 的口径外推：llm.weight 294MB + vision.weight 202MB + kvcache + internal 开销），尚未真机实测；4B 的 3200 MB 是实测口径。estimated_init_seconds=30 同为外推值（4B 的 60 秒是实测）。⚠️ **worker_name 必须是 intern08，不能沿用 4B 的 intern-dec**：registry 的 _find_workers_by_name() 按 /proc/<pid>/comm 精确匹配 worker:<alias>（截断到 15 字节），4B 的 worker:intern-dec 被截成 worker:intern-d —— 同名会让启停 0.8B 时把 4B 的 worker 当成自己的孤儿杀掉。",
+  "available_targets": [
+    "182x"
+  ],
+  "display_order": 92
+}
