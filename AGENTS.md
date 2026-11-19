@@ -4194,7 +4194,7 @@ window.ImApp_video_detection.applyWizardSnapshot = async function (opts) {
 验共享启动器的三种行为(不就绪不启动 / 等到就绪才启动 / 启动没成功要报错)
 + 四张卡的 hook 里不再有 `btn.click()` + 框架认识新错误码。
 
-### `window.WizardProgress` —— 模型加载进度条的对外入口（2026-11-19）
+### 卡片「额外要加载的模型」与**并行**进度条（2026-11-19）
 
 finish 步等模型就绪时本来就有进度条（`#wd-wizard-finish-error` 里那几行
 `model@npu` + 百分比）。但那只会等**向导自己声明的模型**
@@ -4205,30 +4205,55 @@ finish 步等模型就绪时本来就有进度条（`#wd-wizard-finish-error` �
 是慢端点（服务端等模型加载完才返回，~30 s），串行 await 的话那 30 秒
 里屏幕上是空的，用户只看到「卡住了」。
 
-⇒ 宿主把 finish 步的等待循环**提取**成通用函数，并对外暴露：
+更糟的是**串行**：先等 ASR 模型加载完（进度条走完），再由
+`applyWizardSnapshot` 单独加载翻译模型（再来一条进度条）⇒ 用户等两轮。
+
+⇒ 两件事一起改：
+
+**1. 宿主把 finish 步的等待循环**提取**成通用函数**（一份算法两处用）：
 
 ```js
-const w = WizardProgress.watch(
-  [{ model_id: "hy-mt-1-5", npu_index: null }],
-  { headerText: "翻译模型加载中", timeoutMs: 150000 });
-try { await startTheModel(); }        // 与进度条**并行**
-finally { await w.settle(); }          // 或 w.cancel("原因")
+const w = _watchModelProgress(targets, opts);
+//   → { promise, cancel(reason), markFailed(key, reason) }
 ```
 
-* **一份算法两处用** —— 进度行 DOM / 百分比 / 顶替 / 宽限 / 终态判定
-  全在 `_watchModelProgress()` 里（`_waitForModelsRunning` 现在只是
-  「算 targets + 调它」），样式与 ASR 模型那条完全一致。
-* `npu_index: null` = **任意一张卡**起来即可 —— 落哪张卡由后端卡位策略
-  决定（翻译模型跟随 ASR 所在的卡），前端事先不知道。
-* `cancel(reason)` = 放弃等待；带 reason 时在框里显示一行原因（卡片用来
-  报「翻译模型加载失败 —— 识别照常启动」）。
-* ⚠️ **进度条加载完就消失**（框架 `clearBox()`）⇒ 想断言它出现过，
-  **只能轮询抓**，事后查 DOM 永远是空的。
+进度行 DOM / 百分比 / 顶替 / 缺席宽限 / 终态判定全在里面
+（`_waitForModelsRunning` 现在只是「算 targets + 调它」）。
 
-**回归**：`scripts/verify_asr_wizard_translate.py`（25/25）—— 用例 1 先
-`POST /translate/disable` 把翻译模型停掉（模型已经在跑的话 enable 直接
-复用 ⇒ 没有 loading 进度可看），再断言「出现了 hy-mt-1-5 的进度行」+
-「显示过百分比」。
+**2. 卡片可选实现 `preloadExtraModels(opts)` 钩子** —— 框架在
+`_finish` 里**等模型之前**问卡片要「额外要加载的模型」：
+
+```js
+window.ImApp_qwen3_asr.preloadExtraModels = async function (opts) {
+  // 只**发起**加载（不 await！await 的话框架的等待被推迟 30 s ⇒ 又变串行）
+  Qwen3Asr._trEnablePromise = Qwen3Asr._trStartModel(lang);
+  Qwen3Asr._trEnablePromise.catch((e) =>
+    WizardProgress.notifyFailed(modelId, (e && e.message) || "启动失败"));
+  return {
+    targets: [{ model_id: modelId, npu_index: null }],
+    soft:    [modelId + "@null"],     // 软失败：起不来不拖累整体
+  };
+};
+```
+
+框架拿到后把它们**并进**同一个等待 ⇒ **两个模型并行加载、同一块进度条
+里两行**（`模型加载进度 (2/2)`）。
+
+| 口径 | 说明 |
+|---|---|
+| `npu_index: null` | **任意一张卡**起来即可 —— 落哪张卡由后端卡位策略决定（翻译模型跟随 ASR 所在的卡），前端事先不知道。进度条标签会换成**实际卡号** |
+| `soft` | 软失败目标：起不来只把**那一行**标 error，**不**让整个等待失败（翻译模型起不来不该把识别带崩） |
+| `notifyFailed(modelId, reason)` | 卡片**发起**时就可能知道会失败（比如请求直接 500）⇒ 登记后正在等的 watcher 下一轮（≤1 s）就把那行标 error —— 不用干等「实例一直不出现」的 15 s 宽限。⚠️ 登记**只在 30 s 内有效**，且 watcher 收尾时清理 ⇒ 不会污染下一轮向导 |
+| 没有这个钩子的卡 | 行为与以前**完全一样**（只等 `swcap_to_model`） |
+
+⚠️ **进度条加载完就消失**（框架 `clearBox()`）⇒ 想断言它出现过，
+**只能轮询抓**，事后查 DOM 永远是空的。
+
+**回归**：`scripts/verify_asr_wizard_translate.py`（26/26）—— 两个用例都
+先 `POST /translate/disable` 把翻译模型停掉（模型已经在跑的话 enable 直接
+复用 ⇒ 没有 loading 进度可看；用例 2 里它还会让框架判「翻译已就绪」直接
+清空进度条），再断言「出现了 hy-mt-1-5 的进度行」+「显示过百分比」+
+「**同屏两行**（ASR + 翻译并行，不是等完再加载）」。
 
 #### 同一个坑的第 5 张卡:语音生成(tts)—— v0.30 修
 

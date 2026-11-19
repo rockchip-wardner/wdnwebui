@@ -138,7 +138,7 @@ def _wizard_err(page) -> str:
 
 
 def _progress_rows(page) -> list[dict]:
-    """当前向导 finish 框里的模型加载进度行。
+    """当前向导 finish 框里的模型加载进度行（**所有**行）。
 
     ⚠️ 进度条**加载完就消失**（框架 clearBox）⇒ 断言只能靠**轮询抓**，
     事后查 DOM 永远是空的。
@@ -153,20 +153,29 @@ def _progress_rows(page) -> list[dict]:
     )
 
 
-def _capture_progress(page, seconds: float = 14.0, interval: float = 0.5) -> list[dict]:
-    """轮询抓进度条内容（去重后返回见过的一切状态）。"""
+def _capture_progress(page, seconds: float = 14.0, interval: float = 0.5) -> dict:
+    """轮询抓进度条内容。
+
+    返回 ``{seen, max_rows, samples}``：
+      seen     —— 见过的一切行（去重）
+      max_rows —— **同屏**最多出现过几行（这是「两个进度条一起显示」的判据）
+      samples  —— 每次采样时的行数
+    """
     seen: list[dict] = []
+    samples: list[int] = []
     t0 = time.time()
     while time.time() - t0 < seconds:
         try:
             rows = _progress_rows(page)
         except Exception:  # noqa: BLE001
             rows = []
+        samples.append(len(rows))
         for r in rows:
             if r not in seen:
                 seen.append(r)
         page.wait_for_timeout(int(interval * 1000))
-    return seen
+    return {"seen": seen, "max_rows": max(samples) if samples else 0,
+            "samples": samples}
 
 
 def _card_hint(page) -> str:
@@ -305,7 +314,8 @@ def _run_case(browser, *, fail_enable: bool, lang: str) -> tuple[list, list]:
     # ⚠️ 翻译模型的加载进度条**加载完就消失**（框架 clearBox）⇒ 只能在这
     # 段窗口里轮询抓，事后查 DOM 永远是空的。
     progress = _capture_progress(page, 14.0)
-    print("  进度条:", json.dumps(progress, ensure_ascii=False))
+    print("  进度条:", json.dumps(progress["seen"], ensure_ascii=False))
+    print("  同屏行数:", progress["max_rows"], progress["samples"][:20])
 
     enable_seen = _wait_calls(page, calls, "/translate/enable", 90)
     started, snap = _wait_new_round(page, baseline, 120)
@@ -326,6 +336,28 @@ def _run_case(browser, *, fail_enable: bool, lang: str) -> tuple[list, list]:
     return calls, errors, progress
 
 
+def _ensure_asr_ready(timeout_s: int = 180) -> None:
+    """确保 ASR 模型在跑 —— 否则向导的 env 步「下一步」是灰的，测试必假失败。
+
+    ⚠️ 板子上有人点了「全部停止」/「退出应用」时，模型会全部停下来
+    （产品语义）⇒ 回归脚本得自己把模型拉回来，不能靠现场状态。
+    """
+    st, snap = api("GET", f"/api/{CARD}/")
+    if st == 200 and snap.get("model_id"):
+        return
+    print("  ASR 模型没在跑，拉起来…")
+    api("POST", "/api/compute/instances",
+        {"model": "qwen3-asr", "npu_index": 0}, timeout=60)
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        st, snap = api("GET", f"/api/{CARD}/")
+        if st == 200 and snap.get("model_id"):
+            print("  ASR 模型已就绪")
+            return
+        time.sleep(2)
+    print(f"  [warn] ASR 模型 {timeout_s}s 内没就绪，继续（测试可能失败）")
+
+
 def main() -> int:
     if not os.path.isfile(SOURCE):
         print(f"❌ 测试音频不存在: {SOURCE}")
@@ -333,6 +365,7 @@ def main() -> int:
 
     # ⚠️ 本脚本**不改**板子的算力配置：active-app 的写操作被 route 拦下，
     #    读操作在前端被伪装成「空」⇒ compute.autostart 原样不动。
+    _ensure_asr_ready()
     return _run_all()
 
 def _run_all() -> int:
@@ -355,18 +388,30 @@ def _run_all() -> int:
               f"status={json.dumps(ts, ensure_ascii=False)[:200]}")
         check("目标语言是 zh-CN", ts.get("target_lang") == "zh-CN",
               f"实际 {ts.get('target_lang')!r}")
-        # ---- 翻译模型的加载进度条（和 ASR 模型同一套渲染） ----
-        tr_rows = [r for r in progress if "hy-mt-1-5" in (r.get("model") or "")]
+        # ---- 翻译模型的加载进度条（与 ASR 模型**同屏两行**） ----
+        seen = progress["seen"]
+        tr_rows = [r for r in seen if "hy-mt-1-5" in (r.get("model") or "")]
+        asr_rows = [r for r in seen if "qwen3-asr" in (r.get("model") or "")]
         check("翻译模型加载时出现了进度条", bool(tr_rows),
-              f"实际 {json.dumps(progress, ensure_ascii=False)[:200]}")
-        pct_rows = [r for r in tr_rows if "%" in (r.get("pct") or "")]
-        check("进度条显示了加载百分比", bool(pct_rows),
+              f"实际 {json.dumps(seen, ensure_ascii=False)[:200]}")
+        check("进度条显示了加载百分比",
+              any("%" in (r.get("pct") or "") for r in tr_rows),
               f"实际 {json.dumps(tr_rows, ensure_ascii=False)[:200]}")
+        check("ASR 与翻译模型**同屏两行**（并行加载，不是等完再加载）",
+              progress["max_rows"] >= 2 and bool(asr_rows) and bool(tr_rows),
+              f"max_rows={progress['max_rows']} "
+              f"asr={json.dumps(asr_rows, ensure_ascii=False)[:120]} "
+              f"tr={json.dumps(tr_rows, ensure_ascii=False)[:120]}")
 
         # ---------------- 用例 2：翻译模型启用失败 ⇒ 识别照常启动 ---------- #
         print("\n=== 用例 2：翻译模型启用失败 ⇒ 识别照常启动 ===")
         _wait_idle()
         api("POST", f"/api/{CARD}/translate/settings", {"enabled": False})
+        # ⚠️ 也要先停掉翻译模型 —— 否则它已经在跑，框架会判「翻译已就绪」
+        #    直接清空进度条，失败那一行根本没机会画出来（场景也不真实：
+        #    模型没在跑时 enable 才会失败）。
+        print("  停掉翻译模型…")
+        api("POST", f"/api/{CARD}/translate/disable")
         time.sleep(1)
         _run_case(browser, fail_enable=True, lang="zh-CN")
         st2, ts2 = api("GET", f"/api/{CARD}/translate/status")

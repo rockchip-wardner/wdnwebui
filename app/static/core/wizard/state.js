@@ -2562,14 +2562,26 @@
       window._wd_wizard_cfg_source = JSON.stringify(cfg.steps.find(s => s.id === "source") || {}).slice(0, 500);
     } catch (_) {}
 
-    // 2. wait for models running (if swcap_to_model 声明了)
-    if (cfg.swcap_to_model && Object.keys(cfg.swcap_to_model).length > 0) {
-      await _waitForModelsRunning(cfg);
-    }
-
-    // 3. call applyWizardSnapshot
+    // 2. 卡片可选钩子：**额外**要加载的模型（例：ASR 卡的翻译模型）。
+    //    钩子只负责**发起**加载（不等它），返回目标清单 ⇒ 框架把这些目标
+    //    并进等待 ⇒ 两个模型**并行加载**、**同一块进度条**里两行。
+    //    （早先是串行：先等 ASR 加载完，再由卡片单独加载翻译模型。）
     const ns = "ImApp_" + (app.id || "").replace(/-/g, "_");
     const api = window[ns];
+    const extra = await _collectExtraTargets(api, opts);
+
+    // 3. wait for models running（ASR 声明的 + 额外的，一起等）
+    const asrTargets = await _collectModelTargets(cfg);
+    const targets = [...asrTargets, ...extra.targets];
+    if (targets.length > 0) {
+      const w = _watchModelProgress(targets, {
+        requireBox: true,
+        soft: extra.soft,
+      });
+      await w.promise;
+    }
+
+    // 4. call applyWizardSnapshot
     if (!api || typeof api.applyWizardSnapshot !== "function") {
       // 应用层未暴露 API:静默跳过启动动作,只完成向导
       console.warn("[wizard-state] window." + ns + ".applyWizardSnapshot not found — skip");
@@ -2668,21 +2680,34 @@
     return targets;
   }
 
+  /** 卡片提前宣告「这个模型起不来」的登记表：model_id → 原因。
+   *
+   *  卡片在**发起**加载时就可能知道会失败（比如请求直接 500）⇒ 立刻登记
+   *  ⇒ 正在等的 watcher 下一轮就把那一行标成 error、继续等别的目标 ——
+   *  不用干等「实例一直不出现」的宽限（15 s）。
+   */
+  const _notifiedFailures = new Map();
+
   /** 等一组模型跑到 running，并在 finish 状态框里画加载进度。
    *
    *  这是 finish 步「等模型就绪」和卡片「额外模型加载进度」**共用**的
    *  实现 —— 一份算法两处用，避免进度条样式/百分比算法各写一份漂移。
+   *
+   *  返回句柄而不是裸 promise：调用方可能要在等待**进行中**取消它
+   *  （卡片放弃等待）或提前宣告某个目标起不来（软失败）。
    *
    *  opts:
    *    statusBox    —— 画进哪个框（默认 ``#wd-wizard-finish-error``）
    *    requireBox   —— true: 框不存在就**直接返回**（finish 步的老行为）
    *    timeoutMs    —— 兜底超时（默认 90s）
    *    graceMs      —— 「实例一直不出现」的宽限（默认 15s）
-   *    ctl          —— ``{stopped, reason}``：外部取消（卡片放弃时用）
+   *    soft         —— **软失败**目标的 key 集合：它们起不来时只把这行
+   *                    标成 error，**不**让整个等待失败（翻译模型起不来
+   *                    不该把识别带崩）
    *    headerText   —— 强制显示的标题（默认按目标数自动决定）
    *    timeoutText  —— 超时文案
    */
-  async function _watchModelProgress(targets, opts) {
+  function _watchModelProgress(targets, opts) {
     const o = opts || {};
     const ctl = o.ctl || { stopped: false, reason: "" };
     const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 90 * 1000;
@@ -2690,7 +2715,9 @@
     const statusBox = o.statusBox || _q("#" + WIZARD_NS + "finish-error");
     // 框不存在时：requireBox=true ⇒ 直接返回（不等了）；否则继续等，只是
     // 没地方画（卡片在自己的流程里调用时可能还没进 finish 步）。
-    if (!statusBox && o.requireBox !== false) return;
+    if (!statusBox && o.requireBox !== false) {
+      return { promise: Promise.resolve(), cancel() {}, markFailed() {} };
+    }
     const deadline = Date.now() + timeoutMs; // 兜底超时
     // 缺席宽限：模型不在 registry 里持续这么久 → 判定为没启动。POST 后
     // ~1s 实例才出现，15s 足够宽松。
@@ -2699,6 +2726,8 @@
     const PROG_CLS = WIZARD_NS + "finish-progress";
     const FAIL_CLS = WIZARD_NS + "finish-error-fail";
     const hasHeader = o.headerText ? true : targets.length > 1;
+    /** 软失败目标：key → 失败原因 */
+    const failed = new Map();
 
     // DOM 只构建一次:tick 内只更新 fill.style.width 让 CSS transition
     // (0.5s) 把"数字跳变"变成视觉上"跑"的进度,避免每秒重建节点导致
@@ -2762,6 +2791,11 @@
         fill.classList.toggle(WIZARD_NS + "progress-bar-done",  info.status === "done");
         fill.classList.toggle(WIZARD_NS + "progress-bar-error", info.status === "error");
         pctEl.textContent = info.label;
+        // npu_index=null 的目标（卡由后端策略决定）⇒ 标签换成**实际卡号**
+        if (info.labelKey) {
+          const lbl = row.querySelector("." + WIZARD_NS + "progress-row-label");
+          if (lbl) lbl.textContent = info.labelKey;
+        }
       }
     };
 
@@ -2771,125 +2805,212 @@
       statusBox.textContent = "";
     };
 
-    while (Date.now() - deadline < 0) {
-      // 外部取消（卡片放弃等待）—— 收工，不报错。带了原因就显示一行，
-      // 让用户知道「为什么没有进度条了」。
-      if (ctl.stopped) {
-        clearBox();
-        if (ctl.reason && statusBox) {
-          statusBox.classList.remove(PROG_CLS);
-          statusBox.classList.add(FAIL_CLS);
-          statusBox.textContent = ctl.reason;
+    const promise = (async () => {
+      while (Date.now() - deadline < 0) {
+        // 外部取消（卡片放弃等待）—— 收工，不报错。带了原因就显示一行，
+        // 让用户知道「为什么没有进度条了」。
+        if (ctl.stopped) {
+          clearBox();
+          if (ctl.reason && statusBox) {
+            statusBox.classList.remove(PROG_CLS);
+            statusBox.classList.add(FAIL_CLS);
+            statusBox.textContent = ctl.reason;
+          }
+          return;
         }
-        return;
-      }
-      // 向导已被卸载（上一步 / 跳过向导 / 切页）→ 中止。注意是**抛错**
-      // 不是 return：静默 return 等于「等待成功」，_finish 会接着调
-      // applyWizardSnapshot，把没就绪的应用拉起来。
-      if (statusBox && !statusBox.isConnected) {
-        throw new Error("向导已离开，等待中止。");
-      }
-      let abort = null;
-      try {
-        const r = await fetch("/api/compute", { cache: "no-store" });
-        if (r.ok) {
-          const data = await r.json();
-          // 预估耗时复用 /api/compute 快照(与算力配置页 "初始化中…约 Xs" 同源)
-          const perModel = (data.estimated_init_seconds_per_model) || {};
-          const defaultEst = data.default_estimated_init_seconds || 30;
-          // 只算本机算力(spawned / adopted_local),peer adopted 不算 —— 与
-          // _probeEnv 一致;_wizardBringUpModels 已保证 POST 成功 = 本机就绪。
-          const instances = (data.instances || [])
-            .filter((i) => i._source !== "adopted");
-          // 「有人顶替」：本机有 running/loading 实例提供这个 cap 就顶掉 ——
-          // 卡片按 capability 取 session（get_session），不认 model_id，等下
-          // 去只是白耗 90s 再报「本机未运行 xxx」。
-          //
-          // ⚠️ **缺席 ≠ error**：running 就绪；loading 还在起（等它）；error
-          // 是终态故障，必须报出来、不能被顶替掩盖；缺席 = 没起，可被顶替。
-          const providedCaps = new Set();
-          for (const inst of instances) {
-            if (inst.status !== "running" && inst.status !== "loading") continue;
-            for (const c of (inst.capability_types || [])) providedCaps.add(c);
-          }
-          const ownInst = (t) => _pickInst(instances.filter((i) => i.model_id === t.model_id
-            && (t.npu_index == null || _instanceCards(i).includes(Number(t.npu_index)))));
-          const targetReady = (t) => {
-            const own = ownInst(t);
-            if (own) {
-              if (own.status === "running") return true;
-              // loading：还在起 → 等它。error：终态 → 不就绪（下面 abort）。
-              if (own.status === "loading" || own.status === "error") return false;
-              // not_loaded 之类 = 没起 → 落到下面看能不能被顶替
+        // 向导已被卸载（上一步 / 跳过向导 / 切页）→ 中止。注意是**抛错**
+        // 不是 return：静默 return 等于「等待成功」，_finish 会接着调
+        // applyWizardSnapshot，把没就绪的应用拉起来。
+        if (statusBox && !statusBox.isConnected) {
+          throw new Error("向导已离开，等待中止。");
+        }
+        let abort = null;
+        try {
+          const r = await fetch("/api/compute", { cache: "no-store" });
+          if (r.ok) {
+            const data = await r.json();
+            // 预估耗时复用 /api/compute 快照(与算力配置页 "初始化中…约 Xs" 同源)
+            const perModel = (data.estimated_init_seconds_per_model) || {};
+            const defaultEst = data.default_estimated_init_seconds || 30;
+            // 只算本机算力(spawned / adopted_local),peer adopted 不算 —— 与
+            // _probeEnv 一致;_wizardBringUpModels 已保证 POST 成功 = 本机就绪。
+            const instances = (data.instances || [])
+              .filter((i) => i._source !== "adopted");
+            // 「有人顶替」：本机有 running/loading 实例提供这个 cap 就顶掉 ——
+            // 卡片按 capability 取 session（get_session），不认 model_id，等下
+            // 去只是白耗 90s 再报「本机未运行 xxx」。
+            //
+            // ⚠️ **缺席 ≠ error**：running 就绪；loading 还在起（等它）；error
+            // 是终态故障，必须报出来、不能被顶替掩盖；缺席 = 没起，可被顶替。
+            const providedCaps = new Set();
+            for (const inst of instances) {
+              if (inst.status !== "running" && inst.status !== "loading") continue;
+              for (const c of (inst.capability_types || [])) providedCaps.add(c);
             }
-            // 没起 → 有人提供这个能力就顶替（能力可用，功能是通的）
-            return providedCaps.has(t.cap);
-          };
-          if (targets.every(targetReady)) {
-            // 模型全部就绪 → 清空 statusBox,避免误导用户"是不是出错了"
-            clearBox();
-            return;
-          }
-          if (!initialized) initDOM();
-          // 进度 = (now - inst.started_at) / estimated;99% 封顶避免先撞
-          // 100% 后 status=running 才到位的小幅抖动。
-          const now = Date.now() / 1000;
-          const statusMap = {};
-          let doneCount = 0;
-          for (const m of targets) {
-            const key = _targetKey(m);
-            const est = perModel[m.model_id] != null
-              ? perModel[m.model_id] : defaultEst;
-            const inst = _pickInst(instances.filter((i) => i.model_id === m.model_id
-              && (m.npu_index == null
-                  || _instanceCards(i).includes(Number(m.npu_index)))));
-            if (!inst) {
-              // 一直不出现 = 没启动（被关了 / 压根没开），不是「还在启动」。
-              // 超过宽限就中止 —— 盯一条不变的进度条等满 90s 比报错更像死机。
-              if (missingSince[key] == null) missingSince[key] = Date.now();
-              if (Date.now() - missingSince[key] > MISSING_GRACE_MS) {
-                abort = `本机未运行「${key}」—— 模型可能已被关闭或从未开启。`;
+            const ownInst = (t) => _pickInst(instances.filter((i) => i.model_id === t.model_id
+              && (t.npu_index == null || _instanceCards(i).includes(Number(t.npu_index)))));
+            const targetReady = (t) => {
+              // 已判失败（软失败）⇒ 不再等它（否则永远等不到）
+              if (failed.has(_targetKey(t))) return true;
+              const own = ownInst(t);
+              if (own) {
+                if (own.status === "running") return true;
+                // loading：还在起 → 等它。error：终态 → 不就绪（下面 abort）。
+                if (own.status === "loading" || own.status === "error") return false;
+                // not_loaded 之类 = 没起 → 落到下面看能不能被顶替
+              }
+              // 没起 → 有人提供这个能力就顶替（能力可用，功能是通的）
+              return providedCaps.has(t.cap);
+            };
+            if (targets.every(targetReady)) {
+              // 全部结算完毕。**有软失败目标时保留进度框** —— 那行写着
+              // 「启动失败」，用户该看见（正常全好时清空，避免误导）。
+              if (failed.size) {
+                if (!initialized) initDOM();
+                const statusMap = {};
+                for (const [k, reason] of failed) {
+                  statusMap[k] = {
+                    status: "error", barPct: 100,
+                    label: `启动失败：${reason}`,
+                  };
+                }
+                updateProgress(statusMap, targets.length - failed.size);
+              } else {
+                clearBox();
+              }
+              return;
+            }
+            if (!initialized) initDOM();
+            // 进度 = (now - inst.started_at) / estimated;99% 封顶避免先撞
+            // 100% 后 status=running 才到位的小幅抖动。
+            const now = Date.now() / 1000;
+            const statusMap = {};
+            let doneCount = 0;
+            for (const m of targets) {
+              const key = _targetKey(m);
+              // 软失败：外部（卡片）提前宣告起不来 ⇒ 立刻标 error，不再等
+              const notified = _notifiedFailures.get(m.model_id);
+              if (notified != null) {
+                // 登记只在短时间内有效 —— 免得上一轮的失败登记污染下一轮
+                // （watcher 提前结束、没来得及消费的情况）。
+                if (Date.now() - notified.at < 30000) {
+                  _notifiedFailures.delete(m.model_id);
+                  if (o.soft && o.soft.includes(key)) {
+                    failed.set(key, notified.reason);
+                    statusMap[key] = {
+                      status: "error", barPct: 100,
+                      label: `启动失败：${notified.reason}`,
+                    };
+                    continue;
+                  }
+                } else {
+                  _notifiedFailures.delete(m.model_id);
+                }
+              }
+              if (failed.has(key)) {
+                statusMap[key] = {
+                  status: "error", barPct: 100,
+                  label: `启动失败：${failed.get(key) || "未知原因"}`,
+                };
+                continue;
+              }
+              const est = perModel[m.model_id] != null
+                ? perModel[m.model_id] : defaultEst;
+              const inst = _pickInst(instances.filter((i) => i.model_id === m.model_id
+                && (m.npu_index == null
+                    || _instanceCards(i).includes(Number(m.npu_index)))));
+              if (!inst) {
+                // 一直不出现 = 没启动（被关了 / 压根没开），不是「还在启动」。
+                // 超过宽限就中止 —— 盯一条不变的进度条等满 90s 比报错更像死机。
+                if (missingSince[key] == null) missingSince[key] = Date.now();
+                if (Date.now() - missingSince[key] > MISSING_GRACE_MS) {
+                  const why = `本机未运行「${key}」`;
+                  // 软失败目标：只把这行标 error，继续等其它目标
+                  if (o.soft && o.soft.includes(key)) {
+                    failed.set(key, why);
+                    statusMap[key] = { status: "error", barPct: 100, label: why };
+                    continue;
+                  }
+                  abort = `${why}—— 模型可能已被关闭或从未开启。`;
+                  break;
+                }
+                // POST 后 1s 内 worker 还没上报 status;显式 "等待启动…" 而
+                // 非 0%,避免和真 0% 加载混淆
+                statusMap[key] = { status: "wait", barPct: 0, label: "等待启动…" };
+                continue;
+              }
+              delete missingSince[key];
+              // npu_index=null ⇒ 标签用**实际卡号**（卡由后端策略决定）
+              const actualCards = _instanceCards(inst);
+              const labelKey = (m.npu_index == null && actualCards.length)
+                ? `${m.model_id}@${actualCards[0]}`
+                : key;
+              if (inst.status === "running") {
+                statusMap[key] = {
+                  status: "done", barPct: 100, label: "✓ 100%", labelKey,
+                };
+                doneCount++;
+                continue;
+              }
+              if (inst.status === "error") {
+                // **终态**：worker 挂了 / 被别处关掉了。立刻中止 —— 继续等满
+                // 90s 只会让用户盯一条不再变化的进度条（真机实测：另一个页面
+                // 「全部停止」后，这里卡满 90s 才报错）。
+                const why = `「${key}」启动失败：${inst.error || "未知错误"}`;
+                if (o.soft && o.soft.includes(key)) {
+                  failed.set(key, why);
+                  statusMap[key] = { status: "error", barPct: 100, label: why };
+                  continue;
+                }
+                abort = why;
                 break;
               }
-              // POST 后 1s 内 worker 还没上报 status;显式 "等待启动…" 而
-              // 非 0%,避免和真 0% 加载混淆
-              statusMap[key] = { status: "wait", barPct: 0, label: "等待启动…" };
-              continue;
+              const startTs = inst.started_at || now;
+              const elapsed = Math.max(0, now - startTs);
+              const pct = Math.min(99, Math.max(0, Math.round((elapsed / est) * 100)));
+              const remaining = Math.max(0, Math.round(est - elapsed));
+              statusMap[key] = {
+                status: "loading", barPct: pct,
+                label: `${pct}% (~${remaining}s 剩余)`,
+                labelKey,
+              };
             }
-            delete missingSince[key];
-            if (inst.status === "running") {
-              statusMap[key] = { status: "done", barPct: 100, label: "✓ 100%" };
-              doneCount++;
-              continue;
-            }
-            if (inst.status === "error") {
-              // **终态**：worker 挂了 / 被别处关掉了。立刻中止 —— 继续等满
-              // 90s 只会让用户盯一条不再变化的进度条（真机实测：另一个页面
-              // 「全部停止」后，这里卡满 90s 才报错）。
-              abort = `「${key}」启动失败：${inst.error || "未知错误"}`;
-              break;
-            }
-            const startTs = inst.started_at || now;
-            const elapsed = Math.max(0, now - startTs);
-            const pct = Math.min(99, Math.max(0, Math.round((elapsed / est) * 100)));
-            const remaining = Math.max(0, Math.round(est - elapsed));
-            statusMap[key] = {
-              status: "loading", barPct: pct,
-              label: `${pct}% (~${remaining}s 剩余)`,
-            };
+            if (!abort) updateProgress(statusMap, doneCount);
           }
-          if (!abort) updateProgress(statusMap, doneCount);
+        } catch (_) { /* retry */ }
+        if (abort) {
+          clearBox();
+          throw _modelWaitError(abort);
         }
-      } catch (_) { /* retry */ }
-      if (abort) {
-        clearBox();
-        throw _modelWaitError(abort);
+        await new Promise((r) => setTimeout(r, 1000));
       }
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    clearBox();
-    throw _modelWaitError(o.timeoutText
-      || `等待模型启动超时（${Math.round(timeoutMs / 1000)}s）—— 模型可能已被关闭或加载失败。`);
+      // 超时：软失败目标不拖累整体
+      const softPending = targets.filter(
+        (t) => o.soft && o.soft.includes(_targetKey(t)));
+      if (softPending.length && softPending.length < targets.length) {
+        for (const t of softPending) failed.set(_targetKey(t), "加载超时");
+        return;
+      }
+      clearBox();
+      throw _modelWaitError(o.timeoutText
+        || `等待模型启动超时（${Math.round(timeoutMs / 1000)}s）—— 模型可能已被关闭或加载失败。`);
+    })().finally(() => {
+      // 收尾：清掉本次相关的失败登记 —— 别让上一轮的登记污染下一轮向导
+      // （watcher 提前结束、没来得及消费的情况）。
+      for (const m of targets) _notifiedFailures.delete(m.model_id);
+    });
+
+    return {
+      promise,
+      cancel(reason) {
+        ctl.stopped = true;
+        ctl.reason = reason || "";
+      },
+      /** 提前宣告某个目标起不来（软失败）—— 下一轮轮询就会把它标 error。 */
+      markFailed(key, reason) {
+        failed.set(key, reason || "启动失败");
+      },
+    };
   }
 
   /** finish 步：等 wizard.json 里 ``swcap_to_model`` 声明的模型就绪。 */
@@ -2897,7 +3018,37 @@
     const targets = await _collectModelTargets(cfg);
     if (targets.length === 0) return;
     // 框不存在 ⇒ 不等（老行为：没有进度框可显示就别卡住用户）
-    await _watchModelProgress(targets, { requireBox: true });
+    const w = _watchModelProgress(targets, { requireBox: true });
+    await w.promise;
+  }
+
+  /**
+   * 问卡片要「**额外**要加载的模型」。
+   *
+   *  卡片可选实现 ``window.ImApp_<id>.preloadExtraModels(opts)``，返回：
+   *
+   *      { targets: [{ model_id, npu_index }],
+   *        soft:    ["model_id@npu", ...] }     // 软失败：起不来不拖累整体
+   *
+   *  钩子**只发起**加载、不要 await —— 框架紧接着就开始等 ⇒ 两个模型
+   *  并行加载、同屏两行进度条。
+   *
+   *  没有这个钩子的卡 ⇒ 行为与以前完全一样（只等 swcap_to_model）。
+   */
+  async function _collectExtraTargets(api, opts) {
+    const empty = { targets: [], soft: [] };
+    if (!api || typeof api.preloadExtraModels !== "function") return empty;
+    let res;
+    try {
+      res = await api.preloadExtraModels(opts);
+    } catch (e) {
+      console.warn("[wizard-state] preloadExtraModels 失败（忽略）:", e);
+      return empty;
+    }
+    if (!res) return empty;
+    const list = Array.isArray(res) ? res : (res.targets || []);
+    const soft = Array.isArray(res.soft) ? res.soft : [];
+    return { targets: list, soft };
   }
 
   // ------------------------------------------------------------------ #
@@ -3083,11 +3234,10 @@
   // window.WizardProgress —— 模型加载进度条的**对外**入口
   //
   // finish 步等「自己声明的模型」用的是 _watchModelProgress；卡片在自己
-  // 的流程里（applyWizardSnapshot）额外要加载的模型 —— 例如 ASR 卡选了
-  // 翻译目标语言后要起的翻译模型 —— 也用同一份进度条，避免「翻译在转圈
-  // 但屏幕上没有任何反馈」。
+  // 的流程里额外要加载的模型 —— 例如 ASR 卡选了翻译目标语言后要起的翻译
+  // 模型 —— 也用同一份进度条。
   //
-  // 用法：
+  // 用法（卡片自己开一个 watcher）：
   //   const w = WizardProgress.watch(
   //     [{ model_id: "hy-mt-1-5", npu_index: null }],
   //     { headerText: "翻译模型加载中", timeoutMs: 150000 });
@@ -3097,26 +3247,47 @@
   //     策略挑卡，前端事先不知道它会落在哪）。
   //   - settle()：等进度条走到 running；模型起不来时调用方先 cancel()。
   //   - cancel(reason)：放弃等待（进度条清掉，reason 非空则显示一行原因）。
+  //
+  // 另一条路（**推荐**：让框架统一等，天然并行）：
+  //   卡片实现 ``window.ImApp_<id>.preloadExtraModels(opts)``，返回
+  //   ``{targets:[...], soft:[...]}`` ⇒ 框架把这些目标并进 finish 步的
+  //   等待 ⇒ **两个模型并行加载、同一块进度条里两行**。
+  //   卡片在钩子里只**发起**加载（不 await），失败时调
+  //   ``WizardProgress.notifyFailed(modelId, reason)``。
   // ------------------------------------------------------------------ #
   window.WizardProgress = {
     /**
      * @param {Array<{model_id:string, npu_index:(number|null), cap?:string}>} targets
      * @param {object} [opts] 见 _watchModelProgress 的 opts
-     * @returns {{promise: Promise<void>, cancel: (reason?:string)=>void, settle: ()=>Promise<void>}}
+     * @returns {{promise: Promise<void>, cancel: (reason?:string)=>void,
+     *           markFailed: (key:string, reason?:string)=>void,
+     *           settle: ()=>Promise<void>}}
      */
     watch(targets, opts) {
-      const ctl = { stopped: false, reason: "" };
-      const promise = _watchModelProgress(
-        Array.isArray(targets) ? targets : [],
-        Object.assign({}, opts || {}, { ctl }));
+      const w = _watchModelProgress(
+        Array.isArray(targets) ? targets : [], opts || {});
       return {
-        promise,
-        cancel(reason) {
-          ctl.stopped = true;
-          ctl.reason = reason || "";
-        },
-        settle() { return promise.catch(() => {}); },
+        promise: w.promise,
+        cancel: w.cancel,
+        markFailed: w.markFailed,
+        settle() { return w.promise.catch(() => {}); },
       };
+    },
+    /**
+     * 宣告「这个模型起不来」（软失败）。
+     *
+     *  正在等的 watcher 下一轮（≤1 s）就把那一行标成 error 并继续等别的
+     *  目标 —— 不用干等「实例一直不出现」的宽限。
+     *
+     *  ⚠️ 登记只在 **30 s** 内有效（watcher 可能提前结束、来不及消费）
+     *  ⇒ 不会把上一轮的失败误用到下一轮。
+     */
+    notifyFailed(modelId, reason) {
+      if (!modelId) return;
+      _notifiedFailures.set(modelId, {
+        reason: reason || "启动失败",
+        at: Date.now(),
+      });
     },
   };
 
