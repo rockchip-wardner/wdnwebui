@@ -503,7 +503,9 @@ def test_file_path_splitter() -> None:
     def run(steps, flush: bool = True) -> list:
         sp = _SentenceSplitter()
         out: list = []
-        emit = lambda t, i: out.append((i, t))   # noqa: E731
+        # ⚠️ emit 的签名是 **4 参**（text, index, c0, c1）—— c0/c1 是这句在
+        # 当前 epoch 文本里的**字符区间**（半开）⇒ 前端据此换算音频时间。
+        emit = lambda t, i, c0, c1: out.append((i, t, c0, c1))   # noqa: E731
         for c in steps:
             sp.feed(c, emit)
         if flush:
@@ -514,8 +516,19 @@ def test_file_path_splitter() -> None:
     out = run(["第一句。第二句。第三句。"])
     check("中文句末标点 ⇒ 一句一条", len(out) == 3, f"out={out}")
     check("切出来的内容对",
-          [t for _, t in out] == ["第一句。", "第二句。", "第三句。"], f"out={out}")
-    check("句序号从 1 起、连续", [i for i, _ in out] == [1, 2, 3], f"out={out}")
+          [t for _, t, _, _ in out] == ["第一句。", "第二句。", "第三句。"],
+          f"out={out}")
+    check("句序号从 1 起、连续", [i for i, _, _, _ in out] == [1, 2, 3], f"out={out}")
+    check("字符区间连续且首尾相接（前端靠它换算音频时间）",
+          all(out[k][2] < out[k][3] for k in range(len(out)))
+          and [out[k][3] for k in range(len(out) - 1)]
+              == [out[k + 1][2] for k in range(len(out) - 1)],
+          f"out={out}")
+    check("字符区间落在原文里（切出来的就是那一段）",
+          all(src[o[2]:o[3]].strip() == o[1]
+              for o in out
+              for src in ["第一句。第二句。第三句。"]),
+          f"out={out}")
 
     # --- 英文句点（带护栏）---
     out = run(["Hello there. This is a test."])
@@ -542,7 +555,7 @@ def test_file_path_splitter() -> None:
     # --- epoch 切换：显式 flush + 句序号继续 ---
     sp = _SentenceSplitter()
     out = []
-    emit = lambda t, i: out.append((i, t))       # noqa: E731
+    emit = lambda t, i, c0, c1: out.append((i, t, c0, c1))       # noqa: E731
     sp.feed("first epoch text without punctuation", emit)
     sp.flush(emit)          # ← _rotate_epoch 里的显式 flush
     sp.reset_epoch()
@@ -550,7 +563,7 @@ def test_file_path_splitter() -> None:
     sp.flush(emit)
     check("epoch 切换 ⇒ 两段各出一条", len(out) == 2, f"out={out}")
     check("epoch 切换后句序号继续（不归零）",
-          [i for i, _ in out] == [1, 2], f"out={out}")
+          [i for i, _, _, _ in out] == [1, 2], f"out={out}")
 
 
 # --------------------------------------------------------------------------- #
