@@ -730,7 +730,10 @@
        而不是 btn.click()（disabled 按钮的 click 会被浏览器静默丢弃）。 -->
   <script src="/static/core/wizard-start.js" defer></script>
   <!-- 右上角「界面语言」切换。译文不走浏览器 —— 浏览器在这套网络里够不到
-       Google 系域名,统一转发到板子的 /api/translate(见 app/core/translate/)。 -->
+       Google 系域名,统一转发到板子的 /api/translate(见 app/core/translate/)。
+       font-check.js 要在它之前 —— 用来判断「板端有没有这个文字的字体」
+       （没字体的语言不摆进下拉,否则整页都是豆腐块)。 -->
+  <script src="/static/core/font-check.js" defer></script>
   <script src="/static/core/translate.js" defer></script>
 </body>
 </html>

@@ -166,6 +166,19 @@
 .wdn-lang-status[data-kind="busy"] { background: #f8fafc; color: var(--muted); }
 /* NPU 翻译中 —— 绿色,跟「正在用本板算」这件事对上 */
 .wdn-lang-status[data-kind="npu"] { background: #f0fdf4; color: #166534; }
+
+/* 板端没有字体的那些语言 —— 说明为什么它们不在下拉里 */
+.wdn-lang-missing {
+  margin: 0.35rem 0.5rem 0.15rem;
+  padding: 0.35rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.74rem;
+  line-height: 1.45;
+  color: var(--muted);
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+}
+.wdn-lang-missing[hidden] { display: none; }
 .wdn-lang-status[hidden] { display: none; }
 
 /* 让出右上角控件的位置 */

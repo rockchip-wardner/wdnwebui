@@ -152,6 +152,35 @@
   }
 
   // ─────────────────────────────────────────────────────────────────────
+  // 板端**渲染不出来**的语言（没有字体 ⇒ 本族文字是豆腐块）
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // ⚠️ **为什么要把它们从下拉里拿掉**（而不只是把本族名换成中文名）：
+  // 界面语言 = **整页**的文案语言 ⇒ 用户一选「泰语」，**整个界面**都变成
+  // ไทย ⇒ 板端没泰文字体 ⇒ **满屏方框**（比下拉里两个方框严重得多）。
+  //
+  // ⇒ 板端**渲染不出来**的语言干脆**不提供**：模型能翻 ≠ 板端能显示。
+  //
+  // ⚠️ 判据用**运行时**的字体检测（``/static/core/font-check.js``）而不是
+  // 写死一张语言表 —— 板子换板、装了字体，结论自动跟着变。
+  function _renderable(lang) {
+    if (!lang || !lang.native) return false;
+    const fc = window.WdnFontCheck;
+    if (!fc || typeof fc.canRender !== "function") return true;   // 检测器没加载 ⇒ 不拦
+    return fc.canRender(lang.native);
+  }
+
+  /** 能显示的语言（SOURCE + 渲染得出来的那些）。 */
+  function renderableLanguages() {
+    return LANGUAGES.filter(_renderable);
+  }
+
+  /** 渲染不出来的那些（面板里要说一句，别让用户以为「这板子没这些语言」）。 */
+  function unrenderableLanguages() {
+    return LANGUAGES.filter((l) => !_renderable(l));
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
   // 控件
   // ─────────────────────────────────────────────────────────────────────
   function buildUI() {
@@ -201,9 +230,23 @@
     engine.hidden = true;
 
     list.appendChild(languageItem({ code: SOURCE, zh: "中文(原文)", native: "简体中文" }));
-    LANGUAGES.forEach((lang) => list.appendChild(languageItem(lang)));
+    // ⚠️ **只列「板端渲染得出来」的语言** —— 选了渲染不出来的，整页都是方框
+    // （见 ``_renderable`` 的说明）。
+    renderableLanguages().forEach((lang) => list.appendChild(languageItem(lang)));
 
-    panel.append(title, engine, list, status);
+    // ⚠️ **板端渲染不出来的那些** —— 不摆进下拉，但**在面板里说一声**：
+    // 不说的话用户会以为「这板子压根不支持这些语言」。
+    const missing = h("div", "wdn-lang-missing");
+    const miss = unrenderableLanguages();
+    if (miss.length) {
+      missing.hidden = false;
+      missing.textContent = "本板没有这些语言的字体，已隐藏："
+        + miss.map((l) => l.zh).join("、");
+    } else {
+      missing.hidden = true;
+    }
+
+    panel.append(title, engine, list, missing, status);
     root.append(btn, progress, panel);
     document.body.appendChild(root);
 
@@ -255,7 +298,11 @@
 
   function updateButton() {
     const lang = langByCode(state.target);
-    els.name.textContent = lang ? lang.native : "中文";
+    // ⚠️ 按钮上显示的是**本族名** —— 板端渲染不出来时退回**中文名**
+    // （按钮本身也不能是一排方框）。
+    els.name.textContent = lang
+      ? (_renderable(lang) ? lang.native : lang.zh)
+      : "中文";
     // 翻译期间**不**禁用按钮:禁用了用户就点不开面板,看不到进度 —— 而一次
     // 整页翻译要几十秒,期间必须让人看得见「在翻第几片」。
     els.btn.setAttribute("aria-busy", state.busy ? "true" : "false");
@@ -605,7 +652,16 @@
   function savedTarget() {
     try {
       const v = localStorage.getItem(STORAGE_KEY);
-      return v && langByCode(v) ? v : null;
+      if (!v || !langByCode(v)) return null;
+      // ⚠️ **上次选的语言板端渲染不出来 ⇒ 当作没选过** ——
+      // 不然一进页面就**整屏方框**（这正是本节要修的那个问题本身）。
+      // ⇒ 把那份记录清掉（别让用户永远卡在这个状态里）。
+      const lang = langByCode(v);
+      if (!_renderable(lang)) {
+        localStorage.removeItem(STORAGE_KEY);
+        return null;
+      }
+      return v;
     } catch (_) {
       return null;
     }
