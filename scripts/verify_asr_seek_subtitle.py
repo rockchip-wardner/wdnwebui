@@ -198,6 +198,8 @@ PROBE = """
   return {
     t: (document.getElementById('asr-video') || {}).currentTime || 0,
     slots: slots,
+    lines: tl.map((l) => [l.start, l.end,
+                          (l.words || []).map((w) => w.text).join('')]),
     ranges: ranges.map((r) => [r.start, r.end]),
     epochSpans: epochSpans,
     rounds: rs.map((r) => ({
@@ -478,14 +480,19 @@ def main() -> int:
         check("最终语种是中文", bool(langs) and langs[-1] == "Chinese",
               f"最后语种={langs[-1] if langs else '(空)'}")
 
-        # ---- 切会话必须带回看上下文（**确定性**判据） -------------------- #
+        # ---- 切会话**不留下重复 / 缺口**（新契约） ------------------------ #
+        #
+        # ⚠️ **回看（look-back）现在不进公开输出了**（2026-11-20 改）：
+        # 换会话时那 10 秒的重放只当**模型的上下文** ⇒ 它的轮次既不广播、
+        # 也不进轮次列表 ⇒ 前端看到的是**连续**的会话边界。
+        #
+        # ⇒ 这里断言**新契约**：
+        #   ① 相邻两段在时间轴上**首尾相接**（没有缺口 ⇒ 回看没漏出来；
+        #      没有重叠 ⇒ 回看没变成「同一段音频显示两遍」）；
+        #   ② 时间轴上**没有整句重复**（同一段内容不被显示两次）。
         #
         # ⚠️ 「整段变英文」是**概率性**的（取决于那一秒模型抽什么风）⇒
-        # 单次跑抓不住 ⇒ 这里断言**结构**：每切一次会话，新会话的**起点**
-        # 必须比上一段的**终点**更早（差值 ≈ 回看窗口 10 秒）。
-        #
-        # ⇒ 没有回看时：新会话的起点 == 上一段的终点（差值 0）⇒ 判据命中 ✓
-        # ⇒ 有回看时：新会话带着上一段的尾巴（差值 ≈ 10 s）✓
+        # 单次跑抓不住 ⇒ 这里断言**结构**。
         spans = d["epochSpans"]
         gaps = []
         for i in range(1, len(spans)):
@@ -494,15 +501,29 @@ def main() -> int:
             if prev_end is None or cur_start is None:
                 continue
             gap = round(prev_end - cur_start, 1)
-            # ⚠️ **只测「切会话」那种边界**：新会话紧跟着上一段（缺口在
-            # 几秒量级）。拖动重开识别时新会话是从**更后面**开始的
-            # （缺口是几十秒的负数）⇒ 那种边界不算数。
+            # ⚠️ **只测「切会话」那种边界**：拖动重开识别时新会话是从
+            # **更后面**开始的（缺口是几十秒的负数）⇒ 那种边界不算数。
             if gap < -2.0:
                 continue
             gaps.append(gap)
-        check("切会话时**带回了上下文**（新会话起点比上一段终点更早）",
-              bool(gaps) and all(g >= 5.0 for g in gaps),
-              f"各段回看缺口={gaps}")
+        check("切会话时**时间轴首尾相接**（回看不进公开输出 ⇒ 不留缺口）",
+              bool(gaps) and all(abs(g) <= 2.0 for g in gaps),
+              f"各段衔接差={gaps}")
+
+        # 整句重复（短句的重复是正常的 —— 说话人确实说了两遍 ⇒ 不算）
+        lines = [ln[2].strip() for ln in d.get("lines", []) if ln[2].strip()]
+        seen = {}
+        dups = []
+        for i, text in enumerate(lines):
+            key = text[:30]
+            if len(key) < 8:
+                continue
+            if key in seen:
+                dups.append((seen[key], i, key))
+            else:
+                seen[key] = i
+        check("时间轴上没有**整句重复**（回看重放没变成重复内容）",
+              not dups, f"{len(dups)} 处重复，例：{dups[:2]}")
 
         # ---- 识别没有停滞（已确认文本在增长） --------------------------- #
         d = _probe(page)
