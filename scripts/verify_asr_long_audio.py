@@ -85,6 +85,18 @@ BASE = "https://127.0.0.1:8000"
 #: 静音前缀（秒）—— 让模型先踩进「没有新内容」的状态。
 SILENCE_LEAD_SEC = 10.0
 
+#: 静音后缀（秒）—— 让整段素材**超过会话上限**（60 s，见
+#: ``service.py::_FILE_SESSION_MAX_SEC``）。
+#:
+#: ⚠️ 用例 A 的第 4 条断言（「长音频被切成了多个会话」）要的就是这个：
+#: 素材总长必须**超过**会话上限，否则根本不会切 —— 断言就成了一句废话。
+#:
+#: ⚠️ 以前这条断言是被**别的原因**满足的：25 秒的素材在「热身期」
+#: （模型还没提交过任何东西）被误判成「停滞」而切了一刀。现在「还没
+#: 确认过任何东西」**不算停滞**（那不是自锁，是热身），所以素材必须
+#: 自己长到能触发**长度上限**这一条。
+SILENCE_TAIL_SEC = 45.0
+
 #: 用例 B 的语音长度（秒）与尾巴长度（采样）。
 TAIL_CASE_SEC = 6.0
 #: 末块必须 < ``N_FFT + HOP_LENGTH``（560 @ 16 kHz）才会踩到越界。
@@ -172,15 +184,19 @@ def _write_wav(dest: Path, pcm: bytes) -> Path:
 
 
 def _build_test_wav(dest: Path) -> tuple:
-    """造「静音 + 语音」的 16 kHz 单声道 s16 WAV（用例 A：自锁）。
+    """造「静音 + 语音 + 静音」的 16 kHz 单声道 s16 WAV（用例 A：自锁）。
 
     返回 ``(路径, 源文件)``。识别是否成功用**关键词**判定
     （见 :data:`KEYWORDS`），不做全文比对 —— 全文比对会因分段而
     在段边界产生差异。
+
+    ⚠️ 尾部那段静音是给「长音频必须被切成多个会话」那条断言用的
+    （见 :data:`SILENCE_TAIL_SEC`）—— 素材总长要**超过**会话上限。
     """
     s16, src = _speech_s16()
     silence = b"\x00" * (int(SILENCE_LEAD_SEC * 16000) * 2)
-    return _write_wav(dest, silence + s16), src
+    tail = b"\x00" * (int(SILENCE_TAIL_SEC * 16000) * 2)
+    return _write_wav(dest, silence + s16 + tail), src
 
 
 def _build_tail_wav(dest: Path) -> tuple:
@@ -270,7 +286,9 @@ def main() -> int:
         print("--- 用例 A：静音 + 语音（缺陷 1：增量会话自锁）---")
         wav_path, src = _build_test_wav(Path(td) / "long_audio_case.wav")
         print(f"源音频: {src}")
-        print(f"测试音频: {wav_path} (静音 {SILENCE_LEAD_SEC:.0f}s + 语音)\n")
+        print(f"测试音频: {wav_path} (静音 {SILENCE_LEAD_SEC:.0f}s + 语音 + "
+              f"静音 {SILENCE_TAIL_SEC:.0f}s = "
+              f"{SILENCE_LEAD_SEC + SILENCE_TAIL_SEC + 15.1:.0f}s)\n")
 
         snap, lr, text, elapsed = _transcribe(wav_path)
         print(f"耗时 {elapsed:.1f}s  audio_sec={lr.get('audio_sec')} "
@@ -295,10 +313,13 @@ def main() -> int:
               f"最严重: {worst_n} 次 x {len(worst)} 字符 {worst[:60]!r}")
 
         # A4) 分了多个会话 —— 说明不是「一个超长会话跑到底」
+        #
+        # ⚠️ 素材总长 > 会话上限（60 s）⇒ 必须被切（见 SILENCE_TAIL_SEC）。
         epochs = int(lr.get("epochs") or 0)
         check(epochs >= 2,
               "A4 长音频被切成了多个会话（不是单个超长会话）",
-              f"epochs={epochs} segments={lr.get('segments')}")
+              f"epochs={epochs} segments={lr.get('segments')} "
+              f"audio_sec={lr.get('audio_sec')}")
 
         # ---------------- 用例 B：极短末块 -------------------------- #
         print("\n--- 用例 B：语音 + {} 采样的尾巴（缺陷 2：末块越界）---"
