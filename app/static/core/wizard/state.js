@@ -2161,6 +2161,30 @@
     setTimeout(refreshNext, 0);
   }
 
+  /**
+   * 一个 select 字段在完成页摘要里该显示什么。
+   *
+   * ⚠️ **显示「选项的文字」，不是 value** —— value 是机器码（``zh-CN`` /
+   * ``single``），用户在摘要页看到「翻译目标语言: zh-CN」根本不知道自己
+   * 选了什么。
+   *
+   * 优先级：
+   * 1. **运行时记下的选项文字**（``state.optLabels``）—— 选项可能是**动态**
+   *    塞进去的（卡片在 ``wizard:step-rendered`` 里重填自己的字段），
+   *    ``wizard.json`` 里只有占位选项 ⇒ 静态表查不到。
+   * 2. **静态选项表**（``field.options``）。
+   * 3. 退回 value（机器码）—— 宁可显示机器码，也不要什么都不显示。
+   */
+  function _selectSummaryText(field, value, state) {
+    const v = String(value == null ? "" : value);
+    const rec = state && state.optLabels && state.optLabels[field.id];
+    // ⚠️ 记下的那条要**对得上 value** —— 用户可能在记下之后又换了选项。
+    if (rec && rec.label && String(rec.value) === v) return rec.label;
+    const opt = (field.options || []).find((o) => String(o.value) === v);
+    if (opt && opt.label) return opt.label;
+    return v;
+  }
+
   function _renderFinishStep(body, foot, cfg, stepDef, state) {
     body.innerHTML = "";
     const titleEl = _ce("h3", WIZARD_NS + "step-title", stepDef.title);
@@ -2209,7 +2233,16 @@
           return;
         }
         hasAny = true;
-        const val = isCheckbox ? (v ? "是" : "否") : String(v);
+        let val;
+        if (isCheckbox) {
+          val = v ? "是" : "否";
+        } else if (f.type === "select") {
+          // ⚠️ **select 显示「选项的文字」**，不是 value（机器码）——
+          // 见 ``_selectSummaryText``。
+          val = _selectSummaryText(f, v, state);
+        } else {
+          val = String(v);
+        }
         row.appendChild(_ce("span", WIZARD_NS + "summary-val", val));
         summary.appendChild(row);
       });
@@ -2463,6 +2496,23 @@
       // 先找内嵌 checkbox,有就以 checked 读;否则按 element value 读
       const innerCb = el.matches?.('input[type="checkbox"]')
         ? el : el.querySelector?.('input[type="checkbox"]');
+      // ⚠️ **select 要顺手记下「选项的文字」** —— 完成页摘要要显示的是
+      // 「翻译目标语言: 简体中文 zh-CN」，不是「翻译目标语言: zh-CN」
+      // （value 是机器码，用户根本看不懂自己选了什么）。
+      //
+      // ⚠️ **必须在这里取**（DOM 还活着的时候）—— 选项可能是**运行时**塞
+      // 进去的：卡片在 ``wizard:step-rendered`` 里把自己的字段选项重填一遍
+      // （ASR 卡的 37 种语言、TTS 卡的音色），``wizard.json`` 里只有占位
+      // 选项（「不翻译」）⇒ 静态表查不到。
+      if (el.tagName === "SELECT") {
+        const opt = (el.options && el.selectedIndex >= 0)
+          ? el.options[el.selectedIndex] : null;
+        const label = opt ? (opt.textContent || "").trim() : "";
+        if (label) {
+          if (!state.optLabels) state.optLabels = {};
+          state.optLabels[fid] = { value: el.value, label: label };
+        }
+      }
       if (innerCb) {
         state.values[fid] = innerCb.checked;
       } else if (el.value !== "") {
@@ -3100,6 +3150,11 @@
       app, cfg, container,
       currentStep: startStep,
       values,
+      // ⚠️ **select 选项的文字**（``{fieldId: {value, label}}``）——
+      // 完成页摘要要显示「简体中文 zh-CN」而不是机器码「zh-CN」。
+      // ⚠️ **只存在内存里**，不落 localStorage（那是派生值，且体积小但
+      // 没必要持久化 —— 摘要页是本次会话的事）。
+      optLabels: {},
       envCheck,
       single,
       intervals: [],
