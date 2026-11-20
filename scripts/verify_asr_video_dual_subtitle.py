@@ -173,6 +173,37 @@ def _sub_state(page) -> dict:
     )
 
 
+def _norm(text: str) -> str:
+    """比文本用：去掉空白和标点。"""
+    import re
+    return re.sub(r"[\s.,!?;:'\"、，。！？；：]", "", text or "")
+
+
+def _timeline_rows(page) -> list[dict]:
+    """时间轴上**每一行**的原文 / 译文 / 译文的原文。
+
+    ⚠️ 直接读前端的行级译文表（``_trLineTr``）⇒ 不依赖「页面自己算的映射」
+    ⇒ 能真的验证「译文挂对了行」（译文条目的 ``source`` 是不是**这一行**
+    的原文）。
+    """
+    return page.evaluate(
+        """() => {
+          const A = window.Qwen3Asr;
+          const tl = (A && A._buildSubTimeline) ? A._buildSubTimeline().lines : [];
+          return tl.map((ln) => {
+            const slot = String(ln.id || '').split(':').slice(0, 2).join(':');
+            const it = (A._trLineTr && A._trLineTr.get(slot)) || null;
+            return {
+              text: (ln.words || []).map((w) => w.text).join(''),
+              tr: it ? (it.text || '') : '',
+              src: it ? (it.source || '') : '',
+              st: it ? (it.status || '') : '',
+            };
+          });
+        }"""
+    )
+
+
 def _transcript_tr(page) -> list[str]:
     """转写框里的译文行。"""
     return page.evaluate(
@@ -256,6 +287,8 @@ def main() -> int:
         dup_ok = True            # 同一句译文不会同时挂在两行上
         match_ok = True          # 槽里的译文 == 映射算出来的那句（无残留）
         mismatch: list[str] = []
+        cur_had_tr = 0           # 「当前行已经有译文」的采样数
+        cur_total = 0            # 采样总数（当前行存在的那些）
         while time.time() - t0 < 240:
             snap = _sub_state(page)
             for ln in snap["lines"]:
@@ -283,9 +316,15 @@ def main() -> int:
                     if len(mismatch) < 3:
                         mismatch.append(f"{ln['orig'][:24]!r} dom={ln['tr'][:24]!r} "
                                         f"exp={exp[:24]!r}")
-            if got_sub and got_tr and len(seen_tr) >= 2 and len(seen_lines) >= 3:
+            # ⚠️ **节奏**：**当前行**（最后一条可见行）自己就该有译文 ——
+            # 不是等下一行出来才有（那是句子级翻译的毛病：看着像没实时翻译）。
+            if snap["lines"]:
+                cur_total += 1
+                if (snap["lines"][-1]["tr"] or "").strip():
+                    cur_had_tr += 1
+            if got_sub and got_tr and len(seen_tr) >= 3 and len(seen_lines) >= 3:
                 break
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(500)
 
         snap = _sub_state(page)
         print("  播放头: %.1f s" % snap["videoTime"])
@@ -311,6 +350,54 @@ def main() -> int:
               f"lines={seen_lines[:4]}")
         check("译文也跟着换（不止一句）", len(seen_tr) >= 2,
               f"tr={seen_tr[:4]}")
+
+        # --- 节奏：译文**逐行**跟着（YouTube 的 cue 对 cue）------------- #
+        #
+        # ⚠️ 句子级翻译的老毛病：字幕行 ~1.5 s 一行、译文 3~9 s 一句 ⇒ 译文
+        # 永远慢半拍，而且长句跨的行**整行没有译文** ⇒ 看着像「不是实时翻译」。
+        check("**当前行**自己就有译文（译文跟着这一行走，不等下一行）",
+              cur_total > 0 and cur_had_tr >= cur_total * 0.8,
+              f"有译文的采样 {cur_had_tr}/{cur_total}")
+
+        # 等识别跑完（最后一行也定稿了 ⇒ 它也该有译文）
+        for _ in range(120):
+            st = page.evaluate("() => (window.Qwen3Asr.snapshot || {}).state || ''")
+            if st == "done":
+                break
+            page.wait_for_timeout(500)
+        # ⚠️ **还要等译文到齐** —— 识别结束 ≠ 译文都回来了（模型还在翻）。
+        rows: list[dict] = []
+        for _ in range(60):
+            rows = _timeline_rows(page)
+            if rows and all((r["tr"] or "").strip() for r in rows):
+                break
+            page.wait_for_timeout(500)
+        print("  时间轴 %d 行：" % len(rows))
+        for r in rows:
+            print("    %-46r -> %s" % (r["text"][:44], (r["tr"] or "")[:36]))
+        missing = [r["text"][:30] for r in rows if not (r["tr"] or "").strip()]
+        check("**每一行**都有译文（不是只有最后一行）", not missing,
+              f"没译文的行={missing[:3]}")
+        wrong = [(r["text"][:24], r["src"][:24]) for r in rows
+                 if (r["tr"] or "").strip()
+                 and _norm(r["src"]) != _norm(r["text"])]
+        check("译文挂对了行（译文的原文 == 那一行的原文）", not wrong,
+              f"对不上={wrong[:3]}")
+        cnt = page.evaluate(
+            """() => {
+              const A = window.Qwen3Asr;
+              return {
+                req: (A._trLineReq && A._trLineReq.size) || 0,
+                items: (A._tr.items || []).length,
+                lines: ((A._buildSubTimeline && A._buildSubTimeline().lines)
+                        || []).length,
+              };
+            }"""
+        )
+        check("没有重复翻译（请求数 == 行数）",
+              cnt["req"] == cnt["lines"], f"{cnt}")
+        check("面板里没有过期条目（条目数 == 行数）",
+              cnt["items"] == cnt["lines"], f"{cnt}")
 
         # --- 转写框同步 ---
         trs = _transcript_tr(page)
