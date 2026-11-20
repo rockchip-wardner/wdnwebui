@@ -4400,7 +4400,8 @@ window.ImApp_qwen3_asr.preloadExtraModels = async function (opts) {
   * ⇒ 断行在**前端**（只有前端知道行怎么排）⇒ 翻译单位也得前端驱动 ⇒ 插件
     新增 `POST /api/qwen3-asr/translate/line`，视频路径的 `/transcribe` 带
     `translate_mode=line`（后端**不做**句子级翻译，否则两种译文会挂同一行）。
-  * ⇒ **音频文件**仍是句子级（没有字幕行，译文只出现在「译文面板」里）。
+  * ⇒ **音频文件**仍是句子级（没有字幕行，译文挂在**结果框的句子流**里 ——
+    见下面「结果区唯一」那一节）。
 * ⚠️ **「翻译的单位」必须跟着**来源**一起认领**（2026-11-20 踩过）——
   插件里的 `_trMode` 不是随手设的开关，是**这批轮次的属性**，必须和
   `_roundsSource` 同时被认领（`_claimRoundsSource(kind, force)`）。
@@ -4430,6 +4431,34 @@ window.ImApp_qwen3_asr.preloadExtraModels = async function (opts) {
 > ⚠️ 素材要先拷进 `<assets>/uploads`（播放端点只放行 `uploads` 与 `tts` 两个
 > 根）—— 脚本自己拷。素材由 `.venv/bin/python scripts/make_asr_ref_video.py`
 > 生成。
+
+### Qwen3-ASR 卡：**结果区唯一** —— 译文并入结果框（2026-11-20）
+
+用户反馈：「『实时翻译』下面的结果显示界面，和『实时结果』下面的结果显示
+界面**是否重复**？」—— 实测**确实重复**（视频路径 3 遍、音频路径 2 遍）。
+
+⇒ 改成**方案 A**：结果框唯一 ——「实时翻译」那块**只剩控制条**（+ 一行
+说明），译文**挂在它自己那句原文下面**（结果框里的**句子流**）。详细设计
+在插件仓的 `AGENTS.md`（「结果区唯一」一节），宿主侧要知道的：
+
+* **断句只有一份** —— 后端 `_SentenceSplitter` 切，随帧的 `sentences` 字段
+  送来；前端**不自己断句**。
+* ⚠️ **`_tr_flush()` 改名 `_sent_flush()`**（插件）—— 切句与翻译**解耦**
+  了（切句器不再看翻译开关）⇒ 收尾 flush 不再依赖翻译上下文 ⇒ 名字跟着
+  改。宿主回归 `scripts/verify_asr_translation.py` 跟着改了。
+* ⚠️ **`GET /api/qwen3-asr/rounds` 多返回 `sentences`** —— 刷新后结果框
+  不能是空的（轮次能恢复、句子也得能恢复）。
+* ⚠️ **`verify_asr_wizard.py` 的 U18 断言改了** —— 「切回音频文件来源 ⇒
+  结果恢复显示」现在看的是**句子流**（`#asr-sentences`）而不是那两个
+  「镜像」span（音频文件来源下它们是**藏起来**的：藏 ≠ 不更新，回归脚本
+  仍从 `#asr-live-committed` 读最终文本）。
+
+回归（宿主仓）：
+
+* `.venv/bin/python scripts/verify_asr_file_translate_ui.py` —— 真机浏览器
+  级（19 条）：翻译控件可见且不在 live 块里、**没有独立的译文列表**、
+  结果框里那两个「镜像」span **藏起来了**、走 UI 流程后结果框里
+  **原文 + 译文成对出行**、「清空」后结果框空了。
 
 ### Qwen3-ASR 卡：「翻译目标语言」下拉的**显示格式**（2026-11-20）
 

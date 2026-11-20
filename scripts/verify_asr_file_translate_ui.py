@@ -7,10 +7,14 @@
 1. **翻译面板对三种来源都可见** —— 它**不在** live 块里（live 块由
    ``asr.live.enabled`` 门控）⇒ 选「音频文件」时它照样在。
 2. **语言下拉被填满** —— 语言表是运行时才有的（provider 的语言表）。
-3. **文件识别 ⇒ 译文真的渲染出来** —— 走完整的 UI 流程（填设备端路径
-   → 点「开始识别」→ 轮次帧 → 译文帧 → ``#asr-rt-translated`` 出行）。
-4. **「清空」后空态提示回得来** —— ⚠️ 译文区原来用 ``innerHTML = ""``
-   重建，会把空态提示节点一起删掉 ⇒ 清空后是一片空白。
+3. **没有独立的译文列表** —— ⚠️ 这是本脚本最核心的一条：译文**只在**
+   结果框（句子流）里，与原文**一句一句对应** ⇒ 同一句话在屏幕上
+   **只出现一遍**（原来「实时翻译」下面那栏把原文又抄了一遍 ⇒ 两遍）。
+4. **文件识别 ⇒ 译文真的渲染出来** —— 走完整的 UI 流程（填设备端路径
+   → 点「开始识别」→ 轮次帧 → 译文帧 → 结果框里成对出行）。
+5. **结果框里不再有连续文本** —— 那两个「镜像」span（回归脚本读最终
+   文本用的）必须**藏起来** ⇒ 否则句子流与连续文本在同一个框里出现两遍。
+6. **「清空」后结果框空了** —— 且翻译面板的控制条与说明还在。
 
 跑之前要满足：**ASR 模型**（``qwen3-asr``）与**翻译模型**在跑，脚本
 自己会开实时翻译开关。
@@ -118,24 +122,24 @@ def _ensure_models() -> tuple[bool, bool]:
     return asr_ok, mt_ok
 
 
-def _tr_rows(page) -> list[dict]:
-    """译文区里的每一行（原文 + 译文）。"""
+def _sent_rows(page) -> list[dict]:
+    """结果框（句子流）里的每一行 —— 原文 + 译文。"""
     return page.evaluate(
-        """() => [...document.querySelectorAll('#asr-rt-translated .asr-tr-item')]
+        """() => [...document.querySelectorAll('#asr-sentences .asr-sent')]
            .map(r => ({
-             src: (r.querySelector('.asr-tr-src') || {}).textContent || '',
-             dst: (r.querySelector('.asr-tr-dst') || {}).textContent || '',
+             src: (r.querySelector('.asr-sent-src') || {}).textContent || '',
+             dst: (r.querySelector('.asr-sent-dst') || {}).textContent || '',
            }))"""
     )
 
 
 def _panel_state(page) -> dict:
-    """翻译面板的可见性 / 语言数 / 空态提示在不在。"""
+    """翻译面板的可见性 / 语言数 / **有没有独立的译文列表**。"""
     return page.evaluate(
         """() => {
           const blk = document.getElementById('asr-tr-block');
           const sel = document.getElementById('asr-tr-target');
-          const empty = document.getElementById('asr-tr-empty');
+          const note = document.querySelector('#asr-tr-block .asr-tr-note');
           const vis = (el) => {
             if (!el) return false;
             const r = el.getBoundingClientRect();
@@ -147,15 +151,26 @@ def _panel_state(page) -> dict:
             }
             return true;
           };
+          // ⚠️ **旧的独立译文列表不许再存在** —— 它把原文又抄了一遍
+          // （与结果框逐字重复）⇒ 同一句话在屏幕上出现两遍。
+          const old = document.getElementById('asr-rt-translated');
+          const oldEmpty = document.getElementById('asr-tr-empty');
+          const mirror = document.getElementById('asr-live-committed');
           return {
             exists: !!blk,
             visible: vis(blk),
             inLiveBlock: !!(blk && blk.closest('#asr-live-block')),
             options: sel ? sel.options.length : 0,
             value: sel ? sel.value : '',
-            emptyExists: !!empty,
-            emptyVisible: vis(empty),
-            emptyText: empty ? (empty.textContent || '').trim() : '',
+            noteExists: !!note,
+            noteVisible: vis(note),
+            noteText: note ? (note.textContent || '').trim() : '',
+            oldListExists: !!old,
+            oldEmptyExists: !!oldEmpty,
+            // 结果框里那两个「镜像」span 必须**藏起来**（否则句子流与
+            // 连续文本在同一个框里出现两遍）。
+            mirrorDisplay: mirror ? getComputedStyle(mirror).display : '',
+            mirrorLen: mirror ? (mirror.textContent || '').trim().length : 0,
           };
         }"""
     )
@@ -163,7 +178,7 @@ def _panel_state(page) -> dict:
 
 def main() -> int:
     print("=" * 72)
-    print("回归（浏览器）：音频文件 ⇒ 实时翻译")
+    print("回归（浏览器）：音频文件 ⇒ 实时翻译（译文并入结果框）")
     print("=" * 72)
 
     asr_ok, mt_ok = _ensure_models()
@@ -179,14 +194,13 @@ def main() -> int:
     _, st = api("GET", "/api/qwen3-asr/translate/status")
     check("实时翻译已开启", bool(st.get("enabled")), f"status={st}")
 
-    # ⚠️ **先把上一轮的识别结果清掉** —— 下面要断言「空态提示在（**还没识别
-    # 时**）」，这个前提得由脚本自己保证。
+    # ⚠️ **先把上一轮的识别结果清掉** —— 下面要断言「还没识别时结果框是
+    # 空的」，这个前提得由脚本自己保证。
     #
     # ⚠️ 轮次只存在**服务端的内存**里 ⇒ 别的脚本（尤其
     # ``verify_asr_video_dual_subtitle.py``）跑完之后，服务端还留着**视频**
-    # 轮次 ⇒ 页面一打开就会**恢复**它们 ⇒ 而且（行级翻译是前端驱动的）
-    # 恢复的这些行会**重新要一遍译文** ⇒ 译文区就不是空的了 ⇒ 「空态提示
-    # 在」这条断言会**假失败**。
+    # 轮次 ⇒ 页面一打开就会**恢复**它们 ⇒ 译文区就不是空的了 ⇒ 断言会
+    # **假失败**。
     #
     # ⇒ 这里显式 ``POST /reset`` ⇒ 前置条件不靠运气。
     api("POST", "/api/qwen3-asr/reset")
@@ -226,9 +240,19 @@ def main() -> int:
               f"state={state}")
         check("语言下拉被填满（运行时语言表）", state["options"] > 1,
               f"options={state['options']}")
-        check("空态提示在（还没识别时）", state["emptyVisible"], f"state={state}")
+        check("翻译块有一行说明（告诉用户译文在哪）", state["noteVisible"],
+              f"state={state}")
 
-        # --- 2. 走 UI 流程识别一个文件 ---
+        # --- 2. **没有独立的译文列表**（本脚本的核心）---
+        check("**没有独立的译文列表**（译文只在结果框里）",
+              not state["oldListExists"], f"state={state}")
+        check("旧的空态提示节点也没了", not state["oldEmptyExists"],
+              f"state={state}")
+        check("结果框里那两个「镜像」span **藏起来了**"
+              "（否则句子流与连续文本出现两遍）",
+              state["mirrorDisplay"] == "none", f"state={state}")
+
+        # --- 3. 走 UI 流程识别一个文件 ---
         page.evaluate(
             """(p) => {
               const el = document.getElementById('asr-source');
@@ -244,15 +268,20 @@ def main() -> int:
         check("「开始识别」按钮可点", btn.is_enabled(), "按钮被禁用")
         btn.click()
 
-        # --- 3. 等译文出现在译文区 ---
+        # --- 4. 等译文出现在结果框（与原文成对）---
         rows: list[dict] = []
         t0 = time.time()
         while time.time() - t0 < 240:
-            rows = _tr_rows(page)
-            if rows:
+            rows = _sent_rows(page)
+            done = [r for r in rows
+                    if (r["dst"] or "").strip()
+                    and "翻译中" not in (r["dst"] or "")
+                    and "未翻译" not in (r["dst"] or "")]
+            if done:
+                rows = done
                 break
             page.wait_for_timeout(1000)
-        check("文件识别 ⇒ 译文区**真的出行了**", len(rows) >= 1,
+        check("文件识别 ⇒ 结果框里**原文 + 译文成对出行了**", len(rows) >= 1,
               f"等了 {time.time() - t0:.0f}s")
         for r in rows:
             print("    原文: %s" % (r["src"] or "")[:70])
@@ -264,19 +293,19 @@ def main() -> int:
             check("每一行都有译文（不是「未翻译」）",
                   all((r["dst"] or "").strip() and "未翻译" not in (r["dst"] or "")
                       for r in rows), f"rows={rows}")
+            # ⚠️ **译文挂在它自己的原文下面** ⇒ 一一对应，不重复。
+            check("译文是**逐句成对**的（行数一致）",
+                  len(rows) == len(_sent_rows(page)),
+                  f"rows={rows}")
 
-        state2 = _panel_state(page)
-        check("有译文时空态提示收起来了", not state2["emptyVisible"],
-              f"state={state2}")
-
-        # --- 4. 「清空」⇒ 空态提示回得来 ---
+        # --- 5. 「清空」⇒ 结果框空了 ---
         page.locator("#asr-reset-btn").click()
         page.wait_for_timeout(2500)
-        rows2 = _tr_rows(page)
+        rows2 = _sent_rows(page)
         state3 = _panel_state(page)
-        check("「清空」后译文区空了", len(rows2) == 0, f"rows={rows2}")
-        check("「清空」后**空态提示回得来**（不是一片空白）",
-              state3["emptyVisible"], f"state={state3}")
+        check("「清空」后结果框空了", len(rows2) == 0, f"rows={rows2}")
+        check("「清空」后翻译面板的控制条还在",
+              state3["visible"] and state3["noteVisible"], f"state={state3}")
 
         check("没有 JS 错误", not errors, f"errors={errors[:4]}")
         browser.close()

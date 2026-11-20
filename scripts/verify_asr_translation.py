@@ -608,7 +608,10 @@ def test_file_path_hook() -> None:
         "committed": "Hello there. This is fine. And a tail",
         "unfixed": "", "language": "English",
     }))
-    svc._tr_flush()
+    # ⚠️ 方法名是 ``_sent_flush``（不是 ``_tr_flush``）—— **切句与翻译解耦**
+    # 了：收尾把尾巴切成一句是「切句」的事，跟翻译开没开无关 ⇒ 切句器
+    # 不再看翻译上下文 ⇒ 方法名从「_tr_」改成了「_sent_」。
+    svc._sent_flush()
     frames = _collect_until(sub_svc, sub_q,
                              lambda f: f.get("type") == "translation")
     tr = sorted((f for f in frames if f.get("type") == "translation"),

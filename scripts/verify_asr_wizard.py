@@ -1991,7 +1991,7 @@ def verify_sources(page, shot_dir: Path) -> None:
                 page.select_option("#asr-mode", "single")
                 page.wait_for_timeout(400)
 
-                # 切回「音频文件」→ 转写框收起，回到单行「实时结果」
+                # 切回「音频文件」→ 转写框收起，回到「句子流」结果框
                 page.click('#asr-source-tabs .asr-source-tab[data-source=file]')
                 page.wait_for_timeout(800)
                 back = page.evaluate(
@@ -1999,12 +1999,23 @@ def verify_sources(page, shot_dir: Path) -> None:
                         const box = document.getElementById('asr-transcript');
                         const c = document.getElementById('asr-live-committed');
                         const cs = getComputedStyle(c);
+                        // ⚠️ **音频文件来源的结果框 = 「句子流」**（原文 + 译文
+                        // 成对）—— 那两个「镜像」span 是**藏起来**的
+                        // （藏 ≠ 不更新：回归脚本仍从 `#asr-live-committed`
+                        // 读最终文本）⇒ 「结果恢复显示」看句子流。
+                        const sents = document.getElementById('asr-sentences');
+                        const ss = sents ? getComputedStyle(sents) : null;
                         return {hidden: box.classList.contains('hidden'),
                                 display: cs.display,
-                                text: (c.textContent || '').trim().length};
+                                text: (c.textContent || '').trim().length,
+                                sentsDisplay: ss ? ss.display : '',
+                                sentsHidden: sents
+                                    ? sents.classList.contains('hidden') : null};
                     }""")
-                check("U18 切回音频文件来源 → 转写框收起、单行结果恢复显示",
-                      back["hidden"] is True and back["display"] != "none",
+                check("U18 切回音频文件来源 → 转写框收起、结果框（句子流）恢复显示",
+                      back["hidden"] is True
+                      and back["sentsHidden"] is False
+                      and back["sentsDisplay"] != "none",
                       f"{back}")
             finally:
                 try:
