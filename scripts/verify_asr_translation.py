@@ -279,6 +279,7 @@ def test_language_normalize() -> None:
 def test_translation_service() -> None:
     print("\n[4] 翻译服务：开关 / 帧 / 降级 / 队列")
     from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+        QUEUE_MAX,
         TranslationService,
     )
 
@@ -368,12 +369,14 @@ def test_translation_service() -> None:
     _install_fake_manager("ok")
     svc5 = TranslationService()
     svc5.configure(enabled=True, target_lang="en")
-    for i in range(1, 60):
+    # ⚠️ **按模块里的 ``QUEUE_MAX`` 填**（2026-11-20 从 32 放大到 256）——
+    # 写死数字的话，改了上限这条断言就测不到「队列有界」了。
+    for i in range(1, QUEUE_MAX + 20):
         svc5.submit(index=i, text=f"句子{i}", lang="Chinese",
                     stream_id="live-q", loop=None)
     st = svc5.status()
     check("队列有界（满了丢最旧，不无限涨）",
-          st["queue_depth"] <= 32, f"queue_depth={st['queue_depth']}")
+          st["queue_depth"] <= QUEUE_MAX, f"queue_depth={st['queue_depth']}")
     check("丢弃被计数", st["dropped"] > 0, f"dropped={st['dropped']}")
 
     # --- 关掉开关 ⇒ 队列清空 ---
@@ -381,6 +384,13 @@ def test_translation_service() -> None:
     check("关掉开关 ⇒ 排队中的句子被丢掉",
           svc5.status()["queue_depth"] == 0,
           f"queue_depth={svc5.status()['queue_depth']}")
+    # ⚠️ **把 svc5 的后台线程彻底停掉** —— 假翻译器是**调用时**取单例的
+    # （``get_npu_translate_instances()``）⇒ svc5 的 worker 要是还活着，就会
+    # 在**下一个**测试里继续翻那些「句子N」，而那时单例已经换成新的假件了
+    # ⇒ 那些调用被算到下一个测试头上 ⇒ 假失败（实测：端点钩子那条看到
+    # 「句子102」）。⇒ close + 等在飞的那一句翻完。
+    svc5.close()
+    time.sleep(0.8)
 
     # --- clear() 清统计 ---
     svc5.clear()
