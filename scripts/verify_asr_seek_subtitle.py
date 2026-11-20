@@ -216,6 +216,39 @@ def _probe(page) -> dict:
     return page.evaluate(PROBE)
 
 
+def _sub_diag(page) -> dict:
+    """采样点的诊断信息（断言失败时要看的就是这些）。
+
+    字幕为什么没出来，只有三种可能：**播放头不在已识别区间里**、
+    **时间轴上还没有行**、**有行但那一行在播放头之前很远**。
+    """
+    return page.evaluate(
+        """() => {
+  const A = window.Qwen3Asr;
+  const video = document.getElementById('asr-video');
+  const t = (video ? (video.currentTime || 0) : 0)
+            - (A ? (A._audioOriginSec || 0) : 0);
+  const rs = (A && A.rounds) ? A.rounds : [];
+  const eps = (A && A._splitEpochs) ? A._splitEpochs(rs) : [];
+  const tl = (A && A._buildSubTimeline) ? A._buildSubTimeline().lines : [];
+  return {
+    t: t,
+    ranges: ((A && A._subRanges) || []).map(r => [r.start, r.end]),
+    recognized: (A && A._subRecognizedAt) ? !!A._subRecognizedAt(t) : null,
+    lines: tl.map(l => [l.start, l.end,
+                        (l.words || []).map(w => w.text).join('')]),
+    epochs: eps.map(ep => {
+      const last = ep[ep.length - 1] || {};
+      let finalText = '';
+      for (const f of ep) if (f.committed) finalText = f.committed;
+      return { start: last.chunk_start_sec, n: ep.length,
+               text: finalText.slice(0, 24) };
+    }),
+  };
+}"""
+    )
+
+
 def _visible(page) -> list[str]:
     return [s["orig"] for s in _probe(page)["slots"]
             if (s["orig"] or "").strip()]
@@ -404,7 +437,8 @@ def main() -> int:
 
         # 追上之后字幕要回来，而且**必须是在播放头附近**的那一行
         vis = _visible(page)
-        check("追上之后字幕恢复", bool(vis), f"slots={vis}")
+        diag = _sub_diag(page)
+        check("追上之后字幕恢复", bool(vis), f"slots={vis} diag={diag}")
         stray2 = _stray_lines(page)
         check("追上之后的字幕**在播放头附近**（不是拖动前那一行）",
               bool(vis) and not stray2,
