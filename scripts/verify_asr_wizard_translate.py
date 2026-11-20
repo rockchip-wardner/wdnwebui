@@ -306,6 +306,17 @@ def _run_case(browser, *, fail_enable: bool, lang: str) -> tuple[list, list]:
     check("完成页摘要里有「翻译目标语言」",
           any("翻译目标语言" in r for r in rows), f"实际 {rows}")
 
+    # ⚠️ **摘要里显示的是「语言名」，不是机器码** —— 机器码（``zh-CN``）是
+    # 给程序看的，用户在完成页看到「翻译目标语言: zh-CN」根本不知道自己选
+    # 了什么 ⇒ 框架要显示**选项的文字**（见 core/wizard/state.js 的
+    # ``_selectSummaryText``）。
+    tr_row = next((r for r in rows if "翻译目标语言" in r), "")
+    zh_opt = next((o for o in opts if o.get("v") == lang), {})
+    zh_name = (zh_opt.get("t") or "").split(" ")[0].strip()
+    check("摘要里显示的是**语言名**（不是机器码）",
+          bool(zh_name) and zh_name in tr_row,
+          f"摘要={tr_row!r} 期望包含={zh_name!r}")
+
     st, before = api("GET", f"/api/{CARD}/")
     baseline = int(before.get("round_count") or 0)
 
