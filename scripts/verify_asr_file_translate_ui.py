@@ -179,6 +179,18 @@ def main() -> int:
     _, st = api("GET", "/api/qwen3-asr/translate/status")
     check("实时翻译已开启", bool(st.get("enabled")), f"status={st}")
 
+    # ⚠️ **先把上一轮的识别结果清掉** —— 下面要断言「空态提示在（**还没识别
+    # 时**）」，这个前提得由脚本自己保证。
+    #
+    # ⚠️ 轮次只存在**服务端的内存**里 ⇒ 别的脚本（尤其
+    # ``verify_asr_video_dual_subtitle.py``）跑完之后，服务端还留着**视频**
+    # 轮次 ⇒ 页面一打开就会**恢复**它们 ⇒ 而且（行级翻译是前端驱动的）
+    # 恢复的这些行会**重新要一遍译文** ⇒ 译文区就不是空的了 ⇒ 「空态提示
+    # 在」这条断言会**假失败**。
+    #
+    # ⇒ 这里显式 ``POST /reset`` ⇒ 前置条件不靠运气。
+    api("POST", "/api/qwen3-asr/reset")
+
     errors: list[str] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(args=["--no-sandbox"])

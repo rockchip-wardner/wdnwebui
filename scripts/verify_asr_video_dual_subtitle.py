@@ -416,6 +416,45 @@ def main() -> int:
               all(not (ln["tr"] or "").strip() for ln in snap2["lines"]),
               f"lines={snap2['lines']}")
 
+        # --- 刷新页面后译文要回来 ------------------------------------- #
+        #
+        # ⚠️ 行级翻译是**前端驱动**的（前端才知道行是怎么排的）⇒ 刷新后
+        # 前端的行级记账是**空的** ⇒ 这些行得**重新要一遍**译文。
+        #
+        # ⚠️ 而且**翻译的单位**必须跟着「来源」一起认领 —— 不然刷新后
+        # ``_trMode`` 还是默认的 "sentence" ⇒ 行级翻译一次都不发起 ⇒
+        # **一句译文都没有**（改行级之前是有的：句子级翻译在后端做，
+        # 刷新后新订阅者照样收得到 ⇒ 这是一条本轮引入的回归）。
+        api("POST", "/api/qwen3-asr/translate/settings",
+            {"enabled": True, "target_lang": "zh-CN"})
+        page.wait_for_timeout(6000)     # 等前端的下一次轮询看到「开着」
+        n_before = len(_timeline_rows(page))
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(2500)
+        skip2 = page.locator("#wd-wizard-root-qwen3-asr .wd-wizard-skip-btn").first
+        if skip2.count() and skip2.is_visible():
+            skip2.click()
+            page.wait_for_timeout(1200)
+        page.wait_for_selector("#page-qwen3-asr:not(.hidden)", timeout=15000)
+        mode_after = page.evaluate("() => window.Qwen3Asr ? window.Qwen3Asr._trMode : ''")
+        check("刷新后认领了「行级」翻译（跟着来源一起认领）",
+              mode_after == "line", f"_trMode={mode_after!r}")
+        rows2: list[dict] = []
+        for _ in range(120):
+            rows2 = _timeline_rows(page)
+            if rows2 and all((r["tr"] or "").strip() for r in rows2):
+                break
+            page.wait_for_timeout(500)
+        check("刷新后轮次恢复了", len(rows2) >= n_before,
+              f"刷新前 {n_before} 行 / 刷新后 {len(rows2)} 行")
+        missing2 = [r["text"][:30] for r in rows2 if not (r["tr"] or "").strip()]
+        check("刷新后**每一行仍有译文**（行级翻译重新要过了）", not missing2,
+              f"没译文的行={missing2[:3]}")
+        wrong2 = [(r["text"][:24], r["src"][:24]) for r in rows2
+                  if (r["tr"] or "").strip()
+                  and _norm(r["src"]) != _norm(r["text"])]
+        check("刷新后译文仍挂对了行", not wrong2, f"对不上={wrong2[:3]}")
+
         check("没有 JS 错误", not errors, f"errors={errors[:4]}")
         browser.close()
 
