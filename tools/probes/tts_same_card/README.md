@@ -16,6 +16,8 @@
 | 脚本 | 对应实验 | 作用 |
 |---|---|---|
 | `scan_core_mask_models.py <card>` | §2.3 实验 4 | 用 4 个真实子模型逐个试 `core_mask` ⇒ 得「**掩码置位数 == 模型编译核数**」规则 |
+| `scan_one.py <rknn> <weight> [llm]` | §2.3 实验 11 | 单个模型探「编译核数」（用驱动的 `CORE_NUMBER` 查询交叉验证）；逐个模型跑可列出全板的核数 |
+| `util_probe.py <card> <rounds>` | §2.3 实验 10 | 合成期间每 50 ms 读 `rknnsmi` 的 `util_rate_pct` ⇒ **单实例到底吃满几个核**（需 root） |
 | `ladder2.py "<role>:<mask>:<count>"` | §2.3 实验 5 | 在空卡上连续建 N 个裸 runtime ⇒ 测每卡配额（每个 spec 用逗号分隔可组合） |
 | `session_quota.py contexts <n>` | §2.3 实验 5/8 | N 个 llm runtime，**每个建 1 个 LLM session** ⇒ 测 session 数量是否受配额 |
 | `session_quota.py per_ctx <n>` | §2.3 实验 8 | **1 个 runtime 上建 N 个 session** ⇒ 测驱动是否允许同 context 多 session |
@@ -34,7 +36,9 @@
    直接用 `app.core.compute.workers._base._build_session`。
 4. **裸 runtime 不会自动释放** ⇒ 阶梯脚本靠进程退出回收；同一进程里想继续占槽就**别调 `release()`**。
 5. **驱动日志走 stderr、且不换行** ⇒ 和 stdout 混在一起会看不清 ⇒ 跑的时候把 stderr 重定向到单独文件。
-6. `rknnsmi` 需要 root（`/dev/pcie-rkep-*` 权限）。
+6. `rknnsmi` 需要 root（`/dev/pcie-rkep-*` 权限）⇒ `util_probe.py` 要用 `sudo -n` 跑。
+7. ⚠️ **`device_id` 传错类型 ⇒ 段错误**：`device_id` 必须是 **bytes**（如 `b"0003:31:00.0"`）。
+   若写成 `BDF[CARD]` 而 `BDF` 本身已经是 bytes ⇒ 会把**字节串当字典索引**得到一个整数 ⇒ 驱动 `rknn3_init` 直接 **SIGSEGV**（不是报错，是段错误，很难查）。
 
 ## 卡号 ↔ device_id
 
