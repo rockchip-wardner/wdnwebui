@@ -2,6 +2,8 @@
 
 > 状态：**待审核**（用户要求先出报告，不实施）
 > 版本：v4（2026-11-21）。v2 按用户三条原则重写；v3 补上**双 TTS 实例的实测评估**；**v4 在用户追问「npu2 禁用后，同卡双 TTS 实例还有没有戏」后重做了硬件侧验证** —— 纠正 v3 的两处结论（`core_mask` 规则、每卡 runtime 上限），并**把「同卡不并行」从推论变成实测**。
+> ➡️ **实施方案见** `docs/SIMULTANEOUS_INTERPRETATION_IMPL.md`（本文讲**为什么**，那篇讲**怎么做**）。
+> ➡️ **部署形态已定（用户 2026-11-21）**：**卡 0 = ASR + 翻译，卡 1 = 单实例 TTS，npu2 禁区，不重新转模型**。
 > 涉及仓库：宿主 `wdnwebui`（`app/core/audio/`、`app/static/core/`）+ 插件 `wdnapps_audio_chat`（`cards/qwen3_asr/`、`cards/tts/`）
 > 适用卡片：`qwen3-asr`（流式语音识别）新增一个与「实时翻译」并列的**同声传译模式**
 
