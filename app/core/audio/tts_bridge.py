@@ -22,7 +22,7 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 
 # 播放目标常量(纯字符串,与具体实现无关)
@@ -30,6 +30,22 @@ PLAY_DEVICE = "device"    # SDK 流式通过 ALSA 板载 codec 播放(原行为)
 PLAY_BROWSER = "browser"  # SDK 静默;服务端 WAV 通过 <audio> 给浏览器播
 PLAY_BOTH = "both"        # SDK 流式 + WAV 同时给浏览器
 PLAY_TARGETS = (PLAY_DEVICE, PLAY_BROWSER, PLAY_BOTH)
+
+#: **同传队列专用**：只合成、**不在会话里播** —— 由队列自己的播放器线程播。
+#:
+#: 为什么需要它：``PLAY_BOTH`` 的播放是**边合成边播**（PCM 一到就进
+#: aplay），于是「合成」和「播放」被**焊死在一句**里 —— 下一句的合成
+#: 必须等这一句的合成结束，而这一句的播放还没完 ⇒ 每句白等一个
+#: **首窗延迟**（实测 3.7 s：decoder 首窗要 50 帧 = 4 s 音频，talker
+#: 50 步 ≈ 3.7 s）⇒ 队列吞吐只有 **0.67× 实时** ⇒ 实时同传的滞后
+#: 必然越落越远（实测 25 s 源音频 ⇒ 滞后 23 s 且持续增长）。
+#:
+#: ⇒ ``PLAY_QUEUE`` 让会话**只产出 PCM**，播放交给队列的播放器线程 ⇒
+#: 下一句的合成可以和这一句的播放**重叠** ⇒ 吞吐回到 ≈1× 实时。
+#:
+#: ⚠️ **不进 ``PLAY_TARGETS``** —— 那是语音生成卡自己 API 的取值校验，
+#: 用户不该能从那个接口选到这个内部模式。
+PLAY_QUEUE = "queue"
 
 
 def default_ref_speaker() -> str:
@@ -51,7 +67,15 @@ def default_ref_speaker() -> str:
 class TTSRequest:
     """TTS 合成请求。``play_to`` 决定音频去向:device/browser/both 三选一。
     ``volume`` 0.0–1.0 线性振幅(原 service.py 注释: web 默认 0.1 适配
-    host mixer 默认 100% 的硬件)。"""
+    host mixer 默认 100% 的硬件)。
+
+    ``save_wav`` / ``tempo`` 是**同声传译队列**加的两个字段（2026-11-21）：
+
+    * ``save_wav=False`` —— 同传是「一句接一句」地播，落 WAV 只是往 eMMC
+      灌垃圾（同传一次会议能灌几百 MB）⇒ 默认关掉。
+    * ``tempo>1.0`` —— 播放变速（sox ``tempo`` 效果，不变调）。**只影响
+      播放**，不影响合成；``1.0`` 时走原来的 ``aplay`` 路径，零风险。
+    """
     text:        str = ""
     language:    str = "auto"
     speaker:     str = ""             # SPK_ID (serena / ryan / ...)
@@ -62,6 +86,22 @@ class TTSRequest:
     play_to:     str = PLAY_DEVICE
     output:      str = ""             # 绝对路径;空则自动填充
     non_streaming_mode: bool = False
+    save_wav:    bool = True          # False = 不落盘（同传用）
+    tempo:       float = 1.0          # 播放变速（1.0 = 不变速）
+    #: **首个解码窗口攒多少帧才开声**（0 = SDK 默认 25）。
+    #:
+    #: ⚠️ 上游实现首窗硬等满 50 帧（= 4 s 音频）⇒ 实测「合成首窗」
+    #: ≈ **3.0 s** —— 同传链路上最大的一段固定延迟。decoder 是**因果**的
+    #: ⇒ 首窗不需要未来帧 ⇒ 攒 25 帧即可 ⇒ **首声提前 ~1.5 s**
+    #: （详见 ``wdnai.backends.tts.FIRST_WINDOW_FRAMES``）。
+    first_window_frames: int = 0
+
+
+class TTSUnavailable(RuntimeError):
+    """TTS 能力不可用 —— 插件没装 / 实例没跑 / 队列不存在。
+
+    调用方（ASR 卡的同传引擎）据此**降级为仅字幕**，而不是让整个功能挂掉。
+    """
 
 
 #: TTS 会话实现所在模块的候选路径 —— 插件包优先,树内旧路径兜底。
@@ -111,6 +151,135 @@ def get_session():
     raise ImportError(
         "TTS 会话实现不可用:候选路径全部 import 失败: "
         + ", ".join(_TTS_SESSION_MODULES))
+
+
+# --------------------------------------------------------------------------- #
+# 同声传译队列（2026-11-21）
+# --------------------------------------------------------------------------- #
+#
+# 同传是**另一个卡片**在调 TTS 卡 ⇒ 卡片之间不能直接 import（AGENTS 铁律：
+# 卡片只能 import ``app.core.*``）⇒ 这一层就是那道门。
+#
+# 队列在插件侧（``cards/tts/queue.py``）：单实例串行消费 + 变速 + 滞后记账。
+# 宿主这边只做「候选路径解析 + 插件缺失抛 TTSUnavailable」。
+
+#: TTS **队列**实现所在模块的候选路径 —— 与会话模块同构。
+_TTS_QUEUE_MODULES = (
+    "wdnapps_audio_chat.cards.tts.queue",
+    "app.apps.tts.queue",
+)
+
+
+def _queue_module():
+    """拿到队列模块；插件没装 → ``TTSUnavailable``（不是 ImportError）。
+
+    为什么不是 ImportError：调用方（同传引擎）要区分「**没有 TTS**」和
+    「**TTS 出 bug**」—— 前者降级为仅字幕，后者要报错。
+    """
+    for mod_path in _TTS_QUEUE_MODULES:
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        return mod
+    raise TTSUnavailable(
+        "TTS 队列不可用:候选路径全部 import 失败: "
+        + ", ".join(_TTS_QUEUE_MODULES))
+
+
+def submit_queued(text: str, language: str = "auto", speaker: str = "",
+                  ref_speaker: str = "", volume: float = 0.5,
+                  tempo: Optional[float] = None,
+                  src_end_ts: float = 0.0, src_start_ts: float = 0.0,
+                  src_start_sec: float = -1.0, stream_id: str = "",
+                  play_to: str = PLAY_BOTH,
+                  first_window_frames: int = 0) -> dict:
+    """把一句译文**排队**给 TTS 播（同传的唯一入口）。
+
+    返回 ``{seq, queued, est_audio_sec, depth}``。
+
+    ⚠️ ``tempo=None``（默认）⇒ **继承队列当前的变速**（``queue_set_tempo``
+    设的那个值）；给数值 = 覆盖这一句。
+
+    ⚠️ **``speaker``（内置音色 SPK_ID）和 ``ref_speaker``（参考音色 /
+    voice-clone）是两个不同的 SDK 参数** —— 本板只有参考音色可用 ⇒ 必须
+    走 ``ref_speaker`` ⇒ 混用会让 SDK 跳过音色条件（「not in SPK_ID,
+    skipping」）⇒ **每句话音色都不一样**。
+
+    Raises:
+        TTSUnavailable: 插件没装 / TTS 实例没跑。
+        ValueError: 文本为空。
+    """
+    if not (text or "").strip():
+        raise ValueError("text 不能为空")
+    q = _queue_module()
+    try:
+        return q.submit_queued(
+            text=text, language=language, speaker=speaker,
+            ref_speaker=ref_speaker, volume=volume,
+            tempo=tempo, src_end_ts=src_end_ts, src_start_ts=src_start_ts,
+            src_start_sec=src_start_sec, stream_id=stream_id,
+            play_to=play_to, first_window_frames=first_window_frames)
+    except TTSUnavailable:
+        raise
+    except RuntimeError as exc:
+        raise TTSUnavailable(str(exc)) from exc
+
+
+def queue_status() -> dict:
+    """队列快照：深度 / 积压秒数 / 当前 tempo / 滞后统计。"""
+    return _queue_module().snapshot()
+
+
+def queue_clear() -> dict:
+    """清空**未开始**的 job（正在合成的那句跑完）。"""
+    return _queue_module().clear()
+
+
+def queue_flush_position(pos_sec: float, direction: str = "") -> dict:
+    """**seek（用户拖了进度条）之后**：冲掉与新位置不匹配的音频。
+
+    ⚠️ **为什么不能直接用** :func:`queue_clear`（实测 2026-11-22，用户报
+    「含音轨的视频多次拖动进度条，没跟字幕的翻译同声播出来」）：
+
+    * ``queue_clear`` **不清**正在合成的那句 ⇒ 它的 PCM 之后还会进队列
+      ⇒ **陈旧的译文照样播出来**（实测错位 −20~−31 秒）；
+    * ``queue_clear`` **不复位播放时钟** ⇒ 后跳之后播放头变小 ⇒ 播放
+      时钟的停滞判定永远不成立 ⇒ 8 秒后兜底放行 ⇒ 播的还是旧内容。
+
+    ⇒ 这一层做三件事：丢待播 job、丢 FIFO 里陈旧的 PCM、**复位播放时钟**。
+    """
+    q = _queue_module()
+    fn = getattr(q, "flush_by_position", None)
+    if fn is None:
+        # 插件版本旧 ⇒ 退回全清（行为差一点，但不至于把陈旧音频留着）。
+        return q.clear()
+    return fn(pos_sec, direction)
+
+
+def queue_set_reserve(seconds: float) -> dict:
+    """设 TTS 队列的**延迟线留量**（FIFO 里留多少秒不播）。
+
+    ⚠️ **跟播模式必须 > 0**：放行器的提前量 = 生产延迟 + 留量 ⇒
+    留量就是管线的**余量** ⇒ 合成抖动不会变成断音；同时播放时刻
+    可精确对齐（可听滞后 ≈ 0）。
+    """
+    q = _queue_module()
+    return q.set_reserve(seconds)
+
+
+def queue_set_clock(provider=None, offset: float = 0.0) -> dict:
+    """设 TTS 队列的**播放时钟**（跟播用）。
+
+    ⚠️ ``provider`` = 返回「当前播放头（媒体秒）」的可调用对象；
+    ``None`` = 关掉时钟（播放不再等源话）。
+    """
+    return _queue_module().set_clock(provider, offset)
+
+
+def queue_set_tempo(tempo: float) -> dict:
+    """改**未开始** job 的变速（积压一降就该回落 1.0）。"""
+    return _queue_module().set_tempo(tempo)
 
 
 if TYPE_CHECKING:  # 仅类型提示用,运行时无副作用

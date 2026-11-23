@@ -434,6 +434,12 @@ def test_endpoint_hook() -> None:
             self._loop = None
             self.published = []
             self.rotated = 0
+            # ⚠️ **同传稳档收尾钩子**（2026-11-21 新增）——
+            # ``_finalize`` 现在会调 ``_interp_flush_steady``（把切句器里的
+            # **尾巴**交出去，而不是把整段再交一遍）。
+            # 替身必须带上这两个成员，否则 ``AttributeError`` 会把
+            # ``_finalize`` 的主流程一起带崩（实测过）。
+            self._interp_splitter = asr_service._SentenceSplitter(max_chars=0)
 
         async def _submit(self, tail, final=False):
             return ""
@@ -447,6 +453,9 @@ def test_endpoint_hook() -> None:
         # 真方法（走真钩子 ⇒ 断言的是**真实接线**）
         def _submit_translation(self):
             asr_service._LiveAsrSession._submit_translation(self)
+
+        def _interp_flush_steady(self, text=""):
+            asr_service._LiveAsrSession._interp_flush_steady(self, text)
 
     stub = Stub()
     # 让翻译服务单例 = 上面那个（endpoint 钩子拿的是单例）

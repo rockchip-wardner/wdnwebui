@@ -186,8 +186,15 @@ def click_to_finish(page, limit: int = 6) -> None:
     的地方才用 click_next 显式点。
     """
     for _ in range(limit):
+        # ⚠️ **必须用 ``querySelector``**，不能用 ``getElementById`` ——
+        # 后者只接受**纯 id**（没有空格、没有 ``#``），传 CSS 选择器进去
+        # 恒返回 null ⇒ 这个判断永远为 false ⇒ 向导已经走到「完成配置」
+        # 步（那一页**没有**「下一步」按钮）时还要再点一下 ⇒
+        # ``page.click`` 等 30 s 超时 ⇒ 整个回归在**视频路径**前就崩了
+        # （症状与「向导卡住」一模一样，其实是脚本自己写错了）。
         if page.evaluate(
-                f"() => !!document.getElementById('{NS}root-{APP} #{NS}finish-btn')"):
+                f"() => !!document.querySelector("
+                f"'#{NS}root-{APP} #{NS}finish-btn')"):
             return
         click_next(page)
 
@@ -1699,9 +1706,34 @@ def verify_sources(page, shot_dir: Path) -> None:
                 check("U17 拖到没识别过的位置 → 前端重开识别（起点=拖动点-8s）",
                       new_seg is not None and abs(new_seg["start"] - 2.0) < 2.5,
                       f"{new_seg}")
-                # 暂停播放 → 「当前行」与「DOM 里渲染的行」是同一个时刻
+                # ⚠️ **先暂停**（把播放头钉住），再等识别**追上播放头**。
+                #
+                # 为什么必须等：重开的识别是**从头再来**的（引导起点 ≈ 拖动点
+                # − 8 s，但那一段是「回看」，真正开始识别的点≈0 s）⇒ 断言的
+                # 那一刻它通常只识别到 3~7 s，而播放头在 **10 s** ⇒
+                # 「播放头落在已识别区间之外」⇒ 字幕**本来就不该画**
+                # ⇒ 立刻断言必然失败（实测基线与改动后都是同一条失败）。
+                #
+                # ⇒ 轮询等 ``_subCovered(播放头)`` 为真（最多 60 s）⇒ 识别
+                #    追上了再断言「字幕确实画出来了」—— **断言的语义不变**
+                #    （仍然是「拖动位置的字幕要显示出来」），只是不再与
+                #    「识别还没跑到那儿」赛跑。
                 page.evaluate(
                     "() => { document.getElementById('asr-video').pause(); }")
+                covered = False
+                for _ in range(60):
+                    covered = bool(page.evaluate(
+                        """() => {
+                            const A = window.Qwen3Asr;
+                            const v = document.getElementById('asr-video');
+                            const t = (v ? v.currentTime : 0)
+                                      - (A._audioOriginSec || 0);
+                            return A._subCovered ? A._subCovered(t) : false;
+                        }"""))
+                    if covered:
+                        break
+                    page.wait_for_timeout(1000)
+                print(f"  识别追上播放头: {covered}")
                 page.wait_for_timeout(400)
                 after = page.evaluate(
                     """() => {
