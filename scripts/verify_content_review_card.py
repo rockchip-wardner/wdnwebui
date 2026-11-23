@@ -148,7 +148,7 @@ globalThis.fetch = async () => ({
       { id: "intern-decision-4b", label: "[DM]图像文字决策模型4B",
         installed: true, memory_mb: 3200, running: true,
         instance_status: "running", npu_index: 0 },
-      { id: "intern-decision-0.8b", label: "[JEV]图像文字决策模型0.8B",
+      { id: "intern-decision-0.8b", label: "[DM]图像文字决策模型0.8B",
         installed: true, memory_mb: 900, running: false,
         instance_status: "not_loaded", npu_index: null },
     ],
@@ -485,7 +485,7 @@ def main() -> int:
             {"id": "intern-decision-4b", "label": "[DM]图像文字决策模型4B",
              "capability_types": ["swcap_decision"], "exists": True,
              "memory_estimate_mb": 3200},
-            {"id": "intern-decision-0.8b", "label": "[JEV]图像文字决策模型0.8B",
+            {"id": "intern-decision-0.8b", "label": "[DM]图像文字决策模型0.8B",
              "capability_types": ["swcap_decision"], "exists": True,
              "memory_estimate_mb": 900},
         ]
