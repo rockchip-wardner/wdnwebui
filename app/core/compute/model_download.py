@@ -651,7 +651,7 @@ class DownloadManager:
             try:
                 self._run_job(job)
             except Exception as exc:  # noqa: BLE001
-                LOG.exception("下载任务 %s 异常", job.id)
+                LOG.exception("the download task %s raised", job.id)
                 with self._lock:
                     job.state = STATE_FAILED
                     job.error = str(exc)
@@ -779,7 +779,7 @@ class DownloadManager:
             from app.core.compute.registry import refresh_model_presets
             refresh_model_presets()
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("刷新模型预设失败: %s", exc)
+            LOG.warning("refreshing the model presets failed: %s", exc)
 
         with self._lock:
             job.state = STATE_DONE

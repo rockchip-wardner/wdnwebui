@@ -116,7 +116,7 @@ def _register_tts_alert(registry) -> None:
     from app.core.audio.tts_bridge import session_available
 
     if not session_available():
-        _LOG.warning("builtins: 语音生成卡未安装，tts_alert 不可用，跳过注册")
+        _LOG.warning("builtins: the speech generation card is not installed, tts_alert is unavailable, skipping the registration")
         return
     try:
         from app.core.tools.tts_alert import TtsAlert

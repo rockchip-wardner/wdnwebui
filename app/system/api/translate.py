@@ -88,7 +88,7 @@ def translate(req: TranslateRequest) -> dict:
     except TranslationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # 兜底:provider 内部抛了别的异常也不能 500 裸奔
-        LOG.exception("translate: 未预期的异常")
+        LOG.exception("translate: an unexpected exception")
         raise HTTPException(status_code=502, detail=f"翻译失败: {exc}") from exc
     return {"translations": translations, **stats}
 

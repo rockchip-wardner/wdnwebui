@@ -374,7 +374,7 @@ def cost_ms(mode: str) -> Optional[float]:
             judge.observe(f, i + 10)
         _COST_CACHE[m] = (time.perf_counter() - t0) / len(thumbs) * 1000.0
     except Exception:  # noqa: BLE001 - 测不出来就退回文档值，别拖垮接口
-        _LOG.warning("frame_judge: 判帧耗时实测失败，退回参考值", exc_info=True)
+        _LOG.warning("frame_judge: measuring the frame-decision time failed, falling back to the reference value", exc_info=True)
         _COST_CACHE[m] = _COST_FALLBACK_MS.get(m, 0.0)
     return _COST_CACHE[m]
 
@@ -417,7 +417,7 @@ def normalize_mode(mode: Optional[str]) -> str:
         return LEGACY_MODE_ALIASES[m]
     if m == MODE_MANUAL or m in _METRICS:
         return m
-    _LOG.warning("frame_judge: 未知模式 %r，回落 manual", m)
+    _LOG.warning("frame_judge: unknown mode %r, falling back to manual", m)
     return MODE_MANUAL
 
 
@@ -440,7 +440,7 @@ def _migrate(mode: Optional[str],
     raw = str(mode or "").strip().lower()
     if raw in LEGACY_MODE_ALIASES:
         target = LEGACY_MODE_ALIASES[raw]
-        _LOG.info("frame_judge: 判据模式 %r 已下架，迁移到 %r 并重置阈值",
+        _LOG.info("frame_judge: the criterion mode %r is retired, migrating to %r and resetting the threshold",
                   raw, target)
         return target, None
     return mode, threshold
@@ -646,7 +646,7 @@ class FrameJudge:
         try:
             score = float(gscore(self._last_luma, frame))
         except Exception:  # noqa: BLE001
-            _LOG.warning("frame_judge: gscore 异常，本帧按送检处理", exc_info=True)
+            _LOG.warning("frame_judge: the gscore is abnormal, this frame is handled as submitted for inspection", exc_info=True)
             self._commit(pos, None, True)
             return True
 

@@ -180,7 +180,7 @@ class MultiAudioSession:
             try:
                 ch.source.start()
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("audio source %s 启动失败: %s", ch.source.source, exc)
+                LOG.warning("audio source %s failed to start: %s", ch.source.source, exc)
                 ch.source.state = "error"
                 ch.source._error = str(exc)   # noqa: SLF001
                 ch.source.exhausted = True
@@ -216,13 +216,13 @@ class MultiAudioSession:
                 # 自行退出（代际校验同时拦掉它的结果，不让它污染新会话）。
                 # 这里不能等满 INFER_TIMEOUT —— stop() 不该被一次卡住的推理
                 # 拖住。
-                LOG.info("audio: 轮转线程仍在推理中，停止后其结果将被丢弃")
+                LOG.info("audio: the rotation thread is still inferring, its result is dropped after the stop")
         self._rr_thread = None
         for ch in chans:
             try:
                 ch.source.stop()
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("停止音频源 %s 失败: %s", ch.source.source, exc)
+                LOG.warning("stopping the audio source %s failed: %s", ch.source.source, exc)
         return self.snapshot()
 
     # ------------------------------------------------------------------ #
@@ -309,7 +309,7 @@ class MultiAudioSession:
                 # 全部放完 → 正常结束。（含 RTSP 源时不会走到这里。）
                 with self._lock:
                     self._state = STATE_DONE
-                LOG.info("audio-rr: 全部 %d 路分析完毕", len(self._channels))
+                LOG.info("audio-rr: all %d streams analysed", len(self._channels))
                 self._notify_state()
                 break
             if not progressed:
@@ -422,7 +422,7 @@ class MultiAudioSession:
         with self._lock:
             stale = gen != self._rr_gen
         if stale:
-            LOG.info("audio: 丢弃过期结果 ch%d 段%d（会话已换代）",
+            LOG.info("audio: dropping the stale result ch%d seg%d (the session was replaced)",
                      ch.idx, ch.chunks_done)
             return None      # 不是失败，是「作废」—— 熔断计数不计入
 
@@ -457,9 +457,9 @@ class MultiAudioSession:
             try:
                 self._on_event(ev)
             except Exception:  # noqa: BLE001
-                LOG.debug("audio on_event 回调抛异常", exc_info=True)
+                LOG.debug("the audio on_event callback raised", exc_info=True)
         if level == "error":
-            LOG.warning("audio ch%d 段%d 推理失败: %s",
+            LOG.warning("audio ch%d seg%d inference failed: %s",
                         ch.idx, ev["chunk_idx"], text[:120])
         return level != "error"     # True=成功 / False=失败 / None=作废
 
@@ -473,4 +473,4 @@ class MultiAudioSession:
             try:
                 self._on_state(self._state)
             except Exception:  # noqa: BLE001
-                LOG.debug("audio on_state 回调抛异常", exc_info=True)
+                LOG.debug("the audio on_state callback raised", exc_info=True)

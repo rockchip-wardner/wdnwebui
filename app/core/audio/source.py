@@ -270,7 +270,7 @@ class FileAudioSource(AudioSource):
                     produced_samples += n
         except Exception as exc:  # noqa: BLE001
             if not self._stop.is_set():
-                LOG.warning("audio file source %s 解码失败: %s",
+                LOG.warning("audio file source %s failed to decode: %s",
                             self.source, exc)
                 with self._lock:
                     self._error = f"{type(exc).__name__}: {exc}"
@@ -373,7 +373,7 @@ class RtspAudioSource(AudioSource):
             try:
                 container = av.open(self.source, timeout=(2.0, 5.0))
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("audio rtsp %s 打开失败（%.1fs 后重试）: %s",
+                LOG.warning("audio rtsp %s failed to open (retrying in %.1fs): %s",
                             self.source, backoff, exc)
                 with self._lock:
                     self._error = f"{type(exc).__name__}: {exc}"
@@ -413,7 +413,7 @@ class RtspAudioSource(AudioSource):
             except Exception as exc:  # noqa: BLE001
                 if self._stop.is_set():
                     return
-                LOG.warning("audio rtsp %s 解码中断（%.1fs 后重连）: %s",
+                LOG.warning("audio rtsp %s decoding was interrupted (reconnecting in %.1fs): %s",
                             self.source, backoff, exc)
                 with self._lock:
                     self._error = f"{type(exc).__name__}: {exc}"

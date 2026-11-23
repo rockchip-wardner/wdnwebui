@@ -592,18 +592,21 @@ def _resolve_tls(args) -> dict:
     if not cert and not key:
         return {}
     if not (cert and key):
-        print("[run.py] ERROR: --ssl-certfile 与 --ssl-keyfile 必须**成对**"
-              "给出；只给一个无法启用 TLS。", file=sys.stderr)
+        print("[run.py] ERROR: --ssl-certfile and --ssl-keyfile must be "
+              "given **as a pair** — one of them alone cannot enable TLS.",
+              file=sys.stderr)
         raise SystemExit(2)
 
     resolved = {}
     for label, raw in (("--ssl-certfile", cert), ("--ssl-keyfile", key)):
         path = Path(raw).expanduser()
         if not path.is_file():
-            print(f"[run.py] ERROR: {label} 不存在: {path}", file=sys.stderr)
+            print(f"[run.py] ERROR: {label} does not exist: {path}",
+                  file=sys.stderr)
             raise SystemExit(2)
         if not os.access(path, os.R_OK):
-            print(f"[run.py] ERROR: {label} 不可读: {path}", file=sys.stderr)
+            print(f"[run.py] ERROR: {label} is not readable: {path}",
+                  file=sys.stderr)
             raise SystemExit(2)
         resolved[label] = str(path)
     return {
@@ -656,21 +659,24 @@ def main() -> None:
     parser.add_argument(
         "--ssl-certfile",
         default=os.environ.get("WDNWEBUI_SSL_CERTFILE") or None,
-        help="TLS 证书路径。给了（且 --ssl-keyfile 也给了）就启用 HTTPS —— "
-             "生产 systemd 单元用的就是它。默认取环境变量 "
-             "WDNWEBUI_SSL_CERTFILE。",
+        help="Path to the TLS certificate. Given (together with "
+             "--ssl-keyfile) it enables HTTPS — the production systemd unit "
+             "uses exactly this. Defaults to the env var "
+             "WDNWEBUI_SSL_CERTFILE.",
     )
     parser.add_argument(
         "--ssl-keyfile",
         default=os.environ.get("WDNWEBUI_SSL_KEYFILE") or None,
-        help="TLS 私钥路径。默认取环境变量 WDNWEBUI_SSL_KEYFILE。",
+        help="Path to the TLS private key. Defaults to the env var "
+             "WDNWEBUI_SSL_KEYFILE.",
     )
     parser.add_argument(
         "--allow-plaintext",
         action="store_true", default=None,
-        help="显式允许在 **生产端口 8000** 上以明文启动（默认拒绝）。"
-             "只有本地调试确实需要明文时才用；等价于环境变量 "
-             "WDNWEBUI_ALLOW_PLAINTEXT=1。",
+        help="Explicitly allow starting in **plaintext** on the production "
+             "port 8000 (refused by default). Use it only when a local "
+             "debug run really needs plaintext; equivalent to the env var "
+             "WDNWEBUI_ALLOW_PLAINTEXT=1.",
     )
     args, _unknown = parser.parse_known_args()
 
@@ -726,16 +732,24 @@ def main() -> None:
         os.environ.get("WDNWEBUI_ALLOW_PLAINTEXT", "").strip() == "1")
     if port == PRODUCTION_HTTPS_PORT and not _ssl and not allow_plaintext:
         print(
-            "[run.py] ERROR: 拒绝在生产端口 8000 上以**明文**启动。\n"
-            f"        8000 是生产 HTTPS 入口（systemd 单元带 "
-            f"--ssl-certfile/--ssl-keyfile）。\n"
-            "        而 run.py 默认会杀掉占着 8000 的旧实例再接管 ⇒ 明文\n"
-            "        启动等于把生产的 HTTPS 入口换成明文。\n"
-            "        三条出路：\n"
-            "          1) 给 TLS 参数：--ssl-certfile <cert> --ssl-keyfile <key>\n"
-            "             （或环境变量 WDNWEBUI_SSL_CERTFILE / WDNWEBUI_SSL_KEYFILE）\n"
-            "          2) 换端口调试：--port 8001（其它端口允许明文）\n"
-            "          3) 确实需要明文：--allow-plaintext（或 WDNWEBUI_ALLOW_PLAINTEXT=1）",
+            "[run.py] ERROR: refusing to start in **plaintext** on the "
+            f"production port {PRODUCTION_HTTPS_PORT}.\n"
+            f"        {PRODUCTION_HTTPS_PORT} is the production HTTPS entry "
+            f"(the systemd unit passes\n"
+            f"        --ssl-certfile/--ssl-keyfile).\n"
+            f"        run.py kills whatever holds port {PRODUCTION_HTTPS_PORT} "
+            f"before it binds => a\n"
+            f"        plaintext start swaps the production HTTPS entry for a "
+            f"plaintext one.\n"
+            f"        Three ways out:\n"
+            f"          1) pass the TLS parameters: "
+            f"--ssl-certfile <cert> --ssl-keyfile <key>\n"
+            f"             (or the env vars WDNWEBUI_SSL_CERTFILE / "
+            f"WDNWEBUI_SSL_KEYFILE)\n"
+            f"          2) debug on another port: --port 8001 "
+            f"(plaintext is allowed there)\n"
+            f"          3) really need plaintext: --allow-plaintext "
+            f"(or WDNWEBUI_ALLOW_PLAINTEXT=1)",
             file=sys.stderr,
         )
         raise SystemExit(2)

@@ -146,8 +146,8 @@ commit 仍能按 SHA 访问）。
     - **明文撞 HTTPS 端口现在会留明文日志**（`app/core/tls_logging.py`）：
       ```
       journalctl -u wdnwebui.service | grep '\[TLS\]'
-      # [ERROR] [TLS] 握手失败  SSLError: [SSL: HTTP_REQUEST] http request
-      # [ERROR] [TLS] 排查提示: 疑似「明文客户端撞上 HTTPS 端口」：客户端用了 http:// 而不是 https://。…
+      # [ERROR] [TLS] handshake failed  SSLError: [SSL: HTTP_REQUEST] http request
+      # [ERROR] [TLS] hint: looks like a plaintext client hitting the HTTPS port: the client used http:// instead of https://. …
       ```
       ⇒ 客户端报「Empty reply from server」时，先看这一行。
       - ⚠️ **生产跑的是 uvloop，不是 asyncio**（`uvicorn --loop auto` 优先
@@ -7416,7 +7416,7 @@ config 派生（实例上的快照会过期）、peer 卡不显示徽章、
 
 * `GET /api/compute/active-app` 直接读当前 active_app。
 * `tail -f logs/app.log | grep active_app` 看服务端的写入 / 清空
-  日志（`compute.active_app=%s：autostart 新增 %d 条`）。
+  日志（`compute.active_app=%s: autostart added %d entry/entries — %s`）。
 * `cat config.jsonc | jq .compute.active_app` 看盘上文件。
 
 ## Configuration

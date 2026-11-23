@@ -18,7 +18,7 @@
 
 本脚本断言（自包含，不占 NPU、不碰生产服务、不起第二个 wdnwebui）：
 
-  1. **明文客户端撞 HTTPS 端口** ⇒ 必须记一条 ``[TLS] 握手失败`` 的 ERROR，
+  1. **明文客户端撞 HTTPS 端口** ⇒ must log one ERROR ``[TLS] handshake failed``，
      且带异常原文与「客户端用了 http:// 而不是 https://」的排查提示；
   2. **正常 TLS 客户端** ⇒ **不能**记握手失败（不能误报）；
   3. **message 过滤** ⇒ 非握手类致命错误（``Fatal error on transport``，
@@ -233,7 +233,7 @@ class _Capture(logging.Handler):
 
     def handshake_lines(self) -> list[str]:
         return [r.getMessage() for r in self.records
-                if "[TLS] 握手失败" in r.getMessage()]
+                if "[TLS] handshake failed" in r.getMessage()]
 
     def clear(self) -> None:
         self.records.clear()
@@ -274,18 +274,18 @@ def _run_suite(cap: _Capture, cert: str, key: str, loop_kind: str) -> None:
         time.sleep(WAIT_AFTER_HIT)
         lines = cap.handshake_lines()
         check(len(lines) == 1,
-              f"[{loop_kind}] 明文客户端撞 HTTPS 端口 ⇒ 恰好记了 1 条 [TLS] 握手失败",
+              f"[{loop_kind}] plaintext client hitting the HTTPS port ⇒ exactly one [TLS] handshake failed",
               f"实际 {len(lines)} 条: {cap.text()!r}")
         if lines:
             joined = "\n".join(lines)
             check("SSLError" in joined or "Error" in joined,
                   f"[{loop_kind}] 日志带异常类型/原文",
                   f"实际: {joined!r}")
-            check("排查提示" in cap.text() and "http://" in cap.text(),
+            check("[TLS] hint:" in cap.text() and "http://" in cap.text(),
                   f"[{loop_kind}] 日志带「客户端用了 http:// 而不是 https://」的排查提示",
                   f"实际记录: {cap.text()!r}")
             levels = [r.levelno for r in cap.records
-                      if "[TLS] 握手失败" in r.getMessage()]
+                      if "[TLS] handshake failed" in r.getMessage()]
             check(levels and all(lv >= logging.ERROR for lv in levels),
                   f"[{loop_kind}] 握手失败日志是 ERROR 级（不会被默认级别过滤掉）",
                   f"实际级别: {levels}")

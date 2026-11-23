@@ -176,7 +176,7 @@ class MyMemoryProvider(TranslationProvider):
             except Exception as exc:  # 网络层什么都可能抛(超时 / SSL / DNS)
                 last = exc
             LOG.warning(
-                "translate: provider=%s 第 %d/%d 次请求失败: %s",
+                "translate: provider=%s request failed (attempt %d/%d): %s",
                 self.name, attempt, self.retries, last,
             )
             if attempt < self.retries:
@@ -267,7 +267,7 @@ class BaiduProvider(TranslationProvider):
             except Exception as exc:  # 网络层什么都可能抛
                 last = exc
                 LOG.warning(
-                    "translate: provider=baidu 第 %d/%d 次请求失败: %s",
+                    "translate: provider=baidu request failed (attempt %d/%d): %s",
                     attempt, self.retries, exc,
                 )
                 if attempt < self.retries:
@@ -648,7 +648,7 @@ class IcibaProvider(TranslationProvider):
             except Exception as exc:
                 last = exc
             LOG.warning(
-                "translate: provider=%s 第 %d/%d 次请求失败: %s",
+                "translate: provider=%s request failed (attempt %d/%d): %s",
                 self.name, attempt, self.retries, last,
             )
             if attempt < self.retries:
@@ -754,7 +754,7 @@ class ProviderChain:
                 self._mark(provider, self._quota_cooldown)
                 last = exc
                 LOG.warning(
-                    "translate: provider=%s 配额用尽,切下一个: %s",
+                    "translate: provider=%s ran out of quota, switching to the next one: %s",
                     provider.name, exc,
                 )
                 continue
@@ -765,7 +765,7 @@ class ProviderChain:
                 # 冷却掉,连累其它 22 种)。
                 last = exc
                 LOG.info(
-                    "translate: provider=%s 不支持该语言对,换下一家: %s",
+                    "translate: provider=%s does not support this language pair, switching to the next one: %s",
                     provider.name, exc,
                 )
                 continue
@@ -773,7 +773,7 @@ class ProviderChain:
                 self._mark(provider, self._error_cooldown)
                 last = exc
                 LOG.warning(
-                    "translate: provider=%s 请求失败,切下一个: %s",
+                    "translate: provider=%s request failed, switching to the next one: %s",
                     provider.name, exc,
                 )
                 continue
@@ -792,7 +792,7 @@ def build_provider(name: str = "youdao", email: str = "") -> TranslationProvider
     key = (name or "youdao").strip().lower()
     cls = PROVIDERS.get(key)
     if cls is None:
-        LOG.warning("translate: 未知的 provider %r,回退 youdao", name)
+        LOG.warning("translate: unknown provider %r, falling back to youdao", name)
         cls = YoudaoProvider
     if cls is MyMemoryProvider:
         return cls(email=email)
@@ -845,7 +845,7 @@ def build_chain(
                 providers.append(BaiduProvider(appid=appid, key=key))
             else:
                 LOG.warning(
-                    "translate: provider=baidu 没配 appid/key,已从链里跳过"
+                    "translate: provider=baidu has no appid/key configured, it was skipped from the chain"
                 )
         elif name == "npu":
             # 本板 NPU 上的翻译模型（默认 HY-MT1.5）。
@@ -856,6 +856,6 @@ def build_chain(
             providers.append(NpuTranslateProvider())
     if not providers:
         # 一个都没配上 —— 至少留个 youdao,免得整个功能直接没了
-        LOG.warning("translate: 没有可用的 provider,回退 youdao")
+        LOG.warning("translate: no usable provider, falling back to youdao")
         providers.append(YoudaoProvider())
     return ProviderChain(providers)

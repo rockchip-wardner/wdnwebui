@@ -147,14 +147,17 @@ def _hint(exc: BaseException) -> str:
     #     OpenSSL / 客户端只发了几个字节时的形态。
     if ("http request" in text or "wrong version number" in text
             or "unknown protocol" in text):
-        return ("疑似「明文客户端撞上 HTTPS 端口」：客户端用了 http:// 而不是 https://。"
-                "服务端 8000 只提供 HTTPS —— 客户端请改用 https://<host>:8000")
+        return ("looks like a plaintext client hitting the HTTPS port: the "
+                "client used http:// instead of https://. The server serves "
+                "HTTPS only on port 8000 — the client must use "
+                "https://<host>:8000")
     if "certificate verify failed" in text or "certificate_verify_failed" in text:
-        return ("客户端不信任板子的 CA 根 —— 客户端需安装 "
-                "/home/rockchip/.config/wdnwebui/tls/ca.pem")
+        return ("the client does not trust the board's CA root — the client "
+                "must install /home/rockchip/.config/wdnwebui/tls/ca.pem")
     if "timed out" in text or "timeout" in text:
-        return ("客户端握手超时 —— 常见于网络不通 / 中间设备拦截 / "
-                "客户端证书链不完整")
+        return ("the client handshake timed out — common causes: the network "
+                "is down, an intermediate device blocks it, or the client "
+                "certificate chain is incomplete")
     return ""
 
 
@@ -167,13 +170,14 @@ def _emit(exc: BaseException, key: int, peer: str = "") -> None:
     try:
         detail = f"{type(exc).__name__}: {exc}"
         peer_part = f"peer={peer}  " if peer else ""
-        LOG.error("[TLS] 握手失败  %s%s", peer_part, detail)
+        LOG.error("[TLS] handshake failed  %s%s", peer_part, detail)
         hint = _hint(exc)
         if hint:
-            LOG.error("[TLS] 排查提示: %s", hint)
+            LOG.error("[TLS] hint: %s", hint)
     except Exception:
         try:
-            LOG.warning("[TLS] 握手失败日志钩子自身异常（已忽略）", exc_info=True)
+            LOG.warning("[TLS] the handshake-failure log hook itself raised "
+                        "(ignored)", exc_info=True)
         except Exception:
             pass
 
@@ -246,7 +250,7 @@ def _patch_ssl_object() -> bool:
     """包 ``ssl.SSLObject.do_handshake`` ⇒ 握手失败落明文 ERROR。"""
     orig = getattr(ssl.SSLObject, "do_handshake", None)
     if orig is None:
-        LOG.warning("[TLS] 装不上握手失败日志钩子：ssl.SSLObject 没有 do_handshake")
+        LOG.warning("[TLS] cannot install the handshake-failure log hook: ssl.SSLObject has no do_handshake")
         return False
     if getattr(orig, _PATCHED_ATTR, False):
         return True
@@ -255,8 +259,9 @@ def _patch_ssl_object() -> bool:
     except (TypeError, ValueError):
         params = []
     if params != ["self"]:
-        LOG.warning("[TLS] 装不上握手失败日志钩子："
-                    "do_handshake 签名与预期不符 -> %s", params)
+        LOG.warning("[TLS] cannot install the handshake-failure log hook: "
+                    "the do_handshake signature is not the expected one -> %s",
+                    params)
         return False
 
     wrapper = _make_ssl_object_wrapper(orig)
@@ -264,10 +269,10 @@ def _patch_ssl_object() -> bool:
     try:
         ssl.SSLObject.do_handshake = wrapper
     except Exception:
-        LOG.warning("[TLS] 装不上握手失败日志钩子：打补丁失败", exc_info=True)
+        LOG.warning("[TLS] cannot install the handshake-failure log hook: patching failed", exc_info=True)
         return False
-    LOG.info("[TLS] ssl.SSLObject.do_handshake 钩子已就位"
-             "（明文 ERROR 级，与 event loop 无关）")
+    LOG.info("[TLS] the ssl.SSLObject.do_handshake hook is in place "
+             "(plain ERROR level, independent of the event loop)")
     return True
 
 
@@ -283,8 +288,8 @@ def _make_fatal_error_wrapper(orig):
                 _emit(exc, id(exc), peer=_describe_peer(self))
         except Exception:
             try:
-                LOG.warning("[TLS] 握手失败日志钩子自身异常（已忽略）",
-                            exc_info=True)
+                LOG.warning("[TLS] the handshake-failure log hook itself "
+                            "raised (ignored)", exc_info=True)
             except Exception:
                 pass
         return orig(self, exc, message)
@@ -309,8 +314,9 @@ def _patch_asyncio() -> bool:
     except (TypeError, ValueError):
         params = []
     if params[:3] != ["self", "exc", "message"]:
-        LOG.warning("[TLS] 装不上 asyncio 对端地址钩子："
-                    "_fatal_error 签名与预期不符 -> %s", params)
+        LOG.warning("[TLS] cannot install the asyncio peer-address hook: "
+                    "the _fatal_error signature is not the expected one -> %s",
+                    params)
         return False
 
     wrapper = _make_fatal_error_wrapper(orig)
@@ -318,10 +324,11 @@ def _patch_asyncio() -> bool:
     try:
         proto_cls._fatal_error = wrapper
     except Exception:
-        LOG.warning("[TLS] 装不上 asyncio 对端地址钩子：打补丁失败", exc_info=True)
+        LOG.warning("[TLS] cannot install the asyncio peer-address hook: patching failed", exc_info=True)
         return False
-    LOG.info("[TLS] asyncio _fatal_error 钩子已就位"
-             "（纯 asyncio 下补对端地址；uvloop 下不触发）")
+    LOG.info("[TLS] the asyncio _fatal_error hook is in place "
+             "(fills in the peer address under plain asyncio; it does not "
+             "fire under uvloop)")
     return True
 
 

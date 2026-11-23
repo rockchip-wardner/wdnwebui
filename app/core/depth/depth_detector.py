@@ -175,7 +175,7 @@ def _rga_resize_for_model(frame: "np.ndarray",
     try:
         return _rga_resize_to(frame, int(tw), int(th))
     except Exception as exc:  # noqa: BLE001 — 缩放失败不是致命错误
-        LOG.warning("depth: RGA 预缩到 %dx%d 失败，送整帧（%s）",
+        LOG.warning("depth: the RGA downscale to %dx%d failed, sending the full frame (%s)",
                     tw, th, exc)
         return frame
 
@@ -468,7 +468,7 @@ class DepthDetector:
                 threads.append(th)
             self._threads = threads
 
-        LOG.info("depth detector 启动：%d 个 slot %s",
+        LOG.info("depth detector started: %d slot(s) %s",
                  len(self._slots), self.slot_pins())
         return self.snapshot()
 
@@ -596,7 +596,7 @@ class DepthDetector:
                 self._infer_sync(slot, session, frame, frame_pos,
                                  frame_b64, judge_score, channel, gen)
             except Exception as exc:  # noqa: BLE001 — 推理失败不能带死线程
-                LOG.warning("depth slot%d 推理失败: %s", slot_idx, exc)
+                LOG.warning("depth slot%d inference failed: %s", slot_idx, exc)
                 self._last_error = f"{type(exc).__name__}: {exc}"
                 self._push_diag({
                     "ts": time.time(),
@@ -736,7 +736,7 @@ class DepthDetector:
             try:
                 fn(event)
             except Exception:  # noqa: BLE001
-                LOG.debug("depth 广播失败", exc_info=True)
+                LOG.debug("the depth broadcast failed", exc_info=True)
 
     def _trim_event_images(self) -> None:
         """历史里只给最近 ``_EVENT_IMAGE_KEEP`` 条留热力图。
@@ -834,6 +834,6 @@ def stop_depth_detector() -> bool:
     try:
         det.stop()
     except Exception:  # noqa: BLE001 — 关停钩子必须 best-effort
-        LOG.warning("停止深度 detector 失败", exc_info=True)
+        LOG.warning("stopping the depth detector failed", exc_info=True)
         return False
     return True

@@ -135,7 +135,7 @@ def _encode_first_frame(video_path: Path) -> Optional[bytes]:
         import av
         import cv2
     except Exception as exc:            # noqa: BLE001
-        LOG.warning("海报生成不可用（缺 av/cv2）: %s", exc)
+        LOG.warning("poster generation is unavailable (av/cv2 missing): %s", exc)
         return None
 
     try:
@@ -148,7 +148,7 @@ def _encode_first_frame(video_path: Path) -> Optional[bytes]:
                 arr = frame.to_ndarray(format="rgb24")
                 break
     except Exception as exc:            # noqa: BLE001
-        LOG.warning("抽首帧失败 %s: %s", video_path, exc)
+        LOG.warning("extracting the first frame failed %s: %s", video_path, exc)
         return None
     if arr is None:
         return None
@@ -178,6 +178,6 @@ def prewarm() -> None:
     try:
         for card_id, path in _preview_map().items():
             if poster_bytes(card_id, path) is None:
-                LOG.warning("预热海报失败: %s", card_id)
+                LOG.warning("pre-warming the poster failed: %s", card_id)
     except Exception as exc:            # noqa: BLE001
-        LOG.warning("预热海报异常（忽略）: %s", exc)
+        LOG.warning("pre-warming the poster raised (ignored): %s", exc)

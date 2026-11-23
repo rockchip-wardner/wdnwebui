@@ -768,19 +768,20 @@ def _parse_autostart_config(raw) -> list[dict]:
         try:
             model, cards = _validate_autostart_entry(entry, idx)
         except ValueError as e:
-            LOG.warning("compute.autostart 忽略一条无效配置: %s", e)
+            LOG.warning("compute.autostart: ignoring an invalid entry: %s", e)
             continue
         if model not in MODEL_PRESETS:
             LOG.warning(
-                "compute.autostart[%d].model=%r 未安装在本板，已跳过该条目"
-                "（本板已安装: %s）",
+                "compute.autostart[%d].model=%r is not installed on this "
+                "board, the entry was skipped (installed on this board: %s)",
                 idx, model, sorted(MODEL_PRESETS.keys()),
             )
             continue
         key = (model, tuple(cards))
         if key in seen:
             LOG.warning(
-                "compute.autostart 含重复条目 model=%r npu_index=%s，已忽略",
+                "compute.autostart has a duplicate entry model=%r "
+                "npu_index=%s, it was ignored",
                 model, cards)
             continue
         seen.add(key)
@@ -859,7 +860,7 @@ def _autostart_npu_map() -> dict[str, int]:
         entries = _parse_autostart_config(
             section.get("autostart") if isinstance(section, dict) else None)
     except ValueError as e:
-        LOG.error("compute.autostart 配置非法（默认卡信息按未配置处理）: %s", e)
+        LOG.error("compute.autostart config is invalid (the default card is treated as unconfigured): %s", e)
         return {}
     out: dict[str, int] = {}
     for e in entries:
@@ -1706,7 +1707,8 @@ class ComputeRegistry:
                     migrated, renamed = migrate_legacy(cap)
                 except RetiredCapabilityError as exc:
                     LOG.warning(
-                        "实例 %s 声明的能力已下线，本次丢弃该能力声明: %s",
+                        "the capability declared by instance %s is retired, "
+                        "the capability declaration was dropped: %s",
                         inst.get("model") or inst.get("name") or "?",
                         exc,
                     )
@@ -1728,7 +1730,8 @@ class ComputeRegistry:
                     # 所以这里兜住**所有**异常：能力名原样保留（后续用到时
                     # 校验会给出准确报错），只记一条日志，不拦停启动。
                     LOG.warning(
-                        "实例 %s 的能力 %r 迁移时异常（已原样保留）: %s: %s",
+                        "migrating the capability %r of instance %s raised "
+                        "(kept as is): %s: %s",
                         inst.get("model") or inst.get("name") or "?",
                         cap, type(exc).__name__, exc,
                     )
@@ -1740,7 +1743,7 @@ class ComputeRegistry:
             if new_caps != caps:
                 inst["capability_types"] = new_caps
         if renamed_total:
-            LOG.info("已迁移 %d 处历史软件能力名", renamed_total)
+            LOG.info("migrated %d legacy software-capability name(s)", renamed_total)
             cfg["instances"] = instances
             try:
                 get_config().set_section("compute", cfg)
@@ -1767,8 +1770,8 @@ class ComputeRegistry:
             if new_name and new_name in MODEL_PRESETS:
                 entry["model"] = new_name
                 renamed_total += 1
-                LOG.info("compute.autostart[%d].model=%r 已自动迁移到 %r "
-                         "（如有疑问参见 git log / AGENTS.md）",
+                LOG.info("compute.autostart[%d].model=%r was migrated to %r "
+                         "(see git log / AGENTS.md if in doubt)",
                          idx, name, new_name)
         if renamed_total:
             cfg["autostart"] = autostart
@@ -1963,11 +1966,11 @@ class ComputeRegistry:
         if not added and not stale:
             return False
         for e in stale:
-            LOG.info("record_autostart: 移除同卡旧条目 %s @ npu%s",
+            LOG.info("record_autostart: removed the old entry of the same card %s @ npu%s",
                      e.get("model"), e.get("npu_index"))
         section["autostart"] = new
         get_config().set_section("compute", section)
-        LOG.info("record_autostart: %s @ npu%s 已写入 compute.autostart",
+        LOG.info("record_autostart: %s @ npu%s was written to compute.autostart",
                  model_id, npu_index)
         return True
 
@@ -2010,7 +2013,7 @@ class ComputeRegistry:
                 reason = e.get("reason") or "被裁剪（原因未知）"
                 # **WARNING 而不是 INFO**：这条被丢弃 = 「用户配的自启没
                 # 生效」。只打 INFO 等于静默少起一个实例。
-                LOG.warning("boot: autostart 跳过 %s @ npu%s —— %s",
+                LOG.warning("boot: autostart skipped %s @ npu%s — %s",
                             e["model"], e["npu_index"], reason)
                 skipped.append({"model": e["model"],
                                 "npu_index": e["npu_index"],
@@ -2051,12 +2054,12 @@ class ComputeRegistry:
             return f"npu_index 必须是整数，got {npu_index!r}"
         # 上次探测失败 → 卡位是未知的 → 不拦（也别再探一次）
         if self.cards_failed_reason():
-            LOG.warning("npu_card_error: 卡位探测失败（%s），跳过越界校验",
+            LOG.warning("npu_card_error: the card-slot probe failed (%s), skipping the out-of-range check",
                         self.cards_failed_reason())
             return None
         cards = self.list_cards()          # 一次探测，下面都复用这份
         if self.cards_failed_reason():     # 刚才这次探测失败了
-            LOG.warning("npu_card_error: 卡位探测失败，跳过越界校验")
+            LOG.warning("npu_card_error: the card-slot probe failed, skipping the out-of-range check")
             return None
         model_cards = self.model_cards(cards)
         if npu_index in model_cards:
@@ -4536,10 +4539,10 @@ class ComputeRegistry:
             time.sleep(_MODEL_RESCAN_INTERVAL_SEC)
             try:
                 if refresh_model_presets():
-                    LOG.info("已安装模型集合变化，算力卡片列表已更新: %s",
+                    LOG.info("the installed model set changed, the compute card list was updated: %s",
                              sorted(MODEL_PRESETS.keys()))
             except Exception as e:  # noqa: BLE001
-                LOG.warning("模型目录重扫失败: %s", e)
+                LOG.warning("rescanning the model directory failed: %s", e)
 
     def boot_compute_services(self) -> None:
         """App boot: start every model listed in ``compute.autostart``.
@@ -4600,7 +4603,7 @@ class ComputeRegistry:
         try:
             entries = _parse_autostart_config(raw)
         except ValueError as e:
-            LOG.error("compute.autostart 配置非法，已跳过开机启动: %s", e)
+            LOG.error("compute.autostart config is invalid, the autostart was skipped: %s", e)
             entries = []
         # autostart 裁剪：非算力卡的条目丢弃 + 每张卡只留第一条
         # （理由与规则见 _crop_autostart_for_cards）。
@@ -4613,14 +4616,15 @@ class ComputeRegistry:
         # cap 不全时 DELETE。这里打 log 是给运维 / 排障一个提示。
         active_app_id = self.get_active_app()
         if active_app_id:
-            LOG.info("boot: compute.active_app=%r （前端会读此值并自动"
-                     "跳到对应 #%s 页面）", active_app_id, active_app_id)
+            LOG.info("boot: compute.active_app=%r (the front end reads this "
+                     "value and jumps to the matching #%s page)",
+                     active_app_id, active_app_id)
         if not entries:
-            LOG.info("boot: compute.autostart 为空 —— 不自动启动任何模型"
-                     "（算力页可手动启用）")
+            LOG.info("boot: compute.autostart is empty — no model is started "
+                     "automatically (the compute page can enable them manually)")
         else:
             known = sorted(e["model"] for e in entries)
-            LOG.info("boot: compute.autostart 声明了 %d 个模型: %s",
+            LOG.info("boot: compute.autostart declares %d model(s): %s",
                      len(entries), known)
 
         for entry in entries:
@@ -4647,7 +4651,7 @@ class ComputeRegistry:
             # _autostart_plan（纯函数，可单测）。
             if _autostart_plan(list(self._instances.values()),
                                model_id, npu_cards) == "skip":
-                LOG.info("boot: %s 已在 npu=%s 跑着，跳过 adopt/spawn",
+                LOG.info("boot: %s is already running on npu=%s, skipping adopt/spawn",
                          model_id, npu_cards)
                 continue
 
@@ -4806,18 +4810,20 @@ class ComputeRegistry:
                 argv = [str(a) for a in
                         (getattr(getattr(inst, "proc", None), "args", None) or [])]
                 i = argv.index("--npu") if "--npu" in argv else -1
-                LOG.info("boot autostart: %s @ npu=%s → %s（worker %s）",
+                LOG.info("boot autostart: %s @ npu=%s → %s (worker %s)",
                          model_id, cards, inst.status,
-                         "命令行带 --npu %s" % argv[i + 1]
+                         "the command line carries --npu %s" % argv[i + 1]
                          if 0 <= i < len(argv) - 1
-                         else "复用已绑定 npu=%s 的实例" % inst.npu_index)
+                         else "reused an instance already bound to npu=%s"
+                         % inst.npu_index)
                 # 兜底：复用到的 worker（/proc 孤儿 → adopted_local）没带 --npu，
                 # 不会自己加载 —— 补一次 load RPC。判据见 _autostart_needs_load。
                 if "--npu" not in argv and inst._source != "adopted":
                     info = self._worker_info(inst)
                     if _autostart_needs_load(argv, (info or {}).get("status")):
-                        LOG.info("boot autostart: %s 复用的 worker 没带 --npu"
-                                 "（%s），补发 load 让它加载到 npu=%s",
+                        LOG.info("boot autostart: the reused worker of %s "
+                                 "carries no --npu (%s), sending an extra load "
+                                 "so it loads onto npu=%s",
                                  model_id, inst._source, cards)
                         self.bind_instance(inst, cards)
             except Exception as e:  # noqa: BLE001
@@ -4973,7 +4979,7 @@ class ComputeRegistry:
         try:
             refresh_model_presets()
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("清理孤儿前刷新模型清单失败: %s", exc)
+            LOG.warning("refreshing the model list before the orphan sweep failed: %s", exc)
 
         try:
             # autostart entries are objects, so take the ``model`` field;
@@ -5277,9 +5283,10 @@ class ComputeRegistry:
                                 inst.finished_at = time.time()
                         if stale:
                             LOG.debug(
-                                "compute_registry: _probe_instance %s 忽略 load "
-                                "确认前的陈旧 error（worker 仍在用上一轮的"
-                                "状态）", inst.model_id)
+                                "compute_registry: _probe_instance %s ignores "
+                                "the stale error from before the load was "
+                                "confirmed (the worker is still using the "
+                                "state of the previous round)", inst.model_id)
                         else:
                             LOG.warning(
                                 "instance %s @ npu=%d → error: %s",
@@ -5722,8 +5729,9 @@ class ComputeRegistry:
                     new_autostart, inst.model_id, target_npu)
                 replaced.extend(stale)
                 for e in stale:
-                    LOG.info("compute.active_app=%s: autostart 移除同卡旧条目 "
-                             "%s @ npu%s（该卡现在跑 %s）",
+                    LOG.info("compute.active_app=%s: autostart removed the old "
+                             "entry of the same card %s @ npu%s (that card now "
+                             "runs %s)",
                              app_id, e["model"], e["npu_index"], inst.model_id)
                 if not added:
                     continue
@@ -5737,11 +5745,12 @@ class ComputeRegistry:
 
         if extended:
             LOG.info(
-                "compute.active_app=%s：autostart 新增 %d 条 —— %s",
+                "compute.active_app=%s: autostart added %d entry/entries "
+                "— %s",
                 app_id, len(extended), extended,
             )
         else:
-            LOG.info("compute.active_app=%s：autostart 无需扩展", app_id)
+            LOG.info("compute.active_app=%s: autostart needs no extension", app_id)
 
         return {
             "ok": True,
@@ -5796,7 +5805,7 @@ class ComputeRegistry:
             LOG.warning("clear_active_app persist failed: %s", e)
             return
         n = len(prev_autostart) if isinstance(prev_autostart, list) else 0
-        LOG.info("compute.active_app 已清空；compute.autostart 已清空（%d 条）", n)
+        LOG.info("compute.active_app has been cleared; compute.autostart has been cleared (%d entries)", n)
 
 
 # --------------------------------------------------------------------------- #

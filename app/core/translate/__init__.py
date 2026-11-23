@@ -101,7 +101,7 @@ def _build_chain() -> ProviderChain:
     try:
         section = get_config().get_section("translate", {}) or {}
     except Exception as exc:  # 配置读不到不该让翻译功能整体不可用
-        LOG.warning("translate: 读取 config.jsonc 的 translate 段失败: %s", exc)
+        LOG.warning("translate: reading the translate section of config.jsonc failed: %s", exc)
 
     names = section.get("providers")
     if not names:
@@ -129,7 +129,7 @@ def _build_chain() -> ProviderChain:
 
     chain = build_chain(list(names), email=email, baidu=baidu, iciba=iciba)
     LOG.info(
-        "translate: provider 链 = %s", " → ".join(chain.names) or "(空)"
+        "translate: provider chain = %s", " → ".join(chain.names) or "(空)"
     )
     return chain
 

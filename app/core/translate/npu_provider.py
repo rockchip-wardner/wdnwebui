@@ -661,7 +661,7 @@ class NpuTranslateProvider(TranslationProvider):
             out, perf = self._translate_one(text, source, target)
         except NpuQualityError as exc:
             # 这条它就是翻不出来 —— **不牵连别人**,交给上层补翻
-            LOG.warning("translate: NPU 这条没翻出来(保留原文): %s", exc)
+            LOG.warning("translate: the NPU did not translate this one (the original is kept): %s", exc)
             # ⚠️ **失败那次的推理也要计入性能汇总** —— 那些 token 和时间
             # 是真花掉了（用户等了那么久）。不带的话「总耗时」算了两次
             # 推理、而「tokens/s」只算成功那次 ⇒ 两个数对不上。
@@ -700,7 +700,7 @@ class NpuTranslateProvider(TranslationProvider):
                 try:
                     val, one = self._translate_one(body, source, target, sess)
                 except NpuQualityError as exc:
-                    LOG.warning("translate: NPU 这条没翻出来(保留原文): %s", exc)
+                    LOG.warning("translate: the NPU did not translate this one (the original is kept): %s", exc)
                     out.append(body)
                     misses.add(idx)
                     # ⚠️ 失败那次的推理也计入性能汇总（真花掉了）
@@ -721,7 +721,7 @@ class NpuTranslateProvider(TranslationProvider):
                 val, one_perf = self._translate_one(body, source, target, sess)
             except NpuQualityError as exc:
                 # 这条翻不出来 —— **不牵连整批**，保留原文、记进 misses
-                LOG.warning("translate: NPU 这条没翻出来(保留原文): %s", exc)
+                LOG.warning("translate: the NPU did not translate this one (the original is kept): %s", exc)
                 with perf_lock:
                     _merge_perf(perf, getattr(exc, "perf", None))
                 with lock:
@@ -812,14 +812,14 @@ class NpuTranslateProvider(TranslationProvider):
             except TranslationError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("translate: NPU 推理失败(%s): %s", type(exc).__name__, exc)
+                LOG.warning("translate: the NPU inference failed (%s): %s", type(exc).__name__, exc)
                 raise TranslationError(f"NPU 翻译推理失败: {exc}") from exc
             _merge_perf(perf, one)
             last = out
             cleaned = self._strip_label(out, source, target)
             if self._looks_translated(cleaned, text, target):
                 return cleaned, _finish_perf(perf)
-            LOG.debug("translate: NPU 这次没翻出来，换下一个措辞: %r", out[:60])
+            LOG.debug("translate: the NPU did not produce a translation this time, trying the next wording: %r", out[:60])
         self._mark_bad(key)
         raise NpuQualityError(
             f"NPU 翻译没能翻出目标语言（最后得到: {last[:60]!r}）",
@@ -901,7 +901,7 @@ class NpuTranslateProvider(TranslationProvider):
             except TranslationError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("translate: NPU 推理失败(%s): %s",
+                LOG.warning("translate: the NPU inference failed (%s): %s",
                             type(exc).__name__, exc)
                 raise TranslationError(f"NPU 翻译推理失败: {exc}") from exc
             _merge_perf(perf, one)
@@ -911,7 +911,7 @@ class NpuTranslateProvider(TranslationProvider):
                 return cleaned, _finish_perf(perf)
             # ⚠️ 把**原始输出**记下来 —— 「没翻出来」有几种完全不同的成因
             # （复读原文 / 方向反了 / 输出是空），现场只看「没翻出来」没法查。
-            LOG.info("translate: fast path 第 %d 条措辞没翻出来（raw=%r）",
+            LOG.info("translate: the fast path did not translate wording #%d (raw=%r)",
                      idx + 1, out[:120])
         raise NpuQualityError(
             f"NPU 翻译这次没翻出来（{last_out[:60]!r}）", perf=_finish_perf(perf))

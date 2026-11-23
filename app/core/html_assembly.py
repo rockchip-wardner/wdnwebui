@@ -148,8 +148,7 @@ def _drop_unmatched_card_slots(template: str) -> str:
     def _sub(match: re.Match) -> str:
         card_id = match.group(1)
         LOG.warning(
-            "card_slot 占位符 %r 没有对应的卡片（插件未安装 / manifest 缺失 / "
-            "插件 import 失败），已从首页移除", card_id,
+            "the card_slot placeholder %r has no matching card (the plugin is not installed / the manifest is missing / the plugin import failed), it was removed from the home page", card_id,
         )
         return f'<!-- card_slot "{card_id}": card not installed -->'
 

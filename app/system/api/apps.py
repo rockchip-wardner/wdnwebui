@@ -116,7 +116,7 @@ def _wheel_info(path: Path) -> dict[str, Any]:
                     if sec.strip().lower() == _EP_SECTION:
                         card_eps = [k for k in cp.options(sec)]
             except Exception as e:  # noqa: BLE001
-                LOG.warning("entry_points.txt 解析失败: %s", e)
+                LOG.warning("parsing entry_points.txt failed: %s", e)
 
         # ---- 卡片 manifest ------------------------------------------------
         manifests = sorted(
@@ -196,7 +196,7 @@ def _pip_install(whl: Path) -> tuple[bool, str]:
 
     out = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
-        LOG.error("pip install 失败 rc=%s: %s", proc.returncode, out[-2000:])
+        LOG.error("pip install failed rc=%s: %s", proc.returncode, out[-2000:])
         return False, out.strip()[-4000:]
     return True, out.strip()[-2000:]
 
@@ -303,7 +303,7 @@ async def install_app(file: UploadFile = File(...)) -> dict:
         # ---- 装之前验：非应用包到此为止，不碰 venv --------------------
         info = _wheel_info(whl)
         _reject_if_not_an_app(info, filename)
-        LOG.info("接受 %s（%s %s）：卡片 entry point %s，manifest %d 个",
+        LOG.info("accepted %s (%s %s): card entry point %s, %d manifest(s)",
                  filename, info["package"], info["version"],
                  info["card_entry_points"], len(info["manifests"]))
 
@@ -314,7 +314,7 @@ async def install_app(file: UploadFile = File(...)) -> dict:
             # 回滚：pip 自己没清干净的话，这里替它清。留着半装的包会让
             # 用户重试时一直撞同一个错，看起来像"这应用永远装不上"。
             undo = _pip_uninstall(info["package"])
-            LOG.warning("安装失败，已回滚 %s: %s", info["package"], undo[-500:])
+            LOG.warning("the installation failed, %s was rolled back: %s", info["package"], undo[-500:])
             raise HTTPException(
                 status_code=500,
                 detail=f"pip install 失败：\n{pip_out}"
@@ -332,7 +332,7 @@ async def install_app(file: UploadFile = File(...)) -> dict:
             #
             # 不用 HTTPException(status_code=200)：前端只看 r.ok，会把它
             # 当成功，然后因为拿不到 cards 而静默不刷新 —— 比报错更难查。
-            LOG.exception("安装成功但重扫卡片失败")
+            LOG.exception("the installation succeeded but the card rescan failed")
             return {
                 "ok": False,
                 "installed": True,
@@ -353,11 +353,11 @@ async def install_app(file: UploadFile = File(...)) -> dict:
         missing = [cid for cid in declared if cid not in {c["id"] for c in after}]
         if missing:
             LOG.warning(
-                "%s 声明了卡片 %s 但重扫后没出现在列表里（manifest 校验可能没过）",
+                "%s declares the card %s but it did not show up in the list after the rescan (the manifest check may have failed)",
                 info["package"], missing,
             )
 
-        LOG.info("安装完成 %s：新增卡片 %s", info["package"], new_ids or "无")
+        LOG.info("the installation of %s finished: the new cards are %s", info["package"], new_ids or "无")
         return {
             "ok": True,
             "package": info["package"],

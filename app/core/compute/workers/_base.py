@@ -417,7 +417,7 @@ def _resolve_card_targets(cards: list, device_id: Optional[str]) -> Tuple[dict, 
             return {"device_id": device_id}, f"device_id={device_id}"
         devices = _probe_devices()
         if devices is None:
-            LOG.warning("设备枚举失败，card#%s 按卡号直传（可能选错卡）",
+            LOG.warning("the device enumeration failed, card#%s passes the card number straight through (it may pick the wrong card)",
                         cards[0])
             return {"npu": cards[0]}, f"card#{cards[0]}（枚举失败，按卡号直传）"
         did = cards_mod.card_no_to_device_id(devices, cards[0])
@@ -431,7 +431,7 @@ def _resolve_card_targets(cards: list, device_id: Optional[str]) -> Tuple[dict, 
     # 多卡：把卡号换算成本进程枚举里的原始下标。
     devices = _probe_devices()
     if devices is None:
-        LOG.warning("设备枚举失败，多卡 %s 按卡号直传（可能选错卡）", cards)
+        LOG.warning("the device enumeration failed, the multi-card %s passes the card number straight through (it may pick the wrong card)", cards)
         return {"npu_indices": list(cards)}, f"cards {cards}（枚举失败，直传）"
     raw: list = []
     missing: list = []
@@ -450,7 +450,7 @@ def _resolve_card_targets(cards: list, device_id: Optional[str]) -> Tuple[dict, 
     if device_id:
         # 主进程给的物理身份与本地换算对不上 → 说明设备集变了。
         # 以主进程为准（那是用户点的那张卡），但要说清楚。
-        LOG.warning("device_id %s 与本地枚举 %s 不一致 —— 以主进程为准",
+        LOG.warning("device_id %s does not match the local enumeration %s - the main process wins",
                     device_id, cards_mod.local_ep_device_ids(devices))
     return {"npu_indices": raw}, f"cards {cards} -> raw {raw}"
 

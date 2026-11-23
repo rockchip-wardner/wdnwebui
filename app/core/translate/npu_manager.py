@@ -191,7 +191,7 @@ class NpuTranslateInstances:
                     with reg.model_op_lock(self.MODEL_ID):
                         reg.stop_instance_local(self.MODEL_ID, npu, replica)
                 except Exception as exc:  # noqa: BLE001
-                    LOG.warning("npu_manager: 卸载实例失败（卡 %s 第 %d 份）: %s",
+                    LOG.warning("npu_manager: unloading the instance failed (card %s, copy %d): %s",
                                 npu, replica + 1, exc)
             return self.status()
 
@@ -402,7 +402,7 @@ class NpuTranslateInstances:
         try:
             reg.record_autostart_entry(self.MODEL_ID, int(card))
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("npu_manager: 记录翻译模型 autostart 失败（卡 #%d）: %s",
+            LOG.warning("npu_manager: recording the autostart of the translation model failed (card #%d): %s",
                         card, exc)
 
     def _wait_ready(self, reg, card: int) -> bool:

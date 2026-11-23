@@ -2601,8 +2601,7 @@ judge_score: Optional[float] = None,
                 ]
             except Exception as e:  # noqa: BLE001
                 LOG.warning(
-                    "target_event: bbox 字段缺失 (既无 result.bbox 也无 "
-                    "result.x1/y1/x2/y2): %s",
+                    "target_event: the bbox field is missing (neither result.bbox nor result.x1/y1/x2/y2): %s",
                     e,
                 )
                 return DetectorEvent(
@@ -3015,9 +3014,7 @@ judge_score: Optional[float] = None,
                     _idle = _now - _last_seen_event_ts
                     if _idle > self._WATCHDOG_IDLE_SECONDS:
                         LOG.warning(
-                            "worker_loop[%s] idle for %.0fs (last event "
-                            "_last_seen_event_ts ago, source 可能停了 / "
-                            "submit_frame 未被调用 / every_n 太大)",
+                            "worker_loop[%s] idle for %.0fs (last event _last_seen_event_ts ago, the source may have stopped / submit_frame was not called / every_n is too large)",
                             slot.label(),
                             _idle,
                         )

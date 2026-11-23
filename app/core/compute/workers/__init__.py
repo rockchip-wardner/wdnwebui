@@ -101,7 +101,7 @@ def _model_dirs() -> List[Path]:
     try:
         dirs = sorted(p for p in root.iterdir() if p.is_dir())
     except OSError as exc:
-        LOG.warning("模型根目录 %s 不可读: %s", root, exc)
+        LOG.warning("the model root directory %s is not readable: %s", root, exc)
         return []
     return [d for d in dirs if not d.name.startswith((".", "_"))]
 
@@ -303,7 +303,7 @@ def _parse_card_requirements(raw: Any) -> Dict[str, Any]:
     """
     if not isinstance(raw, dict):
         if raw:
-            LOG.warning("card_requirements 不是对象，已忽略")
+            LOG.warning("card_requirements is not an object, it was ignored")
         return {}
     layouts = raw.get("layouts")
     if not isinstance(layouts, list):
@@ -448,7 +448,7 @@ def _discover_in_model_dir(model_dir: Path) -> List[WorkerManifest]:
     try:
         candidates = sorted(model_dir.glob(f"*{MANIFEST_SUFFIX}"))
     except OSError as exc:
-        LOG.warning("模型目录 %s 不可读: %s", model_dir, exc)
+        LOG.warning("the model directory %s is not readable: %s", model_dir, exc)
         return out
     for path in candidates:
         if path.name.startswith((".", "_")):
@@ -476,7 +476,7 @@ def _discover_in_model_dir(model_dir: Path) -> List[WorkerManifest]:
                     model_dir=str(model_dir),
                 ))
             else:
-                LOG.warning("跳过无法解析的 json %s: %s", path, exc)
+                LOG.warning("skipping the unparsable json %s: %s", path, exc)
             continue
         if not isinstance(raw, dict) or "spec_factory" not in raw:
             continue

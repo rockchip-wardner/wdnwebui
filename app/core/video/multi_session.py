@@ -227,7 +227,7 @@ def probe_size(path: str) -> Tuple[int, int]:
             if ctx is not None and ctx.width and ctx.height:
                 return int(ctx.width), int(ctx.height)
     except Exception as exc:  # noqa: BLE001
-        LOG.debug("probe_size(%s) 失败: %s", path, exc)
+        LOG.debug("probe_size(%s) failed: %s", path, exc)
     return 0, 0
 
 
@@ -386,7 +386,7 @@ class Channel:
             return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) \
                 if small.ndim == 3 else small
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("mc-ch%02d 判据缩略图 %dx%d 失败: %s",
+            LOG.warning("mc-ch%02d the criterion thumbnail %dx%d failed: %s",
                         self.idx, tw, th, exc)
             return None
 
@@ -545,7 +545,7 @@ class Channel:
                         except Exception as exc:  # noqa: BLE001
                             # 与 _rr_loop 同样"宁可多送不可漏检"：打分失败时
                             # 不影响解码主循环，下一帧重试。
-                            LOG.warning("mc-ch%02d 解码侧判据异常，下帧重试: %s",
+                            LOG.warning("mc-ch%02d the criterion on the decode side is abnormal, retrying with the next frame: %s",
                                         self.idx, exc)
 
                 # 显示节流：**按帧数**（`self.frames % disp_every`），不是按时间。
@@ -614,7 +614,7 @@ class Channel:
                         self._stop.wait(remain)
         finally:
             self._drop_cap(cap)
-            LOG.info("mc-dec-%02d 退出（帧 %d / 重开 %d / 错误 %d）",
+            LOG.info("mc-dec-%02d exited (frames %d / reopened %d / errors %d)",
                      self.idx, self.frames, self.opens, len(self.errors))
 
     @staticmethod
@@ -750,7 +750,7 @@ class MultiChannelSession:
         else:
             self._ana_w, self._ana_h = derive_inference_size(sw, sh)
         self._disp_w, self._disp_h = derive_display_size(len(cleaned), sw, sh)
-        LOG.info("mc-open: 显示 %dx%d / 送检 %dx%d",
+        LOG.info("mc-open: display %dx%d / submit %dx%d",
                  self._disp_w, self._disp_h, self._ana_w, self._ana_h)
 
         self._stop_evt.clear()
@@ -787,8 +787,7 @@ class MultiChannelSession:
             ch._publish = self.publish_frame
         for ch in channels:
             ch.start(eff_decode, eff_display, self.jpeg_quality)
-        LOG.info("mc-open: %d 路 decode=%.1ffps display=%.1ffps "
-                 "(每路上限 %.0f/%.0f, 总预算 %.0f/%.0f)",
+        LOG.info("mc-open: %d streams decode=%.1ffps display=%.1ffps (per-stream limit %.0f/%.0f, total budget %.0f/%.0f)",
                  n, eff_decode, eff_display, self.decode_fps,
                  self.display_fps, MAX_TOTAL_DECODE_FPS,
                  MAX_TOTAL_DISPLAY_FPS)
@@ -947,7 +946,7 @@ class MultiChannelSession:
                 try:
                     ch.judge.reset()
                 except Exception:  # noqa: BLE001
-                    LOG.warning("mc-ch%02d 判据重置失败", ch.idx, exc_info=True)
+                    LOG.warning("mc-ch%02d the criterion reset failed", ch.idx, exc_info=True)
 
     def start_round_robin(self) -> None:
         """起轮转线程，**每个推理 slot 一条**（K 条），至多一组在跑。
@@ -979,7 +978,7 @@ class MultiChannelSession:
             threads = list(self._rr_threads)
         for t in threads:
             t.start()
-        LOG.info("mc-vlm-rr 起了 %d 条 feeder（slot 数 = %d）", k, k)
+        LOG.info("mc-vlm-rr started %d feeder(s) (slot count = %d)", k, k)
 
     def set_round_robin_interval(self, seconds: float) -> float:
         """设置「轮转间隔」秒/路。返回实际生效值。
@@ -1068,7 +1067,7 @@ class MultiChannelSession:
                 # 这里不能静默 pass：detector 上若缺 wait_slot_idle，
                 # AttributeError 被吞掉后 feeder 立刻空转 —— 每秒几千次、
                 # round 恒 0，现象和"模型没返回"一模一样。
-                LOG.warning("mc-vlm-rr slot%d 等 slot 空闲失败: %s",
+                LOG.warning("mc-vlm-rr slot%d failed to wait for a free slot: %s",
                             slot_idx, exc)
                 self._stop_evt.wait(0.5)
                 continue
@@ -1095,7 +1094,7 @@ class MultiChannelSession:
                 spin_streak += 1
                 if spin_streak >= RR_SPIN_STREAK_LIMIT:
                     LOG.warning(
-                        "mc-vlm-rr slot%d 连续 %d 次空转（帧未进队列），退避",
+                        "mc-vlm-rr slot%d idled %d times in a row (no frame in the queue), backing off",
                         slot_idx, spin_streak)
                     with self._lock:
                         self._rr_spins += spin_streak
@@ -1134,7 +1133,7 @@ class MultiChannelSession:
                     else:
                         take = ch.judge.decide_take_for_rr(judge_pos)
                 except Exception as exc:  # noqa: BLE001
-                    LOG.warning("mc-ch%02d 判据异常，按放行处理: %s",
+                    LOG.warning("mc-ch%02d the criterion is abnormal, handling it as a pass: %s",
                                 ch.idx, exc)
                     take = True
                 if not take:
@@ -1164,7 +1163,7 @@ class MultiChannelSession:
                 try:
                     frame_b64 = base64.b64encode(ana_jpg).decode("ascii")
                 except Exception as exc:  # noqa: BLE001
-                    LOG.debug("mc-vlm-rr ch%02d base64 失败: %s",
+                    LOG.debug("mc-vlm-rr ch%02d base64 failed: %s",
                               ch.idx, exc)
                     frame_b64 = ""
 
@@ -1175,7 +1174,7 @@ class MultiChannelSession:
                     frame_b64=frame_b64,
                     judge_score=judge_score, channel=ch.idx)
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("mc-vlm-rr ch%02d submit 失败: %s", ch.idx, exc)
+                LOG.warning("mc-vlm-rr ch%02d submit failed: %s", ch.idx, exc)
                 return False, 0
             if not ok:
                 # 没进队列（detector 没启用 / 队列满）—— 不算推理，别白等
@@ -1186,7 +1185,7 @@ class MultiChannelSession:
                 done = detector.wait_slot_idle(slot_idx,
                                                timeout=RR_INFER_TIMEOUT)
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("mc-vlm-rr slot%d 等推理结束失败: %s",
+                LOG.warning("mc-vlm-rr slot%d failed to wait for the inference to finish: %s",
                             slot_idx, exc)
                 done = False
             dt = (time.perf_counter() - t0) * 1000.0
@@ -1203,7 +1202,7 @@ class MultiChannelSession:
                 spin = 0
                 with self._lock:
                     self._rr_skips += 1
-                LOG.warning("mc-vlm-rr slot%d ch%02d 推理超时 %.1fs，跳过",
+                LOG.warning("mc-vlm-rr slot%d ch%02d inference timed out after %.1fs, skipping",
                             slot_idx, ch.idx, RR_INFER_TIMEOUT)
             # 「轮转间隔」：本路结束后额外等一会儿再抢下一路
             if interval > 0:
@@ -1285,7 +1284,7 @@ class MultiChannelSession:
             for ch in chs:
                 ch.judge.reconfigure(mode=proto_mode, every_n=proto_every,
                                      threshold=proto_thr)
-            LOG.info("mc-judge: %d 路下发 proto=mode=%s thr=%s",
+            LOG.info("mc-judge: %d streams dispatched proto=mode=%s thr=%s",
                      len(chs), proto_mode, proto_thr)
         elif per_overrides:
             # 2) 仅按路下发 —— proto **不动**（用户没显式要改它），每路从
@@ -1302,7 +1301,7 @@ class MultiChannelSession:
                 # 是按旧口径选出来的，继续用会把新旧分数混在一份曲线里。
                 cur.reconfigure(mode=ov_mode, every_n=ov_every,
                                 threshold=ov_thr)
-            LOG.info("mc-judge: %d 路精细下发", len(per_overrides))
+            LOG.info("mc-judge: %d streams dispatched in fine mode", len(per_overrides))
         else:
             LOG.info("mc-judge: no-op")
         return self.judge_snapshot()

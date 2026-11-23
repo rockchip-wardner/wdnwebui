@@ -59,13 +59,13 @@ def _raise_nofile_limit() -> None:
             # hard 也抬不动（少数容器 / 老 systemd 配置），点明症状来源，
             # 否则 28 路崩溃时很难联想到 fd。
             LOG.warning(
-                "RLIMIT_NOFILE soft=hard=%d，多路视频（约 17 fd/路）"
-                "在 30 路左右就会 Too many open files；"
-                "请用 LimitNOFILE=524288 的 systemd unit 或 "
-                "`ulimit -n 524288` 启动", soft,
+                "RLIMIT_NOFILE soft=hard=%d — multi-stream video "
+                "(~17 fd per stream) hits Too many open files around "
+                "30 streams; start it with a systemd unit using "
+                "LimitNOFILE=524288 or `ulimit -n 524288`", soft,
             )
     except Exception as exc:  # noqa: BLE001
-        LOG.warning("提升 RLIMIT_NOFILE 失败（忽略）: %s", exc)
+        LOG.warning("raising RLIMIT_NOFILE failed (ignored): %s", exc)
 
 
 _raise_nofile_limit()
@@ -77,7 +77,7 @@ def _prewarm_preview_posters() -> None:
         from app.core.preview_poster import prewarm
         prewarm()
     except Exception as exc:           # noqa: BLE001
-        LOG.warning("预热预览海报失败（忽略）: %s", exc)
+        LOG.warning("pre-warming the preview poster failed (ignored): %s", exc)
 
 
 class _NoCacheStaticFiles(StaticFiles):
@@ -156,7 +156,7 @@ def create_app() -> FastAPI:
         from app.core.tls_logging import install as install_tls_logging
         install_tls_logging()
     except Exception as exc:               # noqa: BLE001
-        LOG.warning("[TLS] 握手失败日志钩子安装异常（已忽略）: %s", exc)
+        LOG.warning("[TLS] installing the handshake-failure log hook raised (ignored): %s", exc)
 
     # Propagate WDNAI_MODELS_DIR from config so downstream SDKs pick up
     # the configured model root before any LLMSession is built.

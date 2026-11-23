@@ -193,9 +193,9 @@ journalctl -u wdnwebui.service | grep '\[TLS\]'
 ```
 
 ```
-[ERROR] [TLS] 握手失败  SSLError: [SSL: HTTP_REQUEST] http request (_ssl.c:992)
-[ERROR] [TLS] 排查提示: 疑似「明文客户端撞上 HTTPS 端口」：客户端用了 http:// 而不是 https://。
-                   服务端 8000 只提供 HTTPS —— 客户端请改用 https://<host>:8000
+[ERROR] [TLS] handshake failed  SSLError: [SSL: HTTP_REQUEST] http request (_ssl.c:992)
+[ERROR] [TLS] hint: looks like a plaintext client hitting the HTTPS port: the client used http:// instead of https://.
+                   The server serves HTTPS only on port 8000 — the client must use https://<host>:8000
 ```
 
 `[SSL: HTTP_REQUEST] http request` 是 OpenSSL 直接认出来的「对面发的是

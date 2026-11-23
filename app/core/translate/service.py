@@ -333,7 +333,7 @@ class TranslateService:
             raise
         except TranslationError as exc:
             LOG.warning(
-                "translate: 批次请求失败(%d 条),本批保留原文: %s", len(texts), exc
+                "translate: the batch request failed (%d entries), the original text is kept for this batch: %s", len(texts), exc
             )
             return list(texts), 0, set(range(len(texts))), {}, perf
 
@@ -357,7 +357,7 @@ class TranslateService:
 
         # 编号没对上(MT 把两条并成一条、或把编号改写了)→ 逐条翻
         LOG.warning(
-            "translate: 批次编号解析失败(%d 条),退化为逐条翻译", len(texts)
+            "translate: parsing the batch id failed (%d entries), falling back to one-by-one translation", len(texts)
         )
         out = []
         misses = set()
@@ -368,7 +368,7 @@ class TranslateService:
             except QuotaExceeded:
                 raise
             except TranslationError as exc:
-                LOG.warning("translate: 单条翻译失败,保留原文: %s", exc)
+                LOG.warning("translate: the single translation failed, the original text is kept: %s", exc)
                 out.append(text)
                 misses.add(i)
                 continue
@@ -409,7 +409,7 @@ class TranslateService:
             except QuotaExceeded:
                 raise
             except TranslationError as exc:
-                LOG.warning("translate: 单条补翻失败,保留原文: %s", exc)
+                LOG.warning("translate: the single re-translation failed, the original text is kept: %s", exc)
                 continue
             calls += 1
             _merge_perf(perf, getattr(r, "perf", None))

@@ -48,8 +48,7 @@ def probe_video_meta(source: str) -> Optional[dict]:
 
             if (duration_s <= 0 or total_frames <= 0) and fps > 0:
                 LOG.info(
-                    "vr: probe metadata 不全 (duration=%.1fs, frames=%d) — "
-                    "fall back to full decode for %s",
+                    "vr: the probe metadata is incomplete (duration=%.1fs, frames=%d) - falling back to a full decode for %s",
                     duration_s, total_frames, source,
                 )
                 last_pts = 0.0
