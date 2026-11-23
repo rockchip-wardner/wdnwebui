@@ -145,7 +145,7 @@ globalThis.fetch = async () => ({
     card_memory_mb: 5120,
     // ⚠️ **模型候选列表**（2026-11-19）—— 标签 / 显存估算的真源是 manifest。
     models: [
-      { id: "intern-decision-4b", label: "[JEV]图像文字决策模型4B",
+      { id: "intern-decision-4b", label: "[DM]图像文字决策模型4B",
         installed: true, memory_mb: 3200, running: true,
         instance_status: "running", npu_index: 0 },
       { id: "intern-decision-0.8b", label: "[JEV]图像文字决策模型0.8B",
@@ -311,7 +311,7 @@ def main() -> int:
     check("用的是决策能力 swcap_decision",
           "swcap_decision" in (man.get("software_capabilities") or []),
           str(man.get("software_capabilities")))
-    check("默认模型是 intern-decision-4b（= [JEV]图像文字决策模型4B）",
+    check("默认模型是 intern-decision-4b（= [DM]图像文字决策模型4B）",
           DEFAULT_MODEL == "intern-decision-4b", DEFAULT_MODEL)
     check("支持两个型号：4B + 0.8B（0.8B 同规格同协议，只是更小更快）",
           MODEL_IDS == ("intern-decision-4b", "intern-decision-0.8b"),
@@ -482,7 +482,7 @@ def main() -> int:
 
         #: 算力页的模型清单 —— 标签 / 显存估算的真源是模型目录里的 manifest。
         _MODELS = [
-            {"id": "intern-decision-4b", "label": "[JEV]图像文字决策模型4B",
+            {"id": "intern-decision-4b", "label": "[DM]图像文字决策模型4B",
              "capability_types": ["swcap_decision"], "exists": True,
              "memory_estimate_mb": 3200},
             {"id": "intern-decision-0.8b", "label": "[JEV]图像文字决策模型0.8B",

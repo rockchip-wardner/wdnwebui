@@ -1708,7 +1708,7 @@ urgency   "1"      p=0.6921776533126831   logits=[24.90625, 26.78125, 20.984375]
 
 ### 「图文内容审查」卡（`content-review`，插件仓 `wdnapps_audio_chat`）
 
-`display_order=72`（排在网页翻译 71 后面），用 `[JEV]图像文字决策模型4B`
+`display_order=72`（排在网页翻译 71 后面），用 `[DM]图像文字决策模型4B`
 （`intern-decision-4b`，能力 `swcap_decision`）。
 
 **它做什么**：用户维护一张**可增删的审查维度列表** → 输入一张图 + 一段文字 →

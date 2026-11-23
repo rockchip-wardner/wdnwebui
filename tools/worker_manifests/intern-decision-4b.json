@@ -1,5 +1,5 @@
 {
-  "label": "[JEV]图像文字决策模型4B",
+  "label": "[DM]图像文字决策模型4B",
   "capability_types": [
     "swcap_decision"
   ],
