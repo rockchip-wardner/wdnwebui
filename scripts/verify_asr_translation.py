@@ -576,6 +576,125 @@ def test_file_path_splitter() -> None:
           [i for i, _, _, _ in out] == [1, 2], f"out={out}")
 
 
+def test_splitter_no_mid_word_cut() -> None:
+    """兜底切句**不能把一个词劈成两半**（用户报「单词截断」）。
+
+    背景
+    ----
+    旧的兜底是 ``cut = _TR_MAX_SENTENCE_CHARS``（**纯按字符数切**）⇒
+    切点常常落在词中间。实测（英文样本 ``asr_en.wav``）：
+
+    .. code-block:: text
+
+        He wasn't even that big when I started listening to him, bu
+        t in his solo music, didn't do overly well, but he did very
+        well when he started writing for other people.
+
+    ⇒ ① 界面上看到的是**半个词**；② 送进翻译模型的是**半个词** ⇒
+    译文也跟着错位（「well」被当成独立的一句 ⇒ 翻成「嗯，」）。
+    """
+    print("\n[7b] 兜底切句：不劈开词（单词截断）")
+    from wdnapps_audio_chat.cards.qwen3_asr.service import _SentenceSplitter
+
+    def run(steps, flush: bool = True) -> list:
+        sp = _SentenceSplitter()
+        out: list = []
+        emit = lambda t, i, c0, c1: out.append((i, t, c0, c1))   # noqa: E731
+        for c in steps:
+            sp.feed(c, emit)
+        if flush:
+            sp.flush(emit)
+        return out
+
+    # --- 用户报的那段英文（asr_en.wav 的真实识别结果）---
+    full = ("Uh huh. Oh yeah, yeah! He wasn't even that big when I started "
+            "listening to him, but in his solo music, didn't do overly well, "
+            "but he did very well when he started writing for other people.")
+
+    def cuts_are_word_safe(src: str, out: list) -> bool:
+        """每一刀都**没有落在词中间**吗？
+
+        判据：切点**前一个**字符和切点**后一个**字符不能**同时**是
+        字母 / 数字（同时是 ⇒ 把一个词劈成了两半）。
+        """
+        for k in range(len(out) - 1):
+            c1 = out[k][3]
+            if c1 <= 0 or c1 >= len(src):
+                continue
+            if src[c1 - 1].isalnum() and src[c1].isalnum():
+                return False
+        return True
+
+    # ① **逐轮喂**（真实场景：committed 是**逐词**长出来的）
+    # ⚠️ 必须逐轮喂：一次喂全文 ⇒ 走的是「末尾就是句末标点 ⇒ 整段等收尾」
+    #    那条路，看不出兜底切句的行为。
+    seq = [
+        "Uh huh. Oh yeah, yeah! He wasn't even that big when",
+        "Uh huh. Oh yeah, yeah! He wasn't even that big when I started",
+        "Uh huh. Oh yeah, yeah! He wasn't even that big when I started listening to him,",
+        "Uh huh. Oh yeah, yeah! He wasn't even that big when I started listening to him, but in",
+        "Uh huh. Oh yeah, yeah! He wasn't even that big when I started listening to him, but in his solo music,",
+        "Uh huh. Oh yeah, yeah! He wasn't even that big when I started listening to him, but in his solo music, didn't",
+        "Uh huh. Oh yeah, yeah! He wasn't even that big when I started listening to him, but in his solo music, didn't do overly well,",
+        "Uh huh. Oh yeah, yeah! He wasn't even that big when I started listening to him, but in his solo music, didn't do overly well, but he did very well when he started writing for other people.",
+    ]
+    out = run(seq)
+    texts = [t for _, t, _, _ in out]
+    check("逐轮喂 ⇒ 切成了多句（不是一整段）", len(out) >= 3, f"texts={texts}")
+    check("逐轮喂 ⇒ **没有一刀落在词中间**（单词截断没了）",
+          cuts_are_word_safe(full, out), f"texts={texts}")
+    check("逐轮喂 ⇒ 一个字符都不丢",
+          "".join(texts).replace(" ", "") == full.replace(" ", ""),
+          f"texts={texts}")
+    check("逐轮喂 ⇒ 字符区间连续且首尾相接",
+          all(out[k][3] == out[k + 1][2] for k in range(len(out) - 1)),
+          f"out={out}")
+    check("逐轮喂 ⇒ 最后一句带着句号（句末标点没被落在下一段）",
+          texts and texts[-1].endswith("."), f"texts={texts}")
+    check("逐轮喂 ⇒ 没有「只剩一个句号」的碎片句",
+          not any(t.strip() in (".", "!", "?", "。", "！", "？") for t in texts),
+          f"texts={texts}")
+    check("逐轮喂 ⇒ 没有「半个词」这种碎片（bu / t / peopl 之类）",
+          not any(t.strip() in ("bu", "t", "e", "peopl", "le") for t in texts),
+          f"texts={texts}")
+    # 兜底切句优先切在**子句标点**上（语义完整的小句）
+    check("兜底切句优先切在**子句标点**上（语义完整的小句）",
+          any(t.endswith(",") for t in texts), f"texts={texts}")
+
+    # ② **一次喂全文**（末尾就是句末标点 ⇒ 整段等收尾）
+    out = run([full])
+    texts = [t for _, t, _, _ in out]
+    check("一次喂全文 ⇒ 也没有一刀落在词中间",
+          cuts_are_word_safe(full, out), f"texts={texts}")
+    check("一次喂全文 ⇒ 一个字符都不丢",
+          "".join(texts).replace(" ", "") == full.replace(" ", ""),
+          f"texts={texts}")
+    check("一次喂全文 ⇒ 末尾那句完整保留（没被劈开）",
+          texts and texts[-1].endswith("other people."),
+          f"texts={texts}")
+
+    # --- 句末标点**在文本末尾**时 ⇒ 不硬切（等下一轮 / 收尾 flush）---
+    # 「3.」后面可能是「14」⇒ 硬切会把小数劈开。
+    out = run(["The reading was exactly 3."])
+    check("末尾的句点不硬切（等下一轮）",
+          len(out) == 1 and out[0][1] == "The reading was exactly 3.",
+          f"out={out}")
+    out = run(["The reading was exactly 3.", "The reading was exactly 3.14 now"])
+    check("末尾的句点等到了下一轮 ⇒ 小数没被劈开",
+          any("3.14" in x[1] for x in out), f"out={out}")
+
+    # --- 纯中文：子句标点（逗号）也要认 ---
+    cn = "这是一段很长很长的没有任何标点符号的中文句子用来测试强制切句的行为看看会切成什么样"
+    out = run([cn])
+    check("纯中文 ⇒ 仍能切出句子（兜底没坏）", len(out) >= 1, f"out={out}")
+    check("纯中文 ⇒ 一个字符都不丢",
+          "".join(t for _, t, _, _ in out) == cn, f"out={out}")
+
+    # --- 没有边界的超长词 ⇒ 按上限硬切（不能死循环 / 不能不切）---
+    out = run(["x" * 130])
+    check("没有边界的超长串 ⇒ 仍能切（不会卡住）", len(out) >= 2, f"out={out}")
+
+
 # --------------------------------------------------------------------------- #
 # [8] 文件 / 视频路径：round 帧 ⇒ 自己断句 ⇒ 译文
 # --------------------------------------------------------------------------- #
@@ -683,6 +802,7 @@ def main() -> int:
     test_endpoint_hook()
     test_clear_drops_inflight()
     test_file_path_splitter()
+    test_splitter_no_mid_word_cut()
     test_file_path_hook()
     test_api_routes()
 
