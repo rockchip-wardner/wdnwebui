@@ -366,8 +366,15 @@ def main() -> int:
                 break
             page.wait_for_timeout(500)
         # ⚠️ **还要等译文到齐** —— 识别结束 ≠ 译文都回来了（模型还在翻）。
+        #
+        # ⚠️ **等 120 秒**（原来 30 秒）—— 2026-11-24 起前端对翻译请求
+        # **限速**了（全局闸门：600 ms 最多 2 个 ⇒ ≈3.3 个/秒；服务端消化
+        # 能力 ≈2.7 句/秒）⇒ 一整条时间轴（≈150 行）要 **≈55 秒** ⇒
+        # 30 秒的窗口会**差最后几行**。
+        #
+        # ⇒ 契约没变（「每一行都有译文」），只是**慢了**。
         rows: list[dict] = []
-        for _ in range(60):
+        for _ in range(240):
             rows = _timeline_rows(page)
             if rows and all((r["tr"] or "").strip() for r in rows):
                 break
@@ -440,7 +447,13 @@ def main() -> int:
         check("刷新后认领了「行级」翻译（跟着来源一起认领）",
               mode_after == "line", f"_trMode={mode_after!r}")
         rows2: list[dict] = []
-        for _ in range(120):
+        # ⚠️ **等 120 秒**（原来 60 秒）—— 2026-11-24 起前端对翻译请求
+        # **限速**了（全局闸门：600 ms 最多 2 个 ⇒ ≈3.3 个/秒；服务端消化
+        # 能力 ≈2.7 句/秒）⇒ 刷新后**整条时间轴**要重新翻一遍 ⇒ 146 行
+        # 需要 **≈54 秒** ⇒ 60 秒的窗口是**踩线**的（会偶发差最后一行）。
+        #
+        # ⇒ 契约没变（「刷新后每一行仍有译文」），只是**慢了**。
+        for _ in range(240):
             rows2 = _timeline_rows(page)
             if rows2 and all((r["tr"] or "").strip() for r in rows2):
                 break
