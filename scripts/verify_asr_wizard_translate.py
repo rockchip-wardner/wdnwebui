@@ -374,6 +374,36 @@ def _ensure_asr_ready(timeout_s: int = 180) -> None:
     print(f"  [warn] ASR 模型 {timeout_s}s 内没就绪，继续（测试可能失败）")
 
 
+def _ensure_mt_ready(timeout_s: int = 180) -> None:
+    """确保**翻译模型**在跑 —— 用例 2 会把它停掉（测「起不来」的降级）。
+
+    ⚠️⚠️ **必须收尾拉回来**（2026-11-25）：用例 2 故意停掉翻译模型 ⇒
+    跑完自测后板子就**少了这个模型** ⇒ 同传直接翻译不了（面板报
+    「功能未启用」）⇒ 现场就废了。⇒ 跑完**一定**把它拉回来。
+
+    ⚠️ 只拉**本机**实例（``npu_index=0``）—— 不碰别的主机。
+    """
+    st, snap = api("GET", "/api/compute")
+    if st == 200:
+        for i in (snap.get("instances") or []):
+            if i.get("model_id") == "hy-mt-1-5" and i.get("status") == "running":
+                return
+    print("  翻译模型没在跑，拉起来…")
+    api("POST", "/api/compute/instances",
+        {"model": "hy-mt-1-5", "npu_index": 0}, timeout=60)
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        st, snap = api("GET", "/api/compute")
+        if st == 200:
+            for i in (snap.get("instances") or []):
+                if (i.get("model_id") == "hy-mt-1-5"
+                        and i.get("status") == "running"):
+                    print("  翻译模型已就绪")
+                    return
+        time.sleep(2)
+    print(f"  [warn] 翻译模型 {timeout_s}s 内没就绪（同传会翻译不了）")
+
+
 def main() -> int:
     if not os.path.isfile(SOURCE):
         print(f"❌ 测试音频不存在: {SOURCE}")
@@ -382,7 +412,12 @@ def main() -> int:
     # ⚠️ 本脚本**不改**板子的算力配置：active-app 的写操作被 route 拦下，
     #    读操作在前端被伪装成「空」⇒ compute.autostart 原样不动。
     _ensure_asr_ready()
-    return _run_all()
+    try:
+        return _run_all()
+    finally:
+        # ⚠️ **收尾把翻译模型拉回来**（用例 2 把它停了）⇒ 别让自测
+        # 把板子留在「同传翻译不了」的状态。
+        _ensure_mt_ready()
 
 def _run_all() -> int:
     with sync_playwright() as p:
