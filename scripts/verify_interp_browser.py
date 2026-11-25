@@ -51,6 +51,28 @@ CARD = "qwen3-asr"
 #: 设备端的音频（英文）—— 文件源用它。
 SRC_WAV = "/userdata/assets/uploads/asr_en.wav"
 
+#: ⚠️ **测试播放一律 1%**（2026-11-25 用户定案）—— 同传的**默认**音量
+#: 也是 1% ⇒ 但 localStorage 里可能存着**旧的** 0.5 ⇒ 脚本显式拉回 1%。
+#:
+#: ⇒ 测试时**板载喇叭不会整段朗读** ⇒ 不扰民、也不盖住其它声音。
+QUIET_VOLUME_PCT = 1
+
+
+def force_quiet_volume(page) -> None:
+    """把同传音量滑块拉到 **1%** 并触发 change ⇒ 后端立刻收到。
+
+    ⚠️ 必须**在点「开始同传」之前**调用 ⇒ 否则第一句就是 0.5 放出来的。
+    """
+    page.eval_on_selector(
+        "#asr-interp-volume",
+        """(el, pct) => {
+            el.value = String(pct);
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+        }""",
+        QUIET_VOLUME_PCT)
+    page.wait_for_timeout(300)
+
 #: ⚠️ **模拟「浏览器按自动播放策略拒绝了 play()」** ——
 #: 真实桌面浏览器在「媒体参与度不足 / 没有用户手势」时会拒绝自动播放 ⇒
 #: 媒体一直暂停 ⇒ 播放头不动 ⇒ 「跟播放」把句子全压住 ⇒
@@ -189,6 +211,8 @@ def main() -> int:
         src_attr = page.eval_on_selector("#asr-audio-player", "el => el.src || ''")
         check("播放器拿到了源", bool(src_attr), f"src={src_attr!r}")
 
+        # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
+        force_quiet_volume(page)
         page.click("#asr-interp-start")
         page.wait_for_timeout(1200)
         st, data = api("GET", "/api/qwen3-asr/interp/status")
@@ -298,6 +322,8 @@ def main() -> int:
         base_rel = int(base.get("stalled_released") or 0)
         base_done = int((base.get("tts_status") or {}).get("done") or 0)
 
+        # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
+        force_quiet_volume(page2)
         page2.click("#asr-interp-start")
         page2.wait_for_timeout(1500)
         media = page2.eval_on_selector(
@@ -410,6 +436,8 @@ def main() -> int:
         base3_seg = int(base3.get("segments") or 0)
         base3_sub = int(base3.get("submitted") or 0)
 
+        # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
+        force_quiet_volume(page3)
         page3.click("#asr-interp-start")
         # ⚠️ **等媒体播完**（15 s 的文件 + 余量）
         deadline = time.time() + 60
@@ -498,6 +526,8 @@ def main() -> int:
         base4_rel = int(base4.get("stalled_released") or 0)
         base4_seg = int(base4.get("segments") or 0)
 
+        # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
+        force_quiet_volume(page4)
         page4.click("#asr-interp-start")
         page4.wait_for_timeout(1500)
         media4 = page4.eval_on_selector(

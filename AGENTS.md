@@ -13809,6 +13809,16 @@ python3 scripts/verify_log_guardian.py      # 27 条断言
 
 ## 「流式语音识别」卡同声传译：**TTS 播放滞后**的诊断口径与修法（2026-11-23）
 
+### ⓿ ⚠️ **音量纪律**：测试播放与**产品默认**都是 **1%**（2026-11-25 用户定案）
+
+* **同传的默认音量 = 1%**（`volume = 0.01`）—— 引擎默认、前端滑块初值、
+  前端状态，三处一致 ⇒ **板载喇叭默认安静** ⇒ 想听清楚自己往上拉。
+* **测试/回归一律 1%**：探针显式带 `volume=0.01`；**浏览器回归还要显式
+  拉回 1%**（`scripts/verify_interp_browser.py::force_quiet_volume()`）
+  ⇒ localStorage 里可能存着旧的 0.5。
+* ⚠️ `volume` 只是**软件振幅缩放** ⇒ 板载 `amixer`（硬件级）也要压低，
+  否则 1% 仍按硬件音量放。
+
 用户报：「ASR+翻译后，TTS 播放**滞后非常多**」。完整分析见
 `docs/SIMULTANEOUS_INTERPRETATION_IMPL.md` 的 **M29** 一节；卡片侧的实现细节
 见 `.venv/src/wdnapps-audio-chat/AGENTS.md`。这里只留**最容易踩的三条**：
