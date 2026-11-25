@@ -153,7 +153,7 @@ def main() -> int:
     time.sleep(0.5)
     st = _req("/api/qwen3-asr/interp/start",
               {"mode": "steady", "gate": args.gate, "target_lang": "zh-CN",
-               "volume": 0.5, "source": "file"})
+               "volume": 0.01, "source": "file"})
     print("   interp:", {k: st.get(k) for k in
                          ("running", "mt_ready", "tts_local_ready", "tempo")})
 
@@ -200,6 +200,7 @@ def main() -> int:
 
     print("== 采样 %d s ==" % int(args.seconds))
     seen: dict = {}
+    t_sample_start = time.time()
     t_end = time.time() + args.seconds
     while time.time() < t_end:
         q = _req("/api/tts/queue/status")
@@ -208,7 +209,16 @@ def main() -> int:
         time.sleep(0.25)
     sim.stop()
 
+    # ⚠️⚠️ **只统计「本次运行窗口内」播出的条目** ——
+    # 队列的 ``timings`` 是**累积**的（最后一次探针 / 回归留下的历史都在
+    # 里面）⇒ 不按时间窗过滤 ⇒ 拿到的 ``t_play`` 是几小时前的 ⇒
+    # 用本探针的播放头剧本去外推 ⇒ **同步误差全是假的**。
     rows = [seen[k] for k in sorted(seen, key=lambda x: (x is None, x))]
+    before = len(rows)
+    rows = [t for t in rows
+            if float(t.get("t_play") or 0.0) >= t_sample_start - 2.0]
+    print("   （队列 timings 共 %d 条，本次窗口内 %d 条）"
+          % (before, len(rows)))
     if not rows:
         print("   ⚠️ 没有采到 timings")
         print(json.dumps(_req("/api/tts/queue/status"), ensure_ascii=False)[:1500])

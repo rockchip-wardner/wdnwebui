@@ -98,7 +98,7 @@ def warm_up() -> dict:
     api("POST", "/api/tts/queue/clear")
     api("POST", "/api/qwen3-asr/interp/start", {
         "mode": "steady", "gate": "follow", "target_lang": "zh-CN",
-        "volume": 0.5, "source": "file",
+        "volume": 0.01, "source": "file",
     })
     t0 = time.time()
     last = {}

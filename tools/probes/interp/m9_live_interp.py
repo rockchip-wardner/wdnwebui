@@ -77,7 +77,7 @@ def run_mode(mode: str, pcm: bytes, seconds: int) -> dict:
     print(f"\n=== {mode} 档 ===")
     api("POST", "/api/qwen3-asr/interp/start",
         {"mode": mode, "gate": "now", "target_lang": "zh-CN",
-         "volume": 0.05, "source": "live"})
+         "volume": 0.01, "source": "live"})
     time.sleep(0.5)
     before = api("GET", "/api/qwen3-asr/interp/status")
 

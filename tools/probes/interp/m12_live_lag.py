@@ -62,7 +62,7 @@ def main() -> int:
     print(f"=== 实时流 + {mode} 档 + {seconds}s 音频 ===")
     api("POST", "/api/qwen3-asr/interp/start",
         {"mode": mode, "gate": "now", "target_lang": "zh-CN",
-         "volume": 0.05, "source": "live"})
+         "volume": 0.01, "source": "live"})
     time.sleep(0.5)
     base = api("GET", "/api/qwen3-asr/interp/status")
 
