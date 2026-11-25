@@ -60,8 +60,9 @@ def report(ph: float, playing: bool, ended: bool = False) -> None:
 
 
 def main() -> int:
-    # ⚠️ 参数：**切句档**（steady/fast）+ **音量**（默认 0.01 = 探针口径；
-    # 想**听**就传 0.1 ⇒ 用户在板子旁边能判断杂音 / 卡顿 / 断音）。
+    # ⚠️ 参数：**切句档**（steady/fast）+ **音量**（默认 0.01 = 探针口径，
+    # 只量指标不需要出声；想**听**就传 0.05 = 产品默认/测试音量 ⇒ 用户在
+    # 板子旁边能判断杂音 / 卡顿 / 断音）。
     mode = sys.argv[1] if len(sys.argv) > 1 else "steady"
     volume = float(sys.argv[2]) if len(sys.argv) > 2 else 0.01
     print("== M33：播放连续性实测（文件源 + 跟播放 · %s 档 · 音量 %.0f%%）=="
