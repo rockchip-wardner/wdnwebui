@@ -300,7 +300,12 @@ def _run_case(browser, *, fail_enable: bool, lang: str) -> tuple[list, list]:
     check("选中的值被记住", _tr_select_dump(page).get("value") == lang,
           f"实际 {_tr_select_dump(page).get('value')!r}")
 
-    _next(page)                       # translate → finish
+    # ⚠️⚠️ **向导现在有 5 步**（2026-11-25，分支加了「同声传译」步）：
+    # env → source → translate → **interp** → finish
+    # ⇒ 本脚本原来只点 3 次「下一步」⇒ 停在 **interp** 步 ⇒
+    #    完成页摘要是空的、「完成配置」按钮点不到（超时）⇒ 假失败。
+    _next(page)                       # translate → interp
+    _next(page)                       # interp → finish
     rows = _summary_rows(page)
     print("  完成页摘要:", rows)
     check("完成页摘要里有「翻译目标语言」",
