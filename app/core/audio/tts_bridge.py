@@ -133,6 +133,77 @@ def session_available() -> bool:
     return False
 
 
+def tts_model_id() -> str:
+    """TTS 模型的 ``model_id``（没装 / 没发现 ⇒ 空串）。
+
+    给「模型加载进度条」用：进度条是**按 model_id 找实例**的
+    （``state.js::_watchModelProgress`` 轮询 ``GET /api/compute``，
+    拿 ``instances[]`` 里 ``model_id`` 对得上、``status`` 变成
+    ``running`` 的那条判为就绪）⇒ 卡片得先知道**要等的那个 model_id**
+    是谁。
+
+    ⚠️ **为什么不在这里建会话**：进度条要等的是**还没起来**的模型 ⇒
+    这时候压根没有会话 ⇒ 只能从**模型表**里查。
+
+    ⚠️ **为什么按 capability 查而不是写死 "qwen3-tts"**：模型包换了
+    id（版本升级）时，写死的名字就失效 ⇒ 进度条永远等不到 ⇒ 表现为
+    「进度条卡住」而不是「模型没装」⇒ 很难查。
+    """
+    try:
+        from app.core.compute.registry import MODEL_PRESETS
+    except Exception:  # noqa: BLE001 — 宿主还没就绪 ⇒ 当作「没有 TTS」
+        return ""
+    for model_id, preset in (MODEL_PRESETS or {}).items():
+        caps = (preset or {}).get("capability_types") or []
+        if "swcap_text_to_speech" in caps:
+            return str(model_id)
+    return ""
+
+
+def start_model(model_id: str) -> dict:
+    """把某个模型拉起来（**卡位由卡位策略决定**）⇒ 给「模型加载进度条」用。
+
+    ⚠️ **为什么需要它**：向导的进度条是**按 model_id 等实例出现**的
+    （``state.js::_watchModelProgress`` 轮询 ``GET /api/compute``）⇒
+    只把 model_id 报上去**不会有人去起它** ⇒ 进度条会一直等到超时。
+
+    ⚠️ **卡位怎么选**：走 :mod:`app.core.compute.card_roles` 的**同一份
+    策略** —— 感知链（ASR + 翻译）跟卡跑、**发声链（TTS）独占一张卡**
+    ⇒ TTS 会落到一张**没被感知链占用**的卡（需求：ASR+翻译一张卡、
+    TTS 独立一张卡）。
+
+    ⚠️ ``allow_adopt=False`` ⇒ **不允许**拿对端板子的实例 ⇒ 本板自己起。
+
+    返回 ``{"ok": bool, "model_id": str, "npu_index": int, "detail": str}``。
+    """
+    out = {"ok": False, "model_id": str(model_id or ""), "npu_index": -1,
+           "detail": ""}
+    if not model_id:
+        out["detail"] = "没有模型 id"
+        return out
+    try:
+        from app.core.compute import card_roles
+        from app.core.compute.registry import get_registry
+        reg = get_registry()
+        card = card_roles.pick_card(reg, model_id)
+        out["npu_index"] = int(card)
+        inst = reg.ensure_worker_for_model(
+            model_id, allow_adopt=False, npu_index=card, eager_load=False)
+        # ⚠️⚠️ **必须 bind** —— ``ensure_worker_for_model`` 只**起 worker
+        #    进程**；``eager_load=False`` 时 worker **不会自己加载**模型
+        #    （``--npu`` 不传给它）⇒ 状态会一直停在 ``not_loaded`` ⇒
+        #    进度条永远等不到。
+        #    ⇒ ``bind_instance`` 发那条 ``load`` RPC（fire-and-forget：
+        #    立刻把状态置 ``loading``，后台加载完翻 ``running``）。
+        #    —— 与 ``POST /api/compute/instances`` 走的是同一条路。
+        reg.bind_instance(inst, card)
+        out["ok"] = True
+        out["pid"] = getattr(inst, "pid", 0)
+    except Exception as exc:  # noqa: BLE001 — 起不来 ⇒ 软失败
+        out["detail"] = "%s: %s" % (type(exc).__name__, exc)
+    return out
+
+
 def get_session():
     """TTS 会话单例(``TtsSession``)。
 
