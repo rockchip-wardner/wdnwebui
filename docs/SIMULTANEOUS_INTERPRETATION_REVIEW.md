@@ -1,0 +1,680 @@
+# 流式语音识别卡「同声传译」—— 实施方案（审核稿）
+
+> 状态：**待审核**（本稿只出方案与决策项，不动代码）
+> 目标板：RK1828 × 3 协卡（`0001:11:00.0` / `0003:31:00.0` / `0004:41:00.0`，各 5120 MB）
+> 依据：本仓现状（`wdnwebui` @ `05c57bd`、插件 `wdnapps_audio_chat` @ `288c7c2`）+ **板端实测**（2026-11-21 ~ 11-24）
+> 配套文档（同源，均在**未推送的丢弃分支**上）：`docs/SIMULTANEOUS_INTERPRETATION_PLAN.md`（为什么 / v4 979 行）、`docs/SIMULTANEOUS_INTERPRETATION_IMPL.md`（怎么做 / v2 2569 行）
+
+---
+
+## 0. 一页速览
+
+### 0.1 最重要的一件事：**这套功能已经写完了，今天早上被 `git reset` 甩掉了**
+
+2026-11-24 07:36（宿主）与 07:38（插件）各有一次 `git reset`，把一条**已经完成、四天连续实测迭代**的同传分支从工作区甩掉。**提交对象仍在 git 里，未推送，可完整恢复**：
+
+| 仓库 | 丢弃的提交 | 内容 |
+|---|---|---|
+| 插件 `wdnapps-audio-chat` | **`12fa8dd`**（8 个提交，`a7f9ff6`…`12fa8dd`） | `cards/qwen3_asr/interp.py` **2808 行**、`cards/tts/queue.py` **1561 行**、`service.py`/`api.py`/`app.js`/`template.html` 改动，共 **+6796 / −695** |
+| 宿主 `wdnwebui` | **`9432a2b`**（5 个提交，`f11dbb4`…`9432a2b`） | `app/core/audio/tts_bridge.py` 队列桥、`docs/SIMULTANEOUS_INTERPRETATION_IMPL.md` **2569 行**、`docs/SIMULTANEOUS_INTERPRETATION_PLAN.md` **979 行**、**8 个回归脚本**、**37 个真机探针**（27 个同传 + 10 个同卡专项） |
+
+恢复命令（**只读，不改任何东西**）：
+
+```bash
+cd /userdata/wdnwebui/.venv/src/wdnapps-audio-chat
+git show 12fa8dd:src/wdnapps_audio_chat/cards/qwen3_asr/interp.py   # 2808 行
+git show 12fa8dd:src/wdnapps_audio_chat/cards/tts/queue.py          # 1561 行
+cd /userdata/wdnwebui
+git show 9432a2b:docs/SIMULTANEOUS_INTERPRETATION_IMPL.md
+git show 9432a2b:app/core/audio/tts_bridge.py
+```
+
+⇒ **本稿的定位不是「从零设计」，而是「确认已完成的部分 + 补上唯一真缺口 + 给出合并路径」。**
+
+### 0.2 你的 7 条需求 vs 现状
+
+| # | 你的需求 | 现状 | 证据 |
+|---|---|---|---|
+| 1 | ASR 卡加入 TTS 做同传 | ✅ **已完成**（引擎 2808 行 + TTS 队列 1561 行） | `12fa8dd:…/qwen3_asr/interp.py`、`…/tts/queue.py` |
+| 2 | 四种音源接入，板载喇叭播放 | ✅ **已完成**（音频文件 / 含音轨视频 / 浏览器麦 / 板载麦） | `PLAN_why.md` §2.5；`a911dc4`（补文件/视频/浏览器麦输入） |
+| 3 | 视频源：语音节奏 = 字幕节奏，可来回拖动 | ✅ **已完成且实测达标** | 见 §0.3 |
+| 4 | ASR+翻译卡 0，TTS 独立卡 1 | ✅ **与现有卡位策略完全一致** | `app/core/compute/card_roles.py:37-45,324-345` |
+| 5 | 向导加「是否开启同传」+ 进度条参照 ASR/翻译 | ❌ **唯一真缺口**（向导里从未有过这个开关） | 丢弃分支的 `wizard.json` 与主干**逐字节相同** |
+| 6 | 间隔尽量小、不丢语音 | ⚠️ **主体已完成**，但「不丢」要改主干的丢块默认值 | 主干 `app.js:31` `LIVE_MAX_PENDING = 2`（丢最旧） |
+| 7 | 出方案、补不足、出报告 | ✅ 本文档 | — |
+
+### 0.3 需求 3 的实测成绩（这是丢弃分支最硬的成果）
+
+在 **145 秒双语视频、5% 音量**上实测（`c1468da` 提交说明 + 探针 `m23_seek_sync.py` / `m24_browser_seek.py`）：
+
+| 指标 | 修前 | 修后 |
+|---|---|---|
+| 逐行同步误差 `err = 出声时播放头 − 源话位置` 中位数 | **−15.89 s** | **0.05 s** |
+| 误差 > 3 s 的行数 | **19 / 19 行** | **1 / 19 行**（其余 18 行在 0.3 s 内） |
+| 最差单行误差 | **−46.6 s** | — |
+| 每次 TTS 批次包含的行数 | 4–6 行 | 1–3 行（自适应） |
+
+**根因与解法（已落地）**：前端把视频源错报成 `source=file` ⇒ 引擎套用了「离线转写批处理」策略（18 秒一批）⇒ 译文晚 10 秒以上、一次性整块播出。修法三条：
+1. 视频源改报 `source=video`；
+2. 视频源走**播放时钟**（`queue.py::set_clock`）—— 音频播到 `playhead ≥ 该行位置` 才放行，**滞后恒为 0**；
+3. 视频源「源已结束」= **媒体播完**，而不是 ASR 结束（识别跑在播放头前面，ASR 结束不代表画面结束）。
+
+### 0.4 一句话结论
+
+> **能做，且已经做完了 90%。** 剩下的 10% 是：① 恢复分支并与主干 4 个新提交合并；② **补上向导里的「是否开启同传」开关与进度条第三行**（你明确要求、至今不存在）；③ 把主干的「上行丢块」默认值改成不丢。
+>
+> 但有一个**产能天花板**必须你拍板：**单卡 TTS 只有 1.02× 实时**，中→英场景会**逐渐滞后**（内容不丢）。要翻倍必须用第三张卡（npu2，2026-11-21 你划为禁区）。详见 §8 的 **D1**。
+
+### 0.5 拍板记录（2026-11-25 · 用户已定案）
+
+| # | 问题 | **决定** | 落地口径 |
+|---|---|---|---|
+| **D1** | 产能：要不要启用第三张卡（npu2）跑第二个 TTS 实例？ | ✅ **维持 npu2 禁区** | 产能天花板 = **单卡 1.02×**；用 `tempo` 自适应（≤1.15）+ **如实显示滞后**兜底。外语→中文（k≈0.9）恒定滞后；中→英/中→日（k≈1.15~1.30）滞后随讲话时长增长（**内容仍不丢**）。多实例并行合成的代码**保留**（丢弃分支已实现），将来解禁只差一个 `POST /compute/instances` |
+| **D2** | 自测时的音量 | ✅ **自测音量降到 1%（`volume = 0.01`）**，防止扰民 | ① **所有回归/探针脚本**提交 TTS 时一律带 `volume=0.01`；② **用户侧默认仍给 0.5**（实测 0.5 ⇒ −14 dBFS 清晰可闻；0.1 ⇒ −32 dBFS 听不见）；③ ⚠️ **「原声 vs 译音叠加」这一问仍未拍板** ⇒ 本稿按建议默认 **原声降到 15%**（保留对照能力），实现时做成可调，**你验收时可改** |
+| **D3** | 向导开关粒度 | ✅ **开关 + 语言 + 音色** | 新增**独立第 5 步「同声传译（可选）」**，3 个字段（`checkbox` + `select` × 2）⇒ 见 §3.1 |
+| **D4** | 实时麦场景 5~7 s（快档）/ 9~13 s（稳档）的滞后可接受吗？ | ⏸ **待方案实施完实测** | 实施后用探针 `m19_latency_breakdown.py`（分段耗时）+ `m12_live_lag.py`（稳档时间线）出数，再定默认值是快档还是稳档。**不阻塞开发** |
+
+### 0.6 补充发现的**第二个真缺口**：SDK 侧的「首窗优化」从未落地
+
+丢弃分支的方案把「合成首窗 3.23 s → 2.03 s」写进了交付物清单（第 8 项，改 `wdnai/backends/tts.py`），**但那笔改动从未进 SDK 仓**：
+
+* `.venv/src/wdnai` 的 reflog 最后一条停在 **2026-11-20**，工作区干净 ⇒ **没有任何对应提交**；
+* `src/wdnai/backends/tts.py` 里**没有** `FIRST_WINDOW_FRAMES` / `first_window_frames` ⇒ 首窗仍硬等 50 帧（4 s 音频）。
+
+⇒ **这是必须新写的一段代码**（不是恢复），规格已由探针 `m20` 验证过（见 §4.3）。
+⇒ 影响：实时场景总滞后会**多 1.2 s**（3.23 vs 2.03）。
+
+### 0.7 实施进度（2026-11-25 · S0 / S1 / S5 已完成）
+
+**S0 = 抢救 + 合并**，用「cherry-pick 到主干」而不是「merge 丢弃分支」—— 两个分支都是**线性链**，直接落在主干顶端，历史干净、无合并提交。
+
+| 步骤 | 结果 |
+|---|---|
+| 插件工作区的 2 个未提交文件（「字幕比声音更慢」的报障修复） | ✅ 先提交成 `002d390`（否则切分支会丢） |
+| 插件：建分支 `feat/interp-recover` + cherry-pick 8 个提交 | ✅ `64da936` … `3f63b07` |
+| 插件：唯一冲突（`_SentenceSplitter`） | ✅ 手解：**主干**的 `_soft_sentence_end`（子句标点优先 + 句末等待 + 代理对安全）+ **分支**的 `_hold_tail` 暂存机制 + **分支**的「往前扩到下一个词边界」⇒ 三样都要 |
+| 宿主：建分支 `feat/interp-recover` + cherry-pick 5 个提交 | ✅ 5 个全干净（含 37 个探针、8 个回归脚本、2569 行方案、979 行可行性报告、队列桥） |
+| 模块导入自检 | ✅ 6 个模块全部 OK |
+| 不需要硬件的回归 | ✅ `verify_interp_segmenter` **11/11**、`verify_interp_gate` **45/45**、`verify_tts_queue` **20/20** |
+| 重启服务加载新代码 | ✅ 同传 6 路由 + TTS 队列路由全部在线（HTTP 200） |
+| 算力部署 | ✅ **卡 0 = ASR(1600) + MT(2200) = 3800 MB ≤ 5120**（需求 4 的形态，已实机验证） |
+
+**S1 = 向导「是否开启同传」+ 进度条第三行**（需求 5）：
+
+| 项 | 结果 |
+|---|---|
+| 宿主 `app/core/audio/tts_bridge.py` | ✅ 新增 `tts_model_id()`（按 capability 查 `MODEL_PRESETS`，不写死 id）+ `start_model()`（**必须 `reg.bind_instance(inst, card)`**，否则状态停在 `not_loaded`、进度条永远等不到） |
+| 插件 `cards/qwen3_asr/api.py` | ✅ 新增 `POST /interp/ensure-tts`；`GET /interp/status` 追加 `tts_model_id` |
+| 插件 `cards/qwen3_asr/static/wizard.json` | ✅ 新增第 5 步「同声传译（可选）」：开关 + 语言 + 音色（D3） |
+| 插件 `cards/qwen3_asr/static/app.js` | ✅ `_interpWizardOptions()` / `_interpTargetLang()` / `_interpEnsureTts()`；`preloadExtraModels` 勾同传 ⇒ 追加 TTS target + 真实发起加载 |
+| 新回归 `scripts/verify_asr_wizard_interp.py` | ✅ **16/16** |
+| 实机验证（需求 4） | ✅ `POST /interp/ensure-tts` ⇒ `{"ok":true,"model_id":"qwen3-tts","npu_index":1}` ⇒ 算力快照 **卡0: ASR(1600)+MT(2200)=3800 MB / 卡1: TTS(1900) running** ⇒ **感知链同卡、发声链独占** |
+
+**S5 = SDK 首窗优化（唯一需要新写的代码）** —— 见 §0.10。
+
+> ⚠️ **重启的副作用**已按 AGENTS.md 处理：systemd 的 `KillMode=control-group` 会把 cgroup 里的 `compute_worker` 一起 SIGTERM 掉 ⇒ 重启后只有 `compute.autostart` 里的 `qwen3-asr` 自动回来，**翻译模型被连坐杀掉** ⇒ 已用 `POST /api/compute/instances {model:"hy-mt-1-5", npu_index:0}` 拉回（约 21 s 就绪）。
+
+### 0.8 ✅ 已查清：`verify_asr_seek_subtitle` 的失败**不是回归**
+
+**现象**：恢复后的分支上该脚本时而 15/15 全过、时而 11~13/15，失败内容每次都不同。
+
+**排查过程**：
+
+1. **第一次失败**：报 `#asr-start-btn` 一直 `disabled` ⇒ 查服务端状态发现 `busy=True, current_request_id=4` ⇒ **上一个脚本留了一个会话在跑**（`startBtn.disabled = !hasSource || snap.busy || starting`）⇒ 停掉会话后复跑 ⇒ **15/15 通过**。
+2. **第二次失败**：「每一轮的假设文本里都有中文（没有整段变英文）」⇒ 10 轮没有中文，例：` Chinese language`。
+3. **第三次失败**：同样一条断言，但例句变成 ` well.` ⇒ **内容每次都不同** ⇒ 随机现象。
+4. **基线对照**（切到合并前的 `002d390` + 重启）：**15/15 × 2 全过** ⇒ 起初看起来像回归。
+5. **直击根因**：在**基线**上直接识别同一段（`start_sec=34`）⇒ 模型输出：
+
+   ```
+   Or is it? What's she? That's just a cyber. That's just, it's just a machine.
+   I saw it, but that is too fragile. That was ？如果一个人不带心，但他力量不为，
+   他的命运。一个叫什么？四十岁，一个下人。我对于人的理解，就是。您呢？您不是。老练，你可以很谦。
+   ```
+
+   ⇒ **素材本身是中英夹杂的对谈**（`asr_zh_seek_test.mp4`），那几秒**真的有英文语音** ⇒ 模型识别成英文**是对的**。
+
+**结论**：
+
+* 那条断言「每一轮都该有中文」**分不清「素材里的代码切换」和「模型退化」** ⇒ 在这份素材上是**误报**；
+* 该断言测的是**原始识别文本**，在切句器**上游** ⇒ 我手解的切句器冲突**不可能**影响它；
+* ⇒ **合并没有引入回归**。恢复后的分支在该脚本上与基线**同档**（都会因素材的英文段而偶发失败）。
+
+> 📌 **给回归套件的提示**：`asr_zh_seek_test.mp4` 含真实英文段 ⇒ 「不许整段变英文」这条断言要么换成**纯中文素材**，要么改成「只判乱码（重复/自锁）」，否则会一直偶发红。
+
+### 0.9 ⚠️ 恢复的分支里有一条**结论错误的改动**——已回退（2026-11-25）
+
+被恢复的插件提交 `756a3fe`（*shorten the rollback window so the head of a file is kept*）把**文件 / 视频源**的流式回滚窗口从 SDK 默认的 **4 轮 / 5 token** 收窄到 **1 轮 / 3 token**，理由是「4/5 会把句首 8 个词吞掉」。
+
+**合并后跑回归发现 `verify_asr_wizard.py` 的 W6 变红**（「转写文本与 C++ demo 一致」）。追查后确认：**这条改动的前提在当前 SDK 上不成立，已回退。**
+
+| 判据 | 4 / 5（SDK 默认） | 1 / 3（分支的覆盖） |
+|---|---|---|
+| SDK 已确认文本语义 | `_OnlineDecoder.add`：`self.committed += delta` ⇒ **只追加**，提交过就丢不掉 | 同 |
+| 首次提交发生在 | 第 5 轮（`chunk_idx >= rollback_rounds`）⇒ 提交的是**整段假设**（含句首） | 第 2 轮 |
+| `asr_en.wav` 最终文本（各跑 2 遍） | `Uh huh. Oh yeah, yeah! He wasn't …` | `Uh huh. Oh yeah, yeah. He wasn't …` |
+| 与 **C++ demo** 是否逐字节相同 | ✅ **相同** | ✗ 差一个标点 |
+| 与**板载 agent**（`tools/asr_mic_agent.py`，走 SDK 默认）是否相同 | ✅ 相同 | ✗ 不同 |
+| 长中文素材 `asr_zh_seek_test.mp4` | 214 字 | 177 字（**措辞显著不同**） |
+
+**为什么「句首被吞」不成立**：
+
+1. SDK 的已确认文本**只追加** ⇒ 不存在「模型改写把已提交的字吃掉」的路径；
+2. 第一次提交（第 5 轮）提交的是**整段假设** ⇒ 句首必然在内（轮次流实测：第 5 轮 `committed` 就是完整句首）；
+3. **分支自己的切句器**（`12fa8dd` 的 `_SentenceSplitter`）喂 4/5 的 committed 流 ⇒ 首句照样在 ⇒ 切句器也不是元凶；
+4. 文件源在**说话停顿**处切会话（每 40~60 s 一段）⇒ 新会话 `committed` **归零**（实测 `-55`）—— 这才是「实时结果整段消失」的机制，而 **1/3 只是把空窗从 4 轮缩到 1 轮，并没有修掉它**。
+
+**代价对比（全仓标定都按「热身 4 轮」算）**：
+
+* 切会话策略 `_FILE_SESSION_MIN_SEC = 40` 按「热身期占比 4/40 = 10%」权衡；
+* 停滞检测硬编码「前 `rollback_rounds`（**4**）轮不允许提交」；
+* 前端拖动回看 `SUB_SEEK_LEAD_IN_SEC = 8 s` 也按 4 轮热身补偿。
+
+⇒ **收窄窗口会让这三处集体失配**，换来的却只是「转写结果与 C++ demo / 板载 agent 不一致」。
+
+**⇒ 处置**：`_file_stream_options()` 与 `_FILE_ROLLBACK_*` **整体删除** ⇒ 文件 / 视频源回到 **SDK 默认的 4 轮 / 5 token**（= C++ demo = 板载 agent ⇒ **一个窗口、一套标定、一份答案**）。调用方**显式传了**仍然优先（`/transcribe` 的 form 字段 `rollback_rounds` / `rollback_tokens`）⇒ 需要对比时随时能切。
+
+**回归结果**：`verify_asr_wizard.py` **75 通过 / 2 失败 ⇒ 77 通过 / 0 失败**（W6 两条恢复绿）。
+
+> ⚠️ **已知代价（如实告知）**：4/5 下**首次「已确认」文本**要到第 5 轮（≈ t=5~7 s）才有（1/3 是 t≈2 s）⇒ 字幕 / 译音的**开头会晚几秒**。这是「与 C++ demo 逐字一致」的代价。
+> 📌 **待办**：epoch 边界上「实时结果」是否会被清空，属**前端显示层**问题（文件源画的是服务端**句子流**，跨 epoch 累积 ⇒ 实际不会清空），与回滚窗口无关；已记进插件 `AGENTS.md` §⑦。
+
+### 0.10 ✅ S5：SDK 首窗优化（**唯一需要新写的代码**）—— 实测通过
+
+**缺口**：插件 / 宿主侧的 `first_window_frames` **透传链早就修好了**
+（宿主 `tts_bridge.submit_queued` → 插件 `queue.py` → `tts/api.py` → `tts/service.py`
+→ `sess.respond(first_window_frames=…)`），**只有 SDK 端没有这个参数** ⇒
+参数被静默忽略 ⇒ 首声仍要等 50 帧。
+
+**改法**（外部仓 `.venv/src/wdnai`，提交 `6f6eeb0`）：
+
+* `backends/tts.py` 新增 `FIRST_WINDOW_FRAMES = 25` + `first_window_frames` 形参
+  （`run_with_progress` → `_run_talker_streaming_with_progress` → `_decoder_worker_with_stop`），
+  `TTSBackend.run_text` 从 `overrides` 里取并透传；
+* 首窗只攒 `first_n` 帧（其余逻辑不动）⇒ **帧覆盖仍精确、不重不漏**：
+  首窗吃 **0~24**、下一窗吃 **25~49**；
+* 第二窗的输入块 = 「左上下文 0~24 + 新 25~49」**与上游逐字节相同**
+  ⇒ 25 帧以后的音频**与上游相同**；只有 0~24 段的右边从「未来的帧」变成
+  「补零」⇒ 因果解码器不受影响；
+* **空文本前置校验**：`run_with_progress` 在任何重活之前就拒空文本
+  （`ValueError("TTS: empty text")`），不再让上层看到「produced no audio」。
+
+**实测**（探针 `tools/probes/interp/m20_tts_first_window.py`，板端，文本
+「嗯嗯。哦对了，当然了！当他开始给我听的时候…」）：
+
+| 首窗 | **首声延迟**（第一帧出现） | 首段 RMS | 接缝跳变 / 自然跳变基线 |
+|---|---|---|---|
+| **25 帧（新的默认）** | **2.10 s / 2.24 s** | 0.0405 / 0.0362 | 1.65 / 0.17 |
+| 50 帧（上游） | 3.56 s / 3.56 s | 0.0339 / 0.0417 | 1.29 / 1.43 |
+
+⇒ **首声快 ~1.3 s**（同传链路上最大的一段固定延迟）；
+⇒ 25 帧版的首段 RMS **落在** 50 帧版**自身抖动区间**内；
+⇒ 跨配置互相关（−0.011 ~ +0.014）与**同配置基线**（0.001 / 0.006）**同量级**
+⇒ 差异由**采样噪声**主导（`temperature=0.9`）⇒ **不是**首窗引入的；
+⇒ 接缝跳变在**自然跳变的基线量级**内 ⇒ 没有可听见的接缝。
+
+> 📌 **顺手修了探针的判据**：原来用「合成总墙钟」当首声指标 ⇒ **测错了东西**
+> （总时长由 talker 产多少帧决定 ⇒ 两个配置几乎一样 ⇒ 会得出「没变快」的
+> 错误结论）⇒ 改成量「**第一帧出现**」的时刻，并补上「接缝跳变 vs 自然
+> 跳变基线」这一条。
+> ⚠️ **下限 25 帧**：首窗必须盖住窗间隔（`F × 0.08 s ≥ 1.9 s` ⇒ `F ≥ 24`）
+> ⇒ 再小会出现可听的静默（`starved`）。这与同传引擎的
+> `INTERP_FIRST_WINDOW_FRAMES = 25` **正好一致** ⇒ 现在 SDK 默认值与
+> 同传引擎的要求**对上了**（插件注释里一直写着「SDK 的默认值就是 25 帧」，
+> 此前这句是**不成立的**）。
+
+
+
+
+---
+
+## 1. 现状盘点：能复用什么
+
+### 1.1 三颗模型全部就位（实测）
+
+| 环节 | model_id | capability | 显存 | 初始化 | 备注 |
+|---|---|---|---|---|---|
+| ASR | `qwen3-asr` | `swcap_audio_asr` | 1600 MB | 25 s | `tools/worker_manifests/qwen3-asr.json` |
+| 翻译 | `hy-mt-1-5` | `swcap_translate` | 2200 MB | 30 s | 同卡最多 2 份 |
+| TTS | `qwen3-tts` | `swcap_text_to_speech` | 1900 MB | 30 s | 1 实例 = 3 个 8 核上下文 + 2 个 LLM session |
+
+板端实测**同卡争用 ≈ 0**：ASR+MT 同卡 vs 分卡，识别轮间隔中位 **1.21 s vs 1.22 s**，端点后第一轮都是 **1.68 s**（`card_roles.py:22-31`、探针 `m6`）。⇒ **「ASR+翻译同卡」成立**。
+
+### 1.2 部署形态：宿主的卡位策略**已经就是你要的形态**
+
+`app/core/compute/card_roles.py` 是纯策略模块，三处（翻译模型选卡 / 算力页 / 开机自启）共用一份：
+
+* **感知链**（`qwen3-asr` + `hy-mt-1-5`）→ **跟卡跑**：MT 跟随 ASR 所在的卡（锚点 `PERCEPTION_ANCHOR = "qwen3-asr"`，`card_roles.py:82`）
+* **发声链**（`qwen3-tts`）→ **独占一张卡**：挑一张**没被感知链占用**的卡（`card_roles.py:324-345`）
+* 理由（带真机数据，`card_roles.py:37-42`）：TTS 是流式生成、边生成边播 ⇒ 与 ASR 同卡会把识别轮间隔顶到 > 1 s ⇒ 客户端上行队列溢出 ⇒ **丢块**
+
+⇒ **不传 `npu_index`、让策略自己挑，结果就是「卡 0 = ASR + MT、卡 1 = TTS」**。
+⇒ `POST /api/compute/instances {model, npu_index: null}` 走的就是这条路径（`app/system/api/compute.py:559-567`）。
+⇒ **需求 4 = 零代码改动**，只需把 `qwen3-tts` 加进 `compute.autostart`（卡 1）或在向导里以 `npu_index: null` 请求。
+
+> ⚠️ 若把 TTS 放卡 0 ⇒ `can_share_card("qwen3-tts","qwen3-asr") = False`（TTS 是发声链）⇒ **该条目会被 autostart 裁剪丢弃**（`registry.py:1036-1039`）。这条护栏是对的，别绕。
+
+### 1.3 宿主要素（都已具备）
+
+| 能力 | 位置 | 说明 |
+|---|---|---|
+| 单句翻译（流式入口） | `app/core/translate/npu_manager.py:263` `translate_sentence` | docstring 自称「流式同传的唯一入口」，≤2 条措辞，延迟上界 ~1 s |
+| 语种表 | `app/core/translate/npu_provider.py:159-197` | 翻译 **37** 种 |
+| TTS 可发声语种 | `wdnai/backends/tts.py:192-197` `CODEC_LANGUAGE_ID` | **10** 种 + 2 方言 ⇒ 与翻译的**交集 10 种** |
+| 音色 | `wdnai/backends/tts.py:280-299` | 参考音色 6 个（默认 `news_female`）+ 内置 9 个（运行时按权重判定）+ 用户音色 |
+| 端点检测 | `app/core/audio/endpoint.py:159,213` | 静音 −45 dBFS / 1200 ms / 最短 0.3 s |
+| 板载播放 | `cards/tts/service.py:51` `AplayWriter` | `aplay -t raw -f FLOAT_LE -r 24000 -c 1 -D plughw:1,0` + 先 `amixer sset Speaker on` |
+| TTS 跨卡桥 | `app/core/audio/tts_bridge.py` | `TTSRequest` / `get_session()` / `PLAY_*`（**丢弃分支会扩成队列桥**） |
+| 「加载中 vs 未启用」判据 | `app/core/compute/registry.py:2337` `pending_models_for_capability` | TTS 卡已用（`cards/tts/service.py:531`），**ASR 卡未用** |
+
+### 1.4 ASR 卡现状（改动落点）
+
+| 位置 | 现状 | 丢弃分支的改动 |
+|---|---|---|
+| `cards/qwen3_asr/service.py:684` | `_SentenceSplitter`（标点断句，强制长度 60） | 加同传专用切句器（与字幕翻译分开） |
+| `cards/qwen3_asr/service.py:1434` | `_tr_emit`（切句 → 送去翻译，带 `start_sec`/`end_sec`） | 加 `_interp_emit` 旁路出口 |
+| `cards/qwen3_asr/service.py:3236` | `_finalize(reason="endpoint")` | 加 endpoint 钩子（稳档成句） |
+| `cards/qwen3_asr/service.py:3188` | `_on_delta`（拿 `unfixed`/`committed`） | 加 `unfixed` 钩子（快档成句），位置在**回看过滤之后** ⇒ 自动继承「不播回看/不播胡话」 |
+| `cards/qwen3_asr/api.py:846` | WS 广播（10 种帧） | 加 `interp_*` 帧 + 6 个 `/interp/*` 路由 |
+| `cards/qwen3_asr/static/app.js:2697` | `_subPick(lines, t)` —— 当前行 = **区间包含播放头** | 丢弃分支的旧判据已被主干超越 ⇒ 合并时以主干为准 |
+| `cards/qwen3_asr/static/app.js:4864` | `preloadExtraModels`（翻译模型并进 finish 步进度条） | **要加第三个 target（TTS）** ⇒ §5 |
+| `cards/qwen3_asr/static/wizard.json` | 4 步：env / source / translate / finish | **要加第 5 步（同传）** ⇒ §5 |
+
+---
+
+## 2. 方案：架构
+
+### 2.1 端到端数据流（丢弃分支已实现，本稿只补口径说明）
+
+```
+① 音源（4 选 1）
+   file/video ──▶ 服务端解码 ──▶ ASR worker（跑在播放头前面，识别比播放快 5~6 倍）
+   board/browser ──▶ 上行 PCM ──▶ ASR worker（实时）
+
+② 切句 ─▶ ③ 翻译（卡 0，263 ms，一次性定稿）
+   实时流：endpoint（静音 1200 ms）成句 / 快档 = unfixed 稳定前缀
+   文件流：标点断句（快档把强制长度 60 → 24，更早出句）
+
+④ 进 TTS 队列（卡 1，串行）──▶ 合成线程 ──▶ PCM ──▶ 共享 FIFO ──▶ 播放线程 ──▶ aplay ──▶ 板载喇叭
+                                  （并行）              （保序）
+
+⑤ 播放时钟对齐（video 源）──▶ 播到 playhead ≥ 该行位置才放行 ⇒ 音字幕节奏一致
+⑥ seek 处理 ─▶ 双向判定（前跳/后跳）─▶ 冲掉陈旧音频 ─▶ 重播缓存 ─▶ 重新对齐
+⑦ 记账 ─▶ interp_status 帧 ─▶ 面板（滞后 / 队列 / 变速 / 已播 / 丢块）
+```
+
+**两条正交轴**（丢弃分支的设计，仍然成立）：
+
+| 轴 | 取值 | 作用 |
+|---|---|---|
+| **切句档位** | `fast`（快）/ `steady`（稳） | 实时流：快=unfixed 稳定前缀（更早、更碎）；稳=endpoint（更准、更慢）。文件流：快=强制切句 24 字；稳=等标点（≤60 字） |
+| **播放时机** | `now`（不等播放）/ `follow`（跟播放） | `follow` 只对 file/video 有意义（需要播放头）；board/browser 恒为 `now` |
+
+### 2.2 「音字幕节奏一致」的口径（**本稿的补充定义**）
+
+丢弃分支的 `c1468da` 用**播放时钟**解决（音频播到该行位置才放行）⇒ 字幕行与译文音频**天然同位**。但「一致」有两种口径，需要定死：
+
+| 口径 | 定义 | 建议 |
+|---|---|---|
+| **A. 严格同位** | 目标字幕的显示区间 = 该段译文音频**实际出声**的区间 | ✅ **默认**。用户看到的每个字都在被念 |
+| B. 占满原句区间 | 目标字幕占满源句的 `[start, end]`，即使音频已念完 | 仅当 A 造成「字幕闪断」太碎时，作为可选项 |
+
+> 本稿建议 **A**，并在面板提供「字幕跟随语音 / 字幕占满原句」二选一（默认 A）。
+
+### 2.3 四种音源的差异（一张表看完）
+
+| 音源 | 切句信号 | 文本会不会回滚 | 有播放头 | 默认播放时机 | 同传形态 |
+|---|---|---|---|---|---|
+| **音频文件** | 标点 / 强制长度 | ❌ 不回滚 | ❌ **今天没有 ⇒ 要新增 `#asr-audio-player`** | `follow` | 译文跟着音频文件播放头走 |
+| **含音轨的视频** | 标点 / 强制长度 | ❌ 不回滚 | ✅ `#asr-video`（`currentTime − audio_origin_sec`） | `follow` | **播放时钟对齐**（实测误差中位 0.05 s） |
+| **板载麦克风** | endpoint | ✅ 会 | ❌ | `now` | 说完一句即译即播 |
+| **浏览器麦克风** | endpoint | ✅ 会 | ❌ | `now` | 同上 |
+
+⚠️ **file 源今天没有播放器** ⇒ `follow` 模式无播放头 ⇒ 必须新增卡片页自有的 `<audio id="asr-audio-player">`。
+⚠️ **不能复用向导的 `#asr-preview-audio`** —— 它是向导预览播放器：只在点「预览播放」时加载、只吃设备端路径、还会被向导框架搬来搬去（丢弃分支已单独加了新播放器，避开这个坑）。
+
+### 2.4 seek（来回拖动）语义 —— 丢弃分支已实现，本稿确认
+
+| 动作 | 行为 |
+|---|---|
+| **前跳** | 识别出「比两次上报的真实时长多跳了多少」⇒ **媒体缓冲补跳不算**、**暂停后恢复不算** ⇒ 新位置之前的待播句丢弃、之后的**重新武装**（重播） |
+| **后跳** | 重播缓存命中 ⇒ **立即重播**该段译文；未命中 ⇒ 重新合成（3~4 s，面板提示「正在合成译文…」） |
+| **陈旧音频** | `flush_by_position` 冲掉队列里位置过时的 job **和已合成的 PCM**，并**作废正在合成的那句**（⚠️ 作废的句子不能堵住 FIFO —— 回归脚本里这条断言在旧顺序下**真的失败** ⇒ 回归有效） |
+| **同一句重复播** | `SEEK_DUP_SEC = 0.75` 去重 |
+| **媒体声称在播但播放头冻住** | 兜底放行 ⇒ **一句都不能丢**（探针 `m17` 抓到过「媒体播完后句子被永久压住」） |
+| **媒体播完** | `source_done` ⇒ 剩下的译文**照样全播**（探针 `m16` 抓到过「切了 34 句、只送出 28 句」） |
+
+### 2.5 不丢语音（需求 6 的三条路径）
+
+| 场景 | 动作 | 是否允许丢内容 |
+|---|---|---|
+| 浏览器麦上行缓冲满 | **放宽 L1 `LIVE_MAX_PENDING` 2 → 20 块（1 s → 10 s）**、L3 `_LIVE_MAX_BUFFER_CHUNKS` 3 → 20；**丢块数显示到面板** | ❌ 不丢（缓冲吸收抖动） |
+| 熔断（连续丢 5 块） | 保持 | ✅ 故障保护，不是正常丢 |
+| TTS 队列满 | **合并队尾**（内容拼成一段重新合成） | ❌ 不丢 |
+| 播前复核不通过 | **作废重译**（用最新源文重翻） | ❌ 不丢 |
+| 重试 3 次仍不一致 | 放弃该段 + UI 标注 | ✅ **唯一允许的损失** |
+| 用户 seek 跳过 | 丢弃该段（用户自己跳的） | ✅ 用户行为 |
+| 翻译失败 | 显示原文 + 标「未翻译」 | ❌ 不丢 |
+
+> ⚠️ 主干现状：`app.js:31` `LIVE_MAX_PENDING = 2`（**丢最旧**），服务端 `service.py` `_LIVE_MAX_BUFFER_CHUNKS = 3`。
+> ⇒ **丢弃分支已把这两个值放宽**，但那部分改动在**未恢复的分支**上 ⇒ 合回主干时必须一并带上，否则「不能丢语音」不成立。
+
+### 2.6 产能与滞后治理
+
+**单卡 TTS 产能 = 1.02× 实时**（实测 4.19 s 合成 / 4.28 s 音频）⇒ **中→英必然越积越多**。四条对策：
+
+1. **两段流水线**（合成线程 + 播放线程并行）：吞吐 **0.67× → 0.93×**（实测）—— 这是最大的一笔提升。
+2. **自适应批量化**：TTS **每句固定开销 1.33 s**（实测：40 句逐句提交 = 98.8 s 音频 / 152 s = 0.65×）⇒ 板端**不能一句一调** ⇒ 批量大小必须自适应（video 源 1–3 行一批）。
+3. **轻微变速**（`sox tempo`，不变调）：积压 > 2 s / 4 s / 8 s ⇒ 1.04 / 1.08 / **1.15**。实测精度：倍率 1.15 ⇒ 时长缩短 13%（偏差 < 0.01%），FFT 峰值仍 440 Hz ⇒ **音高不变**。
+4. **如实显示滞后**：允许滞后增长，但面板必须显示当前滞后与预计积压。
+
+**语言对膨胀比 k（实测，8 语种，同一句 5.77 s 英文）**：
+
+| 目标语 | german | japanese | chinese | french | portuguese | korean | spanish | italian |
+|---|---|---|---|---|---|---|---|---|
+| **k** | **0.61** | 0.90 | 0.93 | 0.95 | 0.98 | 1.05 | 1.10 | **1.17** |
+
+⇒ **外语 → 中文（k ≈ 0.9）在单卡 1.02× 下就能做到「恒定滞后 + 一句不丢」** ⇒ 产品主场景成立。
+⇒ **中 → 英 / 中 → 日（k ≈ 1.15~1.30）单卡不够** ⇒ 滞后随讲话时长增长（内容仍不丢）。
+⇒ 选目标语时**预先提示**（DD-9）：不在「可发声 10 种」内 ⇒ 自动降级为仅字幕。
+
+### 2.7 端到端延迟预算
+
+| 场景 | 冷启动 | 热态（常态） | 口径 |
+|---|---|---|---|
+| 实时流 · 快档 | 等 MT 就绪 **24.1 s** | **5.1 ~ 5.7 s（恒定）** | 说完 → 听到译文 |
+| 实时流 · 稳档 | — | **5.8 ~ 13.3 s** | 改前 8.2 → **23.2 s 持续增长**（已修） |
+| 文件 / 视频 · 跟播 | — | **≈ 0 s（播放时钟对齐）** | 逐行误差中位 0.05 s |
+
+单段耗时拆解（探针 `m19`）：等 MT 0.00 / 翻译推理 0.28 / 放行等待 / 队列排队 / **TTS 首窗 2.03**（优化前 3.23）/ 出声启动 / 播完。
+⇒ **TTS 首窗是最大的一块** ⇒ 丢弃分支改了 SDK（`wdnai/backends/tts.py` 加 `FIRST_WINDOW_FRAMES = 25`，首窗 50 帧 → 25 帧），实测「跨配置差异落在噪声底内 + 接缝 0.08× ⇒ 音频未劣化」。
+
+> ⚠️ **SDK 改动是必需的**：只改插件不改 SDK ⇒ 首窗仍是 3.23 s ⇒ 实时场景总滞后多 1.2 s。
+> ⚠️ SDK 在 `.venv/src/wdnai`，属**外部代码**（私有 SSH git）⇒ 改动要单独走该仓的提交流程。
+
+---
+
+## 3. 需求 5 专章：向导「是否开启同传」+ 模型加载进度条
+
+> **这是唯一一段从未存在过的功能**（丢弃分支的 `wizard.json` 与主干逐字节相同）。
+
+### 3.1 向导改动
+
+向导框架**已支持 `type: "checkbox"`**（`app/static/core/wizard/state.js:1475-1477` → `_buildToggle`，渲染成胶囊开关；已有 6 处用例：`vd-loop` / `vtd-loop` / `vtl-loop` / `vdp-loop` / video_retrieval 两处）⇒ **加开关零框架改动**。
+
+建议**新增第 5 步**（放在「实时翻译」之后，因为同传依赖译文）：
+
+```jsonc
+{ "id": "interp", "title": "同声传译（可选）", "kind": "form",
+  "fields": [
+    { "id": "asr-interp-enabled", "ui_key": "interp",
+      "label": "开启同声传译（把译文用板载喇叭念出来；实时麦建议戴耳机，避免回声）",
+      "type": "checkbox", "default": false, "summary_label": "同声传译" },
+    { "id": "asr-interp-lang", "ui_key": "interpLang",
+      "label": "朗读语言（只列能出声的 10 种；不在表内时自动降级为仅字幕）",
+      "type": "select",
+      "options": [ { "value": "", "label": "跟随翻译目标语言" } ] },
+    { "id": "asr-interp-voice", "ui_key": "interpVoice",
+      "label": "音色", "type": "select",
+      "options": [ { "value": "news_female", "label": "新闻女声" } ] }
+  ] }
+```
+
+* **选项运行时注入**：`wizard:step-rendered` 时灌进去 —— 照抄 `asr-tr-target` 的现成套路（`cards/qwen3_asr/static/app.js:3140-3184`）。
+  * 朗读语言 = 翻译 37 种 ∩ TTS 可发声 10 种 ⇒ **只列 10 种**（丢弃分支的 `GET /api/qwen3-asr/interp/languages` 已实现这个交集）。
+  * 音色 = `GET /api/tts/voices`（参考 6 + 内置若干 + 用户音色）。
+* **回填**：`applyWizardSnapshot`（`app.js:4895`）里 `opts.interp` / `opts.interpLang` / `opts.interpVoice` ⇒ 调 `POST /api/qwen3-asr/interp/start`。
+* ⚠️ **板端没有 emoji / 符号字体** ⇒ label 用普通汉字；需要图标就用内联 SVG。
+* ⚠️ **`applyWizardSnapshot` 里 `btn.click()` 会被 disabled 吞掉** ⇒ 启动必须走 `WizardStart.run`（`app.js:4944-4960` 有注释）。
+
+### 3.2 模型加载进度条 —— **完全复用框架，一行 UI 都不用写**
+
+**机制**：卡片实现 `window.ImApp_qwen3_asr.preloadExtraModels(opts)` ⇒ 返回 `{targets, soft}` ⇒ 框架把**这些目标并进 finish 步的等待** ⇒ **同一块进度条里几行、并行加载**（`app/static/core/wizard/state.js:2621-2632`）。数据源 `GET /api/compute`，百分比 = `(now − inst.started_at) / estimated_init_seconds_per_model`。
+
+现状：ASR（`wizard.json` 的 `swcap_to_model`）+ 翻译（`preloadExtraModels` 返回的 1 个 target）= **进度条 2 行**。
+
+**加 TTS = 多返一个 target**：
+
+```js
+// 丢弃分支的 preloadExtraModels 上再加一段
+if (opts.interp && ttsModelId) {
+  targets.push({ model_id: ttsModelId, npu_index: null });  // null = 卡位策略自己挑（发声链独占 ⇒ 落卡 1）
+  soft.push(ttsModelId + "@null");                          // 软失败：起不来只标那一行 error
+}
+```
+
+⇒ 进度条变成 **3 行：识别模型 / 翻译模型 / 语音合成模型**，**并行加载**，标签自动把 `null` 换成**实际卡号**（`state.js:2993-2997`）。
+⇒ **TTS 起不来 ⇒ 只有那一行标 error，同传降级为「仅字幕」，不影响识别与翻译**（`soft` 语义）。
+
+**需要补的两个小口子**：
+
+1. **ASR 卡拿不到 TTS 的 model_id** ⇒ 在宿主桥 `app/core/audio/tts_bridge.py` 加一个 `tts_model_id()`（读 registry 里 `capability_types` 含 `swcap_text_to_speech` 的实例 / `supported_models`），或直接让 `GET /api/tts/` 的 snapshot 带上 `model_id`（TTS 卡的 snapshot 已有 `capability_ready`，加一个 `model_id` 即可）。
+2. **「加载中 vs 压根没启用」要分开**（主干 ASR 卡把两者合并成一句「翻译模型未启动」）：
+   ⇒ 照抄 TTS 卡的现成范式 `registry.pending_models_for_capability(cap)`（`cards/tts/service.py:531` + `app/core/compute/registry.py:2337`）。
+
+### 3.3 面板（卡片页）
+
+丢弃分支已有 `#asr-interp-block`（含 SVG 图标、无 emoji、播放时机按源置灰、file 源自带播放器）⇒ **可整体搬**，只需补：
+
+* 状态行加「**上行丢块 N**」（当前主干有个 id 不匹配的 bug：`template.html:187` 是 `asr-rt-gap`，而 `app.js:2461` 查的是 `asr-live-gap` ⇒ **丢块警示条永远不显示** ⇒ 顺手修）
+* 音量默认值：`0.1` 实测 **−32 dBFS（听不见）**，`0.5` ⇒ −14 dBFS ⇒ **默认给 0.5**
+* 目标字幕的两种口径（§2.2）
+
+---
+
+## 4. 改动清单（按仓库）
+
+### 4.1 插件 `wdnapps_audio_chat`（恢复 `12fa8dd` 为主体）
+
+| 文件 | 动作 | 规模（丢弃分支实测） |
+|---|---|---|
+| `cards/qwen3_asr/interp.py` | **新增**（恢复） | 2808 行 |
+| `cards/tts/queue.py` | **新增**（恢复） | 1561 行 |
+| `cards/qwen3_asr/service.py` | 改（恢复）：同传切句器 / `_interp_emit` / `current_text()` / endpoint 与 unfixed 两个钩子 / 文件流快档切句长度 | +799 / −? |
+| `cards/qwen3_asr/api.py` | 改（恢复）：6 个 `/interp/*` 路由 | +175 |
+| `cards/qwen3_asr/static/app.js` | 改（恢复）：`_interp*` 24 个方法 / WS 4 帧 / 播放头上报 / `#asr-audio-player` / `LIVE_MAX_PENDING` 2→20 | +1023 / −? |
+| `cards/qwen3_asr/static/template.html` | 改（恢复）：同传面板 + 音频播放器 | +62 |
+| `cards/tts/service.py` | 改（恢复）：`save_wav` / `tempo`（sox 两段管道）/ 空文本不起 aplay / 多实例轮转 | +468 |
+| `cards/tts/api.py` | 改（恢复）：4 个 `/api/tts/queue/*` 路由 | +86 |
+| `cards/qwen3_asr/static/wizard.json` | **新增第 5 步「同声传译」**（**全新，从未有过**） | +~25 |
+| `cards/qwen3_asr/static/app.js` | **改**：`preloadExtraModels` 加第三个 target + 面板加丢块显示 + 修 `asr-rt-gap` id | +~30 |
+
+### 4.2 宿主 `wdnwebui`（恢复 `9432a2b` 为主体）
+
+| 文件 | 动作 | 规模 |
+|---|---|---|
+| `app/core/audio/tts_bridge.py` | 改（恢复）：队列桥（`submit_queued` / `queue_status` / `queue_clear` / `queue_set_tempo` / `queue_set_clock` / `queue_flush_position` / `TTSUnavailable` / `PLAY_QUEUE`） | +173 |
+| `docs/SIMULTANEOUS_INTERPRETATION_IMPL.md` | **新增**（恢复，2569 行） | +1906 |
+| `docs/SIMULTANEOUS_INTERPRETATION_PLAN.md` | **新增**（恢复，979 行，v4「为什么」） | 改名自 `LIVE_INTERPRETER_PLAN.md` |
+| `scripts/verify_interp_*.py`（7 个）+ `scripts/verify_tts_queue.py` | **新增**（恢复） | 已有断言数见 §6 |
+| `tools/probes/interp/*.py`（27 个） | **新增**（恢复；工作区只剩 `.pyc`，源码已丢） | — |
+| `tools/probes/tts_same_card/*`（10 个） | **新增**（恢复；同卡 8+8 / 4+4 拆核的实测） | — |
+| `app/core/audio/tts_bridge.py` | **改**：`tts_model_id()`（向导进度条要用） | +~10 |
+
+### 4.3 SDK `wdnai`（外部仓，`.venv/src/wdnai`）—— **必须新写，不是恢复**
+
+| 文件 | 动作 | 依据 |
+|---|---|---|
+| `src/wdnai/backends/tts.py` | **新写** `FIRST_WINDOW_FRAMES`（默认 25）+ 可选参数 `first_window_frames`（0 = 用默认）；**空文本不再起 aplay**（前置校验） | 首窗 3.23 s → **2.03 s**（−37%）；A/B 实测「跨配置差异落在采样噪声底内 + 接缝 0.08× ⇒ 音频未劣化」 |
+
+**规格（已由探针 `m20` 验证）**：
+
+* **凭什么能缩短**：`speech_decoder` 是**因果**的 —— 分块解码设计就是「左上下文 25 帧 + 新 25 帧」（`_decode_window_with_context`），后续窗口本来就只攒 25 帧；而**首窗没有左上下文可用** ⇒ **未来的帧对已生成的部分没有影响** ⇒ 攒够 25 帧就能开声，帧覆盖仍精确：
+  `首窗吃 0~24 → 下一窗吃 25~49 → 不重不漏`。
+* **改法**：SDK 加常量 + 形参；插件侧 `TTSRequest` / `TTSJob` / 宿主桥 `submit_queued` **逐层透传**；**只有同传显式给 25**（其它调用方不受影响）。
+* **不影响总合成时间** ⇒ 队列吞吐不变，只让「首声何时出现」提前。
+* ⚠️ **A/B 只验了电平统计 + 边界连续性，没做听感评测**（板子上做不了）⇒ 若用户觉得开头有杂音，把 `FIRST_WINDOW_FRAMES` 调回 50 即可（一个常量）。
+* ⚠️ 插件侧还有 `interp.py::INTERP_FIRST_WINDOW_FRAMES`（**首窗 12 帧**：25 帧 2.07 s → 12 帧 1.05 s）—— **12 帧未验证**，本期按 25 帧实施。
+
+> ⚠️ **SDK 是私有 SSH git 的外部代码** ⇒ 改动走它自己的仓；本仓**不 vendor** 它。
+> ⚠️ **首窗 12 帧**（`25 帧 2.07 s → 12 帧 1.05 s`）在方案里记为「上游硬等 50 帧 = 4 s 音频」的第二选项 —— **未做 A/B**，本期不做。
+
+
+### 4.4 明确**不**做的事
+
+* ❌ 不新建卡片 ⇒ **不需要加 `{% card_slot %}` 占位符**（这条是硬要求，见 AGENTS.md；不新建卡就绕开了它）
+* ❌ 不动 `compute_worker.py` 的入口文件名与 `--model` 参数（孤儿检测与去重的 needle 依赖它们）
+* ❌ 不在 worker 侧做业务语义（bbox/字幕语义一律留在主进程）
+* ❌ 不让卡片直接 import 另一个卡片 ⇒ 同传走**宿主桥** `app.core.audio.tts_bridge`
+* ❌ 不重转模型（现状够用；4+4 拆核路线另议，见 §8 D1）
+
+---
+
+## 5. 实施顺序与验收
+
+| 步 | 内容 | 可独立验收 | 工作量 |
+|---|---|---|---|
+| **S0** | **抢救与合并**（不是写代码）：① 先把插件工作区的 2 个未提交文件提交或 stash（⚠️ **当前 `AGENTS.md` + `app.js` 有未提交改动，切分支会丢**）；② 建分支 `feat/interp-recover` 从 `12fa8dd` / `9432a2b`；③ 与主干 4 个新提交合并（插件 `e6c7694`「不在词中间切句」、`288c7c2`「翻译洪峰」；宿主 `fc113c5`/`f8ac2f5`/`05c57bd`）⇒ **预期在 `app.js` 与 `service.py` 冲突**（丢弃分支的 `2d74cad`「按词边界切句」与主干 `e6c7694` 同源）；④ 跑既有 ASR 回归清单确认没踩坏字幕/翻译 | 既有 9 个 `verify_asr_*` 全绿 | 半天 |
+| **S1** | **向导开关 + 进度条第三行**（需求 5 的缺口） | 向导里勾选「开启同传」⇒ 进度条出现第三行「语音合成模型」并显示实际卡号；不勾 ⇒ 行为与今天完全一致 | 半天 |
+| **S2** | 恢复 TTS 队列 + 变速 + 两段流水线 | 5 句依次播完、顺序不乱；`tempo=1.15` 时长缩短 ~13%、音高不变；`save_wav=false` ⇒ `/userdata/tts` 不新增文件；播放不阻塞合成 | 1 天 |
+| **S3** | 同传引擎 + 实时源（板载麦 / 浏览器麦） | 麦 → 板载出声：快档 ≤ 8 s / 稳档 ≤ 12 s 听到第一句；连续讲 60 s ⇒ 播出的句数 == 切句数；停止 ≤ 2 s 停播；上行丢块 = 0 | 1 天 |
+| **S4** | 文件 / 视频源 + 播放时钟 + seek | 放视频 ⇒ 译文跟画面走且**不跑到画面前面**；逐行误差中位 ≤ 0.3 s；拖进度条（前跳/后跳）⇒ 服务端认出方向、位置对得上、后跳能重播；暂停 ⇒ 译文自动停；file 源用**新增播放器** | 1 天 |
+| **S5** | **SDK 首窗优化（新增，必须新写）**：`wdnai/backends/tts.py` 加 `FIRST_WINDOW_FRAMES = 25` + `first_window_frames` 形参 + 空文本前置校验；插件侧 `TTSRequest`/`TTSJob`/宿主桥逐层透传 | 首窗 3.23 s → **2.03 s**；A/B：跨配置差异落在采样噪声底内、接缝 0.08× ⇒ 音频未劣化 | 半天（**外部仓，需单独提交流程**） |
+| **S6** | 收尾：音量默认、丢块显示、`asr-rt-gap` id 修复、面板口径开关 | 音量 0.5 时板载出声清晰；丢块 N 显示在面板 | 半天 |
+
+### 5.0 ⚠️ 自测纪律（**按 D2 拍板**）
+
+* **所有回归/探针脚本提交 TTS 时一律带 `volume = 0.01`**（1%）。
+* ⚠️ `volume` 是**软件层振幅缩放**，板载 `amixer` 的音量是**硬件级** ⇒ **自测前必须先把板载混音器压低**（`amixer -c 1 sset Speaker <小音量>`），否则 1% 仍是硬件音量。
+* **自测窗口**：测量要在**安静窗口**做 —— 用户每点一次「开始识别」就多一轮，计数是累计的 ⇒ 汇总值会被前几轮污染（实测踩过：并发轮 ⇒ 「切句 18 / 译文 29.5 s」那不是单轮的数）。
+
+
+### 5.1 回归（丢弃分支已写好，断言数已知）
+
+| 脚本 | 覆盖 | 已知断言数 |
+|---|---|---|
+| `verify_interp_segmenter.py` | 快档切句器（LCP 稳定 N 轮 / 改写作废 / 长度上下限） | **11/11** |
+| `verify_interp_gate.py` | 放行器（now/follow / 提前量 / 双向 seek / 播放头 stream_id 对不上兜底 / 卡住兜底 / 会话切换清记账 / 源播完放行 / 播放头冻住兜底） | **45/45** |
+| `verify_tts_queue.py` | 队列（顺序 / 深度 / 合并 / clear / tempo 动态改 / 播放顺序=提交顺序 / 并行合成仍保序） | **22/22** |
+| `verify_interp_api.py` | 6 个同传路由 + 4 个队列路由（校验 / 状态字段 / 降级路径 / 播放头按 stream_id 维护 / 不带音色时保留已选音色） | **55/55** |
+| `verify_interp_browser.py` | 真浏览器 4 场（面板控件 / 10 种可发声语种 / 端到端出声 / 自动播放被拦兜底 / 媒体播完剩余全播 / 播放头冻住不丢句） | **50/50** |
+| `verify_interp_latency.py` | 滞后口径 / 首窗优化 / 重复识别复位 | **22/22** |
+| `verify_interp_lag_floor.py` | 滞后下限（不可低于物理下限的护栏） | 已有断言 |
+| `verify_interp_seek.py` | 双向 seek / 重同步 / `flush_by_position` / FIFO 不被作废句堵住 | **32/32** |
+
+⚠️ **回归必须 mock `PUT`/`DELETE /api/compute/active-app`**（`scripts/active_app_guard.install(ctx)` + `install_active_app_spoof(ctx)`，且**须在 `ctx.new_page()` 之前**）⇒ 服务端配置一个字节都不动。
+⚠️ **别并发跑回归脚本**。
+⚠️ 改插件 `.py` 后要 `sudo systemctl restart wdnwebui` ⇒ **重启会连坐杀掉 `compute_worker`** ⇒ 重启前确认 `compute.autostart` 有值。
+⚠️ `verify_interp_browser.py` 需要 **三个模型都在跑** + Playwright/Chromium（本机已具备）+ 脚本放在 `scripts/`（`active_app_guard` 同目录）。
+
+---
+
+## 6. 决策记录（**已拍板 2026-11-25**）
+
+> 完整表格见 §0.5。以下保留决策依据，便于实施时回查。
+
+### D1 —— 产能：✅ **维持 npu2 禁区**（单卡 TTS 1.02×）
+
+* **现状**：单卡 TTS 产能 **1.02× 实时**。**外语 → 中文（k ≈ 0.9）够用**，恒定滞后；**中 → 英 / 中 → 日（k ≈ 1.15~1.30）不够** ⇒ 滞后随讲话时长增长（内容仍不丢）。
+* **决定**：不启用第三张卡。⇒ 单卡 + `tempo` 自适应（≤1.15）+ **如实显示滞后**。
+* **保留**：多实例并行合成（保序收集器）**代码保留**，解禁时只差一个 `POST /compute/instances {model:"qwen3-tts", npu_index:2}`。
+* **已排除**：同卡 8+8 双实例（设备端 model-setup 配额拒绝，且即便起得来聚合吞吐只有 1.20×）；同卡 4+4 拆核（**必须重转 3 个模型**，本期不做）。
+* **UI 必须说清**：中→英时提示「译音比原话长 10–17% ⇒ 必要时提速到 1.15×（内容不会丢）」。
+
+### D2 —— 音量：✅ **自测降到 1%**；用户侧默认 0.5
+
+* **自测**：所有回归/探针脚本提交 TTS 时带 **`volume = 0.01`**（1%），避免扰民。⚠️ 板载 `amixer` 的音量是**硬件级**的，`aplay` 的 `volume` 只是**振幅缩放** ⇒ 1% 是软件层衰减，**硬件音量仍要单独压低**（`amixer -c 1 sset Speaker 10%` 之类）⇒ **自测前请确认板载音量旋钮/混音器已压低**。
+* **用户侧默认 0.5**（实测 −14 dBFS 清晰可闻；0.1 ⇒ −32 dBFS 听不见 ⇒ **这是「用户报没声音」的第一嫌疑**）。
+* **仍待确认**：**原声 vs 译音叠加** —— 本稿按建议默认「**原声降到 15%**」，做成可调。
+
+### D3 —— 向导粒度：✅ **开关 + 语言 + 音色**（独立第 5 步）
+
+见 §3.1。三个字段：`asr-interp-enabled`（checkbox）/ `asr-interp-lang`（select，只列能出声的 10 种）/ `asr-interp-voice`（select）。
+
+### D4 —— 实时滞后：⏸ **实施完实测再定**
+
+* 实施后用探针 `m19_latency_breakdown.py`（分段耗时：等 MT / 推理 / 放行 / 排队 / 首窗 / 出声 / 播完）+ `m12_live_lag.py`（稳档时间线）出数。
+* **判据建议**：快档 ≤ 8 s、稳档 ≤ 12 s（沿用丢弃分支 S2 的验收口径）。
+* **默认档位待定**：若稳档明显偏慢，默认给**快档**（更实时、句子更碎），稳档作为可选项。
+* **不阻塞开发** —— 快/稳两档本来就要都实现。
+
+---
+
+## 7. 风险清单
+
+| # | 风险 | 影响 | 应对 |
+|---|---|---|---|
+| R1 | **恢复分支与主干 4 个新提交冲突**（插件 `e6c7694`/`288c7c2`；宿主 `fc113c5`/`f8ac2f5`/`05c57bd`）+ 插件工作区 2 个未提交文件 | 合并冲突、可能丢改动 | S0 第一步先提交/stash 未提交改动；逐个冲突人工比对（两侧改动都测过） |
+| R2 | **TTS 首帧 3.23 s** ⇒ 实时场景总滞后多 1.2 s | 实时性 | SDK 改 `FIRST_WINDOW_FRAMES = 25`（已实测安全）⇒ 2.03 s |
+| R3 | **单卡 1.02× 产能天花板** | 中→英滞后持续增长 | 见 D1；`tempo` 兜底 + 如实显示滞后 |
+| R4 | **回声自激**（麦 + 板载喇叭） | 啸叫、识别错乱 | 面板常驻提示「建议戴耳机」；浏览器麦在远端时衰减大 |
+| R5 | **默认音量 0.1 ⇒ −32 dBFS 听不见** | 用户报「没声音」 | 默认 0.5（实测 −14 dBFS） |
+| R6 | **file 源今天没有播放器** | `follow` 模式无播放头 | 新增 `#asr-audio-player`（丢弃分支已有） |
+| R7 | **浏览器自动播放策略**拦掉 `play()` | 译文不出声 | 兜底放行（丢弃分支已有，`verify_interp_browser.py` 第二场覆盖） |
+| R8 | **TTS 目标语不在可发声 10 种内** | 无声 | 自动降级为仅字幕 + UI 说明（DD-9） |
+| R9 | **同传与「语音生成」卡抢同一个 TTS 实例** | 互相拖慢 | 丢弃分支已有互斥处理（同传优先） |
+| R10 | **落盘灌 eMMC** | 板子存储被灌满 | 同传路径 `save_wav = false`（丢弃分支已改） |
+| R11 | **停止/离开页面后喇叭还在念** | 扰民 | DemoGuard + `sendBeacon` 兜底（丢弃分支已做） |
+| R12 | **丢弃分支从未推送、从未合并过主干** | 恢复本身是一次大合并 | S0 单独一步，合并后**先跑既有 9 个 ASR 回归**再往下做 |
+
+---
+
+## 8. 附录 A：板端实测数据（全部来自本机探针，非厂商宣传值）
+
+### 8.1 产能
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| TTS 单实例合成 / 音频 | 4.19 s / 4.28 s ⇒ **1.02×** | `m13` |
+| TTS 双实例（**跨卡**）聚合 | **2.07×**，单卡延迟仅膨胀 6% | `PLAN_why.md` §0.2 |
+| TTS 同卡双实例（8+8） | ❌ **起不来**（设备端 model-setup 配额，失败时剩 2362 MB ⇒ 非显存） | 同上 |
+| 同卡双实例即便起得来 | 聚合吞吐仅 **1.20×**（时间片轮转） | 同上 |
+| 单 TTS 实例吃几个核 | **均值 52.2% / 中位 44.0%**，75% 样本停在 40% ⇒ 自回归是 **memory-bound** | `util_probe.py` |
+| talker / 解码器耗时拆分 | **83% / 17%** ⇒ 瓶颈是模型自回归 ⇒ 只能靠多卡 | `m27_tts_capacity.py` |
+| 每卡 runtime 配额 | 1 核模型 **24** 个；8 核模型 **4** 个；**llm 8 核 ≥ 8** 个；同一 context 可建 6 个 LLM session | `ladder2.py` |
+| TTS 每句固定开销 | **1.33 s**（40 句逐句 = 98.8 s 音频 / 152 s = 0.65×） | `c1468da` |
+| 两段流水线（合成∥播放） | **0.67× → 0.93×** | `m14` |
+| 翻译单句 | **263 ms**（一次性定稿） | `m6` |
+| ASR + MT 同卡争用 | 轮间隔 **1.21 s vs 1.22 s**（分卡）⇒ 争用 ≈ 0 | `m6` |
+
+### 8.2 延迟与同步
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| 实时流 · 快档端到端 | **5.1 ~ 5.7 s（恒定）** | `m19` |
+| 实时流 · 稳档端到端 | **5.8 ~ 13.3 s**（改前 8.2 → 23.2 s 持续增长） | `m12` |
+| TTS 首窗 | **2.03 s**（优化前 3.23 s） | `m20` |
+| 视频逐行同步误差 | 中位 **0.05 s**（修前 −15.89 s） | `m23` / `c1468da` |
+| 真实浏览器拖进度条 | 前跳/后跳均识别，位置误差 < 4 s，后跳能重播 ⇒ **12/12** | `m24` |
+| 麦上行丢块 | **0**（基线与满载争用都是 0） | `m6b` |
+| 端点检测 | 静音 −45 dBFS / 1200 ms / 最短语音 0.3 s | `service.py:2675` |
+
+### 8.3 音频
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| 音量 0.1 ⇒ 实际电平 | **−32 dBFS（听不见）** | `m15` |
+| 音量 0.5 ⇒ 实际电平 | **−14 dBFS** | `m15` |
+| `sox tempo` 精度 | 1.04 → 2.885 s / 1.08 → 2.778 s / 1.15 → 2.609 s（源 3.0 s）⇒ 偏差 **< 0.01%** | `m7` |
+| `tempo` 音高 | FFT 峰值仍 **440 Hz** ⇒ 不变调 | `m7` |
+| `aplay` 消费速率 | 精确 **1.000×**（度量本身先被度量过） | `m22` |
+
+---
+
+## 9. 附录 B：市面对比（摘自丢弃分支的 v4 报告）
+
+| 方案 | 延迟 | 成本 | 板端可行性 |
+|---|---|---|---|
+| **Azure Speech Live Interpreter** | 最低（云端） | 云订阅、按量计费 | ❌ 断网即失效；数据出境 |
+| **Qwen3-Omni 端到端** | 一次推理出译音 | 单模型 | ⚠️ 板上无该模型的 182x 权重；且要重新转模型 |
+| **本板三段式（ASR→MT→TTS）** | 快档 5~7 s / 稳档 9~13 s | 无 | ✅ **全部模型已装、可跑** |
+
+> 取证边界（该报告已声明）：市面数字来自公开文档，**未**在同口径下实测；板端数字全部本机实测。
+
+---
+
+## 10. 附录 C：文件与提交速查
+
+| 位置 | 内容 |
+|---|---|
+| 插件丢弃分支 | `12fa8dd`（`a7f9ff6`…`12fa8dd`，8 个提交） |
+| 宿主丢弃分支 | `9432a2b`（`f11dbb4`…`9432a2b`，5 个提交） |
+| 恢复 | `git show <sha>:<path>` / `git branch feat/interp-recover <sha>` |
+| 插件工作区**未提交** | `AGENTS.md`、`cards/qwen3_asr/static/app.js` ⇒ **切分支前先处理** |
+| 方案正文（宿主） | `docs/SIMULTANEOUS_INTERPRETATION_IMPL.md`（2569 行）+ `docs/SIMULTANEOUS_INTERPRETATION_PLAN.md`（979 行） |
+| 11-21 备份（历史） | `/userdata/backup_interp_20261121/`（880 行早期版，**已被 12fa8dd 取代**，只作考古参考） |
+| 早期方案（历史） | `docs/LIVE_INTERPRETER_PLAN.md`（650 行，2026-11-18；TTS 播报当时「第一期不做」） |
+
+---
+
+*本报告的所有板端数字来自本机实测（`tools/probes/interp/`、`/api/compute`、`rknnsmi`），非厂商宣传值。代码行号引用的是**当前主干**；丢弃分支的行号请以 `git show <sha>:<path>` 为准。*
