@@ -51,17 +51,21 @@ CARD = "qwen3-asr"
 #: 设备端的音频（英文）—— 文件源用它。
 SRC_WAV = "/userdata/assets/uploads/asr_en.wav"
 
-#: ⚠️ **测试播放一律 1%**（2026-11-25 用户定案）—— 同传的**默认**音量
-#: 也是 1% ⇒ 但 localStorage 里可能存着**旧的** 0.5 ⇒ 脚本显式拉回 1%。
+#: ⚠️ **测试播放用 10%**（2026-11-25 用户定案）—— 同传的**产品默认**音量
+#: 仍然是 **1%**（见插件的 ``interp.py`` / 前端 ``app.js``）；但**测试**
+#: 音量改成 10% ⇒ **比较小声、但还是听得见** ⇒ 用户在板子旁边就能判断
+#: 「杂音 / 卡顿 / 断音」这些现象。
 #:
-#: ⇒ 测试时**板载喇叭不会整段朗读** ⇒ 不扰民、也不盖住其它声音。
-QUIET_VOLUME_PCT = 1
+#: ⇒ 1% 太小声 ⇒ 底噪与语音同量级 ⇒ 什么也判断不出来（用户原话）。
+#:
+#: ⚠️ 必须**显式拉回这个值** —— localStorage 里可能存着**旧的** 0.5。
+TEST_VOLUME_PCT = 10
 
 
-def force_quiet_volume(page) -> None:
-    """把同传音量滑块拉到 **1%** 并触发 change ⇒ 后端立刻收到。
+def force_test_volume(page) -> None:
+    """把同传音量滑块拉到 **10%** 并触发 change ⇒ 后端立刻收到。
 
-    ⚠️ 必须**在点「开始同传」之前**调用 ⇒ 否则第一句就是 0.5 放出来的。
+    ⚠️ 必须**在点「开始同传」之前**调用 ⇒ 否则第一句就是旧音量放出来的。
     """
     page.eval_on_selector(
         "#asr-interp-volume",
@@ -70,8 +74,37 @@ def force_quiet_volume(page) -> None:
             el.dispatchEvent(new Event('input', {bubbles: true}));
             el.dispatchEvent(new Event('change', {bubbles: true}));
         }""",
-        QUIET_VOLUME_PCT)
+        TEST_VOLUME_PCT)
     page.wait_for_timeout(300)
+
+
+def settle_rounds(timeout: float = 90.0) -> None:
+    """**场次之间「排干净」**（2026-11-25，用户报「播放卡顿 + 切音」）。
+
+    ⚠️⚠️ **为什么必须排干净**：四场测试**用的是同一段素材** ⇒ 每一场
+    都会把**同一段译文**再灌一遍 TTS 队列 ⇒ 上一场还没放完，下一场已经
+    灌进来了 ⇒ 用户在板子旁边听到的是**同一段话被叠着播 3 遍**，中间
+    还夹着**重新转写**的空洞（~25 s）⇒ 根本分不清哪些是产品的真实
+    表现、哪些是测试方式造成的。
+
+    ⇒ 场次之间：① 停同传（别再送新的）② **等队列排空**（上一场放完）。
+    ⚠️ **先等排空、再清**（反过来的话会把这一场**放一半就切掉** ⇒
+    制造出我们要消除的那种「切音」）。
+    ⇒ 之后每场都是**干净的、可分辨的**一段播放 ⇒ 用户能直接判断
+    「杂音 / 卡顿 / 断音」。
+    """
+    api("POST", "/api/qwen3-asr/interp/stop")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _st, q = api("GET", "/api/tts/queue/status")
+        if (int(q.get("depth") or 0) == 0
+                and int(q.get("inflight") or 0) == 0
+                and not q.get("playing")):
+            return
+        time.sleep(0.5)
+    # ⚠️ 超时了 ⇒ 清掉（下一场别在旧的尾巴上叠）
+    api("POST", "/api/tts/queue/clear")
+
 
 #: ⚠️ **模拟「浏览器按自动播放策略拒绝了 play()」** ——
 #: 真实桌面浏览器在「媒体参与度不足 / 没有用户手势」时会拒绝自动播放 ⇒
@@ -128,9 +161,8 @@ def api(method: str, path: str, payload=None, timeout: int = 120):
 def main() -> int:
     errors: list[str] = []
 
-    # 干净起点：同传停、TTS 队列清空
-    api("POST", "/api/qwen3-asr/interp/stop")
-    api("POST", "/api/tts/queue/clear")
+    # 干净起点：停同传 + **等上一轮放完**（见 settle_rounds 的说明）
+    settle_rounds()
 
     with sync_playwright() as pw:
         # ⚠️⚠️ **严格自动播放策略**（``user-gesture-required``）——
@@ -211,8 +243,8 @@ def main() -> int:
         src_attr = page.eval_on_selector("#asr-audio-player", "el => el.src || ''")
         check("播放器拿到了源", bool(src_attr), f"src={src_attr!r}")
 
-        # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
-        force_quiet_volume(page)
+        # ⚠️ 测试播放用 10%（别用 localStorage 里的旧值）
+        force_test_volume(page)
         page.click("#asr-interp-start")
         page.wait_for_timeout(1200)
         st, data = api("GET", "/api/qwen3-asr/interp/status")
@@ -323,7 +355,7 @@ def main() -> int:
         base_done = int((base.get("tts_status") or {}).get("done") or 0)
 
         # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
-        force_quiet_volume(page2)
+        force_test_volume(page2)
         page2.click("#asr-interp-start")
         page2.wait_for_timeout(1500)
         media = page2.eval_on_selector(
@@ -399,6 +431,9 @@ def main() -> int:
 
         page2.click("#asr-interp-stop")
         page2.wait_for_timeout(800)
+        # ⚠️ **场次之间排干净**（见 settle_rounds）—— 不排的话下一场
+        # 会把**同一段译文**再灌一遍 ⇒ 用户听到的是叠着播的重复内容。
+        settle_rounds()
         ctx2.close()
 
         # ================================================================ #
@@ -437,7 +472,7 @@ def main() -> int:
         base3_sub = int(base3.get("submitted") or 0)
 
         # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
-        force_quiet_volume(page3)
+        force_test_volume(page3)
         page3.click("#asr-interp-start")
         # ⚠️ **等媒体播完**（15 s 的文件 + 余量）
         deadline = time.time() + 60
@@ -480,6 +515,9 @@ def main() -> int:
 
         page3.click("#asr-interp-stop")
         page3.wait_for_timeout(800)
+        # ⚠️ **场次之间排干净**（见 settle_rounds）—— 不排的话下一场
+        # 会把**同一段译文**再灌一遍 ⇒ 用户听到的是叠着播的重复内容。
+        settle_rounds()
         ctx3.close()
 
         # ================================================================ #
@@ -527,7 +565,7 @@ def main() -> int:
         base4_seg = int(base4.get("segments") or 0)
 
         # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
-        force_quiet_volume(page4)
+        force_test_volume(page4)
         page4.click("#asr-interp-start")
         page4.wait_for_timeout(1500)
         media4 = page4.eval_on_selector(
@@ -567,6 +605,9 @@ def main() -> int:
 
         page4.click("#asr-interp-stop")
         page4.wait_for_timeout(800)
+        # ⚠️ **场次之间排干净**（见 settle_rounds）—— 不排的话下一场
+        # 会把**同一段译文**再灌一遍 ⇒ 用户听到的是叠着播的重复内容。
+        settle_rounds()
         ctx4.close()
 
         browser.close()
