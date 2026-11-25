@@ -81,7 +81,11 @@ def synth(first_window_frames: int) -> dict:
         "text": TEXT,
         "language": "chinese",
         "play_to": "browser",
-        "volume": 0.5,
+        # ⚠️ **音量 1%**（按 D2 拍板的自测纪律）—— 本探针走
+        # ``play_to=browser`` ⇒ **不碰板载喇叭** ⇒ 音量只影响存下来的
+        # WAV 的振幅 ⇒ 两个配置**同比缩放** ⇒ RMS/峰值/互相关的**比值**
+        # 判据不受影响。
+        "volume": 0.01,
         "first_window_frames": first_window_frames,
     })
     # ⚠️ 快照里的 ``output`` 在 ``start`` 刚返回时还是空 ⇒ 真实路径在
@@ -90,15 +94,26 @@ def synth(first_window_frames: int) -> dict:
     if not out:
         raise RuntimeError("没有输出路径: %s" % json.dumps(st, ensure_ascii=False))
     deadline = time.time() + 120
+    # ⚠️⚠️ **首声延迟 = 「第一帧出现」的时刻** —— 这才是首窗优化要省的
+    # 东西（**不是**合成总时长！总时长由 talker 产多少帧决定 ⇒ 两个配置
+    # 几乎一样 ⇒ 用它当判据会得出「没变快」的错误结论）。
+    # ``on_step`` 在**每个解码窗口**解完后回调 ⇒ ``frames > 0`` 的那一刻
+    # = **第一窗已经解完、音频可以出声** ⇒ 首声延迟。
+    first_frame_sec = None
     while time.time() < deadline:
         snap = api("GET", "/api/tts/")
+        if first_frame_sec is None and int(snap.get("frames") or 0) > 0:
+            first_frame_sec = time.time() - t0
         if not (snap.get("running") or snap.get("loading")):
             break
-        time.sleep(0.2)
+        time.sleep(0.05)
     t_end = time.time()
     wav = fetch("/api/tts/output?path=" + urllib.parse.quote(out))
     samples, sr = read_wav(wav)
     head = samples[:int(2.0 * sr)]
+    # ⚠️ **接缝位置** = 首窗结束处 = ``首窗帧数 × 0.08 s``（一帧 =
+    # ``kTotalUpsample`` 1920 采样 ÷ 24 kHz = 0.08 s）。
+    seam_sec = first_window_frames * 0.08
     return {
         "samples": samples,
         "sr": sr,
@@ -107,6 +122,10 @@ def synth(first_window_frames: int) -> dict:
         "peak_head": peak(head),
         "rms_all": rms(samples),
         "wall": t_end - t0,
+        "first_frame_sec": first_frame_sec,
+        "seam_sec": seam_sec,
+        "seam_jump": envelope_jump(samples, sr, seam_sec),
+        "baseline_jump": baseline_jumps(samples, sr, seam_sec),
     }
 
 
@@ -173,6 +192,50 @@ def correlate(a, b) -> float:
     return num / (da * db)
 
 
+def envelope_jump(samples, sr, at_sec, win_sec=0.05):
+    """``at_sec`` 处的**包络跳变**（前窗 RMS 与后窗 RMS 的相对差）。
+
+    ⚠️ 这是「接缝」的度量：两段音频在拼接点上如果对不齐，会在这里
+    出现一个**相对幅度跳变**（正常语音也有 ⇒ 需要**基线**来比）。
+    """
+    i = int(at_sec * sr)
+    w = int(win_sec * sr)
+    if i - w < 0 or i + w >= len(samples):
+        return None
+    a = rms(samples[i - w:i])
+    b = rms(samples[i:i + w])
+    m = max(a, b, 1e-9)
+    return abs(a - b) / m
+
+
+def baseline_jumps(samples, sr, seam_sec, step_sec=0.5):
+    """接缝**以外**各处的跳变（⇒ 「自然跳变」的基线）。
+
+    ⇒ 接缝的跳变落在这个基线的量级里 ⇒ 说明**没有可听见的接缝**。
+    """
+    out = []
+    t = step_sec
+    dur = len(samples) / float(sr)
+    while t < dur - 0.5:
+        if abs(t - seam_sec) > 0.4:          # 跳过接缝本身
+            j = envelope_jump(samples, sr, t)
+            if j is not None:
+                out.append(j)
+        t += step_sec
+    return out
+
+
+def median(xs):
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return s[mid]
+    return 0.5 * (s[mid - 1] + s[mid])
+
+
 def main() -> int:
     print(f"=== TTS 首窗 A/B（文本: {TEXT[:24]!r}）===")
     print("⚠️ TTS 是采样生成（temperature=0.9）⇒ 同配置两次也不一样 ⇒ "
@@ -186,7 +249,10 @@ def main() -> int:
             runs[fw].append(r)
             print(f"  时长 {r['dur']:.2f}s · 前 2s RMS {r['rms_head']:.5f} · "
                   f"峰值 {r['peak_head']:.4f} · 全段 RMS {r['rms_all']:.5f} · "
-                  f"墙钟 {r['wall']:.2f}s")
+                  f"墙钟 {r['wall']:.2f}s · "
+                  f"**首声 {r['first_frame_sec']:.2f}s** · "
+                  f"接缝跳变 {r['seam_jump']:.4f}"
+                  f"（基线中位 {median(r['baseline_jump']):.4f}）")
 
     def stat(fw, key):
         return [r[key] for r in runs[fw]]
@@ -222,13 +288,35 @@ def main() -> int:
     print(f"  同配置互相关基线: 25 帧 {base[25]:.4f} / 50 帧 {base[50]:.4f}"
           f" · 跨配置 {min(cross):.4f}~{max(cross):.4f}"
           f" ⇒ 跨配置与基线同量级 = 采样噪声主导，**不是**首窗引入的差异")
-    # ② 首声更快：看墙钟（合成总时长）——首窗少攒 25 帧 ⇒ 应更快
+    # ② **首声更快**（这才是首窗优化要省的东西）—— 量的是「第一帧出现」
+    #    的时刻，**不是**合成总时长（总时长由 talker 产多少帧决定 ⇒ 两个
+    #    配置几乎一样 ⇒ 用它当判据会得出「没变快」的错误结论）。
+    ff25 = [r["first_frame_sec"] for r in runs[25]]
+    ff50 = [r["first_frame_sec"] for r in runs[50]]
+    lo_ff = min(ff25)
+    hi_ff = max(ff50)
+    faster = lo_ff < hi_ff - 0.3
+    print(f"  首声延迟（第一帧出现）: 25 帧 {[round(v, 2) for v in ff25]} · "
+          f"50 帧 {[round(v, 2) for v in ff50]} ⇒ "
+          f"{'更快' if faster else '没更快'}")
     w25 = min(stat(25, "wall"))
     w50 = min(stat(50, "wall"))
-    print(f"  合成墙钟最短: 25 帧 {w25:.2f}s vs 50 帧 {w50:.2f}s ⇒ "
-          f"{'更快' if w25 < w50 else '没更快'}")
-    ok = inside
-    print(f"\n  判定: {'✅ 音频未劣化，可缩短首窗' if ok else '⚠️ 音频劣化，别改'}")
+    print(f"  （合成总墙钟 25 帧 {w25:.2f}s vs 50 帧 {w50:.2f}s —— 总时长由 "
+          f"talker 决定，**不是**首窗的指标）")
+    # ③ **接缝**：首窗与第二窗的拼接点不能有可听见的跳变 ⇒ 接缝处的
+    #    包络跳变要落在「自然跳变」的基线量级里。
+    ratios = []
+    for fw in (25, 50):
+        for r in runs[fw]:
+            base_med = median(r["baseline_jump"])
+            if base_med > 1e-9 and r["seam_jump"] is not None:
+                ratios.append((fw, r["seam_jump"] / base_med))
+    seam_ok = all(v <= 3.0 for _, v in ratios)
+    print(f"  接缝跳变 / 自然跳变基线: "
+          f"{[(fw, round(v, 3)) for fw, v in ratios]} ⇒ "
+          f"{'在基线量级（没有可听接缝）' if seam_ok else '明显偏高（有接缝！）'}")
+    ok = inside and faster and seam_ok
+    print(f"\n  判定: {'✅ 音频未劣化，首声更快，可缩短首窗' if ok else '⚠️ 有问题，别改'}")
     return 0 if ok else 1
 
 
