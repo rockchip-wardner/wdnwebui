@@ -49,7 +49,6 @@ from app.core.video.slicing import (
     iter_slices,
 )
 from app.core.video.utils import (
-    _VISION_SIZE,
     cosine_similarity as _cosine_similarity,
     probe_video_meta as _probe_video_meta,
 )
@@ -62,8 +61,6 @@ _STATE_EXTRACTING = "extracting"
 _STATE_READY = "ready"
 _STATE_ERROR = "error"
 
-# embedding 模型的 vision 输入边长（Qwen3-VL-Embedding-2B 固定 576×576）
-_VISION_SIZE = 576
 _EMBED_DIM = 2048
 
 # 检索参数固化 —— 页面与向导不暴露；需要调整时直接改这里的值。
@@ -126,32 +123,25 @@ def read_image_bgr(path: str) -> np.ndarray:
 
 
 def read_query_image(path: str) -> np.ndarray:
-    """读图并缩放到 576×576（与 ``_read_chunk_frames`` 的索引帧预处理一致）。"""
-    import cv2
+    """读查询图，**保持原图**交给 SDK。
 
-    image = read_image_bgr(path)
-    if (image.shape[0], image.shape[1]) != (_VISION_SIZE, _VISION_SIZE):
-        image = cv2.resize(image, (_VISION_SIZE, _VISION_SIZE),
-                           interpolation=cv2.INTER_LINEAR)
-    return image
+    与 ``_read_chunk_frames`` 一致：不在业务侧预缩放，embedding backend 会
+    按 vision 导出的真实画布做 letterbox。
+    """
+    return read_image_bgr(path)
 
 
 def load_query_image(path: str, *, check_quality: bool = True) -> np.ndarray:
-    """质量检查在**原图**上做，再缩放到 576×576。
+    """质量检查在**原图**上做，然后**保持原图**交给 SDK。
 
-    不能在缩放后的图上检查：把 128×128 的随机噪声双线性放大到 576×576
-    本身就是一次低通滤波，高频噪声会被平滑掉，质量门槛就失效了。
+    不能在缩放后的图上检查：把 128×128 的随机噪声双线性放大本身就是一次
+    低通滤波，高频噪声会被平滑掉，质量门槛就失效了。
     """
-    import cv2
-
     image = read_image_bgr(path)
     if check_quality:
         err = image_quality_error(image)
         if err:
             raise ValueError(err)
-    if (image.shape[0], image.shape[1]) != (_VISION_SIZE, _VISION_SIZE):
-        image = cv2.resize(image, (_VISION_SIZE, _VISION_SIZE),
-                           interpolation=cv2.INTER_LINEAR)
     return image
 
 
@@ -595,7 +585,8 @@ class VideoSearchService:
 
         有图走 ``embed_video([img], prompt=text)`` —— 单帧就是图片
         embedding，与索引里的视频片段同一 2048 维空间；纯文字走
-        ``embed_text``。图片读完统一缩到 576×576（与索引帧一致）。
+        ``embed_text``。图片保持原图交给 SDK（与索引帧一致，由 backend
+        按 vision 画布 letterbox）。
         """
         text = (text or "").strip()
         image_path = (image_path or "").strip()

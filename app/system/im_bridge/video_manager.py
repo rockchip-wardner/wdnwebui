@@ -234,8 +234,8 @@ class WechatVideoManager:
             source_name = entry.filename
             duration_s = entry.duration_s
 
-        # 与 UI 检索/图片检索共用同一个编码入口（含 576×576 预处理与
-        # 纯色/噪声质量门槛；图片 + 文字时 text 作为 prompt）。
+        # 与 UI 检索/图片检索共用同一个编码入口（原图由 SDK letterbox 到
+        # vision 画布、纯色/噪声质量门槛；图片 + 文字时 text 作为 prompt）。
         from app.core.video.search import get_service as get_search_service
         qvec = get_search_service().encode_query(
             text, image_path, check_image_quality=True)

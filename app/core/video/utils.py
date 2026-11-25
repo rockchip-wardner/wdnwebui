@@ -20,9 +20,6 @@ import numpy as np
 
 LOG = logging.getLogger("core.video.utils")
 
-# Qwen3-VL-Embedding-2B 的 vision 输入固定 576×576。
-_VISION_SIZE = 576
-
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """两个归一化向量的余弦相似度（内积）。"""
@@ -122,7 +119,8 @@ def _read_chunk_frames(source: str, start_s: float, chunk_seconds: int,
 
     - PyAV ``avformat_seek_file`` 跳到最近的 keyframe，再顺序 decode 到
       目标时间点 —— 避免从头顺序读全片。
-    - 每帧缩放到 576×576（embedding 模型 vision 输入）。
+    - 返回**原帧**：尺寸/宽高比交给 SDK 的 embedding backend 处理，它按
+      vision 导出的真实画布做 letterbox。
     """
     import av
     LOG.info("vr: PyAV opening %s for chunk @%.2fs (chunk_seconds=%d)",
@@ -168,17 +166,14 @@ def _read_chunk_frames(source: str, start_s: float, chunk_seconds: int,
             if frame_number > max(frame_numbers) + 300:
                 break
 
-        import cv2
         frames: List[np.ndarray] = []
         for fn in frame_numbers:
             f = by_number.get(fn)
             if f is None:
                 continue
-            bgr = f.to_ndarray(format="bgr24")
-            if (bgr.shape[0], bgr.shape[1]) != (_VISION_SIZE, _VISION_SIZE):
-                bgr = cv2.resize(bgr, (_VISION_SIZE, _VISION_SIZE),
-                                 interpolation=cv2.INTER_LINEAR)
-            frames.append(bgr)
+            # 原帧直接交给 SDK：embedding backend 会 letterbox 到 vision
+            # 导出的真实画布。不在业务侧预缩放。
+            frames.append(f.to_ndarray(format="bgr24"))
         LOG.info("vr: PyAV done in %.2fs — %d/%d frames decoded",
                  _time.time() - t0, len(frames), len(frame_numbers))
         return frames
