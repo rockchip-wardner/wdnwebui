@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import ssl
+import sys
 import subprocess
 import time
 import urllib.request
@@ -59,14 +60,19 @@ def report(ph: float, playing: bool, ended: bool = False) -> None:
 
 
 def main() -> int:
-    print("== M33：播放连续性实测（文件源 + 跟播放 ⇒ 短句逐个成作业）==")
+    # ⚠️ 参数：**切句档**（steady/fast）+ **音量**（默认 0.01 = 探针口径；
+    # 想**听**就传 0.1 ⇒ 用户在板子旁边能判断杂音 / 卡顿 / 断音）。
+    mode = sys.argv[1] if len(sys.argv) > 1 else "steady"
+    volume = float(sys.argv[2]) if len(sys.argv) > 2 else 0.01
+    print("== M33：播放连续性实测（文件源 + 跟播放 · %s 档 · 音量 %.0f%%）=="
+          % (mode, volume * 100))
     api("POST", "/api/qwen3-asr/interp/stop")
     api("POST", "/api/tts/queue/clear")
     time.sleep(1.0)
 
     api("POST", "/api/qwen3-asr/interp/start",
-        {"mode": "steady", "gate": "follow", "target_lang": "zh-CN",
-         "volume": 0.01, "source": "file"})
+        {"mode": mode, "gate": "follow", "target_lang": "zh-CN",
+         "volume": volume, "source": "file"})
     time.sleep(0.5)
 
     t0 = time.monotonic()
