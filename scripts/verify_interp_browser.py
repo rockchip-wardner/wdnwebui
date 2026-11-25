@@ -229,6 +229,49 @@ def main() -> int:
         disabled = page.eval_on_selector("#asr-interp-gate", "el => el.disabled")
         check("file 源 ⇒ 播放时机可用", disabled is False)
 
+        # ================================================================ #
+        # **四种来源的结果都显示在页面底部**（2026-11-25）
+        #
+        # ⚠️ 原来：麦克风来源的「实时翻译」句子流在**页面中部**的「实时识别」
+        # 块里，而文件 / 视频来源的在**底部** ⇒ 同一份结果**位置不一致** ⇒
+        # 用户得先看来源才知道去哪找译文。
+        #
+        # ⇒ 现在：四种来源的实时翻译结果都在**底部**的 `#asr-live` 框里
+        #    （同一时刻只显示一个），同传结果在它下面的 `#asr-interp-out`。
+        # ================================================================ #
+        print("== 四种来源的结果统一在底部 ==")
+        for src in ("board", "browser"):
+            page.click(f'#asr-source-tabs .asr-source-tab[data-source="{src}"]')
+            page.wait_for_timeout(500)
+            in_bottom = page.eval_on_selector(
+                "#asr-rt-sentences", "el => !!el.closest('#asr-live')")
+            check(f"{src} 源 ⇒ 实时翻译结果挂在底部的 #asr-live 里", in_bottom is True)
+            shown = page.eval_on_selector(
+                "#asr-rt-sentences", "el => !el.classList.contains('hidden')")
+            check(f"{src} 源 ⇒ 实时翻译结果可见", shown is True)
+        page.click('#asr-source-tabs .asr-source-tab[data-source="file"]')
+        page.wait_for_timeout(500)
+        file_shown = page.eval_on_selector(
+            "#asr-sentences", "el => !el.classList.contains('hidden')")
+        rt_hidden = page.eval_on_selector(
+            "#asr-rt-sentences", "el => el.classList.contains('hidden')")
+        check("file 源 ⇒ 实时翻译结果可见（句子流）", file_shown is True)
+        check("file 源 ⇒ 麦克风的句子流被藏起来（不重复显示）", rt_hidden is True)
+        # 视频来源
+        page.click('#asr-source-tabs .asr-source-tab[data-source="video"]')
+        page.wait_for_timeout(500)
+        tr_in_bottom = page.eval_on_selector(
+            "#asr-transcript", "el => !!el.closest('#asr-live')")
+        check("video 源 ⇒ 字幕转写框挂在底部的 #asr-live 里", tr_in_bottom is True)
+        s_hidden = page.eval_on_selector(
+            "#asr-sentences", "el => el.classList.contains('hidden')")
+        rt_hidden2 = page.eval_on_selector(
+            "#asr-rt-sentences", "el => el.classList.contains('hidden')")
+        check("video 源 ⇒ 文件 / 麦克风的句子流被藏起来（不重复显示）",
+              s_hidden is True and rt_hidden2 is True)
+        page.click('#asr-source-tabs .asr-source-tab[data-source="file"]')
+        page.wait_for_timeout(500)
+
         # 音频播放器（文件源）
         print("== 音频播放器 ==")
         check("有 #asr-audio-player", page.locator("#asr-audio-player").count() == 1)
@@ -298,6 +341,52 @@ def main() -> int:
               int(s.get("segments") or 0) > base1_seg, f"得到 {s}")
         check(f"翻译数有增量（{base1_tr} → {s.get('translated')}）",
               int(s.get("translated") or 0) > base1_tr, f"得到 {s}")
+
+        # ---- **同传结果列表（页面底部）**（2026-11-25 新增）--------
+        #
+        # ⚠️ 原来同传**没有任何结果列表** —— 页面上只有一句状态行 ⇒ 用户
+        # 看不到「说了什么」⇒ 现在后端补了 ``interp_translated`` 帧（原文 +
+        # 完整译文）⇒ 底部一句一句列出来。
+        # ================================================================ #
+        print("== 同传结果列表（页面底部）==")
+        deadline = time.time() + 60
+        rows = []
+        while time.time() < deadline:
+            rows = page.eval_on_selector_all(
+                "#asr-interp-list .asr-interp-sent",
+                """els => els.map(e => ({
+                    src: (e.querySelector('.asr-sent-src') || {}).textContent || '',
+                    dst: (e.querySelector('.asr-sent-dst') || {}).textContent || '',
+                    tag: (e.querySelector('.asr-interp-tag') || {}).textContent || '',
+                }))""")
+            if any(r["src"] and r["dst"] and r["dst"] != "翻译中"
+                   and "（" not in r["dst"] for r in rows):
+                break
+            page.wait_for_timeout(1000)
+        check(f"底部有同传结果行（{len(rows)} 行）", len(rows) > 0, f"得到 {rows[:2]}")
+        check("同传结果行有原文",
+              any(r["src"].strip() for r in rows), f"得到 {rows[:2]}")
+        check("同传结果行有**完整译文**（不是「翻译中」占位）",
+              any(r["dst"].strip() and r["dst"].strip() != "翻译中"
+                  and not r["dst"].startswith("（") for r in rows),
+              f"得到 {rows[:2]}")
+        # 位置：**在「实时结果」框的下面** ⇒ 两类结果都在页面底部。
+        geom = page.evaluate("""() => {
+            const live = document.getElementById('asr-live');
+            const out = document.getElementById('asr-interp-out');
+            const ctrl = document.getElementById('asr-interp-block');
+            if (!live || !out || !ctrl) return null;
+            const y = (el) => el.getBoundingClientRect().top + window.scrollY;
+            return {live: y(live), out: y(out), ctrl: y(ctrl),
+                    outHidden: out.classList.contains('hidden')};
+        }""")
+        check("同传结果区可见", geom and geom.get("outHidden") is False, f"得到 {geom}")
+        check("同传结果区在「实时结果」框**下面**",
+              geom and float(geom.get("out") or 0) > float(geom.get("live") or 0),
+              f"得到 {geom}")
+        check("同传结果区在同传控制条**下面**（页面底部）",
+              geom and float(geom.get("out") or 0) > float(geom.get("ctrl") or 0),
+              f"得到 {geom}")
 
         # 面板上的状态行
         text = page.inner_text("#asr-interp-status")
@@ -421,9 +510,27 @@ def main() -> int:
               f"得到 {q}")
 
         # 状态行也要说清楚
-        status_text = page2.inner_text("#asr-interp-status")
+        #
+        # ⚠️⚠️ **必须等，不能只读一次**（2026-11-25 实测踩过）——
+        # 「播放头卡住」这个提示是**引擎 3 秒后**才判出来的
+        # （``FOLLOW_STALL_WARN_SEC`` = 3 s）⇒ 读早了会读到「正在播报」
+        # 那句 ⇒ **假失败**。
+        #
+        # ⚠️ **为什么这次会读早**：上面的循环一旦 ``sub``/``done`` 都涨了
+        # 就退出 ⇒ **上一场遗留的 TTS 队列**还在放的时候，``done`` 会很快
+        # 涨 ⇒ 采样点落在那 3 秒窗口里 ⇒ 状态行还没来得及说「卡住」。
+        # ⇒ 这里改成**轮询到说清楚为止**（有上限）。
+        status_text = ""
+        deadline_txt = time.time() + 25
+        while time.time() < deadline_txt:
+            status_text = page2.inner_text("#asr-interp-status")
+            if ("没在放" in status_text or "兜底" in status_text
+                    or "卡住" in status_text):
+                break
+            page2.wait_for_timeout(1000)
         check("状态行提到媒体没在放 / 已兜底放行",
-              "没在放" in status_text or "兜底" in status_text,
+              "没在放" in status_text or "兜底" in status_text
+              or "卡住" in status_text,
               f"得到 {status_text!r}")
 
         real_errors2 = [e for e in errors2 if "favicon" not in e.lower()]
