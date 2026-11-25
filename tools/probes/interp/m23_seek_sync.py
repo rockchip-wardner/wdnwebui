@@ -95,8 +95,16 @@ def _multipart(path: str, fields: dict, timeout=900):
         return {"_raw": raw[:300].decode("utf-8", "replace")}
 
 
-def playhead_at(elapsed: float) -> float:
-    """剧本化的播放头（媒体秒）。"""
+def playhead_at(elapsed: float, no_seek: bool = False) -> float:
+    """剧本化的播放头（媒体秒）。
+
+    ⚠️ ``no_seek=True`` ⇒ **不拖动**，播放头从 0 一路 1× 往前走 ——
+    用来把「**跟不跟得上字幕节奏**」和「**拖了之后对不对得上**」这两件事
+    **分开测**：拖动会把话重播一遍（``replayed``）⇒ 队列里堆着两份内容
+    ⇒ 测出来的是**队列积压**，不是「跟播放」的同步误差。
+    """
+    if no_seek:
+        return elapsed
     t0, ph0, speed = SCRIPT[0]
     for t1, ph1, sp1 in SCRIPT[1:]:
         if elapsed < t1:
@@ -108,9 +116,10 @@ def playhead_at(elapsed: float) -> float:
 class PlayheadSim(threading.Thread):
     """**模拟浏览器的播放头**（每 250 ms 上报一次）。"""
 
-    def __init__(self, stream_id: str = "") -> None:
+    def __init__(self, stream_id: str = "", no_seek: bool = False) -> None:
         super().__init__(daemon=True)
         self.stream_id = stream_id
+        self.no_seek = bool(no_seek)
         self.samples: list[tuple] = []      # (墙钟, 播放头)
         self._stop = threading.Event()
 
@@ -118,7 +127,7 @@ class PlayheadSim(threading.Thread):
         t0 = time.time()
         while not self._stop.is_set():
             el = time.time() - t0
-            ph = playhead_at(el)
+            ph = playhead_at(el, self.no_seek)
             self.samples.append((time.time(), ph))
             _req("/api/qwen3-asr/interp/playhead",
                  {"stream_id": self.stream_id, "playhead_sec": round(ph, 3),
@@ -146,6 +155,8 @@ def main() -> int:
     ap.add_argument("--gate", default="follow", choices=["now", "follow"])
     ap.add_argument("--wait-segments", type=int, default=12,
                     help="等识别/翻译追够多少句才开始拖进度条")
+    ap.add_argument("--no-seek", action="store_true",
+                    help="**不拖动**（播放头 1× 往前走）—— 单独测「跟字幕节奏」")
     args = ap.parse_args()
 
     print("== 起同传（gate=%s）==" % args.gate)
@@ -195,7 +206,7 @@ def main() -> int:
         print("   ⚠️ 没等到（继续测）")
 
     print("== 模拟播放头（含两次拖动）==")
-    sim = PlayheadSim("")
+    sim = PlayheadSim("", no_seek=args.no_seek)
     sim.start()
 
     print("== 采样 %d s ==" % int(args.seconds))
