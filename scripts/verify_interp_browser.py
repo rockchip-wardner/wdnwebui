@@ -296,6 +296,7 @@ def main() -> int:
         _st, base = api("GET", "/api/qwen3-asr/interp/status")
         base_sub = int(base.get("submitted") or 0)
         base_rel = int(base.get("stalled_released") or 0)
+        base_done = int((base.get("tts_status") or {}).get("done") or 0)
 
         page2.click("#asr-interp-start")
         page2.wait_for_timeout(1500)
@@ -317,6 +318,7 @@ def main() -> int:
         deadline = time.time() + 180
         sub = base_sub
         rel = base_rel
+        done = base_done
         stalled_seen = False
         pending_seen = 0
         status = {}
@@ -324,10 +326,15 @@ def main() -> int:
             _st, status = api("GET", "/api/qwen3-asr/interp/status")
             sub = int(status.get("submitted") or 0)
             rel = int(status.get("stalled_released") or 0)
+            done = int((status.get("tts_status") or {}).get("done") or 0)
             pending_seen = max(pending_seen, int(status.get("pending") or 0))
             if status.get("playhead_stalled"):
                 stalled_seen = True
-            if sub > base_sub:
+            # ⚠️ **两个条件都要满足**才停：
+            # ① 句子进了 TTS 队列（``submitted``）；
+            # ② **音频真的播出来了**（队列的 ``done``）⇒ 这才是用户
+            #    真正关心的（「听得见译文」）。
+            if sub > base_sub and done > base_done:
                 break
             page2.wait_for_timeout(1000)
 
@@ -335,8 +342,16 @@ def main() -> int:
               f"status={status}")
         check("句子确实被压住过（pending > 0）", pending_seen > 0,
               f"pending 峰值={pending_seen}")
-        check("**兜底放行发生**（stalled_released 增量 > 0）",
-              rel > base_rel, f"{base_rel} → {rel}")
+        # ⚠️⚠️ **这里断言的是「播出来了」，不是放行器的兜底计数** ——
+        # **文件源**的放行器**根本不查播放头**（``interp.py``
+        # ``_batch_ready``：文件源按**内容量**攒批 ⇒ 直接放行）⇒
+        # 放行器那个 ``stalled_released`` 计数**永远不涨**（它是**实时流**
+        # 的兜底：麦 → 一边说一边播 ⇒ 播放头不动 ⇒ 10 s 后强行放行）。
+        # ⇒ **文件源**的「媒体暂停 ⇒ 别把译文永久压住」由**队列的播放
+        # 时钟**兜底（``queue.py::_clock_ready`` 的 ``_CLOCK_STALL_SEC``
+        # = 8 s：源不再往前走 ⇒ 放行）⇒ 断言落在**用户可见的结果**上。
+        check("**译文没有被永久压住（真的播出来了）**（队列 done 增量 > 0）",
+              done > base_done, f"{base_done} → {done} · status={status}")
         check("**兜底后译文仍进了 TTS 队列**（submitted 增量 > 0）",
               sub > base_sub, f"{base_sub} → {sub} · status={status}")
         check("播放头从没走过（自动播放被拦的指纹）",
