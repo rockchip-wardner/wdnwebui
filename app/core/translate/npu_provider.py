@@ -329,6 +329,135 @@ _LATIN_TARGETS = {
 }
 
 # --------------------------------------------------------------------------- #
+# **公共判据**（2026-11-25 补回宿主）
+# --------------------------------------------------------------------------- #
+#
+# ⚠️⚠️ **这两个判据本来就在宿主**（插件侧一直 ``from
+# app.core.translate.npu_provider import has_translatable_content``）——
+# 但**从没提交进这个仓** ⇒ 插件的 ``try/except`` 把它吞了 ⇒
+# ⇒ **「只有标点的碎片不翻」这道闸整条是死的** ⇒ 模型**没东西可翻**时
+# 会把**我们发给它的指令**原样吐回来（实测：
+# ``Translate the following text from zh to …``）⇒ 那是**胡话** ⇒
+# 质量闸只查文种拦不住（指令也是拉丁字母）⇒ 指令被当成译文 ⇒
+# ⇒ **上屏**（字幕里出现指令）+ **被 TTS 念出来**。
+#
+# ⇒ 插件的 AGENTS 明写「判据都在宿主 npu_provider.py ⇒ 别在卡片里另写
+# 一份」⇒ 这里补齐宿主这一半。
+
+#: **模型把指令吐回来**时的特征前缀（小写）。
+_INSTRUCTION_MARKERS = (
+    "translate the following text",
+    "translate from ",
+    "translate the text",
+    "translate text",
+    "please translate",
+)
+
+
+def has_translatable_content(text: str) -> bool:
+    """这段文本**有没有值得翻的内容**。
+
+    ⚠️ **判据 = 有没有「字母类」字符**（拉丁字母 / 汉字 / 假名 / 阿拉伯文
+    …）：
+
+    * 只有标点、空白、emoji、纯数字 ⇒ **没有可译内容** ⇒ 不该送模型
+      （送了模型就会把指令吐回来）；
+    * 只要有一个字母类字符 ⇒ **有内容** ⇒ 该翻。
+
+    ⚠️ **纯数字也不翻**（「2024」翻过去还是「2024」⇒ 白烧一次推理）。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    for ch in t:
+        # ⚠️ ``isalpha()`` 对汉字 / 假名 / 阿拉伯文都为真 ⇒ 一并算「有内容」。
+        if ch.isalpha():
+            return True
+    return False
+
+
+def detect_text_language(text: str) -> str:
+    """按**文种**判这段文本是什么语言（返回语言码；判不出 ⇒ 空串）。
+
+    ⚠️ **拉丁字母系一律给 ``en``** —— 英/德/法/西用同一套字母 ⇒
+    **分不出来** ⇒ 别猜（插件侧的语种锁定就是靠这个「分不出就别锁」）。
+
+    ⇒ 插件侧 `qwen3_asr/service.py::_language_to_lock` 用它判「自报的语种
+    与正文**自不自洽**」（实测：ASR 把中文判成 English ⇒ 锁错了语种 ⇒
+    前两句**没翻译**，面板上原文出现两遍）。
+
+    ⚠️ **这个函数本来就在宿主**（插件一直 import 它）—— 但**从没提交进
+    这个仓** ⇒ 插件的 ``try/except`` 把它吞了 ⇒ 「语种锁定自洽性」这道
+    闸**整条是死的**（2026-11-25 补回）。
+    """
+    scripts = _script_set(text or "")
+    if not scripts:
+        return ""
+    # ⚠️ **假名优先于汉字** —— 日文正文常是「汉字 + 假名」混排 ⇒
+    # 先看假名 ⇒ 才判得出是日文而不是中文。
+    if "kana" in scripts:
+        return "ja"
+    if "hangul" in scripts:
+        return "ko"
+    if "han" in scripts:
+        return "zh-CN" if "latin" not in scripts else ""
+    for script, code in (
+        ("cyrillic", "ru"), ("arabic", "ar"), ("deva", "hi"),
+        ("thai", "th"), ("hebrew", "he"), ("greek", "el"),
+        ("bengali", "bn"), ("tamil", "ta"),
+    ):
+        if script in scripts:
+            return code
+    if "latin" in scripts:
+        return "en"
+    return ""
+
+
+def resolve_source_language(text: str, src: str, tgt: str = "") -> str:
+    """按**文种**校正源语（ASR 偶尔把中文判成 English）。
+
+    ⚠️ **为什么需要**（实测 2026-11-23，用户报「ASR+翻译中途中英夹杂」）：
+    ASR 偶尔把中文判成 English（实测《圆桌派》中文视频 **46/1015 轮**，
+    其中 30 轮正文全是汉字）⇒ 「源语 == 目标语 == English」⇒ 直接**透传**
+    ⇒ **中文原文被当成译文** ⇒ 字幕里中英夹杂。
+
+    ⇒ 文本**全是汉字** ⇒ 源语其实是中文 ⇒ 校正成 ``zh-CN``。
+    ⚠️ **只用来判「要不要透传」** —— 真正交给管理器时仍原样传 ASR 的
+    语言名（契约：归一在管理器内部做）。
+    """
+    scripts = _script_set(text or "")
+    if "han" in scripts and "latin" not in scripts:
+        low = (src or "").lower()
+        if not low.startswith("zh"):
+            return "zh-CN"
+    return src
+
+
+def _looks_like_instruction(text: str) -> bool:
+    """输出是不是**把我们发给它的指令原样吐回来了**。
+
+    ⚠️ **为什么要有**（实测 2026-11-24，用户报「译文里出现
+    ``Translate the following text from zh to …``」）：
+    模型**没东西可翻**时会复读指令 ⇒ 质量闸只查文种 ⇒ 指令也是拉丁字母
+    ⇒ 「合格」⇒ 当成译文 ⇒ **上屏 + 被念出来**。
+
+    ⇒ 质量闸（:meth:`NpuTranslateProvider._looks_translated`）先把它挡掉
+    ⇒ 流式快路径就会**换一条措辞**再试 ⇒ 全都不行才报「没翻出来」
+    （那时字幕显示的是原文 + 失败原因，**不是**指令）。
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    for marker in _INSTRUCTION_MARKERS:
+        if t.startswith(marker):
+            return True
+    # 「zh -> en:」这种箭头写法（:data:`_PROMPTS_CODE` 的第 2 条措辞）。
+    if re.match(r"^[a-z]{2,3}(?:-[a-z]{2,4})?\s*->\s*"
+                r"[a-z]{2,3}(?:-[a-z]{2,4})?\s*:", t):
+        return True
+    return False
+
+# --------------------------------------------------------------------------- #
 # 指令措辞（按实测成功率排序，逐个试）
 # --------------------------------------------------------------------------- #
 #
@@ -872,11 +1001,21 @@ class NpuTranslateProvider(TranslationProvider):
         同传里等于**整句作废** —— 字幕上空一行，比慢半拍难受得多。
         ⇒ 第 2 条只在第 1 条失败时才跑，延迟上界 ~1 s。
 
-        ⚠️ **不走负缓存**（``_is_known_bad``）—— 那是界面翻译的「这句话
-        刚才翻不出来，别再烧推理」用的；同传的句子各不相同，缓存命中率
-        接近 0，却会**误伤**重复句（「好的」「对」这种一句话能重复十次）。
+        ⚠️⚠️ **负缓存**（``_is_known_bad``）—— **2026-11-25 改：走它，
+        但只记「质量失败」** ——
+        实测用户那一轮的行级翻译（前端**每 5 秒重试一次、无上限**）把
+        **同 7 句话**重试了**几百次**（日志：``Translate the following
+        text from zh to en:`` 338 次 / ``己的概括能力。`` 174 次 /
+        ``徐老师。`` 158 次…）⇒ 每次都是**一次真推理** ⇒ **MT 的算力
+        全烧在这 7 句上** ⇒ ASR/TTS 抢不到算力 ⇒ **译文越落越远**。
 
-        ``session`` 不传就现取一个（:meth:`_session`）。
+        ⇒ 现在：**质量失败**（:class:`NpuQualityError` —— 复读 / 指令复读
+        / 方向反了 ⇒ **内容级**、确定性）⇒ **记负缓存** ⇒ 同一句话在
+        :data:`_BAD_TTL`（300 s）内**不再烧推理**，直接返回失败。
+        ⇒ **瞬时故障**（worker 挂了 / 超时 ⇒ :class:`TranslationError`）
+        **不记** ⇒ 恢复后还能重试。
+        ⇒ ⚠️ **重复句不会误伤**：同一句话的失败是**确定性**的（同样的输入
+        ⇒ 同样的输出）⇒ 缓存住它**不丢任何机会**。
         """
         text = (text or "").strip()
         if not text:
@@ -884,6 +1023,13 @@ class NpuTranslateProvider(TranslationProvider):
         if source == target:
             return text, {}
         self._check_pair(source, target)
+
+        # ⚠️ **负缓存**：这句最近翻不出来 ⇒ 别再白烧推理（2026-11-25）。
+        key = (source, target, text)
+        if self._is_known_bad(key):
+            raise NpuQualityError(
+                f"NPU 这条最近翻不出来（{text[:24]!r}），跳过重试"
+            )
 
         if session is None:
             session = self._session()
@@ -913,6 +1059,10 @@ class NpuTranslateProvider(TranslationProvider):
             # （复读原文 / 方向反了 / 输出是空），现场只看「没翻出来」没法查。
             LOG.info("translate: the fast path did not translate wording #%d (raw=%r)",
                      idx + 1, out[:120])
+        # ⚠️ **记负缓存**（2026-11-25）—— 质量失败是**确定性**的 ⇒
+        # 同一句话在 300 s 内**不再烧推理**（前端会每 5 秒重试一次 ⇒
+        # 没有这道闸，同一句话能把 MT 的算力全烧光）。
+        self._mark_bad(key)
         raise NpuQualityError(
             f"NPU 翻译这次没翻出来（{last_out[:60]!r}）", perf=_finish_perf(perf))
 
@@ -1028,6 +1178,12 @@ class NpuTranslateProvider(TranslationProvider):
         if not out:
             return False
         if out == src.strip():
+            return False
+        # ⚠️⚠️ **指令复读**（2026-11-25 补回宿主）—— 模型没东西可翻时
+        # 会把我们发给它的指令原样吐回来 ⇒ 文种是拉丁字母 ⇒ 质量闸本来
+        # 拦不住 ⇒ 指令被当成译文 ⇒ **上屏 + 被 TTS 念出来**。
+        # ⇒ 这里先挡掉 ⇒ 快路径会**换一条措辞**再试。
+        if _looks_like_instruction(out):
             return False
         if self._is_degenerate(out, src):
             return False

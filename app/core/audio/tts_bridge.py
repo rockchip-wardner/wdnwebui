@@ -348,6 +348,26 @@ def queue_set_clock(provider=None, offset: float = 0.0) -> dict:
     return _queue_module().set_clock(provider, offset)
 
 
+def queue_set_media_state(provider=None) -> dict:
+    """设 TTS 队列的**媒体状态**（跟播用，2026-11-25）。
+
+    ⚠️ ``provider`` = 返回「媒体状态字典」的可调用对象，字段：
+
+    * ``ended`` / ``failed`` —— 源播完 / 媒体坏了 ⇒ 剩下的**补播**；
+    * ``playing`` —— 媒体声称在播；
+    * ``moved`` —— 播放头**曾经真的走过**（区分「用户暂停」与
+      「自动播放被拦」）；
+    * ``alive`` —— 前端**还在上报**（心跳在）。
+
+    ⚠️ **为什么必须单独一路**（用户报「视频暂停了同传还在播」「声音不
+    跟随当前字幕」）：播放时钟只回答「播放头在哪」，**回答不了「媒体是不是
+    暂停了」** ⇒ 暂停时播放头不动 ⇒ 8 秒兜底放行 ⇒ **积压一次性狂喷**
+    （实测 184 秒 ⇒ 声音跑到画面前面 174 秒）⇒ 有这一路才分得清
+    「暂停」（按住）与「缓冲 / 失联」（放行）。
+    """
+    return _queue_module().set_media_state(provider)
+
+
 def queue_set_tempo(tempo: float) -> dict:
     """改**未开始** job 的变速（积压一降就该回落 1.0）。"""
     return _queue_module().set_tempo(tempo)
