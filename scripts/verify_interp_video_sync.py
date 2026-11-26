@@ -309,6 +309,66 @@ def main() -> int:
                       f"（|err| ≤ {SYNC_TOL_SEC} s，{len(errs) - len(big)}/{len(errs)} 句）",
                       not big, f"超差的: {['%.2f' % e for e in big]}")
 
+            # ---------------- 「同传结果」跟字幕节奏 + 底部只留一个列表 ----------
+            # ⚠️ 2026-11-25 用户两条要求：
+            #   ① 「同传结果」的显示节奏和字幕的节奏一致，显示当前正在播放的
+            #      同传结果 ⇒ 高亮**播放头所在的那一句**；
+            #   ② 「实时结果」与「同传结果」**合并** ⇒ 同屏只留一个列表
+            #      （同一批句子显示两遍 ⇒ 用户得自己对号入座）。
+            ui = page.evaluate("""() => {
+                const list = document.getElementById('asr-interp-list');
+                const out = document.getElementById('asr-interp-out');
+                const tr = document.getElementById('asr-transcript');
+                const v = document.getElementById('asr-video');
+                const rows = list
+                  ? Array.from(list.querySelectorAll('.asr-interp-sent')) : [];
+                const cur = rows.filter(r => r.classList.contains('is-current'));
+                const c = cur.length ? cur[0] : null;
+                const origin = (window.Qwen3Asr
+                                && window.Qwen3Asr._audioOriginSec) || 0;
+                return {
+                  outVisible: !!out && !out.classList.contains('hidden'),
+                  trHidden: !!tr && tr.classList.contains('hidden'),
+                  sentsHidden: (() => {
+                    const e = document.getElementById('asr-sentences');
+                    return !!e && e.classList.contains('hidden');
+                  })(),
+                  rtHidden: (() => {
+                    const e = document.getElementById('asr-rt-sentences');
+                    return !!e && e.classList.contains('hidden');
+                  })(),
+                  rowCount: rows.length,
+                  curCount: cur.length,
+                  curStart: c ? Number(c.dataset.start) : null,
+                  curEnd: c ? Number(c.dataset.end) : null,
+                  curTag: c
+                    ? ((c.querySelector('.asr-interp-tag') || {}).textContent || '')
+                    : '',
+                  ph: v ? (v.currentTime || 0) - origin : -1,
+                };
+            }""")
+            print("   UI: %s" % json.dumps(ui, ensure_ascii=False))
+            check(f"第 {rnd} 轮：同传结果列表有内容", ui.get("rowCount", 0) >= 3,
+                  f"得到 {ui.get('rowCount')} 行")
+            check(f"第 {rnd} 轮：底部**只留一个**结果列表（同传结果）"
+                  "（实时结果 / 字幕文本已藏）",
+                  bool(ui.get("outVisible")) and bool(ui.get("trHidden"))
+                  and bool(ui.get("sentsHidden")) and bool(ui.get("rtHidden")),
+                  f"得到 {ui}")
+            check(f"第 {rnd} 轮：同传结果里**有且只有一句**是高亮的"
+                  "（当前正在播报的那句）",
+                  ui.get("curCount") == 1, f"得到 {ui.get('curCount')} 句")
+            ph = float(ui.get("ph") or -1)
+            cs = ui.get("curStart")
+            ce = ui.get("curEnd")
+            check(f"第 {rnd} 轮：高亮的那句**包含播放头**（节奏 = 字幕的节奏）",
+                  cs is not None and cs >= 0 and ph >= cs
+                  and (ce is None or ce <= 0 or ph < ce),
+                  f"ph={ph:.2f} 区间=[{cs},{ce}]")
+            check(f"第 {rnd} 轮：当前句标着「正在播报」",
+                  "正在播报" in (ui.get("curTag") or ""),
+                  f"得到 {ui.get('curTag')!r}")
+
             # ---------------- 拖进度条（前跳 / 后跳） ----------------
             print("   拖进度条 …")
             _st, before = api("GET", "/api/qwen3-asr/interp/status")
