@@ -2312,6 +2312,19 @@
       }
     };
     finishBtn.addEventListener("click", runFinish);
+
+    // 完成页也要通知卡片 —— 否则「卡片想装饰完成页」没有任何入口。
+    // 这一卡的 `fields` 可能是空的（由卡片自己注入 UI），框架摘要就会是
+    // 「(未填任何配置)」；卡片收到事件后可以补上有意义的摘要。
+    // 现有卡片的处理器都按 stepId 过滤，多派发一次 finish 事件对它们无影响。
+    try {
+      window.dispatchEvent(new CustomEvent("wizard:step-rendered", {
+        detail: {
+          appId: state.app && state.app.id,
+          stepId: stepDef.id,
+        },
+      }));
+    } catch (_) { /* 订阅方抛异常不影响向导 */ }
   }
 
   /**
