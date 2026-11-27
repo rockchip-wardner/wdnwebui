@@ -323,17 +323,42 @@ def main() -> int:
         #    已开启」⇒ 用户以为**还在译**（其实结果已经没了）⇒ 参照「配音
         #    导出」的清空（它清完就把状态写成「已清空」）。
         cleared_state = page.evaluate(
-            """() => ({
-                tr: (document.getElementById('asr-tr-status')
-                     ?.textContent || '').trim(),
-                hint: (document.getElementById('asr-hint')
-                       ?.textContent || '').trim(),
-            })""")
-        check("「清空」后「实时翻译」的状态 = 「已清空」",
-              cleared_state["tr"] == "已清空", f"实际 = {cleared_state['tr']!r}")
+            """() => {
+                const clear = document.getElementById('asr-tr-clear-status');
+                const btn = document.getElementById('asr-reset-btn');
+                const dub = document.getElementById('asr-dub-status');
+                const cls = (el) => el ? (el.className || '') : '';
+                return {
+                    clear: clear ? (clear.textContent || '').trim() : '',
+                    clearCls: cls(clear),
+                    dubCls: cls(dub),
+                    tr: (document.getElementById('asr-tr-status')
+                         ?.textContent || '').trim(),
+                    hint: (document.getElementById('asr-hint')
+                           ?.textContent || '').trim(),
+                    resetDisabled: btn ? btn.disabled : null,
+                };
+            }""")
+        # ⚠️ **「已清空」在「清空」按钮右边那个状态位里**（2026-11-27 用户
+        #    要求）⇒ 与「配音导出」的 ``#asr-dub-status`` **同位置同风格**。
+        check("「清空」后「清空」按钮右边的状态 = 「已清空」",
+              cleared_state["clear"] == "已清空",
+              f"实际 = {cleared_state['clear']!r}")
+        check("那个状态位的**样式**与「配音导出」的同一款（asr-live-status）",
+              "asr-live-status" in cleared_state["clearCls"]
+              and cleared_state["clearCls"] == cleared_state["dubCls"],
+              f"清空位={cleared_state['clearCls']!r} "
+              f"配音位={cleared_state['dubCls']!r}")
+        check("「清空」后**模型状态**那行不被顶掉（还是模型的事）",
+              "已清空" not in cleared_state["tr"],
+              f"实际 = {cleared_state['tr']!r}")
         check("「清空」后提示行 = 「已清空」",
               cleared_state["hint"] == "已清空",
               f"实际 = {cleared_state['hint']!r}")
+        # ⚠️ **没东西可清 ⇒ 「清空」按钮灰着**（2026-11-27 用户要求）。
+        check("「清空」后「清空」按钮**变灰**（没东西可清了）",
+              cleared_state["resetDisabled"] is True,
+              f"disabled={cleared_state['resetDisabled']}")
 
         check("没有 JS 错误", not errors, f"errors={errors[:4]}")
         browser.close()
