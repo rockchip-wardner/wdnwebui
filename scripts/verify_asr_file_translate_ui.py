@@ -309,6 +309,59 @@ def main() -> int:
         check("页面上**没有**「点击「开始识别」重新跑一遍。」",
               "重新跑一遍" not in hint_now, f"实际 = {hint_now!r}")
 
+        # --- 5d. 识别的**完成信息**在「实时翻译」块里（2026-11-27 用户要求）---
+        # ⚠️ **原来它在页面最底下的全局提示行**（``#asr-hint``，「显示模式」
+        #    上一行）⇒ 用户提出来：离「开始识别 / 停止 / 清空」按钮太远
+        #    （按钮在「实时翻译」块里，提示却掉到卡片底部）⇒ **搬进这一块**。
+        #
+        # ⚠️⚠️ **必须等「识别完成」那一帧到**（实测踩到）—— 译文是**边识别
+        #    边出**的 ⇒ 译文先到、收尾帧（``done``）后到（实测 2.0 s vs
+        #    2.9 s）⇒ 不等就查 ⇒ 查到的永远是**空行**（假失败）。
+        t1 = time.time()
+        while time.time() - t1 < 120:
+            got = page.evaluate(
+                """() => (document.getElementById('asr-tr-info')
+                        ?.textContent || '').trim()""")
+            if got:
+                break
+            page.wait_for_timeout(500)
+        info = page.evaluate(
+            """() => {
+                const el = document.getElementById('asr-tr-info');
+                const blk = document.getElementById('asr-tr-block');
+                const grp = document.querySelector('#asr-tr-block .asr-tr-run');
+                const hint = document.getElementById('asr-hint');
+                const r = (e) => (e ? e.getBoundingClientRect() : null);
+                const box = r(el), gbox = r(grp);
+                const cs = el ? getComputedStyle(el) : null;
+                return {
+                    exists: !!el,
+                    text: el ? (el.textContent || '').trim() : '',
+                    visible: !!el && !!cs && cs.display !== 'none'
+                             && !!box && box.height > 0,
+                    inBlock: !!(blk && el && blk.contains(el)),
+                    belowGroup: !!(box && gbox && box.top >= gbox.bottom - 1),
+                    hint: hint ? (hint.textContent || '').trim() : '',
+                };
+            }""")
+        check("有完成信息那一行（#asr-tr-info）", info["exists"])
+        check("识别跑完后那一行**有内容**", bool(info["text"]),
+              f"实际 = {info['text']!r}")
+        check("内容是「识别完成（…）」", info["text"].startswith("识别完成（"),
+              f"实际 = {info['text']!r}")
+        check("内容里带**耗时**", " s" in info["text"], f"实际 = {info['text']!r}")
+        check("内容里带**语种**", "语种" in info["text"],
+              f"实际 = {info['text']!r}")
+        check("那一行在「实时翻译」块里", info["inBlock"])
+        check("那一行在**按钮组下方**", info["belowGroup"])
+        check("那一行**可见**", info["visible"])
+        # ⚠️ **全局提示行不再拖这条详情** —— 它是「识别中…」「已停止」「出错」
+        #    那种临时提示 ⇒ 详情搬走后它只留一句短的「识别完成」。
+        check("全局提示行**不再**写那条详情（只剩短状态）",
+              "识别完成（" not in info["hint"] and "语种" not in info["hint"],
+              f"实际 = {info['hint']!r}")
+        print("    完成信息:", info["text"])
+
         # --- 5. 「清空」⇒ 结果框空了 ---
         page.locator("#asr-reset-btn").click()
         page.wait_for_timeout(2500)
@@ -336,6 +389,8 @@ def main() -> int:
                          ?.textContent || '').trim(),
                     hint: (document.getElementById('asr-hint')
                            ?.textContent || '').trim(),
+                    info: (document.getElementById('asr-tr-info')
+                           ?.textContent || '').trim(),
                     resetDisabled: btn ? btn.disabled : null,
                 };
             }""")
@@ -359,6 +414,10 @@ def main() -> int:
         check("「清空」后「清空」按钮**变灰**（没东西可清了）",
               cleared_state["resetDisabled"] is True,
               f"disabled={cleared_state['resetDisabled']}")
+        # ⚠️ **完成信息也清掉** —— 它讲的是「上一次识别」⇒ 结果都清了 ⇒
+        #    那一行不该留着（「已清空」由按钮右边的状态位说）。
+        check("「清空」后完成信息也清掉了",
+              cleared_state["info"] == "", f"实际 = {cleared_state['info']!r}")
 
         check("没有 JS 错误", not errors, f"errors={errors[:4]}")
         browser.close()
