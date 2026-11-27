@@ -28,7 +28,7 @@
   2. **行为正确**：用真实的 ``FrameJudge`` 跑一轮"多路轮转"模拟，
      断言 every_n=30 时兜底恒成立（门失效）、every_n=600 时门真的挡得住。
 
-卡片源码现在在插件包里（``.venv/src/wdnapps-video-analyzer/``），脚本通过
+卡片源码现在在插件包里（``.venv/src/wdnapps_video_analyzer/``），脚本通过
 ``scripts/card_dirs.py`` 定位卡目录，**不硬编码** ``app/apps/<id>/``。
 
 用法::

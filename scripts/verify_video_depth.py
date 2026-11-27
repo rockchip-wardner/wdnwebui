@@ -87,7 +87,7 @@ def check(cond: bool, msg: str, detail: str = "") -> bool:
 # --------------------------------------------------------------------------- #
 # 工具                                                                       #
 # --------------------------------------------------------------------------- #
-PLUGIN_PKG = Path(".venv/src/wdnapps-video-analyzer/src/wdnapps_video_analyzer")
+PLUGIN_PKG = Path(".venv/src/wdnapps_video_analyzer/src/wdnapps_video_analyzer")
 CARD_DIR = PLUGIN_PKG / "cards" / "video_depth"
 WDNAI_DEPTH_SRC = (Path(".venv/src/wdnai/src/wdnai/backends/depth_anything.py"))
 

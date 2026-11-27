@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Update the wdnav / wdnai / wdndds / wdnhid SDKs and the four application
+# Update the wdnav / wdnai / wdndds / wdnhid SDKs and the five application
 # plugin packages wdnapps_video_analyzer / wdnapps_hdmi_processor /
-# wdnapps_audio_chat / wdnapps_media_generator, all installed in editable
-# mode under .venv/src
+# wdnapps_audio_chat / wdnapps_media_generator / wdnapps_class_analyzer,
+# all installed in editable mode under .venv/src
 # Usage: ./update_rkwhl.sh
 #
 # The flow per package (since v1.3):
@@ -221,7 +221,7 @@ verify_outputs() {
             # enough to guarantee that this package works.
             return 0
             ;;
-        wdnapps_video_analyzer|wdnapps_hdmi_processor|wdnapps_audio_chat|wdnapps_media_generator)
+        wdnapps_video_analyzer|wdnapps_hdmi_processor|wdnapps_audio_chat|wdnapps_media_generator|wdnapps_class_analyzer)
             # The application plugin packages are pure Python as well, so
             # they have no .so either; but what they need verified matters
             # more — whether the cards really registered (see the notes of
@@ -412,15 +412,35 @@ update_pkg() {
     # usually succeeds on a retry, the latter never does. `--ff-only`
     # guarantees that a failed attempt leaves the **working tree
     # untouched**, so retrying is safe.
+    # Resolve the remote and branch explicitly. `git pull` without arguments
+    # needs an upstream, which a checkout created with `git init` + `git
+    # remote add` (or one whose upstream was unset) does not have — that
+    # fails with "There is no tracking information for the current branch"
+    # and the package is skipped on every run. Prefer origin, fall back to
+    # the first configured remote (wdnhid once used `rk`); the branch is
+    # whatever HEAD points at.
+    local remote branch
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD)
+    remote=""
+    if git -C "$dir" remote | grep -qx origin; then
+        remote="origin"
+    else
+        remote=$(git -C "$dir" remote | head -1)
+    fi
+    if [ -z "$remote" ] || [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+        echo "WARN: [$pkg] cannot resolve remote/branch (remote='$remote' branch='$branch'), skipping" >&2
+        return 1
+    fi
+
     local _pull_ok=0 _try=1
     while [ "$_try" -le "${UPDATE_RKWHL_PULL_RETRY:-5}" ]; do
         # lowSpeedLimit/lowSpeedTime: git has **no** connect timeout by
         # default, so a TCP-level failure takes 135s to surface (observed:
-        # "Failed to connect ... after 135137 ms"). Pulling 8 packages one
+        # "Failed to connect ... after 135137 ms"). Pulling every package one
         # by one, a single hiccup can cost a quarter of an hour. Cap it at
         # 30s.
         if git -C "$dir" -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30 \
-            pull --ff-only; then
+            pull --ff-only "$remote" "$branch"; then
             _pull_ok=1
             break
         fi
@@ -546,10 +566,11 @@ run_pkg wdnhid "$WARDNER_PKG_BASE/wdnhid.git#egg=wdnhid"
 # in the log from pointing at "an SDK that is not installed yet" — a false
 # lead.
 #
-# **The package name must use underscores** (= the directory name = the
-# dist-info / .pth name pip writes to disk). The canonical name of pip is
-# the hyphenated wdnapps-video-analyzer, but what actually lands in
-# site-packages is wdnapps_video_analyzer-0.1.0.dist-info and
+# **The package name must use underscores** (= the checkout directory name =
+# the dist-info / .pth name pip writes to disk). The canonical pip name is
+# the hyphenated wdnapps-video-analyzer, but the checkout under .venv/src is
+# wdnapps_video_analyzer and what lands in site-packages is
+# wdnapps_video_analyzer-0.1.0.dist-info and
 # __editable__.wdnapps_video_analyzer-0.1.0.pth. purge_install_traces globs
 # all of these with $pkg — passing the hyphenated name makes the cleanup
 # silently miss, old .pth files pile up, and that is exactly the "physical
@@ -562,6 +583,10 @@ run_pkg wdnapps_audio_chat "$WARDNER_PKG_BASE/wdnapps_audio_chat.git#egg=wdnapps
 # Qwen-Image-2.1). Its cards run on the image capability of wdnai, so it
 # comes after wdnai as well.
 run_pkg wdnapps_media_generator "$WARDNER_PKG_BASE/wdnapps_media_generator.git#egg=wdnapps_media_generator"
+# The classroom-analysis plugin package (teacher / student behaviour
+# statistics). It consumes the vision-embedding capability of wdnai, so it
+# comes after wdnai as well.
+run_pkg wdnapps_class_analyzer "$WARDNER_PKG_BASE/wdnapps_class_analyzer.git#egg=wdnapps_class_analyzer"
 
 # The dependency audit runs **after every package has been processed**:
 # only then is the state of the venv the final state (the packages before
@@ -573,7 +598,7 @@ DEPS_AUDIT_OK=1
 audit_sdk_deps || DEPS_AUDIT_OK=0
 
 if [ ${#FAILED_PKGS[@]} -eq 0 ] && [ "$DEPS_AUDIT_OK" = "1" ]; then
-    echo "Update complete (wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor / wdnapps_audio_chat / wdnapps_media_generator all succeeded)."
+    echo "Update complete (wdnav / wdnai / wdndds / wdnhid / wdnapps_video_analyzer / wdnapps_hdmi_processor / wdnapps_audio_chat / wdnapps_media_generator / wdnapps_class_analyzer all succeeded)."
     exit 0
 fi
 

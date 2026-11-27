@@ -2904,6 +2904,7 @@ app/apps/<card_id>/
 | `video-detection` | `swcap_vision_chat` + `swcap_audio_chat`（两个模型） | `wdnapps_video_analyzer.cards.video_detection` | `wdnapps_video_analyzer` |
 | `video-target-detection` | `swcap_vision_chat` | `wdnapps_video_analyzer.cards.video_target_detection` (TargetDoc) | `wdnapps_video_analyzer` |
 | `video-target-localization` | `swcap_vision_grounding` | `wdnapps_video_analyzer.cards.video_target_localization` (LocatorDoc) | `wdnapps_video_analyzer` |
+| `class-analyzer` | `swcap_vision_embedding` | `wdnapps_class_analyzer.cards.class_analyzer` | `wdnapps_class_analyzer` |
 | `usb-hid` | `swcap_vision_chat` + `swcap_tool_call`（**同组 → 同一模型**） | `wdnapps_hdmi_processor.cards.usb_hid`（手动透传 + AI 任务循环 `agent.py`） | `wdnapps_hdmi_processor` |
 
 ### 能力词表由 wdnai 定义，不许自造
@@ -4109,7 +4110,7 @@ fallback)一并改成 600。
 > 「多路轮转」模拟(每轮之间解 47 帧),every_n=30 时兜底恒成立(20/20 轮
 > 全放行 = gscore 门被架空),every_n=600 时门只放行 2/20 轮。
 >
-> 卡片源码现在在插件包里(`.venv/src/wdnapps-video-analyzer/`),**改卡片的
+> 卡片源码现在在插件包里(`.venv/src/wdnapps_video_analyzer/`),**改卡片的
 > `wizard.json` 不在本仓库** —— 用 `scripts/card_dirs.py` 查源目录。
 
 三条**实测踩出来的**规矩，改这块时务必先读:
@@ -6587,8 +6588,9 @@ advance. For one-off sync of a single SDK, `pip install -e
 fresh host, `bootstrap_wdndds_native.sh` is still required for apt
 deps + native lib vendoring.
 
-`update_rkwhl.sh` 同样驱动三个**卡片插件包**（`wdnapps_video_analyzer` /
-`wdnapps_hdmi_processor` / `wdnapps_audio_chat`），但它们是 pure-Python、没有 `.so` 可断言，改由
+`update_rkwhl.sh` 同样驱动五个**卡片插件包**（`wdnapps_video_analyzer` /
+`wdnapps_hdmi_processor` / `wdnapps_audio_chat` / `wdnapps_media_generator` /
+`wdnapps_class_analyzer`），但它们是 pure-Python、没有 `.so` 可断言，改由
 `verify_plugin_cards` → `scripts/check_plugin_entrypoints.py` 校验
 「entry point 能解析 → manifest `"id"` 与 entry point 名逐字相同 → 卡片
 目录有 `static/`」。这组断言挡的是另一个静默失败：entry point 名照着包目录
@@ -6596,31 +6598,33 @@ deps + native lib vendoring.
 跳过。
 
 > 包名一律传**下划线**（`wdnapps_video_analyzer`）。pip 规范名是连字符的
-> `wdnapps-video-analyzer`，但 site-packages 上实际生成的是
+> `wdnapps-video-analyzer`，但 **checkout 目录**（`.venv/src/wdnapps_video_analyzer`）、
 > `wdnapps_video_analyzer-0.1.0.dist-info` 和
-> `__editable__.wdnapps_video_analyzer-0.1.0.pth`——实测传连字符名时
+> `__editable__.wdnapps_video_analyzer-0.1.0.pth` 都是下划线——实测传连字符名时
 > `purge_install_traces` 的 glob **一个都命中不到**。
 
 ## `vrepo` —— 工作区多仓库统筹（对标 Android `repo`）
 
-工作区里其实有 **8 个独立 git 仓库**（不是一个 submodule 树）：
+工作区里其实有 **10 个独立 git 仓库**（不是一个 submodule 树）：
 
 | 仓库 | 路径 | 远端 | 说明 |
 |---|---|---|---|
 | wdnwebui | `.` | `origin` | 本仓（.venv/ 已被 .gitignore 排除） |
 | wdnai | `.venv/src/wdnai` | `origin` | editable 安装，VLM/LLM SDK |
 | wdnapps_audio_chat | `.venv/src/wdnapps_audio_chat` | `origin` | editable 安装，音频卡片插件（语音生成 + 流式语音识别） |
+| wdnapps_class_analyzer | `.venv/src/wdnapps_class_analyzer` | `origin` | editable 安装，课堂分析卡片插件 |
 | wdnapps_hdmi_processor | `.venv/src/wdnapps_hdmi_processor` | `origin` | editable 安装，HDMI 卡片插件 |
+| wdnapps_media_generator | `.venv/src/wdnapps_media_generator` | `origin` | editable 安装，媒体生成卡片插件（文生图 / 图生图） |
 | wdnapps_video_analyzer | `.venv/src/wdnapps_video_analyzer` | `origin` | editable 安装，视频卡片插件 |
 | wdnav | `.venv/src/wdnav` | `origin` | editable 安装，MPP/RGA/V4L2 |
 | wdndds | `.venv/src/wdndds` | `origin` | editable 安装，DDS/RPC |
 | wdnhid | `.venv/src/wdnhid` | **`rk`** | editable 安装，USB Gadget HID |
 
-根目录的 `vrepo`（纯标准库、单文件、可执行）把这 8 个仓当**一个 manifest**
+根目录的 `vrepo`（纯标准库、单文件、可执行）把这 10 个仓当**一个 manifest**
 统筹，避免「逐个 cd 进去手工来一遍」：
 
 ```bash
-./vrepo status            # 一屏看清 8 个仓的状态（最常用）
+./vrepo status            # 一屏看清 10 个仓的状态（最常用）
 ./vrepo status --fetch    # 先刷新远端跟踪引用再看
 ./vrepo sync -j 4         # 并行 fetch + ff-only 前进
 ./vrepo sync --reinstall  # 顺带重装 HEAD 变动 / 版本漂移的 editable 包
@@ -13294,7 +13298,7 @@ transport 时，ASGI 层收不到 `websocket.disconnect`** —— 那个事件�
 **客户端**断开时才有 ⇒ handler 根本不知道 socket 没了 ⇒ 永远不退出。
 
 > 同类问题在插件卡 `audio_analysis`
-> （`.venv/src/wdnapps-video-analyzer/.../audio_analysis/api.py:123`，
+> （`.venv/src/wdnapps_video_analyzer/.../audio_analysis/api.py:123`，
 > 卡在 `await queue.get()`）—— **外部仓库**，本仓改不了，只能靠 uvicorn
 > 的优雅超时兜底。
 
@@ -13565,7 +13569,7 @@ git）再重启：
 ## Qwen3-ASR 卡迁到 `wdnapps_audio_chat` 插件包（v0.44）
 
 「流式语音识别」卡（`qwen3-asr`）从宿主 `app/apps/qwen3_asr/` 迁到插件包
-`.venv/src/wdnapps-audio-chat/src/wdnapps_audio_chat/cards/qwen3_asr/` ——
+`.venv/src/wdnapps_audio_chat/src/wdnapps_audio_chat/cards/qwen3_asr/` ——
 与 `tts` 卡同仓。宿主 `app/apps/` 现在只剩 `text_chat` 一张内置卡。
 
 > 迁移动机与 `tts`（commit `95fce52`）完全一致：**卡片是可独立分发的
@@ -13595,7 +13599,7 @@ git）再重启：
 
 搬进插件后，向上寻址的**命中结果取决于插件装在哪儿**：
 
-* editable 装在 `.venv/src/wdnapps-audio-chat/`（本机现状）⇒ 向上走
+* editable 装在 `.venv/src/wdnapps_audio_chat/`（本机现状）⇒ 向上走
   恰好能摸到 `/userdata/wdnwebui/tools/asr_mic_agent.py` ⇒ **碰巧能用**；
 * 真 wheel 装进 site-packages ⇒ 向上走摸不到宿主 ⇒ **板载麦克风静默失效**。
 
@@ -13624,7 +13628,7 @@ for parent in Path(core_file).resolve().parents:
 是**装的时候**生成的。
 
 ```bash
-.venv/bin/pip install -e .venv/src/wdnapps-audio-chat --no-deps --no-build-isolation
+.venv/bin/pip install -e .venv/src/wdnapps_audio_chat --no-deps --no-build-isolation
 ```
 
 不重装 ⇒ 宿主扫不到这张卡 ⇒ **`/health` 里没有 `qwen3-asr`，应用网格里也没有**，
@@ -13917,7 +13921,7 @@ python3 scripts/verify_log_guardian.py      # 27 条断言
 
 用户报：「ASR+翻译后，TTS 播放**滞后非常多**」。完整分析见
 `docs/SIMULTANEOUS_INTERPRETATION_IMPL.md` 的 **M29** 一节；卡片侧的实现细节
-见 `.venv/src/wdnapps-audio-chat/AGENTS.md`。这里只留**最容易踩的三条**：
+见 `.venv/src/wdnapps_audio_chat/AGENTS.md`。这里只留**最容易踩的三条**：
 
 ### ① 滞后只有一种口径能下结论：**可听滞后**
 

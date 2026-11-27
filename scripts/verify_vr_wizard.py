@@ -35,7 +35,7 @@ def pick_video() -> str:
         if c and Path(c).is_file():
             return c
     # 兜底：卡片自带的演示素材
-    fallback = (REPO / ".venv/src/wdnapps-video-analyzer/src/wdnapps_video_analyzer"
+    fallback = (REPO / ".venv/src/wdnapps_video_analyzer/src/wdnapps_video_analyzer"
                 / "cards/video_retrieval/static/preview.mp4")
     if fallback.is_file():
         return str(fallback)
