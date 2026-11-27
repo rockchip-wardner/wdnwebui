@@ -33,11 +33,16 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 
 ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
-REPO = "wardner/Intern_Decision-4B"
-SRC = os.path.expanduser("~/models/Intern_Decision-4B")
+#: 仓库与本地目录。默认是 Intern_Decision-4B；**可用环境变量覆盖**去校验别的
+#: 部署包（例：``HF_VERIFY_REPO=wardner/Lite-Avatar
+#: HF_VERIFY_SRC=~/models/Lite-Avatar``）。
+REPO = os.environ.get("HF_VERIFY_REPO", "wardner/Intern_Decision-4B")
+SRC = os.path.expanduser(os.environ.get("HF_VERIFY_SRC",
+                                        "~/models/Intern_Decision-4B"))
 TOKEN_FILE = os.path.expanduser("~/.cache/huggingface/token")
 #: 下载落地的根目录。⚠️ **别用 /tmp** —— 本机 /tmp 是 tmpfs，只有 3.1 GB，
 #: 下 2 GB 的 .weight 会直接 "No space left on device"。/home 在 nvme 上。
@@ -89,6 +94,11 @@ def main() -> int:
     os.environ["HF_ENDPOINT"] = ENDPOINT
     from huggingface_hub import HfApi, hf_hub_download
 
+    # 并发数：SNI 代理是**每连接一线程**（`threading.Thread(target=proxy.handle…)`）
+    # ⇒ 支持并发。串行时每个文件 ~3.5 s（延迟主导），几千个文件要几小时；
+    # 并发 12 把它压到十几分钟。走 xet 下载时数据面是直连 cas-server，
+    # 不受代理的连接数限制。
+    workers = int(os.environ.get("HF_VERIFY_WORKERS", "12"))
     token = open(TOKEN_FILE, encoding="utf-8").read().strip()
     api = HfApi(token=token)
     setup_backend()
@@ -98,32 +108,42 @@ def main() -> int:
     os.makedirs(DL_ROOT, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="hfverify-", dir=DL_ROOT)
     bad, checked = [], 0
-    try:
-        for rel in sorted(remote):
-            local = os.path.join(SRC, rel)
-            if not os.path.isfile(local):
-                print("  %-48s ⚠️ 本地没有这个文件（跳过）" % rel)
-                continue
-            t0 = time.perf_counter()
-            try:
-                got = retry(
-                    lambda r=rel: hf_hub_download(
-                        REPO, r, token=token,
-                        local_dir=os.path.join(tmp, "dl")),
-                    "下载 %s" % rel)
-            except Exception as exc:  # noqa: BLE001
-                print("  %-48s ❌ 下载失败: %s" % (rel, str(exc)[:120]))
+    lock = threading.Lock()
+
+    def check_one(rel: str) -> None:
+        nonlocal checked
+        local = os.path.join(SRC, rel)
+        if not os.path.isfile(local):
+            print("  %-48s ⚠️ 本地没有这个文件（跳过）" % rel, flush=True)
+            return
+        t0 = time.perf_counter()
+        try:
+            got = retry(
+                lambda r=rel: hf_hub_download(
+                    REPO, r, token=token,
+                    local_dir=os.path.join(tmp, "dl")),
+                "下载 %s" % rel)
+        except Exception as exc:  # noqa: BLE001
+            print("  %-48s ❌ 下载失败: %s" % (rel, str(exc)[:120]), flush=True)
+            with lock:
                 bad.append(rel)
-                continue
-            a, b = sha256(local), sha256(got)
+            return
+        a, b = sha256(local), sha256(got)
+        with lock:
             checked += 1
             if a == b:
                 print("  %-48s ✅ sha256 一致  %s  (%.1fs)"
-                      % (rel, a[:16], time.perf_counter() - t0))
+                      % (rel, a[:16], time.perf_counter() - t0), flush=True)
             else:
                 print("  %-48s ❌ sha256 不一致\n      本地 %s\n      远端 %s"
-                      % (rel, a, b))
+                      % (rel, a, b), flush=True)
                 bad.append(rel)
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(check_one, sorted(remote)))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
