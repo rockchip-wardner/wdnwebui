@@ -40,7 +40,7 @@ ls -la "$WHOLE"
 
 echo
 echo "════════ 3) end-to-end image generation (2 images) ════════"
-cd /home/rockchip/wdnwebui || exit 1
+cd /home/rockchip/.wardner/wdnwebui || exit 1
 timeout 1200 .venv/bin/python /tmp/e2e_qwenimage21.py "a red apple on a wooden table" 8 \
   2>&1 | tee "/tmp/e2e_${TAG}.log" | tail -n 45
 

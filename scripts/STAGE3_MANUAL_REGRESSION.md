@@ -8,7 +8,7 @@ Stage 3 把 worker 的推理链路整体换成了
 跑之前：
 
 ```bash
-cd /home/rockchip/wdnwebui
+cd /home/rockchip/.wardner/wdnwebui
 pkill -9 -f compute_worker            # 清掉打补丁前代码的孤儿 worker
 .venv/bin/python run.py               # uvicorn 会自己 spawn 新 worker
 ```
