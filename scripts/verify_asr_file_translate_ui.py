@@ -309,10 +309,10 @@ def main() -> int:
         check("页面上**没有**「点击「开始识别」重新跑一遍。」",
               "重新跑一遍" not in hint_now, f"实际 = {hint_now!r}")
 
-        # --- 5d. 识别的**完成信息**在「实时翻译」块里（2026-11-27 用户要求）---
-        # ⚠️ **原来它在页面最底下的全局提示行**（``#asr-hint``，「显示模式」
-        #    上一行）⇒ 用户提出来：离「开始识别 / 停止 / 清空」按钮太远
-        #    （按钮在「实时翻译」块里，提示却掉到卡片底部）⇒ **搬进这一块**。
+        # --- 5d. 识别的**完成信息**在「显示模式」的上一行（2026-11-27 用户要求）---
+        # ⚠️ **两个块里都不显示**这些信息 ⇒ **统一**显示在「显示模式」上一行
+        #    （那条**全卡共用**的提示行 ``#asr-hint``）⇒ 「识别完成（…）」与
+        #    「配音完成（…）」**共用**它 ⇒ **哪个后做就覆盖前面的**。
         #
         # ⚠️⚠️ **必须等「识别完成」那一帧到**（实测踩到）—— 译文是**边识别
         #    边出**的 ⇒ 译文先到、收尾帧（``done``）后到（实测 2.0 s vs
@@ -320,49 +320,112 @@ def main() -> int:
         t1 = time.time()
         while time.time() - t1 < 120:
             got = page.evaluate(
-                """() => (document.getElementById('asr-tr-info')
+                """() => (document.getElementById('asr-hint')
                         ?.textContent || '').trim()""")
-            if got:
+            if got.startswith("识别完成"):
                 break
             page.wait_for_timeout(500)
         info = page.evaluate(
             """() => {
-                const el = document.getElementById('asr-tr-info');
-                const blk = document.getElementById('asr-tr-block');
-                const grp = document.querySelector('#asr-tr-block .asr-tr-run');
                 const hint = document.getElementById('asr-hint');
+                const blk = document.getElementById('asr-tr-block');
+                const mode = document.getElementById('asr-mode');
                 const r = (e) => (e ? e.getBoundingClientRect() : null);
-                const box = r(el), gbox = r(grp);
-                const cs = el ? getComputedStyle(el) : null;
+                const hbox = r(hint), mbox = r(mode);
+                const cs = hint ? getComputedStyle(hint) : null;
                 return {
-                    exists: !!el,
-                    text: el ? (el.textContent || '').trim() : '',
-                    visible: !!el && !!cs && cs.display !== 'none'
-                             && !!box && box.height > 0,
-                    inBlock: !!(blk && el && blk.contains(el)),
-                    belowGroup: !!(box && gbox && box.top >= gbox.bottom - 1),
-                    hint: hint ? (hint.textContent || '').trim() : '',
+                    text: hint ? (hint.textContent || '').trim() : '',
+                    visible: !!hint && !!cs && cs.display !== 'none'
+                             && !!hbox && hbox.height > 0,
+                    // ⚠️ **提示行在「显示模式」的上一行**（几何位置）
+                    aboveMode: !!(hbox && mbox && hbox.bottom <= mbox.top + 1),
+                    inBlock: !!(blk && hint && blk.contains(hint)),
+                    // ⚠️ **「实时翻译」块里不再有完成信息那一行**
+                    blockHasInfo: !!document.getElementById('asr-tr-info'),
+                    blkText: blk ? (blk.textContent || '').trim() : '',
                 };
             }""")
-        check("有完成信息那一行（#asr-tr-info）", info["exists"])
-        check("识别跑完后那一行**有内容**", bool(info["text"]),
+        check("识别跑完后提示行**有内容**", bool(info["text"]),
               f"实际 = {info['text']!r}")
         check("内容是「识别完成（…）」", info["text"].startswith("识别完成（"),
               f"实际 = {info['text']!r}")
         check("内容里带**耗时**", " s" in info["text"], f"实际 = {info['text']!r}")
         check("内容里带**语种**", "语种" in info["text"],
               f"实际 = {info['text']!r}")
-        check("那一行在「实时翻译」块里", info["inBlock"])
-        check("那一行在**按钮组下方**", info["belowGroup"])
+        check("那一行**在「显示模式」的上一行**", info["aboveMode"])
         check("那一行**可见**", info["visible"])
-        # ⚠️ **全局提示行不再拖这条详情** —— 它是「识别中…」「已停止」「出错」
-        #    那种临时提示 ⇒ 详情搬走后它只留一句短的「识别完成」。
-        check("全局提示行**不再**写那条详情（只剩短状态）",
-              "识别完成（" not in info["hint"] and "语种" not in info["hint"],
-              f"实际 = {info['hint']!r}")
+        # ⚠️ **两个块里都不显示**这些信息（用户要求）
+        check("「实时翻译」块里**没有**完成信息那一行了",
+              not info["blockHasInfo"])
+        check("「实时翻译」块里**不含**「识别完成」这几个字",
+              "识别完成" not in info["blkText"],
+              f"实际 = {info['blkText'][:120]!r}")
         print("    完成信息:", info["text"])
 
+        # --- 5e. 「实时结果」**别无限加行**（2026-11-27 用户要求）---
+        # ⚠️ 一段长音频几百上千句 ⇒ 结果框越撑越高 ⇒ 页面被顶得很长 ⇒
+        #    ⇒ **固定上限 + 框内滚动条**（与「识别过程」的 ``.asr-rounds``
+        #    同一口径）。
+        scroll = page.evaluate(
+            """() => {
+                const el = document.getElementById('asr-sentences');
+                const cs = el ? getComputedStyle(el) : null;
+                const live = document.getElementById('asr-live');
+                const lcs = live ? getComputedStyle(live) : null;
+                return {
+                    exists: !!el,
+                    maxHeight: cs ? cs.maxHeight : '',
+                    overflowY: cs ? cs.overflowY : '',
+                    liveMaxHeight: lcs ? lcs.maxHeight : '',
+                };
+            }""")
+        check("「实时结果」的句子流有**高度上限**",
+              scroll["exists"] and scroll["maxHeight"] not in ("", "none"),
+              f"maxHeight={scroll['maxHeight']!r}")
+        check("超出部分在**框内滚动**（overflow-y: auto）",
+              scroll["overflowY"] == "auto",
+              f"overflowY={scroll['overflowY']!r}")
+
         # --- 5. 「清空」⇒ 结果框空了 ---
+        # ⚠️⚠️ **「清空」现在只有一个**，在「实时结果」旁边（2026-11-27 用户
+        #    要求：两个块里的「清空」全部去除 ⇒ 统一挪到「实时结果」旁边 ⇒
+        #    **一个按钮清所有结果**）。
+        clear_pos = page.evaluate(
+            """() => {
+                const btn = document.getElementById('asr-reset-btn');
+                const ctrl = document.querySelector('#asr-controls')
+                    || btn?.closest('.asr-controls');
+                const live = document.getElementById('asr-live');
+                const tr = document.getElementById('asr-tr-block');
+                const dub = document.getElementById('asr-dub-block');
+                const all = Array.from(document.querySelectorAll(
+                    '#page-qwen3-asr button')).filter((x) =>
+                        (x.textContent || '').trim() === '清空');
+                const r = (e) => (e ? e.getBoundingClientRect() : null);
+                const lb = r(live);
+                return {
+                    exists: !!btn,
+                    inControls: !!(btn && ctrl && ctrl.contains(btn)),
+                    nearLive: !!(btn && lb && r(btn).bottom <= lb.top + 200),
+                    trHasClear: !!(tr && tr.querySelector(
+                        'button[id="asr-reset-btn"]')),
+                    dubHasClear: !!(dub && dub.querySelector(
+                        'button[id="asr-dub-reset"]')),
+                    clearCount: all.length,
+                };
+            }""")
+        check("有统一的「清空」按钮（#asr-reset-btn）", clear_pos["exists"])
+        check("它在**「显示模式」那一行**（「实时结果」的正上方）",
+              clear_pos["inControls"] and clear_pos["nearLive"],
+              f"inControls={clear_pos['inControls']} "
+              f"nearLive={clear_pos['nearLive']}")
+        check("「实时翻译」块里**没有**「清空」按钮了",
+              not clear_pos["trHasClear"])
+        check("「配音导出」块里**没有**「清空」按钮了",
+              not clear_pos["dubHasClear"])
+        check("整张卡上**只有一个**「清空」按钮", clear_pos["clearCount"] == 1,
+              f"个数 = {clear_pos['clearCount']}")
+
         page.locator("#asr-reset-btn").click()
         page.wait_for_timeout(2500)
         rows2 = _sent_rows(page)
@@ -371,39 +434,23 @@ def main() -> int:
         check("「清空」后翻译面板的控制条还在",
               state3["visible"] and state3["noteVisible"], f"state={state3}")
 
-        # --- 5b. 「清空」⇒ 「实时翻译」的状态显示「已清空」（2026-11-27 用户要求）---
-        # ⚠️ **为什么要有这条** —— 清空之前这里写着「翻译模型就绪 · 实时翻译
-        #    已开启」⇒ 用户以为**还在译**（其实结果已经没了）⇒ 参照「配音
-        #    导出」的清空（它清完就把状态写成「已清空」）。
+        # --- 5b. 「清空」⇒ 提示行显示「已清空」（2026-11-27 用户要求）---
+        # ⚠️ **完成信息统一在那一行** ⇒ 清空后它被「已清空」接管（不该还留着
+        #    「识别完成（…）」）。
         cleared_state = page.evaluate(
             """() => {
-                const clear = document.getElementById('asr-tr-clear-status');
                 const btn = document.getElementById('asr-reset-btn');
                 const dub = document.getElementById('asr-dub-status');
                 const cls = (el) => el ? (el.className || '') : '';
                 return {
-                    clear: clear ? (clear.textContent || '').trim() : '',
-                    clearCls: cls(clear),
                     dubCls: cls(dub),
                     tr: (document.getElementById('asr-tr-status')
                          ?.textContent || '').trim(),
                     hint: (document.getElementById('asr-hint')
                            ?.textContent || '').trim(),
-                    info: (document.getElementById('asr-tr-info')
-                           ?.textContent || '').trim(),
                     resetDisabled: btn ? btn.disabled : null,
                 };
             }""")
-        # ⚠️ **「已清空」在「清空」按钮右边那个状态位里**（2026-11-27 用户
-        #    要求）⇒ 与「配音导出」的 ``#asr-dub-status`` **同位置同风格**。
-        check("「清空」后「清空」按钮右边的状态 = 「已清空」",
-              cleared_state["clear"] == "已清空",
-              f"实际 = {cleared_state['clear']!r}")
-        check("那个状态位的**样式**与「配音导出」的同一款（asr-live-status）",
-              "asr-live-status" in cleared_state["clearCls"]
-              and cleared_state["clearCls"] == cleared_state["dubCls"],
-              f"清空位={cleared_state['clearCls']!r} "
-              f"配音位={cleared_state['dubCls']!r}")
         check("「清空」后**模型状态**那行不被顶掉（还是模型的事）",
               "已清空" not in cleared_state["tr"],
               f"实际 = {cleared_state['tr']!r}")
@@ -414,10 +461,6 @@ def main() -> int:
         check("「清空」后「清空」按钮**变灰**（没东西可清了）",
               cleared_state["resetDisabled"] is True,
               f"disabled={cleared_state['resetDisabled']}")
-        # ⚠️ **完成信息也清掉** —— 它讲的是「上一次识别」⇒ 结果都清了 ⇒
-        #    那一行不该留着（「已清空」由按钮右边的状态位说）。
-        check("「清空」后完成信息也清掉了",
-              cleared_state["info"] == "", f"实际 = {cleared_state['info']!r}")
 
         check("没有 JS 错误", not errors, f"errors={errors[:4]}")
         browser.close()
