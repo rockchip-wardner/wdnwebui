@@ -14689,3 +14689,20 @@ _probe_instance` 照抄 worker 的 `info`）⇒ **不要**去动 `interp.py` 那
 
 ⇒ 修在插件仓（`dub.py::_wait_local_tts`），回归也在插件仓
 （`verify_dub_export.py` 的 **H 段**）。
+
+## ⚠️ 卡片模板是**服务端注入**的 ⇒ 改 `template.html` **不用重启**（2026-11-27）
+
+改 qwen3-asr 卡的按钮位置时顺带确认的：首页 HTML **每次请求现拼**
+（`app/main.py::index()` → `assemble_index_html`，响应头
+`Cache-Control: no-store, must-revalidate`）⇒ 改插件卡的 `template.html`
+**刷新页面就生效**，**不用** `systemctl restart`。
+
+⇒ 卡片资源（`app.js` / `app.css`）由 manifest 声明、带 `?v=<mtime>` 版本戳
+（`app/core/html_assembly.py::_card_asset_stamp`）⇒ 内容变 ⇒ URL 变 ⇒
+浏览器必然拉新 ⇒ 同样**不用重启**。
+
+⇒ **只有改后端 Python 才要重启**（systemd 单元不带 `--reload`）。
+
+⚠️ 顺带记一条：搬 DOM 时前端**一直按 id 取元素** ⇒ 位置无关 ⇒ JS 零改动、
+回归脚本里的 `page.click("#asr-start-btn")` 也不用动（但**别**改成按父节点
+查）。回归在插件仓（`verify_dub_ui.py` 的 **B5 段**）。
