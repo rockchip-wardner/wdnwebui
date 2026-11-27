@@ -102,13 +102,19 @@ def api(method: str, path: str, payload=None, timeout: int = 60):
         return r.status, {}
 
 
-def main() -> int:
-    print("\033[1m「翻译没开」⇒ 前端立刻停手（2026-11-26）\033[0m")
+def _run_checks() -> None:
+    """跑断言（**由 ``main`` 用 try/finally 包着** ⇒ 中途抛异常也会恢复开关）。"""
 
     # ---------------- 1. API 层：拒收响应带权威值 ----------------
     st, body = api("GET", "/api/qwen3-asr/translate/status")
-    if not body.get("enabled"):
+    if body.get("enabled"):
         # ⚠️ 翻译开着 ⇒ 先关掉（这个脚本要验证的是「关着」时的行为）。
+        #
+        # ⚠️⚠️ **条件曾经写反**（2026-11-26 实测踩坑）：原来写的是
+        # ``if not body.get("enabled")`` ⇒ **只在「已经关着」时才去关**
+        # ⇒ 翻译**开着**时压根没关 ⇒ 后面的「前置条件」「拒收返回 ok=false」
+        # 「拒收响应带权威 enabled」三条一起挂（实测第 2 轮 3/9 失败）。
+        # ⇒ 现在：开着就关；本来就关着 ⇒ 什么都不用做。
         api("POST", "/api/qwen3-asr/translate/settings", {"enabled": False})
         time.sleep(1.0)
     st, body = api("GET", "/api/qwen3-asr/translate/status")
@@ -218,6 +224,44 @@ def main() -> int:
               after.get("checked") is False, f"得到 {after}")
 
         browser.close()
+
+
+def _restore_translate() -> None:
+    """把翻译开关恢复原样（**必须无条件执行**）。"""
+
+    # ⚠️⚠️ **必须恢复**（2026-11-26 实测踩坑）—— 这个脚本把服务端的翻译
+    # 开关**关掉**来验证「关着时的行为」⇒ 如果**不恢复** ⇒
+    # **后面跑的任何脚本都继承「翻译是关的」这个状态** ⇒
+    #   * 连跑两轮时，第二轮的**前置状态**就变了 ⇒ 本脚本自己都挂
+    #     （实测第 2 轮 3/9 失败）；
+    #   * 别的脚本（``verify_asr_wizard_translate`` 等）会以为
+    #     「翻译模型没在跑」⇒ 去**停掉 / 重启模型** ⇒ **拖慢整轮**。
+    #
+    # ⚠️ **放在 ``finally`` 里**（2026-11-26 补）—— 之前它挂在 ``main``
+    #   的末尾 ⇒ 脚本**中途抛异常**（浏览器崩了 / 断言炸了）⇒ 恢复被跳过
+    #   ⇒ 翻译开关留在「关」的状态 ⇒ **污染后面的脚本**。
+    try:
+        api("POST", "/api/qwen3-asr/translate/settings",
+            {"enabled": bool(_ORIG_ENABLED)})
+        time.sleep(0.5)
+        _st, _body = api("GET", "/api/qwen3-asr/translate/status")
+        print("   翻译开关已恢复为 %r" % _body.get("enabled"))
+    except Exception as exc:  # noqa: BLE001
+        print("   ⚠️ 恢复翻译开关失败: %s" % exc)
+
+
+def main() -> int:
+    print("\033[1m「翻译没开」⇒ 前端立刻停手（2026-11-26）\033[0m")
+
+    # ⚠️ **先记下原值**（在关它**之前**）⇒ 收尾时恢复原样。
+    global _ORIG_ENABLED
+    st, body = api("GET", "/api/qwen3-asr/translate/status")
+    _ORIG_ENABLED = bool(body.get("enabled"))
+
+    try:
+        _run_checks()
+    finally:
+        _restore_translate()
 
     print("\n" + "=" * 62)
     if _FAIL:

@@ -160,6 +160,37 @@ def main() -> int:
     check("clear 后深度 = 0", q.snapshot()["depth"] == 0,
           f"得到 {q.snapshot()['depth']}")
 
+    # 5b. ⚠️ **clear ⇒ 「正在合成但还没出声」的那句要作废**（2026-11-26）——
+    #
+    # **为什么**：上一轮遗留的句子如果留着 ⇒ 它合成完之后**会新一轮里播出
+    # 来** ⇒ 用户听到**不相干的译文**；⇒ 它还会污染回归（一条 src=99.99
+    # 的遗留句 ⇒ 同步误差 ≈ −40 秒 ⇒ 断言直接挂）。
+    #
+    # ⚠️ **但「正在出声」的那句必须留着**（切音保护，2026-11-25）。
+    #
+    # ⚠️⚠️ **必须用独立的队列实例**（2026-11-26 实测踩坑）——
+    # * 在**共享实例**上直接设 ``_speaking`` / ``_playing`` ⇒ 消费线程随时
+    #   可能把它们改掉 ⇒ 断言变成 flake（而且它跟 ``clear()`` 抢的是
+    #   **非重入**的 ``Lock`` ⇒ 持锁调 ``clear()`` 会**死锁**）；
+    # * ⇒ 构造一个**自己的**队列 ⇒ 立刻 ``shutdown()``（它的两个线程就
+    #   退出了）⇒ **零竞争**、**零死锁**。
+    from wdnapps_audio_chat.cards.tts.queue import TTSJob as _TJ
+    from wdnapps_audio_chat.cards.tts.queue import TTSQueue as _TQ
+    _q2 = _TQ()
+    _q2.shutdown()          # ⇒ 两个 daemon 线程退出 ⇒ 没人会动下面的字段
+    speaking = _TJ(seq=901, text="正在出声的那句")
+    synthesizing = _TJ(seq=902, text="正在合成的那句")
+    with _q2._cond:
+        _q2._speaking = speaking
+        _q2._playing = synthesizing
+    _q2.clear()
+    check("clear ⇒ **正在合成的那句被作废**（不串到下一轮）",
+          getattr(synthesizing, "cancelled", False) is True,
+          f"cancelled={getattr(synthesizing, 'cancelled', None)}")
+    check("clear ⇒ **正在出声的那句保留**（不切音）",
+          getattr(speaking, "cancelled", False) is False,
+          f"cancelled={getattr(speaking, 'cancelled', None)}")
+
     # 6. 变速夹取
     check("tempo 9 夹到 1.15", q.set_tempo(9.0)["tempo"] == 1.15)
     # ⚠️ **下限是 0.9，不是 1.0**（实测 2026-11-23，M28）—— TTS 的可持续

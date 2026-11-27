@@ -309,6 +309,37 @@ def main() -> int:
                       f"（|err| ≤ {SYNC_TOL_SEC} s，{len(errs) - len(big)}/{len(errs)} 句）",
                       not big, f"超差的: {['%.2f' % e for e in big]}")
 
+            # ---------------- ⚠️⚠️ 变速 / 队列形态（2026-11-26 用户三连问）----
+            #
+            # ⚠️ **用户原话**：「TTS 播报明显比视频的实时语音字幕更慢」
+            # 「为什么变速一直是 0.90，是否是这个原因造成同传播放很慢」
+            # 「前后拖动进度条，TTS 后播报也跟不上字幕」。
+            #
+            # ⇒ 根因（实测）：① **变速被产能钉在 0.9**（本板可持续速率
+            #   ~0.78~0.89 ⇒ 阶梯最低档）⇒ 声音比字幕**慢 10%**；
+            #   ② **播放队列被整段素材灌爆**（depth=128 / merged=941 /
+            #   排队 8.3 小时音频）⇒ 合并出**几百秒**的大 blob。
+            #
+            # ⇒ 修法：预合成模式 ⇒ **变速固定 1.0**（播放头是主时钟）+
+            #   **播放队列只收播放头附近的那几句** + **后台预热走独立通道**
+            #   （只落缓存、不排队播放）。
+            _st, q2 = api("GET", "/api/tts/queue/status")
+            tempo = float(q2.get("tempo") or 0.0)
+            check(f"第 {rnd} 轮：预合成模式 ⇒ **变速 = 1.0**"
+                  f"（播放头是主时钟；产能限速只对实时流有意义）",
+                  abs(tempo - 1.0) < 1e-6,
+                  f"得到 tempo={tempo}（need={q2.get('need_tempo')} "
+                  f"sustain={q2.get('sustain_rate')}）")
+            check(f"第 {rnd} 轮：播放队列**没被合并**（merged 不增长）",
+                  int(q2.get("merged") or 0) == 0,
+                  f"得到 merged={q2.get('merged')}")
+            check(f"第 {rnd} 轮：播放队列**深度可控**（≤ 64，不是 128 满）",
+                  int(q2.get("depth") or 0) <= 64,
+                  f"得到 depth={q2.get('depth')}")
+            check(f"第 {rnd} 轮：后台预热**另走一条通道**（bg_depth 可见）",
+                  "bg_depth" in (q2 or {}),
+                  f"得到 bg_depth={(q2 or {}).get('bg_depth')}")
+
             # ---------------- 「同传结果」跟字幕节奏 + 底部只留一个列表 ----------
             # ⚠️ 2026-11-25 用户两条要求：
             #   ① 「同传结果」的显示节奏和字幕的节奏一致，显示当前正在播放的
@@ -361,9 +392,25 @@ def main() -> int:
             ph = float(ui.get("ph") or -1)
             cs = ui.get("curStart")
             ce = ui.get("curEnd")
-            check(f"第 {rnd} 轮：高亮的那句**包含播放头**（节奏 = 字幕的节奏）",
-                  cs is not None and cs >= 0 and ph >= cs
-                  and (ce is None or ce <= 0 or ph < ce),
+            # ⚠️⚠️ **容差 0.30 秒不是放水，是「同步粒度」**（2026-11-26 实测踩坑）——
+            #
+            # **为什么会有偏差**：前端的高亮是**播放头上报循环**里刷的
+            # （``_interpStartPlayhead`` ⇒ ``setInterval(..., 250)`` ⇒
+            # **4 Hz**）⇒ DOM 上的高亮最多落后 ``currentTime`` **250 毫秒**；
+            # 而断言里的 ``ph`` 是**同一刻**现读的 ``currentTime`` ⇒
+            # ⇒ 播放头**刚跨过句尾**的那一瞬间，高亮还停在上一句。
+            #
+            # ⚠️ **实测**：``ph=47.19`` 而高亮区间是 ``[35.064, 47.064]``
+            # ⇒ 差 **0.126 秒** ⇒ 正是「跨句尾 + 高亮还没刷新」。
+            #
+            # ⇒ 容差取 **0.30 秒**（= 250 ms 的循环周期 + 余量）⇒
+            # **远小于**同传的 3 秒同步容差 ⇒ 断言依然在验「节奏 = 字幕的节奏」。
+            tol = 0.30
+            check(f"第 {rnd} 轮：高亮的那句**包含播放头**（节奏 = 字幕的节奏，"
+                  f"容差 {tol}s = 前端 4Hz 同步粒度）",
+                  cs is not None and cs >= 0
+                  and ph >= (cs - tol)
+                  and (ce is None or ce <= 0 or ph < (ce + tol)),
                   f"ph={ph:.2f} 区间=[{cs},{ce}]")
             check(f"第 {rnd} 轮：当前句标着「正在播报」",
                   "正在播报" in (ui.get("curTag") or ""),
@@ -399,6 +446,23 @@ def main() -> int:
             check(f"第 {rnd} 轮：后跳后重新武装了句子（replayed 增长）",
                   int(after.get("replayed") or 0) > replayed1,
                   f"{replayed1} → {after.get('replayed')}")
+
+            # ---------------- 预合成（2026-11-26）----------------
+            #
+            # ⚠️ 用户要求：「ASR、翻译、TTS 可以**一直在后台处理**；
+            # **进度条来回拉的时候，播放也得跟上当前的字幕**」。
+            #
+            # ⇒ 文件 / 视频源 ⇒ **预合成模式**开着；
+            # ⇒ 合成好的音频**按媒体位置**进缓存 ⇒ 拖到哪都能**命中**。
+            check(f"第 {rnd} 轮：文件/视频源 ⇒ 预合成模式开着",
+                  bool(after.get("prefetch")), f"得到 {after.get('prefetch')!r}")
+            pf_entries = int(after.get("prefetch_entries") or 0)
+            check(f"第 {rnd} 轮：后台已经合成出音频并进了缓存",
+                  pf_entries >= 1, f"得到 {pf_entries} 段")
+            # ⚠️ **拖动之后 ⇒ 命中缓存**（这正是「拖动也能立刻跟上」的证据）。
+            pf_hits = int(after.get("prefetch_hits") or 0)
+            check(f"第 {rnd} 轮：拖动后**命中了预合成缓存**（不用重新合成）",
+                  pf_hits >= 1, f"命中 {pf_hits} 次")
 
             # ---------------- 刷新页面 ⇒ 前端要**接管**仍在跑的同传 ----------------
             if rnd == ROUNDS:

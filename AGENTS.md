@@ -143,6 +143,43 @@ commit 仍能按 SHA 访问）。
       cgroup 里的 `compute_worker` 一起 SIGTERM 掉 → 重启前确认
       `compute.autostart` 有值，否则重启后板子没有任何算力，得手工
       `POST /api/compute/instances` 把模型拉回来。
+    - ⚠️⚠️ **RK182X NPU 卡 PCIe 端点卡死 ⇒ 只能重启板子**（2026-11-26
+      实测踩坑，症状与恢复都写在这里）：
+      - **症状**：`qwen3-tts`（npu1）加载失败，报
+        ```
+        E NPUTransfer: ERROR: socket read fd = 45, n = -1: Resource temporarily unavailable
+        E RKNNAPI: rknn3_init, recv(MsgInitAck) fail, -9(ERROR_PIPE) != 256!
+        AssertionError: init text_projection runtime failed
+        ```
+        ⇒ 根因是 **`rknn3.service` 的 per-device 代理子进程卡死**。
+      - **试过但全都无效**（别再试）：重启 `wdnwebui.service`；
+        `kill` 掉代理子进程（**父进程不会拉起来** ⇒ npu1 代理直接没了，更糟）；
+        `echo 1 > /sys/kernel/debug/rknpu/reset`；PCIe **功能级复位**
+        （`/sys/bus/pci/devices/0003:31:00.0/reset` ⇒ **会挂住**，内核报
+        `pcie-rkep 0003:31:00.0: not ready 65535ms after bus reset; giving up`
+        ⇒ 设备节点彻底消失，`remove` + `rescan` 也不回来）；PCIe **端口级复位**
+        （`Permission denied`）。
+      - **唯一有效的恢复 = 整机重启**（`sudo systemctl reboot` ⇒ 等 1~2 分钟）：
+        ```bash
+        lspci | grep 182a                  # 两张卡都要在
+        ps -ef | grep rknn3_transfer_proxy # 三个子进程都要在
+        /usr/bin/rknn3_startup             # 必须 "N succeeded, 0 failed"
+        ```
+      - ⚠️ **重启 `rknn3.service` 之后必须等固件下载成功** ⇒ 否则
+        npu0 也会 `MODEL_SETUP fail` / `check ddr load addr request failed`。
+      - ⚠️ **这台板子就是跑 agent 的那台** ⇒ 重启会把 agent 会话（挂在
+        **ssh 会话**下，**不是** systemd ⇒ **不会自己回来**）一起干掉 ⇒
+        ⇒ 需要「重启后自动验证」就用
+        `scripts/wdnwebui-post-reboot-verify.service`（systemd oneshot）：
+        ```bash
+        sudo systemctl enable --now wdnwebui-post-reboot-verify.service
+        tail -f /userdata/wdnwebui/.post-reboot-verify.log
+        ```
+        ⚠️ **默认是 disabled**（每次开机都跑真 TTS + 真浏览器太重 ⇒ 还会
+        出声）⇒ **按需 enable** ⇒ 跑完记得 `sudo systemctl disable`。
+        ⚠️ 单元**必须以 `rockchip` 身份跑**（Playwright 的浏览器在
+        `/home/rockchip/.cache/ms-playwright` ⇒ 以 root 跑会报
+        `Executable doesn't exist at /root/.cache/ms-playwright/...`）。
     - **明文撞 HTTPS 端口现在会留明文日志**（`app/core/tls_logging.py`）：
       ```
       journalctl -u wdnwebui.service | grep '\[TLS\]'
@@ -14174,3 +14211,355 @@ IIFE**（`?v=<mtime>` 只在**新开页面**时才生效）。
 
 ⚠️ `verify_tr_stop_on_reject.py` **不占 NPU**（翻译全程关着 ⇒ 服务端拒收）
 ⚠️ 但它**真的数请求数** ⇒ 是「风暴」的唯一可信度量。
+
+---
+
+## ⚠️ 四种输入、**两套逻辑**（2026-11-26 用户第三批要求）
+
+用户要求：「音频文件」「含音轨的视频」与「板载麦克风」「浏览器麦克风」
+**分两种逻辑**。
+
+| 输入 | 逻辑 | 引擎源 | 播放时机 | TTS |
+|---|---|---|---|---|
+| 板载麦 / 浏览器麦 | **真同传** | `live` | `gate=now` | 说完一句即译即播 |
+| 音频文件 / 含音轨的视频 | **跟字幕播** | `file` / `video` | `gate=follow` | **后台预合成 + 按位置缓存** |
+
+### 逻辑一（麦克风）：**真同传**
+
+⇒ 麦克风**没有「字幕位置」** ⇒ 播放时机只能是 `now`（不等播放头）⇒
+译文**合成完就播** —— 这正是真人同传。
+
+⇒ 前端：**识别一开始就自动开同传**（`_autoStartInterpForMic`）⇒ 用户不用
+再点「开始同传」。
+
+⚠️ **麦克风下前端那套「按行要译文」是空转的**（`_trMode` 不是 `line`、
+`_sentences` 为空）⇒ 麦克风来源 ⇒ **前端不主动要**（字幕由服务端推）。
+
+⚠️ **实时流永远不开预合成**（队列侧 `_prefetch_mode`）⇒ FIFO 顺序就是
+语义 ⇒ 不能改成「按位置挑」。
+
+### 逻辑二（文件 / 视频）：**后台预合成 + 跟字幕播**
+
+⚠️ **核心是「预合成音频缓存」**（队列侧 `_AudioCache`）：
+
+* **键 = 媒体位置**（`stream_id@src_start_sec`）—— **不是句号**（句号在
+  重新武装时会变 ⇒ 缓存命中不了）；
+* 合成完**落盘 WAV** 进缓存 ⇒ 播放时**按位置直接取** ⇒ **拖到哪就立刻
+  播到哪**（不用等 ~3 s 首窗）；
+* **LRU 淘汰，不留「至少一条」底线** ⇒ 磁盘占用有**硬上限**（192 MB）。
+
+⚠️⚠️ **队满合并 ⇒ 必须丢弃缓存键**（队列侧 `submit_queued`）—— 合并出来
+的文本跟任何位置都**不对应** ⇒ 用它当键 ⇒ 以后命中会播出**错误内容**。
+
+⚠️⚠️ **预合成 ⇒ 播放必须「按位置挑」而不是 FIFO**（队列侧
+`_pick_by_position`）—— 否则「后面那句先合成完」会挡住队头 ⇒ 播放头此刻
+要的那句**被饿死**（这正是原来 45 秒提交窗口要解决的问题，但窗口的代价是
+「远处没法提前合成」⇒ 拖过去还是要等）。
+
+⚠️⚠️ **挑的时候不能 `break`** —— FIFO 里**不一定按位置排** ⇒ 必须继续
+往下扫（这个坑被新回归抓到过）。
+
+⚠️⚠️⚠️ **同位置必须取「第一个」候选（`>` 而不是 `>=`）**（2026-11-26 真机
+实测）—— 真实 FIFO 里**同一句的多个音频分片 + 结束标记（`chunk=None`）
+共享同一个 `src_start_sec`** ⇒ 用 `>=` ⇒ **最后一个**候选胜出 ⇒ **结束
+标记被第一个取走** ⇒
+
+* `_finish_job` 在**一个字都没播**时就结算 ⇒ `t_play = 0` ⇒ 面板/回归统计
+  的「出声句数」**严重偏少**（实测 45 秒只认出 1~2 句）；
+* 这一句的音频分片还留在 FIFO 里 ⇒ 后面**倒着播**（chunk N → … → 1）⇒
+  用户听到的是**反的**译文。
+
+⇒ 用 `>` ⇒ 同位置的**第一个**分片胜出 ⇒ FIFO 顺序保持 ⇒ **音频先播、
+结束标记最后**。回归见 `verify_two_input_modes.py` 的 C 组（负面对照：
+改回 `>=` ⇒ 立刻失败 2 条）。
+
+⚠️⚠️ **跨模块新增能力 ⇒ 必须有「模块级薄封装」**（队列侧 `queue.py`）——
+宿主桥 `app/core/audio/tts_bridge.py` 用 `getattr(队列模块, "xxx", None)`
+找函数 ⇒ 只有**实例方法**的话它拿到 `None` ⇒ **静默降级**（不报错、功能
+就是不生效）⇒ 插件自己的 `cards/tts/api.py` 直接 `q.xxx()` ⇒ **HTTP
+500**（实测 `AttributeError: module ... has no attribute 'cache_stats'`）。
+⇒ 一律按 `queue.py` 既有惯例（`snapshot()` / `clear()` / `set_tempo()`）提供
+**模块级**薄封装。
+
+⚠️⚠️ **缓存 PCM 的分片形状不一致**（队列侧 `_cache_store`）—— TTS 的首窗
+是 **1 维** `(N,)`、后续片是 **2 维** `(1, N)` ⇒ 直接 `np.concatenate` 报
+"all the input arrays must have same number of dimensions" ⇒ **缓存永远存不
+进去** ⇒ 拖动后命中不了 ⇒ 每片先 `reshape(-1)` 摊平再拼（播放端不受影响：
+`tobytes()` 对 1 维 / 2 维 `(1,N)` 结果一样）。
+
+⚠️ **预合成模式下队列满了 ⇒ 这一批放回待放行**（引擎侧
+`PREFETCH_QUEUE_SOFT_MAX` = 64）—— 不能让队列合并（会丢缓存键）⇒ 内容
+不丢（原则不变）。
+
+⚠️⚠️ **预合成模式 ⇒ 一句一个作业（不许合并）**（2026-11-26 真机实测）——
+M28 的「几句拼一段」在预合成模式下是错的：
+
+* **缓存按「位置」索引** ⇒ 合并出来的作业**不对应任何单一位置** ⇒ 缓存键
+  是错的 ⇒ 拖动后命中不了（甚至播错内容）；
+* **播放按「位置」放行** ⇒ 合并作业的位置取**第一句** ⇒ 后面那几句的译文
+  **提前播**（实测一批 3 句 ⇒ 后面两句提前 ~11 秒 ⇒ 正是用户说的「译文跟
+  不上当前字幕」）。
+
+⇒ 引擎侧 `batch = batch[:1]`；⇒ 且**不用攒批**（`_batch_ready` 直接放）。
+
+⚠️⚠️ **预合成模式 ⇒ 过期译文不占用合成线程**（引擎侧
+`PREFETCH_MAX_LAG_SEC` = 3 秒）—— 一轮同传**重新开始**时，第一句译文会
+晚 ~9 秒才交出来（实测：播放头已到 9.2 s，那句的位置却是 1.06 s ⇒ 已过期）
+⇒ 它一进队列就**占住串行合成线程 ~8 秒** ⇒ 紧接着那句（还新鲜、位置也对
+得上）要等它 ⇒ 实测第 2 句晚 **+3.6~3.7 秒**（超过 3 秒同步容差 ⇒ 回归挂）。
+
+⚠️ **实测对照**：关掉预合成跑同一支回归 ⇒ **同样 +3.63** ⇒ 这**不是**预
+合成带来的，是「重新武装的头几句」的固有现象。
+
+⇒ 位置落后播放头超过 3 秒 ⇒ **不提交**（译文已对不上当前字幕）⇒ **但内容
+不丢**（留在待放行里 ⇒ 源读完再补播）⇒ **全都过期 ⇒ 一句都不放**（放了
+又去堵线程）⇒ 计数在 `status().prefetch_stale_skipped`。
+
+### 回归
+
+```bash
+.venv/bin/python scripts/verify_two_input_modes.py   # 37 条 · 纯逻辑 · 不占 NPU
+```
+
+⚠️ 端到端断言在 `verify_interp_video_sync.py`（预合成开着 / 后台已合成 /
+**拖动后命中缓存**）⇒ 需要**真 NPU + 真浏览器**。
+
+## ⚠️ 回归脚本**自己**的三个坑（2026-11-26 第三批收尾实测）
+
+⚠️ **这一节全是「假失败」**：产品行为是对的，**回归**却报红 ⇒ 不查清楚就
+照着回归去改产品 ⇒ **会把对的代码改错**。
+
+### ① 退出条件不能只看**跨会话累计**的计数器
+
+`verify_interp_browser.py` 场景 2 的轮询循环原来是「`submitted` + `done`
+都涨了就 break」⇒ `done` 是 **TTS 队列的累计值**（跨会话不清零）⇒
+**上一场残留的作业**放完就让它涨 ⇒ 循环 **1~2 秒**就退了 ⇒ 读不到
+「播放头卡住」的 **3 秒判定窗口**（探针实测第 **6** 秒才 true）⇒
+**假失败**。
+
+⇒ **累计计数器当退出条件 ⇒ 必须确认它只涨这一场的东西**；⇒ 宁可把
+**判定信号本身**（`stalled_seen`）也放进退出条件。
+
+### ② 模块级 API ≠ 实例级属性
+
+`verify_tts_queue.py` 新加的 `clear()` 断言写了 `q._cond` ⇒ `q` 是
+**模块**（`cards/tts/queue.py`）⇒ 模块只有 `get_queue()` ⇒
+`AttributeError` ⇒ **脚本直接崩**（连汇总行都没有）。
+
+⇒ 要碰 `_jobs` / `_speaking` / `_playing` ⇒ **先 `get_queue()` 拿实例**；
+⇒ 且**不要持锁调 `clear()`**（`_cond` 用的是**非重入** `Lock` ⇒ 死锁）
+⇒ 用**独立队列实例** + 立刻 `shutdown()` ⇒ 零竞争。
+
+### ③ ⚠️ **抓不到 bug 的断言 = 假保险**
+
+本轮新加的「引擎不攒批压句（`pending` 峰值 ≤ 2）」**负面对照证明它抓不到**：
+把插件 `interp.py` 的 `self._prefetch` 改成 `False` 之后，`pending` 峰值
+**仍然是 ≤ 2**（旧的攒批路径有 `MERGE_MAX_HOLD_SEC` = 4 s 的兜底 ⇒ 攒不满
+也会放 ⇒ 压不住）。
+
+⇒ **每条新断言都要能指认「摘掉哪个修复 ⇒ 它会挂」** ⇒ 指不出来 ⇒ 换判据
+（⇒ 换成「**文件源 ⇒ 音频进了缓存 / 命中了缓存**」，直指「拖进度条能立刻
+跟上」这个能力）。
+
+### ④ 条件写反 ⇒ **三条一起挂**，而且**只在第 2 轮挂**
+
+`verify_tr_stop_on_reject.py` 的 `if not body.get("enabled")` ⇒ 只在
+「**已经关着**」时才去关 ⇒ 翻译**开着**时压根没关 ⇒ 第 1 轮（翻译恰好是
+关的）全绿、**第 2 轮**（翻译被别的脚本打开）3/9 失败。
+
+⇒ 「**关掉再验**」型脚本：① 关的条件要**写对**；② 恢复要放在 **`finally`**
+（中途抛异常 ⇒ 恢复被跳过 ⇒ 把状态留给后面的脚本 ⇒ **跨脚本污染**）。
+
+### ④ ⚠️ 断言要比「被测系统的采样粒度」宽 ⇒ 否则是**边界 flake**
+
+`verify_interp_video_sync.py` 的「高亮的那句**包含播放头**」原本是**严格
+包含**（`ph < ce`）⇒ 第 2 轮实测挂在 `ph=47.19` 而高亮区间是
+`[35.064, 47.064]` ⇒ 差 **0.126 秒**。
+
+⇒ **根因**：前端的高亮是**播放头上报循环**里刷的
+（`setInterval(..., 250)` ⇒ **4 Hz**）⇒ DOM 上的高亮最多落后
+`currentTime` **250 毫秒**；而断言里的 `ph` 是**同一刻**现读的
+`currentTime` ⇒ 播放头**刚跨过句尾**的那一瞬间，高亮还停在上一句。
+
+⇒ 容差改成 **0.30 秒**（= 循环周期 + 余量）⇒ 远小于同传的 3 秒同步容差
+⇒ 断言依然在验「节奏 = 字幕的节奏」。
+
+⇒ **教训**：断言测的是「你采样的那一刻恰好在不在边界上」⇒ **边界 flake**；
+⇒ 容差必须按**被测系统真实的采样粒度**来定。
+
+---
+
+## ⚠️ 回归/脚本自身的坑（续 · 2026-11-26 整机重启 + 开机自动验证）
+
+### ① ⚠️⚠️ **别在脚本运行期间改它**（本轮真踩）
+
+`bash /tmp/run_suite.sh` 跑到一半，我用 `edit` 改了 `run_suite.sh` 里一个
+模块名（`verify_lag_floor` → `verify_interp_lag_floor`）⇒ **bash 是边跑
+边从文件读字节的** ⇒ 文件长度一变 ⇒ **读取偏移错位** ⇒ 解析崩溃：
+
+```
+/tmp/run_suite.sh: 行 60: 未预期的记号 ";" 附近有语法错误
+/tmp/run_suite.sh: 行 60: `; done'
+```
+
+⇒ 表现为「前 11 个脚本跑完了，然后整个套件崩在收尾」⇒ **像是脚本挂了**，
+实际是**我把它改坏了**。
+
+⇒ **纪律**：**套件脚本跑起来就别碰它**；要改就**先停**、改完再跑。
+⇒ 套件脚本放 `/tmp` 有个副作用：`/tmp` **重启会清空** ⇒ 重启前建好、
+重启后重建（本次重建时就把模块名写对 ⇒ 又抓出一次「模块名不存在」：
+`No module named scripts.verify_lag_floor` ⇒ 真实名字是
+`verify_interp_lag_floor` ⇒ **脚本名要 `ls scripts/*.py` 核对，别凭记忆**）。
+
+### ② ⚠️ **哨兵值也要用「现在」**
+
+`cards/tts/queue.py` 的 `self._clock_stall_at = 0.0` ⇒
+`clock_stall_sec = time.time() - _clock_stall_at` ⇒ 在 `set_clock()` 之前
+报 **1 795 688 925.98 s**（≈ 从 1970 年算起的墙钟秒）⇒ 一眼看去像
+「时钟停滞了半个世纪」⇒ **本次差点误判成「时钟卡死」**（真实原因是
+npu1 PCIe 卡死）。
+
+⇒ **用 0 / -1 当「无」的时间戳，一旦被拿去减 ⇒ 出来的是天文数字而不是
+「无」** ⇒ 哨兵值用 `time.time()`。
+
+### ③ ⚠️ **两个「滞后」是不同口径**，报给用户前先分清
+
+| 字段 | 含义 | 真机实测 |
+|---|---|---|
+| `audible_lag_sec` | **译文出声时刻 − 源话开口时刻** = 用户真正感受的那一口 | **0.12 s** |
+| `lag_sec`（引擎，跟播模式） | 「源话比最后一句**已提交的**译文前进了多少」= **ASR 转写吞吐**落后于播放头 | 18.06 s |
+
+⇒ 用户说「TTS 比字幕慢」指的是**前者**（已从几十秒降到 0.12 s）；
+⇒ `lag_sec` 那 18 秒是 **ASR 单模型 batch=1 ≈ 0.6× 实时** ⇒
+**字幕本身**就比视频慢 ⇒ **是另一条链路的限制**，别混进「TTS 慢」里。
+
+### ④ 开机自动验证单元（`wdnwebui-post-reboot-verify.service`）自身的三坑
+
+1. **日志 rockchip 无写权限** —— 上一轮日志是 `root:root 644` ⇒ 脚本以
+   rockchip 身份跑时 `: > "$LOG"` **静默失败**（脚本没开 `set -e`）⇒ 新旧
+   日志混在一起。⇒ 单元加 `ExecStartPre=rm -f`（root 身份）⇒ 脚本再以
+   rockchip 自己创建。
+   ⚠️ **实测**：`rockchip` **能删** root 的文件 —— `/userdata/wdnwebui`
+   是 777 ⇒ 靠**目录**写权限，不是文件权限。
+2. **每行双写** —— 脚本 `tee -a "$LOG"` 与单元
+   `StandardOutput=append:<同一个文件>` **各写一遍** ⇒ 上一轮日志**每行
+   出现两次** ⇒ 看日志时每句话都得去重。⇒ 单元改 `StandardOutput=journal`，
+   日志由脚本独家写。
+3. **`python` 走管道是全缓冲** —— 整个脚本跑完才刷 ⇒ 中途日志**一行都
+   没有** ⇒ 看着像卡死（实测 `[2/2]` 之后空白两分钟，浏览器其实早已
+   启动）。⇒ 一律用 `python -u`。
+
+### ⑤ ⚠️ **判「单元还在跑」别用 `systemctl is-active --quiet`**
+
+`is-active --quiet` 对 **`activating`** 状态返回**非零** ⇒ 我据此以为
+单元结束了 ⇒ 实际它还在跑。⇒ 用
+`systemctl show -p ActiveState --value`（返回 `activating`/`active`/
+`inactive`）判断。
+
+### ⑥ npu1 卡死的**恢复流程**（本次实测补全）
+
+⇒ 整机重启**确实**有效（11:38 重启 ⇒ 11:39 三个模型全 running，TTS
+`spawned` 实例在 npu1 上正常）⇒ 与 `AGENTS.md` 既有记载一致。
+
+⇒ **单独重启实例无效**（本轮实测）：`POST /api/compute/restart
+{model:"qwen3-tts", npu_index:1}` 能换新 worker 并让会话**重新构建**
+（worker 日志重新打印 `building LLMSession`），但 npu1 **仍报同样的
+`init text_projection runtime failed`**。
+
+⇒ 开机自动验证要用 `sudo systemctl enable --now
+wdnwebui-post-reboot-verify.service`，**跑完记得
+`sudo systemctl disable`**（默认 disabled ⇒ 每次开机都跑真 TTS + 真
+浏览器太重 ⇒ 还会出声）。
+
+⇒ ⚠️ 单元**必须以 `rockchip` 身份跑**（Playwright 的浏览器在
+`/home/rockchip/.cache/ms-playwright` ⇒ 以 root 跑会报
+`Executable doesn't exist at /root/.cache/ms-playwright/...`）。
+
+### ⑦ ⚠️⚠️ **变速的「真实值」必须是队列的**（2026-11-26 真机抓出来的残留 bug）
+
+⚠️ **症状**：队列侧 `tempo=0.9`、引擎侧 `tempo=1.0` ⇒ **永久不同步**
+⇒ 预合成模式下**播放实际仍慢 10%** ⇒ 用户报的「变速一直是 0.90 /
+TTS 比字幕慢」**根本没被修掉**。
+
+⚠️ **为什么第一轮真机验证没抓到**：那次**队列刚起来** ⇒ `tempo` 恰好是
+初始值 1.0 ⇒ 断言过了 ⇒ **「碰巧过」不是「真的对」**。
+
+⚠️ **根因（三步，全实测确认）**：
+
+1. **跨脚本污染** —— `verify_interp_api.py` 把队列 tempo 设成 1.08
+   **且不恢复**（变速是**队列级全局状态**）；
+2. 某次「非预合成」期间，引擎按产能把队列压到 0.9（此时引擎计数器也
+   = 0.9，两者一致）；
+3. 切到预合成 ⇒ `want=1.0`，但**死区判定用的是引擎自己的计数器**
+   （已是 1.0）⇒ `up = 1.0 > 1.0+0.02` = **False** ⇒ **永远不推**
+   ⇒ 队列的 0.9 **再也纠正不回来**。
+
+⇒ 根源：**变速是「队列级状态」，引擎却是「单向推一次」** ⇒ 任何外部
+改动、或推送被静默吞掉的异常 ⇒ **永久不同步**。
+
+⇒ **两处修复**（插件仓）：
+
+* `interp.py::_refresh_status` ⇒ 死区判定的 `cur` 改读**队列真实值**
+  `st.get("tempo")`；推送失败时把**计数器还原** ⇒ ① 能发现并纠正不同步；
+  ② 推送失败 ⇒ 下一轮**自动再试** ⇒ **自愈**。
+* `cards/tts/queue.py` ⇒ `set_prefetch_mode(True)` **立刻**把 `_tempo`
+  拉回 1.0；`set_tempo()` 在预合成模式下**夹到 1.0** ⇒ 不变量**物理上
+  成立**，不依赖「引擎记得推」；外部 `POST /queue/tempo` 也改不动它。
+  ⚠️ **B 为什么必要**：引擎推送有**死区 + 最小间隔（8 s）** ⇒ 只靠 A，
+  从实时流切进预合成时**最多 8 秒**播放仍慢 10% ⇒ 用户能感知到。
+
+⇒ **脚本纪律**：任何**改动全局状态**的脚本都**必须恢复**（放 `finally`）。
+⚠️ 变速、翻译开关、active_app 都属于「全局状态」。
+
+⇒ **新断言（4 条）**：`verify_two_input_modes.py`（59 → **63**）
+—— 两条**行为**断言（真跑队列：进预合成立刻回 1.0 / 外部改不动）+ 两条
+源码断言（读真实值 / 失败还原）。⇒ **负面对照实测**：摘掉修复 ⇒
+61 通过 / 2 失败 ⇒ **都能抓到 bug**，不是假保险。
+
+## ⚠️ Qwen3-ASR 卡「**配音导出**」（2026-11-26 用户第四批要求 · 11-27 收尾）
+
+### 来源分流（第四批要求）
+
+| 来源 | 实时翻译 + 字幕 | 同声传译 | 新增 |
+|---|---|---|---|
+| 浏览器麦 / 板载麦 | ✅ | ✅（**保留**） | — |
+| 音频文件 | ✅ | ❌（**去掉**） | 导出**目标语言音频** |
+| 含音轨的视频 | ✅ | ❌（**去掉**） | 导出**双字幕配音视频** |
+
+⇒ 前端 `_syncSourceUi()` 互斥显示两块 + 切到文件类来源时**停掉同传**；
+后端 `POST /interp/start` 对 `source in ("file","video")` **直接 400** 兜底。
+
+### 宿主侧只加了一个函数
+
+`app/core/audio/tts_bridge.py::synthesize_pcm()` —— 走 `TtsSession.run_queued`
++ sink 收 PCM，**不落盘、不播放**。
+
+⚠️ **必须带重试**：`TtsSession.start()` 会因上一个 worker 线程没退出抛
+「TTS 正在运行或正在清理」⇒ 重试窗口 `busy_wait_sec=90`。
+
+### 插件侧新增
+
+`cards/qwen3_asr/dub.py`（作业管理）、`cards/qwen3_asr/video_burn.py`
+（MPP 解码 → 烧双字幕 → MPP 编码 → PyAV 封装）、`translation.py` 的
+`set_result_listener()`（**只读观察者**）、`interp.py` 的公开
+`ensure_tts_model()`、`service.py` 的 `file_busy()`。
+
+⚠️ **`AsrService.snapshot()["busy"]` 会被实时（麦克风）会话盖掉** ⇒ 判
+「文件识别在不在跑」要用新增的 `file_busy()`。
+
+### ⚠️ 产物命名（服务端算，前端只列不改）
+
+`<源stem>_<目标语言>_<音色>`，落在**源文件同级目录** ⇒
+`asr_en.wav` + `zh-CN` + `news_female` ⇒ `asr_en_zh-CN_news_female.wav`。
+
+### 回归
+
+```bash
+cd /userdata/wdnwebui
+.venv/bin/python .venv/src/wdnapps-audio-chat/scripts/verify_dub_export.py --no-npu  # 41 条
+.venv/bin/python .venv/src/wdnapps-audio-chat/scripts/verify_dub_ui.py               # 12 条（真浏览器）
+.venv/bin/python scripts/verify_two_input_modes.py                                  # 64 条
+```
+
+⚠️ 真机端到端**必须打运行中的服务**（另起进程够不到进程内的算力注册表）。
+⇒ 改完插件代码要 `sudo systemctl restart wdnwebui` 才生效。

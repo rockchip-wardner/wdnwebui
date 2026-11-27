@@ -1,0 +1,38 @@
+[Unit]
+Description=wdnwebui post-reboot live verification (interp prefetch cache)
+Documentation=https://github.com/rockchip-wardner/wdnwebui
+After=network-online.target wdnwebui.service
+Wants=network-online.target
+# ⚠️ **等 wdnwebui.service 真的起来**（不是「started」而是「active」）
+Requires=wdnwebui.service
+
+[Service]
+Type=oneshot
+# ⚠️ 脚本自己会等模型 ⇒ 这里不设太紧的 TimeoutStartSec
+TimeoutStartSec=2400
+WorkingDirectory=/userdata/wdnwebui
+# ⚠️⚠️ **必须以 rockchip 身份跑**（2026-11-26 实测）——
+#   Playwright 的浏览器装在 **/home/rockchip/.cache/ms-playwright**
+#   ⇒ 以 root 跑它会去找 /root/.cache/ms-playwright ⇒
+#   "Executable doesn't exist at /root/.cache/ms-playwright/..." ⇒ 端到端
+#   回归**整个跑不起来**（不是断言失败，是连浏览器都起不来）。
+User=rockchip
+Group=rockchip
+Environment=HOME=/home/rockchip
+Environment=PLAYWRIGHT_BROWSERS_PATH=/home/rockchip/.cache/ms-playwright
+ExecStart=/bin/bash /userdata/wdnwebui/scripts/post_reboot_verify.sh
+# ⚠️⚠️ **先以 root 身份删掉上一轮的日志**（2026-11-26 实测修）——
+#   脚本以 rockchip 身份跑 ⇒ 上一轮 root:root 644 的日志它**写不了**
+#   （``: > "$LOG"`` 静默失败 ⇒ 新旧日志混在一起）。
+#   ⇒ 这里 root 先删 ⇒ 脚本再以 rockchip 自己创建 ⇒ 属主正确。
+ExecStartPre=/bin/rm -f /userdata/wdnwebui/.post-reboot-verify.log
+# ⚠️ **不要配 `StandardOutput=append:<同一个日志文件>`**（2026-11-26 实测修）——
+#   那会让 systemd 和脚本**各写一遍** ⇒ **每行在日志里出现两遍**
+#   （上一轮 06:32 的日志全是成对重复）⇒ 排查时每句话都得去重。
+#   ⇒ 日志由脚本独家写；systemd 这边只进 journal：
+#     journalctl -u wdnwebui-post-reboot-verify.service
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

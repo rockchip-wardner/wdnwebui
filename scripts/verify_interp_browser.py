@@ -442,6 +442,10 @@ def main() -> int:
         base_sub = int(base.get("submitted") or 0)
         base_rel = int(base.get("stalled_released") or 0)
         base_done = int((base.get("tts_status") or {}).get("done") or 0)
+        # ⚠️ **预合成缓存的基线**（2026-11-26）—— 判「后台有没有在合成」
+        _st, cache0 = api("GET", "/api/tts/queue/cache")
+        cache0_entries = int(cache0.get("entries") or 0)
+        cache0_hits = int(cache0.get("hits") or 0)
 
         # ⚠️ 测试播放一律 1%（别用 localStorage 里的旧值）
         force_test_volume(page2)
@@ -477,18 +481,70 @@ def main() -> int:
             pending_seen = max(pending_seen, int(status.get("pending") or 0))
             if status.get("playhead_stalled"):
                 stalled_seen = True
-            # ⚠️ **两个条件都要满足**才停：
+            # ⚠️⚠️ **三个条件都要满足**才停（2026-11-26 修）：
             # ① 句子进了 TTS 队列（``submitted``）；
             # ② **音频真的播出来了**（队列的 ``done``）⇒ 这才是用户
-            #    真正关心的（「听得见译文」）。
-            if sub > base_sub and done > base_done:
+            #    真正关心的（「听得见译文」）；
+            # ③ **播放头卡住被判定出来**（``playhead_stalled``）。
+            #
+            # ⚠️⚠️ **为什么必须加上 ③**（实测踩坑，62/62 ⇒ 挂 1 条）——
+            # 「播放头卡住」的判据是「播放头**连续 3 秒**没动」
+            # （``FOLLOW_STALL_WARN_SEC`` = 3 s）⇒ **读早了读不到**。
+            #
+            # ⚠️ **为什么原来会读早**：``done`` 是**跨会话累计**的 ⇒
+            # **上一场遗留的作业**放完就让它涨 ⇒ 循环 **1~2 秒**就退了
+            # ⇒ 实测（探针）：第 6 秒才 ``playhead_stalled=True``。
+            if sub > base_sub and done > base_done and stalled_seen:
                 break
             page2.wait_for_timeout(1000)
 
         check("面板提示过「播放头卡住」（playhead_stalled）", stalled_seen,
               f"status={status}")
-        check("句子确实被压住过（pending > 0）", pending_seen > 0,
-              f"pending 峰值={pending_seen}")
+        # ⚠️⚠️ **预合成模式下引擎**不攒批**（2026-11-26 第三批改的）——
+        #
+        # **旧断言是「句子确实被压住过（pending > 0）」** ⇒ 那是**「边播
+        # 边合成」**时代的行为：文件源的句子按**内容量**攒批 ⇒ 先在
+        # ``_pending`` 里蹲着 ⇒ 攒够才提交。
+        #
+        # 现在文件 / 视频源走**预合成**（用户要求：「ASR、翻译、TTS 可以
+        # **一直在后台处理**；进度条来回拉的时候，播放也得跟上当前的
+        # 字幕」）⇒ 句子**立刻**提交（后台合成 + 按媒体位置缓存）⇒
+        # ``pending`` **恒为 0**。
+        #
+        # ⇒ 这条断言必须**反过来**验：① 预合成模式**开着**；② 引擎**没有**
+        #   攒批压住句子。
+        #
+        # ⚠️ **负面对照**：把插件的 ``interp.py`` 里 ``self._prefetch =
+        #   self._source in ("file", "video")`` 改成 ``False`` ⇒ 这两条
+        #   都会挂（``pending`` 峰值 > 0 ⇒ 攒批又回来了）⇒ 证明断言有效。
+        check("**文件源 ⇒ 预合成模式已开**（后台一直处理）",
+              status.get("prefetch") is True, f"得到 {status.get('prefetch')!r}")
+        # ⚠️⚠️ **判据是「缓存动了」，不是「引擎压着几句」**（2026-11-26 改）——
+        #
+        # **为什么换判据**：原来这条验的是「引擎没攒批压句（``pending``
+        # 峰值 ≤ 2）」⇒ **负面对照证明它抓不到 bug** ⇒ 关掉预合成后
+        # ``pending`` 峰值**也是 ≤ 2**（旧的攒批路径有
+        # ``MERGE_MAX_HOLD_SEC`` = 4 s 的兜底 ⇒ 攒不满也会放 ⇒ 压不住）。
+        # ⇒ **抓不到 bug 的断言等于假保险** ⇒ 换掉。
+        #
+        # **现在的判据 = 「音频缓存动了」** ⇒ 它直指用户要的那个能力
+        # （「拖进度条时播放也得跟上当前的字幕」靠的就是这份缓存）：
+        #
+        # * 文件源 ⇒ 引擎带 ``cache_key`` 提交 ⇒ 合成完**落进缓存**
+        #   ⇒ ``entries`` 增长（**第一次**跑这一段）；
+        # * 这一段之前跑过 ⇒ 同一位置**命中缓存** ⇒ ``hits`` 增长
+        #   ⇒ 所以两个都要看。
+        #
+        # ⚠️ **注意这条**不是**「预合成模式特有**（缓存键的生成条件是
+        #   「来源是文件/视频」，**不看** ``_prefetch`` ⇒ 两种模式下都落
+        #   缓存）⇒ 它的负面对照是**摘掉缓存键的生成**。
+        _st, cache1 = api("GET", "/api/tts/queue/cache")
+        d_entries = int(cache1.get("entries") or 0) - cache0_entries
+        d_hits = int(cache1.get("hits") or 0) - cache0_hits
+        check("**文件源 ⇒ 音频进了缓存 / 命中了缓存**（拖进度条能立刻跟上的前提）",
+              (d_entries + d_hits) > 0,
+              f"entries {cache0_entries}→{int(cache1.get('entries') or 0)} "
+              f"hits {cache0_hits}→{int(cache1.get('hits') or 0)}")
         # ⚠️⚠️ **这里断言的是「播出来了」，不是放行器的兜底计数** ——
         # **文件源**的放行器**根本不查播放头**（``interp.py``
         # ``_batch_ready``：文件源按**内容量**攒批 ⇒ 直接放行）⇒

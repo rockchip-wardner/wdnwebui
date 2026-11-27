@@ -20,6 +20,7 @@ README)。core **不得**硬依赖某一个具体包路径 —— 那会让「�
 from __future__ import annotations
 
 import importlib
+import time
 from dataclasses import dataclass
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Optional
@@ -264,7 +265,9 @@ def submit_queued(text: str, language: str = "auto", speaker: str = "",
                   src_end_ts: float = 0.0, src_start_ts: float = 0.0,
                   src_start_sec: float = -1.0, stream_id: str = "",
                   play_to: str = PLAY_BOTH,
-                  first_window_frames: int = 0) -> dict:
+                  first_window_frames: int = 0,
+                  cache_key: str = "",
+                  background: bool = False) -> dict:
     """把一句译文**排队**给 TTS 播（同传的唯一入口）。
 
     返回 ``{seq, queued, est_audio_sec, depth}``。
@@ -276,6 +279,17 @@ def submit_queued(text: str, language: str = "auto", speaker: str = "",
     voice-clone）是两个不同的 SDK 参数** —— 本板只有参考音色可用 ⇒ 必须
     走 ``ref_speaker`` ⇒ 混用会让 SDK 跳过音色条件（「not in SPK_ID,
     skipping」）⇒ **每句话音色都不一样**。
+
+    ⚠️ **``cache_key``**（2026-11-26）—— 非空 ⇒ 这句的音频进**预合成
+    缓存**（按「媒体时间轴上的位置」索引）⇒ 文件 / 视频源可以「后台一直
+    处理」，播放时**按字幕位置直接取缓存播** ⇒ 拖动进度条也能立刻跟上。
+
+    ⚠️ **``background=True``**（2026-11-26）—— **只合成进缓存、不排队
+    播放** ⇒ 走**独立的后台队列** ⇒ 不占播放深度、**不合并**、不进播放
+    FIFO。
+    ⇒ 文件 / 视频源的「后台一直处理」走这条通道 ⇒ 播放队列保持很小 ⇒
+    **一句一个作业** + 按位置放行 ⇒ 声音严格跟字幕（用户实测：把整段灌进
+    播放队列 ⇒ 队列爆 ⇒ 合并出几百秒的大 blob ⇒ 声音彻底跟不上字幕）。
 
     Raises:
         TTSUnavailable: 插件没装 / TTS 实例没跑。
@@ -290,7 +304,8 @@ def submit_queued(text: str, language: str = "auto", speaker: str = "",
             ref_speaker=ref_speaker, volume=volume,
             tempo=tempo, src_end_ts=src_end_ts, src_start_ts=src_start_ts,
             src_start_sec=src_start_sec, stream_id=stream_id,
-            play_to=play_to, first_window_frames=first_window_frames)
+            play_to=play_to, first_window_frames=first_window_frames,
+            cache_key=cache_key, background=background)
     except TTSUnavailable:
         raise
     except RuntimeError as exc:
@@ -302,9 +317,165 @@ def queue_status() -> dict:
     return _queue_module().snapshot()
 
 
+# --------------------------------------------------------------------------- #
+# 合成一段 PCM（**不落盘、不播放**）—— 配音导出用
+# --------------------------------------------------------------------------- #
+#
+# 「音频文件 / 含音轨的视频」这两个来源不再做同声传译 ⇒ 改成**导出**目标
+# 语言的音轨（ASR → 翻译 → TTS ⇒ 拼成一条 WAV）。那条音轨是**自己拼**的
+# ⇒ 不能走队列那条「合成完就播」的通道（它一合成完就进播放 FIFO）。
+#
+# ⇒ 这里开一条**只产出 PCM** 的通道：走 TTS 卡的 ``run_queued``
+# （``play_to=queue`` ⇒ 会话自己不播，只把 PCM 交给 sink）。
+
+
+class _SynthJob:
+    """``TtsSession.run_queued`` 需要的 job 载体（只要这几个属性）。"""
+
+    __slots__ = ("text", "language", "speaker", "ref_speaker", "volume",
+                 "tempo", "first_window_frames")
+
+    def __init__(self, text: str, language: str, speaker: str,
+                 ref_speaker: str, volume: float, first_window_frames: int):
+        self.text = text
+        self.language = language
+        self.speaker = speaker
+        self.ref_speaker = ref_speaker
+        self.volume = volume
+        self.tempo = 1.0
+        self.first_window_frames = first_window_frames
+
+
+def synthesize_pcm(text: str, language: str = "auto", speaker: str = "",
+                   ref_speaker: str = "", volume: float = 0.5,
+                   first_window_frames: int = 0,
+                   busy_wait_sec: float = 90.0) -> tuple:
+    """合成一句话 ⇒ ``(pcm_float32_bytes, sample_rate)``。
+
+    ⚠️ **不落盘、不播放** —— 配音导出要拿到 PCM **自己拼**成一条音轨。
+
+    ⚠️ ``speaker``（内置音色 SPK_ID）和 ``ref_speaker``（参考音色 /
+    voice-clone）是**两个不同的 SDK 参数** —— 本板只有参考音色可用 ⇒
+    混用会让 SDK 跳过音色条件（「not in SPK_ID, skipping」）⇒ **每句话
+    音色都不一样**。
+
+    ⚠️ **「TTS 正在运行或正在清理」要重试**（2026-11-26 实测）——
+    TTS 卡的 ``run_queued`` 只等「状态不是 RUNNING」⇒ 但 ``start()``
+    还会看**上一次那个 worker 线程是不是还活着** ⇒ 上一句刚合成完、
+    线程还没退出时，下一句就会撞上这个错。
+    ⇒ 这里**重试到它让开**（最多等 ``busy_wait_sec``）。
+
+    Raises:
+        TTSUnavailable: 插件没装 / TTS 实例没跑。
+        RuntimeError: 合成失败（错误信息在 ``detail`` 里）。
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("text 不能为空")
+    try:
+        sess = get_session()
+    except ImportError as exc:
+        raise TTSUnavailable(str(exc)) from exc
+    if not getattr(sess, "available", False):
+        raise TTSUnavailable("TTS 不可用: {}".format(
+            getattr(sess, "_init_error", "未知原因")))
+
+    import numpy as np
+
+    job = _SynthJob(text, language, speaker, ref_speaker, volume,
+                    first_window_frames)
+    deadline = time.monotonic() + float(busy_wait_sec)
+    while True:
+        chunks = []
+        rates = []
+
+        def _sink(chunk, sr):
+            flat = np.asarray(chunk, dtype="float32").reshape(-1)
+            if flat.size:
+                chunks.append(flat)
+                rates.append(int(sr))
+
+        try:
+            snap = sess.run_queued(job, sink=_sink)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if ("正在运行" in msg or "正在清理" in msg) and \
+                    time.monotonic() < deadline:
+                # ⚠️ **上一个 worker 线程还没退出** ⇒ 等它让开再试。
+                time.sleep(0.4)
+                continue
+            raise
+        err = str((snap or {}).get("error") or "")
+        if err:
+            if ("正在运行" in err or "正在清理" in err) and \
+                    time.monotonic() < deadline:
+                time.sleep(0.4)
+                continue
+            raise RuntimeError("合成失败: {}".format(err))
+        if not chunks:
+            raise RuntimeError("合成没有产出音频")
+        sr = rates[0] if rates else 24000
+        pcm = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        return pcm.astype("<f4").tobytes(), int(sr)
+
+
 def queue_clear() -> dict:
     """清空**未开始**的 job（正在合成的那句跑完）。"""
     return _queue_module().clear()
+
+
+def queue_cache_status() -> dict:
+    """**预合成音频缓存**的统计（2026-11-26）。
+
+    ⚠️ **为什么需要暴露出来**：文件 / 视频源要「后台一直处理」⇒ 面板要能
+    显示「已经合成好多少秒 / 共多少秒」⇒ 用户才知道**拖到后面也能立刻
+    播**。
+    """
+    q = _queue_module()
+    fn = getattr(q, "cache_stats", None)
+    if fn is None:
+        return {"entries": 0, "bytes": 0, "max_bytes": 0,
+                "hits": 0, "misses": 0}
+    return fn()
+
+
+def queue_cache_has(key: str) -> bool:
+    """预合成缓存里**有没有**这一句（按位置索引）。
+
+    ⚠️ **用途**：同传引擎在「重新武装」某一句（拖动后重播）时 ⇒ 先问
+    缓存有没有 ⇒ 有就**直接提交播**（不用重新合成）⇒ **立刻出声**。
+    """
+    q = _queue_module()
+    fn = getattr(q, "cache_has", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn(key))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def queue_cache_clear() -> dict:
+    """清空预合成缓存（换素材 / 换语言时用）。"""
+    q = _queue_module()
+    fn = getattr(q, "cache_clear", None)
+    if fn is None:
+        return {"cleared": 0}
+    return fn()
+
+
+def queue_set_prefetch_mode(on: bool) -> dict:
+    """开关**预合成模式**（2026-11-26）。
+
+    ⚠️ **开 ⇒ 播放按「播放头位置」挑**（不是 FIFO）⇒ 配合预合成缓存 ⇒
+    拖动进度条也能立刻跟上当前的字幕。
+    ⚠️ **实时流（麦克风）必须关** ⇒ 老的顺序语义不变。
+    """
+    q = _queue_module()
+    fn = getattr(q, "set_prefetch_mode", None)
+    if fn is None:
+        return {"prefetch": bool(on)}
+    return fn(bool(on))
 
 
 def queue_flush_position(pos_sec: float, direction: str = "") -> dict:

@@ -181,6 +181,26 @@ def main() -> int:
     check("POST /tts/queue/tempo ⇒ 200", st == 200, f"得到 {st}")
     check("tempo 生效", abs(float(data.get("tempo", 0)) - 1.08) < 1e-6,
           f"得到 {data}")
+    # ⚠️⚠️ **必须把变速恢复回去**（2026-11-26 实测踩到的**跨脚本污染**）——
+    #
+    # 变速是**队列级全局状态** ⇒ 本脚本把它设成 1.08 之后**不恢复** ⇒
+    # 后面的脚本全部继承这个值。
+    #
+    # ⚠️ **实测它怎么咬人的**：本脚本把队列设成 1.08 ⇒ 之后某次「非
+    # 预合成」期间，引擎按产能把它压到 **0.9** ⇒ 再切到预合成时，引擎
+    # 的死区判定用的是**自己的计数器**（已是 1.0）⇒ 认为「不用升」⇒
+    # **队列的 0.9 永远纠正不回来** ⇒ 播放实际仍慢 10% ⇒
+    # 用户报「变速怎么还是 0.90 / TTS 比字幕慢」。
+    #
+    # ⇒ 任何**改动全局状态**的脚本都**必须恢复**（放 `finally` ⇒ 中途
+    # 抛异常也不会把脏状态留给后面的脚本）。
+    try:
+        st, data = api("POST", "/api/tts/queue/tempo", {"tempo": 1.0})
+        check("把变速恢复回 1.0", st == 200
+              and abs(float(data.get("tempo", 0)) - 1.0) < 1e-6,
+              f"得到 {st} {data}")
+    except Exception as exc:  # noqa: BLE001
+        check("把变速恢复回 1.0", False, f"恢复失败: {exc}")
 
     st, data = api("POST", "/api/tts/queue/clear")
     check("POST /tts/queue/clear ⇒ 200", st == 200, f"得到 {st}")
