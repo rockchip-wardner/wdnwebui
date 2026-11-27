@@ -1828,6 +1828,32 @@ CoprocessorMenu.init();
 // npu_index）返回；按物理协卡数 cap 住，避免 UI 出现重复 option。
 const CC_MAX_RK182X_CARDS = 2;
 
+// 「本机内置 NPU（RK3588）」的**卡号哨兵** —— 与宿主
+// app/core/compute/registry.py 的 CARD_LOCAL_ONLY 一致。
+//
+// 为什么是 -1 而不是「没有卡号」：实例在 registry 里的键是
+// (卡号, 模型, 来源, 副本号)，卡号是键的一部分，不能缺。
+//
+// 算力页「运行在」把它当成**一等设备**渲染（一个可勾选的 RK3588
+// 复选框）—— 不占 EP 协卡的模型（数字人 LiteAvatar）就跑在它上面。
+const LOCAL_NPU_INDEX = -1;
+
+// 数值字段的「**显式 0 安全**」读取。
+//
+// ⚠️ ``requires_cards: 0``（数字人 LiteAvatar 不占 EP 协卡）是**合法声明**，
+// 不是「没填」。写成 ``v || 1`` 会把 0 当成 falsy ⇒ 吞成 1 ⇒
+// 「本机 NPU only」的模型被当成「要占一张 EP 协卡」⇒
+//   * 「运行在」里渲染出 RK182x 复选框（而模型根本跑不了协卡）
+//   * 又因为 available_targets=["3588"] 而一张都渲染不出 ⇒
+//     最后只剩一句「未检测到 NPU 卡 —— 等待 enumerate…」
+//
+// 空字符串也算「没填」—— ``Number("")`` 是 0，不是合法数字。
+function numOrDefault(v, dflt) {
+  if (v === undefined || v === null || v === "") return dflt;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : dflt;
+}
+
 // v0.15: banner / 顶部汇总只对"本机算力"响。adopted 远端 peer 状态本机
 // 无权干预,告警 = 误导。_source 缺失按 spawned 兜底(与 _renderBanners
 // 错误桶 fallback 一致);unavailable 进本机桶以对齐"本机声明"语义,
@@ -1870,10 +1896,6 @@ const ComputeConfigPage = {
   _system: null,        // /api/system-monitor 缓存
   _loading: false,
   _selectedTarget: {},  // {model_id: [npu_index, ...]} —— 用户勾选的卡（可多张）
-  // {model_id: true} —— 「运行在」选了**自动**：不指定卡号，由**后端的
-  // 卡位策略**挑（翻译模型跟随识别模型所在的卡；语音合成模型独占剩下
-  // 那张卡）。见宿主 app/core/compute/card_roles.py。
-  _autoTarget: {},
   _pendingModels: new Set(),  // 在飞的启停请求（model_id）—— 防连点
   // 「已装 N/M」角标的数据源：/api/compute/model-repos 的清单（和下载弹框
   // 同一个口径）。30s 刷新一次 —— 不能 1Hz 拉，那个端点要扫本地模型目录。
@@ -2672,7 +2694,10 @@ const ComputeConfigPage = {
         // 渲染端 (_makeLocalCard) 仍读这个字段，故保留。
         submodels:            [],
         description:          s.description || "",
-        requires_cards:       Number(s.requires_cards || 1),
+        // ⚠️ **不能写成** `Number(s.requires_cards || 1)` —— 数字人 LiteAvatar
+        // 的 ``requires_cards: 0``（不占 EP 协卡）是合法声明，被 `|| 1` 吞成
+        // 1 就会把它当成「要占一张协卡」，设备清单整个画错。
+        requires_cards:       numOrDefault(s.requires_cards, 1),
         // ⭐ **同一张卡上能跑几份** —— 2 ⇒ 每张卡两个复选框
         // （「RK182x #0」/「RK182x #0 (2)」），用户可以按显存勾选。
         // ⚠️ 必须从 service 条目抄过来：模型卡片的 meta 是**逐字段**拼的
@@ -2682,7 +2707,7 @@ const ComputeConfigPage = {
         // ⭐ 设备拓扑要求（EP 协卡 + 本机 NPU）。requires_cards 只数 EP
         //    协卡；Qwen-Image-2.1 这类模型还要占住第三个 NPU 设备（本机
         //    3588 的 NPU 或第三张 1828）—— 那个设备不在算力卡列表里。
-        requires_devices:     Number(s.requires_devices || 1),
+        requires_devices:     numOrDefault(s.requires_devices, 1),
         card_requirements:    s.card_requirements || null,
         available_targets:    s.available_targets || ["182x"],
       };
@@ -2694,8 +2719,12 @@ const ComputeConfigPage = {
         s.status,
         s.npu_index,
         (s.npu_indices || []).join(","),
-        s.requires_cards || 1,
-        s.requires_devices || 1,
+        // ⚠️ 这两项也要 0-安全：``requires_cards`` 在 0（不占协卡）和 1
+        // 之间切换时**必须**触发卡片重建 —— sig 里被 `|| 1` 抹平的话，
+        // 「本机 NPU only」和「占一张协卡」会共用同一个 sig ⇒ 复选框数量
+        // 停在旧值（要么只剩空提示，要么多出协卡复选框）。
+        numOrDefault(s.requires_cards, 1),
+        numOrDefault(s.requires_devices, 1),
         // 「每卡几份」进 sig —— manifest 改了它，复选框数量要跟着变，
         // 而 sig 没变的话卡片会被复用、复选框数量停留在旧值。
         s.max_replicas_per_card || 1,
@@ -3163,16 +3192,26 @@ const ComputeConfigPage = {
       // 「运行在」是多选：用户可能勾了多张卡 / 同一张卡的多个副本，
       // 启用时**每个槽位各起一个 worker**。
       const targets = this._selectedSlots(modelId);
+      // ⚠️ 「本机 NPU only」的模型（数字人 LiteAvatar，requires_cards=0）
+      // **没有 EP 协卡可选** —— 兜底不能落到 `_defaultTargetNpu()`（那是
+      // 一张协卡的卡号）。它唯一的设备是板载 RK3588（卡号哨兵 -1）。
+      const localOnly = this._isLocalOnlyModel(meta, curSvc);
       const finalTargets = (targets && targets.length)
         ? targets
-        : [ this._slotKey((curSvc && curSvc.npu_index >= 0)
-                            ? curSvc.npu_index
-                            : this._defaultTargetNpu(curCards),
-                          (curSvc && curSvc.replica) || 0) ];
+        : (localOnly
+            ? [this._slotKey(LOCAL_NPU_INDEX, 0)]
+            : [ this._slotKey((curSvc && curSvc.npu_index >= 0)
+                                ? curSvc.npu_index
+                                : this._defaultTargetNpu(curCards),
+                              (curSvc && curSvc.replica) || 0) ]);
       if (toggleInput.checked) {
-        // 选了「自动」⇒ **不传卡号**，由后端按卡位策略挑
-        this._enableInstance(this._isAutoTarget(modelId) ? null : finalTargets,
-                             modelId);
+        // 「运行在」里勾了什么就发什么（**已经没有「自动」这个选项了**）。
+        //
+        // ⚠️ 「本机 NPU only」的模型（数字人 LiteAvatar，requires_cards=0）
+        // **没有 EP 协卡可挑** —— 别把兜底的 ``finalTargets``（一张协卡号）
+        // 发出去：后端会按 local-only 分支忽略卡号、用 -1 哨兵起实例，
+        // 于是「界面显示跑在协卡 #0、实际跑在板载 NPU」对不上。
+        this._enableInstance(finalTargets, modelId);
       } else {
         // 只停**这张卡上这一份** —— 同一模型还跑在别的卡 / 别的副本上时，
         // 不该被一起停掉。
@@ -3266,7 +3305,12 @@ const ComputeConfigPage = {
     const isLoad   = state === "loading";
     const isErr    = state === "error";
     const isMissingDir = state === "missing_model_dir";
-    const noCards  = !cards || cards.length === 0;
+    // ⚠️ 「不占 EP 协卡」的模型（数字人 LiteAvatar）：``requires_cards = 0``
+    // 是**合法声明**，不能被 `|| 1` 吞成 1（那会让它看起来像要占一张协卡）。
+    const localOnly = this._isLocalOnlyModel(meta, svc);
+    // 「本机 NPU only」的模型跑在板载 RK3588 上 ⇒ **有没有 EP 协卡跟它
+    // 无关** ⇒ 不能因为本机没枚举到协卡就把开关锁掉。
+    const noCards  = (!cards || cards.length === 0) && !localOnly;
     const isOrphan = svc._source === "adopted_local";
     const isUnavail = svc._source === "unavailable";
     // 远端 peer（其他板子的 worker）：本机无权启停，toggle 直接禁用，
@@ -3275,7 +3319,10 @@ const ComputeConfigPage = {
     // 后端过渡态:"" | "loading" | "stopping" —— 启停操作进行中。
     const trans    = svc.transition || "";
     const requiresCards = Number(
-      (meta && meta.requires_cards) || svc.requires_cards || 1
+      (meta && meta.requires_cards !== undefined && meta.requires_cards !== null)
+        ? meta.requires_cards
+        : (svc && svc.requires_cards !== undefined && svc.requires_cards !== null)
+          ? svc.requires_cards : 1
     );
     const modelCardCount = this._modelCards(cards || []).length;
     const insufficientCards = requiresCards > 1
@@ -3490,9 +3537,6 @@ const ComputeConfigPage = {
       meta.max_replicas_per_card || 1,
       this._modelNpus(card.dataset.model).join(","),
       this._selectedSlots(card.dataset.model).join(","),
-      // 「自动」进 sig —— 勾/取消它都要重建 fieldset（复选框状态 +
-      // toggle 的可用状态都跟着变）。
-      this._isAutoTarget(card.dataset.model) ? "auto" : "",
       // 设备拓扑布局进了 sig —— 插了第三张卡 / 装了 rknn2-runtime 之后，
       // 「运行在」里的第三个设备（EP 卡 or 本机 NPU）要跟着变。
       ((meta.card_requirements && meta.card_requirements.selected) || {}).id || "",
@@ -3581,11 +3625,6 @@ const ComputeConfigPage = {
       if (n >= 0 && !cards.includes(n)) cards.push(n);
     }
     return cards;
-  },
-
-  // 「运行在」是否选了**自动**（卡号交给后端的卡位策略挑）。
-  _isAutoTarget(modelId) {
-    return this._autoTarget[modelId] === true;
   },
 
   // 本模型**正在跑**的槽位（"卡:份"）
@@ -3879,6 +3918,21 @@ const ComputeConfigPage = {
     return Array.from(suffixes).join(" + ");
   },
 
+  // 「不占 EP 协卡」的模型（requires_cards=0）—— 跑在板子**自带的** NPU 上。
+  //
+  // ⚠️ 判定必须用「显式 0」而不是「falsy」：``requires_cards: 0`` 是**合法
+  // 声明**（数字人 LiteAvatar 就是），``|| 1`` 那种写法会把 0 当成「没填」。
+  _isLocalOnlyModel(meta, inst) {
+    const raw = (meta && meta.requires_cards !== undefined
+                 && meta.requires_cards !== null)
+      ? meta.requires_cards
+      : (inst && inst.requires_cards !== undefined
+         && inst.requires_cards !== null)
+        ? inst.requires_cards
+        : 1;
+    return Number(raw) === 0;
+  },
+
   _makeTargetFieldset(modelId, meta, inst, cards) {
     // v0.8 patch: 改回 radio + fieldset（v0.7 形态）。用户反馈
     // <select> 在 tick patch 路径下 dropdown 还是会被关闭（即使我们
@@ -3908,9 +3962,23 @@ const ComputeConfigPage = {
     const MAX_RK182X_OPTIONS = CC_MAX_RK182X_CARDS;
     const sorted = this._sortNpuCards(this._modelCards(cards));
     const sortedIndices = sorted.map(c => c.npu_index);
-    const requiresCards = Number(
-      (meta && meta.requires_cards) || (inst && inst.requires_cards) || 1
-    );
+    // ⚠️ **不能写成** `(meta && meta.requires_cards) || (inst && inst.requires_cards) || 1`
+    // —— 那个 `||` 链会把**显式的 0** 当成「没填」⇒ 回退到 1。
+    //
+    // 「不占 EP 协卡」的模型（数字人 LiteAvatar：requires_cards=0 +
+    // card_requirements.layouts[0].ep_cards=0 + local_npu=1）会被算成
+    // 「要占 1 张卡」⇒ 前端给它渲染一堆 RK182x 复选框，用户随手勾一张
+    // 协卡，后端却按 local-only 分支起在板载 NPU 上 ⇒ 界面与实际不符。
+    const _reqCards = (meta && meta.requires_cards !== undefined
+                       && meta.requires_cards !== null)
+      ? meta.requires_cards
+      : (inst && inst.requires_cards !== undefined
+         && inst.requires_cards !== null)
+        ? inst.requires_cards
+        : 1;
+    const requiresCards = Number(_reqCards);
+    // 「本机 NPU only」—— 不占 EP 协卡，没有卡可选。
+    const localOnly = this._isLocalOnlyModel(meta, inst);
 
     // v0.8: 模型本身只支持某些 target（available_targets，如 ["182x"]）；
     // 不支持的卡灰掉 + 不可点。
@@ -3944,7 +4012,19 @@ const ComputeConfigPage = {
     let defaults;
     if (requiresCards > 1) {
       // 多卡模型（要占 N 张卡的那种）：仍是「按卡」，一份一个实例
-      defaults = new Set(sortedIndices.slice(0, requiresCards));
+      //
+      // ⚠️ 必须是**槽位键**（"卡:份"）而不是裸卡号 —— 后面拿
+      // ``defaults.has(slot)`` 去匹配复选框时对不上（裸卡号是数字
+      // 0/1，槽位键是 "0:0"/"1:0"）⇒ 复选框显示成未勾选，而模型
+      // 其实**必须占满**这些卡，用户也改不动（多卡模型本来就 disabled）
+      // ⇒ 开关永远点不动。
+      defaults = new Set(
+        sortedIndices.slice(0, requiresCards).map(idx => this._slotKey(idx, 0))
+      );
+    } else if (localOnly) {
+      // 「本机 NPU only」—— 这个模型**只能**跑在板载 RK3588 上，
+      // 所以唯一可选的设备就是它（勾上 = npu_index=-1 的哨兵）。
+      defaults = new Set([this._slotKey(LOCAL_NPU_INDEX, 0)]);
     } else {
       defaults = new Set(this._selectedSlots(modelId));
       if (defaults.size === 0) {
@@ -3970,53 +4050,28 @@ const ComputeConfigPage = {
     }
     // 只保留真实枚举出来的卡，避免 snapshot 里的陈旧卡号留下幽灵勾选。
     // ⚠️ defaults 现在装的是**槽位**（"卡:份"），要拆出卡号再比。
+    // ⚠️ **本机 NPU（-1）不是枚举出来的卡** —— 它是板载 SoC 自己的 NPU，
+    // 不在 RKNN3 的设备枚举里 ⇒ 不能拿 sortedIndices 去卡它。
     for (const key of Array.from(defaults)) {
       const [n] = this._parseSlot(key);
+      if (n === LOCAL_NPU_INDEX) continue;
       if (!sortedIndices.includes(n)) defaults.delete(key);
     }
     this._selectedTarget[modelId] = Array.from(defaults);
 
-    // 「自动（按卡位策略）」选项 —— 不指定卡号，由**后端**挑：
-    //   翻译模型 → 跟随识别模型所在的卡（感知链同卡）
-    //   语音合成 → 独占剩下那张卡（发声链不与识别共卡）
-    // 见宿主 app/core/compute/card_roles.py。
-    // ⚠️ 选了自动 ⇒ **不预选任何槽位**（卡号交给后端）。
-    const autoOn = this._isAutoTarget(modelId);
-    if (autoOn) this._selectedTarget[modelId] = [];
+    // ⚠️ **没有「自动（按卡位策略）」这个选项了**（2026-11-26）。
+    //
+    // 「运行在」现在**只列这个模型能跑的设备**：RK3588（板载内置 NPU）+
+    // RK182x #N（EP 协卡）—— 每个设备一个复选框，勾哪个就跑在哪。
+    //
+    // 为什么去掉「自动」：那个选项让用户看到的是一个**抽象的策略**（让后端
+    // 按卡位角色挑卡），而不是「这个模型到底能跑在哪」。用户在算力页上
+    // 看到的设备清单（RK3588 / RK182x #0 / RK182x #1）才是真正要选的。
+    // 后端的卡位策略（app/core/compute/card_roles.py）仍然保留 —— 向导
+    // 「一键开启」等不经过这个 picker 的调用方照旧用它。
 
-    const autoLabel = document.createElement("label");
-    autoLabel.className = "cc-target-opt cc-target-opt-auto";
-    autoLabel.title = "不指定卡号，由后端按卡位策略挑："
-      + "翻译模型跟随识别模型所在的卡；语音合成模型独占剩下那张卡";
-    const autoInput = document.createElement("input");
-    autoInput.type = "checkbox";
-    autoInput.value = "__auto__";
-    autoInput.className = "cc-target-radio";
-    autoInput.checked = autoOn;
-    // 多卡模型（要占 N 张卡的那种）策略管不了 ⇒ 不给「自动」
-    if (requiresCards > 1) {
-      autoInput.disabled = true;
-      autoLabel.title = "多卡模型不支持自动卡位";
-    }
-    autoInput.addEventListener("change", () => {
-      if (autoInput.checked) {
-        this._autoTarget[modelId] = true;
-        this._selectedTarget[modelId] = [];
-        // 取消所有具体槽位的勾选（自动 = 不指定卡号）
-        opts.querySelectorAll("input.cc-target-radio").forEach((el) => {
-          if (el !== autoInput) el.checked = false;
-        });
-      } else {
-        this._autoTarget[modelId] = false;
-      }
-    });
-    autoLabel.appendChild(autoInput);
-    const autoTxt = document.createElement("span");
-    autoTxt.textContent = "自动（按卡位策略）";
-    autoLabel.appendChild(autoTxt);
-    opts.appendChild(autoLabel);
-
-    let rendered = 0;
+    let rendered = 0;      // 已渲染的**可勾选**槽位数（locked 项不计入）
+    let drewAny = false;   // 至少画出了一个设备？占位文案靠它判断
     // 同一张卡上可以跑几份 —— 模型 manifest 的 ``max_replicas_per_card``。
     // 2 ⇒ 每张卡两个复选框（"1828#0" 的第 1 份 / 第 2 份）。
     const maxReplicas = Math.max(1, Number(
@@ -4025,10 +4080,19 @@ const ComputeConfigPage = {
     ));
 
     const renderOpt = (npuIndex, title, sub, targetFamily, supportedFlag,
-                       replica) => {
+                       replica, locked) => {
       // 不支持的 target 不渲染（直接跳过）—— 用户只看到能用的 NPU 卡。
       const isSup = supportedFlag !== false;
       if (!isSup) return;
+      // ---- locked：设备由**模型拓扑**决定 ⇒ 勾上且**不允许取消** ----
+      //
+      // 典型例子是本机 RK3588（板载 NPU）：它不在 RKNN3 的设备枚举里，
+      // 不是通过 npu_index 绑定的（worker 在 open 阶段自己挑这个设备），
+      // 用户改勾选不生效 ⇒ 界面上直接锁死，别给一个骗人的开关。
+      //
+      // ⚠️ locked 项**不计入 rendered**（它不是一个可选槽位，也不能让
+      // 「RK182x #0/#1」的渲染上限被它挤掉）。
+      const isLocked = locked === true;
       const slot = this._slotKey(npuIndex, replica);
       const label = document.createElement("label");
       label.className = "cc-target-opt";
@@ -4039,6 +4103,7 @@ const ComputeConfigPage = {
       // **不能**把括号写进标题文本 —— 那样会变成「☐ (#0-2)」，括号跑到框外，
       // 而且括号和框之间会被 flex gap 撑开。
       if (Number(replica || 0) > 0) label.classList.add("cc-target-opt-bracket");
+      if (isLocked) label.classList.add("cc-target-opt-locked");
       label.title = sub || "";
       const input = document.createElement("input");
       // checkbox 而非 radio：同一个模型可以同时跑在多张卡上、同一张卡上
@@ -4046,27 +4111,79 @@ const ComputeConfigPage = {
       input.type = "checkbox";
       input.value = slot;
       input.className = "cc-target-radio";
-      if (defaults.has(slot)) input.checked = true;
-      if (requiresCards > 1) input.disabled = true;
-      input.addEventListener("change", () => {
-        if (requiresCards > 1) return;
-        const cur = new Set(this._selectedSlots(modelId));
-        if (input.checked) cur.add(slot); else cur.delete(slot);
-        this._selectedTarget[modelId] = Array.from(cur);
-        // 手动勾了卡 ⇒ 取消「自动」（显式指定永远优先于策略）
-        if (input.checked) {
-          this._autoTarget[modelId] = false;
-          autoInput.checked = false;
+      if (isLocked) {
+        // 锁定：永远勾上、永远点不动。
+        input.checked = true;
+        input.disabled = true;
+      } else {
+        if (defaults.has(slot)) input.checked = true;
+        if (requiresCards > 1) {
+          input.disabled = true;
+          // 多卡模型：这些卡是**必须占满**的，同样不可取消 ⇒ 跟 locked
+          // 用同一套视觉（勾上 + 中性色 + 不可点），别一个灰一个蓝。
+          label.classList.add("cc-target-opt-locked");
         }
-      });
+      }
+      // ⚠️ locked 项**不注册 change** —— 它不是用户的选择，变了也不该
+      // 写进 _selectedTarget（那个键是「用户选中的槽位」，写进去会被
+      // 当成「要起一个绑在 -1 上的 worker」发出去）。
+      if (!isLocked) {
+        input.addEventListener("change", () => {
+          if (requiresCards > 1) return;
+          const cur = new Set(this._selectedSlots(modelId));
+          if (input.checked) cur.add(slot); else cur.delete(slot);
+          this._selectedTarget[modelId] = Array.from(cur);
+        });
+      }
       label.appendChild(input);
       const txt = document.createElement("span");
       txt.textContent = title;
       label.appendChild(txt);
       opts.appendChild(label);
-      rendered += 1;
+      drewAny = true;
+      if (!isLocked) rendered += 1;
     };
 
+    // ---- 设备清单：RK3588（板载内置 NPU）+ RK182x #N（EP 协卡）----
+    //
+    // 哪个设备出现，取决于 manifest 的 ``available_targets``：
+    // * ["182x"] → 只有 EP 协卡（绝大多数模型）
+    // * ["3588"] → 只有板载 RK3588（数字人 LiteAvatar 这类不占协卡的）
+    //
+    // RK3588 的卡号是 **-1**（LOCAL_NPU_INDEX 哨兵）：它不在 RKNN3 的设备
+    // 枚举里（枚举出来的是 RK182x 协卡），但它是**真实存在的一个设备**，
+    // 所以给它一个可勾选的复选框，而不是一句说明文字。
+
+    // ① RK3588 —— 本机板载内置 NPU
+    //
+    // 出现在两种情况：
+    //   * 「本机 NPU only」的模型（数字人 LiteAvatar）：它是**唯一**设备；
+    //   * 其它模型、但 manifest 声明了 local_npu（Qwen-Image-2.1 的 VAE
+    //     走本机 rknn2）：被模型**自动占用**，也在清单里露个面。
+    //
+    // ⚠️ 两种情况都**锁定**（勾上 + 不允许取消）：
+    //   * 它不是通过 npu_index 绑定的（worker 在 open 阶段自己挑这个
+    //     设备），用户改了勾选也不会生效 ⇒ 给一个能点的开关是骗人；
+    //   * local-only 模型取消勾选后，界面显示「没勾」而实际仍跑在
+    //     RK3588 上（兜底仍会发 -1）⇒ 状态对不上。
+    //
+    // ⚠️ 判断条件**不能**写成 ``supported.has("3588")`` —— Qwen-Image-2.1 的
+    // available_targets 是 ["182x"]（它主要跑协卡），拿它当闸门会把
+    // RK3588 整条藏掉，正好是用户要修的那个形态。
+    const devReq = (meta && meta.card_requirements) || null;
+    const sel = (devReq && devReq.selected) || null;
+    const localNpu = localOnly ? 0 : Number((sel && sel.local_npu) || 0);
+    if (localOnly || localNpu > 0) {
+      renderOpt(LOCAL_NPU_INDEX, "RK3588",
+                (sel && sel.local_label)
+                  ? sel.local_label
+                  : (localOnly
+                      ? "本机内置 NPU（板载 RK3588，不占 EP 协卡）"
+                      : "本机 RK3588 内置 NPU（模型自动占用）"),
+                "3588", true, 0, /* locked */ true);
+    }
+
+    // ② RK182x #N —— EP 协卡
     // enumerate index 本身就是 NPU 编号。3588 走 device_id 路径不在
     // npu 枚举里 —— enumerate 0 就是第一张 182x 协卡，label 写
     // "RK182x #0"，input value 也是 0（直接给 worker 用）。
@@ -4095,46 +4212,12 @@ const ComputeConfigPage = {
                   "182x", supported.has("182x"), rep);
       }
     }
-    if (rendered === 0) {
+    if (!drewAny) {
       const ph = document.createElement("span");
       ph.className = "cc-mem-empty";
       ph.style.fontSize = "12px";
       ph.textContent = "未检测到 NPU 卡 —— 等待 enumerate…";
       opts.appendChild(ph);
-    }
-
-    // ---- ⭐ 第三个设备：本机 NPU（不是 EP 协卡 ⇒ 不可勾选）
-    //
-    // 有些模型（Qwen-Image-2.1）除了 EP 协卡还要占住**第三个 NPU
-    // 设备**：本机 RK3588 自带的 NPU（VAE 解码走 rknn2）。
-    //
-    // 那个设备**不在算力卡列表里**（那列表只列 EP 协卡）⇒ 光看
-    // 「RK182x #0/#1」用户会以为模型只占 2 张卡，不知道还有一个自动
-    // 占着的本机 NPU。所以这里补一个**固定条目**（不可勾选 —— 它不是
-    // 通过 npu_index 绑定的，由 worker 在 open 阶段自己挑）。
-    const devReq = (meta && meta.card_requirements) || null;
-    const sel = (devReq && devReq.selected) || null;
-    const localNpu = Number((sel && sel.local_npu) || 0);
-    for (let i = 0; i < localNpu; i++) {
-      const fixed = document.createElement("span");
-      fixed.className = "cc-target-fixed";
-      fixed.title = (sel && sel.local_label)
-        ? sel.local_label
-        : "本机 SoC 自带的 NPU（自动占用，不可选择）";
-      const icon = document.createElement("span");
-      icon.className = "cc-target-fixed-icon";
-      icon.textContent = "▣";
-      fixed.appendChild(icon);
-      const txt = document.createElement("span");
-      txt.textContent = (sel && sel.local_label)
-        ? sel.local_label
-        : "本机 NPU（自动占用）";
-      fixed.appendChild(txt);
-      const auto = document.createElement("span");
-      auto.className = "cc-target-fixed-tag";
-      auto.textContent = "自动";
-      fixed.appendChild(auto);
-      opts.appendChild(fixed);
     }
 
     fs.appendChild(opts);
@@ -4187,7 +4270,10 @@ const ComputeConfigPage = {
   _hasTargetPicked(modelId, svc) {
     if (svc && svc.npu_index >= 0) return true;
     if (this._modelNpus(modelId).length) return true;
-    if (this._isAutoTarget(modelId)) return true;   // 自动 = 也是一种「选好了」
+    // ⚠️ 「本机 NPU only」的模型（数字人 LiteAvatar）：它的设备是板载
+    // RK3588，卡号哨兵 -1 ⇒ ``_selectedTargets``（只收 >= 0 的协卡号）
+    // 会把它滤掉 ⇒ 这里必须单独放行，否则开关永远点不动。
+    if (this._isLocalOnlyModel(null, svc)) return true;
     return this._selectedTargets(modelId).length > 0;
   },
 

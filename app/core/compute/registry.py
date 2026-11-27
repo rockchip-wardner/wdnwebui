@@ -833,7 +833,7 @@ def _validate_autostart_entry(entry, idx: int) -> tuple[str, list[int]]:
             f"compute.autostart[{idx}].npu_index 含重复卡号: {cards}")
     if model in MODEL_PRESETS:
         preset = MODEL_PRESETS[model]
-        static = int(preset.get("requires_cards", 1) or 1)
+        static = static_requires_cards(preset)
         # EP 卡数按**硬件布局**而定（「2×1828+3588」2 张 /「3×1828」3 张）
         # ⇒ 接受集合而不是单一数字。
         allowed = (cards_mod.allowed_ep_card_counts(preset.get("card_requirements"))
@@ -896,13 +896,21 @@ def _wants_eager_load(eager_load: bool | None) -> bool:
 
 def _worker_npu_arg(npu_index: int | None,
                     eager_load: bool | None) -> list[str]:
-    """worker 命令行上的 ``--npu`` 参数；不该由 worker 自己加载时是空列表。"""
+    """worker 命令行上的 ``--npu`` 参数；不该由 worker 自己加载时是空列表。
+
+    ⚠️ **-1（``CARD_LOCAL_ONLY``）不传** —— 「本机内置 NPU only」的模型不占
+    EP 协卡，worker 端没有卡可选，传 ``--npu -1`` 反而会让它去查一张不存在的
+    卡。让它**不带 ``--npu``** 起来，等 load RPC 再决定。
+    """
     if npu_index is None or not _wants_eager_load(eager_load):
         return []
     if isinstance(npu_index, (list, tuple)):
         value = ",".join(str(int(x)) for x in npu_index)
     else:
         value = str(int(npu_index))
+    if value.strip() == str(CARD_LOCAL_ONLY) or all(
+            int(x) == CARD_LOCAL_ONLY for x in value.split(",")):
+        return []
     return ["--npu", value]
 
 
@@ -1325,7 +1333,7 @@ class ModelInstance:
             "stderr_full":        self.stderr_full,
             "capability_types":   list(self.capability_types),
             "memory_estimate_mb": self.memory_estimate_mb,
-            "requires_cards":    int(preset.get("requires_cards", 1) or 1),
+            "requires_cards":    static_requires_cards(preset),
             # **同一张卡上可以并行跑几份** —— 算力页据此渲染复选框：
             # 2 ⇒ 每张卡给两个复选框（1828#0 的第 1 份 / 第 2 份）。
             # ⚠️ 这个字段**必须**出现在 service 条目里：算力页的模型卡片是
@@ -1413,6 +1421,32 @@ class SessionHandle:
 # --------------------------------------------------------------------------- #
 # ComputeRegistry                                                           #
 # --------------------------------------------------------------------------- #
+#: 「本机内置 NPU only」实例的**卡号哨兵** —— -1 表示「不占任何 EP 协卡，
+#: 只用板子自带的 RK3588 NPU」（数字人 LiteAvatar 就是这一类）。
+#:
+#: 为什么用哨兵而不是「空卡号」：实例在 registry 里的键是
+#: ``(卡号, 模型, 来源, 副本号)``，卡号是键的一部分，不能是「没有」。
+CARD_LOCAL_ONLY = -1
+
+
+def static_requires_cards(preset: Any) -> int:
+    """模型**静态**声明要占几张 EP 协卡。
+
+    ⚠️ **不能写成** ``int(preset.get("requires_cards", 1) or 1)`` ——
+    那个 ``or 1`` 会把显式声明的 **0** 变成 1，于是「不占 EP 卡」的模型
+    （``requires_cards: 0`` + ``card_requirements`` 里 ``ep_cards: 0``）
+    被强行占掉一张协卡。
+
+    缺省值仍是 1（绝大多数模型都要一张卡）；只有**显式**写 0 才是 0。
+    """
+    raw = preset.get("requires_cards", 1)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    return n if n >= 0 else 1
+
+
 class ComputeRegistry:
     """算力注册中心：管理 subprocess 实例 + capability 路由。"""
 
@@ -2120,7 +2154,7 @@ class ComputeRegistry:
                 # 向导的「一键开启所需模型」在**回退到别的 provider** 时必须
                 # 按替代模型的实际卡数选卡位：钉 9B（2 张）退到 4B（1 张）
                 # 还占 2 张的话，后端会对 npu_index 里的每张卡各起一个实例。
-                "requires_cards":     int(preset.get("requires_cards", 1) or 1),
+                "requires_cards":     static_requires_cards(preset),
                 # **同一张卡上可以并行跑几份** —— 算力页据此渲染复选框：
                 # 2 ⇒ 每张卡给两个复选框（1828#0 的第 1 份 / 第 2 份）。
                 # 默认 1 = 维持「一张卡一个实例」的旧行为。
@@ -2691,6 +2725,19 @@ class ComputeRegistry:
                 "model_path", f"{default_models_root()}/"))
 
         manifest = load_worker_manifest(model_id)
+        # ⭐ **Per-model worker 环境变量覆盖**（manifest 的 ``env`` 字段）。
+        #
+        # 背景：worker 的环境默认是主进程环境的副本 ⇒ 想切某个**只有这个
+        # 模型**关心的开关（比如 ``WDNAI_AVATAR_COMPOSITE`` = GPU / CPU
+        # 嘴部合成），原本只能改主进程环境 + **重启整个 webui 服务**。
+        # manifest 声明的 env 在这里注入 ⇒ 改一行 manifest、下次起这个
+        # worker 时生效，不影响别的模型、也不中断 webui。
+        #
+        # ⚠️ 注入发生在 ``WDNAI_MODELS_DIR`` 的 setdefault **之后** ⇒
+        # manifest 能覆盖它（这是有意的：manifest 更具体）。
+        if manifest is not None:
+            for _k, _v in (manifest.env or {}).items():
+                env[_k] = _v
         entry = (manifest.entry_path if manifest is not None
                  else str(Path(__file__).resolve().parent / "worker.py"))
         cmd = [
@@ -3176,7 +3223,7 @@ class ComputeRegistry:
         ⇒ 回退静态 ``requires_cards``（保持旧行为）。
         """
         preset = MODEL_PRESETS.get(model_id, {})
-        static = int(preset.get("requires_cards", 1) or 1)
+        static = static_requires_cards(preset)
         if ev is None:
             ev = self.evaluate_device_requirements(model_id)
         sel = ev.get("selected") or {}
@@ -3184,7 +3231,12 @@ class ComputeRegistry:
             n = int(sel.get("ep_cards") or 0)
         except (TypeError, ValueError):
             n = 0
-        return n if n > 0 else static
+        # ⚠️ 选中布局说「0 张 EP 卡」就**真的返回 0**（不占协卡，只用板子
+        # 自带的 NPU）。以前这里 ``n if n > 0 else static`` 会把 0 顶回
+        # 静态值（≥1），于是「本机 NPU only」的模型被算成要占一张卡。
+        if "ep_cards" in sel:
+            return max(0, n)
+        return static
 
     def allowed_ep_card_counts(self, model_id: str) -> set:
         """该模型允许的 EP 协卡数量**集合**（来自布局声明）。
@@ -3431,7 +3483,10 @@ class ComputeRegistry:
             cards = [int(x) for x in npu_index]
         else:
             cards = [int(npu_index)]
-        if not cards or any(c < 0 for c in cards):
+        # ⚠️ **-1 是合法卡号** —— 「本机内置 NPU only」的模型（数字人
+        # LiteAvatar）不占任何 EP 协卡，用 -1 作哨兵。
+        # 其它负数仍然非法。
+        if not cards or any(c < 0 and c != CARD_LOCAL_ONLY for c in cards):
             raise RuntimeError(f"npu_index 非法: {npu_index!r}")
         npu_index = cards[0]
 
@@ -4455,7 +4510,7 @@ class ComputeRegistry:
                 "instance_name":      preset["instance_name"],
                 "capability_types":   list(preset["capability_types"]),
                 "memory_estimate_mb": preset["memory_estimate_mb"],
-                "requires_cards":    int(preset.get("requires_cards", 1) or 1),
+                "requires_cards":    static_requires_cards(preset),
                 # 同上：未启用的模型也要告诉前端「每卡能跑几份」，
                 # 否则它的「运行在」也只渲染一个复选框。
                 "max_replicas_per_card": int(

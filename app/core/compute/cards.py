@@ -253,8 +253,15 @@ def allowed_ep_card_counts(req: Any) -> set:
             n = int(lay.get("ep_cards") or 0)
         except (TypeError, ValueError):
             continue
-        if n > 0:
-            out.add(n)
+        # ⚠️ **0 也要收进来** —— 「本机 NPU only」的布局（``ep_cards: 0`` +
+        # ``local_npu: 1``）表达的是「这个模型**不占** EP 协卡，只用板子
+        # 自带的 NPU」（数字人 LiteAvatar 就是这一类）。
+        #
+        # 以前这里 ``if n > 0`` 把 0 滤掉了 ⇒ 允许集合为空 ⇒ 调用方回退到
+        # 静态 ``requires_cards``（默认 1）⇒ 「不占卡」的模型被迫占一张卡。
+        #
+        # 既有布局的 ``ep_cards`` 都 ≥ 1，所以这条只影响新写的 manifest。
+        out.add(n)
     return out
 
 

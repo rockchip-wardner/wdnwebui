@@ -307,7 +307,11 @@ def allowed_card_counts(manifest: dict) -> set:
     没声明 ``card_requirements`` ⇒ 回退静态 ``requires_cards``（旧行为）。
     """
     try:
-        static = int((manifest or {}).get("requires_cards", 1) or 1)
+        # ⚠️ **不能写成** ``int(...get("requires_cards", 1) or 1)`` —— 显式的
+        # ``requires_cards: 0``（不占 EP 协卡的模型，比如数字人 LiteAvatar）
+        # 是合法声明，被 ``or 1`` 吞成 1 就会凭空多出一张「必须绑的卡」。
+        raw = (manifest or {}).get("requires_cards", 1)
+        static = 1 if raw is None else int(raw)
     except (TypeError, ValueError):
         static = 1
     counts = cards_mod.allowed_ep_card_counts(
@@ -412,6 +416,10 @@ def _resolve_card_targets(cards: list, device_id: Optional[str]) -> Tuple[dict, 
     真的不存在 → 报错；连枚举都失败 → 退回按卡号直传（此时 wdnai 自己
     也会用同一份枚举，报错信息更贴近 wdnai 的原文），并记一条 WARNING。
     """
+    if not cards:
+        # 「本机 NPU only」—— 不选任何 EP 协卡。后端用板子自带的 NPU
+        # （RKNN2 运行时），不传 npu / device_id 即默认设备。
+        return {}, "本机内置 NPU（不占 EP 协卡）"
     if len(cards) == 1:
         if device_id:
             return {"device_id": device_id}, f"device_id={device_id}"
@@ -625,7 +633,19 @@ def load_handler(state: dict, model_id: str,
         cards = [int(x) for x in raw]
     else:
         cards = []
-    if not cards or any(c < 0 for c in cards):
+    manifest = load_manifest(model_id)
+    allowed = allowed_card_counts(manifest)
+    # ⚠️ **-1 是「不占 EP 协卡」的哨兵**（与 registry 的 ``CARD_LOCAL_ONLY``
+    # 一致）—— 主进程把卡号 -1 传过来，这里翻译成「空卡列表」。
+    cards = [c for c in cards if c != -1]
+    # ⚠️ **「0 张卡」是合法的** —— 「本机 NPU only」的模型（数字人
+    # LiteAvatar）只用板子自带的 RK3588 NPU，不占任何 EP 协卡。
+    # 以前这里 ``not cards`` 一律报错，于是这类模型根本起不来。
+    #
+    # 判定依据是 manifest 声明的**允许卡数集合**里有没有 0 —— 不是「随便
+    # 放行空卡号」，而是「模型自己说了它可以一张卡都不占」。
+    local_only = 0 in allowed
+    if (not cards and not local_only) or any(c < 0 for c in cards):
         return {
             "status": "error",
             "error": "npu_index 缺失：load action 必须传 npu_index 或 npu_indices",
@@ -633,8 +653,6 @@ def load_handler(state: dict, model_id: str,
     # device_id = 主进程解析出来的**物理身份**（PCI BDF）。有它就用它选卡 ——
     # 那样「主进程说的卡」与「本进程加载的卡」不可能不一致。
     device_id = payload_device_id or state.get("device_id")
-    manifest = load_manifest(model_id)
-    allowed = allowed_card_counts(manifest)
     if len(cards) not in allowed:
         return {
             "status": "error",
@@ -643,7 +661,9 @@ def load_handler(state: dict, model_id: str,
             "npu_index": cards[0],
             "npu_indices": cards,
         }
-    npu_index = cards[0]
+    # 「不占 EP 卡」的模型没有卡号 —— 用 -1 作哨兵（与 registry 的
+    # ``CARD_LOCAL_ONLY`` 一致）。
+    npu_index = cards[0] if cards else -1
     npu_indices = cards
     # 资源预检：model_dir 不存在就直接报 missing_model_dir，不再去
     # 撞 rknn（撞了也只是把 FileNotFoundError 当 init_error 报上去，

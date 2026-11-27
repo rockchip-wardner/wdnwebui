@@ -3050,6 +3050,29 @@ body.dg-modal-open .back-home-btn {
   color: var(--muted);
   cursor: not-allowed;
 }
+
+/* v0.21: 被**模型拓扑**锁定的设备。
+ *
+ * 两种来源：
+ *   * 本机 RK3588（板载 NPU）—— 不是通过 npu_index 绑定的（worker 在
+ *     open 阶段自己挑），用户改勾选不生效；
+ *   * 多卡模型必须占满的那些协卡（requires_cards > 1）—— 本来就不可改。
+ *
+ * 语义是「**已占用**」，不是「灰掉了没使」⇒ 勾选状态要看得清楚，
+ * 不能沿用上面那条 disabled 的 opacity:0.5。
+ *
+ * ⚠️ 选择器要压过 `.cc-target-opt input[type=checkbox]:disabled`
+ * （那是 (0,2,1)，这条是 (0,3,1)，且写在后面）。 */
+.cc-target-opt.cc-target-opt-locked {
+  cursor: default;
+}
+.cc-target-opt.cc-target-opt-locked input[type="radio"]:disabled,
+.cc-target-opt.cc-target-opt-locked input[type="checkbox"]:disabled {
+  cursor: default;
+  opacity: 0.85;
+  /* 用中性色而不是默认蓝 ⇒ 一眼看出「这个不是用户选的」。 */
+  accent-color: var(--muted, #6b7280);
+}
 /* v0.20: 每张卡的**第 2 份起**，整个选项被括号包住：「(☐ #0-2)」。
  *
  * ⚠️ 括号必须包住**复选框本身** ⇒ 用伪元素（::before / ::after），
@@ -3074,32 +3097,8 @@ body.dg-modal-open .back-home-btn {
   margin: 0 4px 0 0;
 }
 
-/* v0.16: 「运行在」里的**第三个设备**（本机 SoC 自带的 NPU）。
- * 它不是 EP 协卡 ⇒ 不可勾选 —— 由 worker 在 open 阶段自己挑（Qwen-Image-2.1
- * 的 VAE 跑本机 rknn2 NPU）。用 chip 样式与可选的卡区分开。 */
-.cc-target-fixed {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 13px;
-  padding: 2px 8px;
-  border: 1px dashed var(--border, #d1d5db);
-  border-radius: 4px;
-  color: var(--text-muted, #6b7280);
-  background: rgba(0, 0, 0, 0.03);
-  cursor: default;
-  user-select: none;
-}
-.cc-target-fixed-icon {
-  opacity: 0.7;
-}
-.cc-target-fixed-tag {
-  font-size: 10px;
-  padding: 0 4px;
-  border-radius: 3px;
-  background: rgba(0, 0, 0, 0.08);
-  color: var(--text-muted, #6b7280);
-}
+/* v0.21: 「运行在」里的设备 chip 形态（.cc-target-fixed）已删除 ——
+ * 本机 RK3588 现在和其它设备一样是**复选框**（勾上 + 锁定）。 */
 
 /* v0.8: 加载倒计时（loading 状态显示在 NPU picker 下方） */
 .cc-load-countdown {

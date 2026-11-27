@@ -219,6 +219,23 @@ class WorkerManifest:
     #: Sort key for the enumeration order (ascending). Defaults to
     #: ``display_order`` semantics used by cards.
     display_order: int = 9999
+    #: **Per-model worker environment overrides** — ``{"NAME": "value"}``.
+    #:
+    #: Injected into the spawned worker's environment by the registry
+    #: (``registry.py`` → ``env.update(manifest.env)``), **overriding** the
+    #: main process's inherited value.
+    #:
+    #: Why this exists: the main process copies its own environment into
+    #: every worker, so a switch like ``WDNAI_AVATAR_COMPOSITE`` (GPU vs
+    #: CPU 嘴部合成) could only be flipped by restarting the whole web
+    #: service. With this field the switch lives **next to the model** and
+    #: takes effect on the next worker start — no service restart, and it
+    #: only affects the one model that declares it.
+    #:
+    #: ⚠️ Values must be **strings** (they end up in ``os.environ``).
+    #: ⚠️ Keep it small and explicit — this is a per-model tuning knob,
+    #: not a general config mechanism.
+    env: Dict[str, str] = field(default_factory=dict)
     #: Extra keys we do not model explicitly, preserved verbatim so a
     #: manifest can carry worker-specific metadata without a code change.
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -284,6 +301,9 @@ class WorkerManifest:
             # the display order of its 本地算力 card list, so the UI order
             # is declared here instead of in a hand-maintained JS array.
             "display_order": self.display_order,
+            # Per-model worker env overrides (registry injects these into
+            # the spawned worker's environment).
+            "env": dict(self.env),
             "entry_path": self.entry_path,
             "service_name": self.service_name(),
         })
@@ -332,6 +352,33 @@ def _parse_card_requirements(raw: Any) -> Dict[str, Any]:
         item["required_files"] = [str(f) for f in files] if isinstance(files, list) else []
         clean.append(item)
     out["layouts"] = clean
+    return out
+
+
+def _parse_env(raw: Any) -> Dict[str, str]:
+    """把 manifest 的 ``env`` 归一化成 ``{name: value}``（值都是字符串）。
+
+    **宽容解析**：字段缺失 / 不是对象 ⇒ 空 dict（不约束 worker）；
+    值不是字符串 ⇒ 走 ``str()``（``os.environ`` 只收字符串）。
+
+    ⚠️ 这里只做**形状**校验，不做**语义**校验 —— 允许注入什么环境变量
+    由 manifest 的作者负责。唯一的硬约束是名字得像环境变量、值不能是
+    ``None``（那会炸 ``os.environ``）。
+    """
+    if not isinstance(raw, dict):
+        if raw:
+            LOG.warning("env is not an object, it was ignored")
+        return {}
+    out: Dict[str, str] = {}
+    for name, value in raw.items():
+        key = str(name)
+        if not key or "=" in key or "\0" in key:
+            LOG.warning("env 里的名字不合法，已跳过: %r", name)
+            continue
+        if value is None:
+            LOG.warning("env[%r] 是 null，已跳过", key)
+            continue
+        out[key] = str(value)
     return out
 
 
@@ -402,6 +449,7 @@ def _validate(raw: Any, stem: str, *, canonical: bool = False
         "memory_estimate_mb", "estimated_init_seconds",
         "infer_timeout_s",
         "description", "notes", "available_targets", "hidden", "display_order",
+        "env",
     }
     try:
         infer_timeout_s = float(raw.get("infer_timeout_s") or 0.0)
@@ -431,6 +479,7 @@ def _validate(raw: Any, stem: str, *, canonical: bool = False
         available_targets=list(raw.get("available_targets", [])),
         hidden=bool(raw.get("hidden", False)),
         display_order=int(raw.get("display_order", 9999)),
+        env=_parse_env(raw.get("env")),
         extra={k: v for k, v in raw.items() if k not in known},
         path="",
     ), errors
@@ -639,6 +688,8 @@ _SPEC_PATH_FIELDS = (
     "rknn_llm_path", "weight_llm_path",
     "rknn_vision_path", "weight_vision_path",
     "tts_model_dir", "omni_model_dir", "asr_model_dir", "image_model_dir",
+    # 数字人（LiteAvatar）：整个素材目录（RKNN 权重 + avatars/<id>/ 形象素材）
+    "avatar_model_dir",
     "embed_path", "tokenizer_path",
     "depth_local_path", "depth_global_path", "depth_head_path",
 )

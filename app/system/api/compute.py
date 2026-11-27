@@ -102,8 +102,12 @@ class InstanceSlot(BaseModel):
     @field_validator("npu_index")
     @classmethod
     def _card_id(cls, v: int) -> int:
-        if v < 0:
-            raise ValueError(f"npu_index 必须是非负整数: {v!r}")
+        # ⚠️ **-1 是合法值** —— 它是「本机内置 NPU（RK3588）」的哨兵
+        # （registry.CARD_LOCAL_ONLY）：算力页上「运行在 RK3588」勾的就是它。
+        # 数字人 LiteAvatar 这类「不占 EP 协卡」的模型用它。
+        # 其它负数仍然是非法卡号。
+        if v < -1:
+            raise ValueError(f"npu_index 必须 >= 0（实际卡号）或 -1（本机 NPU）: {v!r}")
         return v
 
     @field_validator("replica")
@@ -168,8 +172,12 @@ class InstanceRequest(BaseModel):
         for n in items:
             if not isinstance(n, int) or isinstance(n, bool):
                 raise ValueError(f"npu_index 必须是整数，got {n!r}")
-            if n < 0:
-                raise ValueError(f"npu_index 必须 >= 0（实际卡号，0 起），got {n}")
+            # ⚠️ **-1 是合法的** —— 「本机内置 NPU（RK3588）」的哨兵，
+            # 与 ``registry.CARD_LOCAL_ONLY`` 一致。算力页上「运行在 RK3588」
+            # 勾的就是它（数字人这类不占 EP 协卡的模型）。
+            if n < -1:
+                raise ValueError(
+                    f"npu_index 必须 >= 0（实际卡号）或 -1（本机 NPU），got {n}")
             if n not in out:
                 out.append(n)
         return out
@@ -556,7 +564,13 @@ async def start_instance(req: InstanceRequest) -> dict:
         422: pydantic 校验失败（缺字段 / model 未知 / npu_index 不是整数）。
     """
     reg = get_registry()
-    if req.npu_index is None:
+    # ⚠️ **「不占 EP 协卡」的模型**（``requires_cards == 0``，例如数字人
+    # LiteAvatar）只跑在板子**自带的 RK3588 NPU** 上 —— 没有卡可挑，也不该
+    # 挑。卡号用 -1 作哨兵（``registry.CARD_LOCAL_ONLY``）。
+    local_only = reg.effective_requires_cards(req.model) == 0
+    if local_only:
+        npu_indices = []
+    elif req.npu_index is None:
         # **不给卡号 = 按卡位策略自己挑**（见
         # :mod:`app.core.compute.card_roles`）：翻译模型跟随 ASR 所在的卡，
         # TTS 挑一张没被感知链占用的卡，其余模型挑一张放得下的卡。
@@ -571,8 +585,13 @@ async def start_instance(req: InstanceRequest) -> dict:
     # **槽位** = (卡号, 本卡第几份)。``slots`` 给了就以它为准（算力页勾
     # 「1828#0 的第 2 份」时发的是它）；没给就退化成「每张卡第 0 份」——
     # 老调用方（向导 / 卡片 / config autostart）的语义完全不变。
-    slots: List[tuple] = ([s.as_tuple() for s in req.slots] if req.slots
-                          else [(n, 0) for n in npu_indices])
+    if local_only:
+        # 「本机 NPU only」—— 槽位卡号是哨兵 -1（不占 EP 协卡）。
+        slots: List[tuple] = ([s.as_tuple() for s in req.slots] if req.slots
+                              else [(-1, 0)])
+    else:
+        slots = ([s.as_tuple() for s in req.slots] if req.slots
+                 else [(n, 0) for n in npu_indices])
     # ⚠️ 动态卡数：EP 卡数**取决于选中的硬件布局**（「2×1828+3588」绑 2 张，
     #    「3×1828」绑 3 张），静态 requires_cards 只能表达前者。
     requires_cards = reg.effective_requires_cards(req.model)
@@ -597,6 +616,9 @@ async def start_instance(req: InstanceRequest) -> dict:
     # 再收到一个语焉不详的 409。docstring 早就承诺了「npu_index 越界 → 400」，
     # 以前只有 `>= 0` 的校验，单卡板上传 npu=1 会造出僵尸实例。
     for n in sorted({n for (n, _r) in slots}):
+        if n == -1:
+            # 哨兵卡号 = 「本机内置 NPU」，不是 EP 协卡位 —— 不做卡位校验。
+            continue
         bad = reg.npu_card_error(n)
         if bad:
             raise HTTPException(status_code=400, detail=bad)
