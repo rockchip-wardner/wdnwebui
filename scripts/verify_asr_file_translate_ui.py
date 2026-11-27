@@ -298,6 +298,17 @@ def main() -> int:
                   len(rows) == len(_sent_rows(page)),
                   f"rows={rows}")
 
+        # --- 5c. 那句没意义的提示**不许再出现**（2026-11-27 用户要求删掉）---
+        # ⚠️ 「点击『开始识别』重新跑一遍。」—— 没有信息量（按钮就在旁边）⇒
+        #    删掉了 ⇒ 断言钉住，防回退。
+        # ⚠️ **在清空之前查** —— 清空之后提示行会变成「已清空」⇒ 查它
+        #    查不出那句话（假通过）。
+        hint_now = page.evaluate(
+            """() => (document.getElementById('asr-hint')
+                    ?.textContent || '').trim()""")
+        check("页面上**没有**「点击「开始识别」重新跑一遍。」",
+              "重新跑一遍" not in hint_now, f"实际 = {hint_now!r}")
+
         # --- 5. 「清空」⇒ 结果框空了 ---
         page.locator("#asr-reset-btn").click()
         page.wait_for_timeout(2500)
@@ -306,6 +317,23 @@ def main() -> int:
         check("「清空」后结果框空了", len(rows2) == 0, f"rows={rows2}")
         check("「清空」后翻译面板的控制条还在",
               state3["visible"] and state3["noteVisible"], f"state={state3}")
+
+        # --- 5b. 「清空」⇒ 「实时翻译」的状态显示「已清空」（2026-11-27 用户要求）---
+        # ⚠️ **为什么要有这条** —— 清空之前这里写着「翻译模型就绪 · 实时翻译
+        #    已开启」⇒ 用户以为**还在译**（其实结果已经没了）⇒ 参照「配音
+        #    导出」的清空（它清完就把状态写成「已清空」）。
+        cleared_state = page.evaluate(
+            """() => ({
+                tr: (document.getElementById('asr-tr-status')
+                     ?.textContent || '').trim(),
+                hint: (document.getElementById('asr-hint')
+                       ?.textContent || '').trim(),
+            })""")
+        check("「清空」后「实时翻译」的状态 = 「已清空」",
+              cleared_state["tr"] == "已清空", f"实际 = {cleared_state['tr']!r}")
+        check("「清空」后提示行 = 「已清空」",
+              cleared_state["hint"] == "已清空",
+              f"实际 = {cleared_state['hint']!r}")
 
         check("没有 JS 错误", not errors, f"errors={errors[:4]}")
         browser.close()
