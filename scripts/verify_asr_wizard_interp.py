@@ -1,34 +1,42 @@
 #!/usr/bin/env python3
-"""向导「同声传译」那一步的回归（2026-11-25 新增）。
+"""向导「配音导出 / 同传」那几步的回归。
 
-用户拍板 D3：向导里加「**开启同声传译**」开关 + 朗读语言 + 音色，
-并且模型加载进度条要**参照 ASR 和翻译**（同一块进度条里多一行）。
+⚠️ **2026-11-27 重写** —— 原脚本钉的契约已经**不存在**了。
 
-本脚本把这条契约钉死：
+原脚本钉的是向导第 5 步「同声传译（可选）」（开启同传开关 + 朗读语言 +
+音色）⇒ 那一步在 **2026-11-26** 就被**移除**了：
 
-  I1 向导有第 5 步「同声传译（可选）」，且**能走到**
-  I2 那一步有「开启同声传译」开关（checkbox）+「朗读语言」下拉
-     +「音色」下拉
-  I3 朗读语言**只列能出声的语言**（≥ 8 种）+ 第一项是「跟随翻译目标语言」
-  I4 音色下拉的值是 ``kind:id``（参考音色 / 内置音色是**两个不同的
-     SDK 参数** ⇒ 混用音色不生效）
-  I5 勾上开关 ⇒ ``preloadExtraModels`` 多返回一个 target
-     ⇒ 进度条从 2 行（识别 / 翻译）变 3 行（+ 语音合成）
-  I6 **不勾**开关 ⇒ 行为与今天完全一致（不加载 TTS）
-  I7 全程无 JS 错误
+* 同传只对**麦克风**两种来源开放（板载麦 / 浏览器麦）；
+* 而向导的流程是**文件类**的（它要一个**设备端路径**）⇒ 文件类来源在
+  向导里做同传没有意义 ⇒ 那一步换成了「**配音导出（可选）**」（配音音色
+  + 导出语言的初始值）。
+
+⇒ 脚本从此一直挂 9 条（2026-11-26 那天没人重跑它 ⇒ 一直没人发现）。
+
+现在钉的是**当前流程**：
+
+  J1 向导能走到第 4 步「配音导出（可选）」
+  J2 那一步有「配音音色」下拉
+  J3 **同传的三个控件不在向导里**（防回退 —— 别哪天又加回来）
+  J4 音色下拉：≥ 3 项 + 值是 ``kind:id``（参考音色 / 内置音色是**两个不同
+     的 SDK 参数** ⇒ 混用 ⇒ 音色不生效）+ 默认选中**参考音色**
+  J5 向导的「翻译目标语言」下拉：≥ 30 项 + 第一项是「不翻译」
+  J6 向导 finish 用的入参形状 ⇒ ``preloadExtraModels`` **不加载 TTS**
+     ⇒ 进度条仍是 2 行（识别 / 翻译）
+  J7 全程无 JS 错误
 
 用法：
     .venv/bin/python scripts/verify_asr_wizard_interp.py
     .venv/bin/python scripts/verify_asr_wizard_interp.py --headful
 
 依赖：本机服务在跑 + playwright/chromium（本机已装）+ ASR 模型已启用。
-⚠️ 回归期间会**真的把 TTS 模型拉起来**（1.9 GB，独占卡 1）⇒
-   这是需求 4 的部署形态本身，跑完可以留着。
+
+⚠️ 回归期间会**真的把翻译模型拉起来**（2.2 GB）—— 那是需求本身的部署形态，
+   跑完可以留着。
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -58,7 +66,15 @@ NS = "wd-wizard-"
 #: 一个**短**音频 —— 用来填「音频源」那一步（向导只要有源就能往下走）。
 SOURCE = "/userdata/assets/uploads/asr_en.wav"
 
-STEP_TITLE = "同声传译（可选）"
+#: 当前的向导步骤（2026-11-26 起）：
+#:   环境检查 → 音频源 → 实时翻译（可选）→ **配音导出（可选）** → 完成配置
+STEP_TR = "实时翻译（可选）"
+STEP_DUB = "配音导出（可选）"
+
+#: ⚠️ **同传那三个字段早就不在向导里了**（2026-11-26 移除）⇒ 这条是
+#: **防回退**：别哪天又把「同声传译」加回向导（它只对麦克风来源有意义，
+#: 而向导是文件类流程）。
+GONE_INTERP_FIELDS = ("asr-interp-enabled", "asr-interp-lang", "asr-interp-voice")
 
 PASSED = 0
 FAILED: list[str] = []
@@ -157,6 +173,29 @@ def goto_step(page, want_title: str, max_clicks: int = 8) -> bool:
     return step_title(page) == want_title
 
 
+def _select_info(page, field_id: str) -> dict:
+    """读向导里某个 select 字段的选项信息。"""
+    return page.evaluate("""(fid) => {
+        const el = document.querySelector(
+            '#wd-wizard-root-qwen3-asr [data-field-id="' + fid + '"]');
+        if (!el) return {n: -1, first: '', value: '', texts: [], values: []};
+        const opts = Array.from(el.options || []);
+        return {
+            n: opts.length,
+            first: (opts[0] && opts[0].textContent || '').trim(),
+            value: el.value || '',
+            texts: opts.map(o => (o.textContent || '').trim()),
+            values: opts.map(o => o.value),
+        };
+    }""", field_id)
+
+
+def _has_field(page, field_id: str) -> bool:
+    return bool(page.evaluate("""(fid) => !!document.querySelector(
+        '#wd-wizard-root-qwen3-asr [data-field-id="' + fid + '"]'
+        )""", field_id))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--headful", action="store_true")
@@ -183,111 +222,88 @@ def main() -> int:
 
         try:
             print("=" * 72)
-            print("向导「同声传译」那一步的回归")
+            print("向导「配音导出 / 同传」那几步的回归")
             print("=" * 72)
 
             open_wizard(page)
             # ⚠️ **先填源** —— 「音频源」那一步的源是必填的 ⇒ 不填的话
-            #    「下一步」是 disabled ⇒ 走不到第 5 步。
+            #    「下一步」是 disabled ⇒ 走不到第 4 步。
             fill_source(page)
 
-            # ---- I1 第 5 步存在且能走到 -------------------------------- #
-            ok = goto_step(page, STEP_TITLE)
-            check(f"I1 向导能走到第 5 步「{STEP_TITLE}」", ok,
+            # ---- J5 第 3 步：翻译目标语言 -------------------------------- #
+            print("\n--- 第 3 步「实时翻译（可选）」---")
+            ok = goto_step(page, STEP_TR)
+            check(f"J0 向导能走到第 3 步「{STEP_TR}」", ok,
                   f"当前步标题 = {step_title(page)!r}")
+            tr_info = _select_info(page, "asr-tr-target")
+            check("J5a 翻译目标语言下拉有 ≥ 30 项", tr_info["n"] >= 30,
+                  f"实际 {tr_info['n']} 项")
+            check("J5b 第一项是「不翻译」", tr_info["first"] == "不翻译",
+                  f"实际 = {tr_info['first']!r}")
+            check("J5c 有一项的 value 是 'off'（哨兵值）",
+                  "off" in (tr_info["values"] or []),
+                  f"实际 = {tr_info['values'][:3]!r}")
 
-            # ---- I2 三个控件都在 ---------------------------------------- #
-            has_cb = page.evaluate("""() => !!document.querySelector(
-                '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-enabled"]'
-                )""")
-            has_lang = page.evaluate("""() => !!document.querySelector(
-                '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-lang"]'
-                )""")
-            has_voice = page.evaluate("""() => !!document.querySelector(
-                '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-voice"]'
-                )""")
-            check("I2a 有「开启同声传译」开关", has_cb)
-            check("I2b 有「朗读语言」下拉", has_lang)
-            check("I2c 有「音色」下拉", has_voice)
+            # ---- J1 第 4 步：配音导出 ------------------------------------ #
+            print("\n--- 第 4 步「配音导出（可选）」---")
+            ok = goto_step(page, STEP_DUB)
+            check(f"J1 向导能走到第 4 步「{STEP_DUB}」", ok,
+                  f"当前步标题 = {step_title(page)!r}")
+            check("J2 配音导出步有「配音音色」下拉",
+                  _has_field(page, "asr-dub-voice"))
 
-            # 开关得是 **checkbox**（值是布尔 ⇒ ``opts.interp === true``）
-            cb_type = page.evaluate("""() => {
-                const el = document.querySelector(
-                  '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-enabled"]');
-                const cb = el && (el.matches?.('input[type=checkbox]')
-                    ? el : el.querySelector?.('input[type=checkbox]'));
-                return cb ? 'checkbox' : (el ? el.tagName : 'none');
-            }""")
-            check("I2d 开关是 checkbox（值是布尔）", cb_type == "checkbox",
-                  f"实际 = {cb_type}")
+            # ---- J3 同传的控件不许回来（防回退）------------------------- #
+            gone = [fid for fid in GONE_INTERP_FIELDS if _has_field(page, fid)]
+            check("J3 同传的三个控件**不在**向导里（防回退）", not gone,
+                  f"仍然存在 = {gone}")
 
-            # ---- I3 朗读语言只列能出声的 -------------------------------- #
-            lang_info = page.evaluate("""() => {
-                const el = document.querySelector(
-                  '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-lang"]');
-                if (!el) return {n: -1, first: '', values: []};
-                const opts = Array.from(el.options || []);
-                return {
-                    n: opts.length,
-                    first: (opts[0] && opts[0].textContent || '').trim(),
-                    values: opts.map(o => o.value),
-                };
-            }""")
-            # 第一项 = 「跟随翻译目标语言」（空值）+ 10 种能出声的语言 ⇒ ≥ 11
-            check("I3a 朗读语言下拉有 ≥ 11 项（含「跟随翻译目标语言」）",
-                  lang_info["n"] >= 11, f"实际 {lang_info['n']} 项")
-            check("I3b 第一项是「跟随翻译目标语言」",
-                  lang_info["first"] == "跟随翻译目标语言",
-                  f"实际 = {lang_info['first']!r}")
-            check("I3c 有空值项（= 跟随翻译目标语言）",
-                  "" in (lang_info["values"] or []))
-
-            # ---- I4 音色下拉的值是 kind:id ------------------------------ #
-            voice_info = page.evaluate("""() => {
-                const el = document.querySelector(
-                  '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-voice"]');
-                if (!el) return {n: -1, values: []};
-                const opts = Array.from(el.options || []);
-                return {n: opts.length, values: opts.map(o => o.value)};
-            }""")
-            check("I4a 音色下拉有 ≥ 3 项", voice_info["n"] >= 3,
+            # ---- J4 音色下拉 ---------------------------------------------- #
+            # ⚠️ 选项是**运行时**灌进去的（卡片在 ``wizard:step-rendered`` 里
+            #    拉 ``/api/tts/voices``）⇒ 刚渲染完可能还是空的 ⇒ 等一下。
+            voice_info = {"n": -1, "first": "", "value": "", "texts": [],
+                          "values": []}
+            for _ in range(12):
+                voice_info = _select_info(page, "asr-dub-voice")
+                if voice_info["n"] > 0:
+                    break
+                page.wait_for_timeout(500)
+            check("J4a 音色下拉有 ≥ 3 项", voice_info["n"] >= 3,
                   f"实际 {voice_info['n']} 项")
-            check("I4b 音色值是「kind:id」格式",
+            check("J4b 音色值是「kind:id」格式",
                   all(":" in v for v in (voice_info["values"] or [])),
                   f"实际 = {voice_info['values']!r}")
+            check("J4c 默认选中的是**参考音色**（本板只有这类能出声）",
+                  (voice_info["value"] or "").startswith("ref:"),
+                  f"实际 = {voice_info['value']!r}")
+            check("J4d 音色项都标了类别（参考音色 / 内置音色）",
+                  all(t.startswith("参考音色 ") or t.startswith("内置音色 ")
+                      for t in (voice_info["texts"] or [])),
+                  f"实际 = {voice_info['texts']!r}")
 
-            # ---- I5 / I6 preloadExtraModels 的返回 ---------------------- #
-            # ⚠️ 这一步会**真的**把 TTS 模型拉起来（1.9 GB）⇒ 那是需求 4 的
-            #    部署形态本身，不是副作用。
-            res_on = page.evaluate("""async (src) => {
+            # ---- J6 finish 的入参形状 ⇒ 不加载 TTS ---------------------- #
+            # ⚠️ **向导现在给的就是这个形状**（``wizard.json`` 里没有同传的
+            #    字段 ⇒ 框架构造的 opts 里**没有** ``interp``）⇒ 那条
+            #    「同传开着就拉 TTS」的分支现在是**死代码** ⇒ TTS **不加载**
+            #    ⇒ 进度条仍是 2 行（识别 / 翻译）。
+            print("\n--- finish 的模型预加载 ---")
+            res = page.evaluate("""async (src) => {
                 const r = await window.ImApp_qwen3_asr.preloadExtraModels({
-                    source: src, trTarget: 'zh-CN', interp: true });
+                    source: src, trTarget: 'zh-CN' });
                 return {targets: (r && r.targets) || [],
                         soft: (r && r.soft) || []};
             }""", SOURCE)
-            ids_on = [t.get("model_id") for t in res_on["targets"]]
-            check("I5a 勾上同传 ⇒ 目标里有语音合成模型",
-                  "qwen3-tts" in ids_on, f"实际 = {ids_on}")
-            check("I5b 目标里有翻译模型", "hy-mt-1-5" in ids_on,
-                  f"实际 = {ids_on}")
-            check("I5c 两个目标都是 npu_index=null（后端按卡位策略挑卡）",
-                  all(t.get("npu_index") is None for t in res_on["targets"]),
-                  f"实际 = {res_on['targets']!r}")
-            check("I5d TTS 是软失败（起不来只标那一行 error）",
-                  any("qwen3-tts" in s for s in res_on["soft"]),
-                  f"实际 = {res_on['soft']!r}")
+            ids = [t.get("model_id") for t in res["targets"]]
+            check("J6a 向导的入参形状下**不加载** TTS（同传已不在向导里）",
+                  "qwen3-tts" not in ids, f"实际 = {ids}")
+            check("J6b 目标里有**翻译**模型（进度条仍是 2 行）",
+                  any(str(i or "").startswith("hy-mt") for i in ids),
+                  f"实际 = {ids}")
+            check("J6c 目标都是 npu_index=null（后端按卡位策略挑卡）",
+                  all(t.get("npu_index") is None for t in res["targets"]),
+                  f"实际 = {res['targets']!r}")
 
-            res_off = page.evaluate("""async (src) => {
-                const r = await window.ImApp_qwen3_asr.preloadExtraModels({
-                    source: src, trTarget: 'zh-CN', interp: false });
-                return {targets: (r && r.targets) || []};
-            }""", SOURCE)
-            ids_off = [t.get("model_id") for t in res_off["targets"]]
-            check("I6 不勾同传 ⇒ 不加载 TTS（行为与今天一致）",
-                  "qwen3-tts" not in ids_off, f"实际 = {ids_off}")
-
-            # ---- I7 无 JS 错误 ------------------------------------------ #
-            check("I7 全程没有 JS 错误", not js_errors,
+            # ---- J7 无 JS 错误 ------------------------------------------ #
+            check("J7 全程没有 JS 错误", not js_errors,
                   "; ".join(js_errors[:3]))
 
         finally:

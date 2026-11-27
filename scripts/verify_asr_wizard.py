@@ -3328,31 +3328,38 @@ def main() -> int:
               f"labels={labels}")
         page.screenshot(path=str(shot_dir / "2_source.png"))
 
-        # ---------------- 第 3/4 步：翻译目标语言 → 完成配置 → 真的发起识别 --------
-        # 流程 4 步：运行环境检查 → 音频源 → 实时翻译（可选）→ 完成配置。
+        # ---------------- 第 3/4 步：翻译目标语言 → 配音导出 → 完成配置 → 真的发起识别 --------
+        # 流程 5 步：运行环境检查 → 音频源 → 实时翻译（可选）→ 配音导出（可选）
+        # → 完成配置。
         # **仍然没有「识别参数」步** —— 分块长度 / token 上限 / 回退策略
         # 等于 C++ demo 的 ONLINE_* 常量，属于内部契约，不暴露给用户。
-        print("\n=== 第 3/5 步：翻译目标语言 → 同声传译 → 完成配置 → 发起识别 ===")
+        print("\n=== 第 3/5 步：翻译目标语言 → 配音导出 → 完成配置 → 发起识别 ===")
         set_field(page, "asr-source", WAV)
         click_next(page)
         check("W5 第 3 步是「实时翻译（可选）」",
               step_title(page) == "实时翻译（可选）", step_title(page))
         click_next(page)
-        # ---- 2026-11-25 新增：第 4 步是「同声传译（可选）」----
-        # ⚠️ 用户拍板 D3：向导里加「是否开启同传」+ 朗读语言 + 音色
-        #    ⇒ 步骤从 4 步变成 5 步（env / source / translate / interp /
-        #    finish）。
-        check("W5 第 4 步是「同声传译（可选）」",
-              step_title(page) == "同声传译（可选）", step_title(page))
-        # 同传那一步的三个控件（详细契约见 verify_asr_wizard_interp.py）
-        check("W5 同传步有「开启同声传译」开关",
+        # ---- 2026-11-26 起第 4 步是「配音导出（可选）」----
+        # ⚠️ **同传那一步已经从向导里移除了**（2026-11-26）—— 同传只对
+        #    **麦克风**两种来源开放，而向导的流程是**文件类**的（它要一个
+        #    设备端路径）⇒ 文件类来源在向导里做同传没有意义 ⇒ 那一步改成
+        #    「配音导出（可选）」（配音音色 + 导出语言的初始值）。
+        check("W5 第 4 步是「配音导出（可选）」",
+              step_title(page) == "配音导出（可选）", step_title(page))
+        # 配音导出那一步的控件（详细契约见 verify_asr_wizard_interp.py）
+        check("W5 配音导出步有「配音音色」下拉",
               bool(page.evaluate("""() => !!document.querySelector(
-                  '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-enabled"]'
+                  '#wd-wizard-root-qwen3-asr [data-field-id="asr-dub-voice"]'
                   )""")))
+        # ⚠️ **防回退**：同传那一步**不许回来** —— 它在 2026-11-26 被移除了。
+        check("W5 配音导出步**没有**「开启同声传译」开关",
+              not page.evaluate("""() => !!document.querySelector(
+                  '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-enabled"]'
+                  )"""))
         click_next(page)
         check("W5 步骤标题是「完成配置」", step_title(page) == "完成配置",
               step_title(page))
-        # 向导总步数 = 5（env / source / translate / interp / finish），
+        # 向导总步数 = 5（env / source / translate / dub / finish），
         # 仍然**没有**识别参数步。
         nsteps = page.evaluate(
             f"""() => {{
