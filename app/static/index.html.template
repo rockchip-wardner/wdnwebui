@@ -622,6 +622,7 @@
       {% card_slot "video-retrieval" %}
       {% card_slot "qwen3-asr" %}
       {% card_slot "tts" %}
+      {% card_slot "digital-human" %}
       {% card_slot "text-chat" %}
       {% card_slot "web-translate" %}
       {% card_slot "content-review" %}

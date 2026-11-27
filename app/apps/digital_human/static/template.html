@@ -1,0 +1,142 @@
+      <section id="page-digital-human" class="page hidden" data-page="digital-human">
+        <header class="page-header">
+          <h2>数字人</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="dh-status-line">空闲</span>
+          </div>
+        </header>
+
+        <div class="imb-card">
+          <div class="imb-card-body dh-layout">
+
+            <!-- ── 上排：形象选择 | 数字人 | 运行状态 ── -->
+            <div class="dh-top">
+
+              <!-- 左：形象选择 -->
+              <aside class="dh-side dh-side-left">
+                <section class="dh-block">
+                  <header class="dh-block-head">
+                    <h4>形象</h4>
+                    <span class="dh-hint" id="dh-avatar-count"></span>
+                  </header>
+
+                  <div class="dh-avatar-picker" id="dh-avatar-picker"></div>
+
+                  <div class="dh-row">
+                    <button id="dh-gallery-btn" class="vd-btn" type="button">形象库…</button>
+                    <span class="dh-hint" id="dh-avatar-hint">嘴型模型通用，换形象只需换素材</span>
+                  </div>
+                </section>
+              </aside>
+
+              <!-- 中：形象舞台（尺寸跟着形象走） -->
+              <div class="dh-stage">
+                <div class="dh-canvas-wrap" id="dh-stage-wrap">
+                  <img id="dh-frame" class="dh-frame" alt="数字人形象" />
+                  <div class="dh-placeholder" id="dh-placeholder">
+                    <img id="dh-stage-preview" class="dh-stage-preview" alt="当前形象" />
+                    <div class="dh-placeholder-text">
+                      <p>写一句台词，点「开始说话」</p>
+                      <p class="dh-hint">板端 TTS 合成语音 → 嘴型参数模型跑在 RK3588 内置 NPU 上，逐帧渲染成会说话的形象</p>
+                    </div>
+                  </div>
+                </div>
+                <div class="dh-stage-bar">
+                  <span id="dh-frame-info" class="dh-hint"></span>
+                </div>
+                <audio id="dh-audio" preload="auto"></audio>
+              </div>
+
+              <!-- 右：运行状态 -->
+              <aside class="dh-side dh-side-right">
+                <section class="dh-block">
+                  <header class="dh-block-head">
+                    <h4>运行状态</h4>
+                  </header>
+                  <dl class="dh-runtime" id="dh-runtime"></dl>
+                </section>
+              </aside>
+            </div>
+
+            <!-- ── 下排：语音来源（吃满整行） ── -->
+            <div class="dh-bottom">
+
+              <section class="dh-block">
+                <header class="dh-block-head">
+                  <h4>语音来源</h4>
+                  <span class="dh-hint" id="dh-tts-hint">文本合成 · 板端 TTS</span>
+                </header>
+
+                <div class="dh-tts-grid">
+                  <!-- 左：台词 -->
+                  <div class="dh-tts-text-wrap">
+                    <textarea id="dh-text" class="dh-tts-text" rows="4"
+                              placeholder="输入要说的台词，例如：你好，我是跑在 RK3588 上的数字人。"></textarea>
+                    <span class="dh-hint dh-text-count" id="dh-text-count">0 字</span>
+                  </div>
+
+                  <!-- 右：音色 / 语种 / 音量 / 输出 -->
+                  <div class="dh-tts-params">
+                    <div class="dh-row">
+                      <label class="dh-file-label" for="dh-voice">音色</label>
+                      <select id="dh-voice" class="dh-select"></select>
+                      <button id="dh-voice-preview" class="vd-btn" type="button"
+                              title="播放这个音色的试听样例">试听</button>
+                    </div>
+
+                    <div class="dh-row">
+                      <label class="dh-file-label" for="dh-language">语种</label>
+                      <select id="dh-language" class="dh-select"></select>
+                    </div>
+
+                    <div class="dh-row">
+                      <label class="dh-file-label" for="dh-volume">音量</label>
+                      <input type="range" id="dh-volume" class="dh-volume"
+                             min="0" max="100" step="5" value="10" />
+                      <span class="dh-hint" id="dh-volume-value">10%</span>
+                    </div>
+
+                    <div class="dh-row">
+                      <label class="dh-file-label" for="dh-stride">输出</label>
+                      <select id="dh-stride" class="dh-select"
+                              title="渲染耗时主要由帧数决定">
+                        <option value="3" selected>10 fps 流式</option>
+                        <option value="2">15 fps 均衡</option>
+                        <option value="1">30 fps 清晰</option>
+                      </select>
+                    </div>
+                    <div class="dh-hint">边合成边播要用 10 fps —— 画面得比语音合成跑得快才追得上</div>
+                  </div>
+
+                  <!-- 左下：开始 —— 跟在台词框后面，符合「输入完就点发送」的习惯 -->
+                  <div class="dh-row dh-run-row">
+                    <button id="dh-speak-btn" class="vd-btn" type="button">开始说话</button>
+                    <button id="dh-cancel-btn" class="vd-btn hidden" type="button">取消</button>
+                  </div>
+                </div>
+
+                <audio id="dh-voice-preview-audio" class="hidden" preload="none"></audio>
+
+                <div class="dh-progress hidden" id="dh-progress">
+                  <div class="dh-progress-bar" id="dh-progress-bar"></div>
+                </div>
+                <div class="dh-log" id="dh-log"></div>
+              </section>
+
+            </div>
+          </div>
+        </div>
+
+        <!-- 官方形象库（ModelScope LiteAvatarGallery） -->
+        <div class="dh-gallery hidden" id="dh-gallery">
+          <div class="dh-gallery-head">
+            <h4>官方形象库</h4>
+            <div class="dh-row">
+              <span class="dh-hint" id="dh-gallery-hint">点击下载形象素材（12~27 MB）</span>
+              <button id="dh-gallery-refresh" class="vd-btn" type="button">刷新清单</button>
+              <button id="dh-gallery-close" class="vd-btn" type="button">关闭</button>
+            </div>
+          </div>
+          <div class="dh-gallery-grid" id="dh-gallery-grid"></div>
+        </div>
+      </section>

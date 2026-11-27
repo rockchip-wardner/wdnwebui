@@ -1,0 +1,60 @@
+{
+  "id": "digital-human",
+  "title": "数字人",
+  "category": "chat",
+  "description": "语音驱动的 2D 数字人：嘴型参数模型和 decoder 都跑在 RK3588 内置 NPU 上，逐帧渲染出会说话的形象。",
+  "version": "0.1.0",
+  "preview_video": "",
+  "preview_image": "",
+  "software_capabilities": [],
+  "hardware_capabilities": [
+    "hwcap_audio_output"
+  ],
+  "backend": {
+    "module": "app.apps.digital_human",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/digital-human/template.html",
+    "js": [
+      "/static/apps/digital-human/app.js?v=28"
+    ],
+    "css": [
+      "/static/apps/digital-human/app.css?v=11"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "job.state"
+    ],
+    "stop_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/digital-human/stop"
+      },
+      {
+        "method": "POST",
+        "path": "/api/tts/stop"
+      }
+    ],
+    "stop_sync_endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/digital-human/stop"
+      },
+      {
+        "method": "POST",
+        "path": "/api/tts/stop"
+      }
+    ]
+  },
+  "prompts": {
+    "schema_class": "",
+    "editable_fields": [],
+    "prompt_template": ""
+  },
+  "requires_core": [],
+  "uploads_dir": "uploads/digital_human",
+  "display_order": 68
+}
