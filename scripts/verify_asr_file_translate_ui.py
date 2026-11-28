@@ -387,26 +387,39 @@ def main() -> int:
               f"overflowY={scroll['overflowY']!r}")
 
         # --- 5. 「清空」⇒ 结果框空了 ---
-        # ⚠️⚠️ **「清空」现在只有一个**，在「实时结果」旁边（2026-11-27 用户
-        #    要求：两个块里的「清空」全部去除 ⇒ 统一挪到「实时结果」旁边 ⇒
-        #    **一个按钮清所有结果**）。
+        # ⚠️⚠️ **「清空」现在只有一个**，在**「显示模式」下拉的正右边**
+        #    （2026-11-27 用户定案：那个下拉当前显示的就是「实时结果」⇒
+        #    按钮**字面上**就在「实时结果」旁边 ⇒ 用户一眼知道它清什么）。
+        # ⚠️ **之前放在那一行最右边** ⇒ 挨着「完成 / 语种」⇒ 看着像跟状态是
+        #    一组的 ⇒ 用户搞不清 ⇒ **钉住这个位置**。
         clear_pos = page.evaluate(
             """() => {
                 const btn = document.getElementById('asr-reset-btn');
                 const ctrl = document.querySelector('#asr-controls')
                     || btn?.closest('.asr-controls');
-                const live = document.getElementById('asr-live');
+                const sel = document.getElementById('asr-mode');
+                const grp = document.querySelector('.asr-status-group');
                 const tr = document.getElementById('asr-tr-block');
                 const dub = document.getElementById('asr-dub-block');
                 const all = Array.from(document.querySelectorAll(
                     '#page-qwen3-asr button')).filter((x) =>
                         (x.textContent || '').trim() === '清空');
                 const r = (e) => (e ? e.getBoundingClientRect() : null);
-                const lb = r(live);
+                const mid = (e) => {
+                    const x = r(e);
+                    return x ? Math.round(x.y + x.height / 2) : -1;
+                };
+                const bb = r(btn), sb = r(sel), gb = r(grp);
                 return {
                     exists: !!btn,
                     inControls: !!(btn && ctrl && ctrl.contains(btn)),
-                    nearLive: !!(btn && lb && r(btn).bottom <= lb.top + 200),
+                    // ⚠️ **紧挨「显示模式」下拉的右边**
+                    rightOfSelect: !!(bb && sb && bb.left >= sb.right - 2),
+                    gap: bb && sb ? Math.round(bb.left - sb.right) : -1,
+                    sameRow: Math.abs(mid(btn) - mid(sel)) <= 12,
+                    // ⚠️ **在状态组（徽标 / 语种）的左边** —— 挨着它就又像
+                    //    「状态组的一部分」了 ⇒ 用户又搞不清。
+                    beforeStatus: !!(bb && gb && bb.right <= gb.left + 2),
                     trHasClear: !!(tr && tr.querySelector(
                         'button[id="asr-reset-btn"]')),
                     dubHasClear: !!(dub && dub.querySelector(
@@ -415,10 +428,14 @@ def main() -> int:
                 };
             }""")
         check("有统一的「清空」按钮（#asr-reset-btn）", clear_pos["exists"])
-        check("它在**「显示模式」那一行**（「实时结果」的正上方）",
-              clear_pos["inControls"] and clear_pos["nearLive"],
-              f"inControls={clear_pos['inControls']} "
-              f"nearLive={clear_pos['nearLive']}")
+        check("它在**「显示模式」下拉的正右边**（下拉当前显示「实时结果」）",
+              clear_pos["inControls"] and clear_pos["rightOfSelect"]
+              and clear_pos["sameRow"] and 0 <= clear_pos["gap"] <= 40,
+              f"gap={clear_pos['gap']} sameRow={clear_pos['sameRow']} "
+              f"rightOfSelect={clear_pos['rightOfSelect']}")
+        check("它**不在**状态组（徽标 / 语种）那一侧",
+              clear_pos["beforeStatus"],
+              f"beforeStatus={clear_pos['beforeStatus']}")
         check("「实时翻译」块里**没有**「清空」按钮了",
               not clear_pos["trHasClear"])
         check("「配音导出」块里**没有**「清空」按钮了",
