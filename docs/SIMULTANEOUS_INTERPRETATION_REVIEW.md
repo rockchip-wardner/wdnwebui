@@ -186,7 +186,8 @@ git show 9432a2b:app/core/audio/tts_bridge.py
 → `sess.respond(first_window_frames=…)`），**只有 SDK 端没有这个参数** ⇒
 参数被静默忽略 ⇒ 首声仍要等 50 帧。
 
-**改法**（外部仓 `.venv/src/wdnai`，提交 `6f6eeb0`）：
+**改法**（外部仓 `.venv/src/wdnai`，提交 **`82401a4`** —— 原 `6f6eeb0`，
+rebase 到上游的 avatar 提交之后换了号）：
 
 * `backends/tts.py` 新增 `FIRST_WINDOW_FRAMES = 25` + `first_window_frames` 形参
   （`run_with_progress` → `_run_talker_streaming_with_progress` → `_decoder_worker_with_stop`），
