@@ -52,6 +52,23 @@ tokenizers>=0.15,<1
 # 这条路径 —— 所以板子上其它模型一直正常，直到第一次启用 9B 才暴露。
 # MarkupSafe 是 jinja2 自己的硬依赖，pip 会一并装上。
 jinja2>=3.1.0,<4
+# scipy —— wdnai **数字人后端**（backends/avatar.py）的嘴型参数低通平滑：
+# 4 阶 Butterworth（cutoff 10 Hz / 采样率 30 Hz）+ filtfilt，与原版
+# ``Audio2Mouth.mouth_smooth`` 逐字一致（滤波器不同的话，嘴部抖动肉眼可见）。
+#
+# wdnai 的 pyproject **已经声明** scipy>=1.7（上游的 avatar 提交加的），但
+# update_rkwhl.sh / README §4 都是 `pip install --no-deps -e` 装 SDK
+# —— --no-deps 直接跳过依赖安装 ⇒ scipy **永远**不会自己进 venv
+# ⇒ 必须在这里兜住（同 transformers / tokenizers / jinja2 / v4l2 一类）。
+#
+# 故障链：缺包时数字人在「嘴型平滑」那一步抛
+#   ModuleNotFoundError: No module named 'scipy'
+# ⚠️ 那是**懒加载** import ⇒ 不影响其它卡（算力页、TTS、ASR 都照常），
+# 只有第一次真正渲染数字人时才炸 —— 报错点离原因很远。
+#
+# 数字人整条链路不需要 torch，但需要 scipy。
+# 上界卡 <2：scipy 2.x 的 API 变动未验证。
+scipy>=1.7,<2
 # v4l2（PyPI，纯 ctypes 的 Video4L2 绑定，GPLv2）—— wdnav.v4l2 的硬依赖，
 # 同属「SDK 声明了、但 --no-deps 装不进来、只能由 wdnwebui 兜」的一类。
 #
